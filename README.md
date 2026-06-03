@@ -6,7 +6,7 @@ locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
 priority; the same goldens double as GUI **bench** VMs you can open in UTM to test things like
 plugins in a DAW.
 
-> Project-agnostic. Pulp is the first consumer, but any repo (e.g. a Pulp-based
+> Project-agnostic. [Pulp](https://github.com/danielraffel/pulp/) is the first consumer, but any repo (e.g. a Pulp-based
 > plugin) plugs in with one `vm-image` manifest. This repo holds **scripts +
 > configs + docs only — never the large VM images** (those stay local / pulled /
 > baked, and are gitignored).
