@@ -1,7 +1,7 @@
 # tartci — local CI VMs on macOS (Tart + QEMU + Shipyard)
 
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
-Silicon Mac**, wired to GitHub runners + Shipyard, so you can build & test a repo
+Silicon Mac**, wired to GitHub runners + [Shipyard](https://github.com/danielraffel/shipyard), so you can build & test a repo
 locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
 priority; the same goldens double as GUI **bench** VMs you can open in UTM to test
 plugins in a DAW.
