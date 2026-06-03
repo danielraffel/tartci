@@ -10,7 +10,7 @@
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
-  tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
+#   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci up <os>             # linux/macos: pointer to the runbook (WIP); windows: -> windows run
 #   tartci help
 #
