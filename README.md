@@ -20,15 +20,20 @@ plugins in a DAW.
 - Ephemeral per-job clones, host-mounted caches, SSH access + log collection,
   and a tiny metrics dashboard.
 
-## Quick start (the goal: one command)
+## Quick start
 ```bash
 git clone <this-repo> tartci && cd tartci
-./tartci setup            # installs tart/qemu/sshpass, pulls base images, host config
-./tartci up linux         # bring up a Linux build VM for the current repo's manifest
-./tartci bench windows    # clone the golden → open in UTM for GUI/DAW testing
+./tartci doctor           # report host prereqs + golden/bench stores (always safe)
+./tartci setup            # brew-install tart/qemu/sshpass + create local stores
+./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
+./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
+./tartci windows run      # boot the Windows QEMU build VM
 ```
-(See `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide while the
-one-command wrappers are being finished.)
+`tartci doctor`, `bench`, `metrics`, and `windows run` are wired today. `tartci up
+linux|macos` currently points at the runbook — the Tart bring-up is still
+hand-driven (provider scripts are the next step). See `docs/runbook.md` for the
+from-scratch, gotcha-by-gotcha guide and `docs/new-repo-agent-guide.md` to
+onboard a new repo.
 
 ## Per-project use
 A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its

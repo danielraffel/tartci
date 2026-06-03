@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# tartci — front door for local CI VMs on macOS (Tart + QEMU + Shipyard).
+#
+# This dispatcher wires the parts of the toolkit that are proven today and is
+# honest about what is still hand-driven (see docs/runbook.md). It adds NO
+# dependencies of its own — just bash + the tools `doctor` checks for.
+#
+#   tartci doctor              # report host prereqs + stores (always safe)
+#   tartci setup               # brew-install prereqs + create local stores
+#   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
+#   tartci metrics [report|dashboard] [file]
+#   tartci windows run         # boot the Windows QEMU VM (provider script)
+#   tartci up <os>             # linux/macos: pointer to the runbook (WIP); windows: -> windows run
+#   tartci help
+#
+# Stores (override via env): TARTCI_HOME (default ~/.tartci) holds goldens/,
+# bench/, windows/, iso/. Large images live here and are NEVER committed.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TARTCI_HOME="${TARTCI_HOME:-$HOME/.tartci}"
+export TARTCI_GOLDENS="${TARTCI_GOLDENS:-$TARTCI_HOME/goldens}"
+export TARTCI_BENCH="${TARTCI_BENCH:-$TARTCI_HOME/bench}"
+export TARTCI_WIN="${TARTCI_WIN:-$TARTCI_HOME/windows}"
+
+c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
+c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
+c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
+
+cmd_doctor() {
+  echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
+  echo "prereqs:"
+  for t in tart qemu-system-aarch64 qemu-img sshpass gh git jq; do
+    if command -v "$t" >/dev/null 2>&1; then c_ok "$t ($(command -v "$t"))"; else c_miss "$t (missing)"; fi
+  done
+  # vncdotool + UTM are optional helpers.
+  command -v vncdo >/dev/null 2>&1 && c_ok "vncdo (VNC drive)" || c_warn "vncdo (optional: headless VNC drive — pip install vncdotool)"
+  [ -d /Applications/UTM.app ] && c_ok "UTM.app (GUI bench)" || c_warn "UTM.app (optional: GUI/DAW bench)"
+  echo "stores under $TARTCI_HOME:"
+  for d in "$TARTCI_GOLDENS" "$TARTCI_BENCH" "$TARTCI_WIN"; do
+    [ -d "$d" ] && c_ok "$d" || c_warn "$d (will be created by 'setup')"
+  done
+  if [ -d "$TARTCI_GOLDENS" ]; then
+    local n; n=$(find "$TARTCI_GOLDENS" -maxdepth 1 \( -name '*.qcow2' -o -name '*.tart' \) 2>/dev/null | wc -l | tr -d ' ')
+    echo "goldens: $n"; find "$TARTCI_GOLDENS" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sed 's/^/  - /'
+  fi
+}
+
+cmd_setup() {
+  echo "tartci setup — installing prereqs (idempotent) + creating stores"
+  if command -v brew >/dev/null 2>&1; then
+    brew list cirruslabs/cli/tart >/dev/null 2>&1 || brew install cirruslabs/cli/tart || true
+    for f in qemu sshpass jq gh; do brew list "$f" >/dev/null 2>&1 || brew install "$f" || true; done
+  else
+    echo "Homebrew not found — install it first: https://brew.sh"; return 1
+  fi
+  mkdir -p "$TARTCI_GOLDENS" "$TARTCI_BENCH" "$TARTCI_WIN" "$TARTCI_HOME/iso"
+  echo "stores ready under $TARTCI_HOME"
+  cmd_doctor
+}
+
+cmd_bench()   { exec "$HERE/bench/bench.sh" "$@"; }
+
+cmd_metrics() {
+  local mode="${1:-report}"; shift || true
+  local file="${1:-$HERE/metrics/sample.jsonl}"
+  case "$mode" in
+    report)    exec python3 "$HERE/metrics/report.py" "$file" ;;
+    dashboard) exec python3 "$HERE/metrics/dashboard.py" "$file" "${2:-$HERE/metrics/index.html}" ;;
+    *) echo "usage: tartci metrics [report|dashboard] [file]"; return 2 ;;
+  esac
+}
+
+cmd_windows() {
+  case "${1:-}" in
+    run) exec "$HERE/providers/qemu-windows/qemu-run.sh" ;;
+    *)   echo "usage: tartci windows run   (boots the Windows QEMU VM; see providers/qemu-windows/)"; return 2 ;;
+  esac
+}
+
+cmd_up() {
+  case "${1:-}" in
+    windows) cmd_windows run ;;
+    linux|macos)
+      echo "tartci up $1 — the one-command Tart bring-up is still hand-driven."
+      echo "Follow docs/runbook.md (the $1 lane is fully documented + proven)."
+      echo "Provider scripts (tart-$1) are the next productionization step." ;;
+    *) echo "usage: tartci up <linux|macos|windows>"; return 2 ;;
+  esac
+}
+
+usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+
+case "${1:-help}" in
+  doctor)  cmd_doctor ;;
+  setup)   cmd_setup ;;
+  bench)   shift; cmd_bench "$@" ;;
+  metrics) shift; cmd_metrics "$@" ;;
+  windows) shift; cmd_windows "$@" ;;
+  up)      shift; cmd_up "$@" ;;
+  help|-h|--help) usage ;;
+  *) echo "unknown command: $1"; echo; usage; exit 2 ;;
+esac
