@@ -3,7 +3,7 @@
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
 Silicon Mac**, wired to GitHub runners + [Shipyard](https://github.com/danielraffel/shipyard), so you can build & test a repo
 locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
-priority; the same goldens double as GUI **bench** VMs you can open in UTM to test
+priority; the same goldens double as GUI **bench** VMs you can open in UTM to test things like
 plugins in a DAW.
 
 > Project-agnostic. Pulp is the first consumer, but any repo (e.g. a Pulp-based
@@ -12,7 +12,7 @@ plugins in a DAW.
 > baked, and are gitignored).
 
 ## What you get
-- **macOS + Linux** via **Tart** (Apple Virtualization) — native speed, CoW
+- **macOS + Linux** via **[Tart](https://github.com/cirruslabs/tart/)** (Apple Virtualization) — native speed, CoW
   clones, host-mounted ccache warm across clones.
 - **Windows** via **standalone QEMU** (hvf) — AVF can't install Windows (no inbox
   virtio-blk driver; black installer display), so Windows is first-class on QEMU
