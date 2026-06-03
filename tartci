@@ -10,6 +10,7 @@
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
+  tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci up <os>             # linux/macos: pointer to the runbook (WIP); windows: -> windows run
 #   tartci help
 #
@@ -72,9 +73,11 @@ cmd_metrics() {
 }
 
 cmd_windows() {
-  case "${1:-}" in
-    run) exec "$HERE/providers/qemu-windows/qemu-run.sh" ;;
-    *)   echo "usage: tartci windows run   (boots the Windows QEMU VM; see providers/qemu-windows/)"; return 2 ;;
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    run)    exec "$HERE/providers/qemu-windows/qemu-run.sh" ;;
+    golden) exec "$HERE/providers/qemu-windows/make-golden.sh" "$@" ;;
+    *)      echo "usage: tartci windows <run|golden [name]>   (see providers/qemu-windows/)"; return 2 ;;
   esac
 }
 
@@ -89,7 +92,7 @@ cmd_up() {
   esac
 }
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,18p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  cmd_doctor ;;
