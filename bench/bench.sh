@@ -42,6 +42,7 @@ case "$OS" in
     src="$(ls -t "$GOLDENS"/*windows*.qcow2 2>/dev/null | head -1 || true)"
     [ -n "$src" ] || { echo "no windows golden in $GOLDENS"; exit 1; }
     dst="$BENCH/${NAME}.qcow2"
+    [ -e "$dst" ] && { echo "bench already exists: $dst — pick another name or remove it first (won't clobber your customized bench)"; exit 1; }
     echo "cloning $src → $dst"
     cp -c "$src" "$dst" 2>/dev/null || cp "$src" "$dst"   # APFS CoW when possible
     open_in_utm "$dst"

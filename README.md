@@ -17,8 +17,17 @@ plugins in a DAW.
 - **Windows** via **standalone QEMU** (hvf) — AVF can't install Windows (no inbox
   virtio-blk driver; black installer display), so Windows is first-class on QEMU
   with an NVMe disk + `ramfb` display.
-- Ephemeral per-job clones, host-mounted caches, SSH access + log collection,
-  and a tiny metrics dashboard.
+- Host-mounted caches, SSH access + log collection, and a tiny metrics dashboard.
+
+> **Maturity (be honest):** this is a working lab toolkit, not yet a turnkey
+> dependency. Proven today: the Windows QEMU bring-up + golden, the Linux Tart
+> bring-up, the metrics, and `tartci doctor/bench/metrics/windows`. **Not yet
+> wired:** ephemeral *per-job* clones (the Windows provider is still
+> single-operator state — fixed disk/VM-name/ports), the `tart-linux`/
+> `tart-macos` provider scripts (`tartci up` points at the runbook), and the
+> `target_arch=x86_64`/`cross` manifest fields (the lanes build native ARM64
+> today — useful signal, not x64 coverage; GitHub-hosted x64 stays the
+> authoritative x64 gate). Don't take a hard dependency on this yet.
 
 ## Quick start
 ```bash
