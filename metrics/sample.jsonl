@@ -1,0 +1,4 @@
+{"ts": "2026-06-01", "os": "linux", "arch": "arm64", "provider": "tart", "mode": "cold", "configure_s": 273, "build_s": 107, "ccache_hit_pct": 2.62, "note": "V1 cold full build 1003/1003"}
+{"ts": "2026-06-02", "os": "linux", "arch": "arm64", "provider": "tart", "mode": "warm", "build_s": 20.8, "ccache_hit_pct": 99.93, "ctest_s": 14, "tests_total": 9370, "tests_passed": 9366, "note": "V2 warm build in CoW clone"}
+{"ts": "2026-06-01", "os": "macos", "arch": "arm64", "provider": "tart", "mode": "warm", "ccache_hit_pct": 88.0, "note": "macOS lane prior measurement (cold 0.6->warm 88)"}
+{"ts": "2026-06-02", "os": "windows", "arch": "arm64", "provider": "qemu", "mode": "cold", "configure_s": 6, "note": "24H2 GPU-off MSVC arm64; build GREEN ~7min; ctest 99% (7287/7303, 8 env/CLI fails)", "build_s": 426, "ctest_s": 181, "tests_total": 7303, "tests_passed": 7287, "tests_failed": 8}

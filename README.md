@@ -45,10 +45,21 @@ useful when present; never a punishment when missing.
 ```
 providers/   tart-macos · tart-linux · qemu-windows   (per-OS provision + run)
 manifests/   example vm-image.toml per project profile
-metrics/     dashboard.py + report.py (file-based; no server)
+metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
 bench/        helper to clone a golden → open in UTM for GUI testing
 docs/        runbook.md (from-scratch), gotchas, design
 ```
+
+## Metrics (file-based, no server)
+Per-run build/configure/ctest times + cache-hit% land in a `metrics.jsonl` (one
+JSON object per line). Two zero-dependency Python scripts read it:
+```bash
+python3 metrics/report.py    metrics/sample.jsonl                 # text table
+python3 metrics/dashboard.py metrics/sample.jsonl index.html      # self-contained HTML
+```
+`sample.jsonl` carries the real 2026-06 bring-up numbers so the dashboard renders
+out-of-box (a "Last run" hero + per-OS configure/build/ctest + cache-warmth
+trends). Your own `metrics.jsonl` is gitignored.
 
 ## Status
 Bring-up proven on a Mac Studio (2026-06): Linux build+test+cache green; Windows
