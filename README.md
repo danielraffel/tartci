@@ -19,7 +19,7 @@ plugins in a DAW.
   with an NVMe disk + `ramfb` display.
 - Host-mounted caches, SSH access + log collection, and a tiny metrics dashboard.
 
-> **Maturity (be honest):** this is a working lab toolkit, not yet a turnkey
+> **Project Status:** this is a working lab toolkit, not yet a turnkey
 > dependency. Proven today: the Windows QEMU bring-up + golden, the Linux Tart
 > bring-up, the metrics, and `tartci doctor/bench/metrics/windows`. **Not yet
 > wired:** ephemeral *per-job* clones (the Windows provider is still
