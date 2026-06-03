@@ -47,7 +47,7 @@ providers/   tart-macos · tart-linux · qemu-windows   (per-OS provision + run)
 manifests/   example vm-image.toml per project profile
 metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
 bench/        helper to clone a golden → open in UTM for GUI testing
-docs/        runbook.md (from-scratch), gotchas, design
+docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent onboarding) · gotchas.md
 ```
 
 ## Metrics (file-based, no server)
