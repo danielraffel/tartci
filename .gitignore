@@ -1,0 +1,16 @@
+# NEVER commit VM images or per-run state (they're large + machine-local)
+*.iso
+*.qcow2
+*.img
+*.vhdx
+vms/
+qemu/
+iso/
+metrics.jsonl
+*.log
+
+# generated locally from your keys — never commit
+autounattend.xml
+media/
+bin/
+win-provision/
