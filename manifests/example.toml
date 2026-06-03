@@ -1,0 +1,60 @@
+# vm-image manifest (schema v2) — the per-repo "unit of reuse".
+#
+# A consuming repo drops one of these (conventionally at
+# `.shipyard/vm-image.toml`, or `.tartci/vm-image.toml`) and tartci bakes or
+# clones a golden from it — no hand-provisioning. This file is the SKELETON
+# with every field documented; see `pulp.linux.toml` / `pulp.windows.toml` for
+# real, proven instances.
+#
+# Schema v2 adds the cross-arch fields (`arch`, `target_arch`, `cross`) and
+# OS-scoped package tables ([apt]/[brew]/[choco]) so one schema covers all
+# three providers. v1 macOS manifests (no arch fields) still validate.
+
+schema   = 2
+name     = "example-build-base"      # golden image name: <name> / <name>-<os>
+provider = "tart"                    # tart (macOS/Linux) | qemu (Windows)
+strategy = "configure-on-boot"       # bake (hot repos) | configure-on-boot (new/low-volume)
+
+os          = "linux"                # linux | windows | macos
+arch        = "arm64"                # GUEST arch. Apple Virtualization is ARM64-only;
+                                     #   QEMU on Apple Silicon is also ARM64 (hvf).
+target_arch = "x86_64"              # what you ultimately ship/gate on. If != arch,
+                                     #   you cross-compile in-guest and emulate for
+                                     #   TEST execution (qemu-user on Linux, Prism on
+                                     #   Windows). GitHub-hosted x64 stays the
+                                     #   AUTHORITATIVE gate; local x64 is smoke/debug.
+cross       = true                   # true when target_arch != arch.
+
+base    = "ghcr.io/cirruslabs/ubuntu:24.04"   # tart: OCI base image ref.
+disk_gb = 90
+
+[toolchain]
+# Free-form per-OS toolchain pins. Examples:
+#   cmake = "3.29"   ninja = "1.12"   python = "3.12"
+#   msvc  = "14.44"  (Windows)        xcode = "26.5" (macOS)
+
+[apt]            # Linux package layer (Debian/Ubuntu). Use [brew] for macOS,
+packages = []    # [choco] for Windows. Only the table matching `os` is applied.
+
+[skia]
+# Prebuilt Skia pin (danielraffel/skia-builder). linux-x64/linux-arm64/mac-*/
+# ios-* exist; WINDOWS HAS NO PREBUILT — Windows builds GPU-off until a
+# windows-* Skia archive exists. Match the archive arch to `arch`.
+release = "chrome/m149"
+variant = "linux-arm64-gpu"
+
+[caches]
+# Host-mounted, warm across ephemeral clones. virtio-fs on Tart, a host share on
+# QEMU. ccache on POSIX; sccache on Windows (ccache+MSVC is unreliable).
+ccache_max = "40G"
+
+[mounts]
+# name:host_path pairs surfaced read-write in the guest via virtio-fs.
+# e.g. "ccache:${TARTCI_CACHE}/ccache"
+
+[run]
+# Commands the job runner executes (after clone + cache mount). Keep these the
+# SAME contract across providers so CI is hypervisor-agnostic.
+configure = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release"
+build     = "cmake --build build -j"
+test      = "ctest --test-dir build --output-on-failure"

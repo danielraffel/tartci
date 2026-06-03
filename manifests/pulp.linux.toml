@@ -1,0 +1,55 @@
+# Pulp — Linux build lane (Tart, ARM64 guest). PROVEN: Release build green +
+# ctest ~99% + warm host-mounted ccache (2026-06). x86_64 is reached by
+# cross-compile + qemu-user for test execution; GitHub-hosted ubuntu-latest
+# stays the authoritative x64 gate.
+
+schema      = 2
+name        = "pulp-linux-build"
+provider    = "tart"
+strategy    = "bake"
+os          = "linux"
+arch        = "arm64"
+target_arch = "x86_64"
+cross       = true
+
+base    = "ghcr.io/cirruslabs/ubuntu:24.04"   # pinned 24.04; bump deliberately
+disk_gb = 90
+
+[toolchain]
+cmake  = "system"     # apt cmake/ninja are current enough on 24.04
+ninja  = "system"
+python = "3.12"
+
+[apt]
+# Full Pulp Linux build deps. NOTE the pkg-config module name `libdrm` (not
+# `drm`) — setup.sh was fixed for this. ICU dev headers are required because
+# Skia's bundled HarfBuzz/ICU symbols (icu_74::Locale) must resolve at link
+# (core/canvas links ICU::uc/i18n/data on UNIX-not-APPLE).
+packages = [
+  "build-essential", "cmake", "ninja-build", "git", "pkg-config", "ccache",
+  "python3", "python3-pip",
+  "libicu-dev",
+  "libegl1-mesa-dev", "libgbm-dev", "libdrm-dev",
+  "libx11-dev", "libxext-dev", "libxrandr-dev", "libxcursor-dev",
+  "libxi-dev", "libxinerama-dev", "libwayland-dev", "libxkbcommon-dev",
+  "libasound2-dev", "libpulse-dev",
+  "qemu-user-static", "binfmt-support",   # x86_64 test execution
+]
+
+[skia]
+release = "chrome/m149"
+variant = "linux-arm64-gpu"   # baked into the golden so configure is offline
+
+[caches]
+ccache_max = "40G"
+
+[mounts]
+# Host-mounted ccache via virtio-fs (systemd .mount in the golden; survives the
+# cloud-init fstab revert). 99.9%-warm on a second build.
+ccache = "${TARTCI_CACHE}/pulp/ccache"
+
+[run]
+deps      = "./setup.sh --ci --deps-only"
+configure = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja"
+build     = "cmake --build build -j"
+test      = "ctest --test-dir build --output-on-failure"

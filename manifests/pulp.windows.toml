@@ -1,0 +1,63 @@
+# Pulp — Windows build lane (standalone QEMU, ARM64 guest, Win11 24H2). PROVEN:
+# Release build green (~7 min ninja, GPU-off, MSVC arm64) + ctest 99%
+# (7287/7303) (2026-06). Apple Virtualization can't install Windows (no inbox
+# virtio-blk driver), so Windows is first-class on QEMU with an NVMe disk +
+# ramfb display. x86_64 plugins run under Prism; GitHub-hosted windows-latest
+# stays the authoritative x64 gate.
+
+schema      = 2
+name        = "pulp-windows-build"
+provider    = "qemu"
+strategy    = "bake"
+os          = "windows"
+arch        = "arm64"
+target_arch = "x86_64"
+cross       = true
+
+# Win11 24H2 ARM64 (build 26100). Use 24H2, NOT 25H2 (26200) — 25H2 fails BCD
+# 0xc000000d under this QEMU profile. Obtain via UUP dump (WU CDN) if the MS
+# direct download is blocked by a VPN/Tailscale egress IP. The ISO is padded to
+# a 512-byte boundary so AVF/Tart-adjacent tooling accepts it.
+iso_hint = "Win11 24H2 ARM64 (UUP dump), 512-byte padded"
+disk_gb  = 90
+
+[qemu]
+# The load-bearing flags (see providers/qemu-windows/qemu-run.sh):
+machine    = "virt,highmem=on"
+accel      = "hvf"
+cpu        = "host"
+smp        = 8
+mem_mb     = 8192
+disk_bus   = "nvme"        # Win11-ARM has an inbox NVMe driver; virtio-blk has none
+display    = "ramfb"       # installer/headless; bench switches to virtio-gpu for GUI
+install_media_bus = "usb-storage"   # ALL install CDs on USB — autounattend is not
+                                    #   found on virtio-scsi during WinPE
+firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
+ssh_hostfwd = "2222:22"
+
+[toolchain]
+# Provisioned over SSH with `powershell -EncodedCommand` (scp'd .cmd mis-execute;
+# cmd mangles | / % / >). MSVC: if the VS Installer no-ops silently (phantom
+# partial-instance), nuke BuildTools+Packages+Setup, reboot, clean reinstall.
+msvc   = "14.44"          # cl.exe at VC\Tools\MSVC\14.44.x\bin\Hostarm64\arm64
+cmake  = "system"
+ninja  = "system"
+python = "3.12"
+
+[choco]
+packages = ["git", "cmake", "ninja", "python3"]
+
+# No [skia] — there is no prebuilt Windows Skia archive yet, so Pulp builds
+# GPU-off on Windows (PULP_ENABLE_GPU=OFF) until a windows-* archive exists.
+
+[caches]
+sccache_max = "30G"       # sccache, not ccache (ccache+MSVC is unreliable)
+
+[run]
+# ctest is driven via PowerShell directly; the cmd/.bat harness mis-launches
+# test processes (Unix-redirect residue floods output). Tests that hardcode
+# /tmp need C:\tmp to exist.
+deps      = "./setup.sh --ci --deps-only"
+configure = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja -DPULP_ENABLE_GPU=OFF"
+build     = "cmake --build build -j"
+test      = "ctest --test-dir build --output-on-failure"   # invoke via powershell, not .bat
