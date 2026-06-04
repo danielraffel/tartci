@@ -474,6 +474,69 @@ at-a-glance trends are wanted. See `metrics/` and the README.
 
 ---
 
+## 6. Serve the GitHub Actions pool (per-job ephemeral runners)
+
+§3–§4 cover **on-demand** builds (`tartci up <os>` — one build, then discard).
+To make a host **serve the GitHub Actions pool** instead — boot a throwaway VM
+per *queued job* and let the workflow drive the build — use the runner
+supervisors. They are the pool-serving siblings of the `run.sh` provider
+scripts, ported from Pulp's proven `tools/ci/{tart-runner-linux,qemu-runner-windows}.sh`.
+
+```bash
+# One job then exit (pilot-safe): mint a JIT runner, boot a clone, run one job, discard.
+tartci serve linux
+tartci serve windows
+
+# Keep serving (what the LaunchAgents run):
+tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux
+```
+
+What the supervisor does each job: mint a **Just-In-Time** (single-job) runner
+config via `gh api .../generate-jitconfig` (needs repo admin), clone the golden
+(Linux) or CoW-overlay it on a free SSH port (Windows), run the Actions agent
+once with that JIT config, then discard the VM. The agent processes exactly one
+job and deregisters — no long-lived runner state. The `--loop` gate only boots
+when there is queued work (counts queued runs of `TARTCI_RUNNER_WORKFLOW_NAME`,
+default `Build and Test`), so idle hosts don't spin VMs.
+
+Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
+`TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`,
+`TARTCI_RUNNER_GROUP_ID`, `TARTCI_RUNNER_VERSION` (Windows agent). Defaults
+target `danielraffel/pulp` (the first consumer).
+
+**Windows gotchas preserved from the Pulp original** (debugged live; don't
+"simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
+file**, never on a command line (cmd.exe's 8191-char limit blows through the
+ssh→cmd→powershell chain); the agent runs as `Runner.Listener.exe` reading that
+file; `vcvarsall` is discovered via `Get-ChildItem` in base64-encoded PowerShell
+(vswhere returns empty for a BuildTools-only install); the supervisor **bails the
+moment QEMU dies** (`kill -0 $qpid`) so a free-port TOCTOU surfaces fast instead
+of burning the full ~10 min SSH window; and a post-extract integrity check
+asserts `Runner.Listener.exe` exists before running.
+
+### Serve across reboots (LaunchAgent)
+
+Install one of the templates in `launchd/` so the supervisor runs under
+`launchd` and survives reboot. The two shipped templates are **Pulp's concrete
+instance** — their labels (`com.danielraffel.pulp.tart-runner-linux`,
+`com.danielraffel.pulp.qemu-runner-windows`) are what the
+[shipyard-macos-gui](https://github.com/danielraffel/shipyard-macos-gui) "Serve
+CI builds from this Mac" switch toggles via `launchctl load/unload`. See
+`launchd/README.md` for the install `sed` recipe and how to serve a different
+repo. Two traps carried over from the Pulp lane: launchd does **not** expand
+`$HOME`/`$TARTCI_REPO` (the install `sed` must write absolute paths), and a
+LaunchAgent can't read a `/Volumes` golden store without **Full Disk Access**.
+
+### Emulation note
+
+Pool jobs build whatever arch the **workflow** targets. The emulated **x86_64**
+lane belongs on the **on-demand** side (`tartci up <os>`, see the cross-arch
+manifest work), not as a pool-serving lane — a serving runner that "picks up
+jobs" would misrepresent an emulated local build. GitHub-hosted x64 stays the
+authoritative gate.
+
+---
+
 ## Where the lanes stand
 
 - **Linux:** done — green build + 99% ctest + 99.93% warm ccache, golden tagged.
@@ -481,3 +544,5 @@ at-a-glance trends are wanted. See `metrics/` and the README.
   non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
   (needs Windows skia-builder slices + the Windows GPU-host product work).
 - **macOS:** the proven lane this toolkit generalizes from.
+- **Pool serving:** `tartci serve linux|windows` wired (ported from Pulp's
+  proven `tools/ci` supervisors); LaunchAgent templates in `launchd/`.
