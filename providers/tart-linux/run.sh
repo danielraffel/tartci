@@ -106,13 +106,18 @@ export CCACHE_TEMPDIR="$HOME/.ccache-tmp"; mkdir -p "$CCACHE_TEMPDIR"
 
 cd "$HOME/pulp"
 if [ -n "$REF" ]; then
-  # Fetch ALL remote-tracking refs first, then check out the ref detached. The
-  # documented form is `origin/<branch>` (or a SHA/tag); `git fetch origin "$REF"`
-  # with REF="origin/main" asks the remote for a ref literally named "origin/main"
-  # (fails) and the old fallback then built a STALE locally-cached ref. Fetching
-  # the whole remote and detaching at the ref builds exactly what's on origin now.
+  # Build exactly what's on origin now, for ANY ref form. Fetch all remote refs,
+  # then prefer the freshly-fetched origin/<REF> when it exists — so an unqualified
+  # `--ref main` detaches at fresh origin/main, NOT the golden's stale local `main`.
+  # Already-qualified (origin/feature/x), SHA, and tag refs have no origin/<REF>
+  # and fall through to the ref as given. (The old `git fetch origin "$REF"` failed
+  # for the origin/* form and built a stale cached ref.)
   git fetch --quiet origin
-  git checkout --quiet --detach "$REF"
+  if git rev-parse --verify --quiet "origin/$REF^{commit}" >/dev/null 2>&1; then
+    git checkout --quiet --detach "origin/$REF"
+  else
+    git checkout --quiet --detach "$REF"
+  fi
 fi
 echo "• building pulp @ $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD 2>/dev/null))"
 
