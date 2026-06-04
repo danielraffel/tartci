@@ -14,3 +14,7 @@ autounattend.xml
 media/
 bin/
 win-provision/
+
+# python bytecode (scripts/lint.sh + CI run py_compile)
+__pycache__/
+*.pyc

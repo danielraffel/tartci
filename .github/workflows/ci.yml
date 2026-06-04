@@ -1,0 +1,32 @@
+name: lint
+
+# Repo hygiene gate. tartci is shell + python + TOML, so the failure mode is a
+# syntax slip in a script that only surfaces at run time on a CI host (e.g. a
+# help line that ran as a command before `set -e`). `scripts/lint.sh` — the
+# same script contributors run locally — catches that class before merge.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Ensure shellcheck
+        run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
+
+      - name: Show tool versions
+        run: |
+          bash --version | head -1
+          shellcheck --version | sed -n '1,2p'
+          python3 --version
+
+      - name: Run repo lint (shellcheck + bash -n + py_compile + TOML parse)
+        run: ./scripts/lint.sh
