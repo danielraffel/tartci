@@ -128,8 +128,12 @@ if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Liste
   wsh "powershell -NoProfile -EncodedCommand $enc_install" \
     || { note "[$i] runner install failed"; kill "$qpid" 2>/dev/null||true; rm -rf "$jobdir"; return 1; }
 
-  # (2) stream the JIT config in via stdin → file (no command-line length limit)
-  printf '%s' "$jit" | wsh "powershell -NoProfile -Command \"[Console]::In.ReadToEnd() | Out-File -FilePath C:\\actions-runner\\jit.cfg -Encoding ascii -NoNewline\""
+  # (2) stream the JIT config in via stdin → file (no command-line length limit).
+  # Guard the pipeline: under `set -euo pipefail` a dropped SSH / PowerShell error
+  # here would otherwise exit the whole supervisor BEFORE the cleanup below,
+  # leaking the QEMU process + overlay for a launchd --loop runner to trip over.
+  printf '%s' "$jit" | wsh "powershell -NoProfile -Command \"[Console]::In.ReadToEnd() | Out-File -FilePath C:\\actions-runner\\jit.cfg -Encoding ascii -NoNewline\"" \
+    || { note "[$i] JIT config upload failed — discarding overlay"; kill "$qpid" 2>/dev/null||true; rm -rf "$jobdir"; return 1; }
 
   # (3) run the agent reading the jit FILE — small PS, no blob on the wire.
   # Use Runner.Listener.exe directly (not run.cmd) so the agent reads the JIT
