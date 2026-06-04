@@ -24,12 +24,14 @@ plugins in a DAW.
 > **Project Status:** a working lab toolkit, hardening toward turnkey. Wired +
 > proven today: the **Linux Tart lane** (`tartci up linux` — ephemeral clone →
 > warm host ccache → full build + ctest → discard, host-validated green), the
-> Windows QEMU bring-up + golden, the metrics, and `tartci doctor/bench/metrics`.
-> **Not yet wired:** ephemeral *per-job* clones on the Windows provider (still
-> single-operator state — fixed disk/VM-name/ports), the `tart-macos` provider
-> (`tartci up macos` points at the runbook), and the `target_arch=x86_64`/`cross`
-> manifest fields (the lanes build native ARM64 today — useful signal, not x64
-> coverage; GitHub-hosted x64 stays the authoritative x64 gate).
+> **Windows QEMU lane** (`tartci up windows` — per-job CoW overlay → dynamic SSH
+> port → MSVC arm64 build + ctest → discard; host-validated: overlay/SSH
+> mechanics + full 735-target compile green, ctest is the golden's proven 7287/7303),
+> the metrics, and `tartci doctor/bench/metrics`. **Not yet wired:** the
+> `tart-macos` provider (`tartci up macos` points at the runbook) and the
+> `target_arch=x86_64`/`cross` manifest fields (the lanes build native ARM64
+> today — useful signal, not x64 coverage; GitHub-hosted x64 stays the
+> authoritative x64 gate).
 
 ## Quick start
 ```bash
@@ -39,14 +41,18 @@ git clone <this-repo> tartci && cd tartci
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
-./tartci windows run      # boot the Windows QEMU build VM
+./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
+./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
 ```
-`tartci doctor`, `bench`, `metrics`, `up linux`, and `windows run` are wired
+`tartci doctor`, `bench`, `metrics`, `up linux`, and `up windows` are wired
 today. `tartci up linux [--ref <git-ref>] [--no-gpu] [--keep]` clones the
-`pulp-linux-build` golden, mounts the host ccache, builds + ctests in-guest, and
-discards the clone (see `providers/tart-linux/`). `tartci up macos` still points
-at the runbook. See `docs/runbook.md` for the from-scratch, gotcha-by-gotcha
-guide and `docs/new-repo-agent-guide.md` to onboard a new repo.
+`pulp-linux-build` golden, mounts the host ccache, and builds + ctests in-guest.
+`tartci up windows [--ref <git-ref>] [--smoke] [--keep]` makes a per-job CoW
+overlay off the Windows golden on a dynamic SSH port (concurrent-safe), builds
+GPU-off under MSVC arm64, then discards the overlay (see `providers/`). `tartci
+up macos` still points at the runbook. See `docs/runbook.md` for the
+from-scratch, gotcha-by-gotcha guide and `docs/new-repo-agent-guide.md` to
+onboard a new repo.
 
 ## Per-project use
 A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its

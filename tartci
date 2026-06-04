@@ -84,7 +84,7 @@ cmd_windows() {
 cmd_up() {
   local os="${1:-}"; shift || true
   case "$os" in
-    windows) cmd_windows run "$@" ;;
+    windows) exec "$HERE/providers/qemu-windows/run.sh" "$@" ;;
     linux)   exec "$HERE/providers/tart-linux/run.sh" "$@" ;;
     macos)
       echo "tartci up macos — the one-command Tart bring-up is still hand-driven."
