@@ -51,8 +51,13 @@ VM="${VM:-linux-job-$$}"
 mkdir -p "$CACHE_ROOT/ccache-linux"
 
 RPID=""
+CLONED=0
 cleanup(){
   if [ "$KEEP" = 1 ]; then note "--keep: leaving $VM (tart delete $VM to remove)"; return; fi
+  # Only ever touch a VM THIS run created. Otherwise a name collision (a stale
+  # $VM, or a --vm a caller also uses elsewhere) makes `tart clone` fail and the
+  # EXIT trap would blindly stop+delete the pre-existing VM out from under it.
+  [ "$CLONED" = 1 ] || return
   tart stop "$VM" >/dev/null 2>&1 || true
   [ -n "$RPID" ] && kill "$RPID" 2>/dev/null || true
   sleep 2
@@ -63,6 +68,7 @@ trap cleanup EXIT
 
 note "cloning $GOLDEN → $VM (CoW)"
 tart clone "$GOLDEN" "$VM"
+CLONED=1
 
 note "booting with host ccache mount (Skia is baked into the golden)"
 tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$VM" >/dev/null 2>&1 & RPID=$!
@@ -100,7 +106,13 @@ export CCACHE_TEMPDIR="$HOME/.ccache-tmp"; mkdir -p "$CCACHE_TEMPDIR"
 
 cd "$HOME/pulp"
 if [ -n "$REF" ]; then
-  git fetch --quiet origin "$REF" && git checkout --quiet FETCH_HEAD 2>/dev/null || git checkout --quiet "$REF"
+  # Fetch ALL remote-tracking refs first, then check out the ref detached. The
+  # documented form is `origin/<branch>` (or a SHA/tag); `git fetch origin "$REF"`
+  # with REF="origin/main" asks the remote for a ref literally named "origin/main"
+  # (fails) and the old fallback then built a STALE locally-cached ref. Fetching
+  # the whole remote and detaching at the ref builds exactly what's on origin now.
+  git fetch --quiet origin
+  git checkout --quiet --detach "$REF"
 fi
 echo "• building pulp @ $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD 2>/dev/null))"
 
