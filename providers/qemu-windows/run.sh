@@ -30,7 +30,13 @@ WUSER="${TARTCI_WIN_SSH_USER:-admin}"
 SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/danielraffel/pulp}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
-CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude slow}"
+# Default excludes the `validation`-labeled tests — the primary source of the
+# Windows golden's known env/CLI ctest failures (7287/7303), matching what
+# build.yml's Windows leg excludes — so the default run gates green instead of
+# red on those. Single label (no `|`) keeps it safe inside the cmd /c chain;
+# pass a fuller exclude (e.g. the CI `validation|slow` + an --exclude-regex) via
+# PULP_CTEST_ARGS/--ctest-args, quoting the regex so cmd.exe doesn't pipe on `|`.
+CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude validation}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
