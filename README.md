@@ -1,5 +1,7 @@
 # tartci — local CI VMs on macOS (Tart + QEMU + Shipyard)
 
+[![lint](https://github.com/danielraffel/tartci/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/tartci/actions/workflows/ci.yml)
+
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
 Silicon Mac**, wired to GitHub runners + [Shipyard](https://github.com/danielraffel/shipyard), so you can build & test a repo
 locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
@@ -61,8 +63,21 @@ providers/   tart-macos · tart-linux · qemu-windows   (per-OS provision + run)
 manifests/   example vm-image.toml per project profile
 metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
 bench/        helper to clone a golden → open in UTM for GUI testing
+scripts/     lint.sh — repo hygiene gate (shellcheck + bash -n + py_compile + TOML)
 docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent onboarding) · gotchas.md
 ```
+
+## Contributing checks
+Run the same gate CI runs before you push — it's one script, portable to macOS's
+stock bash 3.2:
+```bash
+./scripts/lint.sh    # shellcheck -S warning + bash -n on every shell script
+                     # (incl. the extensionless `tartci` dispatcher), py_compile
+                     # on metrics/*.py, and a parse check on manifests/*.toml
+```
+`.github/workflows/ci.yml` runs this on every push + PR. It guards the class of
+bug that only bites at run time on a CI host — e.g. a help line that executes as
+a command before `set -e`.
 
 ## Metrics (file-based, no server)
 Per-run build/configure/ctest times + cache-hit% land in a `metrics.jsonl` (one
