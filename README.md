@@ -27,11 +27,14 @@ plugins in a DAW.
 > **Windows QEMU lane** (`tartci up windows` — per-job CoW overlay → dynamic SSH
 > port → MSVC arm64 build + ctest → discard; host-validated: overlay/SSH
 > mechanics + full 735-target compile green, ctest is the golden's proven 7287/7303),
-> the metrics, and `tartci doctor/bench/metrics`. **Not yet wired:** the
-> `tart-macos` provider (`tartci up macos` points at the runbook) and the
-> `target_arch=x86_64`/`cross` manifest fields (the lanes build native ARM64
-> today — useful signal, not x64 coverage; GitHub-hosted x64 stays the
-> authoritative x64 gate).
+> the **x86_64 cross/emulation smoke lane** (`tartci up linux --target-arch
+> x86_64` — cross-compile + run tests under qemu-user-static; `--self-test`
+> proves the toolchain+emulator chain golden-agnostically), the metrics, and
+> `tartci doctor/bench/metrics`. **Not yet wired:** the `tart-macos` provider
+> (`tartci up macos` points at the runbook) and the Windows/Prism cross lane
+> (Linux/qemu-user is wired; Windows-on-ARM x64-via-Prism is documented as a
+> follow-up). Emulated x64 is a SMOKE/debug signal only — GitHub-hosted x64
+> stays the authoritative x64 gate.
 
 ## Quick start
 ```bash
@@ -41,6 +44,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
+./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under qemu-user (SMOKE)
 ./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
 ./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
 ```
@@ -53,6 +57,19 @@ GPU-off under MSVC arm64, then discards the overlay (see `providers/`). `tartci
 up macos` still points at the runbook. See `docs/runbook.md` for the
 from-scratch, gotcha-by-gotcha guide and `docs/new-repo-agent-guide.md` to
 onboard a new repo.
+
+### x86_64 cross / emulation (smoke, not a gate)
+The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux
+--target-arch x86_64` cross-compiles for x64 (gcc/g++-x86-64-linux-gnu) and runs
+the test subset under **qemu-user-static** (binfmt) — a first line of defense for
+atomics / SIMD / ISA-divergent behavior, but **not** a gate: GitHub-hosted x64
+stays authoritative (sanitizers, SIMD/Highway dispatch, and RT timing are
+unreliable emulated). It defaults **GPU OFF** because the prebuilt Skia maps both
+Linux arches to the same `libskia.a` path (`docs/gotchas.md`); `--gpu` requires
+an explicit x64 Skia tree via `--skia-dir`, else it fails loud. `--self-test`
+proves just the toolchain+emulator chain with a trivial binary (golden-agnostic).
+The manifest declares this with `target_arch`/`cross` + an `[emulation]` table —
+see `manifests/example.x64.toml`.
 
 ## Per-project use
 A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its

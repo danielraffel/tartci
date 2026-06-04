@@ -14,9 +14,13 @@ else is already solved in `providers/` + `docs/gotchas.md`.
 1. **Which OS lane(s)?** linux / windows / macos. Most projects start with one.
 2. **Guest arch is ARM64. Always.** Apple Virtualization and QEMU-on-hvf both
    run ARM64 guests on Apple Silicon — there is no x86 guest. If the project
-   ships x86_64, set `target_arch = "x86_64"`, `cross = true`, and treat the
-   local lane as *smoke/debug*; keep a GitHub-hosted x64 runner as the
-   authoritative gate. Do not pretend a cross+emulated local run replaces it.
+   ships x86_64, set `target_arch = "x86_64"`, `cross = true`, add an
+   `[emulation]` table (`emulator = "qemu-user"`, cross `toolchain`,
+   `test_labels`), and treat the local lane as *smoke/debug*; keep a
+   GitHub-hosted x64 runner as the authoritative gate. Do not pretend a
+   cross+emulated local run replaces it. Drive it with `tartci up linux
+   --target-arch x86_64` (the Linux/qemu-user lane is wired — see runbook §3.8
+   and `manifests/example.x64.toml`).
 3. **bake or configure-on-boot?**
    - `bake` — pre-bake a project golden. Choose for hot repos / slow toolchains
      (MSVC, large dep trees): clones are instant and offline.

@@ -1,0 +1,66 @@
+# vm-image manifest (schema v2) — WORKED x86_64 / CROSS example.
+#
+# A Linux lane whose authoritative ship target is x86_64, reached on an ARM64
+# Apple-Silicon host by cross-compiling in-guest and running TESTS under
+# qemu-user-static. This is a SMOKE / debug signal — a first line of defense for
+# atomics, SIMD/Highway codegen, and behavior that differs across ISAs — NOT a
+# gate. GitHub-hosted x64 (ubuntu-latest) stays the authoritative x64 gate.
+#
+# Drive it with: `tartci up linux --target-arch x86_64`  (GPU off by default).
+# Prove just the toolchain+emulator chain (golden-agnostic, no Pulp checkout):
+#            `tartci up linux --target-arch x86_64 --self-test`.
+
+schema      = 2
+name        = "example-linux-x64-smoke"
+provider    = "tart"                 # tart=linux/macos guest (ARM64), qemu=windows
+strategy    = "configure-on-boot"
+
+os          = "linux"
+arch        = "arm64"                # GUEST arch — Apple Virtualization is ARM64-only.
+target_arch = "x86_64"              # what you ultimately ship/gate on.
+cross       = true                   # target_arch != arch ⇒ cross + emulate.
+
+base    = "ghcr.io/cirruslabs/ubuntu:24.04"
+disk_gb = 90
+
+[toolchain]
+cmake  = "system"
+ninja  = "system"
+python = "3.12"
+
+[apt]
+# Native build deps PLUS the x86_64 cross toolchain and the qemu-user runtime.
+# A full Pulp cross-LINK also needs x64 versions of the linked system libs
+# (`dpkg --add-architecture amd64` + the `:amd64` -dev packages, or a baked x64
+# sysroot). The default `--target-arch x86_64` run is GPU-off to keep that
+# surface small; if a lib is missing the cross configure/link fails loudly
+# rather than silently emitting an arm64 artifact.
+packages = [
+  "build-essential", "cmake", "ninja-build", "git", "pkg-config", "ccache",
+  "python3", "python3-pip",
+  "gcc-x86-64-linux-gnu", "g++-x86-64-linux-gnu",   # the cross compiler
+  "qemu-user-static", "binfmt-support",             # emulated x64 test execution
+]
+
+# No [skia] baked here: the cross smoke lane builds GPU-off. GPU-on cross needs a
+# SEPARATE x64 Skia tree (both Linux arches collide on one libskia.a path — see
+# docs/gotchas.md), passed via `--skia-dir` / [emulation].skia_dir.
+
+[emulation]
+emulator    = "qemu-user"          # qemu-user (Linux) | prism (Windows-ARM, planned)
+toolchain   = "x86_64-linux-gnu"   # cross compiler prefix → gcc/g++-x86-64-linux-gnu
+gpu         = false                # set true ONLY with an explicit x64 skia_dir below
+skia_dir    = ""                   # e.g. "$HOME/skia-x64" containing build/linux-gpu/lib/Release/libskia.a
+test_labels = "unit"               # ctest subset safe to emulate (excludes sanitizer/simd/gpu/timing)
+
+[caches]
+ccache_max = "40G"
+
+[run]
+deps      = "./setup.sh --ci --deps-only"
+# These mirror the native contract; the provider injects the cross compilers
+# (-DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc, …) and -DCMAKE_SYSTEM_PROCESSOR=x86_64
+# when target_arch != arch, then runs ctest under qemu-user.
+configure = "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -G Ninja -DPULP_ENABLE_GPU=OFF"
+build     = "cmake --build build -j"
+test      = "ctest --test-dir build --output-on-failure --label-exclude 'sanitizer|simd|gpu|timing'"
