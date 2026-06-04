@@ -21,15 +21,15 @@ plugins in a DAW.
   with an NVMe disk + `ramfb` display.
 - Host-mounted caches, SSH access + log collection, and a tiny metrics dashboard.
 
-> **Project Status:** this is a working lab toolkit, not yet a turnkey
-> dependency. Proven today: the Windows QEMU bring-up + golden, the Linux Tart
-> bring-up, the metrics, and `tartci doctor/bench/metrics/windows`. **Not yet
-> wired:** ephemeral *per-job* clones (the Windows provider is still
-> single-operator state — fixed disk/VM-name/ports), the `tart-linux`/
-> `tart-macos` provider scripts (`tartci up` points at the runbook), and the
-> `target_arch=x86_64`/`cross` manifest fields (the lanes build native ARM64
-> today — useful signal, not x64 coverage; GitHub-hosted x64 stays the
-> authoritative x64 gate). Don't take a hard dependency on this yet.
+> **Project Status:** a working lab toolkit, hardening toward turnkey. Wired +
+> proven today: the **Linux Tart lane** (`tartci up linux` — ephemeral clone →
+> warm host ccache → full build + ctest → discard, host-validated green), the
+> Windows QEMU bring-up + golden, the metrics, and `tartci doctor/bench/metrics`.
+> **Not yet wired:** ephemeral *per-job* clones on the Windows provider (still
+> single-operator state — fixed disk/VM-name/ports), the `tart-macos` provider
+> (`tartci up macos` points at the runbook), and the `target_arch=x86_64`/`cross`
+> manifest fields (the lanes build native ARM64 today — useful signal, not x64
+> coverage; GitHub-hosted x64 stays the authoritative x64 gate).
 
 ## Quick start
 ```bash
@@ -38,13 +38,15 @@ git clone <this-repo> tartci && cd tartci
 ./tartci setup            # brew-install tart/qemu/sshpass + create local stores
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
+./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci windows run      # boot the Windows QEMU build VM
 ```
-`tartci doctor`, `bench`, `metrics`, and `windows run` are wired today. `tartci up
-linux|macos` currently points at the runbook — the Tart bring-up is still
-hand-driven (provider scripts are the next step). See `docs/runbook.md` for the
-from-scratch, gotcha-by-gotcha guide and `docs/new-repo-agent-guide.md` to
-onboard a new repo.
+`tartci doctor`, `bench`, `metrics`, `up linux`, and `windows run` are wired
+today. `tartci up linux [--ref <git-ref>] [--no-gpu] [--keep]` clones the
+`pulp-linux-build` golden, mounts the host ccache, builds + ctests in-guest, and
+discards the clone (see `providers/tart-linux/`). `tartci up macos` still points
+at the runbook. See `docs/runbook.md` for the from-scratch, gotcha-by-gotcha
+guide and `docs/new-repo-agent-guide.md` to onboard a new repo.
 
 ## Per-project use
 A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its
@@ -59,7 +61,7 @@ useful when present; never a punishment when missing.
 
 ## Layout
 ```
-providers/   tart-macos · tart-linux · qemu-windows   (per-OS provision + run)
+providers/   tart-linux · qemu-windows  (per-OS provision + run; tart-macos: runbook + Pulp tools/ci)
 manifests/   example vm-image.toml per project profile
 metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
 bench/        helper to clone a golden → open in UTM for GUI testing

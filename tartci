@@ -82,12 +82,14 @@ cmd_windows() {
 }
 
 cmd_up() {
-  case "${1:-}" in
-    windows) cmd_windows run ;;
-    linux|macos)
-      echo "tartci up $1 — the one-command Tart bring-up is still hand-driven."
-      echo "Follow docs/runbook.md (the $1 lane is fully documented + proven)."
-      echo "Provider scripts (tart-$1) are the next productionization step." ;;
+  local os="${1:-}"; shift || true
+  case "$os" in
+    windows) cmd_windows run "$@" ;;
+    linux)   exec "$HERE/providers/tart-linux/run.sh" "$@" ;;
+    macos)
+      echo "tartci up macos — the one-command Tart bring-up is still hand-driven."
+      echo "Follow docs/runbook.md (the macos lane is documented + proven);"
+      echo "Pulp's tools/ci/tart-run-job.sh is the working macOS ephemeral runner." ;;
     *) echo "usage: tartci up <linux|macos|windows>"; return 2 ;;
   esac
 }
