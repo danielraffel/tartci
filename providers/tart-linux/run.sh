@@ -112,7 +112,7 @@ if [ -n "$REF" ]; then
   # Already-qualified (origin/feature/x), SHA, and tag refs have no origin/<REF>
   # and fall through to the ref as given. (The old `git fetch origin "$REF"` failed
   # for the origin/* form and built a stale cached ref.)
-  git fetch --quiet origin
+  git fetch --quiet --prune origin
   if git rev-parse --verify --quiet "origin/$REF^{commit}" >/dev/null 2>&1; then
     git checkout --quiet --detach "origin/$REF"
   else
