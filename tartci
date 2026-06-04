@@ -11,6 +11,7 @@
 #   tartci metrics [report|dashboard] [file]
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
+#   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci help
@@ -82,6 +83,16 @@ cmd_windows() {
   esac
 }
 
+cmd_prepare() {
+  local os="${1:-}"; shift || true
+  case "$os" in
+    linux)   exec "$HERE/providers/tart-linux/provision.sh" "$@" ;;
+    windows) echo "tartci prepare windows — use: tartci windows golden [name]"; return 2 ;;
+    macos)   echo "tartci prepare macos — follow docs/runbook.md; provider generalization is a follow-up"; return 2 ;;
+    *) echo "usage: tartci prepare <linux> [provider args]"; return 2 ;;
+  esac
+}
+
 cmd_up() {
   local os="${1:-}"; shift || true
   case "$os" in
@@ -121,6 +132,7 @@ case "${1:-help}" in
   bench)   shift; cmd_bench "$@" ;;
   metrics) shift; cmd_metrics "$@" ;;
   windows) shift; cmd_windows "$@" ;;
+  prepare) shift; cmd_prepare "$@" ;;
   up)      shift; cmd_up "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
   help|-h|--help) usage ;;

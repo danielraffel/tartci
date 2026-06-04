@@ -19,12 +19,12 @@
 #   providers/tart-linux/run.sh --ref origin/feature/x   # fetch + build a ref
 #   providers/tart-linux/run.sh --no-gpu                 # fast no-Skia smoke
 #   providers/tart-linux/run.sh --keep --ctest-args '-R Knob'
-#   providers/tart-linux/run.sh --target-arch x86_64     # cross-build x64 + run tests under qemu-user (SMOKE)
+#   providers/tart-linux/run.sh --target-arch x86_64     # cross-build x64 + run tests under Rosetta (SMOKE)
 #   providers/tart-linux/run.sh --target-arch x86_64 --self-test  # toolchain+emulator proof, golden-agnostic
 #
 # Cross / emulation (tartci#4): the guest is ARM64 (Apple Virtualization has no
 # x86). `--target-arch x86_64` cross-compiles for x64 and runs the test subset
-# under qemu-user-static (binfmt) — a SMOKE/debug signal, NOT a gate. GitHub-
+# under Rosetta-for-Linux (binfmt) — a SMOKE/debug signal, NOT a gate. GitHub-
 # hosted x64 stays authoritative. The cross build defaults GPU OFF (the prebuilt
 # Skia maps both Linux arches to the same libskia.a path — see docs/gotchas.md);
 # `--gpu` requires an explicit x64 SKIA_DIR via --skia-dir, else it fails loud.
@@ -39,7 +39,7 @@ CACHE_ROOT="${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}"
 VM=""; REF=""; BUILD_TYPE="Release"; KEEP=0; NO_GPU=0
 # Cross / emulation (tartci#4). Empty/arm64 TARGET_ARCH = native (unchanged path).
 TARGET_ARCH="${PULP_TARGET_ARCH:-}"; WANT_GPU=0; X64_SKIA_DIR="${PULP_X64_SKIA_DIR:-}"; SELF_TEST=0
-EMULATOR="${PULP_CROSS_EMULATOR:-qemu-user}"
+EMULATOR="${TARTCI_CROSS_EMULATOR:-${PULP_CROSS_EMULATOR:-rosetta}}"
 CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude slow}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -72,7 +72,7 @@ case "$TARGET_ARCH" in
   *) die "unsupported --target-arch '$TARGET_ARCH' (arm64 | x86_64)";;
 esac
 if [ "$CROSS" = 1 ]; then
-  case "$EMULATOR" in qemu-user|qemu-user-static) ;; *) die "Linux cross only supports the qemu-user emulator (got '$EMULATOR')";; esac
+  case "$EMULATOR" in rosetta|qemu-user|qemu-user-static) ;; *) die "Linux cross only supports rosetta or qemu-user (got '$EMULATOR')";; esac
   # GPU-on cross needs an x64 Skia tree; you can't reuse the baked arm64 one
   # (both arches collide on the same libskia.a path — docs/gotchas.md). Fail loud
   # rather than silently linking the wrong arch.
@@ -106,25 +106,48 @@ tart clone "$GOLDEN" "$VM"
 CLONED=1
 
 note "booting with host ccache mount (Skia is baked into the golden)"
-tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$VM" >/dev/null 2>&1 & RPID=$!
+TART_RUN_ARGS=(--no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux")
+if [ "$CROSS" = 1 ] && [ "$EMULATOR" = "rosetta" ]; then
+  TART_RUN_ARGS+=(--rosetta=rosetta)
+fi
+tart run "${TART_RUN_ARGS[@]}" "$VM" >/dev/null 2>&1 & RPID=$!
 
 IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$VM" 2>/dev/null || true)"; [ -n "$IP" ] && break; sleep 2; done
 [ -n "$IP" ] || die "no IP for $VM after 120s"
-for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null && break; sleep 2; done
+GUEST_TRANSPORT=""
+for _ in $(seq 1 90); do
+  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if tart exec "$VM" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
+  sleep 2
+done
+[ -n "$GUEST_TRANSPORT" ] || die "guest did not become reachable for $VM at $IP via SSH or Tart guest agent"
 if [ "$SELF_TEST" = 1 ]; then
-  note "vm $VM up at $IP — x86_64 toolchain+emulator self-test (cross-compile a trivial binary + run under $EMULATOR)"
+  note "vm $VM up at $IP — x86_64 toolchain+emulator self-test (cross-compile a trivial dynamic binary + run under $EMULATOR)"
 elif [ "$CROSS" = 1 ]; then
   note "vm $VM up at $IP — CROSS-building x86_64 (gpu=$([ "$NO_GPU" = 1 ] && echo off || echo on), tests via $EMULATOR) — SMOKE, not a gate"
 else
   note "vm $VM up at $IP — building $BUILD_TYPE (ref=${REF:-<golden as-is>}, gpu=$([ "$NO_GPU" = 1 ] && echo off || echo on))"
 fi
+note "guest transport: $GUEST_TRANSPORT"
+
+run_guest_script(){
+  if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+      "REF='$REF' BUILD_TYPE='$BUILD_TYPE' NO_GPU='$NO_GPU' CTEST_ARGS='$CTEST_ARGS' TARGET_ARCH='$TARGET_ARCH' CROSS='$CROSS' SELF_TEST='$SELF_TEST' X64_SKIA_DIR='$X64_SKIA_DIR' EMULATOR='$EMULATOR' bash -s"
+  else
+    tart exec -i "$VM" env \
+      "REF=$REF" "BUILD_TYPE=$BUILD_TYPE" "NO_GPU=$NO_GPU" "CTEST_ARGS=$CTEST_ARGS" \
+      "TARGET_ARCH=$TARGET_ARCH" "CROSS=$CROSS" "SELF_TEST=$SELF_TEST" \
+      "X64_SKIA_DIR=$X64_SKIA_DIR" "EMULATOR=$EMULATOR" \
+      bash -s
+  fi
+}
 
 set +e
-ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
-  "REF='$REF' BUILD_TYPE='$BUILD_TYPE' NO_GPU='$NO_GPU' CTEST_ARGS='$CTEST_ARGS' TARGET_ARCH='$TARGET_ARCH' CROSS='$CROSS' SELF_TEST='$SELF_TEST' X64_SKIA_DIR='$X64_SKIA_DIR' EMULATOR='$EMULATOR' bash -s" <<'GUEST'
+run_guest_script <<'GUEST'
 set -euo pipefail
 
-# --- x86_64 cross toolchain + qemu-user helpers (tartci#4) -------------------
+# --- x86_64 cross toolchain + Rosetta/qemu-user helpers ----------------------
 # Resolve an x86_64 C/C++ cross compiler. Prefer the gnu cross packages
 # (gcc/g++-x86-64-linux-gnu); fall back to clang --target. install-if-missing so
 # a golden that didn't pre-bake them still works (best-effort; needs apt).
@@ -140,8 +163,91 @@ ensure_x64_toolchain(){
   fi
   return 1
 }
-# Resolve a qemu-user x86_64 runner (binfmt makes ./x64binary transparent, but
-# we also keep an explicit runner for the self-test + clarity).
+pin_existing_apt_sources_to_arm64(){
+  local file tmp
+  for file in /etc/apt/sources.list.d/*.sources; do
+    [ -e "$file" ] || continue
+    tmp="$(mktemp)"
+    awk '
+      function flush(  i) {
+        if (n == 0) return;
+        if (has_types && !has_arch) {
+          inserted = 0;
+          for (i = 1; i <= n; i++) {
+            print lines[i];
+            if (!inserted && lines[i] ~ /^URIs:/) {
+              print "Architectures: arm64";
+              inserted = 1;
+            }
+          }
+          if (!inserted) print "Architectures: arm64";
+        } else {
+          for (i = 1; i <= n; i++) print lines[i];
+        }
+        n = 0; has_types = 0; has_arch = 0;
+      }
+      BEGIN { n = 0; has_types = 0; has_arch = 0 }
+      NF == 0 {
+        flush(); print ""; next
+      }
+      {
+        lines[++n] = $0;
+        if ($0 ~ /^Types:/) has_types = 1;
+        if ($0 ~ /^Architectures:/) has_arch = 1;
+      }
+      END { flush() }
+    ' "$file" >"$tmp"
+    sudo install -m 0644 "$tmp" "$file"
+    rm -f "$tmp"
+  done
+}
+
+ensure_amd64_userland(){
+  [ -x /lib64/ld-linux-x86-64.so.2 ] && return 0
+  local codename
+  codename="$(
+    . /etc/os-release
+    printf '%s' "${VERSION_CODENAME:-noble}"
+  )"
+  echo "• installing amd64 userland for dynamic x86_64 binaries"
+  sudo dpkg --add-architecture amd64
+  pin_existing_apt_sources_to_arm64
+  sudo tee /etc/apt/sources.list.d/tartci-amd64.sources >/dev/null <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu
+Suites: ${codename}-security
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+  sudo apt-get update -qq >/dev/null
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
+    libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 \
+    libtinfo6:amd64 libxml2:amd64 >/dev/null
+}
+
+register_rosetta_binfmt(){
+  sudo mkdir -p /mnt/rosetta
+  mountpoint -q /mnt/rosetta || sudo mount -t virtiofs rosetta /mnt/rosetta
+  [ -x /mnt/rosetta/rosetta ] || { echo "✗ Rosetta runtime missing; boot Tart with --rosetta=rosetta"; return 1; }
+  if command -v tartci-register-rosetta-binfmt >/dev/null 2>&1; then
+    sudo tartci-register-rosetta-binfmt
+    return 0
+  fi
+  # binfmt_misc decodes \xHH escapes itself. Do not use printf %b here; decoded
+  # NUL bytes truncate the match and make Rosetta catch arm64 binaries too.
+  sudo bash -c "mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc; \
+    if [ -e /proc/sys/fs/binfmt_misc/rosetta ]; then echo -1 > /proc/sys/fs/binfmt_misc/rosetta; fi; \
+    printf '%s' ':rosetta:M::\\x7fELF\\x02\\x01\\x01\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x02\\x00\\x3e\\x00:\\xff\\xff\\xff\\xff\\xff\\xfe\\xfe\\x00\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xff\\xfe\\xff\\xff\\xff:/mnt/rosetta/rosetta:F' > /proc/sys/fs/binfmt_misc/register"
+}
+
 ensure_qemu_user(){
   if command -v qemu-x86_64-static >/dev/null 2>&1; then QEMU_X64="$(command -v qemu-x86_64-static)"; return 0; fi
   if command -v qemu-x86_64 >/dev/null 2>&1; then QEMU_X64="$(command -v qemu-x86_64)"; return 0; fi
@@ -153,25 +259,48 @@ ensure_qemu_user(){
   return 1
 }
 
+ensure_x64_emulator(){
+  case "${EMULATOR:-rosetta}" in
+    rosetta)
+      ensure_amd64_userland || return 1
+      register_rosetta_binfmt || return 1
+      /lib64/ld-linux-x86-64.so.2 --version >/dev/null
+      EMULATOR_LABEL="rosetta"
+      ;;
+    qemu-user|qemu-user-static)
+      ensure_qemu_user || return 1
+      EMULATOR_LABEL="$QEMU_X64"
+      ;;
+    *) echo "✗ unsupported emulator: ${EMULATOR:-}"; return 1;;
+  esac
+}
+
+run_x64_binary(){
+  case "${EMULATOR:-rosetta}" in
+    rosetta) "$@";;
+    qemu-user|qemu-user-static) QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/x86_64-linux-gnu}" "$QEMU_X64" "$@";;
+  esac
+}
+
 # --self-test: prove the cross toolchain + emulator end-to-end on a trivial
-# program — golden-agnostic, no Pulp checkout / Skia / multiarch sysroot needed.
+# program — golden-agnostic, no Pulp checkout / Skia needed.
 # This is exactly the issue's "How to test" acceptance check.
 if [ "${SELF_TEST:-0}" = 1 ]; then
   echo "• host arch: $(uname -m)"
   ensure_x64_toolchain || { echo "✗ no x86_64 cross compiler (install gcc-x86-64-linux-gnu)"; exit 1; }
-  ensure_qemu_user     || { echo "✗ no qemu-user x86_64 (install qemu-user-static)"; exit 1; }
+  ensure_x64_emulator  || { echo "✗ no x86_64 emulator/runtime ($EMULATOR)"; exit 1; }
   td="$(mktemp -d)"; trap 'rm -rf "$td"' EXIT
   cat > "$td/probe.c" <<'EOF'
 #include <stdio.h>
 int main(void){ printf("tartci-x64-selftest-ok\n"); return 0; }
 EOF
-  "$X64_CXX" -x c "$td/probe.c" -o "$td/probe.x64" -static 2>/dev/null \
-    || "$X64_CC" "$td/probe.c" -o "$td/probe.x64" -static
+  "$X64_CXX" -x c "$td/probe.c" -o "$td/probe.x64" 2>/dev/null \
+    || "$X64_CC" "$td/probe.c" -o "$td/probe.x64"
   file "$td/probe.x64" 2>/dev/null | grep -qi 'x86-64' || { echo "✗ produced binary is not x86-64"; exit 1; }
-  out="$("$QEMU_X64" "$td/probe.x64")" || { echo "✗ qemu-user failed to run the x64 binary"; exit 1; }
-  echo "• qemu-user output: $out"
+  out="$(run_x64_binary "$td/probe.x64")" || { echo "✗ $EMULATOR failed to run the dynamic x64 binary"; exit 1; }
+  echo "• $EMULATOR output: $out"
   [ "$out" = "tartci-x64-selftest-ok" ] || { echo "✗ unexpected output from emulated x64 binary"; exit 1; }
-  echo "✓ x86_64 cross-compile + qemu-user execution verified"
+  echo "✓ dynamic x86_64 cross-compile + $EMULATOR execution verified"
   exit 0
 fi
 # ----------------------------------------------------------------------------
@@ -220,20 +349,18 @@ ccache --zero-stats >/dev/null 2>&1 || true
 CROSS_FLAGS=()
 if [ "${CROSS:-0}" = 1 ]; then
   # x86_64 cross: distinct compilers + SYSTEM_PROCESSOR so CMake knows it's a
-  # cross. The build also needs x64 versions of the linked system libs (ALSA /
-  # X11 / wayland …) — i.e. `dpkg --add-architecture amd64` + the `:amd64` dev
-  # packages, or an x64 sysroot baked into the golden. If they're absent the
-  # configure/link fails with a clear missing-lib error rather than silently
-  # producing an arm64 artifact; GitHub-hosted x64 is the authoritative gate.
+  # cross. Rosetta handles x64 execution; amd64 userland provides the dynamic
+  # loader and shared libs. Missing x64 dev packages still fail loudly at
+  # configure/link; GitHub-hosted x64 remains the authoritative gate.
   ensure_x64_toolchain || { echo "✗ no x86_64 cross compiler"; exit 1; }
-  ensure_qemu_user     || { echo "✗ no qemu-user x86_64 runtime"; exit 1; }
+  ensure_x64_emulator  || { echo "✗ no x86_64 emulator/runtime ($EMULATOR)"; exit 1; }
   CROSS_FLAGS=(-DCMAKE_SYSTEM_NAME=Linux -DCMAKE_SYSTEM_PROCESSOR=x86_64
                -DCMAKE_C_COMPILER="$X64_CC" -DCMAKE_CXX_COMPILER="$X64_CXX")
   if [ "$NO_GPU" != 1 ] && [ -n "${X64_SKIA_DIR:-}" ]; then
     echo "• cross GPU-on: SKIA_DIR=$X64_SKIA_DIR (x64 Skia; avoids the arm64/x64 libskia.a collision)"
     CROSS_FLAGS+=(-DSKIA_DIR="$X64_SKIA_DIR")
   fi
-  echo "• cross toolchain: CC=$X64_CC CXX=$X64_CXX  emulator=$QEMU_X64"
+  echo "• cross toolchain: CC=$X64_CC CXX=$X64_CXX  emulator=$EMULATOR_LABEL"
 fi
 
 cmake -S . -B build -G Ninja \
@@ -245,12 +372,12 @@ cmake --build build --parallel "$(nproc)"
 echo "=== ccache stats ==="; ccache -s 2>/dev/null | grep -iE 'hits|misses|cache size' || true
 
 if [ "${CROSS:-0}" = 1 ]; then
-  # Run the test subset under qemu-user. binfmt routes x64 test binaries to
-  # qemu-x86_64 transparently, so plain ctest works once binfmt is registered;
-  # we point CMAKE/ctest at it via the crosscompiling emulator. Keep the subset
-  # small + exclude sanitizer/SIMD/timing-sensitive labels (unreliable emulated).
-  echo "• running ctest subset under qemu-user (emulated x64 — SMOKE, not a gate)"
-  export QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/x86_64-linux-gnu}"
+  # Run the test subset under the selected binfmt-backed emulator. Keep the
+  # subset small + exclude sanitizer/SIMD/timing-sensitive labels.
+  echo "• running ctest subset under $EMULATOR (emulated x64 — SMOKE, not a gate)"
+  if [ "${EMULATOR:-rosetta}" != "rosetta" ]; then
+    export QEMU_LD_PREFIX="${QEMU_LD_PREFIX:-/usr/x86_64-linux-gnu}"
+  fi
   ctest --test-dir build $CTEST_ARGS --label-exclude 'sanitizer|simd|gpu|timing' || {
     rc=$?; echo "• emulated-x64 ctest exit=$rc (treat as smoke signal; GitHub-hosted x64 is the gate)"; exit $rc; }
 else

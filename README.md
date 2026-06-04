@@ -28,13 +28,13 @@ plugins in a DAW.
 > port → MSVC arm64 build + ctest → discard; host-validated: overlay/SSH
 > mechanics + full 735-target compile green, ctest is the golden's proven 7287/7303),
 > the **x86_64 cross/emulation smoke lane** (`tartci up linux --target-arch
-> x86_64` — cross-compile + run tests under qemu-user-static; `--self-test`
-> proves the toolchain+emulator chain golden-agnostically), the **pool-serving
+> x86_64` — cross-compile + run dynamic x64 binaries under Rosetta-for-Linux;
+> `--self-test` proves the toolchain+emulator chain golden-agnostically), the **pool-serving
 > lanes** (`tartci serve linux|windows` — ephemeral per-job GitHub Actions
 > runners, ported from Pulp's proven `tools/ci` supervisors), the metrics, and
 > `tartci doctor/bench/metrics`. **Not yet wired:** the `tart-macos` provider
 > (`tartci up macos`/`serve macos` point at the runbook + Pulp's `tools/ci`) and
-> the Windows/Prism cross lane (Linux/qemu-user is wired; Windows-on-ARM
+> the Windows/Prism cross lane (Linux/Rosetta is wired; Windows-on-ARM
 > x64-via-Prism is a follow-up). Emulated x64 is a SMOKE/debug signal only —
 > GitHub-hosted x64 stays the authoritative x64 gate.
 
@@ -45,8 +45,9 @@ git clone <this-repo> tartci && cd tartci
 ./tartci setup            # brew-install tart/qemu/sshpass + create local stores
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
+./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
-./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under qemu-user (SMOKE)
+./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
 ./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
 ./tartci serve linux      # serve the GitHub Actions pool: ephemeral per-job runner(s)
 ./tartci serve windows --loop   # keep serving Windows jobs (throwaway overlay each)
@@ -78,15 +79,17 @@ debug); pool jobs build whatever arch the workflow targets.
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux
 --target-arch x86_64` cross-compiles for x64 (gcc/g++-x86-64-linux-gnu) and runs
-the test subset under **qemu-user-static** (binfmt) — a first line of defense for
+the test subset under **Rosetta-for-Linux** (binfmt) — a first line of defense for
 atomics / SIMD / ISA-divergent behavior, but **not** a gate: GitHub-hosted x64
 stays authoritative (sanitizers, SIMD/Highway dispatch, and RT timing are
 unreliable emulated). It defaults **GPU OFF** because the prebuilt Skia maps both
 Linux arches to the same `libskia.a` path (`docs/gotchas.md`); `--gpu` requires
 an explicit x64 Skia tree via `--skia-dir`, else it fails loud. `--self-test`
-proves just the toolchain+emulator chain with a trivial binary (golden-agnostic).
-The manifest declares this with `target_arch`/`cross` + an `[emulation]` table —
-see `manifests/example.x64.toml`.
+proves just the dynamic x64 toolchain+emulator chain with a trivial binary
+(golden-agnostic). The provision step installs Rosetta systemd mount/binfmt
+units plus an amd64 userland so the setup survives reboot. The manifest declares
+this with `target_arch`/`cross` + an `[emulation]` table — see
+`manifests/example.x64.toml`.
 
 ## Per-project use
 A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its
