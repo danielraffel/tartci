@@ -40,6 +40,15 @@ packages = [
 release = "chrome/m149"
 variant = "linux-arm64-gpu"   # baked into the golden so configure is offline
 
+[emulation]
+# x86_64 reached via cross-compile + qemu-user (the apt list bakes
+# qemu-user-static + binfmt-support). SMOKE only; ubuntu-latest on GitHub stays
+# the authoritative x64 gate. `tartci up linux --target-arch x86_64` drives this.
+emulator    = "qemu-user"
+toolchain   = "x86_64-linux-gnu"
+gpu         = false               # GPU-off (no x64 Skia baked; would collide with arm64 libskia.a)
+test_labels = "unit"
+
 [caches]
 ccache_max = "40G"
 

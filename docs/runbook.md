@@ -237,16 +237,49 @@ not regressions. Cold build ≈ **1:47** compile (configure ≈ 273 s); **warm b
 
 A fast inner-loop variant: `-DPULP_ENABLE_GPU=OFF` for a no-Skia smoke.
 
-### 3.8 Linux x86_64 — cross-compile + emulated test (optional, later)
+### 3.8 Linux x86_64 — cross-compile + emulated test (wired)
 
-Cross-build x64 (`clang --target=x86_64-linux-gnu` + an x64 glibc/libstdc++
-sysroot + the `linux-x64` Skia, with the arch-path fix from §3.6), then run the
-unit subset under `qemu-user-static` + binfmt inside the same arm VM.
+The guest is ARM64; you reach x86_64 by cross-compiling in-guest and running the
+test subset under `qemu-user-static` (binfmt). This is wired into the provider —
+`tartci up linux --target-arch x86_64` (or `providers/tart-linux/run.sh
+--target-arch x86_64`). The manifest declares it with `target_arch = "x86_64"`,
+`cross = true`, and an `[emulation]` table (see `manifests/example.x64.toml`).
+
+What the provider does when `target_arch != arch`:
+
+1. **Toolchain** — install-if-missing `gcc-x86-64-linux-gnu` /
+   `g++-x86-64-linux-gnu`, and `qemu-user-static` + `binfmt-support`. CMake is
+   configured with `-DCMAKE_SYSTEM_PROCESSOR=x86_64
+   -DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=…-g++`.
+2. **GPU off by default.** The fetch script maps both `linux-arm64` and
+   `linux-x64` to the SAME `build/linux-gpu/lib/Release/libskia.a`
+   (`arch_subdir=""` — §3.6), so you can't reuse the baked arm64 Skia for an x64
+   link. The cross build therefore defaults `-DPULP_ENABLE_GPU=OFF`. To build
+   GPU-on, fetch the `linux-x64` Skia into a **separate** tree and pass
+   `--gpu --skia-dir <that tree>` (or `[emulation].skia_dir`); without an
+   explicit x64 `SKIA_DIR` the provider refuses `--gpu` rather than silently
+   linking the arm64 lib.
+3. **Full cross-LINK also needs x64 system libs.** ALSA / X11 / wayland / etc.
+   must be present for x64 (`dpkg --add-architecture amd64` + the `:amd64` -dev
+   packages, or a baked x64 sysroot). If absent, the configure/link fails with a
+   clear missing-lib error — it never emits an arm64 artifact under an x64 name.
+4. **Tests** run via `ctest` under qemu-user (binfmt), excluding
+   `sanitizer|simd|gpu|timing` labels.
+
+**Prove just the chain, golden-agnostic:** `tartci up linux --target-arch
+x86_64 --self-test` cross-compiles a trivial program and runs it under
+qemu-user — no Pulp checkout, Skia, or x64 sysroot needed. This is the
+acceptance check for the toolchain+emulator wiring.
 
 **Treat emulated-x64 green as a smoke signal, NOT a gate.** Sanitizers
 (ASan/TSan/UBSan/MSan/RTSan) don't translate under qemu-user — run those on real
 x64 (GitHub). SIMD/Highway dispatch, futex/signal semantics, and RT-audio timing
 are all unreliable emulated. GitHub-hosted x64 stays authoritative.
+
+> **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
+> Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
+> heavier and not yet wired — `--target-arch` is Linux/qemu-user today. Tracked
+> as a follow-up; until then the Windows lane builds native ARM64.
 
 ---
 

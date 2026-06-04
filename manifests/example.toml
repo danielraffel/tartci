@@ -43,6 +43,20 @@ packages = []    # [choco] for Windows. Only the table matching `os` is applied.
 release = "chrome/m149"
 variant = "linux-arm64-gpu"
 
+[emulation]
+# How a `cross = true` lane reaches `target_arch` when it differs from the guest
+# `arch`: cross-compile in-guest, then run TESTS under an emulator. Consulted
+# ONLY when `cross = true`. SMOKE/debug signal — GitHub-hosted x64 stays the
+# authoritative gate (sanitizers, SIMD/Highway dispatch, and RT timing are all
+# unreliable emulated). Maps to `providers/tart-linux/run.sh --target-arch …`.
+emulator    = "qemu-user"          # qemu-user (Linux) | prism (Windows-ARM, planned)
+toolchain   = "x86_64-linux-gnu"   # cross compiler prefix → gcc/g++-x86-64-linux-gnu
+gpu         = false                # GPU-on cross requires a SEPARATE x64 Skia tree:
+skia_dir    = ""                   #   both Linux arches collide on one libskia.a path
+                                   #   (arch_subdir="" — see docs/gotchas.md), so point
+                                   #   skia_dir at an x64-only build/linux-gpu/lib/Release.
+test_labels = "unit"               # ctest subset safe to emulate (excludes sanitizer/simd/gpu/timing)
+
 [caches]
 # Host-mounted, warm across ephemeral clones. virtio-fs on Tart, a host share on
 # QEMU. ccache on POSIX; sccache on Windows (ccache+MSVC is unreliable).
