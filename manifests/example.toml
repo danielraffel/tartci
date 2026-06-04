@@ -20,7 +20,7 @@ arch        = "arm64"                # GUEST arch. Apple Virtualization is ARM64
                                      #   QEMU on Apple Silicon is also ARM64 (hvf).
 target_arch = "x86_64"              # what you ultimately ship/gate on. If != arch,
                                      #   you cross-compile in-guest and emulate for
-                                     #   TEST execution (qemu-user on Linux, Prism on
+                                     #   TEST execution (Rosetta on Linux, Prism on
                                      #   Windows). GitHub-hosted x64 stays the
                                      #   AUTHORITATIVE gate; local x64 is smoke/debug.
 cross       = true                   # true when target_arch != arch.
@@ -49,7 +49,7 @@ variant = "linux-arm64-gpu"
 # ONLY when `cross = true`. SMOKE/debug signal — GitHub-hosted x64 stays the
 # authoritative gate (sanitizers, SIMD/Highway dispatch, and RT timing are all
 # unreliable emulated). Maps to `providers/tart-linux/run.sh --target-arch …`.
-emulator    = "qemu-user"          # qemu-user (Linux) | prism (Windows-ARM, planned)
+emulator    = "rosetta"            # rosetta (Linux default) | qemu-user fallback | prism (Windows-ARM, planned)
 toolchain   = "x86_64-linux-gnu"   # cross compiler prefix → gcc/g++-x86-64-linux-gnu
 gpu         = false                # GPU-on cross requires a SEPARATE x64 Skia tree:
 skia_dir    = ""                   #   both Linux arches collide on one libskia.a path

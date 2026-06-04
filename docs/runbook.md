@@ -21,7 +21,7 @@ Conventions used below (no operator-specific data — substitute your own):
 > **One fact that shapes everything: Tart is ARM-only.** Apple
 > Virtualization.framework boots **ARM64 guests only** on Apple Silicon. Every VM
 > here is arm64. You build arm64 natively; you reach x86_64 via cross-compile +
-> emulation (qemu-user on Linux, Prism on Windows) as a *signal*, not an
+> emulation (Rosetta on Linux, Prism on Windows) as a *signal*, not an
 > authoritative gate. GitHub-hosted x64 stays the required check.
 
 ---
@@ -195,7 +195,7 @@ ssh pulp-linux sudo apt-get install -y \
   libxrender-dev libxss-dev libxtst-dev libwayland-dev wayland-protocols \
   libicu-dev \
   cmake ninja-build clang lld ccache git git-lfs python3 \
-  qemu-user-static binfmt-support
+  gcc-x86-64-linux-gnu g++-x86-64-linux-gnu binfmt-support
 ```
 
 - `libicu-dev` is needed because Pulp opts into direct `icu::Locale` /
@@ -203,8 +203,9 @@ ssh pulp-linux sudo apt-get install -y \
   SkUnicode, not ICU's own symbols (see gotchas: ICU link).
 - `libjack-jackd2-dev` is **deliberately omitted** — base Linux compiles fine
   without it; only add it for a JACK-enabled lane.
-- `qemu-user-static` + `binfmt-support` are only for the x64 emulated test lane
-  (§3.8).
+- `gcc/g++-x86-64-linux-gnu` + `binfmt-support` are for the x64 smoke lane
+  (§3.8). The provision script also installs Rosetta-for-Linux and the amd64
+  runtime libraries needed by dynamic x64 binaries.
 
 ### 3.6 Fetch prebuilt Skia (linux-arm64) + bake it
 
@@ -237,10 +238,10 @@ not regressions. Cold build ≈ **1:47** compile (configure ≈ 273 s); **warm b
 
 A fast inner-loop variant: `-DPULP_ENABLE_GPU=OFF` for a no-Skia smoke.
 
-### 3.8 Linux x86_64 — cross-compile + emulated test (wired)
+### 3.8 Linux x86_64 — cross-compile + Rosetta-emulated test (wired)
 
 The guest is ARM64; you reach x86_64 by cross-compiling in-guest and running the
-test subset under `qemu-user-static` (binfmt). This is wired into the provider —
+test subset under Rosetta-for-Linux (binfmt). This is wired into the provider —
 `tartci up linux --target-arch x86_64` (or `providers/tart-linux/run.sh
 --target-arch x86_64`). The manifest declares it with `target_arch = "x86_64"`,
 `cross = true`, and an `[emulation]` table (see `manifests/example.x64.toml`).
@@ -248,10 +249,19 @@ test subset under `qemu-user-static` (binfmt). This is wired into the provider �
 What the provider does when `target_arch != arch`:
 
 1. **Toolchain** — install-if-missing `gcc-x86-64-linux-gnu` /
-   `g++-x86-64-linux-gnu`, and `qemu-user-static` + `binfmt-support`. CMake is
+   `g++-x86-64-linux-gnu`, plus Rosetta binfmt registration. CMake is
    configured with `-DCMAKE_SYSTEM_PROCESSOR=x86_64
    -DCMAKE_C_COMPILER=x86_64-linux-gnu-gcc -DCMAKE_CXX_COMPILER=…-g++`.
-2. **GPU off by default.** The fetch script maps both `linux-arm64` and
+2. **Rosetta runtime** — host Rosetta is installed with
+   `softwareupdate --install-rosetta --agree-to-license`, Tart boots x64-smoke
+   clones with `--rosetta=rosetta`, the guest mounts the Rosetta virtiofs share
+   at `/mnt/rosetta`, and systemd re-registers binfmt after reboot. The golden
+   also carries an amd64 apt source + `libc6:amd64 libstdc++6:amd64
+   libgcc-s1:amd64 zlib1g:amd64 libtinfo6:amd64 libxml2:amd64`, so dynamic x64
+   binaries have `/lib64/ld-linux-x86-64.so.2`. The binfmt register string must
+   be written with literal `\xHH` escapes (`printf '%s'`); `binfmt_misc` decodes
+   them itself.
+3. **GPU off by default.** The fetch script maps both `linux-arm64` and
    `linux-x64` to the SAME `build/linux-gpu/lib/Release/libskia.a`
    (`arch_subdir=""` — §3.6), so you can't reuse the baked arm64 Skia for an x64
    link. The cross build therefore defaults `-DPULP_ENABLE_GPU=OFF`. To build
@@ -259,26 +269,28 @@ What the provider does when `target_arch != arch`:
    `--gpu --skia-dir <that tree>` (or `[emulation].skia_dir`); without an
    explicit x64 `SKIA_DIR` the provider refuses `--gpu` rather than silently
    linking the arm64 lib.
-3. **Full cross-LINK also needs x64 system libs.** ALSA / X11 / wayland / etc.
+4. **Full cross-LINK also needs x64 system libs.** ALSA / X11 / wayland / etc.
    must be present for x64 (`dpkg --add-architecture amd64` + the `:amd64` -dev
    packages, or a baked x64 sysroot). If absent, the configure/link fails with a
    clear missing-lib error — it never emits an arm64 artifact under an x64 name.
-4. **Tests** run via `ctest` under qemu-user (binfmt), excluding
+5. **Tests** run via `ctest` under Rosetta binfmt, excluding
    `sanitizer|simd|gpu|timing` labels.
 
 **Prove just the chain, golden-agnostic:** `tartci up linux --target-arch
-x86_64 --self-test` cross-compiles a trivial program and runs it under
-qemu-user — no Pulp checkout, Skia, or x64 sysroot needed. This is the
-acceptance check for the toolchain+emulator wiring.
+x86_64 --self-test` cross-compiles a dynamic trivial program and runs it under
+Rosetta — no Pulp checkout or Skia needed. A project with V8's bundled clang can
+also verify the real workload toolchain with
+`third_party/llvm-build/Release+Asserts/bin/clang --version`; it should print
+`Target: x86_64-unknown-linux-gnu`.
 
 **Treat emulated-x64 green as a smoke signal, NOT a gate.** Sanitizers
-(ASan/TSan/UBSan/MSan/RTSan) don't translate under qemu-user — run those on real
+(ASan/TSan/UBSan/MSan/RTSan) don't translate reliably under emulation — run those on real
 x64 (GitHub). SIMD/Highway dispatch, futex/signal semantics, and RT-audio timing
 are all unreliable emulated. GitHub-hosted x64 stays authoritative.
 
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
 > Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
-> heavier and not yet wired — `--target-arch` is Linux/qemu-user today. Tracked
+> heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
 > as a follow-up; until then the Windows lane builds native ARM64.
 
 ---

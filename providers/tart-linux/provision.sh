@@ -13,6 +13,7 @@
 #     [--base ghcr.io/cirruslabs/ubuntu:24.04@sha256:<pin>] \
 #     [--name pulp-linux-build] [--src-repo https://github.com/danielraffel/pulp] \
 #     [--disk 80] [--memory 16384] [--cpu 8] [--skia-arch linux-arm64]
+#     [--rosetta|--no-rosetta]
 set -euo pipefail
 
 export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
@@ -21,7 +22,7 @@ SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
 NAME="pulp-linux-build"
 SRC_REPO="https://github.com/danielraffel/pulp"
-DISK=80; MEMORY=16384; CPU=8; SKIA_ARCH="linux-arm64"
+DISK=80; MEMORY=16384; CPU=8; SKIA_ARCH="linux-arm64"; ENABLE_ROSETTA=1
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -36,7 +37,9 @@ while [ $# -gt 0 ]; do case "$1" in
   --memory) MEMORY="$2"; shift 2;;
   --cpu) CPU="$2"; shift 2;;
   --skia-arch) SKIA_ARCH="$2"; shift 2;;
-  -h|--help) sed -n '2,18p' "$0"; exit 0;;
+  --rosetta) ENABLE_ROSETTA=1; shift;;
+  --no-rosetta) ENABLE_ROSETTA=0; shift;;
+  -h|--help) sed -n '2,16p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
 
@@ -50,16 +53,160 @@ note "§3.2 bump resources (VM must be stopped; cloud-init grows the FS on boot)
 tart set "$NAME" --disk-size "$DISK" --memory "$MEMORY" --cpu "$CPU"
 
 note "§3.2 boot once so cloud-init grows the root FS"
-RPID=""; tart run --no-graphics "$NAME" >/dev/null 2>&1 & RPID=$!
+if [ "$ENABLE_ROSETTA" = 1 ]; then
+  note "§3.4 host Rosetta for Linux runtime (idempotent)"
+  softwareupdate --install-rosetta --agree-to-license >/dev/null 2>&1 \
+    || die "host Rosetta install/check failed; run: softwareupdate --install-rosetta --agree-to-license"
+fi
+TART_RUN_ARGS=(--no-graphics)
+[ "$ENABLE_ROSETTA" = 1 ] && TART_RUN_ARGS+=(--rosetta=rosetta)
+RPID=""; tart run "${TART_RUN_ARGS[@]}" "$NAME" >/dev/null 2>&1 & RPID=$!
 trap '[ -n "$RPID" ] && kill "$RPID" 2>/dev/null || true' EXIT
 IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$NAME" 2>/dev/null || true)"; [ -n "$IP" ] && break; sleep 2; done
 [ -n "$IP" ] || die "no IP for $NAME"
-for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null && break; sleep 2; done
-note "vm up at $IP — provisioning deps + Skia in-guest"
+GUEST_TRANSPORT=""
+for _ in $(seq 1 90); do
+  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if tart exec "$NAME" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
+  sleep 2
+done
+[ -n "$GUEST_TRANSPORT" ] || die "guest did not become reachable for $NAME at $IP via SSH or Tart guest agent"
+note "vm up at $IP via $GUEST_TRANSPORT — provisioning deps + Skia in-guest"
 
-ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
-  "SRC_REPO='$SRC_REPO' SKIA_ARCH='$SKIA_ARCH' bash -s" <<'GUEST'
+run_guest_script(){
+  if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+      "SRC_REPO='$SRC_REPO' SKIA_ARCH='$SKIA_ARCH' ENABLE_ROSETTA='$ENABLE_ROSETTA' bash -s"
+  else
+    tart exec -i "$NAME" env \
+      "SRC_REPO=$SRC_REPO" "SKIA_ARCH=$SKIA_ARCH" "ENABLE_ROSETTA=$ENABLE_ROSETTA" \
+      bash -s
+  fi
+}
+
+run_guest_script <<'GUEST'
 set -euo pipefail
+
+pin_existing_apt_sources_to_arm64(){
+  local file tmp
+  for file in /etc/apt/sources.list.d/*.sources; do
+    [ -e "$file" ] || continue
+    tmp="$(mktemp)"
+    awk '
+      function flush(  i) {
+        if (n == 0) return;
+        if (has_types && !has_arch) {
+          inserted = 0;
+          for (i = 1; i <= n; i++) {
+            print lines[i];
+            if (!inserted && lines[i] ~ /^URIs:/) {
+              print "Architectures: arm64";
+              inserted = 1;
+            }
+          }
+          if (!inserted) print "Architectures: arm64";
+        } else {
+          for (i = 1; i <= n; i++) print lines[i];
+        }
+        n = 0; has_types = 0; has_arch = 0;
+      }
+      BEGIN { n = 0; has_types = 0; has_arch = 0 }
+      NF == 0 {
+        flush(); print ""; next
+      }
+      {
+        lines[++n] = $0;
+        if ($0 ~ /^Types:/) has_types = 1;
+        if ($0 ~ /^Architectures:/) has_arch = 1;
+      }
+      END { flush() }
+    ' "$file" >"$tmp"
+    sudo install -m 0644 "$tmp" "$file"
+    rm -f "$tmp"
+  done
+}
+
+install_amd64_userland(){
+  local codename
+  codename="$(
+    . /etc/os-release
+    printf '%s' "${VERSION_CODENAME:-noble}"
+  )"
+  sudo dpkg --add-architecture amd64
+  pin_existing_apt_sources_to_arm64
+  sudo tee /etc/apt/sources.list.d/tartci-amd64.sources >/dev/null <<EOF
+Types: deb
+URIs: http://archive.ubuntu.com/ubuntu
+Suites: ${codename} ${codename}-updates ${codename}-backports
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.ubuntu.com/ubuntu
+Suites: ${codename}-security
+Components: main restricted universe multiverse
+Architectures: amd64
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 \
+    libtinfo6:amd64 libxml2:amd64
+}
+
+install_rosetta_units(){
+  sudo mkdir -p /mnt/rosetta /usr/local/sbin
+  sudo tee /usr/local/sbin/tartci-register-rosetta-binfmt >/dev/null <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+mountpoint -q /proc/sys/fs/binfmt_misc || mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+if [ ! -x /mnt/rosetta/rosetta ]; then
+  echo "Rosetta runtime not mounted at /mnt/rosetta/rosetta" >&2
+  exit 1
+fi
+if [ -e /proc/sys/fs/binfmt_misc/rosetta ]; then
+  echo -1 > /proc/sys/fs/binfmt_misc/rosetta
+fi
+# binfmt_misc decodes \xHH escapes itself. Do not use printf %b here; decoded
+# NUL bytes truncate the match and make Rosetta catch arm64 binaries too.
+printf '%s' ':rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/rosetta/rosetta:F' > /proc/sys/fs/binfmt_misc/register
+SCRIPT
+  sudo chmod 0755 /usr/local/sbin/tartci-register-rosetta-binfmt
+  sudo tee /etc/systemd/system/mnt-rosetta.mount >/dev/null <<'UNIT'
+[Unit]
+Description=Apple Rosetta for Linux virtiofs mount
+After=local-fs-pre.target
+Before=tartci-rosetta-binfmt.service
+
+[Mount]
+What=rosetta
+Where=/mnt/rosetta
+Type=virtiofs
+Options=rw,nofail
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  sudo tee /etc/systemd/system/tartci-rosetta-binfmt.service >/dev/null <<'UNIT'
+[Unit]
+Description=Register Apple Rosetta for Linux x86_64 binfmt
+Requires=mnt-rosetta.mount
+After=mnt-rosetta.mount proc-sys-fs-binfmt_misc.mount systemd-binfmt.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tartci-register-rosetta-binfmt
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  sudo systemctl daemon-reload
+  sudo systemctl enable mnt-rosetta.mount tartci-rosetta-binfmt.service >/dev/null
+  sudo mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null || true
+  sudo /usr/local/sbin/tartci-register-rosetta-binfmt
+}
 
 # §3.5 — the canonical Pulp Linux dependency set (mirror build.yml's "Install
 # Linux dependencies"), plus CI extras. libicu-dev is required (Pulp calls ICU
@@ -73,7 +220,16 @@ sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
   libxrender-dev libxss-dev libxtst-dev libwayland-dev wayland-protocols \
   libicu-dev \
   cmake ninja-build clang lld ccache git git-lfs python3 \
+  gcc-x86-64-linux-gnu g++-x86-64-linux-gnu \
   qemu-user-static binfmt-support
+
+if [ "${ENABLE_ROSETTA:-1}" = 1 ]; then
+  echo "• configuring Rosetta-for-Linux x86_64 runtime + amd64 userland"
+  install_amd64_userland
+  install_rosetta_units
+  /lib64/ld-linux-x86-64.so.2 --version >/dev/null
+  echo "• Rosetta x86_64 dynamic runtime verified"
+fi
 
 # Clone the project (the golden carries a ~/pulp checkout that run.sh updates to
 # the ref under test).

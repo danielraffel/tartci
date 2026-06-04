@@ -13,7 +13,7 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 - **Tart only boots arm64 guests.**
   → *Cause:* Apple Virtualization.framework has no x86 virtualization/emulation.
   → *Fix:* design every VM as arm64; reach x64 via cross-compile + emulation
-  (qemu-user on Linux, Prism on Windows) as a *signal only* — GitHub-hosted x64
+  (Rosetta on Linux, Prism on Windows) as a *signal only* — GitHub-hosted x64
   stays the authoritative gate.
 
 ## Linux (Tart)
@@ -60,6 +60,32 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   separate `SKIA_DIR` roots per target arch, or add a Linux arch-subdir to the
   fetch script + teach `FindSkia.cmake` to select it. The x64 link also needs a
   matching x64 glibc/libstdc++ sysroot.
+
+- **Dynamic x86_64 binary says `/lib64/ld-linux-x86-64.so.2` is missing.**
+  → *Cause:* Rosetta translates the CPU instructions, but dynamic x64 binaries
+  still need an amd64 userspace. → *Fix:* `dpkg --add-architecture amd64`, pin
+  existing Ubuntu ports sources to `arm64`, add `archive.ubuntu.com` /
+  `security.ubuntu.com` deb822 sources with `Architectures: amd64`, then install
+  `libc6:amd64 libstdc++6:amd64 libgcc-s1:amd64 zlib1g:amd64 libtinfo6:amd64
+  libxml2:amd64`.
+
+- **x86_64 binaries stop running after a reboot.**
+  → *Cause:* Tart's Rosetta virtiofs mount and binfmt registration are runtime
+  state. → *Fix:* bake the `mnt-rosetta.mount` and
+  `tartci-rosetta-binfmt.service` units from `providers/tart-linux/provision.sh`
+  into the golden, and boot Tart x64-smoke clones with `--rosetta=rosetta`.
+
+- **After registering Rosetta, normal arm64 commands fail with `Too many levels
+  of symbolic links`.**
+  → *Cause:* the binfmt register string was written with decoded NUL bytes
+  (`printf '%b'`) instead of literal `\xHH` escapes, so the kernel only kept the
+  short ELF prefix and matched arm64 binaries too. → *Fix:* write the canonical
+  register string with `printf '%s'`; `binfmt_misc` decodes the escapes itself.
+
+- **`mount -t virtiofs rosetta /mnt/rosetta` fails.**
+  → *Cause:* the VM was not booted with a Rosetta share, or host Rosetta is not
+  installed. → *Fix:* run `softwareupdate --install-rosetta --agree-to-license`
+  on the Mac and boot with `tart run --rosetta=rosetta <vm>`.
 
 ## Windows (QEMU)
 
