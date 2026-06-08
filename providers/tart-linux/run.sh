@@ -335,10 +335,16 @@ if [ -n "$REF" ]; then
   # and fall through to the ref as given. (The old `git fetch origin "$REF"` failed
   # for the origin/* form and built a stale cached ref.)
   git fetch --quiet --prune origin
+  # The golden's checkout can carry baked-in local edits (e.g. the Skia bake
+  # touches core/canvas/CMakeLists.txt), which make a plain `git checkout` abort
+  # ("local changes would be overwritten"). The ephemeral clone is disposable, so
+  # hard-discard any working-tree drift before switching refs.
+  git reset --quiet --hard
+  git clean -qfd -e external/skia-build
   if git rev-parse --verify --quiet "origin/$REF^{commit}" >/dev/null 2>&1; then
-    git checkout --quiet --detach "origin/$REF"
+    git checkout --quiet --detach --force "origin/$REF"
   else
-    git checkout --quiet --detach "$REF"
+    git checkout --quiet --detach --force "$REF"
   fi
 fi
 echo "• building pulp @ $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD 2>/dev/null))"
