@@ -1,0 +1,61 @@
+# Pulp — macOS build lane (Tart, ARM64 guest). The golden is a layered macOS
+# runner image with Xcode, Homebrew build tools, actions-runner, baked Skia, and
+# env parity for the stock Build and Test workflow.
+
+schema   = 2
+name     = "pulp-build-runner"
+provider = "tart"
+strategy = "bake"
+os       = "macos"
+arch     = "arm64"
+cross    = false
+
+base    = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+disk_gb = 150
+
+[toolchain]
+xcode  = "26.5"
+cmake  = "homebrew"
+ninja  = "homebrew"
+python = "3.12"
+
+[brew]
+packages = [
+  "git",
+  "git-lfs",
+  "gh",
+  "rsync",
+  "ccache",
+  "jq",
+  "cmake",
+  "ninja",
+  "node",
+  "python@3.12",
+]
+
+[skia]
+release = "chrome/m149"
+variant = "darwin-arm64-gpu"
+path    = "/Users/admin/pulp-skia-build"
+
+[caches]
+ccache_max = "5G"
+
+[mounts]
+ccache          = "${TARTCI_CACHE}/pulp/ccache"
+fetchcontent    = "${TARTCI_CACHE}/pulp/fetchcontent-src"
+
+[run]
+configure = "cmake -S ~/src -B ~/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=ON"
+build     = "cmake --build ~/build --parallel $(sysctl -n hw.ncpu)"
+test      = "ctest --test-dir ~/build --output-on-failure --exclude-regex AudioWorkgroup --label-exclude slow"
+
+[runner]
+golden          = "pulp-build-runner:latest"
+pilot_labels    = "self-hosted,macOS,ARM64,pulp-build-vm"
+required_labels = "self-hosted,macOS,ARM64,pulp-build"
+workflow_name   = "Build and Test"
+vm_cap          = 2
+idle_timeout_s  = 900
+job_warn_s      = 5400
+job_timeout_s   = 7200

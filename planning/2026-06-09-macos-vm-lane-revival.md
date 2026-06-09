@@ -315,6 +315,22 @@ run/job id + `rerun_eligible` + coarse phase timestamps), timeout teardown + reg
 --once` processes a `pulp-build-vm` job; **a synthetic hung/long-sleep job is torn down at the timeout,
 its registration reclaimed, no clone remains, the LaunchAgent keeps serving**; `scripts/lint.sh` passes.
 
+**Status 2026-06-09:** tartci macOS provider/Tier-1 CLI gate green; production LaunchAgent pilot is still
+Phase 4. Added `providers/tart-macos/{run,runner,provision}.sh`, `manifests/pulp.macos.toml`, and wired
+`tartci prepare/up/serve macos`. `tartci up macos --src /Volumes/Workshop/Code/pulp --golden
+pulp-build-runner:latest --vm tartci-macos-up-proof-20260609-01 --build-type Release --ctest-args
+"--output-on-failure -N"` built in the guest, listed `Total Tests: 10011`, reported warm ccache activity
+(`1491/1687` hits), exited `0`, and deleted the clone. `tartci serve macos --once` assigned scratch run
+`27232755147` to `tartci-serve-proof-20260609-01`, configured and built successfully, then failed the same
+known Pulp payload test (`Screenshot render_to_rgba produces non-black pixels (Skia raster)`); provider
+teardown still removed the VM and runner registration. Timeout validation used a minimal scratch workflow:
+run `27236065657` assigned to `tartci-timeout-graceful-20260609-01`, emitted `job_warn`, `job_timeout`
+with `run_id=27236065657 job_id=80428279082 rerun_eligible=true`, canceled the run before hard-kill,
+let the Actions runner remove `.credentials`/`.runner`, then deleted the VM; no proof VM or proof runner
+registration remained. Earlier kill-first timeout attempts proved GitHub can hold an offline runner as
+`busy` after VM death; the final implementation cancels first and waits for graceful runner exit before
+falling back to kill. `./scripts/lint.sh` passed.
+
 ### Phase 4 — Pilot on the non-required label **+ Tier 2 janitor + observability**
 `tartci serve macos --loop` on Studio with `…,pulp-build-vm[,pulp-build-studio]`; dispatch via `gh
 workflow run build.yml -R danielraffel/pulp -f macos_runner_selector_json='[…,"pulp-build-vm"]'`. Verify
@@ -431,7 +447,7 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 0 — safety freeze & inventory (2026-06-09)
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
-- [ ] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified
+- [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
 - [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 + Tier 2 janitor proven
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

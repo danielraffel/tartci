@@ -98,8 +98,8 @@ cmd_prepare() {
   case "$os" in
     linux)   exec "$HERE/providers/tart-linux/provision.sh" "$@" ;;
     windows) echo "tartci prepare windows — use: tartci windows golden [name]"; return 2 ;;
-    macos)   echo "tartci prepare macos — follow docs/runbook.md; provider generalization is a follow-up"; return 2 ;;
-    *) echo "usage: tartci prepare <linux> [provider args]"; return 2 ;;
+    macos)   exec "$HERE/providers/tart-macos/provision.sh" "$@" ;;
+    *) echo "usage: tartci prepare <linux|macos> [provider args]"; return 2 ;;
   esac
 }
 
@@ -108,10 +108,7 @@ cmd_up() {
   case "$os" in
     windows) exec "$HERE/providers/qemu-windows/run.sh" "$@" ;;
     linux)   exec "$HERE/providers/tart-linux/run.sh" "$@" ;;
-    macos)
-      echo "tartci up macos — the one-command Tart bring-up is still hand-driven."
-      echo "Follow docs/runbook.md (the macos lane is documented + proven);"
-      echo "Pulp's tools/ci/tart-run-job.sh is the working macOS ephemeral runner." ;;
+    macos)   exec "$HERE/providers/tart-macos/run.sh" "$@" ;;
     *) echo "usage: tartci up <linux|macos|windows>"; return 2 ;;
   esac
 }
@@ -127,10 +124,8 @@ cmd_serve() {
   case "$os" in
     linux)   exec "$HERE/providers/tart-linux/runner.sh" "$@" ;;
     windows) exec "$HERE/providers/qemu-windows/runner.sh" "$@" ;;
-    macos)
-      echo "tartci serve macos — the macOS pool runner is Pulp's tools/ci/tart-runner.sh."
-      echo "Generalizing it into a providers/tart-macos/runner.sh is a tracked follow-up." ;;
-    *) echo "usage: tartci serve <linux|windows> [--loop] [--labels ...]"; return 2 ;;
+    macos)   exec "$HERE/providers/tart-macos/runner.sh" "$@" ;;
+    *) echo "usage: tartci serve <linux|macos|windows> [--loop] [--labels ...]"; return 2 ;;
   esac
 }
 

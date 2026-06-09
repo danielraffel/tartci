@@ -28,14 +28,17 @@ plugins in a DAW.
 > **Windows QEMU lane** (`tartci up windows` — per-job CoW overlay → dynamic SSH
 > port → MSVC arm64 build + ctest → discard; host-validated: overlay/SSH
 > mechanics + full 735-target compile green, ctest is the golden's proven 7287/7303),
+> the **macOS Tart primitive** (`tartci up macos` / `serve macos` now dispatch to
+> `providers/tart-macos`; 2026-06-09 validation proved disposable in-VM Release
+> build + ctest enumeration, JIT runner assignment/cleanup, and `$HOME` launchd
+> boot; one Pulp screenshot payload test remains red in the scratch JIT run),
 > the **x86_64 cross/emulation smoke lane** (`tartci up linux --target-arch
 > x86_64` — cross-compile + run dynamic x64 binaries under Rosetta-for-Linux;
 > `--self-test` proves the toolchain+emulator chain golden-agnostically), the **pool-serving
 > lanes** (`tartci serve linux|windows` — ephemeral per-job GitHub Actions
 > runners, ported from Pulp's proven `tools/ci` supervisors), the metrics, and
-> `tartci doctor/bench/metrics`. **Not yet wired:** the `tart-macos` provider
-> (`tartci up macos`/`serve macos` point at the runbook + Pulp's `tools/ci`) and
-> the Windows/Prism cross lane (Linux/Rosetta is wired; Windows-on-ARM
+> `tartci doctor/bench/metrics`. **Not yet wired:** the Windows/Prism cross lane
+> (Linux/Rosetta is wired; Windows-on-ARM
 > x64-via-Prism is a follow-up). Emulated x64 is a SMOKE/debug signal only —
 > GitHub-hosted x64 stays the authoritative x64 gate.
 
@@ -51,13 +54,15 @@ git clone <this-repo> tartci && cd tartci
 ./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
+./tartci up macos --src /path/to/pulp     # ephemeral macOS build+test clone (host caches mounted)
 ./tartci up windows       # ephemeral Windows build+test (CoW overlay→build→ctest→discard)
 ./tartci serve linux      # serve the GitHub Actions pool: ephemeral per-job runner(s)
+./tartci serve macos --once --labels self-hosted,macOS,ARM64,pulp-build-vm
 ./tartci serve windows --loop   # keep serving Windows jobs (throwaway overlay each)
 ./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
 ```
 `tartci doctor`, `bench`, `metrics`, `up linux`, `up windows`, and `serve
-linux|windows` are wired today. `tartci status --json` and `tartci profile
+linux|macos|windows` are wired today. `tartci status --json` and `tartci profile
 list|show|explain|plan` are read-only helpers for Shipyard, Codex, Claude, or
 other agents to answer where CI should run from machine-readable config.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
@@ -65,7 +70,9 @@ other agents to answer where CI should run from machine-readable config.
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]
 [--keep]` makes a per-job CoW overlay off the Windows golden on a dynamic SSH
 port (concurrent-safe), builds GPU-off under MSVC arm64, then discards the
-overlay (see `providers/`). `tartci up macos` still points at the runbook. See
+overlay (see `providers/`). `tartci up macos --src <checkout>` clones the
+macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
+`~/build`, runs ctest, and discards the clone. See
 `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide and
 `docs/new-repo-agent-guide.md` to onboard a new repo.
 
@@ -76,8 +83,8 @@ boots a throwaway clone per queued job, and lets the GitHub **workflow** drive
 the build — the host just supplies a clean VM each time. `--loop` keeps serving
 (what the LaunchAgents run); the default is one job then exit (pilot-safe).
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
-`TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`); see each
-`providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
+`TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
+`TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /
 debug); pool jobs build whatever arch the workflow targets.
@@ -124,7 +131,7 @@ useful when present; never a punishment when missing.
 
 ## Layout
 ```
-providers/   tart-linux · qemu-windows  (per-OS provision + run + runner; tart-macos: runbook + Pulp tools/ci)
+providers/   tart-linux · tart-macos · qemu-windows  (per-OS provision + run + runner)
 launchd/     LaunchAgent templates to serve the pool at boot (Pulp's concrete instance + how to genericize)
 manifests/   example vm-image.toml per project profile
 metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
