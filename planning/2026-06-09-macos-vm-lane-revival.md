@@ -370,6 +370,19 @@ the home Tart store does not have `pulp-build-runner:latest` installed, and the 
 `com.danielraffel.pulp.tart-runner` LaunchAgent is still the pre-Phase-2 `/Volumes` plist flapping with
 exit `126`; replacing that label must stay pilot-only and must not advertise required `pulp-build`.
 
+**Serve-loop pilot note 2026-06-09:** copied `pulp-build-runner:latest` into the launchd-accessible
+home Tart store (`TART_HOME=/Users/danielraffel/VMs`; `tart get` reported `OS=darwin`, `State=stopped`,
+`Disk=150`, `Size=150.041`). Hardened `providers/tart-macos/runner.sh` so `queued_work` inspects queued
+jobs and only counts jobs whose requested labels are a subset of the configured runner labels; added a
+bounded `TARTCI_GH_TIMEOUT_SECS` around those `gh api` calls and `--print-queue` as a safe preflight.
+Validation: with many unrelated queued `Build and Test` runs, the `pulp-build-vm` `--print-queue`
+preflight returned `0`. Replaced the old flapping
+`~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist` with the home-anchored pilot plist from
+tartci; backed up the old plist as `com.danielraffel.pulp.tart-runner.pre-20260609-phase4.plist`.
+`launchctl print` showed the serve agent running with `self-hosted,macOS,ARM64,pulp-build-vm`, and the
+log showed repeated `waiting 20s (queued=0 running_macos_vms=0/2)` with no idle VM boot. Phase 4 is still
+open until real `pulp-build-vm` jobs pass x3.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,

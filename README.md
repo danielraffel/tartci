@@ -88,7 +88,10 @@ Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /
-debug); pool jobs build whatever arch the workflow targets.
+debug); pool jobs build whatever arch the workflow targets. The macOS serve loop
+only boots when a queued job's requested labels are satisfiable by the configured
+runner labels, so a `pulp-build-vm` pilot agent does not boot for unrelated
+queued `Build and Test` work.
 
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart

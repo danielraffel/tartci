@@ -3,6 +3,8 @@
 # It mints a single-job JIT config, boots a fresh clone, runs the Actions agent
 # once, emits state/heartbeat/events, then tears everything down. Defaults are
 # pilot-safe (`pulp-build-vm`, not required `pulp-build`).
+# `--print-queue` reports queued jobs whose requested labels are satisfiable by
+# the configured runner labels; it is a safe preflight for the loop gate.
 set -euo pipefail
 
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
@@ -14,6 +16,8 @@ REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-danielraffel/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
+QUEUE_RUN_LIMIT="${TARTCI_QUEUE_RUN_LIMIT:-20}"
+GH_TIMEOUT="${TARTCI_GH_TIMEOUT_SECS:-15}"
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"
@@ -26,6 +30,7 @@ RUNNER_NAME="${TARTCI_RUNNER_NAME:-${PULP_RUNNER_NAME:-}}"
 RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-}}"
 SLOT="${TARTCI_RUNNER_SLOT:-${PULP_RUNNER_SLOT:-1}}"
 PRINT_NAME=0
+PRINT_QUEUE=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
@@ -68,6 +73,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --slot) SLOT="$2"; shift 2;;
   --state-dir) STATE_DIR="$2"; EVENT_LOG="$STATE_DIR/events.jsonl"; shift 2;;
   --print-name) PRINT_NAME=1; shift;;
+  --print-queue) PRINT_QUEUE=1; shift;;
   -h|--help) usage; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
@@ -124,9 +130,59 @@ print(n)
 }
 
 queued_work(){
-  gh api "repos/$REPO/actions/runs?status=queued&per_page=30" \
-    --jq "[.workflow_runs[] | select(.name == \"$WORKFLOW_NAME\")] | length" \
-    2>/dev/null || echo 0
+  python3 - "$REPO" "$WORKFLOW_NAME" "$LABELS" "$QUEUE_RUN_LIMIT" "$GH_TIMEOUT" <<'PY'
+import json
+import subprocess
+import sys
+
+repo, workflow_name, labels_csv, queue_limit, gh_timeout = sys.argv[1:]
+runner_labels = {label.strip() for label in labels_csv.split(",") if label.strip()}
+try:
+    limit = max(1, min(100, int(queue_limit)))
+except ValueError:
+    limit = 20
+try:
+    timeout = max(1, int(gh_timeout))
+except ValueError:
+    timeout = 15
+
+
+def gh_json(path):
+    return json.loads(
+        subprocess.check_output(
+            ["gh", "api", path],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=timeout,
+        )
+    )
+
+
+try:
+    data = gh_json(f"repos/{repo}/actions/runs?status=queued&per_page={limit}")
+except Exception:
+    print(0)
+    raise SystemExit
+
+matches = 0
+for run in data.get("workflow_runs", []):
+    if run.get("name") != workflow_name:
+        continue
+    run_id = run.get("id")
+    if not run_id:
+        continue
+    try:
+        jobs = gh_json(f"repos/{repo}/actions/runs/{run_id}/jobs")
+    except Exception:
+        continue
+    for job in jobs.get("jobs", []):
+        if job.get("status") != "queued":
+            continue
+        job_labels = {str(label) for label in job.get("labels", []) if str(label)}
+        if job_labels and job_labels.issubset(runner_labels):
+            matches += 1
+print(matches)
+PY
 }
 
 reclaim_runner_name(){
@@ -301,6 +357,8 @@ run_one(){
 }
 
 i=0
+[ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
+
 if [ "$LOOP" = 1 ]; then
   note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP"
   heartbeat loop
