@@ -383,6 +383,24 @@ tartci; backed up the old plist as `com.danielraffel.pulp.tart-runner.pre-202606
 log showed repeated `waiting 20s (queued=0 running_macos_vms=0/2)` with no idle VM boot. Phase 4 is still
 open until real `pulp-build-vm` jobs pass x3.
 
+**Pilot run 2026-06-09:** dispatched Build and Test run `27238315420` on scratch branch
+`codex/tartci-macos-vm-pilot-20260609-215402Z` with
+`macos_runner_selector_json=["self-hosted","macOS","ARM64","pulp-build-vm"]`. The pilot LaunchAgent saw
+`queued=1`, cloned `pulp-build-runner:latest` to `pulp-vm-01`, booted it at `192.168.64.48`, and the job
+`macOS (ARM64) [operator]` ran on the VM. Configure and Build passed; Test failed with exactly one ctest
+failure out of `9177`: `4708 - Screenshot render_to_rgba produces non-black pixels (Skia raster)`, with
+the failing assertion at `/Users/admin/actions-runner/_work/pulp/pulp/test/test_screenshot.cpp:132`.
+The Actions runner removed `.credentials` and `.runner`, exited `0`, and the supervisor discarded
+`pulp-vm-01`; `TART_HOME=/Users/danielraffel/VMs tart list` showed only stopped
+`macos-build-base:launchd-proof` and `pulp-build-runner:latest`, and GitHub had no `pulp-vm-01`
+registration. The scratch run was cancelled after the macOS result to stop unrelated hosted jobs, and
+the scratch branch was deleted. This is a valid isolation/lifecycle pilot but **not** a green pilot.
+
+**Janitor no-VM state fix 2026-06-09:** after the pilot, report-only `doctor --reap` found an old
+owner-dead state file with no VM (`pulp-daniels-mac-studio-01.state.json`) and proposed only
+`delete_stale_state`; `--fix` deleted it, and the next report had `problems=[]`, `fixed=[]`,
+`github_runners=[]`, `capacity.free=2`, one live waiting supervisor (`pulp-vm-01`), and no stale VMs.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
@@ -492,6 +510,6 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
-- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending; Tier 2 janitor proven (2026-06-09)
+- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending (first real pilot hit known screenshot failure); Tier 2 janitor proven (2026-06-09)
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

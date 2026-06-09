@@ -324,12 +324,39 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             for state in states:
                 state_vm = str(state.get("vm") or "")
                 path_text = str(state.get("_path") or "")
-                if not state_vm or state_vm in seen_vms:
+                owner_pid_alive = bool(state.get("_owner_pid_alive"))
+                age = int(state.get("_age_secs") or 0)
+                if not state_vm:
+                    action = ""
+                    stale = False
+                    if path_text and not owner_pid_alive and age >= args.stopped_age_secs:
+                        stale = True
+                        action = "delete_stale_state"
+                        if args.fix:
+                            try:
+                                fixed.append(unlink_state(path_text))
+                            except Exception as exc:  # noqa: BLE001
+                                problems.append(f"fix_failed:delete_stale_state:{path_text}:{exc}")
+                    if stale:
+                        vms.append(
+                            {
+                                "name": str(state.get("runner") or path_text),
+                                "state": "no_vm_state",
+                                "owned": True,
+                                "protected": False,
+                                "owner_pid_alive": owner_pid_alive,
+                                "age_secs": age,
+                                "stale": stale,
+                                "action": action,
+                                "state_file": path_text,
+                            }
+                        )
+                    continue
+                if state_vm in seen_vms:
                     continue
                 prefix_ok = starts_with_any(state_vm, prefixes)
                 protected_name = is_protected_name(state_vm, protected)
                 marker_ok = prefix_ok and not protected_name
-                owner_pid_alive = bool(state.get("_owner_pid_alive"))
                 action = ""
                 stale = False
                 if marker_ok and not owner_pid_alive:
@@ -347,7 +374,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         "owned": marker_ok,
                         "protected": protected_name,
                         "owner_pid_alive": owner_pid_alive,
-                        "age_secs": int(state.get("_age_secs") or 0),
+                        "age_secs": age,
                         "stale": stale,
                         "action": action,
                         "state_file": path_text,
