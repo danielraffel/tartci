@@ -97,8 +97,10 @@ and fixed-action fields with exit codes suitable for launchd/cron (`0`
 healthy/fixed, `1` stale or wedged, `2` unreadable). Add `--fix` only after a
 clean report: VM deletion requires an allowed CI prefix plus a tartci state-file
 ownership marker, and goldens/bench names/`pulp-vm`/`rosetta-probe` stay
-protected. See `launchd/com.danielraffel.tartci.reap.plist.template` for the
-periodic host-local LaunchAgent shape.
+protected. Offline GitHub runner registrations are reaped only when their names
+match an owned CI prefix and no fresh live supervisor heartbeat backs them. See
+`launchd/com.danielraffel.tartci.reap.plist.template` for the periodic
+host-local LaunchAgent shape.
 
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux

@@ -6,7 +6,8 @@ The janitor is intentionally conservative:
   * The VM or runner name must match an allowed CI prefix.
   * Protected names and golden/tagged images are never deleted.
   * GitHub runner deletion only touches stale offline registrations whose
-    names match an allowed CI prefix.
+    names match an allowed CI prefix and are not backed by a fresh live
+    supervisor heartbeat.
 """
 
 from __future__ import annotations
@@ -241,6 +242,11 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         for state in states
         if str(state.get("vm") or "")
     }
+    states_by_runner = {
+        str(state.get("runner") or ""): state
+        for state in states
+        if str(state.get("runner") or "")
+    }
     vms: list[dict[str, Any]] = []
     runners: list[dict[str, Any]] = []
     capacity = {"macos_cap": args.macos_cap, "running_macos_vms": None, "free": None}
@@ -357,18 +363,38 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     name = str(runner.get("name") or "")
                     if not starts_with_any(name, prefixes):
                         continue
+                    state = states_by_runner.get(name)
+                    state_age = int((state or {}).get("_age_secs") or 0) if state else None
+                    state_provider = str((state or {}).get("provider") or "")
+                    owner_pid_alive = bool((state or {}).get("_owner_pid_alive")) if state else None
+                    state_file = (state or {}).get("_path")
+                    live_fresh_supervisor = (
+                        bool(state)
+                        and state_provider in ("", "tart-macos")
+                        and owner_pid_alive is True
+                        and state_age is not None
+                        and state_age < args.heartbeat_stale_secs
+                    )
                     status = str(runner.get("status") or "")
                     busy = bool(runner.get("busy"))
                     action = ""
                     stale = False
                     if status == "offline" and not busy:
-                        stale = True
-                        action = "delete_offline_runner"
+                        if live_fresh_supervisor:
+                            action = "wait_for_live_supervisor"
+                        elif state and owner_pid_alive is True:
+                            stale = True
+                            action = "suspect_live_owner_stale_offline_runner"
+                            problems.append(f"suspect_live_owner_stale_offline_runner:{name}")
+                        else:
+                            stale = True
+                            action = "delete_offline_runner"
                         if args.fix:
-                            try:
-                                fixed.append(delete_runner(args.repo, runner.get("id"), name))
-                            except Exception as exc:  # noqa: BLE001
-                                problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
+                            if action == "delete_offline_runner":
+                                try:
+                                    fixed.append(delete_runner(args.repo, runner.get("id"), name))
+                                except Exception as exc:  # noqa: BLE001
+                                    problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
                     elif status == "offline" and busy:
                         stale = True
                         action = "offline_busy_wait_for_github"
@@ -376,6 +402,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     runner["owned"] = True
                     runner["stale"] = stale
                     runner["action"] = action
+                    runner["heartbeat_age_secs"] = state_age
+                    runner["owner_pid_alive"] = owner_pid_alive
+                    runner["state_file"] = state_file
 
     digest = {
         "ts": iso(now),
@@ -416,6 +445,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "owned": runner.get("owned", False),
                 "stale": runner.get("stale", False),
                 "action": runner.get("action", ""),
+                "heartbeat_age_secs": runner.get("heartbeat_age_secs"),
+                "owner_pid_alive": runner.get("owner_pid_alive"),
+                "state_file": runner.get("state_file"),
             }
             for runner in runners
             if runner.get("owned")

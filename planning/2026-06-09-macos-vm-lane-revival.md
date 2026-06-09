@@ -348,9 +348,16 @@ created a stopped owned clone plus a missing-VM stale state file; report-only pr
 `delete_stopped_vm` and `delete_stale_state`, and `--fix` deleted the proof VM/state files without
 touching protected goldens or unrelated VMs. `plutil -lint` passed for the serve and reap templates, and
 `./scripts/lint.sh` passed. Stale offline GitHub-runner deletion is implemented for prefix-matching
-offline/non-busy registrations but has not yet been live-proven with a manufactured stale reg. The
-`pulp-build-vm` pilot green x3 gate is also still pending because current VM payload runs hit the known
-Pulp screenshot failure from Phase 1/3; do not graduate labels or advance to Phase 5 from this evidence.
+offline/non-busy registrations, guarded by the local supervisor heartbeat so a live booting JIT runner is
+not deleted. Manufactured JIT-registration proof used `tartci-reap-runner-proof-20260609-live` and
+`tartci-reap-runner-proof-20260609-stale`: report-only returned `rc=1`, preserved the live-backed offline
+runner with `action=wait_for_live_supervisor`, and proposed `delete_offline_runner` only for the stale
+registration; `--fix` returned `rc=0` and deleted only
+`github_runner_deleted:tartci-reap-runner-proof-20260609-stale:12824`. Post-clean GitHub runner lookup
+found no `tartci-reap-runner-proof-20260609*` registrations, and the live host report was clean again
+(`problems=[]`, `fixed=[]`, `capacity.free=2`). The `pulp-build-vm` pilot green x3 gate is still pending
+because current VM payload runs hit the known Pulp screenshot failure from Phase 1/3; do not graduate
+labels or advance to Phase 5 from this evidence.
 
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
@@ -461,6 +468,6 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
-- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 + Tier 2 janitor proven
+- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending; Tier 2 janitor proven (2026-06-09)
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

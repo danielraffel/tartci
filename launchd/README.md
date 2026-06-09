@@ -48,7 +48,9 @@ tartci doctor --reap --json --fix
 It is safe-by-construction rather than denylist-only. VM deletion requires both
 an allowed CI prefix (`pulp-vm-`/`tartci-` by default) and a tartci state-file
 ownership marker. Goldens, `pulp-vm`, `rosetta-probe`, and bench names remain
-protected. Run it report-only first:
+protected. Offline GitHub runner registrations are removed only when they match
+an owned CI prefix and no fresh live supervisor heartbeat backs them. Run it
+report-only first:
 
 ```sh
 TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
