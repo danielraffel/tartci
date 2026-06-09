@@ -413,6 +413,11 @@ owner-dead state file with no VM (`pulp-daniels-mac-studio-01.state.json`) and p
 `delete_stale_state`; `--fix` deleted it, and the next report had `problems=[]`, `fixed=[]`,
 `github_runners=[]`, `capacity.free=2`, one live waiting supervisor (`pulp-vm-01`), and no stale VMs.
 
+**Cross-store capacity check 2026-06-09:** the default Tart store has a long-running `rosetta-probe`,
+but `tart get rosetta-probe --format json` reports `OS=linux`. That VM does not consume the macOS-only
+AVF quota, so the home-store pilot cap should not be reduced for it. A future fleet observer should
+still count macOS VMs across all configured Tart stores before routing.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
