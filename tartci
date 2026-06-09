@@ -6,6 +6,7 @@
 # dependencies of its own — just bash + the tools `doctor` checks for.
 #
 #   tartci doctor              # report host prereqs + stores (always safe)
+#   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci setup               # brew-install prereqs + create local stores
@@ -33,6 +34,10 @@ c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 
 cmd_doctor() {
+  if [ "${1:-}" = "--reap" ]; then
+    shift
+    exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
   for t in tart qemu-system-aarch64 qemu-img sshpass gh git jq; do
@@ -132,7 +137,7 @@ cmd_serve() {
 usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
-  doctor)  cmd_doctor ;;
+  doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   setup)   cmd_setup ;;

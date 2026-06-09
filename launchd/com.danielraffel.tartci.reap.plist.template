@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci per-host janitor.
+
+  Runs `tartci doctor --reap --json --fix` periodically. The janitor deletes
+  only positively owned CI residue: a VM must match an allowed CI prefix AND
+  have a tartci state-file ownership marker before it can be deleted. Goldens,
+  `pulp-vm`, `rosetta-probe`, and bench VMs are protected.
+
+  Install shape:
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    sed -e "s|\$HOME|$HOME|g" \
+      launchd/com.danielraffel.tartci.reap.plist.template \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reap.plist"
+
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reap.plist"
+    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.reap"
+
+  The template assumes the macOS launchd rule from this directory's README:
+  tartci is installed under $HOME and exposed as $HOME/.local/bin/tartci, while
+  macOS goldens live under $HOME/VMs.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.reap</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>doctor</string>
+        <string>--reap</string>
+        <string>--json</string>
+        <string>--fix</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-reap.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-reap.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TART_HOME</key>
+        <string>$HOME/VMs</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+        <key>TARTCI_STATE_DIR</key>
+        <string>$HOME/.tartci/state/macos</string>
+        <key>TARTCI_REAP_PREFIXES</key>
+        <string>pulp-vm-,tartci-</string>
+        <key>TARTCI_REAP_PROTECTED_NAMES</key>
+        <string>pulp-vm,rosetta-probe</string>
+        <key>TARTCI_RUNNER_REPO</key>
+        <string>danielraffel/pulp</string>
+    </dict>
+</dict>
+</plist>

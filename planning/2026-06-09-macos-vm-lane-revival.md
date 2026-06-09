@@ -339,6 +339,19 @@ Implement + run `tartci doctor --reap --json` on Studio; create controlled resid
 clone, stale offline reg, stale state file) and verify `--fix` removes **only** owned/stale resources.
 Lifecycle/observability events land here. **Gate:** ≥3 pilot jobs pass; janitor fixes only owned residue.
 
+**Status 2026-06-09:** Tier-2 janitor implementation is in place, but the Phase-4 gate remains open.
+Added `tartci doctor --reap --json [--fix]`, `scripts/vm_reap.py`, runner heartbeat ownership fields
+(`provider`, host, supervisor PID, PID start time), and the periodic `$HOME`-anchored
+`launchd/com.danielraffel.tartci.reap.plist.template`. Live report-only on Studio was clean
+(`problems=[]`, `fixed=[]`, `capacity.free=2`, no owned VMs/runners). Controlled residue validation
+created a stopped owned clone plus a missing-VM stale state file; report-only proposed only
+`delete_stopped_vm` and `delete_stale_state`, and `--fix` deleted the proof VM/state files without
+touching protected goldens or unrelated VMs. `plutil -lint` passed for the serve and reap templates, and
+`./scripts/lint.sh` passed. Stale offline GitHub-runner deletion is implemented for prefix-matching
+offline/non-busy registrations but has not yet been live-proven with a manufactured stale reg. The
+`pulp-build-vm` pilot green x3 gate is also still pending because current VM payload runs hit the known
+Pulp screenshot failure from Phase 1/3; do not graduate labels or advance to Phase 5 from this evidence.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,

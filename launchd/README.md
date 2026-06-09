@@ -10,8 +10,8 @@ counterpart of `tartci serve <os> --loop`.
 
 The **runner scripts are project-agnostic** — repo, golden, labels, and the
 "is there queued work?" workflow name are all env-driven
-(`TARTCI_RUNNER_REPO`, `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,
-`TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_WORKFLOW_NAME`).
+(`TARTCI_RUNNER_REPO`, `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` /
+`TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_WORKFLOW_NAME`).
 
 The **templates here are Pulp's concrete instance** — the first consumer.
 Their `Label`s are `com.danielraffel.pulp.tart-runner`,
@@ -36,6 +36,26 @@ shape: install tartci into `$HOME/.local/share/tartci`, expose a small
 `$HOME/.local/bin/tartci` wrapper, and keep macOS goldens under `$HOME/VMs`.
 Only use `/Volumes` for macOS launchd after introducing a signed Full Disk
 Access helper.
+
+## Janitor
+
+`com.danielraffel.tartci.reap.plist.template` runs the Phase-4 Tier-2 janitor:
+
+```sh
+tartci doctor --reap --json --fix
+```
+
+It is safe-by-construction rather than denylist-only. VM deletion requires both
+an allowed CI prefix (`pulp-vm-`/`tartci-` by default) and a tartci state-file
+ownership marker. Goldens, `pulp-vm`, `rosetta-probe`, and bench names remain
+protected. Run it report-only first:
+
+```sh
+TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
+```
+
+Then install the LaunchAgent once the report is clean. Logs land in
+`~/Library/Logs/tartci/tartci-reap.log`.
 
 ## Serving a different repo
 

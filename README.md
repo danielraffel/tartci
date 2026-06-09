@@ -46,6 +46,7 @@ plugins in a DAW.
 ```bash
 git clone <this-repo> tartci && cd tartci
 ./tartci doctor           # report host prereqs + golden/bench stores (always safe)
+./tartci doctor --reap --json    # report owned stale CI VM/runner residue
 ./tartci setup            # brew-install tart/qemu/sshpass + create local stores
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
@@ -88,6 +89,16 @@ Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /
 debug); pool jobs build whatever arch the workflow targets.
+
+### Reap stale CI residue
+`tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart
+CI hosts. It emits capacity, supervisor heartbeat, VM, GitHub runner, problem,
+and fixed-action fields with exit codes suitable for launchd/cron (`0`
+healthy/fixed, `1` stale or wedged, `2` unreadable). Add `--fix` only after a
+clean report: VM deletion requires an allowed CI prefix plus a tartci state-file
+ownership marker, and goldens/bench names/`pulp-vm`/`rosetta-probe` stay
+protected. See `launchd/com.danielraffel.tartci.reap.plist.template` for the
+periodic host-local LaunchAgent shape.
 
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux

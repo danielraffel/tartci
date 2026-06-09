@@ -31,6 +31,9 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CLEANED_UP=0
+SUPERVISOR_PID="$$"
+SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -89,7 +92,7 @@ heartbeat(){
   local phase="$1" ts
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   cat >"$STATE_DIR/$RUNNER_NAME.state.json" <<EOF
-{"ts":"$ts","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","phase":"$(json_sanitize "$phase")","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","phase":"$(json_sanitize "$phase")","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
 }
 

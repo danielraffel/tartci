@@ -6,7 +6,7 @@
 #   1. shell  — `bash -n` syntax + `shellcheck -S warning` on every shell
 #               script (*.sh plus extensionless files with a bash shebang,
 #               so the front-door `tartci` dispatcher is covered).
-#   2. python — `py_compile` on every *.py (metrics/).
+#   2. python — `py_compile` on every *.py.
 #   3. TOML   — every manifests/*.toml and profiles/*.toml parses (skipped with a note if the
 #               local python predates tomllib / 3.11).
 #
