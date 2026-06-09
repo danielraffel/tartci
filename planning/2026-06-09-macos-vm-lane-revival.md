@@ -297,6 +297,12 @@ install the executable under `$HOME/.local/bin`; absolute paths only. Signed FDA
 data-relocation can't satisfy runtime `/Volumes` access. Reject plain LaunchDaemon.
 **Gate:** no exit 126 **and a VM actually boots from launchd** and reaches the runner loop.
 
+**Status 2026-06-09:** TCC/boot gate green. Added the macOS Pulp LaunchAgent replacement shape in
+`launchd/com.danielraffel.pulp.tart-runner-macos.plist.template`: production label
+`com.danielraffel.pulp.tart-runner`, `$HOME/.local/bin/tartci`, `WorkingDirectory=$HOME`, and
+`TART_HOME=$HOME/VMs`. The live proof used the same layout and booted a macOS VM from launchd with exit
+`0`; the runner-loop portion depends on Phase 3's `tartci serve macos` provider wiring.
+
 ### Phase 3 — Port macOS into tartci as a first-class provider **+ Tier 1 self-defense + warm caches**
 New `providers/tart-macos/{run,runner,provision}.sh` from pulp's scripts; generic `TARTCI_*` env with
 `PULP_*` fallback; preserve macOS cleanup traps/static names/stale reclaim/cap gate/`brew shellenv`
@@ -424,7 +430,7 @@ Three independent checks that finalize Phases 2/3/5:
 
 - [x] Phase 0 — safety freeze & inventory (2026-06-09)
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
-- [ ] Phase 2 — launchd boots a VM (no exit 126)
+- [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [ ] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified
 - [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 + Tier 2 janitor proven
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
