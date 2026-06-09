@@ -13,6 +13,7 @@ SRC="${TARTCI_SRC:-$PWD}"
 VM=""
 DISK=""
 BUILD_TYPE="${TARTCI_BUILD_TYPE:-${PULP_BUILD_TYPE:-Release}}"
+BUILD_TARGET="${TARTCI_BUILD_TARGET:-${PULP_BUILD_TARGET:-}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 CTEST_ARGS="${TARTCI_CTEST_ARGS:-${PULP_CTEST_ARGS:---output-on-failure --exclude-regex AudioWorkgroup --label-exclude slow}}"
 CMAKE_ARGS="${TARTCI_CMAKE_ARGS:-${PULP_CMAKE_ARGS:--DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=ON}}"
@@ -30,7 +31,8 @@ tart-macos/run.sh — run one build+test inside an ephemeral Tart macOS VM.
 
 Usage:
   providers/tart-macos/run.sh --src /path/to/checkout [--golden pulp-build-runner:latest]
-      [--vm macos-job-N] [--build-type Release] [--cmake-args "..."] [--ctest-args "..."] [--keep]
+      [--vm macos-job-N] [--build-type Release] [--build-target target]
+      [--cmake-args "..."] [--ctest-args "..."] [--keep]
 
 Environment:
   TART_HOME defaults to ~/VMs. TARTCI_* env names have PULP_* fallbacks for Pulp.
@@ -46,6 +48,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --vm) VM="$2"; shift 2;;
   --disk) DISK="$2"; shift 2;;
   --build-type) BUILD_TYPE="$2"; shift 2;;
+  --build-target) BUILD_TARGET="$2"; shift 2;;
   --cache-root) CACHE_ROOT="$2"; shift 2;;
   --cmake-args) CMAKE_ARGS="$2"; shift 2;;
   --ctest-args) CTEST_ARGS="$2"; shift 2;;
@@ -102,7 +105,7 @@ note "vm $VM up at $IP — running build ($BUILD_TYPE) + ctest in guest"
 
 set +e
 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
-  "BUILD_TYPE='$BUILD_TYPE' CMAKE_ARGS='$CMAKE_ARGS' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
+  "BUILD_TYPE='$BUILD_TYPE' BUILD_TARGET='$BUILD_TARGET' CMAKE_ARGS='$CMAKE_ARGS' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
 set -euo pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)"
 SHARED="/Volumes/My Shared Files"
@@ -131,7 +134,11 @@ cmake -S "$HOME/src" -B "$BUILD" \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
   -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
   $CMAKE_ARGS
-cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu)"
+if [ -n "${BUILD_TARGET:-}" ]; then
+    cmake --build "$BUILD" --target "$BUILD_TARGET" --parallel "$(sysctl -n hw.ncpu)"
+else
+    cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu)"
+fi
 echo "=== ccache stats (warmth) ==="
 ccache --show-stats | grep -iE 'cacheable|hit|miss|cache size' || ccache -s
 ctest --test-dir "$BUILD" $CTEST_ARGS
