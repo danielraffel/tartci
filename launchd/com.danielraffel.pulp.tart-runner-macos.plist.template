@@ -23,7 +23,7 @@
          rsync -a --delete --exclude .git "$PWD/" "$HOME/.local/share/tartci/"
          cat > "$HOME/.local/bin/tartci" <<'EOF'
          #!/usr/bin/env bash
-         exec "$HOME/.local/share/tartci/tartci" "$@"
+         exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"
          EOF
          chmod 755 "$HOME/.local/bin/tartci"
 

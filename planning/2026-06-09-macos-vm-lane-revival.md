@@ -359,6 +359,17 @@ found no `tartci-reap-runner-proof-20260609*` registrations, and the live host r
 because current VM payload runs hit the known Pulp screenshot failure from Phase 1/3; do not graduate
 labels or advance to Phase 5 from this evidence.
 
+**Host-side Phase-4 note 2026-06-09:** installed tartci under `$HOME/.local/share/tartci` with a
+`$HOME/.local/bin/tartci` shim that executes the copied dispatcher via `/bin/bash`, then rendered and
+bootstrapped `~/Library/LaunchAgents/com.danielraffel.tartci.reap.plist`. `launchctl kickstart` ran the
+janitor with `TART_HOME=/Users/danielraffel/VMs`; `launchctl print` reported `state = not running`,
+`runs = 2`, `last exit code = 0`, and `run interval = 300 seconds`. The log JSON had `fix=true`,
+`problems=[]`, `fixed=[]`, `capacity.free=2`, and only the protected stopped proof VM
+`macos-build-base:launchd-proof`. Did not start the persistent `pulp-build-vm` serve LaunchAgent yet:
+the home Tart store does not have `pulp-build-runner:latest` installed, and the existing old
+`com.danielraffel.pulp.tart-runner` LaunchAgent is still the pre-Phase-2 `/Volumes` plist flapping with
+exit `126`; replacing that label must stay pilot-only and must not advertise required `pulp-build`.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
