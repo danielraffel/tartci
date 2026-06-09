@@ -396,6 +396,18 @@ The Actions runner removed `.credentials` and `.runner`, exited `0`, and the sup
 registration. The scratch run was cancelled after the macOS result to stop unrelated hosted jobs, and
 the scratch branch was deleted. This is a valid isolation/lifecycle pilot but **not** a green pilot.
 
+**Pilot payload diagnosis 2026-06-09:** the first real VM pilot used `workflow_dispatch`, and Pulp's
+macOS workflow configures non-PR runs with `-DPULP_ENABLE_GPU=OFF`
+(`/Volumes/Workshop/Code/pulp/.github/workflows/build.yml:799`). The failing test is compiled on every
+Apple build because its gate is `defined(__APPLE__) || defined(PULP_HAS_SKIA)`
+(`/Volumes/Workshop/Code/pulp/test/test_screenshot.cpp:105`), but the macOS implementation returns an
+empty RGBA buffer whenever `PULP_HAS_SKIA` is not defined
+(`/Volumes/Workshop/Code/pulp/core/view/platform/mac/screenshot_mac.mm:243`). So the current
+`workflow_dispatch` pilot path cannot produce a green macOS payload until Pulp either keeps the needed
+Skia/CPU-raster path enabled for dispatch builds or changes the test/implementation gate for Apple
+no-Skia builds. Do not treat this as a tartci lifecycle failure, and do not edit Pulp from this lane
+while the parallel Pulp refactor agent is active.
+
 **Janitor no-VM state fix 2026-06-09:** after the pilot, report-only `doctor --reap` found an old
 owner-dead state file with no VM (`pulp-daniels-mac-studio-01.state.json`) and proposed only
 `delete_stale_state`; `--fix` deleted it, and the next report had `problems=[]`, `fixed=[]`,
