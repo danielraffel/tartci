@@ -15,6 +15,7 @@ DISK=""
 BUILD_TYPE="${TARTCI_BUILD_TYPE:-${PULP_BUILD_TYPE:-Release}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 CTEST_ARGS="${TARTCI_CTEST_ARGS:-${PULP_CTEST_ARGS:---output-on-failure --exclude-regex AudioWorkgroup --label-exclude slow}}"
+CMAKE_ARGS="${TARTCI_CMAKE_ARGS:-${PULP_CMAKE_ARGS:--DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=ON}}"
 KEEP=0
 CLONED=0
 RPID=""
@@ -29,7 +30,7 @@ tart-macos/run.sh — run one build+test inside an ephemeral Tart macOS VM.
 
 Usage:
   providers/tart-macos/run.sh --src /path/to/checkout [--golden pulp-build-runner:latest]
-      [--vm macos-job-N] [--build-type Release] [--ctest-args "..."] [--keep]
+      [--vm macos-job-N] [--build-type Release] [--cmake-args "..."] [--ctest-args "..."] [--keep]
 
 Environment:
   TART_HOME defaults to ~/VMs. TARTCI_* env names have PULP_* fallbacks for Pulp.
@@ -46,6 +47,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --disk) DISK="$2"; shift 2;;
   --build-type) BUILD_TYPE="$2"; shift 2;;
   --cache-root) CACHE_ROOT="$2"; shift 2;;
+  --cmake-args) CMAKE_ARGS="$2"; shift 2;;
   --ctest-args) CTEST_ARGS="$2"; shift 2;;
   --keep) KEEP=1; shift;;
   -h|--help) usage; exit 0;;
@@ -100,7 +102,7 @@ note "vm $VM up at $IP — running build ($BUILD_TYPE) + ctest in guest"
 
 set +e
 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
-  "BUILD_TYPE='$BUILD_TYPE' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
+  "BUILD_TYPE='$BUILD_TYPE' CMAKE_ARGS='$CMAKE_ARGS' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
 set -euo pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)"
 SHARED="/Volumes/My Shared Files"
@@ -113,19 +115,22 @@ export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
 mkdir -p "$CCACHE_TEMPDIR"
 export CCACHE_BASEDIR="$HOME/src"
 export CCACHE_NOHASHDIR=true
-export CCACHE_SLOPPINESS=time_macros,pch_defines
-export CCACHE_DEPEND=true
+export CCACHE_COMPILERCHECK=content
+export CCACHE_NODEPEND=true
+unset CCACHE_DEPEND
+export CCACHE_SLOPPINESS=time_macros
 export SKIA_DIR="$HOME/pulp-skia-build"
 export FETCHCONTENT_BASE_DIR="$HOME/fetchcontent"
 
 ccache --zero-stats >/dev/null 2>&1 || true
 BUILD="$HOME/build"
 rm -rf "$BUILD"
+# shellcheck disable=SC2086
 cmake -S "$HOME/src" -B "$BUILD" \
   -G Ninja \
   -DCMAKE_BUILD_TYPE="$BUILD_TYPE" \
-  -DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=ON \
-  -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+  -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+  $CMAKE_ARGS
 cmake --build "$BUILD" --parallel "$(sysctl -n hw.ncpu)"
 echo "=== ccache stats (warmth) ==="
 ccache --show-stats | grep -iE 'cacheable|hit|miss|cache size' || ccache -s
