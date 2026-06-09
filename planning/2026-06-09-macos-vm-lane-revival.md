@@ -231,8 +231,18 @@ A named goal: make repeat builds nearly as fast as the warm bare-metal dirs, **w
    `$HOME`/`/Users/Shared`. **Experiment (~10 min):** move `TART_HOME` to `$HOME/VMs`, point a minimal
    LaunchAgent at a `$HOME` wrapper, `launchctl start`, see if a VM boots. Decides: relocate data +
    executable (cheap) vs. signed FDA helper (expensive). Not fixed until a VM boots **from launchd**.
+   **Status 2026-06-09:** resolved in favor of relocation. The production plist's log shows the real
+   exit-126 cause: `getcwd` on `/Volumes/Workshop/Code/pulp` and `/bin/bash` reading the script under
+   `/Volumes` both fail with `Operation not permitted`. A proof LaunchAgent with `WorkingDirectory=$HOME`,
+   executable under `$HOME/.local/bin`, and `TART_HOME=$HOME/VMs` booted a macOS clone from launchd and
+   logged `BOOT_OK vm=launchd-home-proof-20260609-01 ip=192.168.64.37`; launchd reported last exit `0`.
+   A sparse-copied proof base remains stopped at `~/VMs/vms/macos-build-base:launchd-proof`.
 2. **Tart JSON OS field** — confirm `OS` / `"macOS"` against live `tart list --format json` before
    touching `capacity.rs`.
+   **Status 2026-06-09:** `tart list --format json` on this host does **not** include `OS`; keys observed
+   were `Accessed`, `Disk`, `Name`, `Running`, `Size`, `Source`, and `State`. `tart get <vm> --format json`
+   does include `OS`, with `darwin` for macOS images and `linux` for Linux images. Do not implement
+   capacity against `list[].OS == "macOS"` without enrichment/fallback.
 3. **Admission architecture [CODEX].** GitHub binds a job to one runner → concern is VM *waste*, not
    correctness. Start with self-coordinating per-host `serve --loop` + idle-timeout reap; central
    SSH-fan-out admission is a later `VmSlot`-lease optimization, not SSH bolted onto `queue_scheduler`.
@@ -256,6 +266,11 @@ script flags via `--help` before running.**
 Keep bare-metal `pulp-build` online; change no labels. Inventory goldens + **live** slot usage:
 `tart list --format json`. **Gate:** ≥1 free macOS slot on Studio; required `pulp-build` still on bare metal.
 
+**Status 2026-06-09:** complete. Started from `feat/macos-vm-lane-revival` in tartci with no label changes.
+Initial `TART_HOME=/Volumes/Workshop/VMs tart list --format json` had no running VMs. Final safety check
+showed four online, idle required bare-metal runners carrying `pulp-build`: `pulp-m5-01`,
+`pulp-studio-01`, `pulp-studio-02`, and `pulp-studio-03`.
+
 ### Phase 1 — Prove the macOS primitive interactively (START HERE)
 Local on macstudio, independent of launchd/GitHub: clone `pulp-build-runner:latest` → boot → SSH →
 build → discard, e.g. `tools/ci/tart-run-job.sh --golden pulp-build-runner:latest --src "$PWD" --vm
@@ -263,6 +278,18 @@ macos-proof-01 --build-type Release --ctest-args "--output-on-failure -N"` (conf
 **[CODEX] Also prove the JIT path** (`tart-runner.sh` / a `--once` mode). Verify exit 0; `tart list`
 shows no clone; build ran *inside* the VM (not under `/Volumes/Workshop/ci/pulp/work/pulp-studio-*`);
 ccache shows activity. **Gate:** an interactive throwaway-VM build succeeds and leaves no clone behind.
+
+**Status 2026-06-09:** interactive primitive is green; JIT infrastructure is green, but the Pulp payload
+was red. `tart-run-job.sh --golden pulp-build-runner:latest --vm macos-proof-20260609-01 --build-type
+Release --ctest-args "--output-on-failure -N"` built inside the guest (`/Users/admin/build`, not
+`/Volumes/Workshop/ci/pulp/work/pulp-studio-*`), listed `Total Tests: 10005`, reported ccache activity
+(`1686` cacheable calls, `674` hits), exited `0`, and deleted the clone. The one-shot JIT runner
+`macos-jit-proof-20260609-01` registered with `self-hosted,macOS,ARM64,pulp-build-vm`, claimed scratch
+workflow run `27230185763`, ran the macOS job inside `/Users/admin/actions-runner/_work/pulp/pulp/build-macos`,
+exited `0`, deregistered, and deleted the VM. That job failed in Pulp tests: `9170` tests ran, `9169`
+passed and `Screenshot render_to_rgba produces non-black pixels (Skia raster)` failed at
+`test/test_screenshot.cpp:132` because `rgba.empty()` was true. Scratch branch
+`codex/macos-vm-jit-proof-20260609-191935Z` was deleted; no stale runner registration or VM remained.
 
 ### Phase 2 — Fix launchd / TCC
 Run Open Decision #1 first. Default: move `TART_HOME` + working dirs under `$HOME`/`/Users/Shared` *and*
@@ -383,16 +410,20 @@ macOS VMs, M5 failover works, janitor ran clean, `fleet-status` stayed healthy, 
 ## Immediate next actions (in one session on macstudio)
 
 Three independent checks that finalize Phases 2/3/5:
-1. **Phase 1:** interactively prove the throwaway-VM build (`tart-run-job.sh` + the JIT path).
+1. **Phase 1:** interactively prove the throwaway-VM build (`tart-run-job.sh` + the JIT path). **Status
+   2026-06-09:** interactive build green; JIT runner lifecycle green; JIT payload failed one Pulp screenshot
+   test, so do not treat this as a green pilot payload yet.
 2. **Decision #1 experiment:** the 10-minute launchd-from-`$HOME` / `TART_HOME`-relocation test.
-3. **Decision #2:** confirm the Tart JSON `OS` field on the live host.
+   **Status 2026-06-09:** green; `$HOME` wrapper + `$HOME/VMs` booted a macOS VM from launchd with exit `0`.
+3. **Decision #2:** confirm the Tart JSON `OS` field on the live host. **Status 2026-06-09:** resolved;
+   use `tart get --format json` for `OS`, not `tart list`.
 
 ---
 
 ## Progress checklist (executing agent: tick + datestamp as you complete each)
 
-- [ ] Phase 0 — safety freeze & inventory
-- [ ] Phase 1 — macOS primitive proven (interactive + JIT)
+- [x] Phase 0 — safety freeze & inventory (2026-06-09)
+- [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [ ] Phase 2 — launchd boots a VM (no exit 126)
 - [ ] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified
 - [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 + Tier 2 janitor proven
