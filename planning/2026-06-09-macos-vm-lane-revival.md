@@ -418,6 +418,16 @@ but `tart get rosetta-probe --format json` reports `OS=linux`. That VM does not 
 AVF quota, so the home-store pilot cap should not be reduced for it. A future fleet observer should
 still count macOS VMs across all configured Tart stores before routing.
 
+**Local PR-like payload proof 2026-06-09:** after adding `tartci up macos --cmake-args`, ran a clean
+Pulp checkout (`91b743b1d`) in disposable VM `tartci-prlike-rgba-proof-20260609223008Z` with
+`-DPULP_BUILD_TESTS=ON -DPULP_BUILD_EXAMPLES=OFF` and `ctest -R render_to_rgba`. Configure found
+`/Users/admin/pulp-skia-build`, built the Skia-enabled test graph, and ctest passed
+`Screenshot render_to_rgba produces non-black pixels (Skia raster)` in `0.04s`. The VM was discarded,
+the temporary host checkout was removed, and post-run `doctor --reap` was clean. This strengthens the
+payload diagnosis: the screenshot failure is specific to the `workflow_dispatch` no-Skia configure path,
+not the Tart VM lifecycle. This is still **not** a green Phase-4 pilot job because it did not exercise
+GitHub JIT dispatch or count toward the required `pulp-build-vm` green x3 gate.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
@@ -527,6 +537,6 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
-- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending (first real pilot hit known screenshot failure); Tier 2 janitor proven (2026-06-09)
+- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending (workflow_dispatch hit no-Skia screenshot failure; local PR-like Skia proof passed); Tier 2 janitor proven (2026-06-09)
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated
