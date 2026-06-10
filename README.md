@@ -105,6 +105,13 @@ match an owned CI prefix and no fresh live supervisor heartbeat backs them. See
 `launchd/com.danielraffel.tartci.reap.plist.template` for the periodic
 host-local LaunchAgent shape.
 
+### Observe a live macOS runner
+`tartci observe macos` is the read-only operator view for macOS VM jobs. It
+combines the janitor digest, matching GitHub run/job/step state, guest process
+snapshots, recent CTest output, and the runner log tail. Use `--no-guest` when
+the VM is already gone or SSH is not useful, `--runner NAME` to narrow a host
+with multiple supervisors, and `--json` for scripts.
+
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux
 --target-arch x86_64` cross-compiles for x64 (gcc/g++-x86-64-linux-gnu) and runs

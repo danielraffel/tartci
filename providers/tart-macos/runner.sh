@@ -35,6 +35,7 @@ CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
+CURRENT_IP=""
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -98,7 +99,7 @@ heartbeat(){
   local phase="$1" ts
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   cat >"$STATE_DIR/$RUNNER_NAME.state.json" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","phase":"$(json_sanitize "$phase")","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
 }
 
@@ -206,6 +207,7 @@ discard_current_vm(){
   tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
   CURRENT_VM=""
   CURRENT_RPID=""
+  CURRENT_IP=""
 }
 
 cleanup(){
@@ -333,6 +335,7 @@ run_one(){
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; return 1
   fi
+  CURRENT_IP="$ip"
   rm -f "$boot_log"
   for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && break; sleep 2; done
   note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s job_timeout=${JOB_TIMEOUT}s)"
@@ -350,6 +353,9 @@ run_one(){
   tart delete "$vm" >/dev/null 2>&1 || true
   CURRENT_VM=""
   CURRENT_RPID=""
+  CURRENT_IP=""
+  CURRENT_RUN_ID=""
+  CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
   heartbeat stopped
   CLEANED_UP=1

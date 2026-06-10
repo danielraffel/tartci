@@ -428,6 +428,23 @@ payload diagnosis: the screenshot failure is specific to the `workflow_dispatch`
 not the Tart VM lifecycle. This is still **not** a green Phase-4 pilot job because it did not exercise
 GitHub JIT dispatch or count toward the required `pulp-build-vm` green x3 gate.
 
+**Direct retarget pilot + observability note 2026-06-09:** scratch Pulp branch
+`codex/tartci-macos-vm-dispatch-prlike-20260609224714Z` rewired `build-macos.yml` to dispatch directly
+to `["self-hosted","macOS","ARM64","pulp-build-vm"]`, use Ninja, and check out exact target SHA
+`908dbc3779b6ee07633d1fc77575f1744bc7f703`. Run `27242881525` proved the representative VM mechanics:
+the job ran on `pulp-vm-01`, Configure passed, Build passed with `cmake --build build-macos-retarget
+--parallel 8` and `/opt/homebrew/bin/ninja -j 8`, and teardown removed the VM/runner with
+`doctor --reap --json` clean (`capacity.free=2`, no GitHub runners, no stale VMs). Test failed after
+`9931` CTest cases with exactly two failures: `9202 - cmake-ios-auv3-configure` and
+`9203 - cmake-ios-hostapp-links`. Both failed compiling `core/runtime/src/model_download.cpp` for
+`iphonesimulator`; `external/cpp-httplib/httplib.h` references undeclared
+`SecTrustCopyAnchorCertificates`. This is a Pulp iOS-simulator payload/config issue surfaced by the
+macOS retarget lane, not a tartci lifecycle failure. While diagnosing, manual SSH showed the visibility
+gap: the GitHub UI only said `Test`, while the guest was in `ctest`, then two long CMake/Xcode iOS tests,
+then duplicate `three.js` FetchContent clones. Added read-only `tartci observe macos` plus heartbeat
+fields (`vm_ip`, `run_id`, `job_id`) so future pilots expose the GitHub step, guest process tree, recent
+CTest log, and runner log without ad hoc SSH.
+
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
@@ -537,6 +554,6 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
-- [ ] Phase 4 — pilot on `pulp-build-vm` green ×3 pending (workflow_dispatch hit no-Skia screenshot failure; local PR-like Skia proof passed); Tier 2 janitor proven (2026-06-09)
+- [ ] Phase 4 — pilot on `pulp-build-vm` green x3 pending (workflow_dispatch hit no-Skia screenshot failure; local PR-like Skia proof passed; direct retarget run then hit Pulp iOS simulator `SecTrustCopyAnchorCertificates` failures); Tier 2 janitor proven and `tartci observe macos` added (2026-06-09)
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

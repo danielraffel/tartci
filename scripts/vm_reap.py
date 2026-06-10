@@ -451,7 +451,12 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             {
                 "runner": state.get("runner"),
                 "vm": state.get("vm"),
+                "vm_ip": state.get("vm_ip"),
                 "phase": state.get("phase"),
+                "repo": state.get("repo"),
+                "labels": state.get("labels"),
+                "run_id": state.get("run_id"),
+                "job_id": state.get("job_id"),
                 "ts": state.get("ts"),
                 "heartbeat_age_secs": state.get("_age_secs"),
                 "supervisor_pid": state.get("supervisor_pid"),

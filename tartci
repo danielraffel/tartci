@@ -9,6 +9,7 @@
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci observe macos       # read-only live view of macOS VM runners/jobs
 #   tartci setup               # brew-install prereqs + create local stores
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
@@ -62,6 +63,14 @@ cmd_status() {
 
 cmd_profile() {
   exec python3 "$HERE/scripts/profile.py" "$@"
+}
+
+cmd_observe() {
+  local os="${1:-macos}"; shift || true
+  case "$os" in
+    macos) exec python3 "$HERE/scripts/macos_observe.py" "$@" ;;
+    *) echo "usage: tartci observe <macos> [--json] [--runner NAME] [--run-id ID]"; return 2 ;;
+  esac
 }
 
 cmd_setup() {
@@ -140,6 +149,7 @@ case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
   profile) shift; cmd_profile "$@" ;;
+  observe) shift; cmd_observe "$@" ;;
   setup)   cmd_setup ;;
   bench)   shift; cmd_bench "$@" ;;
   metrics) shift; cmd_metrics "$@" ;;
