@@ -475,8 +475,11 @@ JIT labels/claim/cleanup, and representative Pulp builds only for release gates 
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
 fail-closed; tests). Confirm field name (Decision #2). Resolve M5 golden distribution (Decision #4) —
 build on each host or pull from a registry. Configure each host (install tartci under `$HOME`, goldens
-present, launchd serve + reap agents, `[host_class.*]` for each host). **Make explicit that
-only macOS lanes consume a `VmSlot`; Linux/Windows lanes are admitted without the 2-cap.** **[CODEX]
+present, launchd serve + reap agents, `[host_class.*]` for each host). The controller and secondary
+hosts are multi-role CI hosts: they can participate in the macOS pool and also serve Linux/Windows
+lanes, but the capacity model is lane-specific. **Make explicit that only macOS lanes consume a
+`VmSlot`; Linux/Windows lanes have their own Tart/QEMU supervisors, labels, and caps, and are admitted
+without the macOS 2-cap.** **[CODEX]
 Model the macOS slot as a `VmSlot` lease resource** (per-host ceiling) rather than SSH-fan-out in
 `queue_scheduler`; wire `reroute.rs` (probe → free>0 **and supervisor fresh** → candidates →
 `decide_reroute` → retarget + launch one VM). **Local-queue + failover:** when no slot is free a job
@@ -486,7 +489,7 @@ local fleet is offline/unhealthy or the operator explicitly chooses hosted fallb
 **[CODEX] Mixed-use hosts get stricter separation:** CI-specific state root + prefixes +
 protected names; `--fix` disabled-or-stricter until ownership markers proven; host-local cap reservations
 / route weights so the dev laptop isn't treated as a dedicated runner (its bench/agent VMs share its Tart
-namespace + 2-slot quota). **Gate:** with `pulp-vm` on Studio and a free host idle, two queued jobs → one
+namespace + physical CPU/RAM). **Gate:** with `pulp-vm` on Studio and a free host idle, two queued jobs → one
 to Studio (if free), overflow to the free host; no host exceeds 2 macOS VMs; **a Linux/Windows VM does
 NOT reduce macOS free, and Linux/Windows jobs run concurrently beyond 2**; `fleet-status --json` shows
 per-host capacity, unreadable hosts, **dead supervisors (host unroutable despite free slots)**, orphan
@@ -548,6 +551,20 @@ GitHub-hosted macOS as automatic overflow for a full local fleet; local jobs sho
 drain when any controller/secondary host slot opens. Hosted macOS is reserved for explicit operator
 fallback when the local fleet is offline/unhealthy or when a particular workflow intentionally asks for
 hosted coverage.
+**Status 2026-06-10 shared-label sentinel proof:** used Pulp's lightweight `Docs Consistency`
+workflow instead of `Build and Test` to avoid broad Pulp builds or hosted macOS. Dispatched
+workflow runs `27248875575` (`main`) and `27248876390` (`develop/shipyard-validation`) with
+`runner_selector_json=["self-hosted","macOS","ARM64","pulp-build-vm-sentinel-20260610-0225"]`.
+Started one `tartci serve macos --once` VM runner on the controller and one on the secondary host
+with `TARTCI_RUNNER_WORKFLOW_NAME="Docs Consistency"` and the same sentinel label. Both jobs assigned
+to local Tart VM runners, completed successfully, deregistered their JIT runners, and discarded their
+VM clones. Post-run GitHub runner lookup for the sentinel label returned empty; `tart list` on both
+hosts showed no sentinel VM; host-local `tartci doctor --reap --json` reported `problems=[]`.
+Final Shipyard `runner fleet-status` reported `free_slots=3`, `routable_free_slots=3`,
+`any_unreadable=false`, `problem_hosts=false`, `supervisor_unhealthy=false`, and no stale
+supervisors. This proves shared-label local queue drain across two hosts without inviting
+GitHub-hosted macOS; the remaining Phase-5 gap is wiring this capacity snapshot into the live
+scheduler/reroute admission path for production labels.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
