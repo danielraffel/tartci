@@ -115,8 +115,9 @@ makes wedge handling far simpler than today's bare-metal worker-killing.
   they scale with host resources and run many concurrently.
 - **Pool across the controller + secondary Apple Silicon hosts** with **secondary-host failover** and
   **local queueing**: when no slot is free, a job waits and is picked up the moment a slot opens on any
-  configured host (no premature cloud push); cloud-queued macOS jobs are drained back to local when a
-  slot frees (`reroute.rs`).
+  configured host (no premature cloud push). GitHub-hosted macOS is an explicit fallback for local-fleet
+  outage or an operator override, not normal overflow just because local slots are temporarily full.
+  Cloud-queued macOS jobs are drained back to local when a slot frees (`reroute.rs`).
 - **Self-healing wedge handling** so a hung job is caught and reaped in minutes without a human.
 - **tartci repo kept current** — README/docs/runbook updated, and the `tart-ci` skill updated to point
   at tartci's macOS provider.
@@ -479,8 +480,10 @@ only macOS lanes consume a `VmSlot`; Linux/Windows lanes are admitted without th
 Model the macOS slot as a `VmSlot` lease resource** (per-host ceiling) rather than SSH-fan-out in
 `queue_scheduler`; wire `reroute.rs` (probe → free>0 **and supervisor fresh** → candidates →
 `decide_reroute` → retarget + launch one VM). **Local-queue + failover:** when no slot is free a job
-stays queued and is taken the moment any configured host frees a slot (serve-loop polling + reroute), with no
-premature cloud push. **[CODEX] Mixed-use hosts get stricter separation:** CI-specific state root + prefixes +
+stays queued on the local VM labels and is taken the moment any configured host frees a slot (serve-loop
+polling + reroute), with no premature cloud push. GitHub-hosted macOS should be invited only when the
+local fleet is offline/unhealthy or the operator explicitly chooses hosted fallback.
+**[CODEX] Mixed-use hosts get stricter separation:** CI-specific state root + prefixes +
 protected names; `--fix` disabled-or-stricter until ownership markers proven; host-local cap reservations
 / route weights so the dev laptop isn't treated as a dedicated runner (its bench/agent VMs share its Tart
 namespace + 2-slot quota). **Gate:** with `pulp-vm` on Studio and a free host idle, two queued jobs → one
@@ -533,6 +536,18 @@ rename it into place. Patched tartci was synced to the local and secondary
 `$HOME/.local/share/tartci` installs; the local and side-by-side secondary pilot
 supervisors were restarted idle and `doctor --reap --json` reported
 `problems=[]` with fresh `waiting` heartbeats on both.
+**Status 2026-06-10 Shipyard scheduling primitive:** Shipyard now records macOS
+VM-slot demand in queued job resource plans and has pure admission helpers that
+can defer a second macOS VM job when a supplied `macos` slot capacity snapshot is
+exhausted, while Linux/cloud jobs remain ungated by local VM slots. This is not
+the live Phase-5 drain-loop gate yet; the next wiring step is feeding the
+fleet-status capacity snapshot into the scheduler/reroute path and proving
+shared-label local queue/failover with pilot jobs.
+**Policy clarification 2026-06-10:** local macOS VMs are the preferred service path. Do not treat
+GitHub-hosted macOS as automatic overflow for a full local fleet; local jobs should remain queued and
+drain when any controller/secondary host slot opens. Hosted macOS is reserved for explicit operator
+fallback when the local fleet is offline/unhealthy or when a particular workflow intentionally asks for
+hosted coverage.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
