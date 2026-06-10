@@ -577,6 +577,46 @@ when the Mac fleet is merely full. Hosted macOS remains available as explicit
 operator fallback by restoring the old value:
 `gh variable set -R danielraffel/pulp PULP_OVERFLOW_BUILD_MACOS_RUNS_ON_JSON --body '["macos-15"]'`.
 
+**Status 2026-06-10 Phase-6 required-label prevalidation:** proved a disposable
+macOS VM can advertise the required `pulp-build` label and satisfy the `macos`
+alias while bare-metal `pulp-build` runners remain online. A scratch Pulp branch
+(`codex/tartci-phase6-required-vm-proof-20260610`) first dispatched
+`Build and Test` run `27250248645` with selector
+`["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm-phase6-proof-20260610"]`.
+The job assigned to VM runner `tartci-phase6-pulp-build-proof-20260610`, built
+and tested in the VM, then failed one Pulp payload test:
+`Screenshot render_to_rgba produces non-black pixels (Skia raster)`. Root cause:
+the proof used `workflow_dispatch`, whose macOS configure path sets
+`-DPULP_ENABLE_GPU=OFF`; the test was guarded on `__APPLE__ || PULP_HAS_SKIA`
+even though raw RGBA rendering is Skia-only on macOS.
+
+The scratch branch then added commit `f6f02c974` (`test: guard rgba screenshot
+proof on skia`) and reran as `27250564395` with selector
+`["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm-phase6-proof-r2-20260610"]`.
+Evidence:
+- `macOS (ARM64) [operator]` ran on
+  `tartci-phase6-pulp-build-proof-r2-20260610`, started `2026-06-10T03:12:52Z`,
+  completed `2026-06-10T03:17:05Z`, conclusion `success`.
+- `macos` alias started `2026-06-10T03:12:52Z`, completed
+  `2026-06-10T03:17:08Z`, conclusion `success`.
+- The one-shot runner deregistered (`Removed .credentials`, `Removed .runner`)
+  and discarded VM `tartci-phase6-pulp-build-proof-r2-20260610`.
+- Post-run `tartci doctor --reap --json` on the controller reported
+  `problems=[]`, no proof GitHub runners, `running_macos_vms=0`, `free=2`;
+  `tart list --format json` showed only the stopped protected base/golden VMs.
+- Required bare-metal runners stayed online during and after the proof; no
+  production bare-metal label was removed.
+- Remaining Linux/Windows jobs in the workflow were canceled after the `macos`
+  alias went green to avoid burning GitHub-hosted minutes.
+- Final Shipyard fleet view stayed healthy:
+  `problem_hosts=false`, `supervisor_unhealthy=false`, `any_unreadable=false`,
+  `routable_free_slots=3` across controller + secondary.
+
+This is a green **prevalidation** of VM assignment + required-label compatibility.
+It is not Phase-6 graduation yet: production `pulp-build` still needs a planned
+drain/relabel window, rollback automation/SLA trigger, and an agreed observation
+period with real required jobs running on VM lanes.
+
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
 "pre-registered"): bring up a VM JIT runner advertising `pulp-build`, confirm it takes a required job
@@ -667,5 +707,5 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
 - [x] Phase 4 — pilot on `pulp-build-vm` green x3; Tier 2 janitor proven; `tartci observe macos` added and used for live process/CTest visibility (2026-06-09; green runs `27244204561`, `27244825290`, `27245570264`)
-- [ ] Phase 5 — controller+secondary hosts pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
-- [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated
+- [x] Phase 5 — controller+secondary hosts pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status (2026-06-10)
+- [ ] Phase 6 — required `pulp-build` prevalidation green on a VM; production graduation/drain window still pending; bare-metal fallback retained
