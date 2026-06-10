@@ -539,13 +539,18 @@ rename it into place. Patched tartci was synced to the local and secondary
 `$HOME/.local/share/tartci` installs; the local and side-by-side secondary pilot
 supervisors were restarted idle and `doctor --reap --json` reported
 `problems=[]` with fresh `waiting` heartbeats on both.
-**Status 2026-06-10 Shipyard scheduling primitive:** Shipyard now records macOS
-VM-slot demand in queued job resource plans and has pure admission helpers that
-can defer a second macOS VM job when a supplied `macos` slot capacity snapshot is
-exhausted, while Linux/cloud jobs remain ungated by local VM slots. This is not
-the live Phase-5 drain-loop gate yet; the next wiring step is feeding the
-fleet-status capacity snapshot into the scheduler/reroute path and proving
-shared-label local queue/failover with pilot jobs.
+**Status 2026-06-10 Shipyard scheduler wiring:** Shipyard now records macOS
+VM-slot demand in queued job resource plans and feeds the same live
+`[host_class.*]` Tart capacity probe used by `runner capacity` / `fleet-status`
+into the cooperative drain scheduler. When host classes are configured, pending
+macOS/Darwin local VM jobs consume the aggregate `macos` VM-slot snapshot and
+stay queued when the local pool is full; Linux/Windows/cloud jobs remain
+ungated by macOS VM slots. The drain loop skips the Tart/SSH capacity probe when
+no queued/running job claims a macOS VM slot, so Linux/Windows-only queues do
+not pay macOS fleet-probe latency. Focused Shipyard tests covered the pure
+scheduler, capacity parsing, fleet-status, queue concurrency, and the regression
+that a zero-slot macOS pool defers a macOS job while still running an independent
+Linux job.
 **Policy clarification 2026-06-10:** local macOS VMs are the preferred service path. Do not treat
 GitHub-hosted macOS as automatic overflow for a full local fleet; local jobs should remain queued and
 drain when any controller/secondary host slot opens. Hosted macOS is reserved for explicit operator
@@ -563,8 +568,14 @@ hosts showed no sentinel VM; host-local `tartci doctor --reap --json` reported `
 Final Shipyard `runner fleet-status` reported `free_slots=3`, `routable_free_slots=3`,
 `any_unreadable=false`, `problem_hosts=false`, `supervisor_unhealthy=false`, and no stale
 supervisors. This proves shared-label local queue drain across two hosts without inviting
-GitHub-hosted macOS; the remaining Phase-5 gap is wiring this capacity snapshot into the live
-scheduler/reroute admission path for production labels.
+GitHub-hosted macOS. The remaining Phase-5 gap is production-label graduation rather than scheduler
+capacity wiring.
+**Status 2026-06-10 local-first overflow config:** set Pulp repo variable
+`PULP_OVERFLOW_BUILD_MACOS_RUNS_ON_JSON=local-only`, replacing the previous
+`["macos-15"]` automatic overflow target. This makes local queueing the default
+when the Mac fleet is merely full. Hosted macOS remains available as explicit
+operator fallback by restoring the old value:
+`gh variable set -R danielraffel/pulp PULP_OVERFLOW_BUILD_MACOS_RUNS_ON_JSON --body '["macos-15"]'`.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
