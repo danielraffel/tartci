@@ -68,6 +68,35 @@ MagicDNS name and can `ssh`/log-pull from anywhere without port juggling. Prefer
 the MagicDNS name over the per-boot vmnet IP. Disable Tailscale SSH on persistent
 operator boxes to avoid re-auth prompts.
 
+**Secondary Apple Silicon hosts (M-series pool members).** Keep host-specific
+aliases in your local SSH and Shipyard config, not in this repo. The reusable
+shape is:
+
+```bash
+# Prove non-interactive SSH and the host's Tart install/store.
+ssh <m-series-ssh-alias> 'hostname; sw_vers -productVersion; sysctl -n machdep.cpu.brand_string'
+ssh <m-series-ssh-alias> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list --format json'
+```
+
+Use an explicit Homebrew Tart path because non-interactive SSH may not load
+Homebrew's PATH. Prefer a home-backed Tart store for launchd-operated macOS CI:
+`TART_HOME=/Users/<you>/VMs` on each host, with the macOS golden copied or baked
+there. In Shipyard, keep the matching operator-local capacity config outside the
+committed repo config:
+
+```toml
+[host_class.m5]
+ssh = "<m-series-ssh-alias>"
+cap = 2
+tart_bin = "/opt/homebrew/bin/tart"
+tart_home = "/Users/<you>/VMs" # absolute path; no shell/tilde expansion
+labels = ["self-hosted", "macos", "arm64", "<repo>-build-m5"]
+```
+
+The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
+all point at the same Tart store. If one uses default `tart` state and another
+uses `TART_HOME`, capacity and cleanup will disagree.
+
 ---
 
 ## 2. macOS lane (Tart)

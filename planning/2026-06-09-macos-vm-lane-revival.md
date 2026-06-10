@@ -10,13 +10,14 @@
 
 ## For the executing agent — read this first
 
-**You are running ON the Mac Studio** (`macstudio` / Daniels-Mac-Studio), the primary host. macOS VM
-work is **local** — do **not** `ssh macstudio`. For the multi-host phase you will `ssh blackbook` and
-`ssh m5` to configure the secondary hosts; establishing/verifying that outbound SSH is a Phase-5
-prerequisite.
+**You are running ON the primary Mac Studio host.** macOS VM work is **local** — do **not** `ssh`
+back into the controller. For the multi-host phase, SSH only to the configured secondary host aliases
+needed for setup/verification; establishing/verifying outbound SSH is a Phase-5 prerequisite. Keep
+actual host aliases in operator-local config, not reusable repo docs.
 
 **Mission:** take pulp's macOS CI from "VM lane built but dead, silently on bare-metal" to a working
-**ephemeral disposable-VM lane**, abstracted into `tartci`, pooled across **Studio + BlackBook + M5**
+**ephemeral disposable-VM lane**, abstracted into `tartci`, pooled across the controller and secondary
+Apple Silicon hosts
 (macOS capped at **2 VMs/host**; **Linux/Windows uncapped**), with **warm caches** (pulp, Skia, v8)
 and **self-healing wedge handling**, while keeping the required `pulp-build` gate green the whole time.
 End state also serves **on-demand pre-configured `bench` VMs** an agent can boot to test in isolation.
@@ -112,9 +113,10 @@ makes wedge handling far simpler than today's bare-metal worker-killing.
   goldens so dependencies are warm by construction.
 - **macOS is the only slot-capped OS (2/host); Linux & Windows lanes are NOT gated by that limit** —
   they scale with host resources and run many concurrently.
-- **Pool across Studio + BlackBook + M5** with **failover to M5** and **local queueing**: when no slot
-  is free, a job waits and is picked up the moment a slot opens on Studio *or* M5 (no premature cloud
-  push); cloud-queued macOS jobs are drained back to local when a slot frees (`reroute.rs`).
+- **Pool across the controller + secondary Apple Silicon hosts** with **secondary-host failover** and
+  **local queueing**: when no slot is free, a job waits and is picked up the moment a slot opens on any
+  configured host (no premature cloud push); cloud-queued macOS jobs are drained back to local when a
+  slot frees (`reroute.rs`).
 - **Self-healing wedge handling** so a hung job is caught and reaped in minutes without a human.
 - **tartci repo kept current** — README/docs/runbook updated, and the `tart-ci` skill updated to point
   at tartci's macOS provider.
@@ -193,7 +195,8 @@ Aggregates per-host `tartci doctor` digests + `capacity.rs` free slots + GitHub 
 - Alerts: (a) queued-age>threshold **with** free capacity **and** responsive supervisors; (b)
   capacity-free-but-supervisor-dead; (c) **no fresh digest from a host** (who-watches-the-watchers —
   catches all-supervisors-dead even when queue age is low); (d) capacity **starvation** (queued high +
-  zero free on a CI host — must not stay silent, esp. on BlackBook where bench VMs can starve CI).
+  zero free on a CI host — must not stay silent, especially on mixed-use hosts where bench VMs can
+  starve CI).
 - Backstop: launchd `KeepAlive` on serve/janitor agents + the poller alerting on missing digests.
 
 ### Seam
@@ -219,7 +222,7 @@ A named goal: make repeat builds nearly as fast as the warm bare-metal dirs, **w
   warm by construction; only pulp's own source compiles fresh in each clone.
 - **Project-agnostic:** tartci's per-repo `vm-image` manifest means **v8** and **skia-builder** get the
   same treatment via their own manifests + cache mounts later (their runners — `v8builder-*` — already
-  exist on Studio + BlackBook). pulp is the first consumer; v8/skia are fast-follow consumers.
+  exist on the controller + secondary hosts). pulp is the first consumer; v8/skia are fast-follow consumers.
 
 ---
 
@@ -246,7 +249,7 @@ A named goal: make repeat builds nearly as fast as the warm bare-metal dirs, **w
 3. **Admission architecture [CODEX].** GitHub binds a job to one runner → concern is VM *waste*, not
    correctness. Start with self-coordinating per-host `serve --loop` + idle-timeout reap; central
    SSH-fan-out admission is a later `VmSlot`-lease optimization, not SSH bolted onto `queue_scheduler`.
-4. **M5 golden distribution [CODEX — Phase-5 blocker].** Local `tart build` (reproducible, slow) vs.
+4. **Secondary-host golden distribution [CODEX — Phase-5 blocker].** Local `tart build` (reproducible, slow) vs.
    `tart push/pull` via a registry (fast, needs registry+auth). Decide before pooling.
 5. **[CODEX] Auto-rerun-on-timeout** — timeout = failed/lost run, so define a guarded *capped* rerun
    policy (e.g. rerun once if `rerun_eligible` and not a repeat timeout). Default off until pilot data.
@@ -466,18 +469,18 @@ deregistration, and VM cleanup. They should not be the routine tartci health pro
 visibility loop should be layered: local Tart smoke for boot/SSH/teardown, a tiny GitHub sentinel job for
 JIT labels/claim/cleanup, and representative Pulp builds only for release gates or lane-changing work.
 
-### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
-**Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
+### Phase 5 — Multi-host pooling + shipyard wiring (controller + secondary hosts)
+**Prereq:** establish/verify outbound SSH from the controller to each configured secondary host alias. First fix
 `capacity.rs` to count macOS-only VMs (add `os`, filter `OS=="macOS"`, conservative on missing,
 fail-closed; tests). Confirm field name (Decision #2). Resolve M5 golden distribution (Decision #4) —
 build on each host or pull from a registry. Configure each host (install tartci under `$HOME`, goldens
-present, launchd serve + reap agents, `[host_class.*]` for studio/blackbook/m5). **Make explicit that
+present, launchd serve + reap agents, `[host_class.*]` for each host). **Make explicit that
 only macOS lanes consume a `VmSlot`; Linux/Windows lanes are admitted without the 2-cap.** **[CODEX]
 Model the macOS slot as a `VmSlot` lease resource** (per-host ceiling) rather than SSH-fan-out in
 `queue_scheduler`; wire `reroute.rs` (probe → free>0 **and supervisor fresh** → candidates →
 `decide_reroute` → retarget + launch one VM). **Local-queue + failover:** when no slot is free a job
-stays queued and is taken the moment Studio *or* M5 frees a slot (serve-loop polling + reroute), with no
-premature cloud push. **[CODEX] BlackBook gets stricter separation:** CI-specific state root + prefixes +
+stays queued and is taken the moment any configured host frees a slot (serve-loop polling + reroute), with no
+premature cloud push. **[CODEX] Mixed-use hosts get stricter separation:** CI-specific state root + prefixes +
 protected names; `--fix` disabled-or-stricter until ownership markers proven; host-local cap reservations
 / route weights so the dev laptop isn't treated as a dedicated runner (its bench/agent VMs share its Tart
 namespace + 2-slot quota). **Gate:** with `pulp-vm` on Studio and a free host idle, two queued jobs → one
@@ -485,6 +488,13 @@ to Studio (if free), overflow to the free host; no host exceeds 2 macOS VMs; **a
 NOT reduce macOS free, and Linux/Windows jobs run concurrently beyond 2**; `fleet-status --json` shows
 per-host capacity, unreadable hosts, **dead supervisors (host unroutable despite free slots)**, orphan
 counts, oldest queued-age; non-zero exit on unreadable host or queued-age-with-capacity.
+
+**Status 2026-06-09:** secondary M-series host reachable via operator-local SSH alias. Non-interactive
+SSH did not inherit Homebrew's PATH, so reusable setup docs now require explicit
+`tart_bin = "/opt/homebrew/bin/tart"` plus absolute `tart_home = "/Users/<you>/VMs"`. Live Shipyard
+capacity proof with `tart_home` support read the controller as `running=0/free=2` and the M-series host
+as `running=1/free=1`, total `free=3`, `any_unreadable=false`. A stale global host-class entry failed
+closed until overridden locally, confirming unreadable hosts do not advertise free capacity.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
@@ -496,7 +506,7 @@ misses SLA by > N min, bare metal re-registers automatically. **Update tartci** 
 new-repo-agent-guide (macOS "wired"; pilot-vs-required labels; 2-VM cap; `$HOME`-executable rule; the
 three tiers; warm-cache notes) and **update the `tart-ci` skill** to point at tartci's macOS provider.
 **Gate:** for an agreed window — required jobs run in VMs, no `pulp-studio-*` build paths, no host >2
-macOS VMs, M5 failover works, janitor ran clean, `fleet-status` stayed healthy, docs + skill updated.
+macOS VMs, secondary-host failover works, janitor ran clean, `fleet-status` stayed healthy, docs + skill updated.
 
 ---
 
@@ -541,7 +551,7 @@ macOS VMs, M5 failover works, janitor ran clean, `fleet-status` stayed healthy, 
 
 ## Cross-cutting concerns — mostly **[CODEX]**
 
-- **BlackBook is a dev/agent laptop AND a CI host** — CI + bench VMs share one Tart namespace + the
+- **A secondary host may be a dev/agent laptop AND a CI host** — CI + bench VMs share one Tart namespace + the
   2-slot quota. CI-specific state root + prefixes + protected names; gate `--fix` stricter; host-local
   cap reservations / route weights; alert on bench VMs *starving* CI. Positive CI ownership markers
   mandatory before unattended `--fix`.
@@ -551,7 +561,7 @@ macOS VMs, M5 failover works, janitor ran clean, `fleet-status` stayed healthy, 
 - **Who-watches-the-watchers** — all-supervisors-dead surfaces via stale digests / missing heartbeats +
   launchd `KeepAlive`.
 - **Golden rebuild cadence** — weekly / on-toolchain-or-Skia-bump rebake as a first-class acceptance criterion.
-- **M5 golden distribution** — Decision #4 (Phase-5 blocker).
+- **Secondary-host golden distribution** — Decision #4 (Phase-5 blocker).
 - **On-demand agent/bench VM** — first-class design, kept out of CI reap scope.
 
 ---
@@ -576,5 +586,5 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
 - [x] Phase 4 — pilot on `pulp-build-vm` green x3; Tier 2 janitor proven; `tartci observe macos` added and used for live process/CTest visibility (2026-06-09; green runs `27244204561`, `27244825290`, `27245570264`)
-- [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
+- [ ] Phase 5 — controller+secondary hosts pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

@@ -10,7 +10,7 @@
   serving Pulp. A different consuming repo renames BOTH this label and the
   matching row in shipyard-macos-gui's CIServingLane.known.
 
-  Install (per Mac that hosts the Linux Tart golden — e.g. the M5/blackbook):
+  Install (per Apple Silicon host that serves the Linux Tart golden):
 
     1. Bake the golden: it must carry the actions-runner agent at ~/actions-runner
        (actions-runner-linux-arm64). Copy the Linux golden into this host's TART_HOME.
@@ -22,8 +22,7 @@
            launchd/com.danielraffel.pulp.tart-runner-linux.plist.template \
            > ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-linux.plist
 
-       (On the blackbook/M5, TART_HOME is /Users/danielraffel/VMs — set it to
-       wherever the golden lives.)
+       Set TART_HOME to the absolute path where this host's Tart goldens live.
     3. Grant Full Disk Access if TART_HOME is on /Volumes (TCC; exit 126 without).
     4. Load:   launchctl load ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-linux.plist
        Verify: launchctl list | grep tart-runner-linux ; tail -F ~/Library/Logs/tartci/tart-runner-linux.log

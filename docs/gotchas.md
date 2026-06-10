@@ -16,6 +16,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   (Rosetta on Linux, Prism on Windows) as a *signal only* — GitHub-hosted x64
   stays the authoritative gate.
 
+- **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
+  → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
+  → *Fix:* configure fleet tools with the absolute Tart path, usually
+  `/opt/homebrew/bin/tart`, and pass the intended store explicitly as
+  `TART_HOME=/Users/<you>/VMs` (or the host's absolute Tart store path).
+
 ## Linux (Tart)
 
 - **Injected SSH keys vanish after reboot.**

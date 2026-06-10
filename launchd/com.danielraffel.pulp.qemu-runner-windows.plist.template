@@ -11,7 +11,7 @@
   serving Pulp. A different consuming repo renames BOTH this label and the
   matching row in shipyard-macos-gui's CIServingLane.known.
 
-  Install (per Mac that hosts the Windows golden — e.g. the M5/blackbook):
+  Install (per Apple Silicon host that serves the Windows golden):
 
     1. Copy the Windows golden qcow2 into this host's $TARTCI_GOLDENS
        (default $HOME/.tartci/goldens). The supervisor install-if-missing the

@@ -92,6 +92,9 @@ debug); pool jobs build whatever arch the workflow targets. The macOS serve loop
 only boots when a queued job's requested labels are satisfiable by the configured
 runner labels, so a `pulp-build-vm` pilot agent does not boot for unrelated
 queued `Build and Test` work.
+For additional Apple Silicon pool members, use the generic host checklist in
+`docs/runbook.md`: stable SSH alias, absolute `/opt/homebrew/bin/tart`,
+home-backed `TART_HOME`, and matching Shipyard `host_class` capacity config.
 
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart
