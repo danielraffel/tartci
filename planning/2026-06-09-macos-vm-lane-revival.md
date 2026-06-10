@@ -495,6 +495,9 @@ SSH did not inherit Homebrew's PATH, so reusable setup docs now require explicit
 capacity proof with `tart_home` support read the controller as `running=0/free=2` and the M-series host
 as `running=1/free=1`, total `free=3`, `any_unreadable=false`. A stale global host-class entry failed
 closed until overridden locally, confirming unreadable hosts do not advertise free capacity.
+`runner reroute-watch --repo danielraffel/pulp --target macos --once --json` now emits the per-host
+capacity rows and the full candidate list in observe mode; the live tick saw `free_slots=3`,
+`candidate_count=10`, and would have selected PR `#3808` without acting.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
