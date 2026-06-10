@@ -511,6 +511,13 @@ required disposable VM as unowned/non-stale. Remote
 `tartci serve macos --print-queue --labels self-hosted,macOS,ARM64,pulp-build-vm-m5-pilot` returned
 `0`, so the unique pilot label would idle. Rendered a valid, distinct, **not loaded** pilot plist at
 `$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-pilot.plist`.
+**Status 2026-06-09 pilot load proof:** loaded the side-by-side M-series pilot LaunchAgent. It is
+running with labels `self-hosted,macOS,ARM64,pulp-build-vm-m5-pilot`, `TART_HOME=$HOME/VMs`, and
+workflow filter `Build and Test (macOS retarget)`. The log shows `queued=0 running_macos_vms=1/2`; Tart
+still has only the existing required-lane `pulp-m5-01` VM running. Remote `tartci observe macos --json
+--no-guest` reports supervisor `pulp-vm-m5-pilot-01`, phase `waiting`, fresh heartbeat, and
+`owner_pid_alive=true`. Rollback remains
+`launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-pilot"` on that host.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
