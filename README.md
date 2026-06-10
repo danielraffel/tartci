@@ -94,7 +94,8 @@ runner labels, so a `pulp-build-vm` pilot agent does not boot for unrelated
 queued `Build and Test` work.
 For additional Apple Silicon pool members, use the generic host checklist in
 `docs/runbook.md`: stable SSH alias, absolute `/opt/homebrew/bin/tart`,
-home-backed `TART_HOME`, and matching Shipyard `host_class` capacity config.
+absolute `$HOME/.local/bin/tartci`, home-backed `TART_HOME`, and matching
+Shipyard `host_class` capacity config.
 
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart
@@ -106,7 +107,9 @@ ownership marker, and goldens/bench names/`pulp-vm`/`rosetta-probe` stay
 protected. Offline GitHub runner registrations are reaped only when their names
 match an owned CI prefix and no fresh live supervisor heartbeat backs them. See
 `launchd/com.danielraffel.tartci.reap.plist.template` for the periodic
-host-local LaunchAgent shape.
+host-local LaunchAgent shape. macOS runner heartbeats replace their state files
+atomically so `doctor`, `observe`, and fleet-level probes never need to infer
+health from a partially written JSON file.
 
 ### Observe a live macOS runner
 `tartci observe macos` is the read-only operator view for macOS VM jobs. It

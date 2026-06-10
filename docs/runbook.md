@@ -85,17 +85,20 @@ there. In Shipyard, keep the matching operator-local capacity config outside the
 committed repo config:
 
 ```toml
-[host_class.m5]
+[host_class.secondary]
 ssh = "<m-series-ssh-alias>"
 cap = 2
 tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/<you>/.local/bin/tartci"
 tart_home = "/Users/<you>/VMs" # absolute path; no shell/tilde expansion
-labels = ["self-hosted", "macos", "arm64", "<repo>-build-m5"]
+labels = ["self-hosted", "macos", "arm64", "<repo>-build-secondary"]
 ```
 
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
 uses `TART_HOME`, capacity and cleanup will disagree.
+Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
+host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 
 ---
 
@@ -539,6 +542,9 @@ once with that JIT config, then discard the VM. The agent processes exactly one
 job and deregisters — no long-lived runner state. The `--loop` gate only boots
 when there is queued work (counts queued runs of `TARTCI_RUNNER_WORKFLOW_NAME`,
 default `Build and Test`), so idle hosts don't spin VMs.
+macOS supervisors atomically replace their heartbeat state file; `doctor`,
+`observe`, and Shipyard fleet probes should treat an unreadable state file as a
+real health problem, not as "no active runner."
 
 Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`,

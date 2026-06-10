@@ -96,11 +96,19 @@ event(){
 }
 
 heartbeat(){
-  local phase="$1" ts
+  local phase="$1" ts state_file tmp_file
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  cat >"$STATE_DIR/$RUNNER_NAME.state.json" <<EOF
+  state_file="$STATE_DIR/$RUNNER_NAME.state.json"
+  tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
+  if cat >"$tmp_file" <<EOF
 {"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
+  then
+    mv -f "$tmp_file" "$state_file"
+  else
+    rm -f "$tmp_file"
+    return 1
+  fi
 }
 
 running_macos_vms(){

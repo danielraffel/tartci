@@ -518,6 +518,21 @@ still has only the existing required-lane `pulp-m5-01` VM running. Remote `tartc
 --no-guest` reports supervisor `pulp-vm-m5-pilot-01`, phase `waiting`, fresh heartbeat, and
 `owner_pid_alive=true`. Rollback remains
 `launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-pilot"` on that host.
+**Status 2026-06-09 fleet visibility proof:** Shipyard now has
+`runner fleet-status`, which aggregates `runner capacity`, host-local
+`tartci doctor --reap --json`, supervisor freshness, and queued macOS age. A
+live high-threshold check (`--queued-age-threshold-secs 999999 --queue-run-limit 40`)
+reported `free_slots=4`, `routable_free_slots=4`, `any_unreadable=false`,
+`supervisor_unhealthy=false`, and `problem_hosts=false` across controller +
+secondary host. The normal-threshold check exited `1` only because
+`queued_age_with_capacity=true` (`queue.count=29`, oldest queued age about
+13.2k seconds) while both hosts stayed routable; this is the intended visibility
+alert. During validation a transient empty heartbeat state file was caught and
+fixed by making the macOS runner heartbeat write a temp file and atomically
+rename it into place. Patched tartci was synced to the local and secondary
+`$HOME/.local/share/tartci` installs; the local and side-by-side secondary pilot
+supervisors were restarted idle and `doctor --reap --json` reported
+`problems=[]` with fresh `waiting` heartbeats on both.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not

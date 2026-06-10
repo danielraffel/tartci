@@ -36,6 +36,9 @@ shape: install tartci into `$HOME/.local/share/tartci`, expose a small
 `$HOME/.local/bin/tartci` wrapper, and keep macOS goldens under `$HOME/VMs`.
 Only use `/Volumes` for macOS launchd after introducing a signed Full Disk
 Access helper.
+Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
+wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
+capacity and supervisor health will be read from different Tart homes.
 
 If a host already has a required-lane Pulp LaunchAgent using
 `com.danielraffel.pulp.tart-runner`, do not overwrite it during pilot. Install a
