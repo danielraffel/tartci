@@ -37,6 +37,13 @@ shape: install tartci into `$HOME/.local/share/tartci`, expose a small
 Only use `/Volumes` for macOS launchd after introducing a signed Full Disk
 Access helper.
 
+If a host already has a required-lane Pulp LaunchAgent using
+`com.danielraffel.pulp.tart-runner`, do not overwrite it during pilot. Install a
+side-by-side pilot plist with a distinct `Label`, log path, and non-required
+runner labels, then load it only after `shipyard runner capacity` shows a free
+slot. Graduate labels later, after the required lane drains and rollback is
+ready.
+
 ## Janitor
 
 `com.danielraffel.tartci.reap.plist.template` runs the Phase-4 Tier-2 janitor:

@@ -54,6 +54,12 @@
   `pulp-build-vm` pilot lane. Do not advertise `pulp-build` until Phase 6,
   with bare-metal fallback still live.
 
+  SIDE-BY-SIDE HOSTS: if a host already has a required-lane Pulp LaunchAgent
+  using com.danielraffel.pulp.tart-runner, do not overwrite it. Copy this
+  template to a pilot-specific plist and change, at minimum, Label, log paths,
+  ProgramArguments --labels, and TARTCI_RUNNER_LABELS to a non-required pilot
+  label. Load the pilot only after `shipyard runner capacity` shows a free slot.
+
   Requires on this host: tart + the macOS golden in TART_HOME, gh authenticated
   for the target repo (repo admin, to mint JIT configs), and ~/.ssh/id_ed25519
   accepted by the golden. Override repo/golden/labels via tartci runner env vars.
