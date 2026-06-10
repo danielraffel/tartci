@@ -108,9 +108,11 @@ host-local LaunchAgent shape.
 ### Observe a live macOS runner
 `tartci observe macos` is the read-only operator view for macOS VM jobs. It
 combines the janitor digest, matching GitHub run/job/step state, guest process
-snapshots, recent CTest output, and the runner log tail. Use `--no-guest` when
-the VM is already gone or SSH is not useful, `--runner NAME` to narrow a host
-with multiple supervisors, and `--json` for scripts.
+snapshots, recent CTest output, and the runner log tail. Guest process snapshots
+redact GitHub runner `--jitconfig` payloads and truncate long command lines by
+default; use `--process-line-width N` if a wider diagnostic view is needed. Use
+`--no-guest` when the VM is already gone or SSH is not useful, `--runner NAME`
+to narrow a host with multiple supervisors, and `--json` for scripts.
 
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux

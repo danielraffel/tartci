@@ -339,7 +339,7 @@ Implement + run `tartci doctor --reap --json` on Studio; create controlled resid
 clone, stale offline reg, stale state file) and verify `--fix` removes **only** owned/stale resources.
 Lifecycle/observability events land here. **Gate:** ≥3 pilot jobs pass; janitor fixes only owned residue.
 
-**Status 2026-06-09:** Tier-2 janitor implementation is in place, but the Phase-4 gate remains open.
+**Status 2026-06-09:** Tier-2 janitor implementation is in place and the Phase-4 gate is green.
 Added `tartci doctor --reap --json [--fix]`, `scripts/vm_reap.py`, runner heartbeat ownership fields
 (`provider`, host, supervisor PID, PID start time), and the periodic `$HOME`-anchored
 `launchd/com.danielraffel.tartci.reap.plist.template`. Live report-only on Studio was clean
@@ -355,9 +355,8 @@ runner with `action=wait_for_live_supervisor`, and proposed `delete_offline_runn
 registration; `--fix` returned `rc=0` and deleted only
 `github_runner_deleted:tartci-reap-runner-proof-20260609-stale:12824`. Post-clean GitHub runner lookup
 found no `tartci-reap-runner-proof-20260609*` registrations, and the live host report was clean again
-(`problems=[]`, `fixed=[]`, `capacity.free=2`). The `pulp-build-vm` pilot green x3 gate is still pending
-because current VM payload runs hit the known Pulp screenshot failure from Phase 1/3; do not graduate
-labels or advance to Phase 5 from this evidence.
+(`problems=[]`, `fixed=[]`, `capacity.free=2`). The first full pilots hit payload issues described
+below, then the direct retarget scratch branch produced the required `pulp-build-vm` green x3.
 
 **Host-side Phase-4 note 2026-06-09:** installed tartci under `$HOME/.local/share/tartci` with a
 `$HOME/.local/bin/tartci` shim that executes the copied dispatcher via `/bin/bash`, then rendered and
@@ -443,7 +442,29 @@ macOS retarget lane, not a tartci lifecycle failure. While diagnosing, manual SS
 gap: the GitHub UI only said `Test`, while the guest was in `ctest`, then two long CMake/Xcode iOS tests,
 then duplicate `three.js` FetchContent clones. Added read-only `tartci observe macos` plus heartbeat
 fields (`vm_ip`, `run_id`, `job_id`) so future pilots expose the GitHub step, guest process tree, recent
-CTest log, and runner log without ad hoc SSH.
+CTest log, and runner log without ad hoc SSH. The observer now redacts runner `--jitconfig` payloads and
+truncates long process command lines by default, keeping the useful process/step signal visible.
+
+**Representative green pilot gate 2026-06-09 / 2026-06-10 UTC:** the same scratch branch then added Pulp
+commit `d7f8df437b73ebb82600cc97bddb20b20600bbd1` (`ci: keep httplib macOS cert bridge off iOS`),
+which disables the cpp-httplib macOS root-certificate bridge for iOS builds while preserving the macOS
+Security/CoreFoundation bridge. Local scratch verification passed both former failing scripts:
+`test/cmake/test_ios_auv3_configure.sh` and `test/cmake/test_ios_hostapp_links.sh`. Three sequential
+GitHub-dispatched representative jobs then passed on the local Tart VM runner `pulp-vm-01`, all at the
+pinned `d7f8df437b73ebb82600cc97bddb20b20600bbd1` SHA:
+`27244204561`, `27244825290`, and `27245570264`. Each job ran on
+`["self-hosted","macOS","ARM64","pulp-build-vm"]`, completed Configure/Build/Test successfully, and
+returned the host to a clean state. Post-run `doctor --reap --json` after the final run reported
+`capacity.free=2`, `running_macos_vms=0`, `github_runners=[]`, `problems=[]`, `fixed=[]`, and the
+supervisor back in `phase=waiting`; `tart list --format json` showed only stopped protected goldens, and
+GitHub had no lingering `pulp-vm-01` runner registration. This satisfies the Phase-4 green x3 pilot and
+cleanup gate.
+
+**Cost/visibility lesson 2026-06-09:** full Pulp retarget jobs are useful as the expensive final proof
+because they exercise real GitHub JIT registration, label routing, job claim, payload execution, runner
+deregistration, and VM cleanup. They should not be the routine tartci health probe. The cheaper ongoing
+visibility loop should be layered: local Tart smoke for boot/SSH/teardown, a tiny GitHub sentinel job for
+JIT labels/claim/cleanup, and representative Pulp builds only for release gates or lane-changing work.
 
 ### Phase 5 — Multi-host pooling + shipyard wiring (Studio + BlackBook + M5)
 **Prereq:** establish/verify outbound `ssh blackbook` and `ssh m5` from macstudio. First fix
@@ -554,6 +575,6 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 1 — macOS primitive proven (interactive + JIT lifecycle) (2026-06-09; JIT payload failed one Pulp screenshot test)
 - [x] Phase 2 — launchd boots a VM (no exit 126) (2026-06-09; runner loop completed by Phase 3 provider)
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
-- [ ] Phase 4 — pilot on `pulp-build-vm` green x3 pending (workflow_dispatch hit no-Skia screenshot failure; local PR-like Skia proof passed; direct retarget run then hit Pulp iOS simulator `SecTrustCopyAnchorCertificates` failures); Tier 2 janitor proven and `tartci observe macos` added (2026-06-09)
+- [x] Phase 4 — pilot on `pulp-build-vm` green x3; Tier 2 janitor proven; `tartci observe macos` added and used for live process/CTest visibility (2026-06-09; green runs `27244204561`, `27244825290`, `27245570264`)
 - [ ] Phase 5 — Studio+BlackBook+M5 pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status
 - [ ] Phase 6 — required `pulp-build` graduated to VMs; bare-metal fallback retained; tartci docs + `tart-ci` skill updated

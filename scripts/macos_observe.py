@@ -175,7 +175,9 @@ set +e
 echo '[processes]'
 ps -axo pid,ppid,stat,etime,pcpu,pmem,command | \\
   egrep 'ctest|pulp-test|cmake --build|cmake -S|ninja|clang|xcodebuild|git clone|gtimeout|Runner.Worker|actions-runner' | \\
-  grep -v egrep | head -{args.process_limit}
+  grep -v egrep | head -{args.process_limit} | \\
+  sed -E 's/--jitconfig [A-Za-z0-9_+=\\/+.-]+/--jitconfig <redacted>/g' | \\
+  awk '{{ if (length($0) > {args.process_line_width}) print substr($0, 1, {args.process_line_width}) "..."; else print }}'
 echo
 echo '[ctest-lasttest]'
 find "$HOME/actions-runner/_work" -path '*/Testing/Temporary/LastTest.log' -type f -print 2>/dev/null | \\
@@ -346,6 +348,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--tart-timeout", type=int, default=10)
     parser.add_argument("--process-limit", type=int, default=40)
+    parser.add_argument("--process-line-width", type=int, default=280)
     parser.add_argument("--ctest-tail-lines", type=int, default=60)
     parser.add_argument("--log-lines", type=int, default=40)
     return parser.parse_args(argv)
