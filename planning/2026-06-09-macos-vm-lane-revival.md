@@ -504,6 +504,13 @@ Remote M-series inspection showed an existing required-lane LaunchAgent still ru
 cutover is side-by-side: install tartci under `$HOME/.local/share/tartci`, add a non-required pilot
 LaunchAgent/label on the M-series host, prove cleanup/observe output there, then graduate labels after
 the active required lane drains.
+**Status 2026-06-09 side-by-side prep:** installed current tartci to the M-series host's
+`$HOME/.local/share/tartci` with `$HOME/.local/bin/tartci` wrapper. Remote
+`TART_HOME=$HOME/VMs tartci doctor --reap --json` reported `problems=[]`, `free=1`, and the existing
+required disposable VM as unowned/non-stale. Remote
+`tartci serve macos --print-queue --labels self-hosted,macOS,ARM64,pulp-build-vm-m5-pilot` returned
+`0`, so the unique pilot label would idle. Rendered a valid, distinct, **not loaded** pilot plist at
+`$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-pilot.plist`.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
