@@ -498,6 +498,12 @@ closed until overridden locally, confirming unreadable hosts do not advertise fr
 `runner reroute-watch --repo danielraffel/pulp --target macos --once --json` now emits the per-host
 capacity rows and the full candidate list in observe mode; the live tick saw `free_slots=3`,
 `candidate_count=10`, and would have selected PR `#3808` without acting.
+Remote M-series inspection showed an existing required-lane LaunchAgent still running the older
+`~/Code/pulp-ci/tools/ci/tart-runner.sh` shape with `pulp-build,pulp-build-m5` labels and an active
+`pulp-m5-01` disposable VM. Do **not** replace that in place while it is serving required jobs. The safe
+cutover is side-by-side: install tartci under `$HOME/.local/share/tartci`, add a non-required pilot
+LaunchAgent/label on the M-series host, prove cleanup/observe output there, then graduate labels after
+the active required lane drains.
 
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
