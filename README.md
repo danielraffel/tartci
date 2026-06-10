@@ -97,6 +97,14 @@ For additional Apple Silicon pool members, use the generic host checklist in
 absolute `$HOME/.local/bin/tartci`, home-backed `TART_HOME`, and matching
 Shipyard `host_class` capacity config.
 
+For Pulp-style required macOS gates, keep setup two-step. First serve the
+non-required pilot label (`self-hosted,macOS,ARM64,pulp-build-vm`) and prove a
+job can drain locally. After that, graduate by serving both labels from the VM
+supervisor (`self-hosted,macOS,ARM64,pulp-build,pulp-build-vm`) and route the
+workflow selector to the full label set. Keep the bare-metal `pulp-build`
+runners online as rollback fallback, but excluded from the default VM route by
+the extra `pulp-build-vm` label.
+
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart
 CI hosts. It emits capacity, supervisor heartbeat, VM, GitHub runner, problem,

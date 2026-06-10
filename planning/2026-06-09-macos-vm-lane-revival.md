@@ -617,6 +617,75 @@ It is not Phase-6 graduation yet: production `pulp-build` still needs a planned
 drain/relabel window, rollback automation/SLA trigger, and an agreed observation
 period with real required jobs running on VM lanes.
 
+**Status 2026-06-10 Phase-6 production graduation:** production Pulp macOS
+routing now defaults to the disposable VM pool while the bare-metal runners stay
+online as rollback fallback. The persistent controller LaunchAgent was relabeled
+to `self-hosted,macOS,ARM64,pulp-build,pulp-build-vm`; the secondary-host pilot
+was relabeled to
+`self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-vm-m5-pilot`.
+Both run `Build and Test` and both use the home-backed `$HOME/.local/bin/tartci`
+/ `$HOME/VMs` launchd shape. Backups were kept at:
+- controller:
+  `$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist.pre-phase6-20260610T032614Z`
+- secondary host:
+  `$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-pilot.plist.pre-phase6-20260610T032717Z`
+
+Pulp repo variables were switched to:
+- `PULP_LOCAL_MACOS_RUNS_ON_JSON=["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm"]`
+  (`2026-06-10T03:28:52Z`)
+- `PULP_LOCAL_MAC_RUNNER_LABEL=pulp-build-vm`
+  (`2026-06-10T03:28:53Z`)
+- `PULP_OVERFLOW_BUILD_MACOS_RUNS_ON_JSON=local-only` remained in place, so a
+  full local fleet queues locally instead of auto-inviting GitHub-hosted macOS.
+
+Production/default-route evidence:
+- Default dispatch, no `macos_runner_selector_json` override:
+  `Build and Test` run `27251134234` on
+  `codex/tartci-phase6-required-vm-proof-20260610`. `macOS (ARM64) [local]`
+  requested `["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm"]`,
+  ran on `pulp-vm-01`, started `2026-06-10T03:31:21Z`, completed
+  `2026-06-10T03:36:27Z`, conclusion `success`. The `macos` alias completed
+  `success` at `2026-06-10T03:38:31Z`. Linux/Windows hosted legs from this
+  synthetic proof were canceled after `macos` went green.
+- Real PR run `27251378268`
+  (`ci/release-cli-macos-strip`, `Build and Test`) exercised secondary-host
+  failover. `macOS (ARM64) [local]` ran on `pulp-vm-m5-pilot-01`, started
+  `2026-06-10T03:38:27Z`, completed `2026-06-10T03:45:42Z`, conclusion
+  `success`; the `macos` alias completed `success` at
+  `2026-06-10T03:45:45Z`. The supervisor deregistered the JIT runner, discarded
+  the VM, and returned to `waiting`.
+- Real PR run `27251442228`
+  (`feature/refactor-local-ci-command-actions`, `Build and Test`) exercised the
+  controller path. `macOS (ARM64) [local]` ran on `pulp-vm-01`, started
+  `2026-06-10T03:42:34Z`, completed `2026-06-10T03:53:41Z`, conclusion
+  `success`; the `macos` alias completed `success` at
+  `2026-06-10T03:53:45Z`. The supervisor deregistered the JIT runner, discarded
+  the VM, and returned to `waiting`.
+
+Post-observation cleanup and health:
+- `tartci doctor --reap --fix --json` on the controller reported
+  `problems=[]`, `fixed=[]`, `running_macos_vms=0`, `free=2`, and the
+  supervisor in `waiting`.
+- `tartci doctor --reap --fix --json` on the secondary host reported
+  `problems=[]`, `fixed=[]`, and the pilot supervisor in `waiting`. It still had
+  one pre-existing legacy macOS VM runner up, so capacity was `running=1`,
+  `free=1`; that runner is not part of the new `pulp-build-vm` production
+  selector.
+- Final GitHub runner registry showed no `pulp-vm-*` ephemeral runners
+  remaining; bare-metal `pulp-studio-01/02/03` stayed online and idle.
+- Final Shipyard fleet view reported `free_slots=3`,
+  `routable_free_slots=3`, `any_unreadable=false`, `problem_hosts=false`,
+  `supervisor_unhealthy=false`, both hosts `routable=true`, and both VM
+  supervisors fresh + `waiting`.
+
+Rollback remains one operator action set:
+```bash
+gh variable set -R danielraffel/pulp PULP_LOCAL_MACOS_RUNS_ON_JSON --body '["self-hosted","pulp-build"]'
+gh variable set -R danielraffel/pulp PULP_LOCAL_MAC_RUNNER_LABEL --body 'pulp-build'
+launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner"
+ssh <secondary-host> 'launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-pilot"'
+```
+
 ### Phase 6 — Graduate the required gate + update repo & skill
 **[CODEX] Pre-*validate* the JIT path end-to-end** (JIT runners are minted per-VM and discarded — not
 "pre-registered"): bring up a VM JIT runner advertising `pulp-build`, confirm it takes a required job
@@ -708,4 +777,4 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 3 — tartci `providers/tart-macos` + manifest + Tier 1 + warm caches; synthetic-wedge teardown verified (2026-06-09; production LaunchAgent pilot remains Phase 4)
 - [x] Phase 4 — pilot on `pulp-build-vm` green x3; Tier 2 janitor proven; `tartci observe macos` added and used for live process/CTest visibility (2026-06-09; green runs `27244204561`, `27244825290`, `27245570264`)
 - [x] Phase 5 — controller+secondary hosts pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status (2026-06-10)
-- [ ] Phase 6 — required `pulp-build` prevalidation green on a VM; production graduation/drain window still pending; bare-metal fallback retained
+- [x] Phase 6 — required `pulp-build` prevalidation + production default route green on controller and secondary-host VMs; janitor/fleet-status clean; bare-metal fallback retained (2026-06-10)
