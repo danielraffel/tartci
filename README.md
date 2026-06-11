@@ -116,10 +116,14 @@ Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave
 `PULP_LOCAL_WINDOWS_RUNS_ON_JSON` unset until a Windows-native workflow has
 proved the local label. The golden must contain the hosted-runner assumptions
 the workflow uses: Git Bash on `PATH`, Chocolatey, `ccache` when the workflow
-calls it, and `C:\tmp`. Supervisor diagnostics and rough benchmark timings are
-kept per job under `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`,
-`runner-diag.log`, `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the
-full setup and proof recipe.
+calls it, Visual Studio Build Tools/MSVC for C++ workflows, and `C:\tmp`. The
+supervisor imports `vcvarsall` before launching the Actions runner so Bash steps
+can still see `cl.exe`; override the default `arm64` target with
+`TARTCI_WIN_VCVARS_ARCH` if a repo needs a different MSVC environment.
+Supervisor diagnostics and rough benchmark timings are kept per job under
+`TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`, `runner-diag.log`,
+`qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and
+proof recipe.
 
 For Pulp-style required macOS gates, keep setup two-step. First serve the
 non-required pilot label (`self-hosted,macOS,ARM64,pulp-build-vm`) and prove a

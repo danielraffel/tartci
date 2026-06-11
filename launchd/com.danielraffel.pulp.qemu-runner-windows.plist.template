@@ -46,6 +46,11 @@
   stay loaded while normal Windows jobs still route to GitHub-hosted windows-latest.
   Runner names use a host-derived prefix by default; set
   TARTCI_RUNNER_NAME_PREFIX only when you need a stable custom name prefix.
+  The Windows golden must include Git Bash, Chocolatey, ccache if the workflow
+  calls it, C:\tmp, and Visual Studio Build Tools/MSVC for C++ workflows. The
+  supervisor imports vcvarsall before preflight and before Runner.Listener.exe
+  starts; override the default arm64 target with TARTCI_WIN_VCVARS_ARCH when a
+  repo needs a different Visual Studio environment.
   A runner that boots but does not claim a job exits after
   TARTCI_RUNNER_IDLE_TIMEOUT_SECS (15 minutes by default). Per-job diagnostics
   and timing files land under TARTCI_WIN_LOGS.

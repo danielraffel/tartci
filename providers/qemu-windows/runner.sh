@@ -30,6 +30,7 @@ REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-danielraffel/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Windows,ARM64,pulp-build-windows}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
+VCVARS_ARCH="${TARTCI_WIN_VCVARS_ARCH:-${PULP_WIN_VCVARS_ARCH:-arm64}}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 LOGROOT="${TARTCI_WIN_LOGS:-${PULP_WIN_LOGS:-$WORKROOT/logs}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
@@ -309,6 +310,27 @@ foreach ($cmd in @("git", "bash", "choco", "ccache")) {
     Write-Output ("TARTCI_DIAG command {0}=missing" -f $cmd)
   }
 }
+$vcvarsArch="'"$VCVARS_ARCH"'"
+$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
+if ($vcvars) {
+  Write-Output ("TARTCI_DIAG vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
+  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
+  try {
+    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
+    $lines = & cmd.exe /d /c $tmp
+    foreach ($line in $lines) {
+      if ($line -match "^(.*?)=(.*)$") {
+        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+      }
+    }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  }
+  $cl = Get-Command cl -ErrorAction SilentlyContinue
+  if ($cl) { Write-Output ("TARTCI_DIAG command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG command cl=missing-after-vcvars" }
+} else {
+  Write-Output "TARTCI_DIAG vcvars=missing"
+}
 try {
   w32tm /query /status | ForEach-Object { Write-Output ("TARTCI_DIAG w32tm " + $_) }
 } catch {
@@ -352,6 +374,27 @@ $jitPath="C:\actions-runner\jit.cfg"
   "C:\ProgramData\chocolatey\bin"
 )
 $env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
+$vcvarsArch="'"$VCVARS_ARCH"'"
+$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
+if ($vcvars) {
+  Write-Output ("TARTCI_DIAG runner_vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
+  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
+  try {
+    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
+    $lines = & cmd.exe /d /c $tmp
+    foreach ($line in $lines) {
+      if ($line -match "^(.*?)=(.*)$") {
+        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+      }
+    }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  }
+  $cl = Get-Command cl -ErrorAction SilentlyContinue
+  if ($cl) { Write-Output ("TARTCI_DIAG runner_command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG runner_command cl=missing-after-vcvars" }
+} else {
+  Write-Output "TARTCI_DIAG runner_vcvars=missing"
+}
 Set-Location C:\actions-runner
 & "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
 exit $LASTEXITCODE' | iconv -t UTF-16LE | base64)"

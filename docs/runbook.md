@@ -552,9 +552,12 @@ tail -F "$HOME/Library/Logs/tartci/qemu-runner-windows.log"
 The supervisor writes:
 
 - `preflight.log`: guest clock sync, PowerShell execution policy, GitHub/broker
-  TCP checks, runner version, and JIT config byte count.
+  TCP checks, runner version, JIT config byte count, `vcvarsall` discovery, and
+  `cl.exe` visibility after the MSVC environment import.
 - `early-clock.log`: minimal guest clock sync before any HTTPS runner download.
-- `runner-output.log`: stdout/stderr from `Runner.Listener.exe run --jitconfig`.
+- `runner-output.log`: stdout/stderr from `Runner.Listener.exe run --jitconfig`,
+  including the runner-process `vcvarsall` import and `cl.exe` diagnostic before
+  the Actions agent starts.
 - `runner-diag.log`: tail of the latest Actions runner `_diag` logs.
 - `qemu.log`: QEMU stderr.
 - `timing.tsv`: `boot_to_ssh`, `preflight`, `runner_process`, `post_diag`, and
@@ -704,6 +707,7 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_MACOS_GOLDEN` / `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
 `TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_VERSION` (Windows agent),
+`TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_WORK`, and `TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
@@ -719,10 +723,12 @@ file inside PowerShell; the configured Actions runner version is enforced before
 stale `C:\actions-runner` registration files are removed because a golden may
 cache the runner binary but must not cache `.runner` or `.credentials`;
 `vcvarsall` is discovered via `Get-ChildItem` in base64-encoded PowerShell
-(vswhere returns empty for a BuildTools-only install); the supervisor **bails the
-moment QEMU dies** (`kill -0 $qpid`) so a free-port TOCTOU surfaces fast instead
-of burning the full ~10 min SSH window; and a post-extract integrity check
-asserts `Runner.Listener.exe` exists before running.
+(vswhere returns empty for a BuildTools-only install) and imported before both
+preflight diagnostics and the Actions runner process so workflow Bash steps can
+see MSVC; the supervisor **bails the moment QEMU dies** (`kill -0 $qpid`) so a
+free-port TOCTOU surfaces fast instead of burning the full ~10 min SSH window;
+and a post-extract integrity check asserts `Runner.Listener.exe` exists before
+running.
 
 ### Serve across reboots (LaunchAgent)
 

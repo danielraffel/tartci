@@ -95,7 +95,11 @@ LaunchAgent loaded while a repo still defaults ordinary Windows jobs to
 GitHub-hosted `windows-latest`.
 
 Per-job diagnostics are separate from the disposable overlay. The template
-writes them under `TARTCI_WIN_LOGS`:
+writes them under `TARTCI_WIN_LOGS`. `preflight.log` records `vcvarsall`
+discovery and `cl.exe` visibility, and `runner-output.log` records the same
+MSVC environment import immediately before the Actions agent starts. Override
+the default `arm64` `vcvarsall` target with `TARTCI_WIN_VCVARS_ARCH` when a repo
+needs a different Visual Studio environment:
 
 ```sh
 find "$HOME/VMs/logs/tartci-win" -name timing.tsv -print -exec cat {} \;
