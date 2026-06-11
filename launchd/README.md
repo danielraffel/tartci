@@ -102,7 +102,7 @@ the default `arm64` `vcvarsall` target with `TARTCI_WIN_VCVARS_ARCH` when a repo
 needs a different Visual Studio environment:
 
 ```sh
-find "$HOME/VMs/logs/tartci-win" -name timing.tsv -print -exec cat {} \;
+tartci timings "$HOME/VMs/logs/tartci-win"
 tail -F "$HOME/Library/Logs/tartci/qemu-runner-windows.log"
 ```
 

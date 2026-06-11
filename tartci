@@ -13,6 +13,7 @@
 #   tartci setup               # brew-install prereqs + create local stores
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
+#   tartci timings [log-root|timing.tsv ...]
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
@@ -98,6 +99,10 @@ cmd_metrics() {
   esac
 }
 
+cmd_timings() {
+  exec python3 "$HERE/scripts/timing_summary.py" "$@"
+}
+
 cmd_windows() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -153,6 +158,7 @@ case "${1:-help}" in
   setup)   cmd_setup ;;
   bench)   shift; cmd_bench "$@" ;;
   metrics) shift; cmd_metrics "$@" ;;
+  timings) shift; cmd_timings "$@" ;;
   windows) shift; cmd_windows "$@" ;;
   prepare) shift; cmd_prepare "$@" ;;
   up)      shift; cmd_up "$@" ;;

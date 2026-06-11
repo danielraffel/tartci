@@ -61,6 +61,48 @@ prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 command -v gh >/dev/null 2>&1 || die "gh not installed / authed (need admin to mint JIT)"
 
+allocate_ssh_port(){
+  python3 - "$WORKROOT/port-locks" <<'PY'
+import os
+import random
+import shutil
+import socket
+import sys
+import time
+
+root = sys.argv[1]
+os.makedirs(root, exist_ok=True)
+now = time.time()
+for name in os.listdir(root):
+    path = os.path.join(root, name)
+    try:
+        if os.path.isdir(path) and now - os.stat(path).st_mtime > 24 * 60 * 60:
+            shutil.rmtree(path)
+    except OSError:
+        pass
+
+for _ in range(200):
+    port = random.randint(20000, 60999)
+    lock = os.path.join(root, f"{port}.lock")
+    try:
+        os.mkdir(lock)
+    except FileExistsError:
+        continue
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", port))
+    except OSError:
+        shutil.rmtree(lock, ignore_errors=True)
+        continue
+    finally:
+        sock.close()
+    print(port, lock)
+    raise SystemExit(0)
+
+raise SystemExit("no available SSH port after 200 attempts")
+PY
+}
+
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
@@ -176,8 +218,9 @@ run_one(){ # $1=iteration index
         --jq '.encoded_jit_config')" || die "JIT mint failed (need repo admin)"
   [ -n "$jit" ] || die "empty JIT config"
 
-  local port jobdir logdir overlay efivars qpid
-  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1]); s.close()')"
+  local port port_lock jobdir logdir overlay efivars qpid
+  read -r port port_lock < <(allocate_ssh_port)
+  [ -n "$port" ] && [ -n "$port_lock" ] || die "failed to allocate SSH port"
   jobdir="$WORKROOT/$job"; mkdir -p "$jobdir"
   logdir="$LOGROOT/$job"; mkdir -p "$logdir"
   overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
@@ -203,6 +246,7 @@ run_one(){ # $1=iteration index
     kill "$qpid" 2>/dev/null || true
     sleep 1
     rm -rf "$jobdir"
+    rm -rf "$port_lock"
   }
 
   wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }

@@ -583,6 +583,11 @@ while preflight diagnostics took about a minute. A full Build and Test run will
 mostly be build and test time, so keep both the host timing file and the GitHub
 job timestamps when comparing against `windows-latest`.
 
+```bash
+tartci timings
+tartci timings "$HOME/VMs/logs/tartci-win" "$HOME/VMs/logs/tartci-linux"
+```
+
 The Windows runner defaults to `TARTCI_WIN_PREFLIGHT_MODE=fast`: sync the clock,
 verify the JIT config landed, record the runner listener version, then launch
 the job. The old verbose probe path is still available with
@@ -626,6 +631,12 @@ golden is current and caches are warm because there is no hosted-runner queue an
 no x64 translation tax. For x64 coverage or test execution, Windows-on-ARM still
 runs through Microsoft's x64 translation layer, so local hardware mainly helps
 availability and cache locality rather than raw CPU efficiency.
+
+Treat x64-on-Windows-ARM as a separate smoke lane until proven. The QEMU provider
+boots an ARM64 Windows guest with `qemu-system-aarch64`; it does not emulate a
+full Intel Windows machine. A repo can try the x64 MSVC environment with
+`TARTCI_WIN_VCVARS_ARCH=x64`, but release-fidelity x64 gates should stay on
+GitHub-hosted `windows-latest` until those smoke runs are consistently clean.
 
 ---
 
@@ -717,8 +728,8 @@ Ephemeral Windows runner names include a host-derived prefix by default; set
 `TARTCI_RUNNER_NAME_PREFIX` only when a host needs a stable custom prefix.
 Windows writes per-job timing to `$TARTCI_WIN_LOGS/<runner>/timing.tsv`; Linux
 writes the same shape to `$TARTCI_LINUX_LOGS/<runner>/timing.tsv` (default
-`$HOME/VMs/logs/tartci-linux`). Compare those files with GitHub job timestamps
-before promoting local routing.
+`$HOME/VMs/logs/tartci-linux`). Compare those files with `tartci timings` and
+GitHub job timestamps before promoting local routing.
 macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."

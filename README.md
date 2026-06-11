@@ -52,6 +52,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci status --json    # host-local provider/capacity/profile state for agents
 ./tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
 ./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
