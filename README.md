@@ -105,10 +105,16 @@ unrelated queued `Build and Test` work.
 For additional Apple Silicon pool members, use the generic host checklist in
 `docs/runbook.md`: stable SSH alias, absolute `/opt/homebrew/bin/tart`,
 absolute `$HOME/.local/bin/tartci`, home-backed `TART_HOME`, and matching
-Shipyard `host_class` capacity config. If multiple macOS hosts advertise the
-same workflow selector, give each host a unique runner name by appending one
-extra host-specific label after the shared `pulp-build-*` pool label or by
-setting a unique `--name-prefix` in the installed LaunchAgent.
+Shipyard `host_class` capacity config. If multiple hosts can serve the same
+platform, do not let them race the same workflow selector. Give each host one
+extra host-specific label after the shared `pulp-build-*` pool label, then let
+the workflow resolver pick a selector before the job is queued. Pulp's default
+policy is Mac Studio primary (`pulp-host-macstudio`), M5/blackbook overflow
+(`pulp-host-m5`), then GitHub-hosted fallback when each local selector is already
+at its configured in-progress capacity. These Linux/Windows runners are JIT
+ephemeral, so the resolver checks in-progress jobs for each host label rather
+than looking for idle registered GitHub runners. That avoids duplicate VM boots
+and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
 
 For Windows QEMU pool members, install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep

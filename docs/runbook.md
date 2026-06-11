@@ -685,7 +685,8 @@ tartci serve windows
 
 # Keep serving (what the LaunchAgents run):
 tartci serve macos --loop --labels self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
-tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux
+tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux,pulp-host-macstudio
+tartci serve windows --loop --labels self-hosted,Windows,ARM64,pulp-build-windows,pulp-host-macstudio
 ```
 
 What the supervisor does each job: mint a **Just-In-Time** (single-job) runner
@@ -700,8 +701,16 @@ add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
 `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` requires a queued job's requested labels to
 be satisfiable by the configured runner labels before a VM boots. Set it to `0`
-only for debugging broad workflow polling. If multiple Windows hosts boot for
-the same queued job, any VM that does not claim work exits after
+only for debugging broad workflow polling. For coordinated multi-host routing,
+add a host label such as `pulp-host-macstudio` or `pulp-host-m5` after the shared
+`pulp-build-*` label, then point the workflow's primary and overflow selectors
+at those exact label sets. Linux/Windows runners are JIT ephemeral, so they are
+not visible as idle registered GitHub runners before a job is queued; the
+workflow resolver should compare configured per-host capacity with in-progress
+jobs already using each exact host selector. A GitHub Actions job cannot change
+`runs-on` after it is queued, so GitHub-hosted fallback must be selected before
+the job enters the queue. If multiple Windows hosts are accidentally configured
+to race the same queued job, any VM that does not claim work exits after
 `TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
 GitHub runner registration by ephemeral runner name, and discards the overlay.
 Ephemeral Windows runner names include a host-derived prefix by default; set
