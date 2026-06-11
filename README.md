@@ -98,10 +98,10 @@ Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /
-debug); pool jobs build whatever arch the workflow targets. The macOS serve loop
-only boots when a queued job's requested labels are satisfiable by the configured
-runner labels, so a `pulp-build-vm` pilot agent does not boot for unrelated
-queued `Build and Test` work.
+debug); pool jobs build whatever arch the workflow targets. The Linux, macOS,
+and Windows serve loops only boot when a queued job's requested labels are
+satisfiable by the configured runner labels, so a pilot agent does not boot for
+unrelated queued `Build and Test` work.
 For additional Apple Silicon pool members, use the generic host checklist in
 `docs/runbook.md`: stable SSH alias, absolute `/opt/homebrew/bin/tart`,
 absolute `$HOME/.local/bin/tartci`, home-backed `TART_HOME`, and matching
@@ -119,7 +119,10 @@ the workflow uses: Git Bash on `PATH`, Chocolatey, `ccache` when the workflow
 calls it, Visual Studio Build Tools/MSVC for C++ workflows, and `C:\tmp`. The
 supervisor imports `vcvarsall` before launching the Actions runner so Bash steps
 can still see `cl.exe`; override the default `arm64` target with
-`TARTCI_WIN_VCVARS_ARCH` if a repo needs a different MSVC environment.
+`TARTCI_WIN_VCVARS_ARCH` if a repo needs a different MSVC environment. Windows
+preflight is fast by default (`TARTCI_WIN_PREFLIGHT_MODE=fast`); use
+`TARTCI_WIN_PREFLIGHT_MODE=full` only when debugging a golden/toolchain/network
+issue.
 Supervisor diagnostics and rough benchmark timings are kept per job under
 `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`, `runner-diag.log`,
 `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and

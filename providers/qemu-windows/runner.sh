@@ -31,6 +31,7 @@ LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Windows,ARM64,
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
 VCVARS_ARCH="${TARTCI_WIN_VCVARS_ARCH:-${PULP_WIN_VCVARS_ARCH:-arm64}}"
+PREFLIGHT_MODE="${TARTCI_WIN_PREFLIGHT_MODE:-${PULP_WIN_PREFLIGHT_MODE:-fast}}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 LOGROOT="${TARTCI_WIN_LOGS:-${PULP_WIN_LOGS:-$WORKROOT/logs}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
@@ -74,6 +75,7 @@ FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.
 VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
 [ -n "$VARS_TPL" ] || die "no edk2 vars template"
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=21600;; esac
+case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
 
 delete_runner_registration(){
   local name="$1" ids id tries=0
@@ -287,12 +289,16 @@ if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Liste
   ps_preflight='$ErrorActionPreference="Continue"
 $ProgressPreference="SilentlyContinue"
 $hostUtc="'"$host_utc"'"
+$preflightMode="'"$PREFLIGHT_MODE"'"
+Write-Output "TARTCI_DIAG preflight-mode=$preflightMode"
 try {
   Set-Date -Date ([DateTimeOffset]::Parse($hostUtc).LocalDateTime) | Out-Null
   Write-Output "TARTCI_DIAG clock-sync=$hostUtc"
 } catch {
   Write-Output "TARTCI_DIAG clock-sync-failed=$($_.Exception.Message)"
 }
+Write-Output ("TARTCI_DIAG guest-time=" + (Get-Date -Format o))
+if ($preflightMode -eq "full") {
 try {
   Set-ExecutionPolicy -Scope LocalMachine -ExecutionPolicy RemoteSigned -Force
   Write-Output "TARTCI_DIAG execution-policy-localmachine=RemoteSigned"
@@ -304,7 +310,6 @@ try {
 } catch {
   Write-Output "TARTCI_DIAG execution-policy-list-failed=$($_.Exception.Message)"
 }
-Write-Output ("TARTCI_DIAG guest-time=" + (Get-Date -Format o))
 $runnerPathAdd = @(
   "C:\Program Files\Git\cmd",
   "C:\Program Files\Git\bin",
@@ -359,6 +364,7 @@ try {
   Write-Output ("TARTCI_DIAG github-head-status={0}" -f $resp.StatusCode)
 } catch {
   Write-Output "TARTCI_DIAG github-head-failed=$($_.Exception.Message)"
+}
 }
 $listener="C:\actions-runner\bin\Runner.Listener.exe"
 if (Test-Path $listener) {
@@ -479,7 +485,7 @@ if (Test-Path $diagDir) {
 
 i=0
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
+  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
   while true; do
     q="$(queued_work)"
     if [ "${q:-0}" -gt 0 ]; then
@@ -489,6 +495,6 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
-  note "ephemeral Windows runner ONCE; golden=$(basename "$GOLDEN") labels=$LABELS"
+  note "ephemeral Windows runner ONCE; golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE"
   run_one 1
 fi

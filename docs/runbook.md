@@ -583,13 +583,20 @@ while preflight diagnostics took about a minute. A full Build and Test run will
 mostly be build and test time, so keep both the host timing file and the GitHub
 job timestamps when comparing against `windows-latest`.
 
+The Windows runner defaults to `TARTCI_WIN_PREFLIGHT_MODE=fast`: sync the clock,
+verify the JIT config landed, record the runner listener version, then launch
+the job. The old verbose probe path is still available with
+`TARTCI_WIN_PREFLIGHT_MODE=full` when diagnosing a new golden or network/toolchain
+issue.
+
 Highest-return changes, in order:
 
 1. **Move deterministic preflight into the golden.** The normal supervisor path
-   should verify clock, runner version, and GitHub broker reachability. Toolchain
-   discovery, PATH fixes, execution policy, certificate setup, and SDK validation
-   should be baked into the golden and proven during image creation. Keep the
-   verbose probes for a debug mode rather than paying for them on every job.
+   verifies only clock, runner version, and JIT config by default. Toolchain
+   discovery, PATH fixes, execution policy, certificate setup, SDK validation,
+   and GitHub broker probes should be baked into the golden and proven during
+   image creation. Keep `TARTCI_WIN_PREFLIGHT_MODE=full` for debug rather than
+   paying for those probes on every job.
 2. **Add a real Windows build cache.** Use `sccache` for C/C++ and Rust
    compilation, plus the project-specific package caches that matter
    (`CMake` downloads, `NuGet`, `Cargo`, `pnpm`/`npm`, and similar). The cache
@@ -688,17 +695,21 @@ once with that JIT config, then discard the VM. The agent processes exactly one
 job and deregisters — no long-lived runner state. The `--loop` gate only boots
 when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
 `Build and Test`.
-Windows scans queued and in-progress workflow runs for queued jobs and adds two
-more default guards: it ignores queued jobs older than
+Linux and Windows scan queued and in-progress workflow runs for queued jobs and
+add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
 `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` requires a queued job's requested labels to
-be satisfiable by the configured runner labels before QEMU boots. Set it to `0`
-only for debugging broad workflow polling. If multiple hosts boot for the same
-queued job, any VM that does not claim work exits after
+be satisfiable by the configured runner labels before a VM boots. Set it to `0`
+only for debugging broad workflow polling. If multiple Windows hosts boot for
+the same queued job, any VM that does not claim work exits after
 `TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
 GitHub runner registration by ephemeral runner name, and discards the overlay.
 Ephemeral Windows runner names include a host-derived prefix by default; set
 `TARTCI_RUNNER_NAME_PREFIX` only when a host needs a stable custom prefix.
+Windows writes per-job timing to `$TARTCI_WIN_LOGS/<runner>/timing.tsv`; Linux
+writes the same shape to `$TARTCI_LINUX_LOGS/<runner>/timing.tsv` (default
+`$HOME/VMs/logs/tartci-linux`). Compare those files with GitHub job timestamps
+before promoting local routing.
 macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."
@@ -708,6 +719,7 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
 `TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_VERSION` (Windows agent),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
+`TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
 `TARTCI_WIN_WORK`, and `TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
