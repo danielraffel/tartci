@@ -778,3 +778,38 @@ Three independent checks that finalize Phases 2/3/5:
 - [x] Phase 4 — pilot on `pulp-build-vm` green x3; Tier 2 janitor proven; `tartci observe macos` added and used for live process/CTest visibility (2026-06-09; green runs `27244204561`, `27244825290`, `27245570264`)
 - [x] Phase 5 — controller+secondary hosts pooled; capacity.rs macOS-only; VmSlot lease; failover + local queue; Linux/Windows ungated; fleet-status (2026-06-10)
 - [x] Phase 6 — required `pulp-build` prevalidation + production default route green on controller and secondary-host VMs; janitor/fleet-status clean; bare-metal fallback retained (2026-06-10)
+
+---
+
+## Execution update - 2026-06-11
+
+Live status and next-agent prompt now live in Pulp planning:
+
+- `/Volumes/Workshop/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-status.md`
+- `/Volumes/Workshop/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-handoff.md`
+
+Implementation branch:
+
+- `/Volumes/Workshop/Code/tartci`
+- branch `feat/macos-vm-lane-revival`
+- commit `9a561ee feat: wire release and windows vm runner lanes`
+
+Follow-up scope after Phase 6:
+
+- Added isolated Release CLI macOS VM lane template and docs for
+  `pulp-build-vm-release`. Do not move `PULP_RELEASE_MACOS_RUNS_ON_JSON` until a
+  real Release CLI proof claims that label.
+- Hardened Windows QEMU serving for multi-host use: label-aware queue gate,
+  stale queued-job age guard, host-derived runner names, idle-timeout cleanup,
+  stale registration deletion, early clock sync, per-job timing/logs.
+- Explicit Pulp Windows proof run `27327394445` proved routing and registration
+  on `self-hosted|Windows|ARM64|pulp-build-windows`; Mac Studio claimed the job
+  and produced `timing.tsv` (`boot_to_ssh=29s`, `preflight=64s`,
+  `runner_process=65s`, `total=163s`).
+- That proof failed because the Windows golden lacked hosted-runner assumptions:
+  `choco` and `bash` on PATH. Local golden
+  `pulp-windows-build-24h2-arm64-2026-06-11.qcow2` was patched with
+  Chocolatey, `ccache`, Git Bash PATH entries, and `C:\tmp`.
+- The new Windows golden is being distributed to the secondary host before the
+  next explicit proof. Keep `PULP_LOCAL_WINDOWS_RUNS_ON_JSON` unset until a full
+  Windows-native proof is green.
