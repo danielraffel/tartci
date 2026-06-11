@@ -87,6 +87,10 @@
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin</string>
         <key>TART_HOME</key>
         <string>$TART_HOME</string>
+        <key>TARTCI_VM_POLL</key>
+        <string>10</string>
+        <key>TARTCI_LINUX_LOGS</key>
+        <string>$HOME/VMs/logs/tartci-linux</string>
     </dict>
 </dict>
 </plist>

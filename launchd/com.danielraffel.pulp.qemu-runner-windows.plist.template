@@ -108,7 +108,13 @@
         <key>TARTCI_RUNNER_QUEUE_MATCH_LABELS</key>
         <string>1</string>
         <key>TARTCI_RUNNER_IDLE_TIMEOUT_SECS</key>
-        <string>900</string>
+        <string>300</string>
+        <key>TARTCI_VM_POLL</key>
+        <string>10</string>
+        <key>TARTCI_WIN_CPUS</key>
+        <string>8</string>
+        <key>TARTCI_WIN_MEMORY_MB</key>
+        <string>8192</string>
         <key>TARTCI_WIN_WORK</key>
         <string>$HOME/VMs/tmp/tartci-win</string>
         <key>TARTCI_WIN_LOGS</key>

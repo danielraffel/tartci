@@ -32,6 +32,8 @@ RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
 VCVARS_ARCH="${TARTCI_WIN_VCVARS_ARCH:-${PULP_WIN_VCVARS_ARCH:-arm64}}"
 PREFLIGHT_MODE="${TARTCI_WIN_PREFLIGHT_MODE:-${PULP_WIN_PREFLIGHT_MODE:-fast}}"
+WIN_CPUS="${TARTCI_WIN_CPUS:-${PULP_WIN_CPUS:-8}}"
+WIN_MEMORY_MB="${TARTCI_WIN_MEMORY_MB:-${PULP_WIN_MEMORY_MB:-8192}}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 LOGROOT="${TARTCI_WIN_LOGS:-${PULP_WIN_LOGS:-$WORKROOT/logs}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
@@ -76,6 +78,8 @@ VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebre
 [ -n "$VARS_TPL" ] || die "no edk2 vars template"
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=21600;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
+case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esac
+case "$WIN_MEMORY_MB" in ''|*[!0-9]*) die "invalid TARTCI_WIN_MEMORY_MB='$WIN_MEMORY_MB'";; esac
 
 delete_runner_registration(){
   local name="$1" ids id tries=0
@@ -181,7 +185,7 @@ run_one(){ # $1=iteration index
   note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
   qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null
   cp "$VARS_TPL" "$efivars"
-  qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp 8 -m 8192 \
+  qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$WIN_CPUS" -m "$WIN_MEMORY_MB" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" -drive if=pflash,format=raw,file="$efivars" \
     -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
     -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=net0 \
@@ -485,7 +489,7 @@ if (Test-Path $diagDir) {
 
 i=0
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
+  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
   while true; do
     q="$(queued_work)"
     if [ "${q:-0}" -gt 0 ]; then
@@ -495,6 +499,6 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
-  note "ephemeral Windows runner ONCE; golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE"
+  note "ephemeral Windows runner ONCE; golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB"
   run_one 1
 fi

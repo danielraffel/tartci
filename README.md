@@ -128,7 +128,9 @@ can still see `cl.exe`; override the default `arm64` target with
 `TARTCI_WIN_VCVARS_ARCH` if a repo needs a different MSVC environment. Windows
 preflight is fast by default (`TARTCI_WIN_PREFLIGHT_MODE=fast`); use
 `TARTCI_WIN_PREFLIGHT_MODE=full` only when debugging a golden/toolchain/network
-issue.
+issue. QEMU sizing is tunable per host with `TARTCI_WIN_CPUS` and
+`TARTCI_WIN_MEMORY_MB`; keep the template conservative and override on larger
+hosts such as Mac Studio.
 Supervisor diagnostics and rough benchmark timings are kept per job under
 `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`, `runner-diag.log`,
 `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and

@@ -729,7 +729,8 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_VERSION` (Windows agent),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
-`TARTCI_WIN_WORK`, and `TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
+`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
 host-specific label after the shared `pulp-build-*` pool label or by passing a
