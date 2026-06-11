@@ -15,12 +15,14 @@ The **runner scripts are project-agnostic** — repo, golden, labels, and the
 
 The **templates here are Pulp's concrete instance** — the first consumer.
 Their `Label`s are `com.danielraffel.pulp.tart-runner`,
+`com.danielraffel.pulp.tart-runner-macos-release`,
 `com.danielraffel.pulp.tart-runner-linux`, and
 `com.danielraffel.pulp.qemu-runner-windows` because the
 [shipyard-macos-gui](https://github.com/danielraffel/shipyard-macos-gui) "Serve
 CI builds from this Mac" switch hard-codes those labels (its
-`CIServingLane.known`) to `launchctl load/unload` them. Keep the labels exactly
-as-is when serving Pulp.
+`CIServingLane.known`) to `launchctl load/unload` them. Keep the known labels
+exactly as-is when serving Pulp; add new labels to Shipyard before expecting its
+GUI to toggle them.
 
 ## macOS launchd rule
 
@@ -46,6 +48,63 @@ side-by-side pilot plist with a distinct `Label`, log path, and non-required
 runner labels, then load it only after `shipyard runner capacity` shows a free
 slot. Graduate labels later, after the required lane drains and rollback is
 ready.
+
+When more than one Mac serves the same pool selector, keep the workflow selector
+shared but make each runner name unique. The macOS runner derives its default
+name from the last `pulp-build-*` label, so a host may add an extra host-specific
+label after the shared pool label. A job requiring
+`self-hosted,macOS,ARM64,pulp-build,pulp-build-vm` still matches a runner that
+advertises that full set plus one extra label.
+
+## Release CLI macOS launchd rule
+
+`Release CLI` is a different workload from `Build and Test`, so serve it with a
+different Tart VM label and LaunchAgent. Use
+`com.danielraffel.pulp.tart-runner-macos-release.plist.template`, which filters
+on `TARTCI_RUNNER_WORKFLOW_NAME=Release CLI` and advertises the shared release
+pool label:
+
+```text
+self-hosted,macOS,ARM64,pulp-build-vm-release
+```
+
+Keep `PULP_RELEASE_MACOS_RUNS_ON_JSON` on the existing fallback lane until a
+real Release CLI proof claims `pulp-build-vm-release` and completes. After that,
+the intended selector is:
+
+```json
+["self-hosted","macOS","ARM64","pulp-build-vm-release"]
+```
+
+The release lane can stay loaded before the variable is flipped; it will idle
+because queued Release CLI jobs do not request `pulp-build-vm-release` yet.
+
+## Windows QEMU launchd rule
+
+The Windows lane uses QEMU directly, so every participating Apple Silicon host
+needs Homebrew QEMU on the service PATH, the same Windows qcow2 golden in a
+local golden store, and the tartci scripts installed under a home-backed path.
+Use the qemu template's install recipe, which points launchd at
+`$HOME/.local/share/tartci` rather than a mounted workspace.
+
+Leave `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` unless you are debugging the queue
+poller. With that default, the supervisor only boots QEMU when a fresh queued
+job's requested labels can be satisfied by the configured runner labels, for example
+`self-hosted,Windows,ARM64,pulp-build-windows`. That makes it safe to keep the
+LaunchAgent loaded while a repo still defaults ordinary Windows jobs to
+GitHub-hosted `windows-latest`.
+
+Per-job diagnostics are separate from the disposable overlay. The template
+writes them under `TARTCI_WIN_LOGS`:
+
+```sh
+find "$HOME/VMs/logs/tartci-win" -name timing.tsv -print -exec cat {} \;
+tail -F "$HOME/Library/Logs/tartci/qemu-runner-windows.log"
+```
+
+Use a Windows-native workflow for proof runs before setting a repo-level
+Windows `runs-on` variable. A Unix shell smoke can prove assignment, but it will
+fail on Windows if the step assumes tools like `chmod`.
 
 ## Janitor
 

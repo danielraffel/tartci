@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the Pulp Release CLI macOS Tart VM lane.
+
+  This is intentionally separate from the Build and Test VM lane:
+
+    Build and Test -> pulp-build-vm
+    Release CLI    -> pulp-build-vm-release
+
+  Keep PULP_RELEASE_MACOS_RUNS_ON_JSON pointed at the existing fallback lane
+  until one real Release CLI proof has claimed this label and completed. Do not
+  use this template to run the warm bare-metal Studio runners as the normal
+  release path.
+
+  Install shape (per Mac that hosts the macOS Tart golden):
+
+    1. Install tartci under $HOME so BASH_SOURCE resolves inside a readable tree:
+
+         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/VMs" "$HOME/Library/Logs/tartci"
+         rsync -a "$PWD/" "$HOME/.local/share/tartci/"
+         printf '%s\n' '#!/usr/bin/env bash' \
+           'exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"' \
+           > "$HOME/.local/bin/tartci"
+         chmod 755 "$HOME/.local/bin/tartci"
+
+    2. Put macOS goldens under $HOME/VMs.
+
+    3. Render this template with absolute paths:
+
+         sed -e "s|\$HOME|$HOME|g" \
+           launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template \
+           > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-release.plist"
+
+    4. Load:
+
+         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-release.plist"
+         launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-release"
+
+       Verify:
+
+         launchctl print "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-release"
+         tail -F "$HOME/Library/Logs/tartci/tart-runner-macos-release.log"
+
+       Stop:
+
+         launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-release"
+
+  MULTI-HOST: if multiple Macs serve the same Release CLI pool, make each
+  runner name unique. The macOS runner derives its default name from the last
+  `pulp-build-*` label, so either add a host-specific extra label after
+  `pulp-build-vm-release` or pass a custom name-prefix when rendering an installed
+  plist. The workflow selector should still require only the shared pool label:
+
+    ["self-hosted","macOS","ARM64","pulp-build-vm-release"]
+
+  Requires on this host: tart + the macOS golden in TART_HOME, gh authenticated
+  for the target repo (repo admin, to mint JIT configs), and ~/.ssh/id_ed25519
+  accepted by the golden.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.pulp.tart-runner-macos-release</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>serve</string>
+        <string>macos</string>
+        <string>--loop</string>
+        <string>--labels</string>
+        <string>self-hosted,macOS,ARM64,pulp-build-vm-release</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tart-runner-macos-release.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tart-runner-macos-release.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TART_HOME</key>
+        <string>$HOME/VMs</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+        <key>TARTCI_CI_CACHE</key>
+        <string>$HOME/.cache/pulp-ci</string>
+        <key>TARTCI_RUNNER_REPO</key>
+        <string>danielraffel/pulp</string>
+        <key>TARTCI_MACOS_GOLDEN</key>
+        <string>pulp-build-runner:latest</string>
+        <key>TARTCI_RUNNER_LABELS</key>
+        <string>self-hosted,macOS,ARM64,pulp-build-vm-release</string>
+        <key>TARTCI_RUNNER_WORKFLOW_NAME</key>
+        <string>Release CLI</string>
+    </dict>
+</dict>
+</plist>

@@ -19,12 +19,11 @@
 
     1. Install tartci under $HOME so BASH_SOURCE resolves inside a readable tree:
 
-         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/VMs"
-         rsync -a --delete --exclude .git "$PWD/" "$HOME/.local/share/tartci/"
-         cat > "$HOME/.local/bin/tartci" <<'EOF'
-         #!/usr/bin/env bash
-         exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"
-         EOF
+         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/VMs" "$HOME/Library/Logs/tartci"
+         rsync -a "$PWD/" "$HOME/.local/share/tartci/"
+         printf '%s\n' '#!/usr/bin/env bash' \
+           'exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"' \
+           > "$HOME/.local/bin/tartci"
          chmod 755 "$HOME/.local/bin/tartci"
 
     2. Put macOS goldens under $HOME/VMs. Avoid /Volumes unless using a signed
@@ -68,7 +67,7 @@
   SIDE-BY-SIDE HOSTS: if a host already has a required-lane Pulp LaunchAgent
   using com.danielraffel.pulp.tart-runner, do not overwrite it. Copy this
   template to a pilot-specific plist and change, at minimum, Label, log paths,
-  ProgramArguments --labels, and TARTCI_RUNNER_LABELS to a non-required pilot
+  ProgramArguments labels, and TARTCI_RUNNER_LABELS to a non-required pilot
   label. Load the pilot only after `shipyard runner capacity` shows a free slot.
 
   Requires on this host: tart + the macOS golden in TART_HOME, gh authenticated

@@ -16,21 +16,39 @@
     1. Copy the Windows golden qcow2 into this host's $TARTCI_GOLDENS
        (default $HOME/.tartci/goldens). The supervisor install-if-missing the
        win-arm64 runner agent into the clone, so the golden need not pre-bake it.
-    2. Copy this file to ~/Library/LaunchAgents/, replacing $TARTCI_REPO, $HOME, and
+    2. Install tartci into a home-backed path so launchd does not depend on a
+       mounted workspace:
+
+         mkdir -p "$HOME/.local/share/tartci" "$HOME/Library/Logs/tartci"
+         rsync -a ./ "$HOME/.local/share/tartci/"
+
+    3. Copy this file to ~/Library/LaunchAgents/, replacing $TARTCI_REPO, $HOME, and
        $TARTCI_GOLDENS with absolute paths (launchd does NOT expand shell vars):
 
-         sed -e "s|\$TARTCI_REPO|$PWD|g" -e "s|\$HOME|$HOME|g" \
+         sed -e "s|\$TARTCI_REPO|$HOME/.local/share/tartci|g" -e "s|\$HOME|$HOME|g" \
              -e "s|\$TARTCI_GOLDENS|$HOME/.tartci/goldens|g" \
            launchd/com.danielraffel.pulp.qemu-runner-windows.plist.template \
            > ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
 
-    3. Load:   launchctl load ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
+    4. Load:   launchctl load ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
        Verify: launchctl list | grep qemu-runner-windows ; tail -F ~/Library/Logs/tartci/qemu-runner-windows.log
     Stop:      launchctl unload ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
                (or flip the Windows toggle off in the Shipyard macOS GUI)
 
   PILOT: the default label is the non-required `pulp-build-windows`. Windows VMs
   are QEMU (not Tart) and uncapped; each job gets a throwaway qcow2 overlay.
+  The serve loop scans queued and in-progress workflow runs for queued jobs and
+  ignores queued jobs older than TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS (six hours
+  by default) so stale workflow shells cannot keep waking QEMU after their
+  useful jobs are gone.
+  It also requires queued job labels to be satisfiable by the configured runner
+  labels by default (TARTCI_RUNNER_QUEUE_MATCH_LABELS=1), so this supervisor can
+  stay loaded while normal Windows jobs still route to GitHub-hosted windows-latest.
+  Runner names use a host-derived prefix by default; set
+  TARTCI_RUNNER_NAME_PREFIX only when you need a stable custom name prefix.
+  A runner that boots but does not claim a job exits after
+  TARTCI_RUNNER_IDLE_TIMEOUT_SECS (15 minutes by default). Per-job diagnostics
+  and timing files land under TARTCI_WIN_LOGS.
 
   Requires on this host: qemu (brew install qemu) + the Windows golden qcow2,
   gh authenticated for the target repo (repo admin, to mint JIT configs), and
@@ -74,6 +92,16 @@
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin</string>
         <key>TARTCI_GOLDENS</key>
         <string>$TARTCI_GOLDENS</string>
+        <key>TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS</key>
+        <string>21600</string>
+        <key>TARTCI_RUNNER_QUEUE_MATCH_LABELS</key>
+        <string>1</string>
+        <key>TARTCI_RUNNER_IDLE_TIMEOUT_SECS</key>
+        <string>900</string>
+        <key>TARTCI_WIN_WORK</key>
+        <string>$HOME/VMs/tmp/tartci-win</string>
+        <key>TARTCI_WIN_LOGS</key>
+        <string>$HOME/VMs/logs/tartci-win</string>
     </dict>
 </dict>
 </plist>

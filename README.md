@@ -83,6 +83,16 @@ macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 boots a throwaway clone per queued job, and lets the GitHub **workflow** drive
 the build — the host just supplies a clean VM each time. `--loop` keeps serving
 (what the LaunchAgents run); the default is one job then exit (pilot-safe).
+The Windows QEMU loop scans queued and in-progress workflow runs for queued jobs,
+ignores stale queued jobs older than `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (six
+hours by default), and checks queued job labels by default
+(`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1`). That keeps the supervisor safe to leave
+loaded while the repo still defaults ordinary Windows jobs to GitHub-hosted
+`windows-latest`; a race-loser VM that boots but never claims a job exits after
+`TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
+GitHub runner registration, and discards the overlay. Ephemeral Windows runner
+names include a host-derived prefix by default so multiple Macs can serve the
+same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
@@ -95,7 +105,21 @@ queued `Build and Test` work.
 For additional Apple Silicon pool members, use the generic host checklist in
 `docs/runbook.md`: stable SSH alias, absolute `/opt/homebrew/bin/tart`,
 absolute `$HOME/.local/bin/tartci`, home-backed `TART_HOME`, and matching
-Shipyard `host_class` capacity config.
+Shipyard `host_class` capacity config. If multiple macOS hosts advertise the
+same workflow selector, give each host a unique runner name by appending one
+extra host-specific label after the shared `pulp-build-*` pool label or by
+setting a unique `--name-prefix` in the installed LaunchAgent.
+
+For Windows QEMU pool members, install the same golden qcow2 and the same
+tartci checkout/home copy on every participating Apple Silicon host, keep
+Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave
+`PULP_LOCAL_WINDOWS_RUNS_ON_JSON` unset until a Windows-native workflow has
+proved the local label. The golden must contain the hosted-runner assumptions
+the workflow uses: Git Bash on `PATH`, Chocolatey, `ccache` when the workflow
+calls it, and `C:\tmp`. Supervisor diagnostics and rough benchmark timings are
+kept per job under `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`,
+`runner-diag.log`, `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the
+full setup and proof recipe.
 
 For Pulp-style required macOS gates, keep setup two-step. First serve the
 non-required pilot label (`self-hosted,macOS,ARM64,pulp-build-vm`) and prove a
@@ -104,6 +128,13 @@ supervisor (`self-hosted,macOS,ARM64,pulp-build,pulp-build-vm`) and route the
 workflow selector to the full label set. Keep the bare-metal `pulp-build`
 runners online as rollback fallback, but excluded from the default VM route by
 the extra `pulp-build-vm` label.
+
+Keep `Release CLI` on its own macOS VM lane. Serve
+`self-hosted,macOS,ARM64,pulp-build-vm-release` from
+`launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template`, then
+move `PULP_RELEASE_MACOS_RUNS_ON_JSON` to that selector only after a real
+Release CLI proof completes. Do not share the Build and Test `pulp-build-vm`
+label with release jobs.
 
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart

@@ -167,14 +167,23 @@ def gh_json(path):
     )
 
 
+runs = []
+seen = set()
 try:
-    data = gh_json(f"repos/{repo}/actions/runs?status=queued&per_page={limit}")
+    for status in ("queued", "in_progress"):
+        data = gh_json(f"repos/{repo}/actions/runs?status={status}&per_page={limit}")
+        for run in data.get("workflow_runs", []):
+            run_id = run.get("id")
+            if run_id in seen:
+                continue
+            seen.add(run_id)
+            runs.append(run)
 except Exception:
     print(0)
     raise SystemExit
 
 matches = 0
-for run in data.get("workflow_runs", []):
+for run in runs:
     if run.get("name") != workflow_name:
         continue
     run_id = run.get("id")

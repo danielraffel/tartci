@@ -84,6 +84,23 @@ job runner clones the golden, mounts the cache, then executes these.
 ## 4. Wire it for repeat use
 
 - CI clones the golden per job (ephemeral, unique hostname + hostfwd port).
+- For macOS GitHub Actions serving, keep distinct workflow lanes on distinct
+  labels. A build gate can use a shared VM pool label such as `pulp-build-vm`;
+  a release workflow should use a separate label such as
+  `pulp-build-vm-release` and its own `TARTCI_RUNNER_WORKFLOW_NAME` filter.
+  When more than one host serves a pool, add an extra host-specific label or
+  explicit `--name-prefix` so JIT runner names do not collide.
+- For Windows QEMU GitHub Actions serving, install the same qcow2 golden and
+  home-backed tartci copy on each Apple Silicon host, keep
+  `/opt/homebrew/bin` in the launchd PATH, and use
+  `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` so supervisors only boot for queued jobs
+  whose labels they can satisfy. Prove with a Windows-native workflow before
+  setting a repo-level Windows `runs-on` variable. Speed comes first from moving
+  deterministic preflight work into the golden and adding persistent Windows
+  caches; keep warm VM pools as a later optimization after the cold CoW lane is
+  reliable. If the workflow was written for GitHub-hosted Windows, explicitly
+  bake the hosted-runner assumptions it uses, commonly Git Bash on `PATH`,
+  Chocolatey, `ccache`, and `C:\tmp`.
 - A human `bench` clone (`bench/bench.sh <os>`) is a *separate persistent* copy
   opened in UTM for GUI/DAW testing — neither CI nor UTM boots the golden
   directly.

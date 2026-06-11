@@ -2,7 +2,7 @@
 <!--
   launchd template for the tartci per-host janitor.
 
-  Runs `tartci doctor --reap --json --fix` periodically. The janitor deletes
+  Runs tartci doctor in reap/json/fix mode periodically. The janitor deletes
   only positively owned CI residue: a VM must match an allowed CI prefix AND
   have a tartci state-file ownership marker before it can be deleted. Goldens,
   `pulp-vm`, `rosetta-probe`, and bench VMs are protected.
