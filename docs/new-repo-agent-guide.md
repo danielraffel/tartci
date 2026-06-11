@@ -64,8 +64,10 @@ job runner clones the golden, mounts the cache, then executes these.
 - **Windows (QEMU):** follow the `providers/qemu-windows/` recipe verbatim — 24H2
   ISO (not 25H2), 512-byte pad, NVMe disk, `ramfb` display, ALL install media on
   `usb-storage`, edk2 vars seeded from the template. Provision over SSH with
-  `powershell -EncodedCommand` (scp'd `.cmd` mis-execute). The MSVC silent-no-op
-  trap and its nuke-reboot fix are in `docs/gotchas.md`.
+  `powershell -EncodedCommand` for short commands (scp'd `.cmd` mis-execute),
+  but stream longer runner/preflight scripts into guest `.ps1` files to avoid
+  cmd.exe's command-line limit. The MSVC silent-no-op trap and its nuke-reboot
+  fix are in `docs/gotchas.md`.
 
 ## 3. Prove one green build, then golden it
 

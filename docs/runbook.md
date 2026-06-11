@@ -722,13 +722,15 @@ through the ssh→cmd→powershell chain); the agent is started through
 file inside PowerShell; the configured Actions runner version is enforced before every JIT run;
 stale `C:\actions-runner` registration files are removed because a golden may
 cache the runner binary but must not cache `.runner` or `.credentials`;
-`vcvarsall` is discovered via `Get-ChildItem` in base64-encoded PowerShell
-(vswhere returns empty for a BuildTools-only install) and imported before both
-preflight diagnostics and the Actions runner process so workflow Bash steps can
-see MSVC; the supervisor **bails the moment QEMU dies** (`kill -0 $qpid`) so a
-free-port TOCTOU surfaces fast instead of burning the full ~10 min SSH window;
-and a post-extract integrity check asserts `Runner.Listener.exe` exists before
-running.
+long preflight / runner PowerShell probes are **streamed into guest `.ps1`
+files** and executed there, because adding toolchain diagnostics can push
+`powershell -EncodedCommand` past cmd.exe's command-line limit; `vcvarsall` is
+discovered via `Get-ChildItem` (vswhere returns empty for a BuildTools-only
+install) and imported before both preflight diagnostics and the Actions runner
+process so workflow Bash steps can see MSVC; the supervisor **bails the moment
+QEMU dies** (`kill -0 $qpid`) so a free-port TOCTOU surfaces fast instead of
+burning the full ~10 min SSH window; and a post-extract integrity check asserts
+`Runner.Listener.exe` exists before running.
 
 ### Serve across reboots (LaunchAgent)
 

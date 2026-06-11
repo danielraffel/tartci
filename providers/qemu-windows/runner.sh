@@ -217,6 +217,16 @@ run_one(){ # $1=iteration index
   fi
   t_booted="$(now_epoch)"
   note "[$i] vm $job up — ensure runner version + run JIT agent (one job)"
+  run_guest_ps_file(){
+    local remote_path="$1" script="$2" upload_enc
+    upload_enc="$(printf '%s' '$ErrorActionPreference="Stop"
+$p="'"$remote_path"'"
+$script=[Console]::In.ReadToEnd()
+Set-Content -LiteralPath $p -Value $script -Encoding UTF8
+& powershell -NoProfile -ExecutionPolicy Bypass -File $p
+exit $LASTEXITCODE' | iconv -t UTF-16LE | base64)"
+    printf '%s' "$script" | wsh "powershell -NoProfile -EncodedCommand $upload_enc"
+  }
   local host_utc enc_clock
   host_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   enc_clock="$(printf '%s' '$hostUtc="'"$host_utc"'"
@@ -236,7 +246,7 @@ try {
   # through the ssh→cmd→powershell chain ("The command line is too long").
   # So: (1) ensure the agent binary version [no blob], (2) STREAM the blob into a
   # file via ssh STDIN [unbounded], (3) run the agent reading that file [no blob].
-  local enc_install enc_preflight enc_run enc_after
+  local enc_install ps_preflight ps_run enc_after
   enc_install="$(printf '%s' '$ProgressPreference="SilentlyContinue"
 $dir="C:\actions-runner"
 $runnerVersion="'"$RUNNER_VERSION"'"
@@ -274,7 +284,7 @@ if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Liste
   # clocks, so sync the throwaway guest to the host UTC and emit lightweight
   # reachability diagnostics before the agent tries to create its session.
   host_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  enc_preflight="$(printf '%s' '$ErrorActionPreference="Continue"
+  ps_preflight='$ErrorActionPreference="Continue"
 $ProgressPreference="SilentlyContinue"
 $hostUtc="'"$host_utc"'"
 try {
@@ -357,9 +367,9 @@ if (Test-Path $listener) {
 $jitPath="C:\actions-runner\jit.cfg"
   if (Test-Path $jitPath) {
   Write-Output ("TARTCI_DIAG jit-cfg-bytes=" + (Get-Item $jitPath).Length)
-}' | iconv -t UTF-16LE | base64)"
+}'
   mkdir -p "$logdir"
-  wsh "powershell -NoProfile -EncodedCommand $enc_preflight" >"$logdir/preflight.log" 2>&1 \
+  run_guest_ps_file "C:\actions-runner\tartci-preflight.ps1" "$ps_preflight" >"$logdir/preflight.log" 2>&1 \
     || note "[$i] preflight diagnostics failed"
   t_preflight="$(now_epoch)"
   prefix_guest_log "$logdir/preflight.log"
@@ -367,7 +377,7 @@ $jitPath="C:\actions-runner\jit.cfg"
   # (3) run the agent reading the jit FILE — small PS, no blob on the wire.
   # Use Runner.Listener.exe directly (not run.cmd) so the huge JIT config is not
   # expanded through cmd.exe's 8191-character command-line limit.
-  enc_run="$(printf '%s' '$runnerPathAdd = @(
+  ps_run='$runnerPathAdd = @(
   "C:\Program Files\Git\cmd",
   "C:\Program Files\Git\bin",
   "C:\Program Files\Git\usr\bin",
@@ -397,12 +407,12 @@ if ($vcvars) {
 }
 Set-Location C:\actions-runner
 & "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
-exit $LASTEXITCODE' | iconv -t UTF-16LE | base64)"
+exit $LASTEXITCODE'
   local run_status=0
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
   mkdir -p "$logdir"
-  wsh "powershell -NoProfile -EncodedCommand $enc_run" >"$runner_output" 2>&1 &
+  run_guest_ps_file "C:\actions-runner\tartci-runner.ps1" "$ps_run" >"$runner_output" 2>&1 &
   runner_pid=$!
   runner_start="$(now_epoch)"
   while kill -0 "$runner_pid" 2>/dev/null; do
