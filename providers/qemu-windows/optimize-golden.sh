@@ -116,7 +116,24 @@ if ($currentVersion -ne $runnerVersion) {
   $zip = Join-Path $env:TEMP ("actions-runner-win-arm64-" + $runnerVersion + ".zip")
   $url = "https://github.com/actions/runner/releases/download/v$runnerVersion/actions-runner-win-arm64-$runnerVersion.zip"
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Invoke-WebRequest -Uri $url -OutFile $zip
+  $ProgressPreference = "SilentlyContinue"
+  Remove-Item $zip -Force -ErrorAction SilentlyContinue
+  $curl = Get-Command curl.exe -ErrorAction SilentlyContinue
+  if ($curl) {
+    & $curl.Source --fail --location --retry 5 --retry-delay 2 --output $zip $url
+    if ($LASTEXITCODE -ne 0) {
+      Write-Output ("TARTCI_OPT runner-download-curl-exit={0}" -f $LASTEXITCODE)
+      exit $LASTEXITCODE
+    }
+  } else {
+    Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $zip
+  }
+  $zipInfo = Get-Item $zip -ErrorAction SilentlyContinue
+  if (-not $zipInfo -or $zipInfo.Length -le 0) {
+    Write-Output "TARTCI_OPT runner-download-empty=1"
+    exit 1
+  }
+  Write-Output ("TARTCI_OPT runner-download-bytes={0}" -f $zipInfo.Length)
   Expand-Archive -Path $zip -DestinationPath $runnerDir -Force
   Remove-Item $zip -Force -ErrorAction SilentlyContinue
 } else {
@@ -155,6 +172,7 @@ tmp_remote='C:\actions-runner\tartci-optimize-golden.ps1'
 tmp_remote_b64='C:\actions-runner\tartci-optimize-golden.ps1.b64'
 script_b64="$(printf '%s' "$ps_script" | base64 | tr -d '\n')"
 
+"${SSH[@]}" "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path 'C:\actions-runner' | Out-Null\""
 "${SSH[@]}" "powershell -NoProfile -Command \"Set-Content -LiteralPath '$tmp_remote_b64' -Value '' -NoNewline\""
 while [ -n "$script_b64" ]; do
   chunk="${script_b64:0:3000}"
