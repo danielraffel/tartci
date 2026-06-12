@@ -26,6 +26,15 @@ Write-Output "TARTCI_OPT arches=$($arches -join ",")"
 
 New-Item -ItemType Directory -Force -Path "C:\tmp" | Out-Null
 New-Item -ItemType Directory -Force -Path "C:\actions-runner" | Out-Null
+$ccacheDir = Join-Path $env:LOCALAPPDATA "ccache"
+$sccacheDir = Join-Path $env:LOCALAPPDATA "sccache"
+$pulpFetchContentDir = Join-Path $env:LOCALAPPDATA "Pulp\fetchcontent-src"
+New-Item -ItemType Directory -Force -Path $ccacheDir | Out-Null
+New-Item -ItemType Directory -Force -Path $sccacheDir | Out-Null
+New-Item -ItemType Directory -Force -Path $pulpFetchContentDir | Out-Null
+Write-Output "TARTCI_OPT cache ccache=$ccacheDir"
+Write-Output "TARTCI_OPT cache sccache=$sccacheDir"
+Write-Output "TARTCI_OPT cache pulp-fetchcontent=$pulpFetchContentDir"
 
 $wantedPath = @(
   "C:\Program Files\Git\bin",
@@ -69,6 +78,25 @@ foreach ($cmd in @("git", "bash", "choco", "ccache")) {
 if ($missingCommands.Count -gt 0) {
   Write-Output ("TARTCI_OPT missing-commands={0}" -f ($missingCommands -join ","))
   exit 1
+}
+
+$env:CCACHE_DIR = $ccacheDir
+ccache --set-config "cache_dir=$ccacheDir"
+ccache --set-config "max_size=30G"
+ccache --set-config "compression=true"
+ccache --set-config "compiler_check=content"
+Write-Output "TARTCI_OPT ccache-config=start"
+ccache --show-config
+Write-Output "TARTCI_OPT ccache-config=done"
+
+$sccache = Get-Command sccache -ErrorAction SilentlyContinue
+if ($sccache) {
+  [Environment]::SetEnvironmentVariable("SCCACHE_DIR", $sccacheDir, "Machine")
+  $env:SCCACHE_DIR = $sccacheDir
+  Write-Output ("TARTCI_OPT command sccache={0}" -f $sccache.Source)
+  sccache --show-stats
+} else {
+  Write-Output "TARTCI_OPT command sccache=missing-optional"
 }
 
 $runnerDir = "C:\actions-runner"

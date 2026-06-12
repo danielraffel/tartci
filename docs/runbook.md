@@ -493,9 +493,35 @@ TARTCI_WIN_VCVARS_ARCHES=arm64,x64 tartci windows optimize
 The optimizer is idempotent. It creates `C:\tmp`, persists the standard Git
 Bash/Chocolatey/ccache PATH entries when those directories exist, prewarms common
 PowerShell module analysis, preinstalls the configured Windows ARM64 Actions
-runner version, fails if hosted-runner compatibility tools are missing, and
-verifies `vcvarsall` + `cl` for each requested architecture before
-`tartci windows golden <name>` shuts the VM down and snapshots it.
+runner version, creates the standard cache roots, configures ccache, fails if
+hosted-runner compatibility tools are missing, and verifies `vcvarsall` + `cl`
+for each requested architecture before `tartci windows golden <name>` shuts the
+VM down and snapshots it.
+
+Windows cache contract for projects:
+
+- **C/C++ object cache:** use `ccache` first unless the project has already
+  standardized on `sccache`. CMake projects should set
+  `CMAKE_C_COMPILER_LAUNCHER=ccache` and `CMAKE_CXX_COMPILER_LAUNCHER=ccache`
+  or auto-detect `ccache` like Pulp does. Restore/save
+  `~/AppData/Local/ccache` in the workflow. This is the cache that turns repeated
+  compile-heavy Pulp jobs from "compile the world" into "compile only changed
+  translation units".
+- **Rust or mixed-language cache:** if a project uses `sccache`, set
+  `SCCACHE_DIR=%LOCALAPPDATA%\sccache`, `RUSTC_WRAPPER=sccache`, and for CMake
+  use `sccache` as the compiler launcher. Restore/save `~/AppData/Local/sccache`.
+  Do not enable both ccache and sccache for the same C/C++ target.
+- **Dependency/source cache:** restore/save the project's source cache, not build
+  outputs. For Pulp that is `~/AppData/Local/Pulp/fetchcontent-src`, which backs
+  `PULP_SHARED_FETCHCONTENT_SOURCE_DIR` / the default `PulpFetchContent.cmake`
+  lookup. This avoids re-fetching/re-unpacking dependencies; ccache then avoids
+  recompiling them.
+
+The current QEMU Windows lane has disposable overlays and no proven host-mounted
+Windows filesystem cache yet. Until an SMB/virtiofs-style host mount is proven,
+durability comes from workflow cache restore/save into the above guest paths.
+Measure with the workflow's `Ccache stats` step plus `tartci timings`; a faster
+boot without cache hits is not the win.
 
 ### 4.9 Serve Windows jobs from QEMU hosts
 
@@ -621,8 +647,8 @@ Highest-return changes, in order:
 2. **Add a real Windows build cache.** Use `sccache` for C/C++ and Rust
    compilation, plus the project-specific package caches that matter
    (`CMake` downloads, `NuGet`, `Cargo`, `pnpm`/`npm`, and similar). The cache
-   should live outside the disposable qcow2 overlay so every fresh VM can reuse
-   it.
+   must be restored into the guest at job start or live outside the disposable
+   qcow2 overlay so every fresh VM can reuse it.
 3. **Prefer host-backed cache storage once the clean lane is stable.** A
    VirtIO-backed or otherwise host-mounted cache on local NVMe avoids virtual
    disk churn and survives VM recreation. Treat source trees and build outputs
