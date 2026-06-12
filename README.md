@@ -3,7 +3,8 @@
 [![lint](https://github.com/danielraffel/tartci/actions/workflows/ci.yml/badge.svg)](https://github.com/danielraffel/tartci/actions/workflows/ci.yml)
 
 Stand up **fast, cached, disposable Linux / Windows / macOS build VMs on an Apple
-Silicon Mac**, wired to GitHub runners + [Shipyard](https://github.com/danielraffel/shipyard), so you can build & test a repo
+Silicon Mac**, optionally wired to GitHub runners +
+[Shipyard](https://github.com/danielraffel/Shipyard), so you can build & test a repo
 locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
 priority; the same goldens double as GUI **bench** VMs you can open in UTM to test things like
 plugins in a DAW.
@@ -102,12 +103,19 @@ A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its
 golden from it — zero hand-provisioning. Non-generic needs (extra SDKs, a special
 toolchain) go in that manifest.
 
-CI routing policy lives beside the consumer repo or in tartci `profiles/` as
-commented TOML. `profiles/normal-local-fast.toml` is the current Pulp shape:
-PR macOS/Linux/Windows prefer local ARM64 VM runners, overflow to GitHub where
-configured, and scheduled Intel Linux/Windows checks remain GitHub-hosted x64.
-Use `tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
-descriptions and settings from the same parseable source of truth.
+CI routing policy can live beside the consumer repo or in tartci `profiles/` as
+commented TOML. tartci treats profiles as a read-only contract: they explain
+what each repo wants for `pr`, `release`, `coverage`, `scheduled`, and
+`issue_on_failure`, and they map stable target IDs to concrete GitHub
+`runs-on` selectors. Shipyard can consume that contract as the router, while
+tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` is the
+current Pulp shape: PR macOS/Linux/Windows prefer local ARM64 VM runners where
+enabled, overflow to GitHub where configured, and scheduled Intel
+Linux/Windows checks remain GitHub-hosted x64. Use
+`tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
+descriptions and settings from the same parseable source of truth. See
+[Shipyard profiles](https://github.com/danielraffel/Shipyard/blob/main/docs/profiles.md)
+for the orchestration side.
 
 ## Optional pulp-CLI integration
 Soft dependency: if installed, `pulp doctor` reports "local CI VMs: available",

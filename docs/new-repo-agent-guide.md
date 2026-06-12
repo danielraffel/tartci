@@ -91,7 +91,10 @@ job runner clones the golden, mounts the cache, then executes these.
   profile parseable TOML (`.shipyard/ci-profiles/<name>.toml`,
   `.tartci/<name>.toml`, or tartci `profiles/<name>.toml`) and include comments
   for `pr`, `release`, `coverage`, `scheduled`, and `issue_on_failure` so agents
-  do not need a second document to understand the policy.
+  do not need a second document to understand the policy. This is optional:
+  repos can use tartci directly with `tartci up` / `tartci serve`, use Shipyard
+  to resolve profiles and dispatch GitHub workflows, or stay entirely on
+  GitHub-hosted runners.
 - If `pulp` (or another supported CLI) is installed, it can soft-detect this
   toolkit and delegate (`pulp vm up <os>`); absence is never a punishment.
 
