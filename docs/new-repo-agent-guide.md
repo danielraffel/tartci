@@ -87,6 +87,11 @@ job runner clones the golden, mounts the cache, then executes these.
 - A human `bench` clone (`bench/bench.sh <os>`) is a *separate persistent* copy
   opened in UTM for GUI/DAW testing — neither CI nor UTM boots the golden
   directly.
+- Add or update a routing profile when the repo will use local runners. Keep the
+  profile parseable TOML (`.shipyard/ci-profiles/<name>.toml`,
+  `.tartci/<name>.toml`, or tartci `profiles/<name>.toml`) and include comments
+  for `pr`, `release`, `coverage`, `scheduled`, and `issue_on_failure` so agents
+  do not need a second document to understand the policy.
 - If `pulp` (or another supported CLI) is installed, it can soft-detect this
   toolkit and delegate (`pulp vm up <os>`); absence is never a punishment.
 

@@ -45,6 +45,8 @@ git clone <this-repo> tartci && cd tartci
 ./tartci setup            # brew-install tart/qemu/sshpass + create local stores
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
+./tartci status --json    # host-local provider/capacity/profile state for agents
+./tartci profile plan normal-local-fast --repo danielraffel/pulp --json
 ./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
@@ -54,7 +56,10 @@ git clone <this-repo> tartci && cd tartci
 ./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
 ```
 `tartci doctor`, `bench`, `metrics`, `up linux`, `up windows`, and `serve
-linux|windows` are wired today. `tartci up linux [--ref <git-ref>] [--no-gpu]
+linux|windows` are wired today. `tartci status --json` and `tartci profile
+list|show|explain|plan` are read-only helpers for Shipyard, Codex, Claude, or
+other agents to answer where CI should run from machine-readable config.
+`tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]
 [--keep]` makes a per-job CoW overlay off the Windows golden on a dynamic SSH
@@ -96,6 +101,13 @@ A repo drops a `.shipyard/vm-image.toml` (see `manifests/`) declaring its
 `os`/`arch`/`toolchain`/`packages`/`caches`/`mounts`. tartci bakes or clones a
 golden from it — zero hand-provisioning. Non-generic needs (extra SDKs, a special
 toolchain) go in that manifest.
+
+CI routing policy lives beside the consumer repo or in tartci `profiles/` as
+commented TOML. `profiles/normal-local-fast.toml` is the current Pulp shape:
+PR macOS/Linux/Windows prefer local ARM64 VM runners, overflow to GitHub where
+configured, and scheduled Intel Linux/Windows checks remain GitHub-hosted x64.
+Use `tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
+descriptions and settings from the same parseable source of truth.
 
 ## Optional pulp-CLI integration
 Soft dependency: if installed, `pulp doctor` reports "local CI VMs: available",
