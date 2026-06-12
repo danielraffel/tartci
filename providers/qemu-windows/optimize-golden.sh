@@ -152,11 +152,22 @@ Write-Output "TARTCI_OPT done=1"
 '
 
 tmp_remote='C:\actions-runner\tartci-optimize-golden.ps1'
-upload_enc="$(printf '%s' '$ErrorActionPreference="Stop"
+tmp_remote_b64='C:\actions-runner\tartci-optimize-golden.ps1.b64'
+script_b64="$(printf '%s' "$ps_script" | base64 | tr -d '\n')"
+
+"${SSH[@]}" "powershell -NoProfile -Command \"Set-Content -LiteralPath '$tmp_remote_b64' -Value '' -NoNewline\""
+while [ -n "$script_b64" ]; do
+  chunk="${script_b64:0:3000}"
+  script_b64="${script_b64:3000}"
+  "${SSH[@]}" "powershell -NoProfile -Command \"Add-Content -LiteralPath '$tmp_remote_b64' -Value '$chunk' -NoNewline\""
+done
+
+run_enc="$(printf '%s' '$ErrorActionPreference="Stop"
 $p="'"$tmp_remote"'"
-$script=[Console]::In.ReadToEnd()
-Set-Content -LiteralPath $p -Value $script -Encoding UTF8
+$b64="'"$tmp_remote_b64"'"
+$bytes=[Convert]::FromBase64String((Get-Content -LiteralPath $b64 -Raw))
+[IO.File]::WriteAllBytes($p, $bytes)
 & powershell -NoProfile -ExecutionPolicy Bypass -File $p
 exit $LASTEXITCODE' | iconv -t UTF-16LE | base64)"
 
-printf '%s' "$ps_script" | "${SSH[@]}" "powershell -NoProfile -EncodedCommand $upload_enc"
+"${SSH[@]}" "powershell -NoProfile -EncodedCommand $run_enc"
