@@ -110,7 +110,7 @@ provider = "tartci"
 host = "macstudio"
 os = "macos"
 arch = "arm64"
-runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-coverage-vm"]
+runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-coverage-vm-macos"]
 ephemeral = true
 
 [targets."github.macos-arm64"]
