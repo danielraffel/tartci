@@ -542,8 +542,8 @@ Install the Windows golden on each host:
 
 ```bash
 cp /path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2 \
-  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-11.qcow2"
-shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-11.qcow2"
+  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
 ```
 
 Keep the runner code on a home-backed path so launchd and non-interactive SSH do
@@ -558,7 +558,7 @@ One-shot proof, with the same PATH launchd will use:
 
 ```bash
 PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin" \
-TARTCI_WIN_GOLDEN="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-11.qcow2" \
+TARTCI_WIN_GOLDEN="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2" \
 TARTCI_RUNNER_REPO=OWNER/REPO \
 TARTCI_RUNNER_LABELS=self-hosted,Windows,ARM64,pulp-build-windows \
 TARTCI_WIN_WORK="$HOME/VMs/tmp/tartci-win-proof" \
