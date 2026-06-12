@@ -482,6 +482,21 @@ Tag the golden when green: `pulp-windows-build:<date>`. Prefer **sccache** for
 new Windows-native cache work; if the consuming workflow still calls `ccache`,
 bake `ccache` too so the first job does not have to install it.
 
+Before tagging, run the golden optimizer against the booted single-operator VM:
+
+```bash
+tartci windows optimize
+# Optional x64/Prism smoke validation in the same booted ARM64 Windows guest:
+TARTCI_WIN_VCVARS_ARCHES=arm64,x64 tartci windows optimize
+```
+
+The optimizer is idempotent. It creates `C:\tmp`, persists the standard Git
+Bash/Chocolatey/ccache PATH entries when those directories exist, prewarms common
+PowerShell module analysis, preinstalls the configured Windows ARM64 Actions
+runner version, fails if hosted-runner compatibility tools are missing, and
+verifies `vcvarsall` + `cl` for each requested architecture before
+`tartci windows golden <name>` shuts the VM down and snapshots it.
+
 ### 4.9 Serve Windows jobs from QEMU hosts
 
 The Windows pool is intentionally QEMU, not Tart. Each GitHub job gets a fresh
@@ -600,8 +615,9 @@ Highest-return changes, in order:
    verifies only clock, runner version, and JIT config by default. Toolchain
    discovery, PATH fixes, execution policy, certificate setup, SDK validation,
    and GitHub broker probes should be baked into the golden and proven during
-   image creation. Keep `TARTCI_WIN_PREFLIGHT_MODE=full` for debug rather than
-   paying for those probes on every job.
+   image creation. Run `tartci windows optimize` before tagging the qcow2, then
+   keep `TARTCI_WIN_PREFLIGHT_MODE=full` for debug rather than paying for those
+   probes on every job.
 2. **Add a real Windows build cache.** Use `sccache` for C/C++ and Rust
    compilation, plus the project-specific package caches that matter
    (`CMake` downloads, `NuGet`, `Cargo`, `pnpm`/`npm`, and similar). The cache

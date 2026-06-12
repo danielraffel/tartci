@@ -62,6 +62,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci serve macos --once --labels self-hosted,macOS,ARM64,pulp-build-vm
 ./tartci serve windows --loop   # keep serving Windows jobs (throwaway overlay each)
 ./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
+./tartci windows optimize # prewarm/validate the booted Windows golden before tagging
 ```
 `tartci doctor`, `bench`, `metrics`, `up linux`, `up windows`, and `serve
 linux|macos|windows` are wired today. `tartci status --json` and `tartci profile
