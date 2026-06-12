@@ -1,0 +1,137 @@
+# Profile: normal-local-fast
+#
+# PR: checks that run for pull requests, workflow_dispatch PR validation, and
+#     regular fast feedback.
+# Release: conservative release workflows. These may intentionally use fewer
+#     local fallbacks than PR checks.
+# Coverage: coverage-producing jobs. Use clean ephemeral runners; do not route
+#     coverage to warm bare-metal build pools.
+# Scheduled: periodic validation on main. This is the right place for slower
+#     GitHub-hosted Intel Linux/Windows checks.
+# issue_on_failure: for scheduled/main jobs, create or update a deduped issue
+#     with run URL, commit, lane, failing step, and error signature.
+#
+# Target IDs below are tartci/Shipyard vocabulary. They are not GitHub labels.
+# The [targets.*] catalog maps each target to the exact GitHub `runs-on` selector
+# that Pulp workflows receive after Shipyard/tartci planning chooses a concrete
+# route.
+
+name = "normal-local-fast"
+description = "Fast PRs on local ARM64 VMs with nightly GitHub Intel validation."
+
+[repo."danielraffel/pulp".pr.macos]
+strategy = "ordered-fallback"
+targets = ["macstudio.macos-arm64-vm", "m5.macos-arm64-vm", "github.macos-arm64"]
+github_variable = "PULP_LOCAL_MACOS_RUNS_ON_JSON"
+
+[repo."danielraffel/pulp".pr.linux]
+strategy = "ordered-fallback"
+targets = ["macstudio.linux-arm64-vm", "m5.linux-arm64-vm", "github.linux-x64"]
+github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
+
+[repo."danielraffel/pulp".pr.windows]
+strategy = "ordered-fallback"
+targets = ["macstudio.windows-arm64-qemu", "github.windows-x64"]
+github_variable = "PULP_LOCAL_WINDOWS_RUNS_ON_JSON"
+
+[repo."danielraffel/pulp".release.macos]
+strategy = "ordered-fallback"
+targets = ["macstudio.macos-arm64-release-vm", "github.macos-arm64"]
+github_variable = "PULP_RELEASE_MACOS_RUNS_ON_JSON"
+
+[repo."danielraffel/pulp".coverage.macos]
+strategy = "ordered-fallback"
+targets = ["macstudio.macos-arm64-coverage-vm", "github.macos-arm64"]
+github_variable = "PULP_COVERAGE_MACOS_RUNS_ON_JSON"
+ephemeral_required = true
+
+[repo."danielraffel/pulp".coverage.windows]
+strategy = "github-only"
+targets = ["github.windows-x64"]
+github_variable = "PULP_COVERAGE_WINDOWS_RUNS_ON_JSON"
+
+[repo."danielraffel/pulp".scheduled.nightly_intel]
+enabled = true
+branch = "main"
+targets = ["github.linux-x64", "github.windows-x64"]
+issue_on_failure = true
+
+[targets."macstudio.macos-arm64-vm"]
+description = "Mac Studio Tart macOS ARM64 build VM."
+provider = "tartci"
+host = "macstudio"
+os = "macos"
+arch = "arm64"
+runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+
+[targets."m5.macos-arm64-vm"]
+description = "M5/blackbook Tart macOS ARM64 overflow build VM."
+provider = "tartci"
+host = "m5"
+os = "macos"
+arch = "arm64"
+runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+
+[targets."macstudio.linux-arm64-vm"]
+description = "Mac Studio Tart Linux ARM64 build VM."
+provider = "tartci"
+host = "macstudio"
+os = "linux"
+arch = "arm64"
+runs_on_json = ["self-hosted", "Linux", "ARM64", "pulp-build-linux"]
+
+[targets."m5.linux-arm64-vm"]
+description = "M5/blackbook Tart Linux ARM64 overflow build VM."
+provider = "tartci"
+host = "m5"
+os = "linux"
+arch = "arm64"
+runs_on_json = ["self-hosted", "Linux", "ARM64", "pulp-build-linux"]
+
+[targets."macstudio.windows-arm64-qemu"]
+description = "Mac Studio Windows ARM64 QEMU runner."
+provider = "tartci"
+host = "macstudio"
+os = "windows"
+arch = "arm64"
+runs_on_json = ["self-hosted", "Windows", "ARM64", "pulp-build-windows"]
+
+[targets."macstudio.macos-arm64-release-vm"]
+description = "Mac Studio dedicated Tart macOS ARM64 release VM."
+provider = "tartci"
+host = "macstudio"
+os = "macos"
+arch = "arm64"
+runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build-vm-release"]
+
+[targets."macstudio.macos-arm64-coverage-vm"]
+description = "Mac Studio dedicated ephemeral Tart macOS ARM64 coverage VM."
+provider = "tartci"
+host = "macstudio"
+os = "macos"
+arch = "arm64"
+runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-coverage-vm"]
+ephemeral = true
+
+[targets."github.macos-arm64"]
+description = "GitHub-hosted macOS ARM64 runner."
+provider = "github"
+os = "macos"
+arch = "arm64"
+runs_on_json = "macos-15"
+
+[targets."github.linux-x64"]
+description = "GitHub-hosted Linux x64 runner."
+provider = "github"
+os = "linux"
+arch = "x64"
+runs_on_json = "ubuntu-latest"
+authoritative_for = ["linux-x64"]
+
+[targets."github.windows-x64"]
+description = "GitHub-hosted Windows x64 runner."
+provider = "github"
+os = "windows"
+arch = "x64"
+runs_on_json = "windows-latest"
+authoritative_for = ["windows-x64"]

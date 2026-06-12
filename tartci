@@ -6,6 +6,8 @@
 # dependencies of its own — just bash + the tools `doctor` checks for.
 #
 #   tartci doctor              # report host prereqs + stores (always safe)
+#   tartci status --json       # report host-local provider/profile state
+#   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci setup               # brew-install prereqs + create local stores
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
@@ -47,6 +49,14 @@ cmd_doctor() {
     local n; n=$(find "$TARTCI_GOLDENS" -maxdepth 1 \( -name '*.qcow2' -o -name '*.tart' \) 2>/dev/null | wc -l | tr -d ' ')
     echo "goldens: $n"; find "$TARTCI_GOLDENS" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sed 's/^/  - /'
   fi
+}
+
+cmd_status() {
+  exec python3 "$HERE/scripts/status.py" "$@"
+}
+
+cmd_profile() {
+  exec python3 "$HERE/scripts/profile.py" "$@"
 }
 
 cmd_setup() {
@@ -128,6 +138,8 @@ usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  cmd_doctor ;;
+  status)  shift; cmd_status "$@" ;;
+  profile) shift; cmd_profile "$@" ;;
   setup)   cmd_setup ;;
   bench)   shift; cmd_bench "$@" ;;
   metrics) shift; cmd_metrics "$@" ;;

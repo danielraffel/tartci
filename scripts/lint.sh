@@ -7,7 +7,7 @@
 #               script (*.sh plus extensionless files with a bash shebang,
 #               so the front-door `tartci` dispatcher is covered).
 #   2. python — `py_compile` on every *.py (metrics/).
-#   3. TOML   — every manifests/*.toml parses (skipped with a note if the
+#   3. TOML   — every manifests/*.toml and profiles/*.toml parses (skipped with a note if the
 #               local python predates tomllib / 3.11).
 #
 # Portable to macOS's stock bash 3.2 (no `mapfile`, no associative arrays) —
@@ -64,17 +64,22 @@ if [ "${#py_files[@]}" -gt 0 ]; then
 fi
 
 # ── 3. TOML manifests ───────────────────────────────────────────────────────
-if ls manifests/*.toml >/dev/null 2>&1; then
+toml_files=()
+while IFS= read -r f; do toml_files+=("$f"); done < <(
+  find manifests profiles -type f -name '*.toml' 2>/dev/null | sort
+)
+if [ "${#toml_files[@]}" -gt 0 ]; then
   toml_rc=0
   python3 - <<'PY' || toml_rc=$?
-import glob, sys
+import pathlib, sys
 try:
     import tomllib
 except ModuleNotFoundError:
     print("  (tomllib unavailable — python < 3.11; skipping TOML parse)")
     sys.exit(0)
 errs = 0
-for p in sorted(glob.glob("manifests/*.toml")):
+paths = sorted(list(pathlib.Path("manifests").glob("*.toml")) + list(pathlib.Path("profiles").glob("*.toml")))
+for p in paths:
     try:
         with open(p, "rb") as fh:
             tomllib.load(fh)
