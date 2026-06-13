@@ -68,6 +68,38 @@ MagicDNS name and can `ssh`/log-pull from anywhere without port juggling. Prefer
 the MagicDNS name over the per-boot vmnet IP. Disable Tailscale SSH on persistent
 operator boxes to avoid re-auth prompts.
 
+**Secondary Apple Silicon hosts (M-series pool members).** Keep host-specific
+aliases in your local SSH and Shipyard config, not in this repo. The reusable
+shape is:
+
+```bash
+# Prove non-interactive SSH and the host's Tart install/store.
+ssh <m-series-ssh-alias> 'hostname; sw_vers -productVersion; sysctl -n machdep.cpu.brand_string'
+ssh <m-series-ssh-alias> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list --format json'
+```
+
+Use an explicit Homebrew Tart path because non-interactive SSH may not load
+Homebrew's PATH. Prefer a home-backed Tart store for launchd-operated macOS CI:
+`TART_HOME=/Users/<you>/VMs` on each host, with the macOS golden copied or baked
+there. In Shipyard, keep the matching operator-local capacity config outside the
+committed repo config:
+
+```toml
+[host_class.secondary]
+ssh = "<m-series-ssh-alias>"
+cap = 2
+tart_bin = "/opt/homebrew/bin/tart"
+tartci_bin = "/Users/<you>/.local/bin/tartci"
+tart_home = "/Users/<you>/VMs" # absolute path; no shell/tilde expansion
+labels = ["self-hosted", "macos", "arm64", "<repo>-build-secondary"]
+```
+
+The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
+all point at the same Tart store. If one uses default `tart` state and another
+uses `TART_HOME`, capacity and cleanup will disagree.
+Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
+host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
+
 ---
 
 ## 2. macOS lane (Tart)
@@ -438,11 +470,215 @@ Two Windows-specific musts:
 
 - **Create `C:\tmp`** — tests use POSIX `/tmp/...` paths, which resolve to
   `C:\tmp` on Windows. Without it those tests fail.
+- **Bake hosted-runner-compatible command paths** — Pulp's current GitHub
+  workflow assumes `bash`, `choco`, and `ccache` can be found on `PATH`. Install
+  Chocolatey, install `ccache`, and add `C:\Program Files\Git\bin`,
+  `C:\Program Files\Git\usr\bin`, and `C:\ProgramData\chocolatey\bin` to the
+  machine PATH before tagging the golden.
 - **If `cl` hangs on a translation unit, kill it and resume** — Ninja is
   incremental, and the arm→x64 emulation can transiently stall a TU.
 
-Tag the golden when green: `pulp-windows-build:<date>`. Use **sccache** (not
-ccache) for Windows cache warmth.
+Tag the golden when green: `pulp-windows-build:<date>`. Prefer **sccache** for
+new Windows-native cache work; if the consuming workflow still calls `ccache`,
+bake `ccache` too so the first job does not have to install it.
+
+Before tagging, run the golden optimizer against the booted single-operator VM:
+
+```bash
+tartci windows optimize
+# Optional x64/Prism smoke validation in the same booted ARM64 Windows guest:
+TARTCI_WIN_VCVARS_ARCHES=arm64,x64 tartci windows optimize
+```
+
+The optimizer is idempotent. It creates `C:\tmp`, persists the standard Git
+Bash/Chocolatey/ccache PATH entries when those directories exist, prewarms common
+PowerShell module analysis, preinstalls the configured Windows ARM64 Actions
+runner version, creates the standard cache roots, configures ccache, fails if
+hosted-runner compatibility tools are missing, and verifies `vcvarsall` + `cl`
+for each requested architecture before `tartci windows golden <name>` shuts the
+VM down and snapshots it.
+
+Windows cache contract for projects:
+
+- **C/C++ object cache:** use `ccache` first unless the project has already
+  standardized on `sccache`. CMake projects should set
+  `CMAKE_C_COMPILER_LAUNCHER=ccache` and `CMAKE_CXX_COMPILER_LAUNCHER=ccache`
+  or auto-detect `ccache` like Pulp does. Restore/save
+  `~/AppData/Local/ccache` in the workflow. This is the cache that turns repeated
+  compile-heavy Pulp jobs from "compile the world" into "compile only changed
+  translation units".
+- **Rust or mixed-language cache:** if a project uses `sccache`, set
+  `SCCACHE_DIR=%LOCALAPPDATA%\sccache`, `RUSTC_WRAPPER=sccache`, and for CMake
+  use `sccache` as the compiler launcher. Restore/save `~/AppData/Local/sccache`.
+  Do not enable both ccache and sccache for the same C/C++ target.
+- **Dependency/source cache:** restore/save the project's source cache, not build
+  outputs. For Pulp that is `~/AppData/Local/Pulp/fetchcontent-src`, which backs
+  `PULP_SHARED_FETCHCONTENT_SOURCE_DIR` / the default `PulpFetchContent.cmake`
+  lookup. This avoids re-fetching/re-unpacking dependencies; ccache then avoids
+  recompiling them.
+
+The current QEMU Windows lane has disposable overlays and no proven host-mounted
+Windows filesystem cache yet. Until an SMB/virtiofs-style host mount is proven,
+durability comes from workflow cache restore/save into the above guest paths.
+Measure with the workflow's `Ccache stats` step plus `tartci timings`; a faster
+boot without cache hits is not the win.
+
+### 4.9 Serve Windows jobs from QEMU hosts
+
+The Windows pool is intentionally QEMU, not Tart. Each GitHub job gets a fresh
+qcow2 overlay from the golden, a dynamic localhost SSH port, a one-time JIT
+Actions runner, and then the overlay is discarded. Use the same setup on every
+Apple Silicon host that should participate in the Windows pool.
+
+Host prerequisites:
+
+```bash
+brew install qemu
+gh auth status -h github.com
+mkdir -p "$HOME/.tartci/goldens" "$HOME/VMs/tmp" "$HOME/VMs/logs"
+```
+
+Install the Windows golden on each host:
+
+```bash
+cp /path/to/pulp-windows-build-24h2-arm64-YYYY-MM-DD.qcow2 \
+  "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+shasum -a 256 "$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2"
+```
+
+Keep the runner code on a home-backed path so launchd and non-interactive SSH do
+not depend on a mounted workspace:
+
+```bash
+mkdir -p "$HOME/.local/share/tartci"
+rsync -a --delete --exclude .git ./ "$HOME/.local/share/tartci/"
+```
+
+One-shot proof, with the same PATH launchd will use:
+
+```bash
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin" \
+TARTCI_WIN_GOLDEN="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2" \
+TARTCI_RUNNER_REPO=OWNER/REPO \
+TARTCI_RUNNER_LABELS=self-hosted,Windows,ARM64,pulp-build-windows \
+TARTCI_WIN_WORK="$HOME/VMs/tmp/tartci-win-proof" \
+TARTCI_WIN_LOGS="$HOME/VMs/logs/tartci-win-proof" \
+"$HOME/.local/share/tartci/providers/qemu-windows/runner.sh" --once
+```
+
+To create a matching queued job, prefer a Windows-native workflow. For Pulp,
+use `Build and Test` with a per-run selector override for a full proof:
+
+```bash
+gh workflow run build.yml -R danielraffel/pulp --ref main \
+  -f runner_provider=github-hosted \
+  -f 'windows_runner_selector_json=["self-hosted","Windows","ARM64","pulp-build-windows"]'
+```
+
+A tiny workflow can also prove assignment, but it must use a Windows-compatible
+shell. A Unix-shell step such as `chmod +x tools/check-docs.sh` will correctly
+prove that the runner claimed the job, then fail under Windows PowerShell. Treat
+that as an availability probe only, not as a green-lane proof.
+
+After a proof, inspect both GitHub and the host logs:
+
+```bash
+gh api repos/OWNER/REPO/actions/runs/RUN_ID/jobs \
+  --jq '.jobs[] | [.name,.status,(.conclusion//""),.created_at,.started_at,.completed_at,((.labels//[])|join("|")),(.runner_name//"")] | @tsv'
+
+find "$HOME/VMs/logs/tartci-win-proof" -name timing.tsv -print -exec cat {} \;
+tail -F "$HOME/Library/Logs/tartci/qemu-runner-windows.log"
+```
+
+The supervisor writes:
+
+- `preflight.log`: guest clock sync, PowerShell execution policy, GitHub/broker
+  TCP checks, runner version, JIT config byte count, `vcvarsall` discovery, and
+  `cl.exe` visibility after the MSVC environment import.
+- `early-clock.log`: minimal guest clock sync before any HTTPS runner download.
+- `runner-output.log`: stdout/stderr from `Runner.Listener.exe run --jitconfig`,
+  including the runner-process `vcvarsall` import and `cl.exe` diagnostic before
+  the Actions agent starts.
+- `runner-diag.log`: tail of the latest Actions runner `_diag` logs.
+- `qemu.log`: QEMU stderr.
+- `timing.tsv`: `boot_to_ssh`, `preflight`, `runner_process`, `post_diag`, and
+  `total` seconds for rough host-to-host and hosted-runner comparisons.
+
+Only enable normal routing after a Windows-native workflow proves the lane:
+
+```bash
+gh variable set PULP_LOCAL_WINDOWS_RUNS_ON_JSON -R danielraffel/pulp \
+  --body '["self-hosted","Windows","ARM64","pulp-build-windows"]'
+```
+
+Until that variable is set, ordinary Pulp Windows jobs continue to use
+GitHub-hosted `windows-latest`. The QEMU supervisor is still safe to leave loaded
+because `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` makes `--loop` boot only when a
+fresh queued job's requested labels can be satisfied by this runner's labels.
+
+### 4.10 Speed up the Windows QEMU lane
+
+Optimize from `timing.tsv`, not from intuition. The first smoke proofs showed
+QEMU startup was not the dominant cost: boot-to-SSH was roughly 25 seconds,
+while preflight diagnostics took about a minute. A full Build and Test run will
+mostly be build and test time, so keep both the host timing file and the GitHub
+job timestamps when comparing against `windows-latest`.
+
+```bash
+tartci timings
+tartci timings "$HOME/VMs/logs/tartci-win" "$HOME/VMs/logs/tartci-linux"
+```
+
+The Windows runner defaults to `TARTCI_WIN_PREFLIGHT_MODE=fast`: sync the clock,
+verify the JIT config landed, record the runner listener version, then launch
+the job. The old verbose probe path is still available with
+`TARTCI_WIN_PREFLIGHT_MODE=full` when diagnosing a new golden or network/toolchain
+issue.
+
+Highest-return changes, in order:
+
+1. **Move deterministic preflight into the golden.** The normal supervisor path
+   verifies only clock, runner version, and JIT config by default. Toolchain
+   discovery, PATH fixes, execution policy, certificate setup, SDK validation,
+   and GitHub broker probes should be baked into the golden and proven during
+   image creation. Run `tartci windows optimize` before tagging the qcow2, then
+   keep `TARTCI_WIN_PREFLIGHT_MODE=full` for debug rather than paying for those
+   probes on every job.
+2. **Add a real Windows build cache.** Use `sccache` for C/C++ and Rust
+   compilation, plus the project-specific package caches that matter
+   (`CMake` downloads, `NuGet`, `Cargo`, `pnpm`/`npm`, and similar). The cache
+   must be restored into the guest at job start or live outside the disposable
+   qcow2 overlay so every fresh VM can reuse it.
+3. **Prefer host-backed cache storage once the clean lane is stable.** A
+   VirtIO-backed or otherwise host-mounted cache on local NVMe avoids virtual
+   disk churn and survives VM recreation. Treat source trees and build outputs
+   as disposable unless a project deliberately opts into an incremental build
+   directory.
+4. **Keep QEMU on the fast device path.** The runner already uses HVF
+   acceleration, virtio networking, NVMe storage, and an ARM64 Windows guest on
+   Apple Silicon. Do not spend time on hypervisor swaps until the guest-side
+   timings show QEMU itself is the problem.
+5. **Trim Windows background work in the golden.** Disable noisy services only
+   when the lane is isolated for CI and the effect is measured. Search indexing,
+   scheduled maintenance, update orchestration, and Defender scans can affect
+   consistency, but they are not a substitute for build caches.
+6. **Consider warm workers last.** A pool of already-booted VMs can remove most
+   boot latency, but it complicates per-job cleanup, runner registration, and
+   rollback. Keep the cold CoW overlay lane as the reliable baseline first; add
+   warm workers only after the full Windows proof is green and cache behavior is
+   understood.
+
+For ARM64 Windows workloads, this lane can beat GitHub-hosted Windows when the
+golden is current and caches are warm because there is no hosted-runner queue and
+no x64 translation tax. For x64 coverage or test execution, Windows-on-ARM still
+runs through Microsoft's x64 translation layer, so local hardware mainly helps
+availability and cache locality rather than raw CPU efficiency.
+
+Treat x64-on-Windows-ARM as a separate smoke lane until proven. The QEMU provider
+boots an ARM64 Windows guest with `qemu-system-aarch64`; it does not emulate a
+full Intel Windows machine. A repo can try the x64 MSVC environment with
+`TARTCI_WIN_VCVARS_ARCH=x64`, but release-fidelity x64 gates should stay on
+GitHub-hosted `windows-latest` until those smoke runs are consistently clean.
 
 ---
 
@@ -496,11 +732,14 @@ scripts, ported from Pulp's proven `tools/ci/{tart-runner-linux,qemu-runner-wind
 
 ```bash
 # One job then exit (pilot-safe): mint a JIT runner, boot a clone, run one job, discard.
+tartci serve macos
 tartci serve linux
 tartci serve windows
 
 # Keep serving (what the LaunchAgents run):
-tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux
+tartci serve macos --loop --labels self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
+tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux,pulp-host-macstudio
+tartci serve windows --loop --labels self-hosted,Windows,ARM64,pulp-build-windows,pulp-host-macstudio
 ```
 
 What the supervisor does each job: mint a **Just-In-Time** (single-job) runner
@@ -508,36 +747,94 @@ config via `gh api .../generate-jitconfig` (needs repo admin), clone the golden
 (Linux) or CoW-overlay it on a free SSH port (Windows), run the Actions agent
 once with that JIT config, then discard the VM. The agent processes exactly one
 job and deregisters — no long-lived runner state. The `--loop` gate only boots
-when there is queued work (counts queued runs of `TARTCI_RUNNER_WORKFLOW_NAME`,
-default `Build and Test`), so idle hosts don't spin VMs.
+when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
+`Build and Test`.
+Linux and Windows scan queued and in-progress workflow runs for queued jobs and
+add two more default guards: they ignore queued jobs older than
+`TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
+`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` requires a queued job's requested labels to
+be satisfiable by the configured runner labels before a VM boots. Set it to `0`
+only for debugging broad workflow polling. For coordinated multi-host routing,
+add a host label such as `pulp-host-macstudio` or `pulp-host-m5` after the shared
+`pulp-build-*` label, then point the workflow's primary and overflow selectors
+at those exact label sets. Linux/Windows runners are JIT ephemeral, so they are
+not visible as idle registered GitHub runners before a job is queued; the
+workflow resolver should compare configured per-host capacity with in-progress
+jobs already using each exact host selector. A GitHub Actions job cannot change
+`runs-on` after it is queued, so GitHub-hosted fallback must be selected before
+the job enters the queue. If multiple Windows hosts are accidentally configured
+to race the same queued job, any VM that does not claim work exits after
+`TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
+GitHub runner registration by ephemeral runner name, and discards the overlay.
+Ephemeral Windows runner names include a host-derived prefix by default; set
+`TARTCI_RUNNER_NAME_PREFIX` only when a host needs a stable custom prefix.
+Windows writes per-job timing to `$TARTCI_WIN_LOGS/<runner>/timing.tsv`; Linux
+writes the same shape to `$TARTCI_LINUX_LOGS/<runner>/timing.tsv` (default
+`$HOME/VMs/logs/tartci-linux`). Compare those files with `tartci timings` and
+GitHub job timestamps before promoting local routing.
+macOS supervisors atomically replace their heartbeat state file; `doctor`,
+`observe`, and Shipyard fleet probes should treat an unreadable state file as a
+real health problem, not as "no active runner."
 
 Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
-`TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`,
-`TARTCI_RUNNER_GROUP_ID`, `TARTCI_RUNNER_VERSION` (Windows agent). Defaults
-target `danielraffel/pulp` (the first consumer).
+`TARTCI_MACOS_GOLDEN` / `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,
+`TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
+`TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_VERSION` (Windows agent),
+`TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
+`TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
+`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
+(the first consumer). When multiple macOS hosts serve the same selector, keep
+the workflow selector shared and make the runner name unique by adding an extra
+host-specific label after the shared `pulp-build-*` pool label or by passing a
+unique `--name-prefix` in the installed plist.
 
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
-file**, never on a command line (cmd.exe's 8191-char limit blows through the
-ssh→cmd→powershell chain); the agent runs as `Runner.Listener.exe` reading that
-file; `vcvarsall` is discovered via `Get-ChildItem` in base64-encoded PowerShell
-(vswhere returns empty for a BuildTools-only install); the supervisor **bails the
-moment QEMU dies** (`kill -0 $qpid`) so a free-port TOCTOU surfaces fast instead
-of burning the full ~10 min SSH window; and a post-extract integrity check
-asserts `Runner.Listener.exe` exists before running.
+file**, never on the outer ssh command line (cmd.exe's 8191-char limit blows
+through the ssh→cmd→powershell chain); the agent is started through
+`Runner.Listener.exe run --jitconfig` directly while the blob is read from that
+file inside PowerShell; the configured Actions runner version is enforced before every JIT run;
+stale `C:\actions-runner` registration files are removed because a golden may
+cache the runner binary but must not cache `.runner` or `.credentials`;
+long preflight / runner PowerShell probes are **streamed into guest `.ps1`
+files** and executed there, because adding toolchain diagnostics can push
+`powershell -EncodedCommand` past cmd.exe's command-line limit; `vcvarsall` is
+discovered via `Get-ChildItem` (vswhere returns empty for a BuildTools-only
+install) and imported before both preflight diagnostics and the Actions runner
+process so workflow Bash steps can see MSVC; the supervisor **bails the moment
+QEMU dies** (`kill -0 $qpid`) so a free-port TOCTOU surfaces fast instead of
+burning the full ~10 min SSH window; and a post-extract integrity check asserts
+`Runner.Listener.exe` exists before running.
 
 ### Serve across reboots (LaunchAgent)
 
 Install one of the templates in `launchd/` so the supervisor runs under
-`launchd` and survives reboot. The two shipped templates are **Pulp's concrete
-instance** — their labels (`com.danielraffel.pulp.tart-runner-linux`,
+`launchd` and survives reboot. The shipped templates are **Pulp's concrete
+instance** — their known labels (`com.danielraffel.pulp.tart-runner`,
+`com.danielraffel.pulp.tart-runner-macos-release`,
+`com.danielraffel.pulp.tart-runner-linux`, and
 `com.danielraffel.pulp.qemu-runner-windows`) are what the
 [shipyard-macos-gui](https://github.com/danielraffel/shipyard-macos-gui) "Serve
-CI builds from this Mac" switch toggles via `launchctl load/unload`. See
-`launchd/README.md` for the install `sed` recipe and how to serve a different
-repo. Two traps carried over from the Pulp lane: launchd does **not** expand
-`$HOME`/`$TARTCI_REPO` (the install `sed` must write absolute paths), and a
-LaunchAgent can't read a `/Volumes` golden store without **Full Disk Access**.
+CI builds from this Mac" switch toggles via `launchctl load/unload` once the
+GUI knows about the label. See `launchd/README.md` for the install `sed` recipe
+and how to serve a different repo. Two traps carried over from the Pulp lane:
+launchd does **not** expand `$HOME`/`$TARTCI_REPO` (the install `sed` must write
+absolute paths), and a LaunchAgent can't read a `/Volumes` golden store without
+**Full Disk Access**.
+
+For Pulp, keep the macOS workflow lanes distinct:
+
+```text
+Build and Test -> self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
+Release CLI    -> self-hosted,macOS,ARM64,pulp-build-vm-release
+```
+
+Load the Release CLI VM lane only as a separate LaunchAgent filtered with
+`TARTCI_RUNNER_WORKFLOW_NAME=Release CLI`. Do not point Release CLI at the
+Build and Test `pulp-build-vm` lane, and do not flip
+`PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
+Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
 ### Emulation note
 
@@ -556,5 +853,6 @@ authoritative gate.
   non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
   (needs Windows skia-builder slices + the Windows GPU-host product work).
 - **macOS:** the proven lane this toolkit generalizes from.
-- **Pool serving:** `tartci serve linux|windows` wired (ported from Pulp's
-  proven `tools/ci` supervisors); LaunchAgent templates in `launchd/`.
+- **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
+  proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent
+  templates in `launchd/`.

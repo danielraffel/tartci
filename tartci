@@ -6,12 +6,17 @@
 # dependencies of its own — just bash + the tools `doctor` checks for.
 #
 #   tartci doctor              # report host prereqs + stores (always safe)
+#   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci observe macos       # read-only live view of macOS VM runners/jobs
 #   tartci setup               # brew-install prereqs + create local stores
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
 #   tartci metrics [report|dashboard] [file]
+#   tartci timings [log-root|timing.tsv ...]
+#   tartci runtime <summary|export|recent|backfill|prune|complete>
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
+#   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
@@ -33,6 +38,10 @@ c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 
 cmd_doctor() {
+  if [ "${1:-}" = "--reap" ]; then
+    shift
+    exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
   for t in tart qemu-system-aarch64 qemu-img sshpass gh git jq; do
@@ -57,6 +66,14 @@ cmd_status() {
 
 cmd_profile() {
   exec python3 "$HERE/scripts/profile.py" "$@"
+}
+
+cmd_observe() {
+  local os="${1:-macos}"; shift || true
+  case "$os" in
+    macos) exec python3 "$HERE/scripts/macos_observe.py" "$@" ;;
+    *) echo "usage: tartci observe <macos> [--json] [--runner NAME] [--run-id ID]"; return 2 ;;
+  esac
 }
 
 cmd_setup() {
@@ -84,12 +101,21 @@ cmd_metrics() {
   esac
 }
 
+cmd_timings() {
+  exec python3 "$HERE/scripts/timing_summary.py" "$@"
+}
+
+cmd_runtime() {
+  exec python3 "$HERE/scripts/runtime_measure.py" "$@"
+}
+
 cmd_windows() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     run)    exec "$HERE/providers/qemu-windows/qemu-run.sh" ;;
+    optimize) exec "$HERE/providers/qemu-windows/optimize-golden.sh" "$@" ;;
     golden) exec "$HERE/providers/qemu-windows/make-golden.sh" "$@" ;;
-    *)      echo "usage: tartci windows <run|golden [name]>   (see providers/qemu-windows/)"; return 2 ;;
+    *)      echo "usage: tartci windows <run|optimize|golden [name]>   (see providers/qemu-windows/)"; return 2 ;;
   esac
 }
 
@@ -98,8 +124,8 @@ cmd_prepare() {
   case "$os" in
     linux)   exec "$HERE/providers/tart-linux/provision.sh" "$@" ;;
     windows) echo "tartci prepare windows — use: tartci windows golden [name]"; return 2 ;;
-    macos)   echo "tartci prepare macos — follow docs/runbook.md; provider generalization is a follow-up"; return 2 ;;
-    *) echo "usage: tartci prepare <linux> [provider args]"; return 2 ;;
+    macos)   exec "$HERE/providers/tart-macos/provision.sh" "$@" ;;
+    *) echo "usage: tartci prepare <linux|macos> [provider args]"; return 2 ;;
   esac
 }
 
@@ -108,10 +134,7 @@ cmd_up() {
   case "$os" in
     windows) exec "$HERE/providers/qemu-windows/run.sh" "$@" ;;
     linux)   exec "$HERE/providers/tart-linux/run.sh" "$@" ;;
-    macos)
-      echo "tartci up macos — the one-command Tart bring-up is still hand-driven."
-      echo "Follow docs/runbook.md (the macos lane is documented + proven);"
-      echo "Pulp's tools/ci/tart-run-job.sh is the working macOS ephemeral runner." ;;
+    macos)   exec "$HERE/providers/tart-macos/run.sh" "$@" ;;
     *) echo "usage: tartci up <linux|macos|windows>"; return 2 ;;
   esac
 }
@@ -127,22 +150,23 @@ cmd_serve() {
   case "$os" in
     linux)   exec "$HERE/providers/tart-linux/runner.sh" "$@" ;;
     windows) exec "$HERE/providers/qemu-windows/runner.sh" "$@" ;;
-    macos)
-      echo "tartci serve macos — the macOS pool runner is Pulp's tools/ci/tart-runner.sh."
-      echo "Generalizing it into a providers/tart-macos/runner.sh is a tracked follow-up." ;;
-    *) echo "usage: tartci serve <linux|windows> [--loop] [--labels ...]"; return 2 ;;
+    macos)   exec "$HERE/providers/tart-macos/runner.sh" "$@" ;;
+    *) echo "usage: tartci serve <linux|macos|windows> [--loop] [--labels ...]"; return 2 ;;
   esac
 }
 
 usage() { sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
-  doctor)  cmd_doctor ;;
+  doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
   profile) shift; cmd_profile "$@" ;;
+  observe) shift; cmd_observe "$@" ;;
   setup)   cmd_setup ;;
   bench)   shift; cmd_bench "$@" ;;
   metrics) shift; cmd_metrics "$@" ;;
+  timings) shift; cmd_timings "$@" ;;
+  runtime) shift; cmd_runtime "$@" ;;
   windows) shift; cmd_windows "$@" ;;
   prepare) shift; cmd_prepare "$@" ;;
   up)      shift; cmd_up "$@" ;;

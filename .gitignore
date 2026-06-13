@@ -8,6 +8,7 @@ qemu/
 iso/
 metrics.jsonl
 *.log
+.DS_Store
 
 # generated locally from your keys — never commit
 autounattend.xml

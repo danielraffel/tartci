@@ -24,7 +24,7 @@
 #   providers/qemu-windows/run.sh --keep                # leave the clone running
 set -euo pipefail
 
-GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-02.qcow2}"
+GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
 SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/danielraffel/pulp}"
