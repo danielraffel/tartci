@@ -11,6 +11,11 @@ pass. Shipyard does not yet expose `shipyard metrics import tartci` in the
 local checkout, so the Phase-5 import gate currently uses the plan's fallback:
 schema/export validation against tartci records rather than a live Shipyard
 SQLite import.
+Companion Shipyard work is now in progress on
+`/Volumes/Workshop/Code/Shipyard` branch `codex/macos-vm-pool-phase5`: it adds
+`shipyard metrics import tartci` backed by `metrics/metrics.db`. Once that PR is
+merged, this plan's Phase-5 gate should switch from schema/export fallback to a
+live `tartci runtime export | shipyard metrics import tartci` round trip.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
 (canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
@@ -397,7 +402,8 @@ measurement remains to run before production LaunchAgent enablement.
 
 ### Phase 5 — Export contract + backfill + docs
 **Implementation status:** Done for tartci-local export/backfill/docs; live
-Shipyard import is pending parent-plan implementation.
+Shipyard import is pending the companion Shipyard PR merge and a live VM/export
+round trip.
 
 Prove `tartci runtime export` against the parent plan's import (live
 `shipyard metrics import tartci` if landed, else schema-validation against the
@@ -414,9 +420,10 @@ by both paths; docs lint; fresh-clone walkthrough works on one lane.
 **Evidence:** `runtime export`, `recent`, `summary`, `backfill`, and `prune`
 are implemented; `backfill` imports `timing.tsv` and `metrics.jsonl` history.
 README, `launchd/README.md`, `docs/new-repo-agent-guide.md`, and
-`manifests/example.toml` document the optional integration. Local Shipyard
-checkout has no `metrics import tartci` command yet, so the live import gate is
-deferred to the parent Shipyard plan.
+`manifests/example.toml` document the optional integration. The companion
+Shipyard branch now exposes `shipyard metrics import tartci`; live import proof
+still needs a measured VM export after both PRs are available on the operator
+hosts.
 
 ---
 
