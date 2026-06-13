@@ -1,19 +1,23 @@
 # Optional CI runtime measurement — tartci emitter companion plan
 
 **Date:** 2026-06-12
-**Status:** First implementation merged to `main` via PR #13.
+**Status:** First implementation merged to `main` via PR #13; proof/status
+tracking merged via PR #14.
 Phases 1-5 have a first implementation:
 `scripts/timing_lib.py`, `scripts/runtime_measure.py`, `tartci runtime`,
 guarded Linux/Windows/macOS runner emission hooks, optional docs, manifest
 comments, backfill, and export. Local validation so far:
 `python3 -m unittest scripts/test_runtime_measure.py` and `./scripts/lint.sh`
-pass. Companion Shipyard PR #361 is also merged; it adds
-`shipyard metrics import tartci` backed by `metrics/metrics.db`.
+pass. Companion Shipyard PRs #361 and #362 are also merged; they add
+`shipyard metrics import tartci`, `shipyard metrics import github`, agent-facing
+metrics summaries/findings, and the GitHub import path fix.
 
 Proof status, 2026-06-13:
 
 - PR #13 merged at `92249b12da814167f52e91dcf9d23dbd81f00438`.
+- PR #14 merged at `eb7d3426c2dec10c0afe19fd7908fce1250ef583`.
 - PR #361 merged at `659d7bf715d59f0fc5be35c5533144ca1f42e93f`.
+- PR #362 merged at `b5734f60007e4b31d3113c5b0023cb8851b92691`.
 - Cross-repo import proof succeeded from merged code plus the follow-up
   Shipyard GitHub importer fix: backfilled 2 real local `timing.tsv` records
   from `$HOME/VMs/logs/tartci-linux` and `$HOME/VMs/logs/tartci-win`, exported
@@ -21,6 +25,9 @@ Proof status, 2026-06-13:
   `shipyard metrics import tartci`, imported 6 live Pulp GitHub Actions job
   rows with `shipyard metrics import github`, then queried `summary` and
   `watch` from the same isolated `metrics.db`.
+- Shipyard skill guidance now documents the optional metrics integration,
+  including non-tartci projects, `metrics import github`, `metrics import
+  tartci`, `summary`, `watch`, `advise`, and `compare`.
 - Remaining gate: run at least one newly emitted VM job with
   `TARTCI_RUNTIME_MEASURE=1` and import that live runtime export. The current
   proof uses real historical backfill plus live GitHub import, not a fresh VM
