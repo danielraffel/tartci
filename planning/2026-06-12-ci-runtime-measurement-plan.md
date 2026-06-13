@@ -28,10 +28,23 @@ Proof status, 2026-06-13:
 - Shipyard skill guidance now documents the optional metrics integration,
   including non-tartci projects, `metrics import github`, `metrics import
   tartci`, `summary`, `watch`, `advise`, and `compare`.
-- Remaining gate: run at least one newly emitted VM job with
-  `TARTCI_RUNTIME_MEASURE=1` and import that live runtime export. The current
-  proof uses real historical backfill plus live GitHub import, not a fresh VM
-  serve-loop emission.
+- Live VM emission proof succeeded against Pulp run
+  `27459243068` / job `81169692100`: a one-shot macOS Tart runner with
+  `TARTCI_RUNTIME_MEASURE=1` and labels
+  `["self-hosted","macOS","ARM64","tartci-runtime-proof"]` emitted a
+  runner-sourced `tart-macos` record for `tartci-runtime-proof-01`.
+  The record has `status=pass`, `source=runner`, `boot_ms=14000`,
+  `run_ms=387000`, `total_ms=404000`, `tags=["runtime-proof","macstudio"]`,
+  and `external_id=github:27459243068/81169692100/`.
+- The fresh runtime export imported into Shipyard with
+  `shipyard metrics import tartci --file ... --json` (`imported: 1`).
+  `shipyard metrics summary --project pulp --json` then reported one
+  `tart-macos` VM row for `Daniels-Mac-Studio.local`; `shipyard metrics watch
+  --project pulp --since 1d --json` reported the expected
+  `insufficient_samples` finding.
+- The proof workflow's macOS operator job and required `macos` wrapper job both
+  completed successfully. The remainder of that manual run was cancelled after
+  proof collection because the Linux leg resolved to an unrelated local label.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
 (canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
