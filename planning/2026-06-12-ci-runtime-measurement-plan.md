@@ -1,21 +1,30 @@
 # Optional CI runtime measurement — tartci emitter companion plan
 
 **Date:** 2026-06-12
-**Status:** Implementation in progress on `feat/macos-vm-lane-revival`.
-Phases 1-5 have a first implementation in this branch:
+**Status:** First implementation merged to `main` via PR #13.
+Phases 1-5 have a first implementation:
 `scripts/timing_lib.py`, `scripts/runtime_measure.py`, `tartci runtime`,
 guarded Linux/Windows/macOS runner emission hooks, optional docs, manifest
 comments, backfill, and export. Local validation so far:
 `python3 -m unittest scripts/test_runtime_measure.py` and `./scripts/lint.sh`
-pass. Shipyard does not yet expose `shipyard metrics import tartci` in the
-local checkout, so the Phase-5 import gate currently uses the plan's fallback:
-schema/export validation against tartci records rather than a live Shipyard
-SQLite import.
-Companion Shipyard work is now in progress on
-`/Volumes/Workshop/Code/Shipyard` branch `codex/macos-vm-pool-phase5`: it adds
-`shipyard metrics import tartci` backed by `metrics/metrics.db`. Once that PR is
-merged, this plan's Phase-5 gate should switch from schema/export fallback to a
-live `tartci runtime export | shipyard metrics import tartci` round trip.
+pass. Companion Shipyard PR #361 is also merged; it adds
+`shipyard metrics import tartci` backed by `metrics/metrics.db`.
+
+Proof status, 2026-06-13:
+
+- PR #13 merged at `92249b12da814167f52e91dcf9d23dbd81f00438`.
+- PR #361 merged at `659d7bf715d59f0fc5be35c5533144ca1f42e93f`.
+- Cross-repo import proof succeeded from merged code plus the follow-up
+  Shipyard GitHub importer fix: backfilled 2 real local `timing.tsv` records
+  from `$HOME/VMs/logs/tartci-linux` and `$HOME/VMs/logs/tartci-win`, exported
+  them with `tartci runtime export`, imported them with
+  `shipyard metrics import tartci`, imported 6 live Pulp GitHub Actions job
+  rows with `shipyard metrics import github`, then queried `summary` and
+  `watch` from the same isolated `metrics.db`.
+- Remaining gate: run at least one newly emitted VM job with
+  `TARTCI_RUNTIME_MEASURE=1` and import that live runtime export. The current
+  proof uses real historical backfill plus live GitHub import, not a fresh VM
+  serve-loop emission.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
 (canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
@@ -367,7 +376,8 @@ round trip, and timing backfill without GitHub identity. The focused unittest
 passes.
 
 ### Phase 3 — Linux + Windows emission (lower-risk lanes)
-**Implementation status:** Done as guarded hooks; live VM proof still pending.
+**Implementation status:** Done as guarded hooks; fresh live VM emission proof
+still pending.
 
 Guarded hooks in `tart-linux/runner.sh`, then `qemu-windows/runner.sh`
 (incl. idle-timeout/session-failure classification).
@@ -380,7 +390,8 @@ matching `timing.tsv`; a forced Windows idle-timeout boot records
 **Evidence:** both runners call `runtime_measure.py complete` only when
 `TARTCI_RUNTIME_MEASURE=1`; calls are warning-only on failure and happen after
 existing `timing.tsv` writes. `bash -n` and shellcheck via `./scripts/lint.sh`
-pass. Live env-on VM proof remains to run when a safe queued job is available.
+pass. Historical timing backfill/import proof succeeded; live env-on VM proof
+remains to run when a safe queued job is available.
 
 ### Phase 4 — macOS timing + emission (production lane — extra care)
 **Implementation status:** Done as a guarded hook; production enablement still
@@ -401,9 +412,9 @@ timings` now includes `$HOME/VMs/logs/tartci-macos` when present. Live pilot
 measurement remains to run before production LaunchAgent enablement.
 
 ### Phase 5 — Export contract + backfill + docs
-**Implementation status:** Done for tartci-local export/backfill/docs; live
-Shipyard import is pending the companion Shipyard PR merge and a live VM/export
-round trip.
+**Implementation status:** Done for tartci-local export/backfill/docs; Shipyard
+import proof succeeded for backfilled timing data, and a fresh live VM/export
+round trip remains.
 
 Prove `tartci runtime export` against the parent plan's import (live
 `shipyard metrics import tartci` if landed, else schema-validation against the
@@ -421,9 +432,10 @@ by both paths; docs lint; fresh-clone walkthrough works on one lane.
 are implemented; `backfill` imports `timing.tsv` and `metrics.jsonl` history.
 README, `launchd/README.md`, `docs/new-repo-agent-guide.md`, and
 `manifests/example.toml` document the optional integration. The companion
-Shipyard branch now exposes `shipyard metrics import tartci`; live import proof
-still needs a measured VM export after both PRs are available on the operator
-hosts.
+Shipyard main now exposes `shipyard metrics import tartci`. Backfilled real
+Linux/Windows timing records imported successfully into Shipyard's SQLite store
+alongside live Pulp GitHub job rows. Fresh measured VM export still needs to be
+proven after enabling `TARTCI_RUNTIME_MEASURE=1` on a pilot serve lane.
 
 ---
 
