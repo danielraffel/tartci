@@ -7,6 +7,7 @@
 # the configured runner labels; it is a safe preflight for the loop gate.
 set -euo pipefail
 
+TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
@@ -26,6 +27,7 @@ JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
 EVENT_LOG="${TARTCI_EVENT_LOG:-$STATE_DIR/events.jsonl}"
+MACOS_LOGROOT="${TARTCI_MACOS_LOGS:-$HOME/VMs/logs/tartci-macos}"
 RUNNER_NAME="${TARTCI_RUNNER_NAME:-${PULP_RUNNER_NAME:-}}"
 RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-}}"
 SLOT="${TARTCI_RUNNER_SLOT:-${PULP_RUNNER_SLOT:-1}}"
@@ -44,6 +46,8 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
+now_epoch(){ date +%s; }
+elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -109,6 +113,31 @@ EOF
     rm -f "$tmp_file"
     return 1
   fi
+}
+
+runtime_emit_complete(){
+  [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
+  local status="$1" failure_class="$2" exit_code="$3" timing_path="$4" log_dir="$5"
+  python3 "$TARTCI_ROOT/scripts/runtime_measure.py" complete \
+    --repo "$REPO" \
+    --workflow "$WORKFLOW_NAME" \
+    --provider tart-macos \
+    --platform macos \
+    --arch arm64 \
+    --runner-name "$RUNNER_NAME" \
+    --vm-name "${CURRENT_VM:-$RUNNER_NAME}" \
+    --labels "$LABELS" \
+    --run-id "${CURRENT_RUN_ID:-}" \
+    --job-id "${CURRENT_JOB_ID:-}" \
+    --golden "$GOLDEN" \
+    --cache-mode unknown \
+    --cache-mode-source unknown \
+    --status "$status" \
+    --failure-class "$failure_class" \
+    --exit-code "$exit_code" \
+    --timing-path "$timing_path" \
+    --log-dir "$log_dir" \
+    --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
 
 running_macos_vms(){
@@ -324,6 +353,12 @@ run_runner_until_done(){
 
 run_one(){
   local i="$1" vm="$RUNNER_NAME" jit label_args=() l boot_log rpid ip="" rc=0
+  local t_start t_booted t_runner_done t_done logdir=""
+  t_start="$(now_epoch)"
+  if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
+    logdir="$MACOS_LOGROOT/$vm"
+    mkdir -p "$logdir"
+  fi
   CLEANED_UP=0
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
@@ -350,16 +385,18 @@ run_one(){
   for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
-    rm -f "$boot_log"; event boot_failed "no_ip"; return 1
+    rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"; return 1
   fi
   CURRENT_IP="$ip"
   rm -f "$boot_log"
   for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && break; sleep 2; done
+  t_booted="$(now_epoch)"
   note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s job_timeout=${JOB_TIMEOUT}s)"
   event boot_ok "ip=$ip"
   heartbeat idle-wait
 
   run_runner_until_done "$vm" "$ip" "$jit" || rc=$?
+  t_runner_done="$(now_epoch)"
   if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
   note "[$i] discarding ephemeral VM $vm"
@@ -368,6 +405,23 @@ run_one(){
   kill "$rpid" 2>/dev/null || true
   sleep 2
   tart delete "$vm" >/dev/null 2>&1 || true
+  t_done="$(now_epoch)"
+  if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
+    {
+      printf 'phase\tseconds\n'
+      printf 'boot_to_ssh\t%s\n' "$(elapsed "$t_start" "$t_booted")"
+      printf 'runner_process\t%s\n' "$(elapsed "$t_booted" "$t_runner_done")"
+      printf 'cleanup\t%s\n' "$(elapsed "$t_runner_done" "$t_done")"
+      printf 'total\t%s\n' "$(elapsed "$t_start" "$t_done")"
+    } >"$logdir/timing.tsv"
+    if [ "$rc" -eq 0 ]; then
+      runtime_emit_complete pass unknown 0 "$logdir/timing.tsv" "$logdir"
+    elif [ "$rc" -eq 124 ]; then
+      runtime_emit_complete fail runner_timeout "$rc" "$logdir/timing.tsv" "$logdir"
+    else
+      runtime_emit_complete fail source_failure "$rc" "$logdir/timing.tsv" "$logdir"
+    fi
+  fi
   CURRENT_VM=""
   CURRENT_RPID=""
   CURRENT_IP=""

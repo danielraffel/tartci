@@ -29,6 +29,7 @@
 #   providers/tart-linux/runner.sh --labels self-hosted,Linux,ARM64,pulp-build
 set -euo pipefail
 
+TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
@@ -56,6 +57,29 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
+runtime_emit_complete(){
+  [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
+  local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" vm_name="$5" timing_path="$6" log_dir="$7"
+  python3 "$TARTCI_ROOT/scripts/runtime_measure.py" complete \
+    --repo "$REPO" \
+    --workflow "$WORKFLOW_NAME" \
+    --provider tart-linux \
+    --platform linux \
+    --arch arm64 \
+    --runner-name "$runner_name" \
+    --vm-name "$vm_name" \
+    --labels "$LABELS" \
+    --golden "$GOLDEN" \
+    --cache-mode unknown \
+    --cache-mode-source unknown \
+    --status "$status" \
+    --failure-class "$failure_class" \
+    --exit-code "$exit_code" \
+    --timing-path "$timing_path" \
+    --log-dir "$log_dir" \
+    --gh-enrich \
+    --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
+}
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v gh   >/dev/null 2>&1 || die "gh not installed / authed (need admin to mint JIT config)"
 
@@ -160,6 +184,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last lines of \`tart run\` ($boot_log):"; tail -3 "$boot_log" >&2 2>/dev/null || true
     tart stop "$vm" >/dev/null 2>&1||true; kill "$rpid" 2>/dev/null||true; tart delete "$vm" >/dev/null 2>&1||true
+    runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     die "[$i] no IP (see \`tart run\` output above)"
   fi
   local sshok=0
@@ -167,6 +192,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; tart delete "$vm" >/dev/null 2>&1 || true
+    runtime_emit_complete fail ssh_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   t_booted="$(now_epoch)"
@@ -197,6 +223,11 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     printf 'total\t%s\n' "$(elapsed "$t_start" "$t_done")"
   } >"$logdir/timing.tsv"
   note "[$i] timing: boot=$(elapsed "$t_start" "$t_booted")s runner=$(elapsed "$t_booted" "$t_runner_done")s total=$(elapsed "$t_start" "$t_done")s diagnostics=$logdir"
+  if [ "$run_status" -eq 0 ]; then
+    runtime_emit_complete pass unknown 0 "$vm" "$vm" "$logdir/timing.tsv" "$logdir"
+  else
+    runtime_emit_complete fail source_failure "$run_status" "$vm" "$vm" "$logdir/timing.tsv" "$logdir"
+  fi
   return "$run_status"
 }
 

@@ -74,8 +74,12 @@ job runner clones the golden, mounts the cache, then executes these.
 1. Run the `[run]` contract by hand in the VM until `build` is green and `test`
    passes (expect a short triage of portability breaks — that's normal; capture
    each fix as a real upstream PR to the project, guarded by platform macros).
-2. Record the run to `metrics.jsonl` (one JSON line: os/arch/provider/mode +
-   `configure_s`/`build_s`/`ctest_s`/cache% — see `metrics/sample.jsonl`).
+2. If the lane is served through GitHub Actions, prefer automatic runtime
+   capture: set `TARTCI_RUNTIME_MEASURE=1` on the serving invocation and query
+   `tartci runtime summary --repo owner/repo --run-id <id> --json` when the job
+   completes. For older hand-driven bring-up, backfill existing timing files
+   with `tartci runtime backfill --repo owner/repo --timing <log-root>`.
+   `metrics.jsonl` remains a manual fallback for quick experiments.
 3. **Tag the golden**: clean-shutdown the guest, then
    `qemu-img convert -c` (QEMU) or `tart export` (Tart) the powered-off disk to a
    dated, compressed golden under your goldens store. The golden stays

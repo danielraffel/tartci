@@ -13,6 +13,19 @@ The **runner scripts are project-agnostic** — repo, golden, labels, and the
 (`TARTCI_RUNNER_REPO`, `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` /
 `TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_WORKFLOW_NAME`).
 
+Runtime measurement is also env-driven and optional. Add these only to hosts
+where you want local timing history for agents or Shipyard import:
+
+```text
+TARTCI_RUNTIME_MEASURE=1
+TARTCI_RUNTIME_STORE=$HOME/.tartci/runtime
+TARTCI_RUNTIME_GH_ENRICH=1
+TARTCI_RUNTIME_TAGS=macstudio
+```
+
+With the switch unset, the supervisors create no runtime store and serving
+behavior is unchanged.
+
 The **templates here are Pulp's concrete instance** — the first consumer.
 Their `Label`s are `com.danielraffel.pulp.tart-runner`,
 `com.danielraffel.pulp.tart-runner-macos-release`,

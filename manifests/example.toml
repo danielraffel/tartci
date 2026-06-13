@@ -62,6 +62,14 @@ test_labels = "unit"               # ctest subset safe to emulate (excludes sani
 # QEMU. ccache on POSIX; sccache on Windows (ccache+MSVC is unreliable).
 ccache_max = "40G"
 
+# [measurements]
+# Optional operator policy. Serving hot paths still read env vars so this
+# manifest remains portable, but repos can document the intended setup here.
+# enabled = false
+# store = "$HOME/.tartci/runtime"
+# tags = ["macstudio", "cacheopt"]
+# golden_hash = false  # stat golden files by default; hashing huge qcow2s is expensive.
+
 [mounts]
 # name:host_path pairs surfaced read-write in the guest via virtio-fs.
 # e.g. "ccache:${TARTCI_CACHE}/ccache"

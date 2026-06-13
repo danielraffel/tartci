@@ -53,6 +53,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci status --json    # host-local provider/capacity/profile state for agents
 ./tartci profile plan normal-local-fast --repo danielraffel/pulp --json
 ./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
+./tartci runtime summary --repo owner/repo --run-id 123 --json
 ./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)
 ./tartci up linux         # ephemeral Linux build+test of a ref (clone→build→ctest→discard)
 ./tartci up linux --target-arch x86_64   # cross-build x64 + run tests under Rosetta (SMOKE)
@@ -137,6 +138,31 @@ Supervisor diagnostics and rough benchmark timings are kept per job under
 `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`, `runner-diag.log`,
 `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and
 proof recipe.
+
+### Runtime measurements (optional)
+
+VM serving can emit host-local runtime records for agents and Shipyard without
+changing runner behavior. Set `TARTCI_RUNTIME_MEASURE=1` on a serving
+LaunchAgent or one-shot `tartci serve` invocation. When unset, no runtime store
+is created and the runners behave as before.
+
+Records live under `TARTCI_RUNTIME_STORE` (default `~/.tartci/runtime`) as
+append-only JSONL plus per-run summaries. They include VM boot/setup/run/cleanup
+durations, runner identity, repo/run/job linkage when available, cache/golden
+hints, outcome, and a runner-vs-source `failure_class`. The store is local; it
+does not publish to GitHub.
+
+Useful agent-facing queries:
+
+```sh
+tartci runtime summary --repo owner/repo --run-id 123 --json
+tartci runtime recent --repo owner/repo --limit 20 --json
+tartci runtime export --repo owner/repo --since-days 14
+tartci runtime backfill --repo owner/repo --timing "$HOME/VMs/logs/tartci-linux"
+```
+
+Shipyard owns baselines, drift detection, and advice. tartci only emits the VM
+lane truth that Shipyard can import later.
 
 For Pulp-style required macOS gates, keep setup two-step. First serve the
 non-required pilot label (`self-hosted,macOS,ARM64,pulp-build-vm`) and prove a

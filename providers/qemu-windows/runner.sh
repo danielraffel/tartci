@@ -23,6 +23,7 @@
 #   providers/qemu-windows/runner.sh --labels self-hosted,Windows,ARM64,pulp-build
 set -euo pipefail
 
+TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -58,6 +59,31 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
+runtime_emit_complete(){
+  [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
+  local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" timing_path="$5" log_dir="$6"
+  python3 "$TARTCI_ROOT/scripts/runtime_measure.py" complete \
+    --repo "$REPO" \
+    --workflow "$WORKFLOW_NAME" \
+    --provider qemu-windows \
+    --platform windows \
+    --arch arm64 \
+    --runner-name "$runner_name" \
+    --vm-name "$runner_name" \
+    --labels "$LABELS" \
+    --golden "$GOLDEN" \
+    --cache-mode unknown \
+    --cache-mode-source unknown \
+    --cpu-count "$WIN_CPUS" \
+    --ram-mb "$WIN_MEMORY_MB" \
+    --status "$status" \
+    --failure-class "$failure_class" \
+    --exit-code "$exit_code" \
+    --timing-path "$timing_path" \
+    --log-dir "$log_dir" \
+    --gh-enrich \
+    --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
+}
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 command -v gh >/dev/null 2>&1 || die "gh not installed / authed (need admin to mint JIT)"
 
@@ -263,6 +289,7 @@ run_one(){ # $1=iteration index
     # qemu-death already logged the accurate cause above; only emit the generic
     # "waited the full window" message when QEMU stayed up but no SSH.
     [ "$qemu_died" = 1 ] || note "[$i] no SSH after ~10min (qemu alive but unreachable; see $logdir/qemu.log)"
+    runtime_emit_complete fail "$([ "$qemu_died" = 1 ] && printf boot_failed || printf ssh_failed)" 1 "$job" "" "$logdir"
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
@@ -321,14 +348,14 @@ Remove-Item -Force -ErrorAction SilentlyContinue "$dir\.runner","$dir\.credentia
 # but this catches a partial extract loudly rather than failing opaquely at run.
 if (-not (Test-Path "$dir\bin\Runner.Listener.exe")) { Write-Error "Runner.Listener.exe missing after install (corrupt/truncated download?)"; exit 1 }' | iconv -t UTF-16LE | base64)"
   wsh "powershell -NoProfile -EncodedCommand $enc_install" \
-    || { note "[$i] runner install failed"; cleanup_job failure; return 1; }
+    || { note "[$i] runner install failed"; runtime_emit_complete fail jit_failed 1 "$job" "" "$logdir"; cleanup_job failure; return 1; }
 
   # (2) stream the JIT config in via stdin → file (no command-line length limit).
   # Guard the pipeline: under `set -euo pipefail` a dropped SSH / PowerShell error
   # here would otherwise exit the whole supervisor BEFORE the cleanup below,
   # leaking the QEMU process + overlay for a launchd --loop runner to trip over.
   printf '%s' "$jit" | wsh "powershell -NoProfile -Command \"[Console]::In.ReadToEnd() | Out-File -FilePath C:\\actions-runner\\jit.cfg -Encoding ascii -NoNewline\"" \
-    || { note "[$i] JIT config upload failed — discarding overlay"; cleanup_job failure; return 1; }
+    || { note "[$i] JIT config upload failed — discarding overlay"; runtime_emit_complete fail jit_failed 1 "$job" "" "$logdir"; cleanup_job failure; return 1; }
 
   # The JIT token is time-sensitive. QEMU Windows overlays can wake with stale
   # clocks, so sync the throwaway guest to the host UTC and emit lightweight
@@ -523,9 +550,15 @@ if (Test-Path $diagDir) {
   note "[$i] timing: boot=$(elapsed "$t_start" "$t_booted")s preflight=$(elapsed "$t_booted" "$t_preflight")s runner=$(elapsed "$t_preflight" "$t_runner_done")s total=$(elapsed "$t_start" "$t_done")s"
 
   if [ "$run_status" -ne 0 ]; then
+    if [ "$run_status" -eq 124 ]; then
+      runtime_emit_complete fail idle_timeout "$run_status" "$job" "$logdir/timing.tsv" "$logdir"
+    else
+      runtime_emit_complete fail source_failure "$run_status" "$job" "$logdir/timing.tsv" "$logdir"
+    fi
     cleanup_job failure
     return "$run_status"
   else
+    runtime_emit_complete pass unknown 0 "$job" "$logdir/timing.tsv" "$logdir"
     note "[$i] discarding ephemeral overlay $job"
     cleanup_job success
   fi
