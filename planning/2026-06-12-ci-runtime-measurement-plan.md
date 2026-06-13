@@ -45,6 +45,39 @@ Proof status, 2026-06-13:
 - The proof workflow's macOS operator job and required `macos` wrapper job both
   completed successfully. The remainder of that manual run was cancelled after
   proof collection because the Linux leg resolved to an unrelated local label.
+- Linked Linux live emission proof succeeded against Pulp Docs Consistency run
+  `27459504462` / job `81170402485`: a one-shot Tart Linux runner with
+  `TARTCI_RUNTIME_MEASURE=1` and labels
+  `["self-hosted","Linux","ARM64","tartci-runtime-proof-linux"]` emitted a
+  runner-sourced `tart-linux` record for `linux-ephr-77366-1`.
+  The record has `status=pass`, `source=runner`, `boot_ms=7000`,
+  `run_ms=15000`, `total_ms=24000`, `tags=["runtime-proof","macstudio",
+  "linux","linked"]`, and `external_id=github:27459504462/81170402485/`.
+- Linked Windows live emission proof succeeded against Pulp Docs Consistency
+  run `27459521777` / job `81170449321`: a one-shot QEMU Windows runner with
+  `TARTCI_RUNTIME_MEASURE=1`, the cacheopt golden, and labels
+  `["self-hosted","Windows","ARM64","tartci-runtime-proof-windows"]` emitted a
+  runner-sourced `qemu-windows` record for
+  `win-ephr-daniels-mac-studio-79179-1`. The record has `status=pass`,
+  `source=runner`, `boot_ms=23000`, `setup_ms=11000`, `run_ms=50000`,
+  `total_ms=86000`, `tags=["runtime-proof","macstudio","windows","linked"]`,
+  and `external_id=github:27459521777/81170449321/`.
+- Windows idle-timeout classification proof succeeded with no matching queued
+  job: a one-shot QEMU Windows runner using labels
+  `["self-hosted","Windows","ARM64","tartci-runtime-idle-timeout-proof"]` and
+  `TARTCI_RUNNER_IDLE_TIMEOUT_SECS=60` emitted a runner-sourced
+  `qemu-windows` record for `win-ephr-daniels-mac-studio-82716-1` with
+  `status=fail`, `exit_code=124`, `failure_class=idle_timeout`,
+  `boot_ms=24000`, `setup_ms=12000`, `run_ms=60000`, and `total_ms=99000`.
+  The stale GitHub runner registration was deleted and no proof runner
+  registration remained after cleanup.
+- A filtered proof export containing the linked Linux record, linked Windows
+  record, macOS record, and Windows idle-timeout record imported into Shipyard
+  with `shipyard metrics import tartci --file ... --json`; Shipyard reported
+  `imported: 3` because the macOS proof had already been imported. The
+  resulting `shipyard metrics summary --project pulp --json` included
+  `tart-linux`, `tart-macos`, and `qemu-windows` rows plus a failed
+  idle-timeout row.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
 (canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
@@ -396,8 +429,8 @@ round trip, and timing backfill without GitHub identity. The focused unittest
 passes.
 
 ### Phase 3 — Linux + Windows emission (lower-risk lanes)
-**Implementation status:** Done as guarded hooks; fresh live VM emission proof
-still pending.
+**Implementation status:** Done as guarded hooks; fresh Linux, Windows, and
+Windows idle-timeout proofs completed.
 
 Guarded hooks in `tart-linux/runner.sh`, then `qemu-windows/runner.sh`
 (incl. idle-timeout/session-failure classification).
@@ -410,12 +443,16 @@ matching `timing.tsv`; a forced Windows idle-timeout boot records
 **Evidence:** both runners call `runtime_measure.py complete` only when
 `TARTCI_RUNTIME_MEASURE=1`; calls are warning-only on failure and happen after
 existing `timing.tsv` writes. `bash -n` and shellcheck via `./scripts/lint.sh`
-pass. Historical timing backfill/import proof succeeded; live env-on VM proof
-remains to run when a safe queued job is available.
+pass. Historical timing backfill/import proof succeeded. Fresh env-on proofs
+also succeeded:
+Linux Docs Consistency run `27459504462` / job `81170402485` emitted a linked
+`tart-linux` pass record (`total_ms=24000`), Windows Docs Consistency run
+`27459521777` / job `81170449321` emitted a linked `qemu-windows` pass record
+(`total_ms=86000`), and a no-match Windows run emitted
+`failure_class=idle_timeout` with `exit_code=124`.
 
 ### Phase 4 — macOS timing + emission (production lane — extra care)
-**Implementation status:** Done as a guarded hook; production enablement still
-requires a pilot measured job.
+**Implementation status:** Done as a guarded hook; pilot measured job completed.
 
 `TARTCI_MACOS_LOGS` + compatible `timing.tsv` + completion records reusing
 heartbeat run/job state. Add the macOS root to `timing_summary.py` defaults
@@ -428,13 +465,14 @@ LaunchAgent; `vm_reap.py` + `macos_observe.py` outputs unchanged;
 **Evidence:** `providers/tart-macos/runner.sh` creates `TARTCI_MACOS_LOGS`
 only when `TARTCI_RUNTIME_MEASURE=1`, writes a compatible `timing.tsv`, and
 passes `CURRENT_RUN_ID`/`CURRENT_JOB_ID` into the runtime record. `tartci
-timings` now includes `$HOME/VMs/logs/tartci-macos` when present. Live pilot
-measurement remains to run before production LaunchAgent enablement.
+timings` now includes `$HOME/VMs/logs/tartci-macos` when present. The pilot
+measurement ran on Pulp run `27459243068` / job `81169692100` with label
+`tartci-runtime-proof` and emitted a linked `tart-macos` pass record
+(`total_ms=404000`).
 
 ### Phase 5 — Export contract + backfill + docs
 **Implementation status:** Done for tartci-local export/backfill/docs; Shipyard
-import proof succeeded for backfilled timing data, and a fresh live VM/export
-round trip remains.
+import proof succeeded for backfilled timing data and fresh live VM export.
 
 Prove `tartci runtime export` against the parent plan's import (live
 `shipyard metrics import tartci` if landed, else schema-validation against the
@@ -454,8 +492,11 @@ README, `launchd/README.md`, `docs/new-repo-agent-guide.md`, and
 `manifests/example.toml` document the optional integration. The companion
 Shipyard main now exposes `shipyard metrics import tartci`. Backfilled real
 Linux/Windows timing records imported successfully into Shipyard's SQLite store
-alongside live Pulp GitHub job rows. Fresh measured VM export still needs to be
-proven after enabling `TARTCI_RUNTIME_MEASURE=1` on a pilot serve lane.
+alongside live Pulp GitHub job rows. Fresh measured VM exports then imported
+successfully into Shipyard: first the macOS proof (`imported: 1`), then a
+filtered all-lane proof export (`imported: 3`, adding linked Linux, linked
+Windows, and Windows idle-timeout records). `shipyard metrics summary/watch
+--project pulp --json` returned the expected agent-readable rows/findings.
 
 ---
 
