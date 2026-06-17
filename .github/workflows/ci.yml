@@ -30,3 +30,11 @@ jobs:
 
       - name: Run repo lint (shellcheck + bash -n + py_compile + TOML parse)
         run: ./scripts/lint.sh
+
+      - name: Run unit tests
+        # lint.sh only py_compiles the test files; actually EXECUTE the
+        # behavioral suites so a regression in e.g. the idle-gate subset
+        # matcher (scripts/test_idle_gate.py) or runtime_measure fails CI.
+        # These tests are gh/tart-free (they extract+run pure snippets or call
+        # the python-only CLI), so they run on the ubuntu lint host.
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v

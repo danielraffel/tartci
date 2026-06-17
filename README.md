@@ -119,7 +119,29 @@ ephemeral, so the resolver checks in-progress jobs for each host label rather
 than looking for idle registered GitHub runners. That avoids duplicate VM boots
 and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
 
-For Windows QEMU pool members, install the same golden qcow2 and the same
+### Priority-aware idle gate (secondary macOS lanes)
+
+A *secondary* macOS lane (an advisory coverage or sanitizer VM) shares a host
+with the *required* build-gate lane, and macOS allows only **two running macOS
+guests per host**. If the secondary lane grabs and holds a slot, it can starve
+the required gate — which is exactly what forced a coverage lane to be backed
+out of one downstream project. The idle gate prevents that.
+
+Set two env vars on the secondary lane's supervisor (default unset = OFF, so
+the primary gate runner and existing lanes are byte-for-byte unchanged):
+
+- `TARTCI_YIELD_TO_WORKFLOW_NAME` — the priority workflow to defer to
+  (e.g. `Build and Test`).
+- `TARTCI_YIELD_TO_LABELS` — the priority lane's labels
+  (e.g. `self-hosted,macOS,ARM64,pulp-build,pulp-build-vm`).
+
+When set, the loop boots only when (1) this lane has queued work, (2) a VM slot
+is free, and (3) the priority lane has **no** queued or in-progress work whose
+requested labels are a subset of `TARTCI_YIELD_TO_LABELS`. Keep the secondary
+lane on the **same `TART_HOME`** as the gate so `running_macos_vms` stays a true
+host-wide 2-guest semaphore (a separate store would hide the secondary VM from
+the gate's count and let total guests exceed Apple's cap). Preview the current
+yield count with `serve macos --print-priority-demand` (returns 0 when OFF). install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep
 Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave
 `PULP_LOCAL_WINDOWS_RUNS_ON_JSON` unset until a Windows-native workflow has

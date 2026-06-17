@@ -5,6 +5,15 @@
 # pilot-safe (`pulp-build-vm`, not required `pulp-build`).
 # `--print-queue` reports queued jobs whose requested labels are satisfiable by
 # the configured runner labels; it is a safe preflight for the loop gate.
+# Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
+# TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
+# higher-priority lane. When set, the loop boots only when that priority lane
+# has NO queued/in-progress work (in addition to the usual queue + cap checks),
+# so on a shared-cap host (e.g. Apple's 2-running-macOS-guest limit) a long
+# advisory job can never starve the required gate. Unset = no yielding, so the
+# primary gate runner and existing lanes are byte-for-byte unchanged.
+# `--print-priority-demand` reports that yield count (0 when the feature is off);
+# a safe preflight for the gate.
 set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -17,6 +26,9 @@ REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-danielraffel/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
+# Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
+YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
+YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
 QUEUE_RUN_LIMIT="${TARTCI_QUEUE_RUN_LIMIT:-20}"
 GH_TIMEOUT="${TARTCI_GH_TIMEOUT_SECS:-15}"
 LOOP=0
@@ -33,6 +45,7 @@ RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-}}"
 SLOT="${TARTCI_RUNNER_SLOT:-${PULP_RUNNER_SLOT:-1}}"
 PRINT_NAME=0
 PRINT_QUEUE=0
+PRINT_PRIORITY=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
@@ -79,6 +92,9 @@ while [ $# -gt 0 ]; do case "$1" in
   --state-dir) STATE_DIR="$2"; EVENT_LOG="$STATE_DIR/events.jsonl"; shift 2;;
   --print-name) PRINT_NAME=1; shift;;
   --print-queue) PRINT_QUEUE=1; shift;;
+  --print-priority-demand) PRINT_PRIORITY=1; shift;;
+  --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
+  --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
@@ -230,6 +246,58 @@ for run in runs:
             matches += 1
 print(matches)
 PY
+}
+
+# priority_demand — how many jobs a higher-priority lane currently has WAITING or
+# RUNNING. Used by the opt-in idle gate so a secondary lane yields its VM slot.
+#
+# Returns 0 (and never calls gh) when the feature is OFF (YIELD_WORKFLOW empty),
+# so the primary gate runner / release lane are unaffected. When ON, it counts
+# queued + in_progress jobs of the YIELD_WORKFLOW whose requested labels are a
+# SUBSET of the priority lane's labels (YIELD_LABELS) — GitHub's assignment rule:
+# a runner serves a job iff it advertises every label the job requests. We scan
+# BOTH queued and in_progress because a priority run can flip to in_progress
+# (its GitHub-hosted resolver/classify job) before its self-hosted leg is queued.
+#
+# The pure subset matcher below is intentionally identical in shape to the one
+# used elsewhere (reads LABEL_JSON env + job-label JSON lines on stdin, prints a
+# count) so it can be extracted and unit-tested without gh/tart. Non-zero output
+# means "a priority job needs a slot — do not boot the secondary VM".
+priority_demand(){
+  [ -n "$YIELD_WORKFLOW" ] || { printf '%s\n' 0; return 0; }
+  local label_json count=0 run_id matches
+  label_json="$(YL="$YIELD_LABELS" python3 -c 'import json, os; print(json.dumps([x.strip() for x in os.environ["YL"].split(",") if x.strip()]))')"
+  while IFS= read -r run_id; do
+    [ -n "$run_id" ] || continue
+    matches="$(
+      gh api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+        --jq '.jobs[] | select(.status == "queued" or .status == "in_progress") | .labels | @json' 2>/dev/null |
+      LABEL_JSON="$label_json" python3 -c '
+import json, os, sys
+want = {s.lower() for s in json.loads(os.environ["LABEL_JSON"])}
+n = 0
+for line in sys.stdin:
+    try:
+        labels = {s.lower() for s in json.loads(line)}
+    except Exception:
+        continue
+    # A priority job that requests `labels` would land on the priority runner
+    # iff that runner advertises every requested label (labels ⊆ priority set).
+    # Such a job competes for the shared VM cap, so the secondary lane must
+    # stand down while any exist.
+    if labels and labels.issubset(want):
+        n += 1
+print(n)
+'
+    )" || matches=0
+    count=$((count + ${matches:-0}))
+  done < <(
+    for st in queued in_progress; do
+      gh api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
+        --jq ".workflow_runs[] | select(.name == \"${YIELD_WORKFLOW}\") | .id" 2>/dev/null || true
+    done
+  )
+  printf '%s\n' "$count"
 }
 
 reclaim_runner_name(){
@@ -435,17 +503,34 @@ run_one(){
 
 i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
+[ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>}"
   heartbeat loop
   while true; do
     q="$(queued_work)"; r="$(running_macos_vms)"
-    if [ "${q:-0}" -gt 0 ] && [ "${r:-0}" -lt "$CAP" ]; then
-      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$CAP → booting ephemeral VM"
+    # Only probe priority demand when THIS lane actually has work — no point
+    # spending a gh round-trip (and the API quota the secondary-rate-limit cares
+    # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0
+    # when there's no work, and the feature is off entirely for the gate runner.
+    p=0
+    [ "${q:-0}" -gt 0 ] && p="$(priority_demand)"
+    # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
+    # and (3) no higher-priority lane is waiting/running. (3) is always satisfied
+    # when the feature is off (priority_demand returns 0), so this is a no-op for
+    # the primary gate runner. For a secondary lane it guarantees the priority
+    # gate keeps its slot — the failure that backed out the coverage lane.
+    if [ "${q:-0}" -gt 0 ] && [ "${r:-0}" -lt "$CAP" ] && [ "${p:-0}" -eq 0 ]; then
+      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$CAP priority_demand=$p → booting ephemeral VM"
       run_one "$i" || true
+    elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ]; then
+      note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$CAP) — priority lane '${YIELD_WORKFLOW}' has the slot"
+      event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$CAP"
+      heartbeat yielding
+      sleep "$POLL"
     else
-      note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$CAP)"
+      note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$CAP priority_demand=$p)"
       heartbeat waiting
       sleep "$POLL"
     fi
