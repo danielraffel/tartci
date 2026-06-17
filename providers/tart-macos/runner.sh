@@ -18,6 +18,15 @@ set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
+# GitHub CLI used for every API call (queue polling, JIT mint, runner reclaim,
+# job/run polling, cancel). Default `gh` (the personal/host auth) keeps generic
+# tartci behavior unchanged. Hosts that authenticate as a GitHub App can set
+# TARTCI_GH_CLI=ghapp to move ALL provider API traffic off the personal PAT and
+# onto the App's separate rate-limit bucket — the per-poll calls (every VM_POLL
+# seconds × every host) are the dominant throttle source. Exported so the inline
+# python pollers below inherit it.
+export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
+GH_CLI="$TARTCI_GH_CLI"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
@@ -103,7 +112,7 @@ RUNNER_NAME="$(derive_runner_name)"
 [ "$PRINT_NAME" = 1 ] && { printf '%s\n' "$RUNNER_NAME"; exit 0; }
 
 command -v tart >/dev/null 2>&1 || die "tart not installed"
-command -v gh >/dev/null 2>&1 || die "gh not installed / authed (need repo admin to mint JIT config)"
+command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
 mkdir -p "$STATE_DIR"
 
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
@@ -186,9 +195,13 @@ print(n)
 queued_work(){
   python3 - "$REPO" "$WORKFLOW_NAME" "$LABELS" "$QUEUE_RUN_LIMIT" "$GH_TIMEOUT" <<'PY'
 import json
+import os
 import subprocess
 import sys
 
+# Honor TARTCI_GH_CLI (inherited from the exported env) so polling rides the
+# same App bucket as the bash calls; default `gh`.
+GH_CLI = os.environ.get("TARTCI_GH_CLI") or "gh"
 repo, workflow_name, labels_csv, queue_limit, gh_timeout = sys.argv[1:]
 runner_labels = {label.strip() for label in labels_csv.split(",") if label.strip()}
 try:
@@ -204,7 +217,7 @@ except ValueError:
 def gh_json(path):
     return json.loads(
         subprocess.check_output(
-            ["gh", "api", path],
+            [GH_CLI, "api", path],
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
@@ -270,7 +283,7 @@ priority_demand(){
   while IFS= read -r run_id; do
     [ -n "$run_id" ] || continue
     matches="$(
-      gh api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+      "$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
         --jq '.jobs[] | select(.status == "queued" or .status == "in_progress") | .labels | @json' 2>/dev/null |
       LABEL_JSON="$label_json" python3 -c '
 import json, os, sys
@@ -293,7 +306,7 @@ print(n)
     count=$((count + ${matches:-0}))
   done < <(
     for st in queued in_progress; do
-      gh api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
+      "$GH_CLI" api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
         --jq ".workflow_runs[] | select(.name == \"${YIELD_WORKFLOW}\") | .id" 2>/dev/null || true
     done
   )
@@ -303,11 +316,11 @@ print(n)
 reclaim_runner_name(){
   local name="$1" id attempt
   for attempt in $(seq 1 18); do
-    id="$(gh api "repos/$REPO/actions/runners" --paginate \
+    id="$("$GH_CLI" api "repos/$REPO/actions/runners" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    gh api -X DELETE "repos/$REPO/actions/runners/$id" >/dev/null 2>&1 && break
+    "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" >/dev/null 2>&1 && break
     sleep 10
   done
   tart delete "$name" >/dev/null 2>&1 || true
@@ -340,7 +353,7 @@ capture_current_job(){
   CURRENT_JOB_ID=""
   while IFS= read -r run_id; do
     [ -n "$run_id" ] || continue
-    job_id="$(gh api "repos/$REPO/actions/runs/$run_id/jobs" \
+    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" \
       --jq ".jobs[] | select(.runner_name==\"$RUNNER_NAME\") | select(.status==\"in_progress\") | .id" \
       2>/dev/null | head -n1 || true)"
     if [ -n "$job_id" ]; then
@@ -348,7 +361,7 @@ capture_current_job(){
       CURRENT_JOB_ID="$job_id"
       return 0
     fi
-  done < <(gh api "repos/$REPO/actions/runs?per_page=100" \
+  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" \
     --jq ".workflow_runs[] | select(.name == \"$WORKFLOW_NAME\") | .id" 2>/dev/null || true)
   return 1
 }
@@ -357,7 +370,7 @@ cancel_current_run(){
   [ -n "$CURRENT_RUN_ID" ] || capture_current_job || true
   if [ -n "$CURRENT_RUN_ID" ]; then
     event run_cancel "run_id=$CURRENT_RUN_ID job_id=${CURRENT_JOB_ID:-} reason=timeout"
-    gh api -X POST "repos/$REPO/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1 || true
+    "$GH_CLI" api -X POST "repos/$REPO/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1 || true
   fi
 }
 
@@ -435,7 +448,7 @@ run_one(){
   event mint_jit "labels=$LABELS"
   IFS=',' read -r -a labels_split <<< "$LABELS"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$(gh api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || die "JIT config mint failed (need repo admin)"
   [ -n "$jit" ] || die "empty JIT config"

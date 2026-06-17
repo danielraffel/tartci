@@ -81,7 +81,13 @@ runtime_emit_complete(){
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
 command -v tart >/dev/null 2>&1 || die "tart not installed"
-command -v gh   >/dev/null 2>&1 || die "gh not installed / authed (need admin to mint JIT config)"
+# GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
+# App set TARTCI_GH_CLI=ghapp to move provider API traffic off the personal PAT
+# (the per-poll calls are the dominant throttle). Exported so the inline python
+# poller inherits it.
+export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
+GH_CLI="$TARTCI_GH_CLI"
+command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT config)"
 
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
@@ -113,7 +119,9 @@ match_labels = match_labels_raw.strip().lower() not in {"0", "false", "no"}
 now = dt.datetime.now(dt.timezone.utc)
 
 def gh(path):
-    return json.loads(subprocess.check_output(["gh", "api", path], text=True))
+    import os
+    cli = os.environ.get("TARTCI_GH_CLI") or "gh"
+    return json.loads(subprocess.check_output([cli, "api", path], text=True))
 
 def is_fresh(created_at):
     if max_age <= 0:
@@ -168,7 +176,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$(gh api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || die "JIT config mint failed (need repo admin)"
   [ -n "$jit" ] || die "empty JIT config"
