@@ -135,5 +135,58 @@ class IdleGateWiringTests(unittest.TestCase):
         self.assertIn('[ "${p:-0}" -eq 0 ]', self.body)
 
 
+class IdleGateFailClosed(unittest.TestCase):
+    """priority_demand must FAIL CLOSED: a gh error → report demand (yield), not 0.
+
+    gh errors cluster during the rate-limit storms when the gate most needs its
+    slot, so a fail-open guard would let the secondary boot exactly when that is
+    most harmful. Driven through the real `--print-priority-demand` hook with stub
+    CLIs so no gh/tart/network is needed.
+    """
+
+    def _run(self, gh_stub_body: str) -> subprocess.CompletedProcess:
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        tmp = Path(d)
+        def _exe(name: str, body: str) -> None:
+            p = tmp / name
+            p.write_text(body, encoding="utf-8")
+            p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        _exe("tart", "#!/usr/bin/env bash\nexit 0\n")
+        _exe("stubgh", gh_stub_body)
+        base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
+                if Path(b).exists()]
+        env = {
+            "HOME": str(tmp),
+            "PATH": os.pathsep.join([str(tmp), *base]),
+            "TART_HOME": str(tmp / "vms"),
+            "TARTCI_STATE_DIR": str(tmp / "state"),
+            "TARTCI_GH_CLI": "stubgh",
+            # Idle gate ON so priority_demand actually probes.
+            "TARTCI_YIELD_TO_WORKFLOW_NAME": "Build and Test",
+            "TARTCI_YIELD_TO_LABELS": "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+        }
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--print-priority-demand",
+             "--labels", "self-hosted,macOS,ARM64,pulp-coverage-vm-macos"],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def test_gh_error_reports_demand_not_zero(self) -> None:
+        # Stub gh exits non-zero (simulates rate-limit / 5xx).
+        r = self._run("#!/usr/bin/env bash\nexit 1\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1",
+                         "priority_demand must report demand (yield) on a gh error, "
+                         "not fail open to 0")
+
+    def test_no_priority_runs_reports_zero(self) -> None:
+        # Stub gh succeeds with an empty run list → genuinely no demand → 0.
+        r = self._run("#!/usr/bin/env bash\nexit 0\n")  # prints nothing
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

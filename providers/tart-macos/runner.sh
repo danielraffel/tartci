@@ -278,14 +278,28 @@ PY
 # means "a priority job needs a slot — do not boot the secondary VM".
 priority_demand(){
   [ -n "$YIELD_WORKFLOW" ] || { printf '%s\n' 0; return 0; }
-  local label_json count=0 run_id matches
+  # FAIL CLOSED. If we cannot read priority-lane demand, assume there IS demand
+  # (print 1 → the loop gate yields) rather than booting blind. gh errors
+  # (rate-limit / 5xx) cluster during exactly the load spikes when the gate most
+  # needs its slot, so a fail-OPEN guard would let the secondary grab the gate's
+  # slot precisely when that is most harmful. Worst case of fail-closed is an
+  # advisory lane that idles during a gh outage — strictly safer than risking the
+  # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
+  # are declared first and assigned separately so `||` actually fires.)
+  local label_json count=0 run_id matches ids run_ids="" st
   label_json="$(YL="$YIELD_LABELS" python3 -c 'import json, os; print(json.dumps([x.strip() for x in os.environ["YL"].split(",") if x.strip()]))')"
+  for st in queued in_progress; do
+    ids="$("$GH_CLI" api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
+      --jq ".workflow_runs[] | select(.name == \"${YIELD_WORKFLOW}\") | .id" 2>/dev/null)" \
+      || { printf '%s\n' 1; return 0; }
+    [ -n "$ids" ] && run_ids="$run_ids$ids"$'\n'
+  done
   while IFS= read -r run_id; do
     [ -n "$run_id" ] || continue
-    matches="$(
-      "$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
-        --jq '.jobs[] | select(.status == "queued" or .status == "in_progress") | .labels | @json' 2>/dev/null |
-      LABEL_JSON="$label_json" python3 -c '
+    ids="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
+      --jq '.jobs[] | select(.status == "queued" or .status == "in_progress") | .labels | @json' 2>/dev/null)" \
+      || { printf '%s\n' 1; return 0; }
+    matches="$(printf '%s' "$ids" | LABEL_JSON="$label_json" python3 -c '
 import json, os, sys
 want = {s.lower() for s in json.loads(os.environ["LABEL_JSON"])}
 n = 0
@@ -301,15 +315,9 @@ for line in sys.stdin:
     if labels and labels.issubset(want):
         n += 1
 print(n)
-'
-    )" || matches=0
+')" || { printf '%s\n' 1; return 0; }
     count=$((count + ${matches:-0}))
-  done < <(
-    for st in queued in_progress; do
-      "$GH_CLI" api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
-        --jq ".workflow_runs[] | select(.name == \"${YIELD_WORKFLOW}\") | .id" 2>/dev/null || true
-    done
-  )
+  done <<< "$run_ids"
   printf '%s\n' "$count"
 }
 
