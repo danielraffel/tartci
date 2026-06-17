@@ -164,9 +164,17 @@ def parse_timing_fields(path: str | None) -> tuple[dict[str, Any], dict[str, int
     return mapped, phases_ms
 
 
+# Match the providers: route enrichment GitHub calls through TARTCI_GH_CLI
+# (default `gh`) so a host that authenticates as a GitHub App keeps this path off
+# the shared personal PAT too. Lower-frequency than the per-poll loop, but it
+# would otherwise be a bare-PAT hole in the off-PAT routing.
+def _gh_cli() -> str:
+    return os.environ.get("TARTCI_GH_CLI") or "gh"
+
+
 def gh_json(repo: str, path: str, timeout: int) -> dict[str, Any]:
     out = subprocess.check_output(
-        ["gh", "api", f"repos/{repo}/{path}"],
+        [_gh_cli(), "api", f"repos/{repo}/{path}"],
         stderr=subprocess.DEVNULL,
         text=True,
         timeout=timeout,
@@ -176,7 +184,7 @@ def gh_json(repo: str, path: str, timeout: int) -> dict[str, Any]:
 
 
 def enrich_from_github(repo: str, runner_name: str, workflow: str, timeout: int) -> dict[str, str]:
-    if not shutil.which("gh"):
+    if not shutil.which(_gh_cli()):
         return {}
     try:
         runs = gh_json(repo, "actions/runs?per_page=50", timeout).get("workflow_runs", [])
