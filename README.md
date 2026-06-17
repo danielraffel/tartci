@@ -98,7 +98,18 @@ names include a host-derived prefix by default so multiple Macs can serve the
 same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
-`TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header. To serve across reboots, install a LaunchAgent
+`TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
+
+**Routing provider API calls off a personal PAT (`TARTCI_GH_CLI`).** Every
+provider polls GitHub each `VM_POLL` seconds on every host (queue check, plus
+JIT mint / runner reclaim / job + run polling). On a shared personal PAT that
+polling is the dominant secondary-rate-limit ("token invalid") source, and it
+multiplies with each host added. Set `TARTCI_GH_CLI` to a CLI that authenticates
+as a **GitHub App** (e.g. a `ghapp` wrapper that runs `gh` with an App token) to
+move all of it onto the App's separate rate-limit bucket. Default `gh` — generic
+behavior is unchanged; opt in per host via the LaunchAgent env.
+
+To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /
 debug); pool jobs build whatever arch the workflow targets. The Linux, macOS,
