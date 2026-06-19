@@ -348,6 +348,7 @@ discard_current_vm(){
 cleanup(){
   [ "$CLEANED_UP" = 1 ] && return 0
   discard_current_vm
+  [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
   reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
   CLEANED_UP=1
   heartbeat stopped
@@ -526,11 +527,15 @@ i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 
+# Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
+# shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
+source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
+
 if [ "$LOOP" = 1 ]; then
   note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>}"
   heartbeat loop
   while true; do
-    q="$(queued_work)"; r="$(running_macos_vms)"
+    q="$(queued_work)"; cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0
@@ -542,16 +547,18 @@ if [ "$LOOP" = 1 ]; then
     # when the feature is off (priority_demand returns 0), so this is a no-op for
     # the primary gate runner. For a secondary lane it guarantees the priority
     # gate keeps its slot — the failure that backed out the coverage lane.
-    if [ "${q:-0}" -gt 0 ] && [ "${r:-0}" -lt "$CAP" ] && [ "${p:-0}" -eq 0 ]; then
-      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$CAP priority_demand=$p → booting ephemeral VM"
+    if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
+      CURRENT_RESV="$resv"
+      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p → booting ephemeral VM"
       run_one "$i" || true
+      rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ]; then
-      note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$CAP) — priority lane '${YIELD_WORKFLOW}' has the slot"
-      event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$CAP"
+      note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$cap) — priority lane '${YIELD_WORKFLOW}' has the slot"
+      event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
     else
-      note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$CAP priority_demand=$p)"
+      note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap priority_demand=$p)"
       heartbeat waiting
       sleep "$POLL"
     fi
