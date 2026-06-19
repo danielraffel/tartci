@@ -9,15 +9,22 @@
 : "${TARTCI_MACOS_RESV_DIR:=$HOME/.config/tartci/macos-vm-reservations}"
 : "${TARTCI_MACOS_RESV_TTL:=7200}"   # prune a reservation older than this (crash safety); > any build
 : "${TARTCI_MACOS_LOCK_TRIES:=30}"   # × 0.5s ≈ 15s before failing open
+: "${TARTCI_MACOS_HARD_MAX:=2}"      # Apple allows 2 macOS guests/host — a hard ceiling no source may exceed
 
 # Effective cap: live from the GUI-written file if it holds a valid int >=1,
-# else the static $CAP the runner started with. Clamped to >=1.
+# else the static $CAP the runner started with. Clamped to [1, HARD_MAX] so a
+# stale/garbage/fat-fingered cap file (e.g. "20") can never drive boot thrash
+# past Apple's 2-guest virtualization limit.
 tartci_effective_cap(){
   local c="${CAP:-2}" v
   if [ -r "$TARTCI_MACOS_CAP_FILE" ]; then
     v="$(tr -dc '0-9' < "$TARTCI_MACOS_CAP_FILE" 2>/dev/null | head -c 2)"
     if [ -n "$v" ] && [ "$v" -ge 1 ] 2>/dev/null; then c="$v"; fi
   fi
+  # Hard clamp both ends — protects against a bad cap file AND a bad startup $CAP.
+  case "$c" in ""|*[!0-9]*) c=1;; esac
+  [ "$c" -ge 1 ] 2>/dev/null || c=1
+  [ "$c" -le "$TARTCI_MACOS_HARD_MAX" ] 2>/dev/null || c="$TARTCI_MACOS_HARD_MAX"
   printf '%s' "$c"
 }
 
@@ -50,7 +57,15 @@ tartci_lock(){
   for _ in $(seq 1 "$TARTCI_MACOS_LOCK_TRIES"); do
     if mkdir "$TARTCI_MACOS_LOCKDIR" 2>/dev/null; then echo $$ > "$TARTCI_MACOS_LOCKDIR/pid" 2>/dev/null; return 0; fi
     lpid="$(cat "$TARTCI_MACOS_LOCKDIR/pid" 2>/dev/null)"
-    if [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null; then rm -rf "$TARTCI_MACOS_LOCKDIR" 2>/dev/null; continue; fi
+    if [ -n "$lpid" ] && ! kill -0 "$lpid" 2>/dev/null; then
+      # Steal a DEAD holder's lock atomically: `mv` can only succeed for ONE
+      # racer (the source can be renamed exactly once), so two waiters can't both
+      # rm a live holder's freshly-created lockdir and both enter the CS. The
+      # loser's mv fails (source already gone) → it just retries mkdir next pass.
+      mv "$TARTCI_MACOS_LOCKDIR" "$TARTCI_MACOS_LOCKDIR.dead.$$" 2>/dev/null \
+        && rm -rf "$TARTCI_MACOS_LOCKDIR.dead.$$" 2>/dev/null
+      continue
+    fi
     sleep 0.5
   done
   return 1
@@ -72,9 +87,18 @@ tartci_claim_macos_slot(){
   if [ "${running:-0}" -lt "$cap" ]; then
     # Stamp the OWNING supervisor PID ($$ is the parent shell even inside this
     # command-substitution subshell) so a dead owner's slot can be reclaimed.
-    resv="$(mktemp "$TARTCI_MACOS_RESV_DIR/resv.XXXXXX" 2>/dev/null)" \
-      && printf '%s %s' "$$" "$(date +%s)" > "$resv" 2>/dev/null \
-      && printf '%s' "$resv"
+    resv="$(mktemp "$TARTCI_MACOS_RESV_DIR/resv.XXXXXX" 2>/dev/null)"
+    if [ -n "$resv" ]; then
+      printf '%s %s' "$$" "$(date +%s)" > "$resv" 2>/dev/null || true
+      printf '%s' "$resv"
+    else
+      # FS failure (disk full / unwritable config dir): fail OPEN. Never dark a
+      # REQUIRED gate on a transient disk hiccup — boot with an untracked slot;
+      # Apple's 2-guest limit still backstops actual oversubscription. The sentinel
+      # path doesn't exist, so the caller's `rm -f` is a harmless no-op and
+      # tartci_active_reservations never counts it.
+      printf '%s' "$TARTCI_MACOS_RESV_DIR/resv.failopen.$$"
+    fi
   fi
   [ "$locked" = 1 ] && tartci_unlock
   return 0
