@@ -73,6 +73,7 @@ while IFS=$'\t' read -r pr repo hb; do
       else log "  $repo#$pr: would reap ($state)"; reaped=$((reaped+1)); fi ;;
     OPEN)
       info="$($GH pr view "$pr" --repo "$repo" --json mergeable,mergeStateStatus,isDraft --jq '"\(.mergeable)|\(.mergeStateStatus)|\(.isDraft)"' 2>/dev/null)"
+      if [ -z "$info" ]; then log "  $repo#$pr: mergeability read failed — skip (fail closed)"; errs=$((errs+1)); continue; fi
       mergeable="${info%%|*}"; rest="${info#*|}"; mss="${rest%%|*}"; draft="${rest##*|}"
       if [ "$draft" = "true" ]; then log "  $repo#$pr: draft — skip"; waiting=$((waiting+1)); continue; fi
       if [ "$mergeable" = "CONFLICTING" ] || [ "$mss" = "DIRTY" ] || [ "$mss" = "BEHIND" ]; then
