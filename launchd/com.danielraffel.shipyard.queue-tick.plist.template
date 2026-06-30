@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the per-host Shipyard queue janitor.
+
+  Runs scripts/shipyard_queue_tick.sh periodically to drive in-flight
+  ship-state to completion (via shipyard's OWN fail-closed `auto-merge`) and
+  reap orphaned records (merged/closed PRs), INDEPENDENT of any interactive
+  session. See planning/2026-06-30-ship-queue-resilience-design.md in the pulp
+  repo for the full design + adversarial review.
+
+  SAFETY: defaults to DRY-RUN (SHIPYARD_TICK_APPLY=0) — it only logs what it
+  WOULD do. Deploy observe-only first, watch the log for a day, then flip
+  SHIPYARD_TICK_APPLY to 1 to arm live action. The tick never reimplements
+  merge logic, merges only green+head-matched PRs through `shipyard auto-merge`,
+  and discards only GitHub-confirmed MERGED/CLOSED records.
+
+  Install shape (run on each CI host — m1/m3/m5):
+
+    mkdir -p "$HOME/Library/Logs"
+    sed -e "s|\$HOME|$HOME|g" \
+      launchd/com.danielraffel.shipyard.queue-tick.plist.template \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
+
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
+    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.shipyard.queue-tick"
+
+  To arm live action after observing the dry-run log, change
+  SHIPYARD_TICK_APPLY below to 1 and re-run the bootstrap/kickstart.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.shipyard.queue-tick</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/shipyard-queue-tick.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/shipyard-queue-tick.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>SHIPYARD_TICK_APPLY</key>
+        <string>0</string>
+        <key>SHIPYARD_TICK_HEARTBEAT_FRESH_SECS</key>
+        <string>300</string>
+        <key>SHIPYARD_TICK_MERGE_METHOD</key>
+        <string>merge</string>
+    </dict>
+</dict>
+</plist>
