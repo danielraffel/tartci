@@ -145,6 +145,28 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 Then install the LaunchAgent once the report is clean. Logs land in
 `~/Library/Logs/tartci/tartci-reap.log`.
 
+## Shipyard queue janitor
+
+`com.danielraffel.shipyard.queue-tick.plist.template` runs
+`scripts/shipyard_queue_tick.sh` every 5 min to make the Shipyard ship-queue
+progress **independent of any interactive session** — so a cmux restart or a
+Claude session running out of quota can no longer strand a validated PR or leak
+ship-state. Per active ship-state whose worker is not live, it: reaps records
+whose PR GitHub reports merged/closed (`shipyard ship-state discard`), drives
+open green PRs to merge via shipyard's own fail-closed `auto-merge` (no-op
+unless all targets green and the live head matches the validated SHA), and
+surfaces (does not auto-rebase) behind/DIRTY PRs.
+
+Safe-by-construction: acts only on PRs that already have a ship-state record,
+never reimplements merge logic, never edits state files, fails closed on any
+GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
+(`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
+`~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1` in
+the installed plist and re-bootstrap/kickstart to arm live action. Install this
+on every CI Mac (m1/m3/m5). See the template's header comment for the exact
+`sed` install recipe. Design + adversarial review: pulp
+`planning/2026-06-30-ship-queue-resilience-design.md`.
+
 ## Serving a different repo
 
 1. Copy a template to `com.<you>.<repo>.<provider>.plist.template`.
