@@ -19,6 +19,11 @@
 #
 # Tunables (env):
 #   SHIPYARD_TICK_APPLY=0|1                 default 0 (dry-run)
+#   SHIPYARD_TICK_REAP_ONLY=0|1             default 0. With APPLY=1, act on the
+#       proven reap path (discard GitHub-MERGED/CLOSED orphans) but hold the
+#       auto-merge path in surface-only mode. This is the safe staged-rollout
+#       gate: the reap path has been exercised; the OPEN+green auto-merge action
+#       is enabled only once it has been observed firing correctly.
 #   SHIPYARD_TICK_HEARTBEAT_FRESH_SECS=N    default 300 (skip live workers)
 #   SHIPYARD_TICK_MERGE_METHOD=merge|squash|rebase  default merge
 #       (merge-commit preserves a `chore: bump versions` marker on main; squash
@@ -26,6 +31,7 @@
 set -uo pipefail
 
 APPLY="${SHIPYARD_TICK_APPLY:-0}"
+REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
 METHOD="${SHIPYARD_TICK_MERGE_METHOD:-merge}"
 GH="ghapp"; command -v ghapp >/dev/null 2>&1 || GH="gh"
@@ -54,7 +60,8 @@ PY
 
 now=$(date -u +%s)
 total=$(wc -l < "$ROWS" | tr -d ' ')
-log "$HOST: $total active record(s); apply=$APPLY method=$METHOD"
+MODE="dry-run"; [ "$APPLY" = "1" ] && MODE="live"; [ "$APPLY" = "1" ] && [ "$REAP_ONLY" = "1" ] && MODE="reap-only"
+log "$HOST: $total active record(s); mode=$MODE method=$METHOD"
 merged=0; reaped=0; waiting=0; stalled=0; live=0; errs=0
 
 while IFS=$'\t' read -r pr repo hb; do
@@ -79,14 +86,16 @@ while IFS=$'\t' read -r pr repo hb; do
       if [ "$mergeable" = "CONFLICTING" ] || [ "$mss" = "DIRTY" ] || [ "$mss" = "BEHIND" ]; then
         log "  $repo#$pr: OPEN not fast-forwardable (mergeable=$mergeable status=$mss) — SURFACE, no auto-rebase"; stalled=$((stalled+1)); continue
       fi
-      if [ "$APPLY" = "1" ]; then
+      if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
         "$SY" ship-state reconcile "$pr" >/dev/null 2>&1
         out="$("$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>&1)"
         if echo "$out" | grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged'; then log "  $repo#$pr: merged"; merged=$((merged+1))
         else log "  $repo#$pr: not green yet / no-op"; waiting=$((waiting+1)); fi
+      elif [ "$APPLY" = "1" ]; then
+        log "  $repo#$pr: OPEN green — reap-only mode, would attempt shipyard auto-merge (held)"; waiting=$((waiting+1))
       else log "  $repo#$pr: OPEN — would attempt shipyard auto-merge (fail-closed)"; waiting=$((waiting+1)); fi ;;
     *) log "  $repo#$pr: unexpected state '$state' — skip"; errs=$((errs+1)) ;;
   esac
 done < "$ROWS"
 
-log "$HOST: merged=$merged reaped=$reaped waiting=$waiting stalled=$stalled live=$live errs=$errs (apply=$APPLY)"
+log "$HOST: merged=$merged reaped=$reaped waiting=$waiting stalled=$stalled live=$live errs=$errs (mode=$MODE)"
