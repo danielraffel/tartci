@@ -188,5 +188,109 @@ class IdleGateFailClosed(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "0")
 
 
+class HostHealthYieldTests(unittest.TestCase):
+    """host_health_yield must FAIL OPEN (the deliberate opposite of
+    priority_demand): a missing/broken host_vitals probe → boot (0), never a
+    stalled runner. Yields (1) only when the probe reports critical (or warn when
+    opted in). Driven through the real `--print-host-health` hook with a stub
+    host_vitals.sh so no real host metrics are needed."""
+
+    def _run(self, *, vitals_body: str | None, env_extra: dict) -> subprocess.CompletedProcess:
+        import stat
+        import tempfile
+        d = tempfile.mkdtemp()
+        tmp = Path(d)
+        # A `tart` stub keeps the script's top-level happy even though the
+        # --print-host-health hook exits before the VM path.
+        (tmp / "tart").write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+        (tmp / "tart").chmod(0o755)
+        if vitals_body is not None:
+            hv = tmp / "host_vitals.sh"
+            hv.write_text(vitals_body, encoding="utf-8")
+            hv.chmod(0o755)
+        base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
+                if Path(b).exists()]
+        env = {
+            "HOME": str(tmp),
+            "PATH": os.pathsep.join([str(tmp), *base]),
+            "TART_HOME": str(tmp / "vms"),
+            "TARTCI_STATE_DIR": str(tmp / "state"),
+            **env_extra,
+        }
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--print-host-health"],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    _CRIT = "#!/usr/bin/env bash\nexit 20\n"
+    _WARN = "#!/usr/bin/env bash\nexit 10\n"
+    _GREEN = "#!/usr/bin/env bash\nexit 0\n"
+
+    def test_feature_off_prints_zero_without_probing(self) -> None:
+        # No TARTCI_HOST_VITALS_YIELD → short-circuit to 0 even if host_vitals
+        # would report critical. This is the primary-gate-runner default.
+        r = self._run(vitals_body=self._CRIT, env_extra={})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_missing_probe_fails_open(self) -> None:
+        # Feature ON but host_vitals.sh absent → fail OPEN (0/boot), never wedge.
+        r = self._run(vitals_body=None, env_extra={"TARTCI_HOST_VITALS_YIELD": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_critical_yields(self) -> None:
+        r = self._run(vitals_body=self._CRIT,
+                      env_extra={"TARTCI_HOST_VITALS_YIELD": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+    def test_green_boots(self) -> None:
+        r = self._run(vitals_body=self._GREEN,
+                      env_extra={"TARTCI_HOST_VITALS_YIELD": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_warn_does_not_yield_by_default(self) -> None:
+        # WARN (10) is below the critical bar; without opt-in we keep booting.
+        r = self._run(vitals_body=self._WARN,
+                      env_extra={"TARTCI_HOST_VITALS_YIELD": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_warn_yields_when_opted_in(self) -> None:
+        r = self._run(vitals_body=self._WARN,
+                      env_extra={"TARTCI_HOST_VITALS_YIELD": "1",
+                                 "TARTCI_HOST_VITALS_YIELD_ON_WARN": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+    def test_critical_still_yields_with_warn_opt_in(self) -> None:
+        r = self._run(vitals_body=self._CRIT,
+                      env_extra={"TARTCI_HOST_VITALS_YIELD": "1",
+                                 "TARTCI_HOST_VITALS_YIELD_ON_WARN": "1"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+
+class HostHealthWiringTests(unittest.TestCase):
+    """Pin the host-health contract: feature defaults OFF and the loop consults it."""
+
+    def setUp(self) -> None:
+        self.body = SCRIPT.read_text(encoding="utf-8")
+
+    def test_feature_defaults_off(self) -> None:
+        self.assertIn('HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"', self.body)
+        self.assertIn(
+            '[ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] '
+            "|| { printf '%s\\n' 0; return 0; }",
+            self.body,
+        )
+
+    def test_loop_gate_consults_host_health(self) -> None:
+        self.assertIn('hh="$(host_health_yield)"', self.body)
+        self.assertIn('[ "${hh:-0}" -eq 0 ]', self.body)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

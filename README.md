@@ -172,6 +172,30 @@ Supervisor diagnostics and rough benchmark timings are kept per job under
 `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and
 proof recipe.
 
+### Host-health auto-yield (optional)
+
+A tartci host that also carries an interactive/RAM-heavy workload can saturate
+(memory-pressure critical → jetsam → unclean reboot) and take the required gate
+down mid-job. When the host publishes a shared `host_vitals` green/warn/critical
+signal, the serve loop can **stop booting new VMs while the host is saturated**
+and resume automatically once it recovers — automating the manual "pause the
+pool during a heavy session".
+
+Off by default (no `host_vitals` call, no behavior change). To enable on a host
+that has a `host_vitals.sh` on `PATH` (exit `0`=green / `10`=warn / `20`=critical):
+
+- `TARTCI_HOST_VITALS_YIELD=1` — turn the gate on (yields on **critical**).
+- `TARTCI_HOST_VITALS_YIELD_ON_WARN=1` — also drain on **warn** (more cautious).
+- `TARTCI_HOST_VITALS_BIN` — override the probe path (default `host_vitals.sh`).
+
+Unlike the priority gate, this gate **fails open**: a missing or erroring probe
+prints `0` (boot), so a broken `host_vitals` can never wedge the required
+runner — host-health yield is crash-avoidance, not a correctness gate. Preview
+the decision with `serve macos --print-host-health` (`0` boot / `1` yield;
+returns `0` when OFF). `host_vitals.sh` is deliberately **not** shipped by
+tartci — bring your own (any script matching the exit-code contract); Pulp's
+lives at `tools/scripts/host_vitals.sh`.
+
 ### Runtime measurements (optional)
 
 VM serving can emit host-local runtime records for agents and Shipyard without
