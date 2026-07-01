@@ -8,11 +8,17 @@
   session. See planning/2026-06-30-ship-queue-resilience-design.md in the pulp
   repo for the full design + adversarial review.
 
-  SAFETY: defaults to DRY-RUN (SHIPYARD_TICK_APPLY=0) — it only logs what it
-  WOULD do. Deploy observe-only first, watch the log for a day, then flip
-  SHIPYARD_TICK_APPLY to 1 to arm live action. The tick never reimplements
-  merge logic, merges only green+head-matched PRs through `shipyard auto-merge`,
-  and discards only GitHub-confirmed MERGED/CLOSED records.
+  SAFETY: three-stage rollout, most-reversible first.
+    1. DRY-RUN (APPLY=0)                — logs only; observe the log.
+    2. REAP-ONLY (APPLY=1, REAP_ONLY=1) — acts on the proven path (discard
+       GitHub-confirmed MERGED/CLOSED orphans) but HOLDS the auto-merge action
+       in surface-only mode. Enable this once dry-run has baked.
+    3. FULL-LIVE (APPLY=1, REAP_ONLY=0) — also drives OPEN+green ship-state
+       PRs through `shipyard auto-merge`. Enable only after the auto-merge
+       branch has been observed firing correctly on a real PR.
+  The tick never reimplements merge logic, merges only green+head-matched PRs
+  through `shipyard auto-merge`, and discards only GitHub-confirmed
+  MERGED/CLOSED records.
 
   Install shape (run on each CI host — m1/m3/m5):
 
@@ -62,6 +68,8 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>SHIPYARD_TICK_APPLY</key>
+        <string>0</string>
+        <key>SHIPYARD_TICK_REAP_ONLY</key>
         <string>0</string>
         <key>SHIPYARD_TICK_HEARTBEAT_FRESH_SECS</key>
         <string>300</string>
