@@ -112,6 +112,31 @@ as a **GitHub App** (e.g. a `ghapp` wrapper that runs `gh` with an App token) to
 move all of it onto the App's separate rate-limit bucket. Default `gh` — generic
 behavior is unchanged; opt in per host via the LaunchAgent env.
 
+**Scan-blindness self-heal (why a rate-limited poll can't silently wedge a lane).**
+Each `VM_POLL` the serve loop asks GitHub "are there queued jobs my labels can
+serve?" That scan has two outcomes, and the loop keeps them distinct:
+
+- **Normal / "not blind":** the scan succeeds and returns a **count** — `0` means
+  *genuinely no queued work* (idle, correct), `>0` means boot a VM. `--print-queue`
+  prints this number: it's the safe preflight for the loop gate.
+- **Blind:** the `gh` scan *fails* (secondary rate-limit / API timeout / a degraded
+  or expired token / a network blip). The loop must NOT read that as "no work" —
+  doing so is how a supervisor can sit idle for hours (`waiting queued=0`) while the
+  required gate backs up, looking perfectly healthy the whole time. So a failed scan
+  returns the sentinel **`ERR`** (never a bogus `0`); `--print-queue` prints `ERR`.
+
+On a blind scan the loop logs `SCAN BLIND …`, counts consecutive blind polls, and
+after ~3 minutes of *continuous* blindness **self-restarts** (`exit 75` → launchd
+`KeepAlive` respawns a fresh process with fresh `gh`/App-token auth — the exact
+manual `launchctl kickstart` recovery, automated). A single blip costs nothing: any
+successful scan resets the counter. Tune the window with `TARTCI_SCAN_BLIND_MAX`
+(polls). A *hung* (not erroring) `gh` is also covered — every poll has a
+`TARTCI_GH_TIMEOUT_SECS` timeout, so a stalled call raises rather than blocking the
+loop forever. This is why moving polling onto the App token (above) matters most: it
+keeps scans *succeeding* so the self-heal rarely has to fire. Quick host check:
+`runner.sh --print-queue` should print a number; if it prints `ERR`, that host's
+`gh`/App auth is degraded — fix the token, not the runner.
+
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /

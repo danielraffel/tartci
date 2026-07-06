@@ -4,7 +4,12 @@
 # once, emits state/heartbeat/events, then tears everything down. Defaults are
 # pilot-safe (`pulp-build-vm`, not required `pulp-build`).
 # `--print-queue` reports queued jobs whose requested labels are satisfiable by
-# the configured runner labels; it is a safe preflight for the loop gate.
+# the configured runner labels; it is a safe preflight for the loop gate. It prints
+# the queued COUNT on a successful scan (`0` = genuinely idle), or the sentinel `ERR`
+# when the gh scan itself FAILS (rate-limit / timeout / degraded token / network) — so a
+# failed poll is never misread as an empty queue. On sustained blindness (ERR for
+# ~TARTCI_SCAN_BLIND_MAX polls ≈ 3 min) the loop self-restarts via `exit 75` (launchd
+# KeepAlive respawns → fresh auth), instead of idling silent for hours (a real 5h wedge).
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -56,7 +61,7 @@ QUEUE_RUN_LIMIT="${TARTCI_QUEUE_RUN_LIMIT:-20}"
 GH_TIMEOUT="${TARTCI_GH_TIMEOUT_SECS:-15}"
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
-POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"
+POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
@@ -253,7 +258,11 @@ try:
             seen.add(run_id)
             runs.append(run)
 except Exception:
-    print(0)
+    # A scan FAILURE (gh-api timeout / rate-limit / auth degradation / network) is NOT the same as
+    # "no queued work". Emit a distinct sentinel so the loop stays blind-AWARE and can self-restart
+    # to re-establish auth, instead of silently idling as if the queue were empty — the multi-hour
+    # supervisor wedge this guards against (an alive loop printing `queued=0` while jobs pile up).
+    print("ERR")
     raise SystemExit
 
 matches = 0
@@ -581,9 +590,33 @@ source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
   note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${HOST_VITALS_YIELD:-<off>}"
+  # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
+  # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
+  # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
+  # self-restart so launchd (KeepAlive) respawns a fresh process with fresh gh auth — the exact
+  # manual recovery, automated. A blip self-heals on the next successful poll (blind resets to 0).
+  blind=0
+  BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   heartbeat loop
   while true; do
     q="$(queued_work)"; cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
+    # Blind-aware: a non-numeric `q` (ERR) means the gh queue scan FAILED — do NOT treat it as an
+    # empty queue. Count consecutive blind polls; after a sustained window, self-restart for fresh
+    # gh auth (the supervisor is idle at the loop top — run_one blocks — so cleanup discards no live
+    # VM). Any successful poll resets the counter, so a transient blip costs nothing.
+    if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      blind=$((blind + 1))
+      note "SCAN BLIND (gh queue scan failed) ${blind}/${BLIND_MAX} — NOT idling as empty (running_macos_vms=$r/$cap)"
+      event scan_blind "consecutive=$blind running=$r/$cap"
+      heartbeat scan_blind
+      if [ "$blind" -ge "$BLIND_MAX" ]; then
+        note "SCAN BLIND ~$((blind * POLL))s — self-restarting the supervisor for fresh gh auth (launchd KeepAlive respawns)"
+        event scan_blind_restart "seconds=$((blind * POLL))"
+        exit 75
+      fi
+      sleep "$POLL"; continue
+    fi
+    blind=0
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0

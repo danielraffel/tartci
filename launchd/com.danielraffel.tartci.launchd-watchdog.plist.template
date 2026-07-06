@@ -9,8 +9,10 @@
   applied without a full bootout+bootstrap. The watchdog performs the only
   recovery that re-reads the plist (bootout+bootstrap+kickstart), rate-limited so
   a genuinely broken plist logs loudly instead of thrashing. It never heals
-  itself, and it only acts on non-zero-exit + stale-log agents, so a healthy
-  between-jobs serve loop (fresh "waiting" log) is left alone.
+  itself. It acts on two signatures — a non-zero-exit crash-loop with a stale log,
+  and an alive-but-frozen loop (state=running, stale log, no VM building) — so a
+  healthy between-jobs serve loop (fresh "waiting" log), a mid-build supervisor (a
+  VM is running), and a deliberately-stopped agent (not loaded) are all left alone.
 
   Install shape:
 
