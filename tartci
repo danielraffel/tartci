@@ -18,6 +18,8 @@
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
+#   tartci goldens list        # canonical golden + drift/prune candidates
+#   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]  # copy canonical golden to a host (fastest link) + verify + repoint
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
@@ -120,6 +122,8 @@ cmd_windows() {
   esac
 }
 
+cmd_goldens() { exec "$HERE/scripts/goldens.sh" "$@"; }
+
 cmd_prepare() {
   local os="${1:-}"; shift || true
   case "$os" in
@@ -184,6 +188,7 @@ case "${1:-help}" in
   timings) shift; cmd_timings "$@" ;;
   runtime) shift; cmd_runtime "$@" ;;
   windows) shift; cmd_windows "$@" ;;
+  goldens) shift; cmd_goldens "$@" ;;
   prepare) shift; cmd_prepare "$@" ;;
   up)      shift; cmd_up "$@" ;;
   serve)   shift; cmd_serve "$@" ;;

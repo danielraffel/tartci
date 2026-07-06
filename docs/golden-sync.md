@@ -86,30 +86,36 @@ assuming — a host on an external/remote volume would differ.
   and never delete a golden a booted VM's overlay still backs onto.
 - Do one host at a time so the pool's other Windows lanes stay up.
 
-## Turnkey goal — `tartci goldens sync`
+## Turnkey — `tartci goldens` (shipped)
 
-The recipe above should collapse to: **connect the cable, run one command.**
-Proposed subcommand (fits the existing `tartci` dispatcher):
+The recipe above now collapses to: **connect the cable, run one command.**
+Implemented in `scripts/goldens.sh`, wired into the dispatcher:
 
 ```
-tartci goldens list                 # canonical golden per OS + which hosts have it (drift report)
-tartci goldens sync [--to HOST|--all] [--os windows] [--prune]
+tartci goldens list                                    # canonical golden + drift / prune candidates
+tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]
 ```
 
-`sync` would:
-1. **Discover the fastest link** to each target: probe Thunderbolt link-local
-   first (detect the peer's `169.254.x` on `bridge0` via `ndp`/mDNS/known-host
-   handshake), fall back to LAN, then Tailscale. Report which link it chose.
-2. **rsync** the canonical golden(s) + `.sha256` into the target's
-   `$TARTCI_GOLDENS` (resumable; `--partial`).
-3. **Verify** the sha remotely; abort that host on mismatch.
-4. **Re-point + reload** the runner only when idle (unset stale pins, confirm the
-   `LOOP` line flips to the new golden).
-5. **Prune** superseded goldens on the target (guarded: never one in use),
-   opt-in via `--prune`.
+`sync`:
+1. **Discovers the fastest link** to HOST — probes a Thunderbolt link-local peer
+   (`169.254.x` on `bridge0` that identifies as HOST, reusing the ssh alias's
+   user/key), falls back to the alias (LAN/Tailscale). `--via IP` overrides the
+   TB IP if auto-detect misses it.
+2. **rsyncs** the canonical golden + `.sha256` into the target's *own*
+   `$TARTCI_GOLDENS` (read from its runner plist, not assumed); resumable
+   (`--partial`), openrsync-safe flags. `--dry-run` stops here.
+3. **Verifies** the sha remotely; aborts that host on mismatch (never repoints a
+   bad copy).
+4. **Re-points** an explicit `TARTCI_WIN_GOLDEN` pin (backs up the plist first; a
+   host with no pin uses the provider default) and **reloads the runner only when
+   idle** — via a full bootout+bootstrap (`tartci launchd reload`), because a pin
+   is plist env and `kickstart -k` does not re-read it. `--no-reload` to skip.
+5. **Prunes** superseded goldens on the target, guarded (never one a running VM
+   is backed by), opt-in via `--prune`.
 
-The only step that can't be automated is plugging in the cable — so the UX is
-"connect your machines, then `tartci goldens sync --to m1 --prune`." A later
-enhancement could watch for a TB peer appearing and offer the sync automatically.
+The only manual step is plugging in the cable. macOS/Linux Tart goldens (not
+portable qcow2 files) are out of scope for this MVP — they sync via tart
+export/clone.
 
-Tracked in issue #24 (this reconciliation was the manual first run of the above).
+Origin: issue #24 — this reconciliation was the manual first run; the command
+automates it.
