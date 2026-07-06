@@ -8,6 +8,8 @@
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
+#   tartci host-profile [--json] # emit derived role/budget settings
+#   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
 #   tartci setup               # brew-install prereqs + create local stores
@@ -92,6 +94,14 @@ cmd_doctor() {
 
 cmd_status() {
   exec python3 "$HERE/scripts/status.py" "$@"
+}
+
+cmd_host_profile() {
+  exec python3 "$HERE/scripts/host_profile.py" "$@"
+}
+
+cmd_leases() {
+  exec python3 "$HERE/scripts/leases.py" "$@"
 }
 
 cmd_profile() {
@@ -207,6 +217,8 @@ usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
+  host-profile) shift; cmd_host_profile "$@" ;;
+  leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   observe) shift; cmd_observe "$@" ;;
   setup)   cmd_setup ;;

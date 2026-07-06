@@ -51,6 +51,8 @@ git clone <this-repo> tartci && cd tartci
 ./tartci bench windows    # clone the Windows golden → open in UTM for GUI/DAW testing
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci status --json    # host-local provider/capacity/profile state for agents
+./tartci host-profile --json  # derived role budget; read-only
+./tartci leases status --json # host-wide core lease store; does not acquire capacity
 ./tartci profile plan normal-local-fast --repo danielraffel/pulp --json
 ./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
 ./tartci runtime summary --repo owner/repo --run-id 123 --json
