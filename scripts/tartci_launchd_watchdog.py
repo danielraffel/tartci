@@ -106,17 +106,32 @@ def classify(
     last_exit_code: int | None,
     log_age_s: float | None,
     stale_log_s: int,
+    vm_running: bool = True,
 ) -> tuple[str, str]:
     """Decide healthy / wedged / unknown from parsed signals. Pure.
 
-    Wedged := exited non-zero AND its log has gone stale (or is missing). The
-    two conditions together are what distinguishes the invisible crash-loop from
-    a healthy between-jobs idle (state=running, fresh "waiting" log) and from a
-    momentary restart (non-zero exit but a log that is still being written)."""
-    if last_exit_code is None:
-        # Never bootstrapped, or never exited non-zero → not our failure mode.
-        return "healthy", "no non-zero exit recorded"
-    if last_exit_code == 0:
+    Two independent wedge signatures:
+
+    1. **Invisible crash-loop** := exited non-zero AND its log has gone stale (or
+       is missing). Distinguishes the crash-loop from a healthy between-jobs idle
+       (running, fresh "waiting" log) and a momentary restart (non-zero exit,
+       log still being written).
+    2. **Alive-but-frozen** := the process is up (no non-zero exit) BUT its log has
+       gone stale AND no VM is building. A healthy serve loop writes a "waiting"/
+       "SCAN BLIND" line every poll (~10-20s), so a stale log while alive means the
+       loop stopped iterating — a hung `tart`/boot or a frozen loop the in-supervisor
+       self-heal can't catch (it never gets back to the top to increment `blind`).
+       The `vm_running` guard is load-bearing: a legit long build blocks the loop
+       quietly for up to hours, so we only call it frozen when NO VM is running."""
+    if last_exit_code is None or last_exit_code == 0:
+        # Alive / cleanly-restarting. Only the alive-but-frozen signature applies:
+        # a stale log with NO VM building means the loop is stuck, not idle.
+        if not vm_running and log_age_s is not None and log_age_s > stale_log_s:
+            return ("wedged",
+                    f"alive but frozen: log stale {int(log_age_s)}s (> {stale_log_s}s) "
+                    "and no VM building")
+        if last_exit_code is None:
+            return "healthy", "no non-zero exit recorded"
         return "healthy", "clean last exit"
     # last_exit_code != 0 from here.
     if log_age_s is None:
@@ -168,14 +183,30 @@ def _log_path_from_plist(plist_path: str) -> str | None:
     return data.get("StandardOutPath") or data.get("StandardErrorPath")
 
 
-def gather_health(label: str, plist_path: str, stale_log_s: int) -> AgentHealth:
+def any_tart_vm_running() -> bool:
+    """True if any Tart VM is running on this host — a conservative guard for the alive-but-frozen
+    signature so the watchdog never heals a supervisor that is quietly blocked on a legitimate long
+    build. FAILS SAFE: on any error reading `tart list`, returns True (assume a build is running →
+    do not heal on staleness). Host-wide (not per-lane) on purpose: simpler and strictly safer."""
+    try:
+        rc, out, _ = _run(["tart", "list", "--format", "json"])
+        if rc != 0:
+            return True
+        return any(str(vm.get("State", vm.get("state", ""))).lower().startswith("run")
+                   for vm in (json.loads(out) or []))
+    except Exception:
+        return True
+
+
+def gather_health(label: str, plist_path: str, stale_log_s: int,
+                  vm_running: bool = True) -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
     log_path = _log_path_from_plist(plist_path)
     log_age: float | None = None
     if log_path and os.path.exists(log_path):
         log_age = max(0.0, utcnow() - os.path.getmtime(log_path))
-    verdict, reason = classify(state, last_exit, log_age, stale_log_s)
+    verdict, reason = classify(state, last_exit, log_age, stale_log_s, vm_running)
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
 
@@ -269,7 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     agents = discover_agents(args.launch_agents_dir)
-    health = [gather_health(lbl, p, args.stale_log_seconds) for lbl, p in agents]
+    # Compute the VM-running guard ONCE per pass (host-wide) — the alive-but-frozen signature only
+    # fires when nothing is building, so a legit long build is never healed.
+    vm_running = any_tart_vm_running()
+    health = [gather_health(lbl, p, args.stale_log_seconds, vm_running) for lbl, p in agents]
 
     now = utcnow()
     heal_log = load_heal_log(_state_file())
