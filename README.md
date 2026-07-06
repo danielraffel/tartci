@@ -65,7 +65,8 @@ git clone <this-repo> tartci && cd tartci
 ./tartci windows run      # boot the Windows installer/single-operator VM (from-scratch)
 ./tartci windows optimize # prewarm/validate the booted Windows golden before tagging
 ./tartci goldens list     # canonical Windows golden + drift / prune candidates
-./tartci goldens sync --to m1 --prune   # copy the canonical golden to a host over the fastest link (Thunderbolt→LAN→Tailscale), verify sha, repoint + reload its runner, prune old
+./tartci goldens sync --to m1 --prune       # PUSH the canonical golden to a host over the fastest link (Thunderbolt→LAN→Tailscale), verify, repoint + reload its runner, prune old
+./tartci goldens sync --from macstudio      # PULL the canonical golden onto THIS host from a peer (new-machine setup — copy instead of baking)
 ```
 `tartci doctor`, `bench`, `metrics`, `up linux`, `up windows`, and `serve
 linux|macos|windows` are wired today. `tartci status --json` and `tartci profile

@@ -333,6 +333,19 @@ AVF can't install Windows (no inbox virtio-blk driver → 0 bytes written; black
 installer display), so Windows is **first-class on standalone QEMU/hvf**, not a
 fallback. The golden ends up a qcow2 you can also open in UTM as a GUI bench.
 
+> **Two ways to get a host its Windows golden — copy first, bake only if you must.**
+> The golden is a portable ~26 GB qcow2, so a new host almost never needs to bake
+> its own:
+> - **(A) Copy from the pool (preferred, fast).** If any host already has the
+>   canonical golden, run **on the new host** (once tartci is deployed there):
+>   `tartci goldens sync --from <peer-that-has-it>` — it picks the fastest link
+>   (Thunderbolt → LAN → Tailscale), verifies the sha, and points the local runner
+>   at it. (Or push from a host that has it: `tartci goldens sync --to <newhost>`.)
+>   See `docs/golden-sync.md`.
+> - **(B) Bake from scratch (below).** Only for the **first** golden in the pool
+>   or a **new Windows version** — the ISO → autounattend → provision recipe in
+>   §4.1–§4.8. Once baked, other hosts get it via (A).
+
 Approximate timing once set up: **Windows cold build ≈ 7 min** on an 8-core arm
 QEMU VM.
 
