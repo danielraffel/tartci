@@ -91,6 +91,9 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 
+# shellcheck source=providers/common/vm-lease.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
 derive_runner_name(){
@@ -187,12 +190,18 @@ runtime_emit_complete(){
 }
 
 running_macos_vms(){
-  tart list --format json 2>/dev/null | python3 -c '
-import json, subprocess, sys
+  local payload fail_closed
+  fail_closed="${TARTCI_MACOS_HARD_MAX:-2}"
+  if ! payload="$(tart list --format json 2>/dev/null)"; then
+    printf '%s\n' "$fail_closed"
+    return 0
+  fi
+  TARTCI_TART_LIST_JSON="$payload" python3 - "$fail_closed" <<'PY' || printf '%s\n' "$fail_closed"
+import json, os, subprocess, sys
 try:
-    vms = json.load(sys.stdin)
+    vms = json.loads(os.environ["TARTCI_TART_LIST_JSON"])
 except Exception:
-    print(0)
+    print(sys.argv[1])
     raise SystemExit
 n = 0
 for vm in vms if isinstance(vms, list) else []:
@@ -210,7 +219,7 @@ for vm in vms if isinstance(vms, list) else []:
     if os_name in ("", "darwin", "macos"):
         n += 1
 print(n)
-' 2>/dev/null || echo 0
+PY
 }
 
 queued_work(){
@@ -404,6 +413,7 @@ discard_current_vm(){
 cleanup(){
   [ "$CLEANED_UP" = 1 ] && return 0
   discard_current_vm
+  tartci_release_vm_lease
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
   reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
   CLEANED_UP=1
@@ -499,6 +509,7 @@ run_runner_until_done(){
 
 run_one(){
   local i="$1" vm="$RUNNER_NAME" jit label_args=() l boot_log rpid ip="" rc=0
+  local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
@@ -509,19 +520,33 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
+  lease_cores="$(tartci_vm_lease_cores tart-macos)"
+  lease_priority="$(tartci_vm_lease_priority "$LABELS")"
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" || return $?
   heartbeat minting-jit
   event mint_jit "labels=$LABELS"
   IFS=',' read -r -a labels_split <<< "$LABELS"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || die "JIT config mint failed (need repo admin)"
-  [ -n "$jit" ] || die "empty JIT config"
+        --jq '.encoded_jit_config')" || { tartci_release_vm_lease; die "JIT config mint failed (need repo admin)"; }
+  [ -n "$jit" ] || { tartci_release_vm_lease; die "empty JIT config"; }
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
-  tart clone "$GOLDEN" "$vm"
+  if ! tart clone "$GOLDEN" "$vm"; then
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    return 1
+  fi
   CURRENT_VM="$vm"
+  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
+    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    return 1
+  fi
   mkdir -p "$CACHE_ROOT/ccache"
   boot_log="$(mktemp -t "tart-run-$vm")"
   tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
@@ -531,7 +556,10 @@ run_one(){
   for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
-    rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"; return 1
+    rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
   fi
   CURRENT_IP="$ip"
   rm -f "$boot_log"
@@ -551,6 +579,7 @@ run_one(){
   kill "$rpid" 2>/dev/null || true
   sleep 2
   tart delete "$vm" >/dev/null 2>&1 || true
+  tartci_release_vm_lease
   t_done="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     {
@@ -635,7 +664,7 @@ if [ "$LOOP" = 1 ]; then
     if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p host_health_yield=$hh → booting ephemeral VM"
-      run_one "$i" || true
+      run_one "$i" || sleep "$POLL"
       rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"

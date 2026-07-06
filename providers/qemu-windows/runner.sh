@@ -64,6 +64,10 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
+
+# shellcheck source=providers/common/vm-lease.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
   local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" timing_path="$5" log_dir="$6"
@@ -253,7 +257,7 @@ PY
 }
 
 run_one(){ # $1=iteration index
-  local i="$1" jit job="${RUNNER_NAME_PREFIX}-$$-$1"
+  local i="$1" jit job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
   local t_start t_booted t_preflight t_runner_done t_done
   t_start="$(now_epoch)"
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
@@ -270,10 +274,31 @@ run_one(){ # $1=iteration index
   jobdir="$WORKROOT/$job"; mkdir -p "$jobdir"
   logdir="$LOGROOT/$job"; mkdir -p "$logdir"
   overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
+  lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
+  lease_priority="$(tartci_vm_lease_priority "$LABELS")"
+  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" || {
+    local lease_rc=$?
+    rm -rf "$jobdir"
+    rm -rf "$port_lock"
+    return "$lease_rc"
+  }
+  WIN_CPUS="$lease_cores"
 
   note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
-  qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null
-  cp "$VARS_TPL" "$efivars"
+  if ! qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
+    runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
+    tartci_release_vm_lease
+    rm -rf "$jobdir"
+    rm -rf "$port_lock"
+    return 1
+  fi
+  if ! cp "$VARS_TPL" "$efivars"; then
+    runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
+    tartci_release_vm_lease
+    rm -rf "$jobdir"
+    rm -rf "$port_lock"
+    return 1
+  fi
   qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$WIN_CPUS" -m "$WIN_MEMORY_MB" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" -drive if=pflash,format=raw,file="$efivars" \
     -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
@@ -293,6 +318,7 @@ run_one(){ # $1=iteration index
     sleep 1
     rm -rf "$jobdir"
     rm -rf "$port_lock"
+    tartci_release_vm_lease
   }
 
   wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
@@ -606,7 +632,7 @@ if [ "$LOOP" = 1 ]; then
     fi
     blind=0
     if [ "${q:-0}" -gt 0 ]; then
-      i=$((i+1)); note "[$i] queued=$q → booting ephemeral Windows VM"; run_one "$i" || true
+      i=$((i+1)); note "[$i] queued=$q → booting ephemeral Windows VM"; run_one "$i" || sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q — no '$WORKFLOW_NAME' work)"; sleep "$POLL"
     fi

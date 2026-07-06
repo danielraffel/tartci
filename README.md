@@ -74,6 +74,13 @@ git clone <this-repo> tartci && cd tartci
 linux|macos|windows` are wired today. `tartci status --json` and `tartci profile
 list|show|explain|plan` are read-only helpers for Shipyard, Codex, Claude, or
 other agents to answer where CI should run from machine-readable config.
+Pool-serving VM runners acquire host-core leases before booting guests. The
+lease size defaults to the host profile's `vm_pool_cores`; override per host
+with `TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or
+`TARTCI_WIN_VM_CORES`. Set `TARTCI_VM_LEASES=0` only for operator-controlled
+break-glass debugging. Tart-backed macOS/Linux runners apply the lease size with
+`tart set --cpu` after cloning and before boot; QEMU Windows passes the leased
+size through `-smp`.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]
@@ -196,7 +203,9 @@ preflight is fast by default (`TARTCI_WIN_PREFLIGHT_MODE=fast`); use
 `TARTCI_WIN_PREFLIGHT_MODE=full` only when debugging a golden/toolchain/network
 issue. QEMU sizing is tunable per host with `TARTCI_WIN_CPUS` and
 `TARTCI_WIN_MEMORY_MB`; keep the template conservative and override on larger
-hosts such as Mac Studio.
+hosts such as Mac Studio. When VM leases are enabled, `TARTCI_WIN_VM_CORES`
+or the host profile's VM pool size becomes the effective QEMU `-smp` count
+instead of the ungated `TARTCI_WIN_CPUS` default.
 Supervisor diagnostics and rough benchmark timings are kept per job under
 `TARTCI_WIN_LOGS` as `preflight.log`, `runner-output.log`, `runner-diag.log`,
 `qemu.log`, and `timing.tsv`; see `docs/runbook.md` for the full setup and
