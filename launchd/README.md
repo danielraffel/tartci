@@ -69,6 +69,53 @@ label after the shared pool label. A job requiring
 `self-hosted,macOS,ARM64,pulp-build,pulp-build-vm` still matches a runner that
 advertises that full set plus one extra label.
 
+### Reload rule: always bootout+bootstrap, never kickstart alone
+
+launchd caches a job's spec in memory. `KeepAlive` respawn and
+`launchctl kickstart -k` both re-run the CACHED spec — **neither re-reads the
+plist from disk.** So if you edit a plist (a routing / label change) or move the
+tartci tree (a reinstall) and then only `kickstart`, launchd keeps running the
+STALE spec. When that stale spec resolves to a now-unreadable path (the
+`/Volumes` no-Full-Disk-Access case above, or a moved `~/.local` generation),
+every respawn exits 126 *before the script runs* — nothing is logged, the log
+freezes, and `runs=` climbs into the thousands while `KeepAlive` respawns it
+forever. On 2026-07-06 this had silently taken the required macOS gate offline
+for ~2 weeks. Only `bootout` (drop the cached spec) + `bootstrap` (re-read the
+plist) heals it.
+
+Use the wrapper instead of raw `launchctl` so you can never get this wrong:
+
+```
+tartci launchd reload com.danielraffel.pulp.tart-runner   # bootout+bootstrap+kickstart
+tartci launchd status                                     # health of every tartci agent
+```
+
+## LaunchAgent self-heal watchdog
+
+`com.danielraffel.tartci.launchd-watchdog.plist.template` runs
+`tartci launchd heal` on a `StartInterval` (default 300s). Because the
+exit-126 wedge above logs nothing (the script never runs), no in-agent logging
+can catch it — recovery must live outside the wedged agent. The watchdog
+(`scripts/tartci_launchd_watchdog.py`) discovers every tartci LaunchAgent, and
+for each reads `launchctl print` (`last exit code`, `state`) plus the log mtime.
+It heals an agent only when it **exited non-zero AND its log has gone stale**
+(the two together distinguish the invisible crash-loop from a healthy
+between-jobs idle, whose "waiting" log is always fresh). Healing is the same full
+bootout+bootstrap+kickstart, rate-limited (default: max 3 heals per label per
+hour) so a genuinely broken plist logs loudly to
+`~/Library/Logs/tartci/tartci-launchd-watchdog.log` instead of thrashing. It
+never heals itself. Decision logic is covered hermetically by
+`scripts/test_tartci_launchd_watchdog.py` (no launchd needed). Install:
+
+```
+mkdir -p "$HOME/Library/Logs/tartci"
+sed -e "s|\$HOME|$HOME|g" \
+  launchd/com.danielraffel.tartci.launchd-watchdog.plist.template \
+  > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
+launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
+```
+
 ## Release CLI macOS launchd rule
 
 `Release CLI` is a different workload from `Build and Test`, so serve it with a
