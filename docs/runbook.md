@@ -100,6 +100,40 @@ uses `TART_HOME`, capacity and cleanup will disagree.
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 
+**Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
+Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
+token — the `[github.auth]` `source = "command"` block (the
+`shipyard-github-app-token` helper + App ID + private-key path) in
+`~/Library/Application Support/shipyard/config.toml`. If that config is absent,
+Shipyard silently falls back to the ambient `gh` token. For a personal GitHub
+App with no user login, that ambient token is the **anonymous 60/hr** bucket, so
+Shipyard runs unauthenticated and its menu bar shows **"updates paused"** with no
+error surfaced — the exact failure seen on host `m1` (2026-07-06), which had no
+`config.toml` at all and stayed paused for hours before anyone noticed.
+
+Copy the config from an already-correct host with the supported
+`shipyard auth` commands (the exported bundle is sanitized — it carries the
+`token_command` + App ID + key **path**, never a secret):
+
+```bash
+# On a known-good host — emit a sanitized auth bundle (no secrets):
+shipyard auth export > shipyard-auth.bundle
+
+# On the new host — apply it globally, then confirm:
+shipyard auth import shipyard-auth.bundle --scope global
+shipyard auth doctor
+#   github-auth: ok command helper (github-app-installation)   ← want this
+#   github-auth: ... gh-cli (ambient)                          ← DEGRADED (60/hr)
+```
+
+The private key referenced by `token_command` is **not** in the bundle — it must
+already exist at the referenced path on the new host (copy it out-of-band via
+your own secret-transfer path; never commit it). `tartci doctor` runs
+`shipyard auth doctor` for you and WARNs when the effective source is
+`gh-cli (ambient)` rather than `github-app-installation`, so a degraded host is
+caught the next time anyone runs `tartci doctor` on it. Hosts without Shipyard
+installed stay green (the check is skipped, non-fatal).
+
 ---
 
 ## 2. macOS lane (Tart)
