@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci LaunchAgent self-heal watchdog.
+
+  Runs `tartci launchd heal` periodically. It detects the invisible crash-loop
+  where a serve LaunchAgent (e.g. the required macOS build gate) exits non-zero
+  before it can log anything AND its log has gone stale — the signature of
+  launchd respawning a STALE CACHED job spec after a plist edit/move that was
+  applied without a full bootout+bootstrap. The watchdog performs the only
+  recovery that re-reads the plist (bootout+bootstrap+kickstart), rate-limited so
+  a genuinely broken plist logs loudly instead of thrashing. It never heals
+  itself, and it only acts on non-zero-exit + stale-log agents, so a healthy
+  between-jobs serve loop (fresh "waiting" log) is left alone.
+
+  Install shape:
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    sed -e "s|\$HOME|$HOME|g" \
+      launchd/com.danielraffel.tartci.launchd-watchdog.plist.template \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
+
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
+    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
+
+  The template assumes the macOS launchd rule from this directory's README:
+  tartci is installed under $HOME and exposed as $HOME/.local/bin/tartci.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.launchd-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>launchd</string>
+        <string>heal</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-launchd-watchdog.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-launchd-watchdog.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+    </dict>
+</dict>
+</plist>
