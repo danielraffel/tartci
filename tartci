@@ -5,7 +5,7 @@
 # honest about what is still hand-driven (see docs/runbook.md). It adds NO
 # dependencies of its own — just bash + the tools `doctor` checks for.
 #
-#   tartci doctor              # report host prereqs + stores (always safe)
+#   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
@@ -40,6 +40,32 @@ c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 
+# check_shipyard_auth — non-fatal onboarding check (see runbook §1).
+# Shipyard's GitHub auth must point at the GitHub-App installation token (the
+# `[github.auth]` source="command" helper in its config.toml). A host that never
+# imported that config silently falls back to the ambient `gh` token, which for
+# an App with no user login is an anonymous 60/hr bucket — Shipyard then shows
+# "updates paused" in its menu bar with no error. We surface that here by reading
+# `shipyard auth doctor` (the supported diagnostic) and WARN, never fail: hosts
+# without Shipyard are legitimate, and doctor must stay green for them.
+check_shipyard_auth() {
+  echo "shipyard github-auth:"
+  if ! command -v shipyard >/dev/null 2>&1; then
+    c_warn "shipyard (optional: not installed — skipping github-auth check)"
+    return 0
+  fi
+  local out
+  out="$(shipyard auth doctor 2>/dev/null || true)"
+  if printf '%s' "$out" | grep -q 'github-app-installation'; then
+    c_ok "App-token helper (github-app-installation)"
+  elif printf '%s' "$out" | grep -q 'gh-cli (ambient)'; then
+    c_warn "DEGRADED — ambient gh token (anonymous 60/hr; menu bar will show 'updates paused')."
+    c_warn "  Import the App-token config: shipyard auth import <bundle> --scope global   (runbook §1)"
+  else
+    c_warn "could not read source from 'shipyard auth doctor' — verify auth manually (runbook §1)"
+  fi
+}
+
 cmd_doctor() {
   if [ "${1:-}" = "--reap" ]; then
     shift
@@ -61,6 +87,7 @@ cmd_doctor() {
     local n; n=$(find "$TARTCI_GOLDENS" -maxdepth 1 \( -name '*.qcow2' -o -name '*.tart' \) 2>/dev/null | wc -l | tr -d ' ')
     echo "goldens: $n"; find "$TARTCI_GOLDENS" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sed 's/^/  - /'
   fi
+  check_shipyard_auth
 }
 
 cmd_status() {
