@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "providers" / "common" / "vm-lease.lib.sh"
+STATE_HELPER = ROOT / "providers" / "common" / "vm-state.lib.sh"
 MACOS_RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 
 
@@ -116,6 +117,37 @@ class VmLeaseHelperTests(unittest.TestCase):
             proc = _run_bash(script)
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(marker.read_text(encoding="utf-8").strip(), "set demo-vm --cpu 4")
+
+    def test_disk_floor_refuses_vm_admission_when_free_space_is_too_low(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=999999
+                note() {{ :; }}
+                source {STATE_HELPER}
+                tartci_check_disk_floor {Path(td)}
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 75, proc.stderr)
+
+    def test_disk_floor_can_be_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                source {STATE_HELPER}
+                tartci_check_disk_floor {Path(td)}
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
 class RunningMacosVmsFailClosedTests(unittest.TestCase):

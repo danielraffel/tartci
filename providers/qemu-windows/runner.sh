@@ -67,6 +67,8 @@ prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true
 
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+# shellcheck source=providers/common/vm-state.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -259,7 +261,10 @@ PY
 run_one(){ # $1=iteration index
   local i="$1" jit job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
   local t_start t_booted t_preflight t_runner_done t_done
+  local state_dir qemu_started=""
   t_start="$(now_epoch)"
+  tartci_check_disk_floor "$WORKROOT" || return $?
+  tartci_check_disk_floor "$LOGROOT" || return $?
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
@@ -274,6 +279,23 @@ run_one(){ # $1=iteration index
   jobdir="$WORKROOT/$job"; mkdir -p "$jobdir"
   logdir="$LOGROOT/$job"; mkdir -p "$logdir"
   overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
+  state_dir="$(tartci_provider_state_dir qemu-windows)"
+  write_state(){
+    TARTCI_STATE_LABELS="$LABELS" \
+    TARTCI_STATE_REPO="$REPO" \
+    TARTCI_STATE_SUPERVISOR_PID="$$" \
+    TARTCI_STATE_SUPERVISOR_PID_STARTED_AT="$(tartci_pid_started_at "$$")" \
+    TARTCI_STATE_WORK_DIR="$jobdir" \
+    TARTCI_STATE_LOG_DIR="$logdir" \
+    TARTCI_STATE_OVERLAY="$overlay" \
+    TARTCI_STATE_PORT_LOCK="$port_lock" \
+    TARTCI_STATE_SSH_PORT="$port" \
+    TARTCI_STATE_QEMU_PID="${qpid:-}" \
+    TARTCI_STATE_QEMU_PID_STARTED_AT="$qemu_started" \
+    TARTCI_STATE_KEEP_FAILED="${2:-}" \
+    tartci_write_vm_state qemu-windows "$job" "$job" "$1" ephemeral "$state_dir"
+  }
+  delete_state(){ tartci_delete_vm_state "$job" "$state_dir"; }
   lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" || {
@@ -283,11 +305,13 @@ run_one(){ # $1=iteration index
     return "$lease_rc"
   }
   WIN_CPUS="$lease_cores"
+  write_state preparing
 
   note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
   if ! qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     tartci_release_vm_lease
+    delete_state
     rm -rf "$jobdir"
     rm -rf "$port_lock"
     return 1
@@ -295,6 +319,7 @@ run_one(){ # $1=iteration index
   if ! cp "$VARS_TPL" "$efivars"; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     tartci_release_vm_lease
+    delete_state
     rm -rf "$jobdir"
     rm -rf "$port_lock"
     return 1
@@ -305,12 +330,15 @@ run_one(){ # $1=iteration index
     -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=net0 \
     -drive file="$overlay",if=none,id=nvm,format=qcow2 -device nvme,drive=nvm,serial=pulpwin \
     -display none >"$logdir/qemu.log" 2>&1 & qpid=$!
+  qemu_started="$(tartci_pid_started_at "$qpid")"
+  write_state booting
 
   cleanup_job(){
     local outcome="${1:-success}"
     delete_runner_registration "$job" || true
     if [ "$outcome" = "failure" ] && [ "$KEEP_FAILED" = 1 ]; then
       note "[$i] keeping failed VM for inspection: job=$job qemu_pid=$qpid ssh_port=$port dir=$jobdir"
+      write_state kept-failed 1
       return 0
     fi
     note "[$i] host diagnostics: $logdir"
@@ -319,6 +347,7 @@ run_one(){ # $1=iteration index
     rm -rf "$jobdir"
     rm -rf "$port_lock"
     tartci_release_vm_lease
+    delete_state
   }
 
   wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
@@ -340,6 +369,7 @@ run_one(){ # $1=iteration index
   fi
   t_booted="$(now_epoch)"
   note "[$i] vm $job up — ensure runner version + run JIT agent (one job)"
+  write_state running
   run_guest_ps_file(){
     local remote_path="$1" script="$2" upload_enc
     upload_enc="$(printf '%s' '$ErrorActionPreference="Stop"

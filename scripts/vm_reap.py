@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safe local janitor for tartci macOS Tart runners.
+"""Safe local janitor for tartci VM runners.
 
 The janitor is intentionally conservative:
   * VM deletion requires a positive state-file ownership marker.
@@ -18,9 +18,11 @@ import json
 import os
 import pathlib
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import time
 from typing import Any
 
 
@@ -111,16 +113,25 @@ def pid_alive_same(pid_value: Any, expected_start: Any) -> bool:
     return True
 
 
-def state_files(state_dir: pathlib.Path) -> list[pathlib.Path]:
-    if not state_dir.exists():
-        return []
-    return sorted(state_dir.glob("*.state.json"))
+def state_files(state_dirs: list[pathlib.Path]) -> list[pathlib.Path]:
+    files: list[pathlib.Path] = []
+    seen: set[pathlib.Path] = set()
+    for state_dir in state_dirs:
+        if not state_dir.exists():
+            continue
+        for path in sorted(state_dir.glob("*.state.json")):
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            files.append(path)
+    return files
 
 
-def load_states(state_dir: pathlib.Path, now: dt.datetime) -> tuple[list[dict[str, Any]], list[str]]:
+def load_states(state_dirs: list[pathlib.Path], now: dt.datetime) -> tuple[list[dict[str, Any]], list[str]]:
     states: list[dict[str, Any]] = []
     problems: list[str] = []
-    for path in state_files(state_dir):
+    for path in state_files(state_dirs):
         try:
             with path.open("r", encoding="utf-8") as fh:
                 state = json.load(fh)
@@ -221,21 +232,89 @@ def unlink_state(path_text: str) -> str:
     return f"state_deleted:{path_text}"
 
 
+def split_paths(value: str | None) -> list[str]:
+    if not value:
+        return []
+    paths: list[str] = []
+    for chunk in value.replace(",", os.pathsep).split(os.pathsep):
+        chunk = chunk.strip()
+        if chunk:
+            paths.append(chunk)
+    return paths
+
+
+def state_dirs_from_args(args: argparse.Namespace) -> list[pathlib.Path]:
+    explicit = split_paths(args.state_dir)
+    if explicit:
+        return [pathlib.Path(path).expanduser() for path in explicit]
+    root = pathlib.Path(args.state_root).expanduser()
+    return [root, root / "macos", root / "linux", root / "windows"]
+
+
+def safe_owned_path(path_text: Any, runner_name: str) -> pathlib.Path | None:
+    if not isinstance(path_text, str) or not path_text.strip():
+        return None
+    path = pathlib.Path(path_text).expanduser()
+    text = str(path)
+    if text in ("", "/", str(pathlib.Path.home())):
+        return None
+    parts = set(path.parts)
+    name = path.name
+    if runner_name and (runner_name in name or runner_name in text):
+        return path
+    if "tartci-win" in parts or "tartci" in name:
+        return path
+    return None
+
+
+def remove_owned_path(path_text: Any, runner_name: str) -> str | None:
+    path = safe_owned_path(path_text, runner_name)
+    if path is None or not path.exists():
+        return None
+    if path.is_dir():
+        shutil.rmtree(path)
+        return f"path_deleted:{path}"
+    path.unlink()
+    return f"path_deleted:{path}"
+
+
+def stop_pid(pid_value: Any, expected_start: Any) -> bool:
+    try:
+        pid = int(pid_value)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or not pid_alive_same(pid, expected_start):
+        return False
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            return True
+        if sig == signal.SIGTERM:
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if not pid_alive_same(pid, expected_start):
+                    return True
+                time.sleep(0.2)
+    return not pid_alive_same(pid, expected_start)
+
+
 def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     now = utcnow()
     problems: list[str] = []
     fixed: list[str] = []
     unreadable: list[str] = []
 
-    state_dir = pathlib.Path(args.state_dir).expanduser()
+    state_dirs = state_dirs_from_args(args)
     prefixes = [p for p in args.prefixes.split(",") if p]
     protected = [p for p in args.protected_names.split(",") if p]
+    tart_providers = {"", "tart-macos", "tart-linux"}
 
     for tool in ("tart", "gh"):
         if shutil.which(tool) is None:
             unreadable.append(f"missing_tool:{tool}")
 
-    states, state_problems = load_states(state_dir, now)
+    states, state_problems = load_states(state_dirs, now)
     problems.extend(state_problems)
     states_by_vm = {
         str(state.get("vm") or ""): state
@@ -282,7 +361,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     marker_ok
                     and prefix_ok
                     and not protected_name
-                    and (state_provider in ("", "tart-macos"))
+                    and (state_provider in tart_providers)
                     and (not state_runner or starts_with_any(state_runner, prefixes))
                 )
                 age = int((state or {}).get("_age_secs") or 0)
@@ -322,6 +401,8 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     except Exception as exc:  # noqa: BLE001
                         problems.append(f"fix_failed:{action}:{name}:{exc}")
             for state in states:
+                if str(state.get("provider") or "") not in tart_providers:
+                    continue
                 state_vm = str(state.get("vm") or "")
                 path_text = str(state.get("_path") or "")
                 owner_pid_alive = bool(state.get("_owner_pid_alive"))
@@ -380,71 +461,134 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                         "state_file": path_text,
                     }
                 )
-        if not unreadable:
+    for state in states:
+        if str(state.get("provider") or "") != "qemu-windows":
+            continue
+        name = str(state.get("vm") or state.get("runner") or "")
+        runner_name = str(state.get("runner") or name)
+        prefix_ok = starts_with_any(name, prefixes) or starts_with_any(runner_name, prefixes)
+        protected_name = is_protected_name(name, protected) or is_protected_name(runner_name, protected)
+        owned = prefix_ok and not protected_name
+        owner_pid_alive = bool(state.get("_owner_pid_alive"))
+        qemu_alive = pid_alive_same(state.get("qemu_pid"), state.get("qemu_pid_started_at"))
+        age = int(state.get("_age_secs") or 0)
+        keep_failed = bool(state.get("keep_failed"))
+        action = ""
+        stale = False
+
+        if not owned:
+            if prefix_ok and protected_name:
+                problems.append(f"owned_marker_protected_name:{name}")
+        elif keep_failed and qemu_alive and age < args.keep_failed_age_secs:
+            action = "kept_failed_wait_for_operator"
+        elif qemu_alive and not owner_pid_alive and age >= args.running_age_secs:
+            stale = True
+            action = "stop_delete_qemu_vm"
+        elif not qemu_alive and not owner_pid_alive and age >= args.stopped_age_secs:
+            stale = True
+            action = "delete_qemu_workdir"
+        elif owner_pid_alive and age >= args.heartbeat_stale_secs:
+            stale = True
+            action = "suspect_live_owner_stale_qemu_heartbeat"
+            problems.append(f"suspect_live_owner_stale_qemu_heartbeat:{name}")
+
+        if args.fix and action in ("stop_delete_qemu_vm", "delete_qemu_workdir"):
             try:
-                runners = github_runners(args.repo)
+                if qemu_alive:
+                    if stop_pid(state.get("qemu_pid"), state.get("qemu_pid_started_at")):
+                        fixed.append(f"qemu_stopped:{name}:{state.get('qemu_pid')}")
+                for key in ("work_dir", "port_lock"):
+                    removed = remove_owned_path(state.get(key), runner_name)
+                    if removed:
+                        fixed.append(removed)
+                if state.get("_path"):
+                    fixed.append(unlink_state(str(state.get("_path"))))
             except Exception as exc:  # noqa: BLE001
-                unreadable.append(f"github_unreadable:{exc}")
-            else:
-                for runner in runners:
-                    name = str(runner.get("name") or "")
-                    if not starts_with_any(name, prefixes):
-                        continue
-                    state = states_by_runner.get(name)
-                    state_age = int((state or {}).get("_age_secs") or 0) if state else None
-                    state_provider = str((state or {}).get("provider") or "")
-                    owner_pid_alive = bool((state or {}).get("_owner_pid_alive")) if state else None
-                    state_file = (state or {}).get("_path")
-                    live_fresh_supervisor = (
-                        bool(state)
-                        and state_provider in ("", "tart-macos")
-                        and owner_pid_alive is True
-                        and state_age is not None
-                        and state_age < args.heartbeat_stale_secs
-                    )
-                    status = str(runner.get("status") or "")
-                    busy = bool(runner.get("busy"))
-                    action = ""
-                    stale = False
-                    if status == "offline" and not busy:
-                        if live_fresh_supervisor:
-                            action = "wait_for_live_supervisor"
-                        elif state and owner_pid_alive is True:
-                            stale = True
-                            action = "suspect_live_owner_stale_offline_runner"
-                            problems.append(f"suspect_live_owner_stale_offline_runner:{name}")
-                        else:
-                            stale = True
-                            action = "delete_offline_runner"
-                        if args.fix:
-                            if action == "delete_offline_runner":
-                                try:
-                                    fixed.append(delete_runner(args.repo, runner.get("id"), name))
-                                except Exception as exc:  # noqa: BLE001
-                                    problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
-                    elif status == "offline" and busy:
+                problems.append(f"fix_failed:{action}:{name}:{exc}")
+
+        vms.append(
+            {
+                "name": name,
+                "state": "running" if qemu_alive else "stopped",
+                "provider": "qemu-windows",
+                "owned": owned,
+                "protected": protected_name,
+                "owner_pid_alive": owner_pid_alive,
+                "qemu_pid_alive": qemu_alive,
+                "keep_failed": keep_failed,
+                "age_secs": age,
+                "stale": stale,
+                "action": action,
+                "state_file": state.get("_path"),
+                "work_dir": state.get("work_dir"),
+            }
+        )
+    if not unreadable:
+        try:
+            runners = github_runners(args.repo)
+        except Exception as exc:  # noqa: BLE001
+            unreadable.append(f"github_unreadable:{exc}")
+        else:
+            for runner in runners:
+                name = str(runner.get("name") or "")
+                if not starts_with_any(name, prefixes):
+                    continue
+                state = states_by_runner.get(name)
+                state_age = int((state or {}).get("_age_secs") or 0) if state else None
+                state_provider = str((state or {}).get("provider") or "")
+                owner_pid_alive = bool((state or {}).get("_owner_pid_alive")) if state else None
+                state_file = (state or {}).get("_path")
+                live_fresh_supervisor = (
+                    bool(state)
+                    and state_provider in tart_providers
+                    and owner_pid_alive is True
+                    and state_age is not None
+                    and state_age < args.heartbeat_stale_secs
+                )
+                status = str(runner.get("status") or "")
+                busy = bool(runner.get("busy"))
+                action = ""
+                stale = False
+                if status == "offline" and not busy:
+                    if live_fresh_supervisor:
+                        action = "wait_for_live_supervisor"
+                    elif state and owner_pid_alive is True:
                         stale = True
-                        action = "offline_busy_wait_for_github"
-                        problems.append(f"offline_busy_runner:{name}")
-                    runner["owned"] = True
-                    runner["stale"] = stale
-                    runner["action"] = action
-                    runner["heartbeat_age_secs"] = state_age
-                    runner["owner_pid_alive"] = owner_pid_alive
-                    runner["state_file"] = state_file
+                        action = "suspect_live_owner_stale_offline_runner"
+                        problems.append(f"suspect_live_owner_stale_offline_runner:{name}")
+                    else:
+                        stale = True
+                        action = "delete_offline_runner"
+                    if args.fix:
+                        if action == "delete_offline_runner":
+                            try:
+                                fixed.append(delete_runner(args.repo, runner.get("id"), name))
+                            except Exception as exc:  # noqa: BLE001
+                                problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
+                elif status == "offline" and busy:
+                    stale = True
+                    action = "offline_busy_wait_for_github"
+                    problems.append(f"offline_busy_runner:{name}")
+                runner["owned"] = True
+                runner["stale"] = stale
+                runner["action"] = action
+                runner["heartbeat_age_secs"] = state_age
+                runner["owner_pid_alive"] = owner_pid_alive
+                runner["state_file"] = state_file
 
     digest = {
         "ts": iso(now),
         "host": socket.gethostname(),
         "config": {
             "repo": args.repo,
-            "state_dir": str(state_dir),
+            "state_dirs": [str(path) for path in state_dirs],
             "prefixes": prefixes,
             "protected_names": protected,
             "fix": args.fix,
             "stopped_age_secs": args.stopped_age_secs,
             "running_age_secs": args.running_age_secs,
             "heartbeat_stale_secs": args.heartbeat_stale_secs,
+            "keep_failed_age_secs": args.keep_failed_age_secs,
         },
         "capacity": capacity,
         "supervisors": [
@@ -499,17 +643,27 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Report or safely reap tartci macOS CI residue")
+    parser = argparse.ArgumentParser(description="Report or safely reap tartci CI VM residue")
     parser.add_argument("--json", action="store_true", help="emit JSON digest")
     parser.add_argument("--fix", action="store_true", help="perform safe fixes")
     parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "danielraffel/pulp"))
-    parser.add_argument("--state-dir", default=os.environ.get("TARTCI_STATE_DIR", str(pathlib.Path.home() / ".tartci/state/macos")))
-    parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-vm-,tartci-"))
+    parser.add_argument(
+        "--state-dir",
+        default=os.environ.get("TARTCI_STATE_DIR"),
+        help="explicit state dir(s), comma or os.pathsep separated; overrides --state-root",
+    )
+    parser.add_argument(
+        "--state-root",
+        default=os.environ.get("TARTCI_STATE_ROOT", str(pathlib.Path.home() / ".tartci/state")),
+        help="root containing macos/linux/windows state dirs",
+    )
+    parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-,linux-ephr-,win-ephr-,tartci-"))
     parser.add_argument("--protected-names", default=os.environ.get("TARTCI_REAP_PROTECTED_NAMES", "pulp-vm,rosetta-probe"))
     parser.add_argument("--macos-cap", type=int, default=int(os.environ.get("TARTCI_MACOS_VM_CAP", "2")))
     parser.add_argument("--stopped-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_STOPPED_AGE_SECS", "900")))
     parser.add_argument("--running-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_RUNNING_AGE_SECS", "10800")))
     parser.add_argument("--heartbeat-stale-secs", type=int, default=int(os.environ.get("TARTCI_REAP_HEARTBEAT_STALE_SECS", "900")))
+    parser.add_argument("--keep-failed-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_KEEP_FAILED_AGE_SECS", "86400")))
     return parser.parse_args(argv)
 
 

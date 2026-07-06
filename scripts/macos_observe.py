@@ -335,7 +335,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--json", action="store_true", help="emit JSON")
     parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "danielraffel/pulp"))
     parser.add_argument("--state-dir", default=os.environ.get("TARTCI_STATE_DIR", str(pathlib.Path.home() / ".tartci/state/macos")))
-    parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-vm-,tartci-"))
+    parser.add_argument("--prefixes", default=os.environ.get("TARTCI_REAP_PREFIXES", "pulp-,linux-ephr-,win-ephr-,tartci-"))
     parser.add_argument("--protected-names", default=os.environ.get("TARTCI_REAP_PROTECTED_NAMES", "pulp-vm,rosetta-probe"))
     parser.add_argument("--macos-cap", type=int, default=int(os.environ.get("TARTCI_MACOS_VM_CAP", "2")))
     parser.add_argument("--runner", default="", help="limit to a runner name")
