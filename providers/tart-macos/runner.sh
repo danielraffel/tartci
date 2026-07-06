@@ -258,7 +258,7 @@ try:
             seen.add(run_id)
             runs.append(run)
 except Exception:
-    # A scan FAILURE (gh api timeout / rate-limit / auth degradation / network) is NOT the same as
+    # A scan FAILURE (gh-api timeout / rate-limit / auth degradation / network) is NOT the same as
     # "no queued work". Emit a distinct sentinel so the loop stays blind-AWARE and can self-restart
     # to re-establish auth, instead of silently idling as if the queue were empty — the multi-hour
     # supervisor wedge this guards against (an alive loop printing `queued=0` while jobs pile up).
