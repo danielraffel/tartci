@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+import leases
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +66,13 @@ def profile_names() -> list[str]:
     return sorted(path.stem for path in profile_dir.glob("*.toml"))
 
 
+def lease_status() -> dict[str, Any]:
+    try:
+        return leases.status_digest()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tartci status")
     parser.add_argument("--json", action="store_true", help="emit JSON")
@@ -91,8 +100,10 @@ def main(argv: list[str] | None = None) -> int:
             "tart": {"vms": tart_vms()},
             "qemu_windows": {"processes": qemu_processes()},
         },
+        "leases": lease_status(),
         "notes": [
-            "status is host-local and read-only",
+            "status is host-local and does not acquire provider capacity",
+            "lease status may take the host lease lock and reap dead-owner records",
             "fleet-aware placement should be resolved by Shipyard using all host statuses",
         ],
     }
@@ -104,6 +115,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"profiles: {', '.join(data['profiles']) or '-'}")
         qemu_count = len(data["providers"]["qemu_windows"]["processes"])
         print(f"qemu-windows processes: {qemu_count}")
+        lease_capacity = (data.get("leases") or {}).get("capacity") or {}
+        if lease_capacity:
+            print(
+                "leases: "
+                f"{lease_capacity.get('used_cores', 0)}/"
+                f"{lease_capacity.get('total_cores', '?')} cores used"
+            )
     return 0
 
 
