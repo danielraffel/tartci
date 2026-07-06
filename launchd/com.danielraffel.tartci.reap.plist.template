@@ -63,10 +63,10 @@
         <string>$HOME/VMs</string>
         <key>TARTCI_HOME</key>
         <string>$HOME/.tartci</string>
-        <key>TARTCI_STATE_DIR</key>
-        <string>$HOME/.tartci/state/macos</string>
+        <key>TARTCI_STATE_ROOT</key>
+        <string>$HOME/.tartci/state</string>
         <key>TARTCI_REAP_PREFIXES</key>
-        <string>pulp-vm-,tartci-</string>
+        <string>pulp-,linux-ephr-,win-ephr-,tartci-</string>
         <key>TARTCI_REAP_PROTECTED_NAMES</key>
         <string>pulp-vm,rosetta-probe</string>
         <key>TARTCI_RUNNER_REPO</key>

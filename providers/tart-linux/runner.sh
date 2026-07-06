@@ -65,6 +65,8 @@ prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true
 
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
+# shellcheck source=providers/common/vm-state.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
   local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" vm_name="$5" timing_path="$6" log_dir="$7"
@@ -186,11 +188,28 @@ PY
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local i="$1" vm="linux-ephr-$$-$1" jit lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir run_status=0
+  local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
+  tartci_check_disk_floor "$TART_HOME" || return $?
+  tartci_check_disk_floor "$LOGROOT" || return $?
   logdir="$LOGROOT/$vm"; mkdir -p "$logdir"
+  state_dir="$(tartci_provider_state_dir tart-linux)"
+  write_state(){
+    TARTCI_STATE_LABELS="$LABELS" \
+    TARTCI_STATE_REPO="$REPO" \
+    TARTCI_STATE_SUPERVISOR_PID="$$" \
+    TARTCI_STATE_SUPERVISOR_PID_STARTED_AT="$(tartci_pid_started_at "$$")" \
+    TARTCI_STATE_VM_IP="$ip" \
+    TARTCI_STATE_LOG_DIR="$logdir" \
+    TARTCI_STATE_QEMU_PID="$rpid" \
+    TARTCI_STATE_QEMU_PID_STARTED_AT="$(if [ -n "$rpid" ]; then tartci_pid_started_at "$rpid"; fi)" \
+    tartci_write_vm_state tart-linux "$vm" "$vm" "$1" ephemeral "$state_dir"
+  }
+  delete_state(){ tartci_delete_vm_state "$vm" "$state_dir"; }
   lease_cores="$(tartci_vm_lease_cores tart-linux)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" || return $?
+  write_state preparing
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
@@ -202,6 +221,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   if ! tart clone "$GOLDEN" "$vm"; then
     tartci_release_vm_lease
+    delete_state
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
@@ -209,33 +229,38 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
     tart delete "$vm" >/dev/null 2>&1 || true
     tartci_release_vm_lease
+    delete_state
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   mkdir -p "$CACHE_ROOT/ccache-linux"
   local boot_log; boot_log="$logdir/tart-run.log"
-  local rpid; tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  write_state booting
 
-  local ip=""
   for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last lines of \`tart run\` ($boot_log):"; tail -3 "$boot_log" >&2 2>/dev/null || true
     tart stop "$vm" >/dev/null 2>&1||true; kill "$rpid" 2>/dev/null||true; tart delete "$vm" >/dev/null 2>&1||true
     tartci_release_vm_lease
+    delete_state
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
+  write_state booted
   local sshok=0
   for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; tart delete "$vm" >/dev/null 2>&1 || true
     tartci_release_vm_lease
+    delete_state
     runtime_emit_complete fail ssh_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   t_booted="$(now_epoch)"
   note "[$i] vm $vm up at $ip — mounting ccache + launching JIT runner (one job)"
+  write_state running
 
   # Best-effort host ccache via virtio-fs (named "ccache" subdir is the rw one).
   # Then write the JIT config and run the agent once — a JIT runner processes
@@ -254,6 +279,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; sleep 2
   tart delete "$vm" >/dev/null 2>&1 || true
   tartci_release_vm_lease
+  delete_state
   t_done="$(now_epoch)"
   {
     printf 'phase\tseconds\n'

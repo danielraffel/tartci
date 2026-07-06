@@ -276,18 +276,20 @@ Release CLI proof completes. Do not share the Build and Test `pulp-build-vm`
 label with release jobs.
 
 ### Reap stale CI residue
-`tartci doctor --reap --json` is the report-only Tier-2 janitor for macOS Tart
-CI hosts. It emits capacity, supervisor heartbeat, VM, GitHub runner, problem,
-and fixed-action fields with exit codes suitable for launchd/cron (`0`
+`tartci doctor --reap --json` is the report-only Tier-2 janitor for tartci VM
+CI hosts. It emits capacity, supervisor heartbeat, VM/overlay, GitHub runner,
+problem, and fixed-action fields with exit codes suitable for launchd/cron (`0`
 healthy/fixed, `1` stale or wedged, `2` unreadable). Add `--fix` only after a
-clean report: VM deletion requires an allowed CI prefix plus a tartci state-file
-ownership marker, and goldens/bench names/`pulp-vm`/`rosetta-probe` stay
-protected. Offline GitHub runner registrations are reaped only when their names
-match an owned CI prefix and no fresh live supervisor heartbeat backs them. See
-`launchd/com.danielraffel.tartci.reap.plist.template` for the periodic
-host-local LaunchAgent shape. macOS runner heartbeats replace their state files
-atomically so `doctor`, `observe`, and fleet-level probes never need to infer
-health from a partially written JSON file.
+clean report: VM or overlay deletion requires an allowed CI prefix plus a tartci
+state-file ownership marker, and goldens/bench names/`pulp-vm`/`rosetta-probe`
+stay protected. Offline GitHub runner registrations are reaped only when their
+names match an owned CI prefix and no fresh live supervisor heartbeat backs
+them. See `launchd/com.danielraffel.tartci.reap.plist.template` for the
+periodic host-local LaunchAgent shape. macOS/Linux Tart and Windows QEMU runner
+heartbeats replace their state files atomically so `doctor`, `observe`, and
+fleet-level probes never need to infer health from a partially written JSON
+file. `KEEP_FAILED=1` Windows inspection VMs are left alone for the configured
+keep-failed window before becoming reap candidates.
 
 ### Observe a live macOS runner
 `tartci observe macos` is the read-only operator view for macOS VM jobs. It
