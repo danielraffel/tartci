@@ -11,12 +11,15 @@
 #
 # Usage:
 #   tartci goldens list [--os windows]
-#   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]
-#                       [--no-reload] [--via IP]
+#   tartci goldens sync --to HOST   [opts]   # PUSH this host's canonical golden → HOST
+#   tartci goldens sync --from HOST [opts]   # PULL HOST's canonical golden → this host (new-machine setup)
+#     opts: [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]
 #
 # HOST is an ssh alias. The fastest link is auto-detected: a Thunderbolt
 # link-local peer (169.254.x on bridge0) that identifies as HOST is preferred,
 # else it falls back to whatever the ssh alias resolves to (LAN/Tailscale).
+# To seed a brand-new host, run `--from` on it once tartci is deployed; if no
+# peer has the golden yet, bake one from scratch (docs/runbook.md §4).
 set -euo pipefail
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*"; }
@@ -107,75 +110,35 @@ cmd_list(){
   done
 }
 
-cmd_sync(){
-  local HOST="" PRUNE=0 DRY=0 RELOAD=1 VIA=""
-  while [ $# -gt 0 ]; do case "$1" in
-    --to) HOST="$2"; shift 2;;
-    --os) OS="$2"; shift 2;;
-    --prune) PRUNE=1; shift;;
-    --dry-run) DRY=1; shift;;
-    --no-reload) RELOAD=0; shift;;
-    --via) VIA="$2"; shift 2;;
-    *) die "unknown arg: $1";;
-  esac; done
-  [ -n "$HOST" ] || die "usage: tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]"
-
-  local golden name; golden="$(canonical_local)"
-  [ -n "$golden" ] || die "no $OS golden found in $GOLDENS"
-  name="$(basename "$golden")"
-  ensure_sha "$golden"
-  ok "canonical: $name ($(du -h "$golden" | cut -f1))"
-
-  # remote goldens dir (read the target's own TARTCI_GOLDENS, don't assume)
-  local rgoldens
-  rgoldens="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "$HOST" '
+# Read a host's own $TARTCI_GOLDENS (from its runner plist; don't assume the path).
+remote_goldens_dir(){ # $1=host
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" '
     /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:TARTCI_GOLDENS" \
       ~/Library/LaunchAgents/'"$WIN_RUNNER_LABEL"'.plist 2>/dev/null \
-      || echo "${TARTCI_GOLDENS:-$HOME/.tartci/goldens}"' 2>/dev/null)"
-  [ -n "$rgoldens" ] || die "could not resolve remote TARTCI_GOLDENS on $HOST"
-  note "remote \$TARTCI_GOLDENS on $HOST = $rgoldens"
+      || echo "${TARTCI_GOLDENS:-$HOME/.tartci/goldens}"' 2>/dev/null
+}
 
-  local dest; dest="$(resolve_link "$HOST" "$VIA")"
-  local rsh; rsh="$(_rsh "$HOST" "$dest")"
-  local pfx; pfx="$(_dest_prefix "$HOST" "$dest")"
-  note "link: $LINK  →  $pfx"
-
-  local flags="-a --partial --progress"
-  [ "$DRY" = 1 ] && flags="$flags -n"
-  note "rsync $name (+sha256) → $HOST:$rgoldens"
-  # shellcheck disable=SC2086
-  rsync $flags -e "$rsh" "$golden" "$golden.sha256" "$pfx:$rgoldens/" \
-    || die "rsync failed"
-  if [ "$DRY" = 1 ]; then note "dry-run — stopping before verify/reload/prune"; return 0; fi
-
-  note "verifying sha256 on $HOST"
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
-    "cd '$rgoldens' && shasum -a 256 -c '$name.sha256'" \
-    || die "sha256 verify FAILED on $HOST — not repointing"
-  ok "verified on $HOST"
-
-  # repoint an explicit pin if present (a host with no pin uses the provider default)
-  # NB: pass $OS (a bare word), NOT the golden glob — ssh concatenates args into
-  # one string that the remote LOGIN shell (zsh) re-parses, and it would
-  # glob-expand a literal '*' and abort `bash -s` on nomatch. Build the glob
-  # remotely inside bash instead.
-  ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" bash -s -- "$rgoldens" "$name" "$WIN_RUNNER_LABEL" "$RELOAD" "$PRUNE" "$OS" <<'REMOTE' || die "remote repoint/reload on $HOST failed"
+# The repoint + idle-only reload + guarded prune, applied on whichever host runs
+# it — piped to `ssh HOST bash -s` for --to (remote) or `bash -s` for --from
+# (local). Single source of truth so push and pull can't drift. Positional args:
+#   <goldens_dir> <name> <label> <reload:0|1> <prune:0|1> <os>
+_apply_snippet(){ cat <<'SNIP'
 set -euo pipefail
-rgoldens="$1"; name="$2"; label="$3"; reload="$4"; prune="$5"; os="$6"
+gd="$1"; name="$2"; label="$3"; reload="$4"; prune="$5"; os="$6"
 case "$os" in windows) glob="pulp-windows-build-*.qcow2" ;; *) glob="pulp-$os-build-*.qcow2" ;; esac
 plist="$HOME/Library/LaunchAgents/$label.plist"
 note(){ printf '  • %s\n' "$*"; }
 if [ -f "$plist" ] && /usr/libexec/PlistBuddy -c "Print :EnvironmentVariables:TARTCI_WIN_GOLDEN" "$plist" >/dev/null 2>&1; then
   cp "$plist" "$plist.bak.$(date +%Y%m%d-%H%M%S)"
-  /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:TARTCI_WIN_GOLDEN $rgoldens/$name" "$plist"
+  /usr/libexec/PlistBuddy -c "Set :EnvironmentVariables:TARTCI_WIN_GOLDEN $gd/$name" "$plist"
   note "repointed pin → $name"
 else
   note "no explicit pin — provider default resolves to the canonical name"
 fi
-# Reload only when idle (never mid-job — that kills the running build). When we
-# repointed the pin we changed plist env, and `launchctl kickstart -k` does NOT
-# re-read plist EnvironmentVariables — only a full bootout+bootstrap does. Prefer
-# tartci's own launchd reloader, which handles the bootout/bootstrap race.
+# Reload only when idle (never mid-job — that kills the running build). Repointing
+# the pin changed plist env, and `launchctl kickstart -k` does NOT re-read plist
+# EnvironmentVariables — only a full bootout+bootstrap does. Prefer tartci's own
+# launchd reloader, which handles the bootout/bootstrap race.
 if [ "$reload" = 1 ]; then
   log="$HOME/Library/Logs/tartci/${label##*.}.log"
   if tail -1 "$log" 2>/dev/null | grep -q 'waiting'; then
@@ -196,8 +159,8 @@ if [ "$reload" = 1 ]; then
 fi
 # guarded prune: remove older goldens, never one a live VM is backed by
 if [ "$prune" = 1 ]; then
-  cd "$rgoldens"
-  # shellcheck disable=SC2086
+  cd "$gd"
+  # shellcheck disable=SC2010,SC2086
   ls -t $glob 2>/dev/null | grep -v '\.sha256$' | tail -n +2 | while read -r old; do
     if ps aux | grep -i qemu-system | grep -v grep | grep -qF "$old"; then
       note "KEEP $old (a running VM is backed by it)"
@@ -206,8 +169,95 @@ if [ "$prune" = 1 ]; then
     fi
   done
 fi
-REMOTE
-  ok "$HOST synced to $name"
+SNIP
+}
+
+# Emits bash (piped to `ssh HOST bash -s -- <os> <goldens_dir>`) that echoes the
+# host's newest golden filename for OS, ensuring its .sha256 sidecar exists, or
+# "__NONE__". Glob is built inside the remote bash so the login shell can't
+# glob-expand a literal '*'. Piped (not a heredoc-in-$()) to keep bash's command-
+# substitution parser away from the ')' chars in the body.
+_remote_canonical_query(){ cat <<'SNIP'
+set -euo pipefail
+os="$1"; gd="$2"
+case "$os" in windows) g="pulp-windows-build-*.qcow2" ;; *) g="pulp-$os-build-*.qcow2" ;; esac
+# shellcheck disable=SC2010,SC2086
+newest="$(cd "$gd" 2>/dev/null && ls -t $g 2>/dev/null | grep -v '\.sha256$' | head -1 || true)"
+[ -n "$newest" ] || { echo "__NONE__"; exit 0; }
+[ -f "$gd/$newest.sha256" ] || ( cd "$gd" && shasum -a 256 "$newest" > "$newest.sha256" )
+echo "$newest"
+SNIP
+}
+
+cmd_sync(){
+  local TO="" FROM="" PRUNE=0 DRY=0 RELOAD=1 VIA=""
+  while [ $# -gt 0 ]; do case "$1" in
+    --to) TO="$2"; shift 2;;
+    --from) FROM="$2"; shift 2;;
+    --os) OS="$2"; shift 2;;
+    --prune) PRUNE=1; shift;;
+    --dry-run) DRY=1; shift;;
+    --no-reload) RELOAD=0; shift;;
+    --via) VIA="$2"; shift 2;;
+    *) die "unknown arg: $1";;
+  esac; done
+  [ -n "$TO" ] || [ -n "$FROM" ] || die "usage: tartci goldens sync (--to HOST | --from HOST) [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]"
+  [ -n "$TO" ] && [ -n "$FROM" ] && die "--to and --from are mutually exclusive"
+
+  local HOST flags="-a --partial --progress"
+  [ "$DRY" = 1 ] && flags="$flags -n"
+
+  if [ -n "$TO" ]; then
+    ##### PUSH: this host's canonical golden → HOST #####
+    HOST="$TO"
+    local golden name; golden="$(canonical_local)"
+    [ -n "$golden" ] || die "no $OS golden found locally in $GOLDENS"
+    name="$(basename "$golden")"; ensure_sha "$golden"
+    ok "local canonical: $name ($(du -h "$golden" | cut -f1))"
+    local rgoldens; rgoldens="$(remote_goldens_dir "$HOST")"
+    [ -n "$rgoldens" ] || die "could not resolve remote TARTCI_GOLDENS on $HOST"
+    note "remote \$TARTCI_GOLDENS on $HOST = $rgoldens"
+    local dest rsh pfx
+    dest="$(resolve_link "$HOST" "$VIA")"; rsh="$(_rsh "$HOST" "$dest")"; pfx="$(_dest_prefix "$HOST" "$dest")"
+    note "link: $LINK  →  $pfx"
+    note "rsync $name (+sha256) → $HOST:$rgoldens"
+    # shellcheck disable=SC2086
+    rsync $flags -e "$rsh" "$golden" "$golden.sha256" "$pfx:$rgoldens/" || die "rsync failed"
+    if [ "$DRY" = 1 ]; then note "dry-run — stopping before verify/reload/prune"; return 0; fi
+    note "verifying sha256 on $HOST"
+    ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" "cd '$rgoldens' && shasum -a 256 -c '$name.sha256'" \
+      || die "sha256 verify FAILED on $HOST — not repointing"
+    ok "verified on $HOST"
+    _apply_snippet | ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" bash -s -- \
+      "$rgoldens" "$name" "$WIN_RUNNER_LABEL" "$RELOAD" "$PRUNE" "$OS" \
+      || die "remote repoint/reload on $HOST failed"
+    ok "$HOST synced to $name"
+  else
+    ##### PULL: HOST's canonical golden → this host (new-machine setup) #####
+    HOST="$FROM"
+    local rgoldens; rgoldens="$(remote_goldens_dir "$HOST")"
+    [ -n "$rgoldens" ] || die "could not resolve remote TARTCI_GOLDENS on $HOST"
+    # remote canonical NAME + ensure its .sha256 exists (glob built inside remote
+    # bash so the login shell can't glob-expand a literal '*').
+    local rname
+    rname="$(_remote_canonical_query | ssh -o BatchMode=yes -o ConnectTimeout=10 "$HOST" bash -s -- "$OS" "$rgoldens")"
+    [ -n "$rname" ] && [ "$rname" != "__NONE__" ] || die "$HOST has no $OS golden in $rgoldens (bake one first — docs/runbook.md §4)"
+    ok "$HOST canonical: $rname"
+    note "local \$TARTCI_GOLDENS = $GOLDENS"; mkdir -p "$GOLDENS"
+    local dest rsh pfx
+    dest="$(resolve_link "$HOST" "$VIA")"; rsh="$(_rsh "$HOST" "$dest")"; pfx="$(_dest_prefix "$HOST" "$dest")"
+    note "link: $LINK  ←  $pfx"
+    note "rsync $rname (+sha256) ← $HOST:$rgoldens"
+    # shellcheck disable=SC2086
+    rsync $flags -e "$rsh" "$pfx:$rgoldens/$rname" "$pfx:$rgoldens/$rname.sha256" "$GOLDENS/" || die "rsync failed"
+    if [ "$DRY" = 1 ]; then note "dry-run — stopping before verify/reload/prune"; return 0; fi
+    note "verifying sha256 locally"
+    ( cd "$GOLDENS" && shasum -a 256 -c "$rname.sha256" ) || die "sha256 verify FAILED locally — not repointing"
+    ok "verified locally"
+    _apply_snippet | bash -s -- "$GOLDENS" "$rname" "$WIN_RUNNER_LABEL" "$RELOAD" "$PRUNE" "$OS" \
+      || die "local repoint/reload failed"
+    ok "this host synced to $rname"
+  fi
 }
 
 sub="${1:-}"; shift || true

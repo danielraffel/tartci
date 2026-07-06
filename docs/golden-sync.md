@@ -93,8 +93,15 @@ Implemented in `scripts/goldens.sh`, wired into the dispatcher:
 
 ```
 tartci goldens list                                    # canonical golden + drift / prune candidates
-tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]
+tartci goldens sync --to HOST   [opts]                 # PUSH this host's canonical golden → HOST
+tartci goldens sync --from HOST [opts]                 # PULL HOST's canonical golden → this host (new-machine setup)
+#   opts: [--os windows] [--prune] [--dry-run] [--no-reload] [--via IP]
 ```
+
+**Seeding a new host** — the common case is you're *on* the fresh machine and a
+peer already has the golden: deploy tartci, then `tartci goldens sync --from
+<peer>`. `--to` is the mirror (push from a host that has it). If no host has the
+golden yet, bake one from scratch (runbook §4), then the rest copy via `--from`.
 
 `sync`:
 1. **Discovers the fastest link** to HOST — probes a Thunderbolt link-local peer

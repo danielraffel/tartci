@@ -67,10 +67,16 @@ class GoldensCli(unittest.TestCase):
         r = run(["list"], self.dir)
         self.assertIn("sha256 sidecar present", r.stdout)
 
-    def test_sync_requires_to(self):
+    def test_sync_requires_a_direction(self):
         r = run(["sync"], self.dir)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("--to HOST", r.stdout + r.stderr)
+        self.assertIn("--from HOST", r.stdout + r.stderr)
+
+    def test_sync_to_and_from_are_mutually_exclusive(self):
+        r = run(["sync", "--to", "a", "--from", "b"], self.dir)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mutually exclusive", r.stdout + r.stderr)
 
     def test_unknown_os_is_rejected(self):
         r = run(["list", "--os", "macos"], self.dir)
