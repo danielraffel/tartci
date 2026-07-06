@@ -102,6 +102,15 @@ check(v == "healthy", f"alive + fresh log must be healthy, got {v}")
 v, _ = wd.classify("running", 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
 check(v == "wedged", f"exit0 + stale log + no VM must be wedged, got {v}")
 
+# NOT-loaded (deliberately stopped / staged-but-unloaded) → state is None → NEVER resurrect, even
+# with a stale log and no VM. The alive-but-frozen signature is gated on state == "running".
+v, _ = wd.classify(None, None, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
+check(v == "healthy", f"unloaded agent (state None) must be healthy, not resurrected, got {v}")
+
+# Same for a stopped agent that last exited 0 while unloaded.
+v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
+check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
+
 
 # ── rate limiter ─────────────────────────────────────────────────────────────
 NOW = 1_000_000.0

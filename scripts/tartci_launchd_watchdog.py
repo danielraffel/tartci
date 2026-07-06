@@ -17,9 +17,15 @@ silently took a required CI gate offline for ~2 weeks.
 
 No amount of in-script logging can catch this class (the script never runs), so
 the recovery has to live OUTSIDE the wedged agent: this watchdog, on its own
-`StartInterval` LaunchAgent, detects the signature (exited non-zero AND its log
-has gone stale) and runs the one thing that heals it — bootout+bootstrap. It is
-rate-limited so a genuinely-broken plist logs loudly instead of thrashing.
+`StartInterval` LaunchAgent, detects two wedge signatures and runs the one thing
+that heals them — bootout+bootstrap:
+  1. Invisible crash-loop — exited non-zero AND its log has gone stale.
+  2. Alive-but-frozen — the process is UP (state=running) but its log has gone
+     stale AND no VM is building (a hung `tart`/frozen run_one the in-supervisor
+     self-heal can't catch). Gated on state=running + no running VM so a
+     deliberately-stopped agent is never resurrected and a legit long build
+     (which blocks the loop quietly) is never falsely healed.
+It is rate-limited so a genuinely-broken plist logs loudly instead of thrashing.
 
 Modes
 -----
@@ -56,9 +62,11 @@ TARTCI_LABEL_PREFIXES = (
 # The watchdog never heals itself (avoid a watchdog reload storm).
 SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 
-# A stale log older than this (seconds) alongside a non-zero exit is the wedge
-# signature: a healthy serve loop writes a "waiting" line every ~10-20s, so its
-# log is never this old.
+# A stale log older than this (seconds) is the shared staleness input to both wedge
+# signatures (non-zero-exit crash-loop, and alive-but-frozen): a healthy serve loop
+# writes a "waiting"/"SCAN BLIND" line every poll (~10-20s), so its log is never this
+# old. During a legit build the log DOES go this stale (run_one is quiet until the job
+# ends), which is why the alive-but-frozen signature also requires no running VM.
 DEFAULT_STALE_LOG_S = 1800  # 30 min
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
@@ -124,9 +132,14 @@ def classify(
        The `vm_running` guard is load-bearing: a legit long build blocks the loop
        quietly for up to hours, so we only call it frozen when NO VM is running."""
     if last_exit_code is None or last_exit_code == 0:
-        # Alive / cleanly-restarting. Only the alive-but-frozen signature applies:
-        # a stale log with NO VM building means the loop is stuck, not idle.
-        if not vm_running and log_age_s is not None and log_age_s > stale_log_s:
+        # Alive / cleanly-restarting. The alive-but-frozen signature applies ONLY when the process is
+        # genuinely UP: state == "running". A frozen run_one still reports "running" (the process is
+        # up, just stuck), so that's the case we want. A None/absent state means the agent is NOT
+        # loaded — deliberately stopped (pool-off) or a staged-but-unloaded plist — and must never be
+        # resurrected; `launchctl print` returns rc!=0 for those, which gather_health maps to
+        # state=None. So `state == "running"` is the load-bearing guard against reviving a stopped host.
+        if (state == "running" and not vm_running
+                and log_age_s is not None and log_age_s > stale_log_s):
             return ("wedged",
                     f"alive but frozen: log stale {int(log_age_s)}s (> {stale_log_s}s) "
                     "and no VM building")
