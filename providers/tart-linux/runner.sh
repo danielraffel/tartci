@@ -28,6 +28,11 @@
 #   providers/tart-linux/runner.sh --loop          # keep serving jobs (LaunchAgent uses this)
 #   providers/tart-linux/runner.sh --labels self-hosted,Linux,ARM64,pulp-build
 set -euo pipefail
+# Scan-blindness self-heal: `queued_work` prints the queued COUNT on a successful gh scan
+# (`0` = genuinely idle) or `ERR` when the scan FAILS (rate-limit/timeout/degraded token),
+# so a failed poll is never misread as an empty queue. After ~TARTCI_SCAN_BLIND_MAX polls
+# (~3 min) of continuous blindness the loop self-restarts (exit 75 → launchd KeepAlive →
+# fresh auth). See the README 'Scan-blindness self-heal' section.
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
@@ -49,7 +54,7 @@ MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MA
 # defaults still route Linux to GitHub-hosted ubuntu-latest.
 QUEUE_MATCH_LABELS="${TARTCI_RUNNER_QUEUE_MATCH_LABELS:-${PULP_RUNNER_QUEUE_MATCH_LABELS:-1}}"
 LOOP=0
-POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"
+POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -103,7 +108,7 @@ case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=21600;; es
 # Count fresh queued jobs whose labels this runner can satisfy. 0 on any gh
 # failure, treating a flaky API as "no work" so it does not spin VMs.
 queued_work(){
-  python3 - "$REPO" "$WORKFLOW_NAME" "$MAX_QUEUED_AGE_SECONDS" "$LABELS" "$QUEUE_MATCH_LABELS" <<'PY' 2>/dev/null || echo 0
+  python3 - "$REPO" "$WORKFLOW_NAME" "$MAX_QUEUED_AGE_SECONDS" "$LABELS" "$QUEUE_MATCH_LABELS" <<'PY' 2>/dev/null || echo ERR   # ERR (not 0) on gh-scan failure: blind != empty
 import datetime as dt
 import json
 import subprocess
@@ -121,7 +126,14 @@ now = dt.datetime.now(dt.timezone.utc)
 def gh(path):
     import os
     cli = os.environ.get("TARTCI_GH_CLI") or "gh"
-    return json.loads(subprocess.check_output([cli, "api", path], text=True))
+    try:
+        timeout = max(1, int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
+    except ValueError:
+        timeout = 15
+    # timeout is load-bearing for the scan-blindness self-heal: a HUNG gh (stalled TLS / half-open
+    # socket) would otherwise block queued_work forever, so the loop never returns to increment
+    # `blind` and never self-restarts. A timeout kills the child and raises → non-zero exit → `echo ERR`.
+    return json.loads(subprocess.check_output([cli, "api", path], text=True, timeout=timeout))
 
 def is_fresh(created_at):
     if max_age <= 0:
@@ -242,8 +254,24 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
 i=0
 if [ "$LOOP" = 1 ]; then
   note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
+  # Scan-blindness self-heal: `queued_work` prints ERR when the gh queue scan fails; treating
+  # that as 0 silently idles the supervisor while jobs pile up. Count consecutive blind polls
+  # and self-restart after a sustained window so launchd (KeepAlive) respawns with fresh gh
+  # auth (the loop is idle at the top — run_one blocks — so nothing in flight is lost).
+  blind=0
+  BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   while true; do
     q="$(queued_work)"
+    if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      blind=$((blind + 1))
+      note "SCAN BLIND (gh queue scan failed) ${blind}/${BLIND_MAX} — NOT idling as empty"
+      if [ "$blind" -ge "$BLIND_MAX" ]; then
+        note "SCAN BLIND ~$((blind * POLL))s — self-restarting for fresh gh auth (launchd KeepAlive respawns)"
+        exit 75
+      fi
+      sleep "$POLL"; continue
+    fi
+    blind=0
     if [ "${q:-0}" -gt 0 ]; then
       i=$((i+1)); note "[$i] queued=$q → booting ephemeral Linux VM"; run_one "$i" || true
     else

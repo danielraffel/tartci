@@ -22,6 +22,11 @@
 #   providers/qemu-windows/runner.sh --loop          # keep serving (LaunchAgent uses this)
 #   providers/qemu-windows/runner.sh --labels self-hosted,Windows,ARM64,pulp-build
 set -euo pipefail
+# Scan-blindness self-heal: `queued_work` prints the queued COUNT on a successful gh scan
+# (`0` = genuinely idle) or `ERR` when the scan FAILS (rate-limit/timeout/degraded token),
+# so a failed poll is never misread as an empty queue. After ~TARTCI_SCAN_BLIND_MAX polls
+# (~3 min) of continuous blindness the loop self-restarts (exit 75 → launchd KeepAlive →
+# fresh auth). See the README 'Scan-blindness self-heal' section.
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
@@ -47,7 +52,7 @@ KEEP_FAILED="${TARTCI_KEEP_FAILED:-${PULP_KEEP_FAILED:-0}}"
 # satisfied by this runner's labels. This keeps the supervisor safe while repo
 # defaults still route Windows to GitHub-hosted `windows-latest`.
 QUEUE_MATCH_LABELS="${TARTCI_RUNNER_QUEUE_MATCH_LABELS:-${PULP_RUNNER_QUEUE_MATCH_LABELS:-1}}"
-LOOP=0; POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"
+LOOP=0; POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-${PULP_RUNNER_IDLE_TIMEOUT_SECS:-900}}"
 HOST_SLUG="$(hostname -s 2>/dev/null || hostname)"
 HOST_SLUG="$(printf '%s' "$HOST_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
@@ -175,7 +180,7 @@ delete_runner_registration(){
 }
 
 queued_work(){
-  python3 - "$REPO" "$WORKFLOW_NAME" "$MAX_QUEUED_AGE_SECONDS" "$LABELS" "$QUEUE_MATCH_LABELS" <<'PY' 2>/dev/null || echo 0
+  python3 - "$REPO" "$WORKFLOW_NAME" "$MAX_QUEUED_AGE_SECONDS" "$LABELS" "$QUEUE_MATCH_LABELS" <<'PY' 2>/dev/null || echo ERR   # ERR (not 0) on gh-scan failure: blind != empty
 import datetime as dt
 import json
 import subprocess
@@ -193,7 +198,14 @@ now = dt.datetime.now(dt.timezone.utc)
 def gh(path):
     import os
     cli = os.environ.get("TARTCI_GH_CLI") or "gh"
-    return json.loads(subprocess.check_output([cli, "api", path], text=True))
+    try:
+        timeout = max(1, int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
+    except ValueError:
+        timeout = 15
+    # timeout is load-bearing for the scan-blindness self-heal: a HUNG gh (stalled TLS / half-open
+    # socket) would otherwise block queued_work forever, so the loop never returns to increment
+    # `blind` and never self-restarts. A timeout kills the child and raises → non-zero exit → `echo ERR`.
+    return json.loads(subprocess.check_output([cli, "api", path], text=True, timeout=timeout))
 
 def is_fresh(created_at):
     if max_age <= 0:
@@ -575,8 +587,24 @@ if (Test-Path $diagDir) {
 i=0
 if [ "$LOOP" = 1 ]; then
   note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
+  # Scan-blindness self-heal: `queued_work` prints ERR when the gh queue scan fails; treating
+  # that as 0 silently idles the supervisor while jobs pile up. Count consecutive blind polls
+  # and self-restart after a sustained window so launchd (KeepAlive) respawns with fresh gh
+  # auth (the loop is idle at the top — run_one blocks — so nothing in flight is lost).
+  blind=0
+  BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   while true; do
     q="$(queued_work)"
+    if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      blind=$((blind + 1))
+      note "SCAN BLIND (gh queue scan failed) ${blind}/${BLIND_MAX} — NOT idling as empty"
+      if [ "$blind" -ge "$BLIND_MAX" ]; then
+        note "SCAN BLIND ~$((blind * POLL))s — self-restarting for fresh gh auth (launchd KeepAlive respawns)"
+        exit 75
+      fi
+      sleep "$POLL"; continue
+    fi
+    blind=0
     if [ "${q:-0}" -gt 0 ]; then
       i=$((i+1)); note "[$i] queued=$q → booting ephemeral Windows VM"; run_one "$i" || true
     else
