@@ -62,6 +62,9 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
+
+# shellcheck source=providers/common/vm-lease.lib.sh
+source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
   local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" vm_name="$5" timing_path="$6" log_dir="$7"
@@ -181,20 +184,34 @@ PY
 }
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
-  local i="$1" vm="linux-ephr-$$-$1" jit
+  local i="$1" vm="linux-ephr-$$-$1" jit lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir run_status=0
   t_start="$(now_epoch)"
   logdir="$LOGROOT/$vm"; mkdir -p "$logdir"
+  lease_cores="$(tartci_vm_lease_cores tart-linux)"
+  lease_priority="$(tartci_vm_lease_priority "$LABELS")"
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" || return $?
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || die "JIT config mint failed (need repo admin)"
-  [ -n "$jit" ] || die "empty JIT config"
+        --jq '.encoded_jit_config')" || { tartci_release_vm_lease; die "JIT config mint failed (need repo admin)"; }
+  [ -n "$jit" ] || { tartci_release_vm_lease; die "empty JIT config"; }
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
-  tart clone "$GOLDEN" "$vm"
+  if ! tart clone "$GOLDEN" "$vm"; then
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
+    return 1
+  fi
+  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
+    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+    tart delete "$vm" >/dev/null 2>&1 || true
+    tartci_release_vm_lease
+    runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
+    return 1
+  fi
   mkdir -p "$CACHE_ROOT/ccache-linux"
   local boot_log; boot_log="$logdir/tart-run.log"
   local rpid; tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
@@ -204,14 +221,16 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last lines of \`tart run\` ($boot_log):"; tail -3 "$boot_log" >&2 2>/dev/null || true
     tart stop "$vm" >/dev/null 2>&1||true; kill "$rpid" 2>/dev/null||true; tart delete "$vm" >/dev/null 2>&1||true
+    tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
-    die "[$i] no IP (see \`tart run\` output above)"
+    return 1
   fi
   local sshok=0
   for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; tart delete "$vm" >/dev/null 2>&1 || true
+    tartci_release_vm_lease
     runtime_emit_complete fail ssh_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
@@ -234,6 +253,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] discarding ephemeral VM $vm"
   tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; sleep 2
   tart delete "$vm" >/dev/null 2>&1 || true
+  tartci_release_vm_lease
   t_done="$(now_epoch)"
   {
     printf 'phase\tseconds\n'
@@ -273,7 +293,7 @@ if [ "$LOOP" = 1 ]; then
     fi
     blind=0
     if [ "${q:-0}" -gt 0 ]; then
-      i=$((i+1)); note "[$i] queued=$q → booting ephemeral Linux VM"; run_one "$i" || true
+      i=$((i+1)); note "[$i] queued=$q → booting ephemeral Linux VM"; run_one "$i" || sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q — no '$WORKFLOW_NAME' work)"; sleep "$POLL"
     fi

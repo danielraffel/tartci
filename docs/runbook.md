@@ -836,6 +836,15 @@ the workflow selector shared and make the runner name unique by adding an extra
 host-specific label after the shared `pulp-build-*` pool label or by passing a
 unique `--name-prefix` in the installed plist.
 
+VM runners participate in the host-core lease store by default. Set
+`TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or `TARTCI_WIN_VM_CORES` when a
+host needs a provider-specific lease size; otherwise the host profile's
+`vm_pool_cores` value is used. The macOS hard cap remains a separate <=2 guest
+semaphore and fails closed: if `tart list` is unavailable or malformed, the
+macOS serve loop treats the cap as already full and waits. Disable the lease
+consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
+debugging.
+
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
 file**, never on the outer ssh command line (cmd.exe's 8191-char limit blows

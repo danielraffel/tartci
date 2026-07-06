@@ -319,7 +319,7 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
     return {
         "schema": 1,
         "store_dir": str(store_dir),
-        "mode": "no mitigation yet",
+        "mode": "provider VM runners acquire host-core leases when enabled",
         "capacity": usage(active, cfg),
         "leases": sort_records(active),
         "reaped": reaped_summary(reaped),
