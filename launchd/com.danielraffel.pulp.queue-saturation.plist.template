@@ -1,0 +1,86 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the GitHub-hosted queue-saturation detector.
+
+  Runs scripts/gh_queue_saturation.py periodically to catch the failure where
+  the required self-hosted gate sits idle because its GitHub-hosted routing
+  preamble is starved behind a saturated shared pool (the required check reads
+  `pending` with the runners online and idle). See
+  planning/2026-07-06-ci-queue-saturation-watchdog.md in the pulp repo.
+
+  WHY ON THE MAC, NOT A GITHUB WORKFLOW: a scheduled workflow on ubuntu-latest
+  would queue behind the very saturation it is meant to report — silent exactly
+  when needed. This launchd agent runs on the always-on Mac, immune to the
+  GitHub-hosted queue by construction. Same reason the shipyard queue-tick lives
+  here.
+
+  SAFETY: dry-run first, most-reversible first.
+    1. DRY-RUN (PULP_SAT_APPLY=0) — logs the verdict only; observe the log to
+       confirm the triad has no false positives over a week.
+    2. LIVE (PULP_SAT_APPLY=1)    — also opens/updates a single tracking issue
+       when saturation is detected. Enable only once the dry-run log has baked.
+  The detector never merges, cancels, or reroutes anything; its job is to
+  SIGNAL. The structural cure (flip PULP_PREAMBLE_RUNS_ON_JSON in the pulp repo)
+  stays an operator decision.
+
+  Install shape (run on one always-on host — e.g. m5):
+
+    mkdir -p "$HOME/Library/Logs"
+    sed -e "s|\$HOME|$HOME|g" \
+      launchd/com.danielraffel.pulp.queue-saturation.plist.template \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
+
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
+    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
+
+  To arm live issue-opening after observing the dry-run log, change
+  PULP_SAT_APPLY below to 1 and re-run the bootstrap/kickstart.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.pulp.queue-saturation</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>$HOME/.local/share/tartci/scripts/gh_queue_saturation.py</string>
+        <string>--status</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/pulp-queue-saturation.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/pulp-queue-saturation.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PULP_SAT_REPO</key>
+        <string>danielraffel/pulp</string>
+        <key>PULP_SAT_APPLY</key>
+        <string>0</string>
+        <key>PULP_SAT_QUEUE_TRIP</key>
+        <string>50</string>
+        <key>PULP_SAT_GRACE_SECS</key>
+        <string>900</string>
+        <key>PULP_SAT_REQUIRED_LABELS</key>
+        <string>self-hosted,macOS</string>
+    </dict>
+</dict>
+</plist>

@@ -116,6 +116,33 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
 ```
 
+## GitHub-hosted queue-saturation detector
+
+`com.danielraffel.pulp.queue-saturation.plist.template` runs
+`scripts/gh_queue_saturation.py` on a `StartInterval` (default 300s) to catch the
+inverse of a wedge: the required self-hosted gate sits **online and idle** while
+its GitHub-hosted routing preamble is starved behind a saturated shared pool, so
+the required check reads `pending` for reasons that have nothing to do with the
+code or the runners. A runner-health check sees green runners and reports "fine";
+this detector sees the triad — deep repo-wide queue **and** an idle required-gate
+runner **and** a required check pending past a grace window — and says
+"GitHub-hosted starvation." It runs here, on the always-on Mac, precisely because
+a scheduled workflow on `ubuntu-latest` would queue behind the saturation it is
+meant to report. Dry-run by default (`PULP_SAT_APPLY=0`, logs the verdict); set
+`PULP_SAT_APPLY=1` to open/update a single tracking issue once the log has baked.
+Decision logic is covered hermetically by `scripts/test_gh_queue_saturation.py`
+(no network, no `gh`, no clock). Design:
+`planning/2026-07-06-ci-queue-saturation-watchdog.md` in the pulp repo. Install:
+
+```
+mkdir -p "$HOME/Library/Logs"
+sed -e "s|\$HOME|$HOME|g" \
+  launchd/com.danielraffel.pulp.queue-saturation.plist.template \
+  > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
+launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
+```
+
 ## Release CLI macOS launchd rule
 
 `Release CLI` is a different workload from `Build and Test`, so serve it with a
