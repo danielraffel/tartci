@@ -1,6 +1,7 @@
 # Pulp — macOS build lane (Tart, ARM64 guest). The golden is a layered macOS
-# runner image with Xcode, Homebrew build tools, actions-runner, baked Skia, and
-# env parity for the stock Build and Test workflow.
+# runner image with Xcode, Homebrew build tools, a rustup-managed stable Rust
+# toolchain (cargo/rustc for the release-cli lane), actions-runner, baked Skia,
+# and env parity for the stock Build and Test workflow.
 
 schema   = 2
 name     = "pulp-build-runner"
@@ -18,8 +19,17 @@ xcode  = "26.5"
 cmake  = "homebrew"
 ninja  = "homebrew"
 python = "3.12"
+rust   = "stable"   # rustup-managed; release-cli.yml builds the Rust `pulp` CLI
 
 [brew]
+# `rustup` installs the toolchain MANAGER only — the bake must then materialize a
+# real toolchain so cargo/rustc land on PATH (via ~/.cargo/bin). Run one of:
+#   rustup default stable
+#   rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+# The `stable` pin matches Pulp's experimental/pulp-rs/rust-toolchain.toml, so
+# there's no reproducibility drift vs. the workflow fallback. release-cli.yml
+# keeps a run-time rustup bootstrap as the portability belt; baking it here just
+# skips the ~30-60s per-run install on steady-state release runs.
 packages = [
   "git",
   "git-lfs",
@@ -31,6 +41,7 @@ packages = [
   "ninja",
   "node",
   "python@3.12",
+  "rustup",
 ]
 
 [skia]
