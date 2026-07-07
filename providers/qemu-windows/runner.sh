@@ -45,16 +45,11 @@ LOGROOT="${TARTCI_WIN_LOGS:-${PULP_WIN_LOGS:-$WORKROOT/logs}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 # Host-health auto-yield (opt-in): TARTCI_HOST_VITALS_YIELD=1 makes the --loop gate
-# stop booting NEW VMs while the host is saturated (reads the shared host_vitals.sh
-# signal). Off by default, so a host that never installs host_vitals is byte-for-byte
-# unchanged. FAIL-OPEN: a missing/broken/erroring probe prints 0 (boot), so it can
-# never wedge this lane. Yields on CRITICAL (>=20) always; TARTCI_HOST_VITALS_YIELD_ON_WARN=1
-# also drains on WARN (>=10). Mirrors the tart-macos/tart-linux providers so a busy
-# shared host backs off ALL local lanes, not just macOS — the durable guard against
-# oversubscribing one box.
-HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"
-HOST_VITALS_BIN="${TARTCI_HOST_VITALS_BIN:-host_vitals.sh}"
-HOST_VITALS_YIELD_ON_WARN="${TARTCI_HOST_VITALS_YIELD_ON_WARN:-}"
+# stop booting NEW VMs while the host is saturated. The decision lives in the shared
+# providers/common/host-health.lib.sh (reading TARTCI_HOST_VITALS_YIELD[_ON_WARN] /
+# TARTCI_HOST_VITALS_BIN), so a busy shared host backs off ALL local lanes together,
+# not just macOS. Off by default, fail-open, yields on CRITICAL (>=20) always and on
+# WARN (>=10) only when TARTCI_HOST_VITALS_YIELD_ON_WARN is set. See that lib.
 # Ignore stale queued workflow shells by default. Without this guard, old queued
 # runs with no matching self-hosted Windows job can keep waking QEMU forever.
 MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MAX_QUEUED_AGE_SECONDS:-21600}}"
@@ -80,6 +75,8 @@ prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
+# shellcheck source=providers/common/host-health.lib.sh
+source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -169,32 +166,9 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 
-# Host-health auto-yield. Prints 1 when the loop should STOP booting new VMs
-# because the host is saturated, 0 when it is safe to boot. Opt-in via
-# TARTCI_HOST_VITALS_YIELD; off by default so hosts without host_vitals installed
-# are unaffected. FAIL OPEN: if the host_vitals probe is missing, unexecutable, or
-# errors, print 0 (boot) — host-health yield is a crash-avoidance nicety, not a
-# correctness gate, and a broken probe must never wedge this lane. host_vitals.sh
-# exit codes: 0 green, 10 warn, 20 critical. Yield on >=20 always, and on >=10 when
-# TARTCI_HOST_VITALS_YIELD_ON_WARN is set. (Identical policy to the tart-macos and
-# tart-linux providers so the whole host backs off together.)
-host_health_yield(){
-  [ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] || { printf '%s\n' 0; return 0; }
-  command -v "$HOST_VITALS_BIN" >/dev/null 2>&1 || { printf '%s\n' 0; return 0; }
-  local code=0
-  "$HOST_VITALS_BIN" >/dev/null 2>&1 || code=$?
-  if [ "$code" -ge 20 ]; then
-    printf '%s\n' 1
-  elif [ "$code" -ge 10 ] && [ -n "$HOST_VITALS_YIELD_ON_WARN" ] && [ "$HOST_VITALS_YIELD_ON_WARN" != 0 ]; then
-    printf '%s\n' 1
-  else
-    printf '%s\n' 0
-  fi
-}
-
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
-[ "$PRINT_HOST_HEALTH" = 1 ] && { host_health_yield; exit 0; }
+[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
 FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
@@ -703,7 +677,7 @@ if (Test-Path $diagDir) {
 
 i=0
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral Windows runner LOOP (Ctrl-C to stop); golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints ERR when the gh queue scan fails; treating
   # that as 0 silently idles the supervisor while jobs pile up. Count consecutive blind polls
   # and self-restart after a sustained window so launchd (KeepAlive) respawns with fresh gh
@@ -725,7 +699,7 @@ if [ "$LOOP" = 1 ]; then
     # Host-health yield: only worth probing when we actually have work to boot.
     # Cheap local check (no gh call), fail-open, and 0 when the feature is off.
     hh=0
-    [ "${q:-0}" -gt 0 ] && hh="$(host_health_yield)"
+    [ "${q:-0}" -gt 0 ] && hh="$(tartci_host_health_yield)"
     if [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -eq 0 ]; then
       i=$((i+1)); note "[$i] queued=$q host_health_yield=$hh → booting ephemeral Windows VM"; run_one "$i" || sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ]; then

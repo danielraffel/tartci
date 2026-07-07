@@ -82,24 +82,23 @@ class SecondaryLaneHostHealthTests(unittest.TestCase):
 
 
 class SecondaryLaneWiringTests(unittest.TestCase):
-    """Pin the contract in source: feature defaults OFF and the loop consults it."""
+    """Pin the contract in source: each secondary lane sources the SHARED host-health
+    helper and its loop consults it (so the policy can never drift from macOS). The
+    default-off + fail-open behavior itself lives in test_host_health_lib.py."""
 
-    def test_feature_defaults_off(self) -> None:
+    def test_sources_shared_host_health_lib(self) -> None:
         for lane, script in PROVIDERS.items():
             with self.subTest(lane=lane):
                 body = script.read_text(encoding="utf-8")
-                self.assertIn('HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"', body)
                 self.assertIn(
-                    '[ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] '
-                    "|| { printf '%s\\n' 0; return 0; }",
-                    body,
+                    'source "$TARTCI_ROOT/providers/common/host-health.lib.sh"', body
                 )
 
     def test_loop_gate_consults_host_health(self) -> None:
         for lane, script in PROVIDERS.items():
             with self.subTest(lane=lane):
                 body = script.read_text(encoding="utf-8")
-                self.assertIn('hh="$(host_health_yield)"', body)
+                self.assertIn('hh="$(tartci_host_health_yield)"', body)
                 self.assertIn('[ "${hh:-0}" -eq 0 ]', body)
 
     def test_syntax_is_valid(self) -> None:

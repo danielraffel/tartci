@@ -53,10 +53,9 @@ WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
-# Host-health auto-yield (opt-in; see header). Empty/0 = OFF (no host_vitals call).
-HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"
-HOST_VITALS_BIN="${TARTCI_HOST_VITALS_BIN:-host_vitals.sh}"
-HOST_VITALS_YIELD_ON_WARN="${TARTCI_HOST_VITALS_YIELD_ON_WARN:-}"
+# Host-health auto-yield (opt-in; see header): the decision lives in the shared
+# providers/common/host-health.lib.sh, reading TARTCI_HOST_VITALS_YIELD[_ON_WARN]
+# / TARTCI_HOST_VITALS_BIN directly. Empty/0 = OFF (no host_vitals call).
 QUEUE_RUN_LIMIT="${TARTCI_QUEUE_RUN_LIMIT:-20}"
 GH_TIMEOUT="${TARTCI_GH_TIMEOUT_SECS:-15}"
 LOOP=0
@@ -95,6 +94,8 @@ elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }';
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
+# shellcheck source=providers/common/host-health.lib.sh
+source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -415,37 +416,6 @@ print(n)
   printf '%s\n' "$count"
 }
 
-# Host-health auto-yield. Prints 1 when the loop should STOP booting new VMs
-# because the host is saturated, 0 when it is safe to boot. Opt-in via
-# TARTCI_HOST_VITALS_YIELD; off by default so hosts without host_vitals installed
-# are unaffected.
-#
-# FAIL OPEN (the deliberate opposite of priority_demand's fail-closed): if the
-# host_vitals probe is missing, unexecutable, or errors, print 0 (boot). Rationale
-# — host-health yield is a crash-avoidance *nicety*, not a correctness gate. A
-# broken probe must never wedge the required macOS runner; the worst case of
-# fail-open is that we forgo the avoidance we can't measure, which is exactly where
-# we were before this feature. (Priority demand gates a shared VM cap and so must
-# fail closed; these are different risk classes on purpose.)
-#
-# host_vitals.sh exit codes: 0 green, 10 warn, 20 critical. Yield on >=20 always,
-# and on >=10 when TARTCI_HOST_VITALS_YIELD_ON_WARN is set.
-host_health_yield(){
-  [ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] || { printf '%s\n' 0; return 0; }
-  command -v "$HOST_VITALS_BIN" >/dev/null 2>&1 || { printf '%s\n' 0; return 0; }
-  # `local code=0; ... || code=$?` keeps set -e from aborting on a non-zero exit,
-  # and declaring first avoids `local x=$(...)` masking the command's status.
-  local code=0
-  "$HOST_VITALS_BIN" >/dev/null 2>&1 || code=$?
-  if [ "$code" -ge 20 ]; then
-    printf '%s\n' 1
-  elif [ "$code" -ge 10 ] && [ -n "$HOST_VITALS_YIELD_ON_WARN" ] && [ "$HOST_VITALS_YIELD_ON_WARN" != 0 ]; then
-    printf '%s\n' 1
-  else
-    printf '%s\n' 0
-  fi
-}
-
 reclaim_runner_name(){
   local name="$1" id attempt
   for attempt in $(seq 1 18); do
@@ -678,14 +648,14 @@ run_one(){
 i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
-[ "$PRINT_HOST_HEALTH" = 1 ] && { host_health_yield; exit 0; }
+[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
@@ -722,7 +692,7 @@ if [ "$LOOP" = 1 ]; then
     # Host-health yield: only worth probing when we actually have work to boot.
     # Cheap local check (no gh call), fail-open, and 0 when the feature is off.
     hh=0
-    [ "${q:-0}" -gt 0 ] && hh="$(host_health_yield)"
+    [ "${q:-0}" -gt 0 ] && hh="$(tartci_host_health_yield)"
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
     # (3) is always satisfied when the priority feature is off (priority_demand
