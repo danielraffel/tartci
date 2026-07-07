@@ -26,6 +26,8 @@ plugins in a DAW.
 
 ### Host resource governance
 
+**Opt a host out** with `tartci pool off` (and back in with `tartci pool on`; `tartci pool status [--json]` shows state). This host-level switch writes the native-build participation flag *and* unloads the host's CI runner agents, so the Mac finishes in-flight jobs and takes no new CI work — decoupled from any per-lane GUI toggle or placement engine.
+
 Shared Macs run CI validation, agent builds, and VM runners on the same
 hardware. Without a shared budget they oversubscribe — two hosts melted in July
 2026, one CPU-bound, one memory-bound/OOM. tartci is the per-host governor:

@@ -985,3 +985,23 @@ installing prereqs + creating stores, it now:
 After `tartci setup`, deploy the tartci snapshot to `~/.local/share/tartci`
 (rsync) and — for a CI host — register runners. For fleet placement, follow the
 Orchard shadow steps above. Helpers: `providers/common/onboard.lib.sh`.
+
+## Opt a host out of the CI pool (`tartci pool`)
+
+`tartci pool {on|off|status}` is the host-level participation switch — "this
+machine, not now". It is deliberately decoupled from the per-lane GUI toggles
+and from any placement engine, so opting a Mac out can't silently vanish when
+lanes change.
+
+- `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
+  (the lease governor then refuses native-build leases here) **and**
+  `launchctl unload` this host's CI runner agents (`com.danielraffel.pulp.*-runner-*`
+  and `actions.runner.*`). Runners are long-lived, so this drains gracefully:
+  in-flight jobs finish, GitHub routes new jobs to other Macs.
+- `tartci pool on` — participation=1 + `launchctl load` the runner agents.
+- `tartci pool status [--json]` — participation state + each runner agent's
+  loaded/stopped state.
+
+If `TARTCI_ORCHARD_URL` is set and a worker is configured, `pool off`/`on` also
+best-effort `orchard pause`/`resume` this host's worker, so the switch stays
+correct if a lane is ever cut over to Orchard placement.
