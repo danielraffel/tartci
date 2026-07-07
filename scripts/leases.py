@@ -220,6 +220,23 @@ def record_int(record: dict[str, Any], key: str, default: int = 0) -> int:
         return default
 
 
+def record_mem_mb(record: dict[str, Any], per_job_mem_mb: int) -> int:
+    """Memory a lease consumes, in MB. A new record carries an explicit
+    lease_size_mem_mb. A LEGACY core-only record (pre-memory-axis) has none —
+    but it is NOT free: estimate it as cores * per-job memory so a mixed store
+    can't admit a memory-heavy lease on top of unaccounted old work (the
+    2026-07-07 mixed-store trap). Estimation, not a zero default, is the safe
+    accounting rule."""
+    explicit = record_int(record, "lease_size_mem_mb", -1)
+    if explicit >= 0 and "lease_size_mem_mb" in record:
+        return explicit
+    return record_int(record, "lease_size_cores") * per_job_mem_mb
+
+
+def record_has_explicit_mem(record: dict[str, Any]) -> bool:
+    return "lease_size_mem_mb" in record
+
+
 def reclaim(records: list[dict[str, Any]], stale_secs: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     now = utcnow()
     boot = host_boot_time()
@@ -260,10 +277,22 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     )
     reserved = min(max(0, reserved), max(0, total - 1)) if total > 1 else 0
     gate_priority = int(getattr(args, "gate_priority", PRIORITY_CLASSES["gate"]))
+    # Memory axis. 0 total_mem_mb means the axis is OFF (host RAM unknown, or an
+    # old host-profile without a memory budget) → admission stays core-only.
+    total_mem = (
+        int(args.capacity_mem_mb)
+        if getattr(args, "capacity_mem_mb", None) is not None
+        else int(profile.get("lease_capacity_mem_mb", 0))
+    )
+    per_job_mem = int(
+        profile.get("per_compile_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB)
+    )
     return {
         "total": max(1, total),
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
+        "total_mem_mb": max(0, total_mem),
+        "per_job_mem_mb": max(1, per_job_mem),
     }
 
 
@@ -275,7 +304,7 @@ def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
         for record in records
         if record_int(record, "priority") < cfg["gate_priority"]
     )
-    return {
+    result = {
         "total_cores": cfg["total"],
         "used_cores": used,
         "available_cores": max(0, cfg["total"] - used),
@@ -285,6 +314,21 @@ def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
         "non_gate_used_cores": non_gate_used,
         "non_gate_available_cores": max(0, non_gate_limit - non_gate_used),
     }
+    total_mem = int(cfg.get("total_mem_mb", 0))
+    if total_mem > 0:
+        per_job_mem = int(cfg.get("per_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB))
+        used_mem = sum(record_mem_mb(record, per_job_mem) for record in records)
+        legacy = any(not record_has_explicit_mem(record) for record in records)
+        result.update(
+            {
+                "total_mem_mb": total_mem,
+                "used_mem_mb": used_mem,
+                "available_mem_mb": max(0, total_mem - used_mem),
+                "per_job_mem_mb": per_job_mem,
+                "memory_accounting": "estimated_legacy" if legacy else "explicit",
+            }
+        )
+    return result
 
 
 def sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -317,7 +361,7 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
         if len(active) != len(records):
             write_records(store_dir, active)
     return {
-        "schema": 1,
+        "schema": 2,
         "store_dir": str(store_dir),
         "mode": "provider VM runners acquire host-core leases when enabled",
         "capacity": usage(active, cfg),
@@ -358,12 +402,29 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             used_for_limit = current_usage["non_gate_used_cores"]
         total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
         class_exceeded = used_for_limit + lease_size > limit
-        if total_exceeded or class_exceeded:
+        # Memory is the second admission axis. A build lease that omits --mem-mb
+        # is charged its cores * per-job estimate so the axis engages even before
+        # every caller passes memory explicitly. The axis is skipped entirely when
+        # total_mem_mb is 0 (RAM unknown / old profile) → core-only, fail-open.
+        req_mem = (
+            int(args.mem_mb)
+            if getattr(args, "mem_mb", None) is not None
+            else lease_size * cfg["per_job_mem_mb"]
+        )
+        mem_exceeded = (
+            cfg["total_mem_mb"] > 0
+            and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
+        )
+        if total_exceeded or class_exceeded or mem_exceeded:
             write_records(store_dir, active)
+            core_axis = total_exceeded or class_exceeded
+            reason = "capacity_exceeded" if core_axis else "memory_exceeded"
             return {
                 "ok": False,
-                "reason": "capacity_exceeded",
+                "reason": reason,
+                "exceeded_axis": {"cores": core_axis, "memory": mem_exceeded},
                 "requested_cores": lease_size,
+                "requested_mem_mb": req_mem,
                 "priority": priority,
                 "priority_class": priority_class,
                 "capacity": current_usage,
@@ -375,6 +436,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         record = {
             "id": lease_id,
             "lease_size_cores": lease_size,
+            "lease_size_mem_mb": req_mem,
             "priority": priority,
             "priority_class": priority_class,
             "pid": identity["pid"],
@@ -465,7 +527,12 @@ def emit(result: dict[str, Any], json_output: bool) -> None:
 
 def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--store-dir", default=str(default_store_dir()))
-    parser.add_argument("--capacity", type=int, help="override lease capacity")
+    parser.add_argument("--capacity", type=int, help="override lease capacity (cores)")
+    parser.add_argument(
+        "--capacity-mem-mb",
+        type=int,
+        help="override memory lease capacity in MB (0 disables the memory axis)",
+    )
     parser.add_argument("--reserved-gate-cores", type=int, help="cores withheld from non-gate leases")
     parser.add_argument("--gate-priority", type=int, default=PRIORITY_CLASSES["gate"])
     parser.add_argument("--stale-secs", type=int, default=int(os.environ.get("TARTCI_LEASE_STALE_SECS", "300")))
@@ -492,6 +559,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     acquire_parser = sub.add_parser("acquire", help="acquire a core lease")
     add_common(acquire_parser)
     acquire_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    acquire_parser.add_argument(
+        "--mem-mb",
+        type=int,
+        help="memory this lease consumes in MB; omitted → cores * per-job estimate",
+    )
     acquire_parser.add_argument("--priority", default="build")
     acquire_parser.add_argument("--pid", type=int)
     acquire_parser.add_argument("--id")

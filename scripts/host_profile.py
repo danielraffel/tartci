@@ -15,6 +15,12 @@ from typing import Any
 
 VALID_ROLES = ("dedicated-builder", "dev-overflow", "light")
 
+# Estimated resident memory of one concurrent C++ compile job. Used both to size
+# the memory budget and — critically — to estimate the memory a legacy core-only
+# lease record consumes when the store is mixed (see leases.py). Conservative on
+# purpose: the axis exists to stop the compressor/OOM spiral, not to pack tightly.
+PER_COMPILE_JOB_MEM_MB = 1536
+
 
 @dataclass(frozen=True)
 class RoleDefaults:
@@ -24,6 +30,12 @@ class RoleDefaults:
     qos: str
     watch_lock_limit: int = 1
     macos_vm_cap: int = 2
+    # Memory axis (GiB). headroom is left for the OS + window server; the
+    # link/LTO reserve is a FLAT per-host subtraction — link peak-RSS dwarfs the
+    # compile average, and modelling it per-lease double-counts when many jobs
+    # compile but only one links (Codex 2026-07-07). Both come off the cap.
+    headroom_mem_gb: int = 6
+    link_lto_reserve_mem_gb: int = 6
 
 
 ROLE_DEFAULTS = {
@@ -32,6 +44,8 @@ ROLE_DEFAULTS = {
         agent_build_cap_cores=12,
         vm_pool_cores=14,
         qos="normal",
+        headroom_mem_gb=8,
+        link_lto_reserve_mem_gb=8,
     ),
     "dev-overflow": RoleDefaults(
         headroom_cores=4,
@@ -45,12 +59,16 @@ ROLE_DEFAULTS = {
         # fleet-wide. Keep this equal to agent_build_cap_cores.
         vm_pool_cores=6,
         qos="background",
+        headroom_mem_gb=6,
+        link_lto_reserve_mem_gb=6,
     ),
     "light": RoleDefaults(
         headroom_cores=4,
         agent_build_cap_cores=3,
         vm_pool_cores=3,
         qos="background",
+        headroom_mem_gb=6,
+        link_lto_reserve_mem_gb=4,
     ),
 }
 
@@ -80,6 +98,36 @@ def detect_cores() -> int:
         except ValueError:
             pass
     return max(1, os.cpu_count() or 1)
+
+
+def detect_memory_mb() -> int:
+    """Physical RAM in MB. TARTCI_HOST_MEM_MB overrides (tests + odd hosts);
+    else sysctl hw.memsize (macOS/BSD) or _SC_PHYS_PAGES (Linux). 0 if unknown,
+    which the caller treats as 'memory axis unavailable' (fail-open to cores)."""
+    env_value = os.environ.get("TARTCI_HOST_MEM_MB")
+    if env_value:
+        try:
+            mb = int(env_value)
+            if mb > 0:
+                return mb
+        except ValueError:
+            pass
+    sysctl_value = _run_text(["sysctl", "-n", "hw.memsize"])
+    if sysctl_value:
+        try:
+            byte_total = int(sysctl_value)
+            if byte_total > 0:
+                return byte_total // (1024 * 1024)
+        except ValueError:
+            pass
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")
+        page_size = os.sysconf("SC_PAGE_SIZE")
+        if pages > 0 and page_size > 0:
+            return (pages * page_size) // (1024 * 1024)
+    except (ValueError, OSError, AttributeError):
+        pass
+    return 0
 
 
 def detect_model() -> str:
@@ -145,10 +193,14 @@ def build_profile(
     cores: int | None = None,
     model: str | None = None,
     role_file: str | None = None,
+    memory_mb: int | None = None,
 ) -> dict[str, Any]:
     host_cores = cores if cores is not None else detect_cores()
     if host_cores <= 0:
         raise ValueError("cores must be positive")
+    host_mem_mb = memory_mb if memory_mb is not None else detect_memory_mb()
+    if host_mem_mb < 0:
+        raise ValueError("memory_mb must be non-negative")
     host_model = model if model is not None else detect_model()
     resolved_role, role_source = resolve_role(
         explicit_role=role,
@@ -166,8 +218,23 @@ def build_profile(
     non_gate_capacity = max(1, lease_capacity - reserved_gate)
     runner_job_cores = agent_cap
 
+    # Memory axis. lease_capacity_mem = physical - headroom - flat link/LTO
+    # reserve. 0 when RAM can't be read → the axis stays off and admission is
+    # core-only (fail-open). PULP_BUILD_MEM_BUDGET_MB feeds the pulp CLI's
+    # tier-0 min(core, RAM) bound so a no-lease build is memory-bounded too.
+    headroom_mem_mb = defaults.headroom_mem_gb * 1024
+    link_lto_reserve_mem_mb = defaults.link_lto_reserve_mem_gb * 1024
+    if host_mem_mb > 0:
+        lease_capacity_mem_mb = max(
+            PER_COMPILE_JOB_MEM_MB,
+            host_mem_mb - headroom_mem_mb - link_lto_reserve_mem_mb,
+        )
+    else:
+        lease_capacity_mem_mb = 0
+    pulp_build_mem_budget_mb = lease_capacity_mem_mb
+
     return {
-        "schema": 1,
+        "schema": 2,
         "host": {
             "hostname": platform.node(),
             "model": host_model,
@@ -183,6 +250,12 @@ def build_profile(
         "runner_job_cores": runner_job_cores,
         "agent_build_cap_cores": agent_cap,
         "pulp_build_jobs": agent_cap,
+        "mem_mb": host_mem_mb,
+        "headroom_mem_mb": headroom_mem_mb,
+        "link_lto_reserve_mem_mb": link_lto_reserve_mem_mb,
+        "lease_capacity_mem_mb": lease_capacity_mem_mb,
+        "per_compile_job_mem_mb": PER_COMPILE_JOB_MEM_MB,
+        "pulp_build_mem_budget_mb": pulp_build_mem_budget_mb,
         "qos": defaults.qos,
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
@@ -208,6 +281,11 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "TARTCI_MACOS_VM_CAP": profile["macos_vm_cap"],
         "TARTCI_AGENT_QOS": profile["qos"],
         "PULP_BUILD_JOBS": profile["pulp_build_jobs"],
+        "TARTCI_HOST_MEM_MB": profile["mem_mb"],
+        "TARTCI_LEASE_CAPACITY_MEM_MB": profile["lease_capacity_mem_mb"],
+        "TARTCI_LINK_LTO_RESERVE_MEM_MB": profile["link_lto_reserve_mem_mb"],
+        "TARTCI_PER_JOB_MEM_MB": profile["per_compile_job_mem_mb"],
+        "PULP_BUILD_MEM_BUDGET_MB": profile["pulp_build_mem_budget_mb"],
     }
     return "\n".join(f"{key}={value}" for key, value in values.items())
 
