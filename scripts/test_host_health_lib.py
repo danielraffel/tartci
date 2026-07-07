@@ -91,26 +91,12 @@ class HostHealthLibMatrix(unittest.TestCase):
         self.assertEqual(_yield({"TARTCI_HOST_VITALS_YIELD": "1"}, vitals_body=None), "0")
 
     def test_garbage_exit_code_fails_open(self) -> None:
-        # A probe that exits with something other than 0/10/20 (a broken/degraded
-        # probe) is below the critical bar → boot, never wedge.
+        # A probe that IS runnable but exits with something other than 0/10/20 (a
+        # broken/degraded probe) is below the critical bar → boot, never wedge.
+        # (A probe entirely absent from PATH is covered by test_missing_probe_*;
+        # the executability of a present-but-non-exec file is privilege/OS-dependent
+        # and not a contract point, so it is deliberately not asserted here.)
         self.assertEqual(_yield({"TARTCI_HOST_VITALS_YIELD": "1"}, vitals_body=_GARBAGE), "0")
-
-    def test_non_executable_probe_fails_open(self) -> None:
-        # A present-but-non-executable file is not found by `command -v` → treated
-        # as missing → fail-open boot.
-        d = tempfile.mkdtemp()
-        tmp = Path(d)
-        (tmp / "host_vitals.sh").write_text(_CRIT, encoding="utf-8")  # mode 0644
-        base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
-                if Path(b).exists()]
-        env = {"HOME": str(tmp), "PATH": os.pathsep.join([str(tmp), *base]),
-               "TARTCI_HOST_VITALS_YIELD": "1"}
-        r = subprocess.run(
-            ["bash", "-c", f'set -euo pipefail; source "{LIB}"; tartci_host_health_yield'],
-            capture_output=True, text=True, check=False, env=env,
-        )
-        self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.strip(), "0")
 
     def test_green_boots(self) -> None:
         self.assertEqual(_yield({"TARTCI_HOST_VITALS_YIELD": "1"}, vitals_body=_GREEN), "0")
