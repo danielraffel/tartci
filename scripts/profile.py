@@ -28,6 +28,16 @@ PULP_DEFAULT_VARS = {
     ("coverage", "windows"): "PULP_COVERAGE_WINDOWS_RUNS_ON_JSON",
 }
 
+# Target providers tartci understands. `github` = GitHub-hosted; `tartci` = a
+# self-scheduled local Tart/QEMU VM (the runner LaunchAgent path); `orchard` =
+# a VM placed by the Orchard fleet controller. Orchard targets are SHADOW-ONLY
+# for now — vocabulary is accepted so a profile can declare a dormant Orchard
+# target, but a lane must NOT select one until the fleet placement path is
+# proven (see `tartci profile validate` and the governance plan's Orchard
+# rollout). A lane that references an orchard target is a hard validation error.
+VALID_TARGET_PROVIDERS = frozenset({"github", "tartci", "orchard"})
+LANE_SELECTABLE_PROVIDERS = frozenset({"github", "tartci"})
+
 
 def load_profile(name: str) -> tuple[Path, dict[str, Any]]:
     path = PROFILE_DIR / f"{name}.toml"
@@ -86,7 +96,20 @@ def resolve_lanes(profile: dict[str, Any], repo: str) -> list[dict[str, Any]]:
                     continue
                 row = {"id": target_id, **target}
                 target_rows.append(row)
-                if target.get("arch") == "x64" and target.get("provider") != "github":
+                provider = target.get("provider")
+                if provider not in VALID_TARGET_PROVIDERS:
+                    warnings.append(
+                        f"{target_id} has unknown provider {provider!r}; "
+                        f"expected one of {sorted(VALID_TARGET_PROVIDERS)}"
+                    )
+                elif provider not in LANE_SELECTABLE_PROVIDERS:
+                    # Orchard placement is shadow-only until proven — a lane may
+                    # not route to it yet.
+                    warnings.append(
+                        f"{target_id} uses provider {provider!r}, which is not "
+                        f"lane-selectable yet (shadow-only)"
+                    )
+                if target.get("arch") == "x64" and provider != "github":
                     warnings.append(f"{target_id} is local x64; treat as smoke until proven")
             if lane_cfg.get("ephemeral_required"):
                 for row in target_rows:
@@ -191,6 +214,55 @@ def cmd_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def _iter_lane_target_refs(node: Any) -> Any:
+    """Yield every target id referenced by a lane's `targets = [...]` list,
+    anywhere in the profile tree (the top-level `[targets]` catalog is a table,
+    not a list, so it is walked into rather than yielded)."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "targets" and isinstance(value, list):
+                for target_id in value:
+                    yield target_id
+            elif isinstance(value, dict):
+                yield from _iter_lane_target_refs(value)
+
+
+def cmd_validate(args: argparse.Namespace) -> int:
+    names = [args.name] if getattr(args, "name", None) else [p.stem for p in profile_files()]
+    errors: list[str] = []
+    for name in names:
+        _, profile = load_profile(name)
+        targets = profile.get("targets") or {}
+        if not isinstance(targets, dict):
+            errors.append(f"{name}: [targets] must be a table")
+            continue
+        for target_id, target in targets.items():
+            if not isinstance(target, dict):
+                continue
+            provider = target.get("provider")
+            if provider not in VALID_TARGET_PROVIDERS:
+                errors.append(
+                    f"{name}: target {target_id!r} has unknown provider {provider!r} "
+                    f"(expected one of {sorted(VALID_TARGET_PROVIDERS)})"
+                )
+        for target_id in _iter_lane_target_refs(profile):
+            target = targets.get(target_id)
+            if not isinstance(target, dict):
+                continue
+            provider = target.get("provider")
+            if provider in VALID_TARGET_PROVIDERS and provider not in LANE_SELECTABLE_PROVIDERS:
+                errors.append(
+                    f"{name}: a lane references {target_id!r} (provider {provider!r}), "
+                    f"which is not lane-selectable yet (shadow-only)"
+                )
+    if errors:
+        for err in sorted(set(errors)):
+            print(f"profile-validate: {err}", file=sys.stderr)
+        return 1
+    print(f"profile-validate: OK ({len(names)} profile(s))")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="tartci profile")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -200,6 +272,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show")
     p_show.add_argument("name")
     p_show.set_defaults(func=cmd_show)
+    p_validate = sub.add_parser("validate", help="check target providers + lane selectability")
+    p_validate.add_argument("name", nargs="?", help="profile name (default: all)")
+    p_validate.set_defaults(func=cmd_validate)
     for name, func in (("explain", cmd_explain), ("plan", cmd_plan)):
         p = sub.add_parser(name)
         p.add_argument("name")
