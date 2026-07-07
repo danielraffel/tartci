@@ -38,6 +38,20 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertEqual(profile["reserved_gate_cores"], 8)
         self.assertEqual(profile["qos"], "background")
 
+    def test_dev_overflow_vm_pool_fits_non_gate_budget(self) -> None:
+        # A dev-overflow VM lane runs at non-gate priority, so it can only ever
+        # acquire a lease if vm_pool_cores fits the non-gate budget
+        # (lease_capacity - reserved_gate_cores). If it does not, the VM is
+        # permanently capacity_exceeded while the idle macOS gate holds its
+        # reservation, which starves the required-gate Linux preamble
+        # fleet-wide. Assert the fit at the real Mac Studio size (28 cores),
+        # the host that surfaced the deadlock.
+        profile = host_profile.build_profile(role="dev-overflow", cores=28)
+        non_gate = profile["lease_capacity_cores"] - profile["reserved_gate_cores"]
+        self.assertEqual(non_gate, 6)
+        self.assertEqual(profile["vm_pool_cores"], 6)
+        self.assertLessEqual(profile["vm_pool_cores"], non_gate)
+
     def test_light_budget_is_clamped_to_small_hosts(self) -> None:
         profile = host_profile.build_profile(role="light", cores=4, model="portable")
         self.assertEqual(profile["headroom_cores"], 3)

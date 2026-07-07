@@ -36,7 +36,14 @@ ROLE_DEFAULTS = {
     "dev-overflow": RoleDefaults(
         headroom_cores=4,
         agent_build_cap_cores=6,
-        vm_pool_cores=8,
+        # A dev-overflow host runs its VM lane at NON-gate priority (e.g. the
+        # pulp-build-linux preamble VM), so it draws from the non-gate budget,
+        # which is lease_capacity - reserved_gate_cores = agent_build_cap_cores.
+        # vm_pool_cores must therefore stay <= agent_build_cap_cores or the VM
+        # can never acquire a lease (capacity_exceeded) while the idle macOS
+        # gate holds its reservation — which starves the required-gate preamble
+        # fleet-wide. Keep this equal to agent_build_cap_cores.
+        vm_pool_cores=6,
         qos="background",
     ),
     "light": RoleDefaults(
