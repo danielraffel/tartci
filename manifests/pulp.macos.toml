@@ -42,6 +42,12 @@ packages = [
   "node",
   "python@3.12",
   "rustup",
+  # clang-format for the `pulp fmt` CLI. Without it on PATH, the Build-and-Test
+  # gate's `pulp fmt` shell-out tests (test_cli_fmt_shellout.cpp) HANG and hit
+  # their 10s timeout on this VM golden (r.timed_out) rather than exercising the
+  # formatter — reddening the required macOS leg. The Homebrew `clang-format`
+  # formula installs a standalone `clang-format` binary (no full LLVM needed).
+  "clang-format",
 ]
 
 [skia]
