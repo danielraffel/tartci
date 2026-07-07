@@ -113,6 +113,20 @@ derive_runner_name(){
   printf '%s-%02d' "$prefix" "$((10#$SLOT))"
 }
 
+# Per-BOOT GitHub runner registration name: <lane>-<supervisor pid>-<boot index>,
+# mirroring the qemu-windows lane (`${RUNNER_NAME_PREFIX}-$$-$i`). This must be
+# unique for every boot and never reused. Rationale: a fixed static name (the bare
+# $RUNNER_NAME, e.g. `pulp-vm-01`) is reused across boots AND supervisor restarts,
+# so a SIGKILL'd VM (kickstart / yield / crash) orphans a GitHub runner registration
+# stuck "offline but running a job". The next boot then collides on that name
+# (`generate-jitconfig` → HTTP 409 "already exists"), and reclaim_runner_name can't
+# clear it without repo-admin — wedging the ENTIRE macOS gate until an admin deletes
+# the ghost by hand (pulp-runner-ops "Sixth symptom", 2026-07-06). An
+# never-reused name makes the collision impossible: a dead VM's registration just
+# ages out. $$ is the supervisor PID even inside command substitution (bash keeps it
+# the top-level shell's PID); $1 is the monotonic per-boot index.
+ephemeral_boot_name(){ printf '%s-%s-%s' "$RUNNER_NAME" "$$" "$1"; }
+
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
@@ -125,6 +139,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --slot) SLOT="$2"; shift 2;;
   --state-dir) STATE_DIR="$2"; EVENT_LOG="$STATE_DIR/events.jsonl"; shift 2;;
   --print-name) PRINT_NAME=1; shift;;
+  --print-boot-name) PRINT_BOOT_NAME="$2"; shift 2;;  # debug/test: emit ephemeral_boot_name <i>
   --print-queue) PRINT_QUEUE=1; shift;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
@@ -136,6 +151,7 @@ esac; done
 
 RUNNER_NAME="$(derive_runner_name)"
 [ "$PRINT_NAME" = 1 ] && { printf '%s\n' "$RUNNER_NAME"; exit 0; }
+[ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
 
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
@@ -510,7 +526,11 @@ run_runner_until_done(){
 }
 
 run_one(){
-  local i="$1" vm="$RUNNER_NAME" jit label_args=() l boot_log rpid ip="" rc=0
+  # Per-boot EPHEMERAL registration name (see ephemeral_boot_name) — never the bare
+  # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
+  # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
+  local i="$1" vm; vm="$(ephemeral_boot_name "$i")"
+  local jit label_args=() l boot_log rpid ip="" rc=0
   local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
