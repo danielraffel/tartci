@@ -126,13 +126,15 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_ROOT={ROOT}
                 export TARTCI_LEASE_DIR={Path(td) / "leases"}
                 export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # force non-gate budget = 3
-                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux
+                # explicit tiny mem so the core clamp is isolated from the memory axis
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 """
@@ -151,13 +153,14 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_ROOT={ROOT}
                 export TARTCI_LEASE_DIR={Path(td) / "leases"}
                 export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # non-gate budget = 3 (must be ignored for gate)
-                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build
+                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 """
