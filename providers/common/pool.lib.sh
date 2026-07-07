@@ -50,7 +50,12 @@ tartci_pool_runner_agents() {
     [ -e "$f" ] || continue
     b="$(basename "$f" .plist)"
     case "$b" in
-      com.danielraffel.pulp.tart-runner-*|com.danielraffel.pulp.qemu-runner-*|actions.runner.*)
+      com.danielraffel.pulp.tart-runner|com.danielraffel.pulp.tart-runner-*|\
+      com.danielraffel.pulp.qemu-runner|com.danielraffel.pulp.qemu-runner-*|\
+      actions.runner.*)
+        # NB: the bare `tart-runner` (no suffix) is the macOS GATE lane — it MUST
+        # be matched, or `pool off` would leave the gate serving despite
+        # participation=0. Match both bare and `-suffixed` runner labels.
         printf '%s\n' "$b"
         ;;
     esac
