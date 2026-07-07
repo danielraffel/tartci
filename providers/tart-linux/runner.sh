@@ -46,6 +46,18 @@ LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Linux,ARM64,pu
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
+# Host-health auto-yield (opt-in): TARTCI_HOST_VITALS_YIELD=1 makes the --loop gate
+# stop booting NEW VMs while the host is saturated (reads the shared host_vitals.sh
+# signal). Off by default, so a host that never installs host_vitals is byte-for-byte
+# unchanged. FAIL-OPEN: a missing/broken/erroring probe prints 0 (boot), so it can
+# never wedge this lane — worst case is the crash-avoidance we simply don't get.
+# Yields on CRITICAL (>=20) always; TARTCI_HOST_VITALS_YIELD_ON_WARN=1 also drains on
+# WARN (>=10). Mirrors the tart-macos provider so a busy shared host (e.g. a Mac
+# Studio running the macOS gate + this Linux lane) backs off ALL local lanes, not
+# just macOS — the durable guard against oversubscribing one box.
+HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"
+HOST_VITALS_BIN="${TARTCI_HOST_VITALS_BIN:-host_vitals.sh}"
+HOST_VITALS_YIELD_ON_WARN="${TARTCI_HOST_VITALS_YIELD_ON_WARN:-}"
 # Ignore stale queued workflow shells by default. Without this guard, old queued
 # runs with no matching self-hosted Linux job can keep waking Tart forever.
 MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MAX_QUEUED_AGE_SECONDS:-21600}}"
@@ -99,16 +111,41 @@ export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
 GH_CLI="$TARTCI_GH_CLI"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need admin to mint JIT config)"
 
+PRINT_HOST_HEALTH=0
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
   --golden) GOLDEN="$2"; shift 2;;
   --labels) LABELS="$2"; shift 2;;
   --repo) REPO="$2"; shift 2;;
+  --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=21600;; esac
+
+# Host-health auto-yield. Prints 1 when the loop should STOP booting new VMs
+# because the host is saturated, 0 when it is safe to boot. Opt-in via
+# TARTCI_HOST_VITALS_YIELD; off by default so hosts without host_vitals installed
+# are unaffected. FAIL OPEN: if the host_vitals probe is missing, unexecutable, or
+# errors, print 0 (boot) — host-health yield is a crash-avoidance nicety, not a
+# correctness gate, and a broken probe must never wedge this lane. host_vitals.sh
+# exit codes: 0 green, 10 warn, 20 critical. Yield on >=20 always, and on >=10 when
+# TARTCI_HOST_VITALS_YIELD_ON_WARN is set. (Identical policy to the tart-macos
+# provider so the whole host backs off together.)
+host_health_yield(){
+  [ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] || { printf '%s\n' 0; return 0; }
+  command -v "$HOST_VITALS_BIN" >/dev/null 2>&1 || { printf '%s\n' 0; return 0; }
+  local code=0
+  "$HOST_VITALS_BIN" >/dev/null 2>&1 || code=$?
+  if [ "$code" -ge 20 ]; then
+    printf '%s\n' 1
+  elif [ "$code" -ge 10 ] && [ -n "$HOST_VITALS_YIELD_ON_WARN" ] && [ "$HOST_VITALS_YIELD_ON_WARN" != 0 ]; then
+    printf '%s\n' 1
+  else
+    printf '%s\n' 0
+  fi
+}
 
 # Count fresh queued jobs whose labels this runner can satisfy. 0 on any gh
 # failure, treating a flaky API as "no work" so it does not spin VMs.
@@ -318,8 +355,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
 }
 
 i=0
+[ "$PRINT_HOST_HEALTH" = 1 ] && { host_health_yield; exit 0; }
+
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS"
+  note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints ERR when the gh queue scan fails; treating
   # that as 0 silently idles the supervisor while jobs pile up. Count consecutive blind polls
   # and self-restart after a sustained window so launchd (KeepAlive) respawns with fresh gh
@@ -338,8 +377,14 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"; continue
     fi
     blind=0
-    if [ "${q:-0}" -gt 0 ]; then
-      i=$((i+1)); note "[$i] queued=$q → booting ephemeral Linux VM"; run_one "$i" || sleep "$POLL"
+    # Host-health yield: only worth probing when we actually have work to boot.
+    # Cheap local check (no gh call), fail-open, and 0 when the feature is off.
+    hh=0
+    [ "${q:-0}" -gt 0 ] && hh="$(host_health_yield)"
+    if [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -eq 0 ]; then
+      i=$((i+1)); note "[$i] queued=$q host_health_yield=$hh → booting ephemeral Linux VM"; run_one "$i" || sleep "$POLL"
+    elif [ "${q:-0}" -gt 0 ]; then
+      note "host saturated (host_health_yield=1) — deferring boot ${POLL}s (queued=$q)"; sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q — no '$WORKFLOW_NAME' work)"; sleep "$POLL"
     fi
