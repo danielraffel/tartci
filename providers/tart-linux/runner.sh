@@ -264,8 +264,9 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   }
   delete_state(){ tartci_delete_vm_state "$vm" "$state_dir"; }
   lease_cores="$(tartci_vm_lease_cores tart-linux)"
+  lease_mem="$(tartci_vm_lease_mem_mb tart-linux)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" || return $?
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
   write_state preparing
   note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"

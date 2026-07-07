@@ -587,8 +587,9 @@ run_one(){
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
+  lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" || return $?
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
   heartbeat minting-jit
   event mint_jit "labels=$LABELS"
   IFS=',' read -r -a labels_split <<< "$LABELS"

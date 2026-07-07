@@ -357,8 +357,9 @@ run_one(){ # $1=iteration index
   }
   delete_state(){ tartci_delete_vm_state "$job" "$state_dir"; }
   lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
+  lease_mem="$(tartci_vm_lease_mem_mb qemu-windows "$WIN_MEMORY_MB")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
-  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" || {
+  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
     local lease_rc=$?
     rm -rf "$jobdir"
     rm -rf "$port_lock"

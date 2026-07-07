@@ -99,6 +99,52 @@ class VmLeaseHelperTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["5", "6"])
 
+    def test_provider_mem_overrides_and_fallbacks(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            export TARTCI_MACOS_VM_MEM_MB=12288
+            export TARTCI_LINUX_VM_MEM_MB=bogus
+            source {HELPER}
+            printf '%s\\n' "$(tartci_vm_lease_mem_mb tart-macos)"
+            printf '%s\\n' "$(tartci_vm_lease_mem_mb tart-linux)"
+            printf '%s\\n' "$(tartci_vm_lease_mem_mb qemu-windows 8192)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # macos override; linux bogus → per-guest default 8192; windows from
+        # WIN_MEMORY fallback.
+        self.assertEqual(proc.stdout.strip().splitlines(), ["12288", "8192", "8192"])
+
+    def test_acquire_charges_explicit_vm_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 9000
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_mem_mb"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # The VM lease charged its real memory footprint (9000 MB), not a
+        # cores*per-job estimate.
+        self.assertEqual(proc.stdout.strip(), "9000")
+
     def test_tart_cpu_set_uses_acquired_core_count(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
