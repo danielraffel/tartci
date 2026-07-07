@@ -126,6 +126,11 @@ cmd_setup() {
   fi
   mkdir -p "$TARTCI_GOLDENS" "$TARTCI_BENCH" "$TARTCI_WIN" "$TARTCI_HOME/iso"
   echo "stores ready under $TARTCI_HOME"
+  # Onboarding: persist the derived role + prove the host is governed.
+  # shellcheck source=providers/common/onboard.lib.sh
+  . "$HERE/providers/common/onboard.lib.sh"
+  tartci_onboard_role "$HERE" || true
+  tartci_onboard_verify "$HERE" || echo "setup: host not fully onboarded (see verify above)"
   cmd_doctor
 }
 

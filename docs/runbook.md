@@ -939,3 +939,21 @@ for the host lease governor and native builds. `tartci status` shows an
 `orchard: not configured` otherwise. Host-side macOS≤2 enforcement
 (`macos-vm-cap.lib.sh`, fail-closed) stays authoritative; Orchard placement is
 advisory. Templates: `launchd/com.danielraffel.tartci.orchard-{controller,worker}.plist.template`.
+
+## Onboarding a new host
+
+`tartci setup` is the one command to bring a fresh Mac into the pool. Beyond
+installing prereqs + creating stores, it now:
+
+1. **Persists the role** — writes `~/.config/tartci/role` from the role
+   `host_profile.py` derives (cores + `hw.model`), unless an explicit role file
+   already exists (operator intent wins; a re-image/rename can't silently
+   re-classify the host).
+2. **Runs a verification gate** — confirms `host-profile` advertises a build
+   budget (`PULP_BUILD_JOBS`) and the lease store answers. If either fails,
+   `tartci setup` reports the host is not fully onboarded instead of exiting
+   clean, so a half-provisioned host is visible.
+
+After `tartci setup`, deploy the tartci snapshot to `~/.local/share/tartci`
+(rsync) and — for a CI host — register runners. For fleet placement, follow the
+Orchard shadow steps above. Helpers: `providers/common/onboard.lib.sh`.
