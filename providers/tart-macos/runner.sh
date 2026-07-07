@@ -273,17 +273,46 @@ def gh_json(path):
     )
 
 
+# Scan ONLY our workflow's runs, not the global runs list. The global
+# `runs?status=queued` endpoint returns the newest `per_page` runs across ALL workflows; under
+# multi-workflow / multi-PR load those newest runs are dominated by OTHER workflows, so our
+# Build-and-Test runs get crowded out of the window and the fleet can't see queued build legs it
+# should serve — VM-lane starvation under exactly the heavy load we care about. Resolving the
+# workflow id and hitting `workflows/{id}/runs` keeps the window filled with only our runs, so a
+# deep queue of build jobs stays visible. per_page is bumped to 100 (the endpoint max) so a deep
+# backlog is covered in one page.
+_WF_PER_PAGE = 100
 runs = []
 seen = set()
 try:
-    for status in ("queued", "in_progress"):
-        data = gh_json(f"repos/{repo}/actions/runs?status={status}&per_page={limit}")
-        for run in data.get("workflow_runs", []):
-            run_id = run.get("id")
-            if run_id in seen:
-                continue
-            seen.add(run_id)
-            runs.append(run)
+    wf_id = None
+    wfs = gh_json(f"repos/{repo}/actions/workflows?per_page=100")
+    for wf in wfs.get("workflows", []):
+        if wf.get("name") == workflow_name:
+            wf_id = wf.get("id")
+            break
+    if wf_id is not None:
+        for status in ("queued", "in_progress"):
+            data = gh_json(
+                f"repos/{repo}/actions/workflows/{wf_id}/runs?status={status}&per_page={_WF_PER_PAGE}"
+            )
+            for run in data.get("workflow_runs", []):
+                run_id = run.get("id")
+                if run_id in seen:
+                    continue
+                seen.add(run_id)
+                runs.append(run)
+    else:
+        # Workflow not found by name (renamed / not yet created) → degrade to the global scan so
+        # behavior is never worse than before.
+        for status in ("queued", "in_progress"):
+            data = gh_json(f"repos/{repo}/actions/runs?status={status}&per_page={limit}")
+            for run in data.get("workflow_runs", []):
+                run_id = run.get("id")
+                if run_id in seen:
+                    continue
+                seen.add(run_id)
+                runs.append(run)
 except Exception:
     # A scan FAILURE (gh-api timeout / rate-limit / auth degradation / network) is NOT the same as
     # "no queued work". Emit a distinct sentinel so the loop stays blind-AWARE and can self-restart
@@ -292,13 +321,24 @@ except Exception:
     print("ERR")
     raise SystemExit
 
+# Oldest-first so the longest-starved run is checked first (fairness + urgency under a deep queue).
+# The loop only needs to know whether >= 1 servable job exists to boot ONE VM this iteration, so we
+# SHORT-CIRCUIT at the first match instead of fetching jobs for every run — a `jobs` call per run
+# turns a deep backlog into a 60s+ scan that can't keep up with the poll interval. We still bound the
+# no-match case (`_MAX_JOB_FETCHES`) so a large queue of non-servable runs can't stall the scan.
+runs.sort(key=lambda r: r.get("created_at") or "")
+_MAX_JOB_FETCHES = 30
 matches = 0
+fetched = 0
 for run in runs:
     if run.get("name") != workflow_name:
         continue
     run_id = run.get("id")
     if not run_id:
         continue
+    if fetched >= _MAX_JOB_FETCHES:
+        break
+    fetched += 1
     try:
         jobs = gh_json(f"repos/{repo}/actions/runs/{run_id}/jobs")
     except Exception:
@@ -309,6 +349,8 @@ for run in runs:
         job_labels = {str(label) for label in job.get("labels", []) if str(label)}
         if job_labels and job_labels.issubset(runner_labels):
             matches += 1
+    if matches > 0:
+        break  # >= 1 servable job is all the boot gate needs; GitHub assigns the oldest match.
 print(matches)
 PY
 }

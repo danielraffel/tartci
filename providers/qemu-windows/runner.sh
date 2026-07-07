@@ -222,20 +222,38 @@ def is_fresh(created_at):
         return False
     return (now - created).total_seconds() <= max_age
 
+# Scan our workflow's runs, not the GLOBAL runs list: under multi-workflow load other workflows
+# crowd our build runs out of the newest-`per_page` window, hiding queued build legs the fleet
+# should serve (VM-lane starvation under load). Resolve the workflow id and hit workflows/{id}/runs.
 runs = []
 seen = set()
-for status in ("queued", "in_progress"):
-    for run in gh(f"repos/{repo}/actions/runs?status={status}&per_page=100").get("workflow_runs", []):
+wf_id = None
+for wf in gh(f"repos/{repo}/actions/workflows?per_page=100").get("workflows", []):
+    if wf.get("name") == workflow_name:
+        wf_id = wf.get("id")
+        break
+if wf_id is not None:
+    run_paths = [f"repos/{repo}/actions/workflows/{wf_id}/runs?status={s}&per_page=100" for s in ("queued", "in_progress")]
+else:
+    run_paths = [f"repos/{repo}/actions/runs?status={s}&per_page=100" for s in ("queued", "in_progress")]
+for _path in run_paths:
+    for run in gh(_path).get("workflow_runs", []):
         run_id = run.get("id")
         if run_id in seen:
             continue
         seen.add(run_id)
         runs.append(run)
 
+runs.sort(key=lambda r: r.get("created_at") or "")   # oldest-first: fairness + urgency under a deep queue
+_MAX_JOB_FETCHES = 30
 count = 0
+_fetched = 0
 for run in runs:
     if run.get("name") != workflow_name:
         continue
+    if _fetched >= _MAX_JOB_FETCHES:
+        break
+    _fetched += 1
     jobs = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100").get("jobs", [])
     for job in jobs:
         if job.get("status") != "queued":
@@ -254,6 +272,8 @@ for run in runs:
             continue
         if not match_labels or labels:
             count += 1
+    if count > 0:
+        break   # boot gate only needs ">= 1 servable job"; GitHub assigns the oldest match
 print(count)
 PY
 }
