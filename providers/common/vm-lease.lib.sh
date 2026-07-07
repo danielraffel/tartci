@@ -63,6 +63,31 @@ tartci_vm_lease_cores(){
   printf '%s' "$value"
 }
 
+# Memory (MB) a VM lease should reserve on the host memory axis. Explicit
+# per-provider override wins; else a conservative per-guest default — a macOS or
+# Linux CI guest wants ~8 GiB, and Windows already carries WIN_MEMORY_MB. Passing
+# this (rather than letting leases.py derive cores*per-job) keeps VM accounting
+# honest: a VM's real RAM footprint is its guest memory, not its vCPU count.
+tartci_vm_lease_mem_mb(){
+  local provider="$1" fallback="${2:-}" value=""
+  case "$provider" in
+    tart-macos)
+      value="${TARTCI_MACOS_VM_MEM_MB:-${PULP_MACOS_VM_MEM_MB:-}}"
+      ;;
+    tart-linux)
+      value="${TARTCI_LINUX_VM_MEM_MB:-${PULP_LINUX_VM_MEM_MB:-}}"
+      ;;
+    qemu-windows)
+      value="${TARTCI_WIN_MEMORY_MB:-${PULP_WIN_MEMORY_MB:-${fallback:-}}}"
+      ;;
+  esac
+  if ! tartci_positive_int_or_empty "$value"; then
+    value="${fallback:-8192}"
+  fi
+  tartci_positive_int_or_empty "$value" || value=8192
+  printf '%s' "$value"
+}
+
 tartci_vm_lease_priority(){
   local labels="${1:-}"
   if [ -n "${TARTCI_VM_LEASE_PRIORITY:-}" ]; then
@@ -101,7 +126,7 @@ tartci_stop_vm_lease_heartbeat(){
 }
 
 tartci_acquire_vm_lease(){
-  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" lease_id rc=0 out
+  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" lease_id rc=0 out
   if ! tartci_vm_leases_enabled; then
     TARTCI_ACTIVE_VM_LEASE_ID=""
     return 0
@@ -111,10 +136,17 @@ tartci_acquire_vm_lease(){
     return 75
   fi
   tartci_positive_int_or_empty "$cores" || cores=1
+  # An explicit VM memory size charges the memory axis its real footprint;
+  # omitted (empty) lets leases.py fall back to the cores*per-job estimate.
+  local mem_args=()
+  if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
+    mem_args=(--mem-mb "$mem_mb")
+  fi
   lease_id="vm-$kind-$vm_name"
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
     --id "$lease_id" \
     --cores "$cores" \
+    ${mem_args[@]+"${mem_args[@]}"} \
     --priority "$priority" \
     --pid "$$" \
     --kind "$kind" \
@@ -124,12 +156,12 @@ tartci_acquire_vm_lease(){
     --vm-name "$vm_name" \
     --json 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
-    tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores priority=$priority rc=$rc: $out"
+    tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
     return "$rc"
   fi
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   tartci_start_vm_lease_heartbeat "$lease_id"
-  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores priority=$priority"
+  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority"
   return 0
 }
 
