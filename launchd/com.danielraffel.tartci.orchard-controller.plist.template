@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the Orchard fleet controller (SHADOW mode).
+
+  Runs `orchard controller run` on the always-on host (m3) as its own killable
+  agent with an isolated ORCHARD_HOME, so it never shares lifecycle with the
+  required `macos` CI gate. In shadow mode the controller is just an
+  API/scheduler/state process — workers are registered but PAUSED and declare
+  `org.cirruslabs.tart-vms=0`, so it places nothing. Rollback is a single
+  `launchctl bootout`.
+
+  Prereq: `brew install cirruslabs/cli/orchard`.
+
+  Install shape (m3 only):
+
+    mkdir -p "$HOME/Library/Logs/tartci" "$HOME/.orchard-shadow"
+    # one-time: generate an admin bootstrap token and keep it out of the repo
+    #   export ORCHARD_BOOTSTRAP_ADMIN_TOKEN="$(openssl rand -hex 32)"
+    #   (persist it in the plist EnvironmentVariables below, chmod 600 the plist)
+    sed -e "s|\$HOME|$HOME|g" \
+      launchd/com.danielraffel.tartci.orchard-controller.plist.template \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.orchard-controller.plist"
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.orchard-controller.plist"
+
+  Uninstall / rollback:
+    launchctl bootout "gui/$(id -u)/com.danielraffel.tartci.orchard-controller"
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.orchard-controller</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/orchard</string>
+        <string>controller</string>
+        <string>run</string>
+        <string>--listen</string>
+        <string>:6120</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ORCHARD_HOME</key>
+        <string>$HOME/.orchard-shadow</string>
+        <!-- Set ORCHARD_BOOTSTRAP_ADMIN_TOKEN here (chmod 600 this plist). -->
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/orchard-controller.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/orchard-controller.err.log</string>
+</dict>
+</plist>

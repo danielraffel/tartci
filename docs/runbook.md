@@ -912,3 +912,30 @@ authoritative gate.
 - **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent
   templates in `launchd/`.
+
+## Orchard fleet placement (shadow phase)
+
+Orchard (`brew install cirruslabs/cli/orchard`) is the fleet VM-placement layer.
+It is adopted **shadow-first**: registered + observable, but placing nothing.
+Four safety rails keep it off the required `macos` gate's back:
+
+1. **No lane selects it.** `provider = "orchard"` is valid vocabulary, but
+   `tartci profile validate` hard-fails if any lane's `targets` list references
+   an orchard target. The dormant `macstudio.macos-arm64-orchard` target in
+   `profiles/normal-local-fast.toml` exists only to declare the shape.
+2. **Workers are paused.** After each `orchard worker run` (via the
+   `orchard-worker` LaunchAgent), run `orchard pause worker <host>` — the
+   scheduler skips paused workers.
+3. **`org.cirruslabs.tart-vms=0`** in each worker's advertised resources — a hard
+   "no VM fits here" even if unpaused.
+4. **Killable controller.** The controller runs on always-on m3 as its own
+   `orchard-controller` LaunchAgent with an isolated `ORCHARD_HOME`
+   (`~/.orchard-shadow`); `launchctl bootout` is the one-command rollback.
+
+Workers advertise **derated** capacity — each host's `vm_pool_cores` from
+`tartci host-profile` (m3=14, m5=6, m1=3), not physical — so Orchard leaves room
+for the host lease governor and native builds. `tartci status` shows an
+`orchard` block (workers + paused count) when `TARTCI_ORCHARD_URL` is set, and
+`orchard: not configured` otherwise. Host-side macOS≤2 enforcement
+(`macos-vm-cap.lib.sh`, fail-closed) stays authoritative; Orchard placement is
+advisory. Templates: `launchd/com.danielraffel.tartci.orchard-{controller,worker}.plist.template`.
