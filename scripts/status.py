@@ -105,7 +105,7 @@ def orchard_status() -> dict[str, Any]:
             result["workers_paused"] = sum(
                 1
                 for w in workers
-                if isinstance(w, dict) and (w.get("schedulingPaused") or w.get("paused"))
+                if isinstance(w, dict) and (w.get("scheduling_paused") or w.get("schedulingPaused") or w.get("paused"))
             )
     except Exception as exc:  # noqa: BLE001
         result["error"] = str(exc)
