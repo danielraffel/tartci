@@ -913,6 +913,34 @@ authoritative gate.
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent
   templates in `launchd/`.
 
+## Host resource governance
+
+A tartci host is shared: CI validation builds, agent builds, and VM runners all
+land on the same Mac. tartci is the per-host **governor** that keeps them from
+oversubscribing it (two hosts melted in July 2026 — one CPU-bound, one
+memory-bound/OOM — before this existed). Three pieces tie together:
+
+- **Weighted lease store** (`scripts/leases.py`) — every build and VM runner
+  acquires a lease before it starts. Priority classes (`background` < `build` <
+  `vm` < `runner` < `gate`) order contention, and a reserved gate-core headroom
+  (`reserved_gate_cores`) keeps the required `macos` gate schedulable even when
+  non-gate work fills the host. `tartci leases` inspects/acquires/releases it.
+- **Memory as a second axis** — leases carry a memory weight (`--mem-mb`,
+  capacity via `--capacity-mem-mb`); admission is `min(core-budget,
+  memory-budget)`, so a build is refused when it would exhaust RAM even if cores
+  are free. Legacy core-only records are estimated as `cores × per-job memory`
+  so a mixed store never over-admits.
+- **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
+  its cores + `hw.model` — **dedicated-builder**, **dev-overflow**, or
+  **light** — each carrying a core budget *and* a memory budget. `tartci
+  host-profile` emits the derived budget (`PULP_BUILD_JOBS`,
+  `PULP_BUILD_MEM_BUDGET_MB`) that a consumer's build path reads; `tartci status`
+  shows the resolved role + capacity. Onboarding persists the role and verifies
+  the host is governed — see [Onboarding a new host](#onboarding-a-new-host).
+
+Fleet-level placement on top of these per-host budgets is the Orchard shadow
+phase, below.
+
 ## Orchard fleet placement (shadow phase)
 
 Orchard (`brew install cirruslabs/cli/orchard`) is the fleet VM-placement layer.

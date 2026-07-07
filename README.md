@@ -21,6 +21,38 @@ plugins in a DAW.
   virtio-blk driver; black installer display), so Windows is first-class on QEMU
   with an NVMe disk + `ramfb` display.
 - Host-mounted caches, SSH access + log collection, and a tiny metrics dashboard.
+- **Host resource governance** — a per-host weighted lease store keeps builds and
+  VMs from oversubscribing a shared Mac (see below).
+
+### Host resource governance
+
+Shared Macs run CI validation, agent builds, and VM runners on the same
+hardware. Without a shared budget they oversubscribe — two hosts melted in July
+2026, one CPU-bound, one memory-bound/OOM. tartci is the per-host governor:
+
+- **Weighted lease store** (`scripts/leases.py`) — builds and VM runners acquire
+  a lease before starting. Priority classes (`background` < `build` < `vm` <
+  `runner` < `gate`) order contention, and a reserved gate-core headroom keeps
+  the required `macos` gate schedulable even when non-gate work fills the host.
+- **Memory as a second admission axis** — leases carry a memory weight
+  (`--mem-mb`, capacity via `--capacity-mem-mb`); admission is
+  `min(core-budget, memory-budget)`, so a build that would exhaust RAM is refused
+  even when CPU is free. Legacy core-only records are estimated as
+  `cores × per-job memory` so a mixed store never over-admits.
+- **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
+  its cores + `hw.model`: **dedicated-builder**, **dev-overflow**, or **light**,
+  each with both a core budget and a memory budget. `tartci host-profile` emits
+  the derived budget (`PULP_BUILD_JOBS`, `PULP_BUILD_MEM_BUDGET_MB`) that a
+  consumer's build wrapper reads.
+- **Agent surfaces** — `tartci host-profile` (derived budget), `tartci leases`
+  (inspect/acquire/release the store), `tartci status` (provider/capacity/role
+  state), and `tartci profile validate` (check lane selectability).
+- **Orchard fleet placement (shadow phase)** — `provider = "orchard"` is valid
+  lane vocabulary but selects nothing yet; a controller + paused workers run
+  shadow-only. See [`docs/runbook.md`](docs/runbook.md).
+
+Deep setup — onboarding a host, role derivation, and the Orchard shadow rails —
+lives in [`docs/runbook.md`](docs/runbook.md).
 
 > **Project Status:** a working lab toolkit, hardening toward turnkey. Wired +
 > proven today: the **Linux Tart lane** (`tartci up linux` — ephemeral clone →
