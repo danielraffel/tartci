@@ -18,6 +18,7 @@
 #   tartci timings [log-root|timing.tsv ...]
 #   tartci runtime <summary|export|recent|backfill|prune|complete>
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
+#   tartci pool <on|off|status> # opt this host in/out of the CI pool (participation + runners)
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
@@ -217,7 +218,79 @@ cmd_launchd() {
   esac
 }
 
-usage() { sed -n '2,25p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+cmd_pool() {
+  # host-level CI participation switch ("this machine, not now").
+  # shellcheck source=providers/common/pool.lib.sh
+  . "$HERE/providers/common/pool.lib.sh"
+  local sub="${1:-status}"; shift || true
+  local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
+  local agents_dir="$HOME/Library/LaunchAgents"
+  case "$sub" in
+    on|off)
+      local target=1 action=load
+      [ "$sub" = off ] && { target=0; action=unload; }
+      tartci_pool_write_participation "$target"
+      echo "participation: $target ($sub)"
+      local label n=0
+      while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        if launchctl "$action" "$agents_dir/$label.plist" 2>/dev/null; then
+          echo "  ${action}ed $label"; n=$((n + 1))
+        else
+          echo "  ($action skipped: $label)"
+        fi
+      done <<EOF
+$(tartci_pool_runner_agents "$agents_dir")
+EOF
+      echo "runner agents ${action}ed: $n"
+      # Forward-compatible: if an Orchard worker is configured for this host,
+      # pause/resume it too so opt-out also covers Orchard-placed VMs (best-effort).
+      if [ -n "${TARTCI_ORCHARD_URL:-}" ] && command -v orchard >/dev/null 2>&1; then
+        local wv=pause; [ "$sub" = on ] && wv=resume
+        local wname="${TARTCI_ORCHARD_WORKER:-$host}"
+        orchard "$wv" worker "$wname" >/dev/null 2>&1 && echo "  orchard: ${wv}d worker $wname"
+      fi
+      if [ "$sub" = off ]; then
+        echo "opted OUT: $host finishes in-flight jobs, takes no new CI work"
+      else
+        echo "opted IN: $host is participating in the CI pool"
+      fi
+      ;;
+    status)
+      local part; part="$(tartci_pool_read_participation)"
+      if [ "${1:-}" = "--json" ]; then
+        printf '{"host":"%s","participating":%s,"runners":[' \
+          "$host" "$([ "$part" = 1 ] && echo true || echo false)"
+        local first=1 label loaded
+        while IFS= read -r label; do
+          [ -n "$label" ] || continue
+          loaded=false; launchctl list 2>/dev/null | grep -qF "$label" && loaded=true
+          [ "$first" = 1 ] || printf ','
+          printf '{"label":"%s","loaded":%s}' "$label" "$loaded"; first=0
+        done <<EOF
+$(tartci_pool_runner_agents "$agents_dir")
+EOF
+        printf ']}\n'
+      else
+        echo "host: $host"
+        echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
+        echo "runner agents:"
+        local label loaded any=0
+        while IFS= read -r label; do
+          [ -n "$label" ] || continue; any=1
+          loaded=stopped; launchctl list 2>/dev/null | grep -qF "$label" && loaded=loaded
+          printf '  %-56s %s\n' "$label" "$loaded"
+        done <<EOF
+$(tartci_pool_runner_agents "$agents_dir")
+EOF
+        [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
+      fi
+      ;;
+    *) echo "usage: tartci pool <on|off|status> [--json]"; return 2 ;;
+  esac
+}
+
+usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
@@ -236,6 +309,7 @@ case "${1:-help}" in
   prepare) shift; cmd_prepare "$@" ;;
   up)      shift; cmd_up "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
+  pool)    shift; cmd_pool "$@" ;;
   launchd) shift; cmd_launchd "$@" ;;
   help|-h|--help) usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 2 ;;
