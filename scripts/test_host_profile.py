@@ -87,10 +87,19 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertIn("TARTCI_GATE_RESERVED_CORES=8", text)
 
     def test_json_shape_is_stable(self) -> None:
-        profile = host_profile.build_profile(role="light", cores=10)
+        profile = host_profile.build_profile(role="light", cores=10, memory_mb=16384)
         encoded = json.loads(json.dumps(profile))
-        self.assertEqual(encoded["schema"], 1)
+        self.assertEqual(encoded["schema"], 2)
         self.assertIn("no mitigation yet", encoded["notes"])
+        # Memory axis: 16 GiB - 6 GiB headroom - 4 GiB link reserve = 6 GiB budget.
+        self.assertEqual(encoded["mem_mb"], 16384)
+        self.assertEqual(encoded["lease_capacity_mem_mb"], 6144)
+        self.assertEqual(encoded["pulp_build_mem_budget_mb"], 6144)
+
+    def test_memory_axis_off_when_ram_unknown(self) -> None:
+        profile = host_profile.build_profile(role="light", cores=10, memory_mb=0)
+        self.assertEqual(profile["lease_capacity_mem_mb"], 0)
+        self.assertEqual(profile["pulp_build_mem_budget_mb"], 0)
 
 
 class HostProfileEnvironmentTests(unittest.TestCase):

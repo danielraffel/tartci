@@ -46,8 +46,17 @@ class LeaseCliTestCase(unittest.TestCase):
         priority: str = "build",
         capacity: int = 8,
         reserved: int = 0,
+        mem_mb: int | None = None,
+        capacity_mem_mb: int = 0,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
+        # Core-axis tests keep the memory axis OFF (capacity_mem_mb=0) so they
+        # are deterministic regardless of the CI host's RAM; memory-axis tests
+        # pass an explicit budget. Without this, a core capacity like `10` on a
+        # small-RAM runner would be denied by the derived memory budget.
+        extra: list[str] = ["--capacity-mem-mb", str(capacity_mem_mb)]
+        if mem_mb is not None:
+            extra += ["--mem-mb", str(mem_mb)]
         return self.run_cli(
             "acquire",
             "--id",
@@ -66,6 +75,7 @@ class LeaseCliTestCase(unittest.TestCase):
             "test",
             "--owner",
             "unittest",
+            *extra,
             check=check,
         )
 
@@ -257,6 +267,58 @@ class LeaseReclaimTests(unittest.TestCase):
         self.assertEqual(digest["reaped"], [])
         self.assertEqual(digest["problems"], ["stale_heartbeat_live_owner:live-but-stale"])
         self.assertFalse(any(key.startswith("_") for key in digest["leases"][0]))
+
+
+class LeaseMemoryAxisTests(LeaseCliTestCase):
+    def test_build_lease_without_mem_charges_a_core_derived_estimate(self) -> None:
+        body = json.loads(
+            self.acquire("a", 2, capacity=20, capacity_mem_mb=8192).stdout
+        )
+        self.assertTrue(body["ok"])
+        # 2 cores * 1536 MB/job = 3072 MB charged even without an explicit --mem-mb.
+        self.assertEqual(body["lease"]["lease_size_mem_mb"], 3072)
+        self.assertEqual(body["capacity"]["used_mem_mb"], 3072)
+        self.assertEqual(body["capacity"]["available_mem_mb"], 8192 - 3072)
+
+    def test_memory_axis_denies_when_mem_exhausted_though_cores_fit(self) -> None:
+        self.acquire("a", 1, capacity=20, capacity_mem_mb=8192, mem_mb=6000)
+        denied = self.acquire(
+            "b", 1, capacity=20, capacity_mem_mb=8192, mem_mb=4000, check=False
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["reason"], "memory_exceeded")
+        self.assertTrue(body["exceeded_axis"]["memory"])
+        self.assertFalse(body["exceeded_axis"]["cores"])  # 2 cores of 20 — cores fit
+
+    def test_legacy_core_only_record_memory_is_estimated_not_free(self) -> None:
+        self.acquire("real", 1, capacity=20, capacity_mem_mb=8192, mem_mb=1000)
+        store_file = self.store / "leases.json"
+        records = json.loads(store_file.read_text())
+        # A pre-memory-axis record: clone the real one's identity + timestamps
+        # (so reclaim keeps it) but drop lease_size_mem_mb — the only field an
+        # old tartci did not write.
+        legacy = dict(records[0])
+        legacy["id"] = "legacy"
+        legacy["lease_size_cores"] = 3
+        legacy.pop("lease_size_mem_mb", None)
+        records.append(legacy)
+        store_file.write_text(json.dumps(records))
+        digest = json.loads(
+            self.run_cli("status", "--capacity", "20", "--capacity-mem-mb", "8192").stdout
+        )
+        cap = digest["capacity"]
+        # explicit 1000 + legacy estimate (3 * 1536 = 4608) = 5608, NOT 1000.
+        self.assertEqual(cap["used_mem_mb"], 1000 + 4608)
+        self.assertEqual(cap["memory_accounting"], "estimated_legacy")
+
+    def test_memory_axis_is_off_when_capacity_mem_is_zero(self) -> None:
+        body = json.loads(
+            self.acquire("a", 1, capacity=20, capacity_mem_mb=0, mem_mb=999999).stdout
+        )
+        self.assertTrue(body["ok"])  # axis off → an absurd mem request is still granted
+        self.assertNotIn("used_mem_mb", body["capacity"])
 
 
 if __name__ == "__main__":
