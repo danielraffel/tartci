@@ -47,14 +47,16 @@ class LeaseCliTestCase(unittest.TestCase):
         capacity: int = 8,
         reserved: int = 0,
         mem_mb: int | None = None,
-        capacity_mem_mb: int | None = None,
+        capacity_mem_mb: int = 0,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
-        extra: list[str] = []
+        # Core-axis tests keep the memory axis OFF (capacity_mem_mb=0) so they
+        # are deterministic regardless of the CI host's RAM; memory-axis tests
+        # pass an explicit budget. Without this, a core capacity like `10` on a
+        # small-RAM runner would be denied by the derived memory budget.
+        extra: list[str] = ["--capacity-mem-mb", str(capacity_mem_mb)]
         if mem_mb is not None:
             extra += ["--mem-mb", str(mem_mb)]
-        if capacity_mem_mb is not None:
-            extra += ["--capacity-mem-mb", str(capacity_mem_mb)]
         return self.run_cli(
             "acquire",
             "--id",
