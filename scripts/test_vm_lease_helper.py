@@ -99,6 +99,76 @@ class VmLeaseHelperTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["5", "6"])
 
+    def test_is_non_gate_priority_helper(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            for p in gate vm build 100 200 60 0; do
+              if tartci_vm_lease_is_non_gate_priority "$p"; then echo "$p nongate"; else echo "$p gate"; fi
+            done
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["gate gate", "vm nongate", "build nongate", "100 gate", "200 gate", "60 nongate", "0 nongate"],
+        )
+
+    def test_non_gate_lease_clamped_to_budget(self) -> None:
+        # A non-gate VM lane requesting more than the non-gate budget is clamped
+        # down, so it can never be denied for exceeding it nor touch the gate reserve.
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_profile_value() {{ echo 3; }}   # force non-gate budget = 3
+                # explicit tiny mem so the core clamp is isolated from the memory axis
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "3")  # 8 clamped to the 3-core budget
+
+    def test_gate_lease_not_clamped(self) -> None:
+        # The gate lane runs at gate priority and legitimately uses reserved cores;
+        # it must NOT be clamped to the non-gate budget.
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_profile_value() {{ echo 3; }}   # non-gate budget = 3 (must be ignored for gate)
+                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "5")  # gate lease unclamped
+
     def test_provider_mem_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(
             f"""

@@ -100,6 +100,19 @@ tartci_vm_lease_priority(){
   esac
 }
 
+# Is this lease priority NON-gate? Accepts the class names tartci_vm_lease_priority
+# emits ("gate"/"vm") or a numeric priority (gate class is >= 100). A non-gate VM
+# lane is subject to the host's non-gate core budget (lease_capacity -
+# reserved_gate); a gate lane is not and must never be clamped.
+tartci_vm_lease_is_non_gate_priority(){
+  local p="${1:-vm}"
+  case "$p" in
+    gate) return 1 ;;
+    ''|*[!0-9]*) return 0 ;;          # any non-numeric class other than "gate"
+    *) [ "$p" -ge 100 ] && return 1 || return 0 ;;
+  esac
+}
+
 tartci_vm_lease_owner(){
   local host
   host="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf unknown)"
@@ -136,6 +149,21 @@ tartci_acquire_vm_lease(){
     return 75
   fi
   tartci_positive_int_or_empty "$cores" || cores=1
+  # Clamp a NON-GATE VM lane to the host's non-gate core budget
+  # (lease_capacity - reserved_gate). A non-gate lane can never lease more than
+  # that — leases.py denies it — and on a builder+gate host a mis-sized
+  # vm_pool_cores (e.g. dedicated-builder's 14 vs a 12-core non-gate budget) would
+  # otherwise make the lane un-leasable and force a hand-set per-host override.
+  # Clamping here makes any over-sized request safe by construction, so no
+  # override is load-bearing and no VM lane can encroach on the gate reserve.
+  # The gate lane runs at gate priority and is intentionally NOT clamped.
+  local _ngc
+  _ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)"
+  if tartci_vm_lease_is_non_gate_priority "$priority" \
+     && tartci_positive_int_or_empty "$_ngc" && [ "$cores" -gt "$_ngc" ]; then
+    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_ngc (non-gate budget)"
+    cores="$_ngc"
+  fi
   # An explicit VM memory size charges the memory axis its real footprint;
   # omitted (empty) lets leases.py fall back to the cores*per-job estimate.
   local mem_args=()

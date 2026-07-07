@@ -61,8 +61,11 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
     def _fixture_dir(self, td: str) -> Path:
         d = Path(td) / "LaunchAgents"
         d.mkdir()
-        # active runner agents (should match)
+        # active runner agents (should match) — incl. the bare `tart-runner`
+        # (the macOS GATE lane), which MUST be covered or `pool off` leaves the
+        # gate serving.
         for name in (
+            "com.danielraffel.pulp.tart-runner.plist",
             "com.danielraffel.pulp.tart-runner-linux.plist",
             "com.danielraffel.pulp.qemu-runner-windows.plist",
             "actions.runner.danielraffel-pulp.pulp-preamble-m5.plist",
@@ -89,6 +92,7 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
                 [
                     "actions.runner.danielraffel-pulp.pulp-preamble-m5",
                     "com.danielraffel.pulp.qemu-runner-windows",
+                    "com.danielraffel.pulp.tart-runner",
                     "com.danielraffel.pulp.tart-runner-linux",
                 ],
             )

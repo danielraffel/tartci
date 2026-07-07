@@ -1005,3 +1005,26 @@ lanes change.
 If `TARTCI_ORCHARD_URL` is set and a worker is configured, `pool off`/`on` also
 best-effort `orchard pause`/`resume` this host's worker, so the switch stays
 correct if a lane is ever cut over to Orchard placement.
+
+## Non-gate VM lanes are clamped to the non-gate core budget
+
+A VM lane that runs at **non-gate** priority (linux, macOS-release) can never
+lease more than the host's non-gate budget (`lease_capacity_cores -
+reserved_gate_cores`); `leases.py` denies a larger request. On a host that is
+both `dedicated-builder` **and** the gate host (e.g. m3: budget 26, reserved
+gate 14 → 12-core non-gate budget), the role's `vm_pool_cores` (14) *exceeds*
+that budget, so a naive linux lane would be un-leasable.
+
+`tartci_acquire_vm_lease` therefore **clamps** a non-gate lane's cores to
+`non_gate_capacity_cores`. This makes any over-sized `vm_pool_cores` (or a
+hand-set `TARTCI_LINUX_VM_CORES` override) safe by construction — no per-host
+override is load-bearing for safety, and no VM lane can encroach on the gate
+reserve. The gate lane runs at gate priority and is **not** clamped.
+
+Consequence for the m3 `TARTCI_LINUX_VM_CORES=6` override: it is now a *fairness*
+knob (6 leaves room for the macOS-release lane + native builds within the 12-core
+non-gate budget), **not** a redundant safety patch. Do **not** "pin
+`TARTCI_ROLE=dev-overflow`" to shrink it — that would make the linux runner
+acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
+reserve. Keep the override (or remove it for a linux lane sized to the full
+12-core budget); either way the clamp keeps the gate safe.
