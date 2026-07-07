@@ -274,21 +274,20 @@ class HostHealthYieldTests(unittest.TestCase):
 
 
 class HostHealthWiringTests(unittest.TestCase):
-    """Pin the host-health contract: feature defaults OFF and the loop consults it."""
+    """Pin the host-health contract: the gate decision is the SHARED helper and the
+    loop consults it. The default-off + fail-open policy itself is asserted in
+    test_host_health_lib.py (the single source of the extracted decision)."""
 
     def setUp(self) -> None:
         self.body = SCRIPT.read_text(encoding="utf-8")
 
-    def test_feature_defaults_off(self) -> None:
-        self.assertIn('HOST_VITALS_YIELD="${TARTCI_HOST_VITALS_YIELD:-}"', self.body)
+    def test_sources_shared_host_health_lib(self) -> None:
         self.assertIn(
-            '[ -n "$HOST_VITALS_YIELD" ] && [ "$HOST_VITALS_YIELD" != 0 ] '
-            "|| { printf '%s\\n' 0; return 0; }",
-            self.body,
+            'source "$TARTCI_ROOT/providers/common/host-health.lib.sh"', self.body
         )
 
     def test_loop_gate_consults_host_health(self) -> None:
-        self.assertIn('hh="$(host_health_yield)"', self.body)
+        self.assertIn('hh="$(tartci_host_health_yield)"', self.body)
         self.assertIn('[ "${hh:-0}" -eq 0 ]', self.body)
 
 
