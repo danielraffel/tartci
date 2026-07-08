@@ -26,6 +26,68 @@ Conventions used below (no operator-specific data — substitute your own):
 
 ---
 
+## Fleet setup — assemble a pool, or add one Mac to it
+
+Two ordered paths. Both lean on **`tartci setup`** (installs prereqs, creates
+stores, auto-derives + persists this host's role, and runs the governor verify
+gate — see "Onboarding a new host") and **`tartci goldens sync`** (copy goldens
+between hosts instead of re-baking). GitHub is the scheduler; each Mac is a
+label-matched runner, so there is no central "fleet controller" to stand up —
+you onboard hosts one at a time and GitHub load-balances across them.
+
+**Roles are auto-derived** (one per host, from cores + `hw.model`):
+`dedicated-builder` (biggest/always-on box; also hosts the required macOS gate),
+`dev-overflow` (a capable laptop that also does interactive dev), or `light`
+(small/travel laptop). `tartci host-profile` shows the derived role + core/memory
+budgets; pin only if you disagree (see "Onboarding a new host").
+
+### A. From scratch (new pool)
+
+1. **Pick your always-on host** — it becomes the gate anchor (and, if you use
+   Orchard shadow, the controller host). It will derive `dedicated-builder`.
+2. On it: clone tartci → `tartci setup` → bake goldens per lane
+   (§2 macOS, §3 Linux, §4 Windows).
+3. Register its GitHub Actions runners with your lane labels; `tartci pool on`.
+4. Verify governed: `tartci host-profile` (role + budgets) and
+   `tartci leases status` (store answering).
+5. *(Optional)* start the Orchard shadow controller (see "Orchard fleet
+   placement (shadow phase)").
+6. Add every other Mac via path **B**.
+
+### B. Add one Mac to an existing pool  ← the common case
+
+1. **Install + onboard.** On the new Mac: clone tartci (or rsync your deploy to
+   `~/.local/share/tartci` and expose `~/.local/bin/tartci`), then run
+   **`tartci setup`** — it installs prereqs, creates stores, **auto-derives +
+   persists the role**, and runs the governor verify gate. A half-provisioned
+   host is surfaced rather than reported clean.
+2. **Reachability.** Ensure SSH and (recommended) **Tailscale** so this host and
+   the pool can reach each other by stable name — needed for `goldens sync` and,
+   if used, the Orchard shadow.
+3. **Get goldens without re-baking.** `tartci goldens sync --from <existing-host>`
+   pulls the canonical golden(s) over the fastest link (Thunderbolt → LAN →
+   Tailscale), verifies, and repoints this host's runner. (Baking per §2–§4 also
+   works but is slow.)
+4. **Register runners** for the lanes this host will serve, using the pool's
+   label scheme (`<repo>-build` + a host-pin `<repo>-build-<tag>`); install them
+   as launchd agents (or `tartci serve <os>`). GitHub then routes matching jobs
+   here whenever this host is idle.
+5. **Join the pool.** `tartci pool on` (or the GUI "All lanes" toggle).
+   `tartci pool status` confirms the runners are loaded and participating.
+6. **Verify governed.** `tartci host-profile` shows the role + core/memory
+   budgets; `tartci leases status` shows the store answering. The governor now
+   bounds this host's builds + VMs automatically (core + memory admission).
+7. *(Optional) Orchard shadow worker.* If the pool runs the Orchard shadow,
+   register this host as a **paused** worker with derated resources +
+   `org.cirruslabs.tart-vms=0` (see "Orchard fleet placement (shadow phase)").
+   It stays observable and places nothing.
+
+The new Mac is now governed, serving its lanes, and opt-out-able
+(`tartci pool off` finishes in-flight jobs, then takes no new work) exactly like
+the rest of the pool.
+
+---
+
 ## 1. Prereqs + host setup
 
 **Tools (scripted by `./tartci setup`; manual fallback shown):**
