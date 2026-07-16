@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -118,6 +121,77 @@ class HostProfileEnvironmentTests(unittest.TestCase):
             else:
                 os.environ["TARTCI_ROLE"] = old
         self.assertEqual((role, source), ("light", "environment"))
+
+
+class HostProfileMinimalPathTests(unittest.TestCase):
+    """Detection must not depend on the caller's PATH.
+
+    A launchd agent inherits a minimal PATH that routinely omits /usr/sbin,
+    where `sysctl` lives. Every system-binary call here resolves absolutely, so
+    host detection still works under that PATH instead of raising
+    FileNotFoundError and taking the whole lease governor down with it.
+    """
+
+    #: A launchd-agent PATH with no /usr/sbin and no /sbin.
+    MINIMAL_PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+
+    def _clean_env(self) -> dict[str, str]:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.startswith("TARTCI_")
+        }
+        env["PATH"] = self.MINIMAL_PATH
+        return env
+
+    @contextlib.contextmanager
+    def _minimal_path(self):
+        saved = {key: os.environ[key] for key in list(os.environ) if key.startswith("TARTCI_")}
+        old_path = os.environ.get("PATH")
+        for key in saved:
+            os.environ.pop(key, None)
+        os.environ["PATH"] = self.MINIMAL_PATH
+        try:
+            yield
+        finally:
+            os.environ.update(saved)
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+
+    def test_detect_cores_survives_path_without_usr_sbin(self) -> None:
+        with self._minimal_path():
+            self.assertGreater(host_profile.detect_cores(), 0)
+
+    def test_detect_memory_survives_path_without_usr_sbin(self) -> None:
+        with self._minimal_path():
+            self.assertGreater(host_profile.detect_memory_mb(), 0)
+
+    def test_detect_model_survives_path_without_usr_sbin(self) -> None:
+        with self._minimal_path():
+            self.assertTrue(host_profile.detect_model())
+
+    def test_cli_emits_valid_json_under_launchd_path(self) -> None:
+        """End-to-end: the exact failure that denied every lease (rc=2)."""
+        script = Path(host_profile.__file__).resolve()
+        proc = subprocess.run(
+            [sys.executable, str(script), "--json"],
+            env=self._clean_env(),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(
+            proc.returncode,
+            0,
+            msg=f"host-profile exited {proc.returncode} under a launchd PATH; stderr:\n{proc.stderr}",
+        )
+        profile = json.loads(proc.stdout)
+        self.assertGreater(profile["ncpu"], 0)
+        self.assertGreater(profile["mem_mb"], 0)
+        self.assertGreater(profile["lease_capacity_cores"], 0)
+        self.assertGreater(profile["pulp_build_mem_budget_mb"], 0)
 
 
 if __name__ == "__main__":

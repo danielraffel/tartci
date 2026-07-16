@@ -321,5 +321,27 @@ class LeaseMemoryAxisTests(LeaseCliTestCase):
         self.assertNotIn("used_mem_mb", body["capacity"])
 
 
+class LeaseMinimalPathTests(unittest.TestCase):
+    """Lease probes must survive a launchd PATH that omits /usr/sbin."""
+
+    def test_host_boot_time_survives_path_without_usr_sbin(self) -> None:
+        old_path = os.environ.get("PATH")
+        os.environ["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+        try:
+            boot = leases.host_boot_time()
+        finally:
+            if old_path is None:
+                os.environ.pop("PATH", None)
+            else:
+                os.environ["PATH"] = old_path
+        self.assertTrue(boot)
+        self.assertNotEqual(boot, "unknown")
+
+    def test_run_reports_missing_binary_instead_of_raising(self) -> None:
+        proc = leases.run(["tartci-no-such-binary-exists"])
+        self.assertEqual(proc.returncode, 127)
+        self.assertEqual(proc.stdout, "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
