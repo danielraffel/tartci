@@ -55,7 +55,28 @@ def parse_ts(value: Any) -> dt.datetime | None:
 
 
 def run(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, text=True, capture_output=True, check=False)
+    """Run a system binary, PATH-independently. Never raises.
+
+    Resolved through host_profile so a launchd agent's minimal PATH (no
+    /usr/sbin, where `sysctl` lives) cannot turn a probe into an exception that
+    denies every lease. A missing binary reports as rc=127 with empty output,
+    which every caller here already treats as "probe unavailable".
+    """
+    resolved = host_profile.resolve_system_binary(argv[0])
+    if resolved is None:
+        return subprocess.CompletedProcess(argv, 127, "", "")
+    env = dict(os.environ)
+    env["PATH"] = host_profile.system_path()
+    try:
+        return subprocess.run(
+            [resolved, *argv[1:]],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+    except OSError as exc:
+        return subprocess.CompletedProcess(argv, 127, "", str(exc))
 
 
 def pid_start(pid: int) -> str:

@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -73,8 +74,57 @@ ROLE_DEFAULTS = {
 }
 
 
+# Where system binaries live. `sysctl` is in /usr/sbin, which a launchd agent's
+# minimal inherited PATH routinely omits — so resolving system binaries through
+# the caller's PATH makes host detection depend on who happens to invoke it. It
+# must not: every consumer of this profile (the lease governor above all) treats
+# a failure here as "no host budget", which denies every lease and boots no VMs.
+_SYSTEM_BIN_DIRS = ("/usr/sbin", "/sbin", "/usr/bin", "/bin")
+
+
+def system_path() -> str:
+    """PATH for subprocesses, with the system dirs guaranteed present."""
+    parts = [part for part in os.environ.get("PATH", "").split(os.pathsep) if part]
+    parts.extend(dir_ for dir_ in _SYSTEM_BIN_DIRS if dir_ not in parts)
+    return os.pathsep.join(parts)
+
+
+def resolve_system_binary(name: str) -> str | None:
+    """Absolute path to a system binary, independent of the caller's PATH.
+
+    Shared with leases.py: any tartci code that shells out to a system binary
+    from a launchd context must resolve it through here, not through PATH.
+    """
+    if os.path.sep in name:
+        return name
+    for directory in _SYSTEM_BIN_DIRS:
+        candidate = os.path.join(directory, name)
+        if os.access(candidate, os.X_OK):
+            return candidate
+    return shutil.which(name, path=system_path())
+
+
 def _run_text(argv: list[str]) -> str:
-    proc = subprocess.run(argv, text=True, capture_output=True, check=False)
+    """Run a system binary and return stripped stdout; "" on any failure.
+
+    Never raises: a missing binary, a non-zero exit, or an OS error all read as
+    "this probe is unavailable" so callers fall through to their next source.
+    """
+    resolved = resolve_system_binary(argv[0])
+    if resolved is None:
+        return ""
+    env = dict(os.environ)
+    env["PATH"] = system_path()
+    try:
+        proc = subprocess.run(
+            [resolved, *argv[1:]],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=env,
+        )
+    except OSError:
+        return ""
     if proc.returncode != 0:
         return ""
     return proc.stdout.strip()

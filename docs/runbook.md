@@ -666,7 +666,7 @@ rsync -a --delete --exclude .git ./ "$HOME/.local/share/tartci/"
 One-shot proof, with the same PATH launchd will use:
 
 ```bash
-PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin" \
+PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin" \
 TARTCI_WIN_GOLDEN="$HOME/.tartci/goldens/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2" \
 TARTCI_RUNNER_REPO=OWNER/REPO \
 TARTCI_RUNNER_LABELS=self-hosted,Windows,ARM64,pulp-build-windows \
