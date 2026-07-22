@@ -27,7 +27,7 @@ set -euo pipefail
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
-SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/danielraffel/pulp}"
+SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/Generous-Corp/pulp}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
 # Default excludes the `validation`-labeled tests — the primary source of the

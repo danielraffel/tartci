@@ -11,7 +11,7 @@
 # Usage:
 #   providers/tart-linux/provision.sh \
 #     [--base ghcr.io/cirruslabs/ubuntu:24.04@sha256:<pin>] \
-#     [--name pulp-linux-build] [--src-repo https://github.com/danielraffel/pulp] \
+#     [--name pulp-linux-build] [--src-repo https://github.com/Generous-Corp/pulp] \
 #     [--disk 80] [--memory 16384] [--cpu 8] [--skia-arch linux-arm64]
 #     [--rosetta|--no-rosetta]
 set -euo pipefail
@@ -21,7 +21,7 @@ VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
 NAME="pulp-linux-build"
-SRC_REPO="https://github.com/danielraffel/pulp"
+SRC_REPO="https://github.com/Generous-Corp/pulp"
 DISK=80; MEMORY=16384; CPU=8; SKIA_ARCH="linux-arm64"; ENABLE_ROSETTA=1
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 

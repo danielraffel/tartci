@@ -679,7 +679,7 @@ To create a matching queued job, prefer a Windows-native workflow. For Pulp,
 use `Build and Test` with a per-run selector override for a full proof:
 
 ```bash
-gh workflow run build.yml -R danielraffel/pulp --ref main \
+gh workflow run build.yml -R Generous-Corp/pulp --ref main \
   -f runner_provider=github-hosted \
   -f 'windows_runner_selector_json=["self-hosted","Windows","ARM64","pulp-build-windows"]'
 ```
@@ -716,7 +716,7 @@ The supervisor writes:
 Only enable normal routing after a Windows-native workflow proves the lane:
 
 ```bash
-gh variable set PULP_LOCAL_WINDOWS_RUNS_ON_JSON -R danielraffel/pulp \
+gh variable set PULP_LOCAL_WINDOWS_RUNS_ON_JSON -R Generous-Corp/pulp \
   --body '["self-hosted","Windows","ARM64","pulp-build-windows"]'
 ```
 
@@ -892,7 +892,7 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
 `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
-`TARTCI_WIN_LOGS`. Defaults target `danielraffel/pulp`
+`TARTCI_WIN_LOGS`. Defaults target `Generous-Corp/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
 host-specific label after the shared `pulp-build-*` pool label or by passing a

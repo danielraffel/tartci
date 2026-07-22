@@ -646,7 +646,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Report or safely reap tartci CI VM residue")
     parser.add_argument("--json", action="store_true", help="emit JSON digest")
     parser.add_argument("--fix", action="store_true", help="perform safe fixes")
-    parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "danielraffel/pulp"))
+    parser.add_argument("--repo", default=os.environ.get("TARTCI_RUNNER_REPO", "Generous-Corp/pulp"))
     parser.add_argument(
         "--state-dir",
         default=os.environ.get("TARTCI_STATE_DIR"),

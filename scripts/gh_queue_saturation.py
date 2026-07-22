@@ -211,7 +211,7 @@ def gather(repo: str, *, now_epoch: float | None = None) -> tuple[int, list[dict
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0] if __doc__ else None)
-    p.add_argument("--repo", default=os.environ.get("PULP_SAT_REPO", "danielraffel/pulp"))
+    p.add_argument("--repo", default=os.environ.get("PULP_SAT_REPO", "Generous-Corp/pulp"))
     p.add_argument("--apply", action="store_true", help="open/update the tracking issue")
     p.add_argument("--status", action="store_true", help="one-line health report")
     p.add_argument("--json", action="store_true", help="machine-readable verdict")
