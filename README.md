@@ -9,7 +9,7 @@ locally instead of (or alongside) GitHub-hosted runners. Headless CI is the
 priority; the same goldens double as GUI **bench** VMs you can open in UTM to test things like
 plugins in a DAW.
 
-> Project-agnostic. [Pulp](https://github.com/danielraffel/pulp/) is the first consumer, but any repo (e.g. a Pulp-based
+> Project-agnostic. [Pulp](https://github.com/Generous-Corp/pulp/) is the first consumer, but any repo (e.g. a Pulp-based
 > plugin) plugs in with one `vm-image` manifest. This repo holds **scripts +
 > configs + docs only — never the large VM images** (those stay local / pulled /
 > baked, and are gitignored).
@@ -87,7 +87,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci status --json    # host-local provider/capacity/profile state for agents
 ./tartci host-profile --json  # derived role budget; read-only
 ./tartci leases status --json # host-wide core lease store; does not acquire capacity
-./tartci profile plan normal-local-fast --repo danielraffel/pulp --json
+./tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 ./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
 ./tartci runtime summary --repo owner/repo --run-id 123 --json
 ./tartci prepare linux     # bake/provision the Linux golden (Rosetta x64 smoke enabled)

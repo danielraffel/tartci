@@ -70,7 +70,7 @@
         <key>TARTCI_REAP_PROTECTED_NAMES</key>
         <string>pulp-vm,rosetta-probe</string>
         <key>TARTCI_RUNNER_REPO</key>
-        <string>danielraffel/pulp</string>
+        <string>Generous-Corp/pulp</string>
     </dict>
 </dict>
 </plist>

@@ -9,7 +9,7 @@
 #
 # Ported from Pulp's tools/ci/qemu-runner-windows.sh (the proven supervisor) into
 # the project-agnostic tartci provider shape: repo/golden/labels are env-driven.
-# Defaults target danielraffel/pulp (the first consumer); override for any repo.
+# Defaults target Generous-Corp/pulp (the first consumer); override for any repo.
 #
 # The runner agent (actions-runner-win-arm64) is installed into C:\actions-runner
 # install-if-missing, so this works whether or not the golden has it pre-baked;
@@ -32,7 +32,7 @@ TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
-REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-danielraffel/pulp}}"
+REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Windows,ARM64,pulp-build-windows}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"

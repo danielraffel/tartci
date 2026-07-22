@@ -9,7 +9,7 @@
 #
 # Ported from Pulp's tools/ci/tart-runner-linux.sh (the proven supervisor) into
 # the project-agnostic tartci provider shape: repo/golden/labels are env-driven.
-# Defaults target danielraffel/pulp (the first consumer); override for any repo.
+# Defaults target Generous-Corp/pulp (the first consumer); override for any repo.
 #
 # The golden must carry the actions-runner agent at ~/actions-runner (the
 # linux-arm64 install). This supervisor never registers a long-lived runner —
@@ -41,7 +41,7 @@ VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/tartci}}"
 LOGROOT="${TARTCI_LINUX_LOGS:-${PULP_LINUX_LOGS:-$HOME/VMs/logs/tartci-linux}}"
 GOLDEN="${TARTCI_LINUX_GOLDEN:-${PULP_LINUX_GOLDEN:-pulp-linux-build:latest}}"
-REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-danielraffel/pulp}}"
+REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,Linux,ARM64,pulp-build-linux}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 # Workflow name the --loop gate counts as "queued work". Override per repo.

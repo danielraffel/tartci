@@ -94,9 +94,9 @@ fi
 # (2) SILENT progress wedge: process is running but NOT functional — no repo
 # registered and/or tunnel inactive. This is the signature the old error-log-only
 # check missed (a wedged-but-quiet daemon). `daemon status` is the progress signal.
-#   healthy: "... tunnel=tailscale ... repos=danielraffel/pulp"
+#   healthy: "... tunnel=tailscale ... repos=Generous-Corp/pulp"
 #   wedged : "... tunnel=inactive ... repos=—"
-# "repos=danielraffel/pulp" (registered) vs "repos=—" (wedged). ASCII-safe: a real
+# "repos=Generous-Corp/pulp" (registered) vs "repos=—" (wedged). ASCII-safe: a real
 # repo starts with a word char; the wedged placeholder is a non-word em-dash.
 if ! printf '%s' "$status" | grep -qE 'repos=[A-Za-z0-9]' ; then
   # A daemon that JUST (re)started needs a grace period to register before we call
