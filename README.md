@@ -180,6 +180,18 @@ keeps scans *succeeding* so the self-heal rarely has to fire. Quick host check:
 `runner.sh --print-queue` should print a number; if it prints `ERR`, that host's
 `gh`/App auth is degraded — fix the token, not the runner.
 
+The Shipyard queue janitor is a separate control-plane role from Tart CI runner
+capacity. Never enable its full-live mode fleet-wide. Exactly one host may set
+`SHIPYARD_QUEUE_AUTHORITY=1`, and its stored Shipyard runner tag must match the
+repo's `[merge_queue].mutation_machine`. This integration requires Shipyard
+0.79.0 or newer and must be deployed only after that binary is installed. A
+Shipyard hold on the configured authority stops its tick before GitHub reads;
+non-authority hosts are forced to reap-only even if an old plist accidentally
+leaves `SHIPYARD_TICK_APPLY=1`. Full-live also requires
+`SHIPYARD_QUEUE_REPO_ROOT` to name the authoritative checkout; the tick runs
+Shipyard there and verifies its runner tag matches that repo's
+`mutation_machine`.
+
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /

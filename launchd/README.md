@@ -237,10 +237,20 @@ Safe-by-construction: acts only on PRs that already have a ship-state record,
 never reimplements merge logic, never edits state files, fails closed on any
 GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
 (`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
-`~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1` in
-the installed plist and re-bootstrap/kickstart to arm live action. Install this
-on every CI Mac (m1/m3/m5). See the template's header comment for the exact
-`sed` install recipe. Design + adversarial review: pulp
+`~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1`.
+Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
+exactly one host whose Shipyard runner tag matches
+`[merge_queue].mutation_machine`. Other CI Macs may remain dry-run or reap-only
+but cannot become queue writers. Set `SHIPYARD_QUEUE_REPO_ROOT` to the
+authority's repository checkout; the tick runs Shipyard from that directory
+and requires `authority_matches=true` before full-live operation. An
+authority-local `shipyard merge-queue hold` causes the configured authority
+tick to exit before any GitHub read; during an incident, run it on that
+authority (and propagate it fleet-wide for consistent operator status). This
+integration requires Shipyard 0.79.0 or newer; install that release before
+deploying the script or plist. Re-bootstrap after changing the installed
+plist. See the template's header comment for the exact `sed` install recipe.
+Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
 
 ## Serving a different repo

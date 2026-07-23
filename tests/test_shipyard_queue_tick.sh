@@ -18,6 +18,8 @@ SCRIPT="$HERE/../scripts/shipyard_queue_tick.sh"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
 ACTIONS="$WORK/actions.log"; : > "$ACTIONS"
+REPO="$WORK/repo"; git init -q "$REPO"
+git -C "$REPO" remote add origin https://github.com/Generous-Corp/pulp.git
 
 # now-ish and long-ago timestamps for heartbeat freshness control.
 NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
@@ -27,6 +29,8 @@ OLD_ISO="2020-01-01T00:00:00"
 cat > "$BIN/shipyard" <<STUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
+  "--version ") echo "shipyard 0.79.0" ;;
+  "merge-queue status") echo '{"held":false,"authority_matches":true}' ;;
   "ship-state list") cat "$WORK/states.json" ;;
   "ship-state discard") echo "discard \$3" >> "$ACTIONS" ;;
   "ship-state reconcile") echo "reconcile \$3" >> "$ACTIONS" ;;
@@ -60,19 +64,22 @@ chmod +x "$BIN/shipyard" "$BIN/ghapp"
 
 echo '{"event":"merged"}' > "$WORK/automerge_out.json"
 
-# ── fixtures: three records — a merged orphan, an open-green, a live one ──
+# ── fixtures: merged, open-green, live, and a foreign-repo record ──
 cat > "$WORK/states.json" <<JSON
 {"states":[
-  {"pr":"101","repo":"danielraffel/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[]},
-  {"pr":"202","repo":"danielraffel/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[]},
-  {"pr":"303","repo":"danielraffel/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[{"last_heartbeat_at":"$NOW_ISO"}]}
+  {"pr":"101","repo":"Generous-Corp/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[]},
+  {"pr":"202","repo":"Generous-Corp/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[]},
+  {"pr":"303","repo":"Generous-Corp/pulp","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[{"last_heartbeat_at":"$NOW_ISO"}]},
+  {"pr":"404","repo":"owner/other","created_at":"$OLD_ISO","updated_at":"$OLD_ISO","dispatched_runs":[]}
 ]}
 JSON
 echo "MERGED"       > "$WORK/state_101.txt"   # orphan → reap
 echo "OPEN"         > "$WORK/state_202.txt"   # open-green → auto-merge/held
 echo "OPEN"         > "$WORK/state_303.txt"   # open but live worker → skip
+echo "OPEN"         > "$WORK/state_404.txt"   # foreign repo → never mutate
 echo "MERGEABLE|CLEAN|false" > "$WORK/merge_202.txt"
 echo "MERGEABLE|CLEAN|false" > "$WORK/merge_303.txt"
+echo "MERGEABLE|CLEAN|false" > "$WORK/merge_404.txt"
 
 run() { : > "$ACTIONS"; env PATH="$BIN:$PATH" "$@" bash "$SCRIPT" 2>&1; }
 fail() { echo "FAIL: $1"; exit 1; }
@@ -94,16 +101,18 @@ hasnt "discard 303"; hasnt "automerge 303"
 echo "  ok"
 
 echo "== full-live: reap merged AND auto-merge open-green, skip live =="
-out="$(run SHIPYARD_TICK_APPLY=1)"
+out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
 has  "discard 101"
 has  "automerge 202"
+hasnt "automerge 404"
 hasnt "discard 303"; hasnt "automerge 303"
 echo "$out" | grep -q "202: merged" || fail "202 should report merged"
+echo "$out" | grep -q "owner/other#404: outside authority repo Generous-Corp/pulp — skip" || fail "foreign repo should be skipped"
 echo "  ok"
 
 echo "== fail-closed: GitHub state read empty -> skip, no action =="
 echo "" > "$WORK/state_101.txt"   # simulate read failure for 101
-out="$(run SHIPYARD_TICK_APPLY=1)"
+out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
 hasnt "discard 101"
 echo "$out" | grep -q "101: GitHub read failed — skip (fail closed)" || fail "101 should fail closed"
 echo "MERGED" > "$WORK/state_101.txt"   # restore
