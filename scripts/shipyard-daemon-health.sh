@@ -53,7 +53,11 @@ recent_refreshes(){
     [ -n "$ts" ] && [ "$ts" -ge "$cutoff" ] 2>/dev/null && kept="$kept$ts"$'\n'
   done < "$STAMP"
   printf '%s' "$kept" > "$STAMP"
-  printf '%s' "$kept" | grep -c . 2>/dev/null || printf '0'
+  # `grep -c` prints 0 *and* exits 1 when there are no matches. Appending a
+  # fallback `printf 0` therefore returns "0\n0", which is not an integer and
+  # disables the anti-thrash comparison on the first heal. `awk` always exits
+  # successfully and emits exactly one integer.
+  printf '%s' "$kept" | awk 'END { print NR }'
 }
 record_refresh(){ date +%s >> "$STAMP"; }
 
