@@ -19,6 +19,12 @@
 #
 # Tunables (env):
 #   SHIPYARD_TICK_APPLY=0|1                 default 0 (dry-run)
+#   SHIPYARD_QUEUE_AUTHORITY=0|1             default 0. FULL-LIVE is refused
+#       unless this host is the explicitly selected queue authority.
+#   SHIPYARD_QUEUE_REPO_ROOT=<checkout>       required for FULL-LIVE. Shipyard
+#       loads that checkout's mutation_machine policy before GitHub access.
+#   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.79.0. The tick requires
+#       Shipyard's fail-closed merge-queue control surface.
 #   SHIPYARD_TICK_REAP_ONLY=0|1             default 0. With APPLY=1, act on the
 #       proven reap path (discard GitHub-MERGED/CLOSED orphans) but hold the
 #       auto-merge path in surface-only mode. This is the safe staged-rollout
@@ -31,17 +37,82 @@
 set -uo pipefail
 
 APPLY="${SHIPYARD_TICK_APPLY:-0}"
+AUTHORITY="${SHIPYARD_QUEUE_AUTHORITY:-0}"
+REPO_ROOT="${SHIPYARD_QUEUE_REPO_ROOT:-}"
+MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.79.0}"
 REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
 METHOD="${SHIPYARD_TICK_MERGE_METHOD:-merge}"
 GH="ghapp"; command -v ghapp >/dev/null 2>&1 || GH="gh"
 SY="$(command -v shipyard 2>/dev/null || echo "$HOME/.local/bin/shipyard")"
 HOST="$(scutil --get ComputerName 2>/dev/null || hostname)"
-SS=/tmp/_qt_ss.json; ROWS=/tmp/_qt_rows.txt
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/shipyard-queue-tick.XXXXXX")" || exit 0
+trap 'rm -rf "$TMP"' EXIT
+SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [queue-tick] $*"; }
 iso2epoch() { [ -z "${1:-}" ] && { echo 0; return; }; date -u -j -f "%Y-%m-%dT%H:%M:%S" "${1%%.*}" +%s 2>/dev/null || echo 0; }
+
+installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
+compatible="$(python3 - "$installed" "$MIN_VERSION" <<'PY'
+import re, sys
+def version(value):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
+    return tuple(map(int, match.groups())) if match else None
+installed, required = map(version, sys.argv[1:3])
+print("1" if installed is not None and required is not None and installed >= required else "0")
+PY
+)"
+if [ "$compatible" != "1" ]; then
+  log "$HOST: Shipyard $MIN_VERSION or newer is required — skip entire tick (fail closed)"
+  exit 0
+fi
+if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ ! -d "$REPO_ROOT" ]; then
+  log "$HOST: FULL-LIVE refused without SHIPYARD_QUEUE_REPO_ROOT checkout; forcing reap-only"
+  REAP_ONLY=1
+fi
+CONTROL_CWD="$HOME"
+[ -d "$REPO_ROOT" ] && CONTROL_CWD="$REPO_ROOT"
+AUTHORITY_REPO=""
+if [ -d "$REPO_ROOT" ]; then
+  remote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
+  AUTHORITY_REPO="$(python3 - "$remote" <<'PY'
+import re, sys
+remote = sys.argv[1].strip()
+match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", remote)
+print(match.group(1) if match else "")
+PY
+)"
+fi
+if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ -z "$AUTHORITY_REPO" ]; then
+  log "$HOST: FULL-LIVE refused because repo root has no GitHub origin; forcing reap-only"
+  REAP_ONLY=1
+fi
+control="$(cd "$CONTROL_CWD" && "$SY" merge-queue status --json 2>/dev/null)" || {
+  log "$HOST: merge-queue control unavailable — skip entire tick (fail closed)"
+  exit 0
+}
+held="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("held") else "0")' 2>/dev/null)" || {
+  log "$HOST: merge-queue control malformed — skip entire tick (fail closed)"
+  exit 0
+}
+authority_matches="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("authority_matches") else "0")' 2>/dev/null)" || {
+  log "$HOST: merge-queue authority status malformed — skip entire tick (fail closed)"
+  exit 0
+}
+if [ "$held" = "1" ]; then
+  log "$HOST: local merge-queue hold active — skip entire tick before GitHub reads"
+  exit 0
+fi
+if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$AUTHORITY" != "1" ]; then
+  log "$HOST: FULL-LIVE refused without SHIPYARD_QUEUE_AUTHORITY=1; forcing reap-only"
+  REAP_ONLY=1
+fi
+if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$authority_matches" != "1" ]; then
+  log "$HOST: FULL-LIVE refused because runner tag does not match mutation_machine; forcing reap-only"
+  REAP_ONLY=1
+fi
 
 "$SY" ship-state list --json 2>/dev/null > "$SS" || { log "$HOST: shipyard ship-state unavailable"; exit 0; }
 
@@ -79,6 +150,11 @@ while IFS=$'\t' read -r pr repo hb; do
         if "$SY" ship-state discard "$pr" >/dev/null 2>&1; then log "  $repo#$pr: reaped ($state)"; reaped=$((reaped+1)); else log "  $repo#$pr: discard failed"; errs=$((errs+1)); fi
       else log "  $repo#$pr: would reap ($state)"; reaped=$((reaped+1)); fi ;;
     OPEN)
+      if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$repo" != "$AUTHORITY_REPO" ]; then
+        log "  $repo#$pr: outside authority repo $AUTHORITY_REPO — skip"
+        waiting=$((waiting+1))
+        continue
+      fi
       info="$($GH pr view "$pr" --repo "$repo" --json mergeable,mergeStateStatus,isDraft --jq '"\(.mergeable)|\(.mergeStateStatus)|\(.isDraft)"' 2>/dev/null)"
       if [ -z "$info" ]; then log "  $repo#$pr: mergeability read failed — skip (fail closed)"; errs=$((errs+1)); continue; fi
       mergeable="${info%%|*}"; rest="${info#*|}"; mss="${rest%%|*}"; draft="${rest##*|}"
@@ -87,8 +163,8 @@ while IFS=$'\t' read -r pr repo hb; do
         log "  $repo#$pr: OPEN not fast-forwardable (mergeable=$mergeable status=$mss) — SURFACE, no auto-rebase"; stalled=$((stalled+1)); continue
       fi
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
-        "$SY" ship-state reconcile "$pr" >/dev/null 2>&1
-        out="$("$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>&1)"
+        (cd "$REPO_ROOT" && "$SY" ship-state reconcile "$pr") >/dev/null 2>&1
+        out="$(cd "$REPO_ROOT" && "$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>&1)"
         if echo "$out" | grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged'; then log "  $repo#$pr: merged"; merged=$((merged+1))
         else log "  $repo#$pr: not green yet / no-op"; waiting=$((waiting+1)); fi
       elif [ "$APPLY" = "1" ]; then
