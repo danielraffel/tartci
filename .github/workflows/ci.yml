@@ -38,3 +38,9 @@ jobs:
         # These tests are gh/tart-free (they extract+run pure snippets or call
         # the python-only CLI), so they run on the ubuntu lint host.
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
+      - name: Run shell tests
+        run: |
+          for test_script in tests/test_*.sh; do
+            bash "$test_script"
+          done

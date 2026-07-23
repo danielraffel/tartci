@@ -52,7 +52,13 @@ SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [queue-tick] $*"; }
-iso2epoch() { [ -z "${1:-}" ] && { echo 0; return; }; date -u -j -f "%Y-%m-%dT%H:%M:%S" "${1%%.*}" +%s 2>/dev/null || echo 0; }
+iso2epoch() {
+  [ -z "${1:-}" ] && { echo 0; return; }
+  local timestamp="${1%%.*}"
+  date -u -j -f "%Y-%m-%dT%H:%M:%S" "$timestamp" +%s 2>/dev/null \
+    || date -u -d "$timestamp" +%s 2>/dev/null \
+    || echo 0
+}
 
 installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
 compatible="$(python3 - "$installed" "$MIN_VERSION" <<'PY'
