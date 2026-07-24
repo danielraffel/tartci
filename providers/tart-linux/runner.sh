@@ -301,7 +301,9 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host 2>/dev/null; sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || true; \
      if [ -d /mnt/host/ccache ] && [ -w /mnt/host/ccache ]; then mkdir -p ~/.ccache && ln -sfn /mnt/host/ccache ~/.ccache; fi; \
-     printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
+     printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
+     umask 0022 && runner_umask=\"\$(umask)\" && printf 'TARTCI_DIAG runner_umask=%s\n' \"\$runner_umask\" && \
+     [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
     >"$logdir/runner-output.log" 2>&1 \
     || { run_status=$?; note "[$i] runner exited non-zero (job failure or no job) — VM will be discarded regardless"; }
   t_runner_done="$(now_epoch)"
