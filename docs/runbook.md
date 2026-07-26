@@ -857,7 +857,12 @@ config via `gh api .../generate-jitconfig` (needs repo admin), clone the golden
 once with that JIT config, then discard the VM. The agent processes exactly one
 job and deregisters — no long-lived runner state. The `--loop` gate only boots
 when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
-`Build and Test`.
+`Build and Test`. Discovery is intentionally bounded and rotated to keep GitHub
+API use stable. Consequently, `--print-queue` returning `0` means no match in
+that scan window, not that every workflow in the repository was inspected. Use
+`shipyard runner fleet-status --repo OWNER/REPO --json` to diagnose the
+merge-queue front and required contexts; use Tart CI state and logs to diagnose
+VM capacity. `ERR` is the distinct scanner/authentication failure sentinel.
 Linux and Windows scan queued and in-progress workflow runs for queued jobs and
 add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
@@ -884,6 +889,15 @@ GitHub job timestamps before promoting local routing.
 macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."
+
+Set `TARTCI_VM_LEASE_PRIORITY=gate` on the required-gate supervisors on every
+pool host (M1, M3, and M5), and make advisory supervisors yield. Keep required
+and advisory workflows on distinct class labels. Once a JIT runner is online,
+GitHub—not Tart CI—selects any queued job with a satisfiable label set, so
+identical labels let an optional snapshot, example, coverage, or GPU job consume
+capacity intended for the merge-queue front. Queue order, exact-head
+re-enrollment, bounded reruns, and redundant-run coalescing belong to Shipyard.
+Do not run Orchard alongside Shipyard and Tart CI.
 
 Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_MACOS_GOLDEN` / `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,

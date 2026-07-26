@@ -93,6 +93,32 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   installed. → *Fix:* run `softwareupdate --install-rosetta --agree-to-license`
   on the Mac and boot with `tart run --rosetta=rosetta <vm>`.
 
+## Queue and pool control
+
+- **All three Macs look healthy, but the required front job is still queued.**
+  → *Cause:* runner process health is not useful-progress health. A bounded
+  scanner can legitimately report `queued=0` for its current window, or GitHub
+  can assign an optional job that shares the required job's labels.
+  → *Fix:* inspect `shipyard runner fleet-status --repo OWNER/REPO --json`,
+  configure M1/M3/M5 gate supervisors with
+  `TARTCI_VM_LEASE_PRIORITY=gate`, and separate required-gate labels from
+  advisory labels.
+
+- **The queue tick is running every five minutes but arms or merges nothing.**
+  → *Cause:* full-live Shipyard execution was launched without
+  `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
+  plane exits unhealthy and takes no GitHub action.
+  → *Fix:* repair the single authority's environment and alert on that
+  configuration error. Do not treat repeated `merged=0` as proof the queue is
+  healthy, and do not add Orchard as a fallback scheduler.
+
+- **A newly booted VM runs an optional job instead of the required gate.**
+  → *Cause:* GitHub chooses among all queued jobs matching the runner's labels;
+  Tart CI cannot retarget a JIT runner after registration.
+  → *Fix:* use distinct required/advisory class labels. Let Shipyard safely
+  coalesce superseded runs before capacity is offered; never dequeue/requeue a
+  PR merely to change its position.
+
 ## Windows (QEMU)
 
 - **Install media won't boot — BCD `0xc000000d` (\EFI\Microsoft\Boot\BCD).**
