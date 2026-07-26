@@ -64,11 +64,15 @@ JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
 EVENT_LOG="${TARTCI_EVENT_LOG:-$STATE_DIR/events.jsonl}"
+EVENT_LOG_EXPLICIT=0
+[ -n "${TARTCI_EVENT_LOG:-}" ] && EVENT_LOG_EXPLICIT=1
 MACOS_LOGROOT="${TARTCI_MACOS_LOGS:-$HOME/VMs/logs/tartci-macos}"
 RUNNER_NAME="${TARTCI_RUNNER_NAME:-${PULP_RUNNER_NAME:-}}"
 RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-}}"
 SLOT="${TARTCI_RUNNER_SLOT:-${PULP_RUNNER_SLOT:-1}}"
 PRINT_NAME=0
+PRINT_EVENT_LOG=0
+PRINT_IDENTITY=0
 PRINT_QUEUE=0
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
@@ -97,21 +101,6 @@ source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
-derive_runner_name(){
-  if [ -n "$RUNNER_NAME" ]; then printf '%s' "$RUNNER_NAME"; return; fi
-  local prefix="$RUNNER_NAME_PREFIX" class="" l
-  if [ -z "$prefix" ]; then
-    IFS=',' read -r -a label_parts <<< "$LABELS"
-    for l in "${label_parts[@]}"; do case "$l" in pulp-build-?*) class="${l#pulp-build-}";; esac; done
-    if [ -n "$class" ]; then
-      prefix="pulp-$class"
-    else
-      prefix="pulp-$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
-    fi
-  fi
-  printf '%s-%02d' "$prefix" "$((10#$SLOT))"
-}
-
 # Per-BOOT GitHub runner registration name: <lane>-<supervisor pid>-<boot index>,
 # mirroring the qemu-windows lane (`${RUNNER_NAME_PREFIX}-$$-$i`). This must be
 # unique for every boot and never reused. Rationale: a fixed static name (the bare
@@ -136,8 +125,10 @@ while [ $# -gt 0 ]; do case "$1" in
   --name) RUNNER_NAME="$2"; shift 2;;
   --name-prefix) RUNNER_NAME_PREFIX="$2"; shift 2;;
   --slot) SLOT="$2"; shift 2;;
-  --state-dir) STATE_DIR="$2"; EVENT_LOG="$STATE_DIR/events.jsonl"; shift 2;;
+  --state-dir) STATE_DIR="$2"; EVENT_LOG_EXPLICIT=0; shift 2;;
   --print-name) PRINT_NAME=1; shift;;
+  --print-event-log) PRINT_EVENT_LOG=1; shift;;
+  --print-identity) PRINT_IDENTITY=1; shift;;
   --print-boot-name) PRINT_BOOT_NAME="$2"; shift 2;;  # debug/test: emit ephemeral_boot_name <i>
   --print-queue) PRINT_QUEUE=1; shift;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
@@ -148,8 +139,21 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 
-RUNNER_NAME="$(derive_runner_name)"
+IDENTITY_JSON="$(python3 "$TARTCI_ROOT/scripts/macos_runner_identity.py" \
+  --name "$RUNNER_NAME" \
+  --name-prefix "$RUNNER_NAME_PREFIX" \
+  --slot "$SLOT" \
+  --labels "$LABELS" \
+  --state-dir "$STATE_DIR" \
+  --home "$HOME" \
+  --hostname "$HOST_NAME")" \
+  || die "could not derive macOS runner identity"
+RUNNER_NAME="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["runner_name"])')"
+STATE_DIR="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(json.load(sys.stdin)["state_dir"])')"
+[ "$EVENT_LOG_EXPLICIT" = 1 ] || EVENT_LOG="$STATE_DIR/events.jsonl"
+[ "$PRINT_IDENTITY" = 1 ] && { printf '%s\n' "$IDENTITY_JSON"; exit 0; }
 [ "$PRINT_NAME" = 1 ] && { printf '%s\n' "$RUNNER_NAME"; exit 0; }
+[ "$PRINT_EVENT_LOG" = 1 ] && { printf '%s\n' "$EVENT_LOG"; exit 0; }
 [ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
 
 if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then

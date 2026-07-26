@@ -64,6 +64,7 @@ METHOD="${SHIPYARD_TICK_MERGE_METHOD:-merge}"
 GH="${SHIPYARD_QUEUE_GH_CLI:-}"
 SY="$(command -v shipyard 2>/dev/null || echo "$HOME/.local/bin/shipyard")"
 HOST="$(scutil --get ComputerName 2>/dev/null || hostname)"
+SUPPORT="$(cd "$(dirname "$0")" && pwd)/shipyard_queue_tick_support.py"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [queue-tick] $*"; }
@@ -73,16 +74,7 @@ health() {
     log "$HOST: HEALTH WRITE FAILED: cannot create $(dirname "$HEALTH_FILE")"
     return 1
   fi
-  if ! python3 - "$status" "$reason" "$HOST" "$(ts)" > "$temp" 2>/dev/null <<'PY'
-import json,sys
-print(json.dumps({
-    "schema_version": 1,
-    "status": sys.argv[1],
-    "reason": sys.argv[2],
-    "host": sys.argv[3],
-    "observed_at": sys.argv[4],
-}, sort_keys=True))
-PY
+  if ! python3 "$SUPPORT" health "$temp" "$status" "$reason" "$HOST" "$(ts)" 2>/dev/null
   then
     rm -f "$temp"
     log "$HOST: HEALTH WRITE FAILED: cannot encode $HEALTH_FILE"
@@ -104,15 +96,8 @@ unhealthy() {
 validate_tunables() {
   case "$APPLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_APPLY must be 0 or 1" ;; esac
   case "$REAP_ONLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_REAP_ONLY must be 0 or 1" ;; esac
-  python3 - "$FRESH" "$INVALID_THRESHOLD" <<'PY' >/dev/null 2>&1 || \
+  python3 "$SUPPORT" validate-tunables "$FRESH" "$INVALID_THRESHOLD" >/dev/null 2>&1 || \
     unhealthy "heartbeat freshness must be 0..604800 and invalid threshold 1..100000"
-import re, sys
-fresh, threshold = sys.argv[1:]
-if not re.fullmatch(r"[0-9]+", fresh) or not 0 <= int(fresh) <= 604800:
-    raise SystemExit(1)
-if not re.fullmatch(r"[0-9]+", threshold) or not 1 <= int(threshold) <= 100000:
-    raise SystemExit(1)
-PY
   case "$METHOD" in
     merge|squash|rebase) ;;
     *) unhealthy "SHIPYARD_TICK_MERGE_METHOD must be merge, squash, or rebase" ;;
@@ -144,61 +129,11 @@ load_canonical_config() {
 invalid_count() {
   local repo="$1" pr="$2" outcome="$3"
   mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || return 1
-  python3 - "$INVALID_LEDGER" "$repo" "$pr" "$outcome" <<'PY'
-import json, os, sys, tempfile
-path, repo, pr, outcome = sys.argv[1:]
-try:
-    with open(path) as source:
-        data = json.load(source)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    raise ValueError("invalid ledger must contain a JSON object")
-if any(type(value) is not int or value < 0 for value in data.values()):
-    raise ValueError("invalid ledger counters must be nonnegative integers")
-key = f"{repo}#{pr}"
-if outcome == "not_found":
-    data[key] = data.get(key, 0) + 1
-else:
-    data.pop(key, None)
-os.makedirs(os.path.dirname(path), exist_ok=True)
-fd, temp = tempfile.mkstemp(prefix=".queue-tick-invalid.", dir=os.path.dirname(path))
-with os.fdopen(fd, "w") as out:
-    json.dump(data, out, sort_keys=True)
-os.replace(temp, path)
-print(int(data.get(key, 0)))
-PY
+  python3 "$SUPPORT" ledger-update "$INVALID_LEDGER" "$repo" "$pr" "$outcome"
 }
 validate_invalid_ledger() {
   mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || return 1
-  python3 - "$INVALID_LEDGER" <<'PY'
-import json, os, sys, tempfile
-path = sys.argv[1]
-try:
-    with open(path) as source:
-        data = json.load(source)
-except FileNotFoundError:
-    data = {}
-if not isinstance(data, dict):
-    raise ValueError("invalid ledger must contain a JSON object")
-if any(type(value) is not int or value < 0 for value in data.values()):
-    raise ValueError("invalid ledger counters must be nonnegative integers")
-directory = os.path.dirname(path)
-fd, temp = tempfile.mkstemp(prefix=".queue-tick-ledger-probe.", dir=directory)
-published = f"{temp}.published"
-try:
-    with os.fdopen(fd, "w") as out:
-        json.dump(data, out, sort_keys=True)
-        out.flush()
-        os.fsync(out.fileno())
-    os.replace(temp, published)
-finally:
-    for candidate in (temp, published):
-        try:
-            os.unlink(candidate)
-        except FileNotFoundError:
-            pass
-PY
+  python3 "$SUPPORT" ledger-validate "$INVALID_LEDGER"
 }
 validate_tunables
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/shipyard-queue-tick.XXXXXX")" \
@@ -209,15 +144,7 @@ SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
 load_canonical_config
 validate_invalid_ledger || unhealthy "invalid-ledger integrity/writability check failed"
 installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
-compatible="$(python3 - "$installed" "$MIN_VERSION" <<'PY'
-import re, sys
-def version(value):
-    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", value)
-    return tuple(map(int, match.groups())) if match else None
-installed, required = map(version, sys.argv[1:3])
-print("1" if installed is not None and required is not None and installed >= required else "0")
-PY
-)"
+compatible="$(python3 "$SUPPORT" version-compatible "$installed" "$MIN_VERSION")"
 if [ "$compatible" != "1" ]; then
   unhealthy "Shipyard $MIN_VERSION or newer is required"
 fi
@@ -229,23 +156,7 @@ CONTROL_CWD="$HOME"
 AUTHORITY_REPO=""
 if [ -d "$REPO_ROOT" ]; then
   remote="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
-  AUTHORITY_REPO="$(python3 - "$remote" <<'PY'
-import re, sys
-remote = sys.argv[1].strip()
-patterns = (
-    r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-    r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-)
-for pattern in patterns:
-    match = re.fullmatch(pattern, remote)
-    if match:
-        print(f"{match.group(1)}/{match.group(2)}")
-        break
-else:
-    print("")
-PY
-)"
+  AUTHORITY_REPO="$(python3 "$SUPPORT" github-origin "$remote" 2>/dev/null || true)"
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ -z "$AUTHORITY_REPO" ]; then
   unhealthy "FULL-LIVE repo root has no GitHub origin"
@@ -253,17 +164,8 @@ fi
 control="$(cd "$CONTROL_CWD" && "$SY" merge-queue status --json 2>/dev/null)" || {
   unhealthy "merge-queue control unavailable"
 }
-control_flags="$(printf '%s' "$control" | python3 -c '
-import json, sys
-value = json.load(sys.stdin)
-if not isinstance(value, dict):
-    raise ValueError("control must be an object")
-held = value.get("held")
-authority = value.get("authority_matches")
-if type(held) is not bool or type(authority) is not bool:
-    raise ValueError("control booleans must be exact JSON booleans")
-print(f"{int(held)}|{int(authority)}")
-' 2>/dev/null)" || unhealthy "merge-queue control schema malformed"
+control_flags="$(printf '%s' "$control" | python3 "$SUPPORT" control-flags 2>/dev/null)" \
+  || unhealthy "merge-queue control schema malformed"
 held="${control_flags%%|*}"
 authority_matches="${control_flags##*|}"
 if [ "$held" = "1" ]; then
@@ -282,49 +184,18 @@ fi
   || unhealthy "queue tick refuses ambient gh; configure a GitHub App wrapper"
 command -v "$GH" >/dev/null 2>&1 \
   || unhealthy "configured GitHub App wrapper is not executable: $GH"
+# Installation readiness is distinct from completion: publish it after all
+# local/configuration checks, before bounded or queue-size-dependent network I/O.
+health "starting" "local_prerequisites_validated" || exit 2
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
   auth_export="$(cd "$REPO_ROOT" && "$SY" auth export --json 2>/dev/null)" \
     || unhealthy "Shipyard effective GitHub auth config is unavailable"
-  shipyard_auth_mode="$(printf '%s' "$auth_export" | python3 -c '
-import json, os, shutil, sys
-value = json.load(sys.stdin)
-if not isinstance(value, dict) or type(value.get("schema_version")) is not int \
-    or value["schema_version"] != 1:
-    raise ValueError("invalid auth export envelope")
-if value.get("command") != "auth.export" or not isinstance(value.get("bundle"), dict):
-    raise ValueError("invalid auth export payload")
-auth = value["bundle"].get("github", {}).get("auth")
-if auth is None or auth == {} or auth.get("source", "gh-cli") == "gh-cli":
-    print("inject")
-elif (
-    isinstance(auth, dict)
-    and auth.get("source") == "command"
-    and isinstance(auth.get("token_command"), list)
-    and len(auth["token_command"]) > 0
-    and os.path.realpath(shutil.which(auth["token_command"][0]) or auth["token_command"][0])
-        == os.path.realpath(shutil.which(sys.argv[1]) or sys.argv[1])
-):
-    print("configured")
-else:
-    raise ValueError("Shipyard auth is not bound to the configured App wrapper")
-' "$GH" 2>/dev/null)" || unhealthy "Shipyard auth is not bound to configured GitHub App wrapper"
+  shipyard_auth_mode="$(printf '%s' "$auth_export" | python3 "$SUPPORT" auth-mode "$GH" 2>/dev/null)" \
+    || unhealthy "Shipyard auth is not bound to configured GitHub App wrapper"
   APP_TOKEN=""
   if [ "$shipyard_auth_mode" = "inject" ]; then
-    APP_TOKEN="$(python3 - "$GH" <<'PY' 2>/dev/null
-import re, subprocess, sys
-completed = subprocess.run(
-    [sys.argv[1], "auth", "token"],
-    check=False,
-    capture_output=True,
-    text=True,
-    timeout=15,
-)
-token = completed.stdout.strip()
-if completed.returncode != 0 or not token or re.search(r"[\x00-\x20\x7f]", token):
-    raise SystemExit(1)
-sys.stdout.write(token)
-PY
-)" || unhealthy "GitHub App wrapper could not provide a bounded token"
+    APP_TOKEN="$(python3 "$SUPPORT" app-token "$GH" 2>/dev/null)" \
+      || unhealthy "GitHub App wrapper could not provide a bounded token"
   fi
   shipyard_with_app_auth() {
     if [ "$shipyard_auth_mode" = "inject" ]; then
@@ -333,95 +204,14 @@ PY
       "$SY" "$@"
     fi
   }
-  authority_read="$(python3 - "$GH" "$AUTHORITY_REPO" <<'PY' 2>/dev/null
-import subprocess, sys
-completed = subprocess.run(
-    [sys.argv[1], "pr", "list", "--repo", sys.argv[2], "--limit", "1", "--json", "number"],
-    check=False,
-    capture_output=True,
-    text=True,
-    timeout=15,
-)
-if completed.returncode != 0:
-    raise SystemExit(completed.returncode)
-sys.stdout.write(completed.stdout)
-PY
-)" \
+  python3 "$SUPPORT" authority-read "$GH" "$AUTHORITY_REPO" >/dev/null 2>&1 \
     || unhealthy "GitHub App authority-repo read failed"
-  printf '%s' "$authority_read" | python3 -c '
-import json, sys
-value = json.load(sys.stdin)
-if not isinstance(value, list):
-    raise ValueError("expected array")
-for row in value:
-    if not isinstance(row, dict) or type(row.get("number")) is not int:
-        raise ValueError("expected typed PR number rows")
-' 2>/dev/null || unhealthy "GitHub App authority-repo read schema malformed"
 fi
 
 "$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"
 
-python3 - "$SS" > "$ROWS" <<'PY' || unhealthy "shipyard ship-state payload malformed"
-import datetime,json,re,sys
-d=json.load(open(sys.argv[1]))
-if not isinstance(d, dict) or not isinstance(d.get("states"), list):
-    raise ValueError("expected object with states array")
-rows = []
-repo_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+")
-rfc3339_pattern = re.compile(
-    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
-    r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
-    r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
-)
-
-def timestamp_epoch(value, field):
-    if value is None or value == "":
-        return 0
-    if not isinstance(value, str) or not rfc3339_pattern.fullmatch(value):
-        raise ValueError(f"state {field} must be empty or RFC3339")
-    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
-    try:
-        parsed = datetime.datetime.fromisoformat(normalized)
-    except ValueError as error:
-        raise ValueError(f"state {field} must be empty or RFC3339") from error
-    if parsed.tzinfo is None:
-        raise ValueError(f"state {field} must carry an RFC3339 offset")
-    return int(parsed.timestamp())
-
-for s in d["states"]:
-    if not isinstance(s, dict):
-        raise ValueError("state entry must be an object")
-    pr = s.get("pr")
-    if isinstance(pr, bool) or not (
-        isinstance(pr, int) and pr > 0
-        or isinstance(pr, str) and re.fullmatch(r"[1-9][0-9]*", pr)
-    ):
-        raise ValueError("state pr must be a positive integer")
-    pr = str(pr)
-    repo = s.get("repo")
-    if not isinstance(repo, str) or not repo_pattern.fullmatch(repo):
-        raise ValueError("state repo must be a canonical owner/name slug")
-    runs = s.get("dispatched_runs")
-    if runs is None:
-        runs = []
-    if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
-        raise ValueError("state dispatched_runs must be an array of objects")
-    heartbeats = []
-    for run in runs:
-        heartbeats.append(
-            timestamp_epoch(run.get("last_heartbeat_at"), "heartbeat")
-        )
-    hb=max(heartbeats, default=0)
-    timestamps = []
-    for field in ("updated_at", "created_at"):
-        timestamps.append(timestamp_epoch(s.get(field), field))
-    # freshness = most recent of heartbeat / record-write / record-create, so a
-    # just-created ship (runs=0, no heartbeat yet) is still treated as live.
-    fresh=max([hb, *timestamps])
-    rows.append((pr, repo, str(fresh)))
-for row in rows:
-    print("\t".join(row))
-PY
+python3 "$SUPPORT" state-rows "$SS" > "$ROWS" \
+  || unhealthy "shipyard ship-state payload malformed"
 
 now=$(date -u +%s)
 total=$(wc -l < "$ROWS" | tr -d ' ')
@@ -517,22 +307,7 @@ while IFS=$'\t' read -r pr repo hbe; do
         errs=$((errs+1))
         continue
       fi
-      info_fields="$(printf '%s' "$info" | python3 -c '
-import json, sys
-value = json.load(sys.stdin)
-if not isinstance(value, dict) or set(value) != {"mergeable", "mergeStateStatus", "isDraft"}:
-    raise ValueError("unexpected mergeability schema")
-mergeable = value["mergeable"]
-status = value["mergeStateStatus"]
-draft = value["isDraft"]
-if mergeable not in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}:
-    raise ValueError("unexpected mergeable enum")
-if status not in {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}:
-    raise ValueError("unexpected merge-state enum")
-if type(draft) is not bool:
-    raise ValueError("draft must be boolean")
-print(f"{mergeable}|{status}|{str(draft).lower()}")
-' 2>/dev/null)" || {
+      info_fields="$(printf '%s' "$info" | python3 "$SUPPORT" mergeability 2>/dev/null)" || {
         log "  $repo#$pr: mergeability schema malformed — skip (fail closed)"
         errs=$((errs+1))
         continue
@@ -545,28 +320,7 @@ print(f"{mergeable}|{status}|{str(draft).lower()}")
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
         reconcile_out="$(cd "$REPO_ROOT" && shipyard_with_app_auth ship-state reconcile "$pr" --json 2>/dev/null)"
         reconcile_status=$?
-        reconcile_ok="$(printf '%s' "$reconcile_out" | python3 -c '
-import json, sys
-expected = int(sys.argv[1])
-value = json.load(sys.stdin)
-results = value.get("results") if isinstance(value, dict) else None
-ok = (
-    type(value.get("schema_version")) is int
-    and value["schema_version"] == 1
-    and value.get("command") == "ship-state:reconcile"
-    and set(value) == {"schema_version", "command", "results"}
-    and isinstance(results, list)
-    and len(results) == 1
-    and isinstance(results[0], dict)
-    and set(results[0]) == {"pr", "ok", "changes"}
-    and type(results[0].get("pr")) is int
-    and results[0]["pr"] == expected
-    and results[0].get("ok") is True
-    and isinstance(results[0].get("changes"), list)
-    and all(isinstance(change, str) for change in results[0]["changes"])
-)
-print("1" if ok else "0")
-' "$pr" 2>/dev/null)"
+        reconcile_ok="$(printf '%s' "$reconcile_out" | python3 "$SUPPORT" reconcile-ok "$pr" 2>/dev/null)"
         if [ "$reconcile_status" -ne 0 ] || [ "$reconcile_ok" != "1" ]; then
           log "  $repo#$pr: ship-state reconcile failed — skip auto-merge"
           errs=$((errs+1))
@@ -575,48 +329,8 @@ print("1" if ok else "0")
         AUTO_MERGE_ERROR="$TMP/auto-merge-$pr.err"
         out="$(cd "$REPO_ROOT" && shipyard_with_app_auth auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
         auto_merge_status=$?
-        auto_merge_event="$(printf '%s' "$out" | python3 -c '
-import json, sys
-expected_pr = int(sys.argv[1])
-value = json.load(sys.stdin)
-if not isinstance(value, dict):
-    raise ValueError("expected object")
-if type(value.get("schema_version")) is not int or value["schema_version"] != 1 \
-    or value.get("command") != "auto-merge":
-    raise ValueError("unexpected envelope")
-if type(value.get("pr")) is not int or value["pr"] != expected_pr:
-    raise ValueError("unexpected PR")
-event = value.get("event")
-if type(event) is not str:
-    raise ValueError("expected typed event")
-common = {"schema_version", "command", "event", "pr"}
-allowed = {
-    "already-merged": common,
-    "enqueued": common,
-    "pr-not-found": common,
-    "in-flight": common | {"evidence"},
-    "target-failed": common | {"failing_targets", "evidence"},
-    "merge-failed": common | {"error"},
-    "superseded-sha": common | {"validated", "current"},
-    "merged": common | ({"cleanup_warning"} if "cleanup_warning" in value else set()),
-}
-if event not in allowed or set(value) != allowed[event]:
-    raise ValueError("unsupported event")
-if event in {"in-flight", "target-failed"} and not (
-    isinstance(value["evidence"], dict)
-    and all(isinstance(key, str) and isinstance(item, str) for key, item in value["evidence"].items())
-):
-    raise ValueError("evidence must be a string map")
-if event == "target-failed" and not (
-    isinstance(value["failing_targets"], list)
-    and all(isinstance(item, str) for item in value["failing_targets"])
-):
-    raise ValueError("failing_targets must be strings")
-for field in ("error", "validated", "current", "cleanup_warning"):
-    if field in value and not isinstance(value[field], str):
-        raise ValueError(f"{field} must be string")
-print(event)
-' "$pr" 2>/dev/null)" || auto_merge_event=""
+        auto_merge_event="$(printf '%s' "$out" | python3 "$SUPPORT" auto-merge-event "$pr" 2>/dev/null)" \
+          || auto_merge_event=""
         if [ "$auto_merge_status" -eq 0 ]; then
           if [ "$auto_merge_event" = "merged" ] || [ "$auto_merge_event" = "already-merged" ]; then
             log "  $repo#$pr: merged"

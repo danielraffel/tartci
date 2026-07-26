@@ -11,41 +11,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+from macos_runner_identity import resolve_plist_identity
+
 
 LABEL_PREFIX = "com.danielraffel.pulp.tart-runner"
-
-
-def _argument(args: list[str], flag: str) -> str:
-    try:
-        return args[args.index(flag) + 1]
-    except (ValueError, IndexError):
-        return ""
-
-
-def resolve_identity(plist: dict, *, hostname: str) -> tuple[str, str]:
-    args = [str(value) for value in plist.get("ProgramArguments", [])]
-    env = {str(k): str(v) for k, v in plist.get("EnvironmentVariables", {}).items()}
-    home = env.get("HOME", str(Path.home()))
-    name = _argument(args, "--name") or env.get("TARTCI_RUNNER_NAME") or env.get("PULP_RUNNER_NAME")
-    slot = _argument(args, "--slot") or env.get("TARTCI_RUNNER_SLOT") or env.get("PULP_RUNNER_SLOT") or "1"
-    if not name:
-        prefix = (
-            _argument(args, "--name-prefix")
-            or env.get("TARTCI_RUNNER_NAME_PREFIX")
-            or env.get("PULP_RUNNER_NAME_PREFIX")
-        )
-        labels = _argument(args, "--labels") or env.get("TARTCI_RUNNER_LABELS") or env.get("PULP_RUNNER_LABELS", "")
-        if not prefix:
-            classes = [label.removeprefix("pulp-build-") for label in labels.split(",") if label.startswith("pulp-build-") and len(label) > 11]
-            if classes:
-                prefix = f"pulp-{classes[-1]}"
-            else:
-                normalized = re.sub(r"[^a-z0-9]+", "-", hostname.lower()).strip("-")
-                prefix = f"pulp-{normalized}"
-        name = f"{prefix}-{int(slot):02d}"
-    state_dir = _argument(args, "--state-dir") or env.get("TARTCI_STATE_DIR") or os.path.join(home, ".tartci/state/macos")
-    state_dir = os.path.abspath(os.path.expanduser(state_dir.replace("$HOME", home)))
-    return name, os.path.join(state_dir, f"{name}.state.json")
 
 
 def _cached_spec(text: str) -> dict:
@@ -54,7 +23,9 @@ def _cached_spec(text: str) -> dict:
     section = ""
     for raw in text.splitlines():
         line = raw.strip()
-        if line == "arguments = {":
+        if line.startswith("program = "):
+            args = [line.removeprefix("program = ").strip()]
+        elif line == "arguments = {":
             section = "args"
         elif line == "environment = {":
             section = "env"
@@ -71,6 +42,16 @@ def _cached_spec(text: str) -> dict:
             if match:
                 env[match.group(1).strip()] = match.group(2).strip()
     return {"ProgramArguments": args, "EnvironmentVariables": env}
+
+
+def _plausible_runner_label(label: str) -> bool:
+    normalized = label.lower()
+    return (
+        normalized.startswith(LABEL_PREFIX.lower())
+        or "tart-runner" in normalized
+        or "tart-macos" in normalized
+        or "tartci.macos" in normalized
+    )
 
 
 def _service_labels(text: str) -> set[str]:
@@ -149,9 +130,11 @@ def main() -> int:
             plist = cached
         elif label in disk_specs:
             plist = disk_specs[label]
-        else:
+        elif _plausible_runner_label(label):
             print(f"identity guard cannot resolve cached specification for {label}", file=sys.stderr)
             return 2
+        else:
+            continue
         candidate_args = [str(value) for value in plist.get("ProgramArguments", [])]
         candidate_env = plist.get("EnvironmentVariables", {})
         direct_runner = any(
@@ -164,14 +147,21 @@ def main() -> int:
             and any("tartci" in value for value in candidate_args)
         ) or direct_runner or "TARTCI_LAUNCHD_LABEL" in candidate_env
         if not is_macos_runner:
+            if _plausible_runner_label(label):
+                print(
+                    f"identity guard cannot prove plausible Tart runner {label} is unrelated",
+                    file=sys.stderr,
+                )
+                return 2
             continue
         try:
-            identity = resolve_identity(plist, hostname=args.hostname)
+            identity = resolve_plist_identity(plist, hostname=args.hostname)
         except Exception as error:
             print(f"identity guard cannot resolve loaded agent {label}: {error}", file=sys.stderr)
             return 2
-        if identity[0] == expected[0] or identity[1] == expected[1]:
-            conflicts.append((label, identity))
+        resolved = (identity.runner_name, identity.state_file)
+        if resolved[0] == expected[0] or resolved[1] == expected[1]:
+            conflicts.append((label, resolved))
     if conflicts:
         for label, identity in conflicts:
             print(

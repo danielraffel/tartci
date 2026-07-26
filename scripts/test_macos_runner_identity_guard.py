@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import subprocess
@@ -10,9 +11,11 @@ from pathlib import Path
 import sys
 
 SCRIPT = Path(__file__).with_name("macos_runner_identity_guard.py")
+RUNNER = SCRIPT.parents[1] / "providers" / "tart-macos" / "runner.sh"
 MIGRATE = Path(__file__).with_name("migrate_macos_gate_agent.sh")
 sys.path.insert(0, str(SCRIPT.parent))
 import macos_runner_identity_guard as guard  # noqa: E402
+from macos_runner_identity import resolve_plist_identity  # noqa: E402
 
 
 class MacosRunnerIdentityGuardTests(unittest.TestCase):
@@ -114,6 +117,224 @@ services = {
             )
             self.assertEqual(result.returncode, 0)
 
+    def test_unrelated_program_only_service_is_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            launchctl = root / "launchctl"
+            launchctl.write_text(
+                """#!/bin/sh
+case "$2" in
+  gui/*) printf 'services = {\\n  "com.example.menu-helper" => {\\n  }\\n}\\n' ;;
+  */com.example.menu-helper) printf 'program = /usr/bin/true\\n' ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-studio-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_plausible_program_only_runner_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            launchctl = root / "launchctl"
+            launchctl.write_text(
+                """#!/bin/sh
+case "$2" in
+  */local.tart-macos-runner) printf 'program = /unknown/wrapper\\n' ;;
+  gui/*) printf 'services = {\\n  "local.tart-macos-runner" => {\\n  }\\n}\\n' ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-studio-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("cannot prove plausible Tart runner", result.stderr)
+
+    def test_identity_parity_with_runtime_for_all_supported_sources(self) -> None:
+        cases = (
+            (
+                "explicit",
+                ["--name", "exact-name", "--state-dir", "/tmp/exact-state"],
+                {},
+            ),
+            ("prefix-slot", ["--name-prefix", "lane", "--slot", "7"], {}),
+            (
+                "labels",
+                ["--labels", "self-hosted,macOS,pulp-build-studio"],
+                {},
+            ),
+            ("host", [], {}),
+            (
+                "legacy-name",
+                [],
+                {"PULP_RUNNER_NAME": "legacy-name", "PULP_RUNNER_SLOT": "8"},
+            ),
+            (
+                "legacy-prefix-state",
+                [],
+                {
+                    "PULP_RUNNER_NAME_PREFIX": "legacy-prefix",
+                    "PULP_RUNNER_SLOT": "9",
+                    "TARTCI_STATE_DIR": "/tmp/legacy-state",
+                },
+            ),
+        )
+        for label, cli_args, extra_env in cases:
+            with self.subTest(label=label):
+                env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if key
+                    not in {
+                        "TARTCI_RUNNER_NAME",
+                        "PULP_RUNNER_NAME",
+                        "TARTCI_RUNNER_NAME_PREFIX",
+                        "PULP_RUNNER_NAME_PREFIX",
+                        "TARTCI_RUNNER_SLOT",
+                        "PULP_RUNNER_SLOT",
+                        "TARTCI_RUNNER_LABELS",
+                        "PULP_RUNNER_LABELS",
+                        "TARTCI_STATE_DIR",
+                    }
+                }
+                env.update(extra_env)
+                env["HOME"] = "/tmp/identity-home"
+                plist = {
+                    "ProgramArguments": [
+                        "/bin/bash",
+                        str(RUNNER),
+                        *cli_args,
+                    ],
+                    "EnvironmentVariables": {
+                        "HOME": env["HOME"],
+                        **extra_env,
+                    },
+                }
+                runtime_hostname = subprocess.run(
+                    ["hostname", "-s"],
+                    text=True,
+                    capture_output=True,
+                    check=True,
+                ).stdout.strip()
+                expected = resolve_plist_identity(
+                    plist, hostname=runtime_hostname
+                )
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(RUNNER),
+                        *cli_args,
+                        "--print-identity",
+                    ],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                actual = json.loads(result.stdout)
+                self.assertEqual(actual["runner_name"], expected.runner_name)
+                self.assertEqual(actual["state_dir"], expected.state_dir)
+                self.assertEqual(actual["state_file"], expected.state_file)
+
+    def test_runtime_preserves_event_log_env_unless_state_dir_is_explicit(self) -> None:
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key not in {"TARTCI_EVENT_LOG", "TARTCI_STATE_DIR"}
+        }
+        env["TARTCI_EVENT_LOG"] = "/tmp/custom-events.jsonl"
+        custom = subprocess.run(
+            ["/bin/bash", str(RUNNER), "--print-event-log"],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(custom.returncode, 0, custom.stderr)
+        self.assertEqual(custom.stdout.strip(), "/tmp/custom-events.jsonl")
+
+        overridden = subprocess.run(
+            [
+                "/bin/bash",
+                str(RUNNER),
+                "--state-dir",
+                "/tmp/explicit-state",
+                "--print-event-log",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(overridden.returncode, 0, overridden.stderr)
+        self.assertEqual(
+            overridden.stdout.strip(), "/tmp/explicit-state/events.jsonl"
+        )
+
+        normalized = subprocess.run(
+            [
+                "/bin/bash",
+                str(RUNNER),
+                "--state-dir",
+                "~/.normalized-state",
+                "--print-event-log",
+            ],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(normalized.returncode, 0, normalized.stderr)
+        self.assertEqual(
+            normalized.stdout.strip(),
+            f"{env.get('HOME', str(Path.home()))}/.normalized-state/events.jsonl",
+        )
+
 
 class MacosGateMigrationTests(unittest.TestCase):
     def _fixture(self, root: Path, *, bootstrap_rc: int = 0) -> tuple[dict[str, str], Path]:
@@ -136,6 +357,7 @@ class MacosGateMigrationTests(unittest.TestCase):
         fake_bin = root / "bin"
         fake_bin.mkdir()
         (fake_bin / "plutil").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        (fake_bin / "ghapp").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         (fake_bin / "launchctl").write_text(
             f"""#!/bin/sh
 case "$1" in
@@ -168,7 +390,7 @@ esac
 """,
             encoding="utf-8",
         )
-        for command in ("plutil", "launchctl"):
+        for command in ("plutil", "ghapp", "launchctl"):
             (fake_bin / command).chmod(0o755)
         env = os.environ.copy()
         env.update({"HOME": str(root), "PATH": f"{fake_bin}:/usr/bin:/bin"})
@@ -193,6 +415,9 @@ esac
             self.assertEqual(
                 plist["EnvironmentVariables"]["TARTCI_LAUNCHD_LABEL"],
                 "com.danielraffel.pulp.tart-runner-macos-gate",
+            )
+            self.assertEqual(
+                plist["EnvironmentVariables"]["TARTCI_GH_CLI"], "ghapp"
             )
             rerun = subprocess.run([str(MIGRATE), "--apply", "--attest-external-gui-label-updated"], env=env, text=True, capture_output=True, check=False)
             self.assertEqual(rerun.returncode, 0, rerun.stderr)

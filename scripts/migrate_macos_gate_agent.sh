@@ -29,6 +29,10 @@ echo "  install=$DOMAIN/$NEW_LABEL ($NEW_PLIST)"
   echo "--apply requires --attest-external-gui-label-updated after the external shipyard-macos-gui deployment knows $NEW_LABEL" >&2
   exit 2
 }
+command -v ghapp >/dev/null 2>&1 || {
+  echo "migration requires ghapp in PATH for unattended GitHub App authentication" >&2
+  exit 2
+}
 
 mkdir -p "$HOME/Library/LaunchAgents"
 tmp="$(mktemp "$HOME/Library/LaunchAgents/.macos-gate.plist.XXXXXX")"
@@ -93,6 +97,7 @@ with open(path, "rb") as source:
 value["Label"] = label
 environment = value.setdefault("EnvironmentVariables", {})
 environment["TARTCI_LAUNCHD_LABEL"] = label
+environment["TARTCI_GH_CLI"] = "ghapp"
 arguments = [str(item) for item in value.get("ProgramArguments", [])]
 for index, argument in enumerate(arguments):
     if argument.endswith(("tools/ci/tart-runner.sh", "providers/tart-macos/runner.sh")):
@@ -113,11 +118,11 @@ fi
 identity="$(python3 - "$tmp" "$ROOT/scripts" <<'PY'
 import os, plistlib, sys
 sys.path.insert(0, sys.argv[2])
-from macos_runner_identity_guard import resolve_identity
+from macos_runner_identity import resolve_plist_identity
 with open(sys.argv[1], "rb") as source:
     plist = plistlib.load(source)
-name, state_file = resolve_identity(plist, hostname=os.uname().nodename.split(".")[0])
-print(f"{name}|{os.path.dirname(state_file)}")
+identity = resolve_plist_identity(plist, hostname=os.uname().nodename.split(".")[0])
+print(f"{identity.runner_name}|{identity.state_dir}")
 PY
 )"
 runner_name="${identity%%|*}"

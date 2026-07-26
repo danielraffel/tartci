@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Install the queue tick plus its trusted canonical authority configuration.
 set -euo pipefail
+HERE="$(cd "$(dirname "$0")/.." && pwd)"
+SUPPORT="$HERE/scripts/shipyard_queue_tick_support.py"
 
 usage() {
   cat <<'EOF'
@@ -56,33 +58,31 @@ esac
 }
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 REMOTE="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
-if ! python3 - "$REMOTE" <<'PY' >/dev/null
-import re, sys
-remote = sys.argv[1].strip()
-patterns = (
-    r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-    r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
-)
-if not any(re.fullmatch(pattern, remote) for pattern in patterns):
-    raise SystemExit(1)
-PY
+if ! python3 "$SUPPORT" github-origin "$REMOTE" >/dev/null
 then
   echo "repo root has no supported GitHub origin: $REPO_ROOT" >&2
   exit 2
 fi
 
-HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.queue-tick.plist.template"
 SCRIPT="$HERE/scripts/shipyard_queue_tick.sh"
 INSTALL_DIR="$HOME/.local/share/tartci/scripts"
 INSTALLED_SCRIPT="$INSTALL_DIR/shipyard_queue_tick.sh"
+INSTALLED_SUPPORT="$INSTALL_DIR/shipyard_queue_tick_support.py"
 CONFIG="$HOME/.config/shipyard/queue-tick.env"
 PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
 HEALTH="$HOME/Library/Logs/shipyard-queue-tick.health.json"
+HEALTH_WAIT_SECS="${SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS:-300}"
+case "$HEALTH_WAIT_SECS" in
+  ''|*[!0-9]*|0) echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be a positive integer" >&2; exit 2 ;;
+esac
+[ "$HEALTH_WAIT_SECS" -le 3600 ] || {
+  echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be at most 3600" >&2
+  exit 2
+}
 LABEL="com.danielraffel.shipyard.queue-tick"
 
-[ -f "$TEMPLATE" ] && [ -f "$SCRIPT" ] || {
+[ -f "$TEMPLATE" ] && [ -f "$SCRIPT" ] && [ -f "$SUPPORT" ] || {
   echo "installer must run from a complete tartci checkout" >&2
   exit 2
 }
@@ -93,6 +93,7 @@ echo "  authority=$AUTHORITY"
 echo "  mode=$MODE"
 echo "  gh_cli=${GH_CLI:-unset}"
 echo "  executable=$INSTALLED_SCRIPT (mode 755)"
+echo "  support=$INSTALLED_SUPPORT (mode 644)"
 echo "  canonical_config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 if [ "$APPLY" != "1" ]; then
@@ -102,6 +103,7 @@ fi
 
 mkdir -p "$INSTALL_DIR" "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 SCRIPT_TMP=""
+SUPPORT_TMP=""
 CONFIG_TMP=""
 PLIST_TMP=""
 BACKUP=""
@@ -115,9 +117,10 @@ rollback_and_cleanup() {
     set +e
     echo "install failed; rolling back prior queue-tick installation" >&2
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    for entry in script config plist; do
+    for entry in script support config plist; do
       case "$entry" in
         script) target="$INSTALLED_SCRIPT" ;;
+        support) target="$INSTALLED_SUPPORT" ;;
         config) target="$CONFIG" ;;
         plist) target="$PLIST" ;;
       esac
@@ -132,12 +135,13 @@ rollback_and_cleanup() {
         echo "rollback warning: prior LaunchAgent could not be re-bootstrapped" >&2
     fi
   fi
-  rm -f "$SCRIPT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
+  rm -f "$SCRIPT_TMP" "$SUPPORT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
   [ -z "$BACKUP" ] || rm -rf "$BACKUP"
   exit "$rc"
 }
 trap rollback_and_cleanup EXIT
 SCRIPT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick.sh.XXXXXX")"
+SUPPORT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick_support.py.XXXXXX")"
 CONFIG_TMP="$(mktemp "$HOME/.config/shipyard/.queue-tick.env.XXXXXX")"
 PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.queue-tick.plist.XXXXXX")"
 BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/queue-tick-install-backup.XXXXXX")"
@@ -145,6 +149,11 @@ umask 077
 install -m 755 "$SCRIPT" "$SCRIPT_TMP"
 [ -x "$SCRIPT_TMP" ] && cmp -s "$SCRIPT" "$SCRIPT_TMP" || {
   echo "staged queue tick executable failed verification" >&2
+  exit 1
+}
+install -m 644 "$SUPPORT" "$SUPPORT_TMP"
+[ -r "$SUPPORT_TMP" ] && cmp -s "$SUPPORT" "$SUPPORT_TMP" || {
+  echo "staged queue tick support module failed verification" >&2
   exit 1
 }
 {
@@ -168,9 +177,10 @@ with open(path, "wb") as destination:
 PY
 plutil -lint "$PLIST_TMP" >/dev/null
 
-for entry in script config plist; do
+for entry in script support config plist; do
   case "$entry" in
     script) target="$INSTALLED_SCRIPT" ;;
+    support) target="$INSTALLED_SUPPORT" ;;
     config) target="$CONFIG" ;;
     plist) target="$PLIST" ;;
   esac
@@ -186,6 +196,7 @@ fi
 SWITCH_STARTED=1
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
+mv "$SUPPORT_TMP" "$INSTALLED_SUPPORT"
 mv "$CONFIG_TMP" "$CONFIG"
 mv "$PLIST_TMP" "$PLIST"
 
@@ -203,7 +214,8 @@ grep -Fq "$INSTALLED_SCRIPT" <<<"$PRINTED" || {
   exit 1
 }
 healthy=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+attempt=0
+while [ "$attempt" -lt "$HEALTH_WAIT_SECS" ]; do
   if python3 - "$HEALTH" <<'PY' >/dev/null 2>&1
 import json, sys
 with open(sys.argv[1]) as source:
@@ -216,6 +228,7 @@ PY
     break
   fi
   sleep 1
+  attempt=$((attempt + 1))
 done
 [ "$healthy" = "1" ] || {
   echo "queue tick did not publish a fresh healthy verdict: $HEALTH" >&2
