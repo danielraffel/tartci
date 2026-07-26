@@ -254,10 +254,30 @@ class ProviderIntegrationTests(unittest.TestCase):
                     boot = body.index("t_booted=", body.index("run_one"))
                 self.assertLess(boot, gate)
                 self.assertLess(gate, mint)
+                if "tart-linux" in str(provider):
+                    cache_setup = body.index("write_state cache-setup", body.index("run_one"))
+                    self.assertLess(cache_setup, gate)
                 blocked_path = body[gate:mint]
                 self.assertIn('return "$admission_rc"', blocked_path)
                 if "qemu-windows" in str(provider):
                     self.assertIn("cleanup_job success", blocked_path)
+                    self.assertIn("trap handle_windows_runner_signal INT TERM", body)
+                    self.assertIn("trap cleanup_active_windows_job EXIT", body)
+                    self.assertIn(
+                        '[ "${TARTCI_ACTIVE_VM_LEASE_ID:-}" = '
+                        '"$CURRENT_WIN_LEASE_ID_EXPECTED" ]',
+                        body,
+                    )
+                    self.assertIn('-smp "$effective_win_cpus"', body)
+                    self.assertNotIn('WIN_CPUS="$lease_cores"', body)
+                elif "tart-linux" in str(provider):
+                    self.assertIn("discard_current_linux_vm", blocked_path)
+                    cleanup_start = body.index("discard_current_linux_vm(){")
+                    cleanup_end = body.index("handle_linux_runner_signal(){", cleanup_start)
+                    self.assertIn(
+                        "tartci_release_vm_lease",
+                        body[cleanup_start:cleanup_end],
+                    )
                 else:
                     self.assertIn(
                         "tartci_release_vm_lease", blocked_path

@@ -885,6 +885,21 @@ the job enters the queue. If multiple Windows hosts are accidentally configured
 to race the same queued job, any VM that does not claim work exits after
 `TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
 GitHub runner registration by ephemeral runner name, and discards the overlay.
+Linux applies the same assignment deadline and discards the Tart clone, runner
+process, state, and VM lease if `Running job:` never appears. Once that marker
+appears, the assignment deadline is disabled so it cannot terminate a valid
+long-running build. At the deadline, an exact GitHub runner-state check protects
+a runner already marked busy; operational uncertainty is retried a bounded
+number of times, and confirmed-idle registrations are removed during teardown.
+Invalid or zero timeout values fail before any VM boot.
+Before Linux JIT registration, the provider exports `CCACHE_DIR=~/.ccache`,
+which must physically resolve to the
+writable `/mnt/host/ccache` share with the expected virtio-fs source tag; a stale real directory is replaced
+and an unusable mount fails closed rather than silently running with an
+ephemeral cold cache. The provider also exports
+`CMAKE_BUILD_PARALLEL_LEVEL=${TARTCI_LINUX_BUILD_PARALLEL_LEVEL:-4}`, capped by
+the acquired VM lease's cores, so ordinary `cmake --build` workflow steps use
+bounded guest parallelism.
 Ephemeral Windows runner names include a host-derived prefix by default; set
 `TARTCI_RUNNER_NAME_PREFIX` only when a host needs a stable custom prefix.
 Windows writes per-job timing to `$TARTCI_WIN_LOGS/<runner>/timing.tsv`; Linux

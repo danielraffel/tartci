@@ -137,11 +137,15 @@ class VmLeaseHelperTests(unittest.TestCase):
                 tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
+                printf 'effective=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES"
                 """
             )
             proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "3")  # 8 clamped to the 3-core budget
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["3", "effective=3"],
+        )  # 8 clamped to the 3-core budget and exposed to the provider
 
     def test_gate_lease_not_clamped(self) -> None:
         # The gate lane runs at gate priority and legitimately uses reserved cores;

@@ -134,14 +134,24 @@ macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 boots a throwaway clone per queued job, and lets the GitHub **workflow** drive
 the build — the host just supplies a clean VM each time. `--loop` keeps serving
 (what the LaunchAgents run); the default is one job then exit (pilot-safe).
-The Windows QEMU loop scans queued and in-progress workflow runs for queued jobs,
+The Linux Tart and Windows QEMU loops scan queued and in-progress workflow runs for queued jobs,
 ignores stale queued jobs older than `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (six
 hours by default), and checks queued job labels by default
-(`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1`). That keeps the supervisor safe to leave
+(`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1`). That keeps each supervisor safe to leave
 loaded while the repo still defaults ordinary Windows jobs to GitHub-hosted
 `windows-latest`; a race-loser VM that boots but never claims a job exits after
 `TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
-GitHub runner registration, and discards the overlay. Ephemeral Windows runner
+GitHub runner registration, and discards its VM/overlay while releasing the
+capacity lease. Linux rechecks the exact runner's GitHub `busy` state at the
+deadline, bounds API-uncertainty retries, and removes a confirmed-idle JIT
+registration during teardown. Linux also exports `CCACHE_DIR=~/.ccache` and requires that
+directory to resolve to the writable host
+virtio-fs share with the expected filesystem tag before JIT registration; a
+missing or incorrectly bound cache
+fails closed instead of silently running cold. Linux exports
+`CMAKE_BUILD_PARALLEL_LEVEL` from `TARTCI_LINUX_BUILD_PARALLEL_LEVEL` (default
+4, capped by the VM lease's core count) so workflow `cmake --build` calls use
+the provisioned VM without requiring workflow changes. Ephemeral Windows runner
 names include a host-derived prefix by default so multiple Macs can serve the
 same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,

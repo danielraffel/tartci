@@ -81,6 +81,7 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CURRENT_IP=""
+CURRENT_REGISTERED_RUNNER=""
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -333,6 +334,10 @@ cleanup(){
   discard_current_vm
   tartci_release_vm_lease
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+  if [ -n "$CURRENT_REGISTERED_RUNNER" ]; then
+    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" 2>/dev/null || true
+    CURRENT_REGISTERED_RUNNER=""
+  fi
   reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
   CLEANED_UP=1
   heartbeat stopped
@@ -441,6 +446,7 @@ run_one(){
   tartci_check_disk_floor "$TART_HOME" || return $?
   tartci_check_disk_floor "$CACHE_ROOT" || return $?
   CLEANED_UP=0
+  CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
@@ -448,15 +454,19 @@ run_one(){
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
+  lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
+  # Own the unique per-boot name before the foreground clone so signal cleanup
+  # cannot miss a clone completed immediately before the trap is delivered.
+  CURRENT_VM="$vm"
   if ! tart clone "$GOLDEN" "$vm"; then
+    discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  CURRENT_VM="$vm"
   if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
     note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
     discard_current_vm
@@ -519,20 +529,21 @@ run_one(){
 
   heartbeat minting-jit
   event mint_jit "labels=$LABELS"
+  # Claim the exact per-boot registration name before minting. Cleanup can then
+  # reclaim it even when a signal lands immediately after GitHub creates it.
+  CURRENT_REGISTERED_RUNNER="$vm"
   IFS=',' read -r -a labels_split <<< "$LABELS"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
     note "[$i] JIT config mint failed — discarding VM"
-    discard_current_vm
-    tartci_release_vm_lease
+    cleanup
     return 1
   }
   if [ -z "$jit" ]; then
     note "[$i] empty JIT config — discarding VM"
-    discard_current_vm
-    tartci_release_vm_lease
+    cleanup
     return 1
   fi
   note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s job_timeout=${JOB_TIMEOUT}s)"
@@ -573,6 +584,7 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
+  CURRENT_REGISTERED_RUNNER=""
   heartbeat stopped
   CLEANED_UP=1
   return 0

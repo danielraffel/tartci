@@ -62,7 +62,17 @@ MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MA
 QUEUE_MATCH_LABELS="${TARTCI_RUNNER_QUEUE_MATCH_LABELS:-${PULP_RUNNER_QUEUE_MATCH_LABELS:-1}}"
 LOOP=0
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
+IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-${PULP_RUNNER_IDLE_TIMEOUT_SECS:-900}}"
+BUILD_PARALLEL_LEVEL="${TARTCI_LINUX_BUILD_PARALLEL_LEVEL:-4}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
+CURRENT_VM=""
+CURRENT_VM_OWNED=0
+CURRENT_RPID=""
+CURRENT_RUNNER_PID=""
+CURRENT_STATE_DIR=""
+CURRENT_LEASE_ACTIVE=0
+CURRENT_JIT_REGISTERED=0
+CURRENT_CLEANED_UP=1
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -78,6 +88,97 @@ source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
+# shellcheck source=providers/common/runner-assignment.lib.sh
+source "$TARTCI_ROOT/providers/common/runner-assignment.lib.sh"
+
+discard_current_linux_vm(){
+  [ "$CURRENT_CLEANED_UP" = 0 ] || return 0
+  CURRENT_CLEANED_UP=1
+  if [ -n "$CURRENT_RUNNER_PID" ]; then
+    kill -9 "$CURRENT_RUNNER_PID" 2>/dev/null || true
+    wait "$CURRENT_RUNNER_PID" 2>/dev/null || true
+  fi
+  if [ -n "$CURRENT_RPID" ]; then
+    kill -9 "$CURRENT_RPID" 2>/dev/null || true
+    wait "$CURRENT_RPID" 2>/dev/null || true
+  fi
+  if [ "$CURRENT_VM_OWNED" = 1 ] && [ -n "$CURRENT_VM" ]; then
+    tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
+    tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
+  fi
+  if [ "$CURRENT_LEASE_ACTIVE" = 1 ]; then
+    tartci_release_vm_lease
+  fi
+  if [ -n "$CURRENT_STATE_DIR" ] && [ -n "$CURRENT_VM" ]; then
+    tartci_delete_vm_state "$CURRENT_VM" "$CURRENT_STATE_DIR"
+  fi
+  if [ "$CURRENT_JIT_REGISTERED" = 1 ] && [ -n "$CURRENT_VM" ]; then
+    delete_linux_runner_registration "$CURRENT_VM" || true
+  fi
+  CURRENT_VM=""
+  CURRENT_VM_OWNED=0
+  CURRENT_RPID=""
+  CURRENT_RUNNER_PID=""
+  CURRENT_STATE_DIR=""
+  CURRENT_LEASE_ACTIVE=0
+  CURRENT_JIT_REGISTERED=0
+  return 0
+}
+
+handle_linux_runner_signal(){
+  discard_current_linux_vm
+  trap - EXIT
+  exit 143
+}
+trap handle_linux_runner_signal INT TERM
+trap discard_current_linux_vm EXIT
+
+linux_runner_authoritatively_busy(){
+  local payload
+  [ -n "$CURRENT_VM" ] || return 2
+  payload="$("$GH_CLI" api --method GET "repos/$REPO/actions/runners" \
+    -f per_page=10 -f "name=$CURRENT_VM" 2>/dev/null)" || return 2
+  TARTCI_RUNNER_JSON="$payload" TARTCI_RUNNER_NAME="$CURRENT_VM" python3 - <<'PY'
+import json
+import os
+import sys
+
+try:
+    runners = json.loads(os.environ["TARTCI_RUNNER_JSON"])["runners"]
+except (KeyError, TypeError, ValueError):
+    raise SystemExit(2)
+name = os.environ["TARTCI_RUNNER_NAME"]
+raise SystemExit(0 if any(r.get("name") == name and r.get("busy") is True for r in runners) else 1)
+PY
+}
+
+delete_linux_runner_registration(){
+  local name="$1" ids id attempt delete_failed
+  for attempt in 1 2 3; do
+    if ids="$("$GH_CLI" api --method GET "repos/$REPO/actions/runners" \
+      -f per_page=10 -f "name=$name" \
+      --jq ".runners[] | select(.name==\"$name\" and .busy==false) | .id" \
+      2>/dev/null)"; then
+      delete_failed=0
+      for id in $ids; do
+        "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" \
+          >/dev/null 2>&1 || delete_failed=1
+      done
+      if [ "$delete_failed" = 0 ]; then
+        printf 'TARTCI_DIAG runner_registration_cleanup=confirmed name=%s attempt=%s\n' \
+          "$name" "$attempt" >&2
+        return 0
+      fi
+    fi
+    printf 'TARTCI_DIAG runner_registration_cleanup=retry name=%s attempt=%s\n' \
+      "$name" "$attempt" >&2
+    [ "$attempt" = 3 ] || sleep 1
+  done
+  printf 'TARTCI_DIAG runner_registration_cleanup=exhausted name=%s attempts=3\n' \
+    "$name" >&2
+  return 1
+}
+
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
   local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" vm_name="$5" timing_path="$6" log_dir="$7"
@@ -140,6 +241,7 @@ queued_work(){
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_priority
+  local build_parallel_effective
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
@@ -158,39 +260,51 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     TARTCI_STATE_QEMU_PID_STARTED_AT="$(if [ -n "$rpid" ]; then tartci_pid_started_at "$rpid"; fi)" \
     tartci_write_vm_state tart-linux "$vm" "$vm" "$1" ephemeral "$state_dir"
   }
-  delete_state(){ tartci_delete_vm_state "$vm" "$state_dir"; }
+  mark_runner_assigned(){ write_state job-running; }
   lease_cores="$(tartci_vm_lease_cores tart-linux)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-linux)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
+  CURRENT_VM="$vm"
+  CURRENT_STATE_DIR="$state_dir"
+  CURRENT_LEASE_ACTIVE=1
+  CURRENT_CLEANED_UP=0
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
+    local lease_rc=$?
+    discard_current_linux_vm
+    return "$lease_rc"
+  }
+  lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  build_parallel_effective="$BUILD_PARALLEL_LEVEL"
+  if [ "$build_parallel_effective" -gt "$lease_cores" ]; then
+    build_parallel_effective="$lease_cores"
+  fi
   write_state preparing
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
+  # The name is unique to this supervisor/iteration. Claim it before the
+  # foreground clone so a TERM delivered at clone completion cannot strand it.
+  CURRENT_VM_OWNED=1
   if ! tart clone "$GOLDEN" "$vm"; then
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
     note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
-    tart delete "$vm" >/dev/null 2>&1 || true
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   mkdir -p "$CACHE_ROOT/ccache-linux"
   local boot_log; boot_log="$logdir/tart-run.log"
   tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  CURRENT_RPID="$rpid"
   write_state booting
 
   for _ in $(seq 1 60); do ip="$(tart ip "$vm" 2>/dev/null || true)"; [ -n "$ip" ] && break; sleep 2; done
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last lines of \`tart run\` ($boot_log):"; tail -3 "$boot_log" >&2 2>/dev/null || true
-    tart stop "$vm" >/dev/null 2>&1||true; kill "$rpid" 2>/dev/null||true; tart delete "$vm" >/dev/null 2>&1||true
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
@@ -199,13 +313,26 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
-    tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; tart delete "$vm" >/dev/null 2>&1 || true
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     runtime_emit_complete fail ssh_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
   t_booted="$(now_epoch)"
+  write_state cache-setup
+  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "sudo mkdir -p /mnt/host && \
+     (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || mountpoint -q /mnt/host) && \
+     bash -s -- /mnt/host/ccache" \
+    <"$TARTCI_ROOT/providers/tart-linux/prepare-ccache.sh" \
+    >"$logdir/ccache-setup.log" 2>&1; then
+    note "[$i] host ccache binding failed — refusing to launch a silently cold JIT runner"
+    prefix_guest_log "$logdir/ccache-setup.log"
+    discard_current_linux_vm
+    runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
+    return 1
+  fi
+  prefix_guest_log "$logdir/ccache-setup.log"
+
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     write_state admission-check
@@ -219,11 +346,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     if [ "$admission_rc" -ne 0 ]; then
       write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
-      tart stop "$vm" >/dev/null 2>&1 || true
-      kill "$rpid" 2>/dev/null || true
-      tart delete "$vm" >/dev/null 2>&1 || true
-      tartci_release_vm_lease
-      delete_state
+      discard_current_linux_vm
       return "$admission_rc"
     fi
   fi
@@ -231,49 +354,54 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  # Claim uncertain-outcome cleanup before the state-creating POST. If GitHub
+  # creates the registration but the response is lost, teardown still queries
+  # and removes this exact non-busy name.
+  CURRENT_JIT_REGISTERED=1
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
     note "[$i] JIT config mint failed — discarding VM"
-    tart stop "$vm" >/dev/null 2>&1 || true
-    kill "$rpid" 2>/dev/null || true
-    tart delete "$vm" >/dev/null 2>&1 || true
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     return 1
   }
   if [ -z "$jit" ]; then
     note "[$i] empty JIT config — discarding VM"
-    tart stop "$vm" >/dev/null 2>&1 || true
-    kill "$rpid" 2>/dev/null || true
-    tart delete "$vm" >/dev/null 2>&1 || true
-    tartci_release_vm_lease
-    delete_state
+    discard_current_linux_vm
     return 1
   fi
-  note "[$i] vm $vm up at $ip — mounting ccache + launching JIT runner (one job)"
-  write_state running
+  note "[$i] vm $vm up at $ip — launching JIT runner (assignment_timeout=${IDLE_TIMEOUT}s, build_parallel=${build_parallel_effective}, one job)"
+  write_state idle-wait
 
-  # Best-effort host ccache via virtio-fs (named "ccache" subdir is the rw one).
-  # Then write the JIT config and run the agent once — a JIT runner processes
-  # exactly one job and deregisters. CCACHE_* come from the baked
-  # ~/actions-runner/.env so job steps inherit warm-cache settings.
+  # Write the JIT config and run the agent once. A JIT runner processes exactly
+  # one job and deregisters. The host cache binding above is mandatory so a
+  # mount regression cannot silently turn every ephemeral job cold.
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "sudo mkdir -p /mnt/host 2>/dev/null; sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || true; \
-     if [ -d /mnt/host/ccache ] && [ -w /mnt/host/ccache ]; then mkdir -p ~/.ccache && ln -sfn /mnt/host/ccache ~/.ccache; fi; \
-     printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
+    "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
+     export CCACHE_DIR=\"\$HOME/.ccache\" && \
+     export CMAKE_BUILD_PARALLEL_LEVEL='$build_parallel_effective' && \
+     printf 'TARTCI_DIAG ccache_dir=%s\n' \"\$CCACHE_DIR\" && \
+     printf 'TARTCI_DIAG cmake_build_parallel_level=%s\n' \"\$CMAKE_BUILD_PARALLEL_LEVEL\" && \
      umask 0022 && runner_umask=\"\$(umask)\" && printf 'TARTCI_DIAG runner_umask=%s\n' \"\$runner_umask\" && \
      [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
-    >"$logdir/runner-output.log" 2>&1 \
-    || { run_status=$?; note "[$i] runner exited non-zero (job failure or no job) — VM will be discarded regardless"; }
+    >"$logdir/runner-output.log" 2>&1 &
+  CURRENT_RUNNER_PID=$!
+  if tartci_monitor_runner_assignment \
+    "$CURRENT_RUNNER_PID" "$logdir/runner-output.log" "$IDLE_TIMEOUT" \
+    discard_current_linux_vm 5 mark_runner_assigned \
+    linux_runner_authoritatively_busy; then
+    run_status=0
+  else
+    run_status=$?
+  fi
   t_runner_done="$(now_epoch)"
   prefix_guest_log "$logdir/runner-output.log"
 
-  note "[$i] discarding ephemeral VM $vm"
-  tart stop "$vm" >/dev/null 2>&1 || true; kill "$rpid" 2>/dev/null || true; sleep 2
-  tart delete "$vm" >/dev/null 2>&1 || true
-  tartci_release_vm_lease
-  delete_state
+  if [ "$run_status" -eq 124 ] && [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 0 ]; then
+    note "[$i] runner assignment timeout — unassigned JIT runner and VM discarded"
+  elif [ "$run_status" -ne 0 ]; then
+    note "[$i] runner exited non-zero (job failure or no job) — VM discarded"
+  fi
   t_done="$(now_epoch)"
   {
     printf 'phase\tseconds\n'
@@ -283,7 +411,9 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     printf 'total\t%s\n' "$(elapsed "$t_start" "$t_done")"
   } >"$logdir/timing.tsv"
   note "[$i] timing: boot=$(elapsed "$t_start" "$t_booted")s runner=$(elapsed "$t_booted" "$t_runner_done")s total=$(elapsed "$t_start" "$t_done")s diagnostics=$logdir"
-  if [ "$run_status" -eq 0 ]; then
+  if [ "$run_status" -eq 124 ] && [ "$TARTCI_RUNNER_WAS_ASSIGNED" = 0 ]; then
+    runtime_emit_complete fail idle_timeout "$run_status" "$vm" "$vm" "$logdir/timing.tsv" "$logdir"
+  elif [ "$run_status" -eq 0 ]; then
     runtime_emit_complete pass unknown 0 "$vm" "$vm" "$logdir/timing.tsv" "$logdir"
   else
     runtime_emit_complete fail source_failure "$run_status" "$vm" "$vm" "$logdir/timing.tsv" "$logdir"
@@ -293,11 +423,16 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
 
 i=0
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_validate_runner_idle_timeout "$IDLE_TIMEOUT" \
+  || die "invalid Linux runner assignment timeout configuration"
+tartci_validate_bounded_positive_integer \
+  TARTCI_LINUX_BUILD_PARALLEL_LEVEL "$BUILD_PARALLEL_LEVEL" 64 \
+  || die "invalid Linux build parallelism configuration"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS assignmentTimeout=${IDLE_TIMEOUT}s buildParallel=${BUILD_PARALLEL_LEVEL} maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints ERR when the gh queue scan fails; treating
   # that as 0 silently idles the supervisor while jobs pile up. Count consecutive blind polls
   # and self-restart after a sustained window so launchd (KeepAlive) respawns with fresh gh

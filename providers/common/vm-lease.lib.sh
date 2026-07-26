@@ -140,15 +140,17 @@ tartci_stop_vm_lease_heartbeat(){
 
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" lease_id rc=0 out
+  tartci_positive_int_or_empty "$cores" || cores=1
   if ! tartci_vm_leases_enabled; then
     TARTCI_ACTIVE_VM_LEASE_ID=""
+    # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+    TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
     return 0
   fi
   if [ -n "${TARTCI_ACTIVE_VM_LEASE_ID:-}" ]; then
     tartci_vm_lease_note "refusing to acquire $kind lease for $vm_name while ${TARTCI_ACTIVE_VM_LEASE_ID} is active"
     return 75
   fi
-  tartci_positive_int_or_empty "$cores" || cores=1
   # Clamp a NON-GATE VM lane to the host's non-gate core budget
   # (lease_capacity - reserved_gate). A non-gate lane can never lease more than
   # that — leases.py denies it — and on a builder+gate host a mis-sized
@@ -188,6 +190,8 @@ tartci_acquire_vm_lease(){
     return "$rc"
   fi
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
   tartci_start_vm_lease_heartbeat "$lease_id"
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority"
   return 0
@@ -202,6 +206,8 @@ tartci_release_vm_lease(){
     [ "$rc" -eq 0 ] || tartci_vm_lease_note "lease release reported rc=$rc for $lease_id"
   fi
   TARTCI_ACTIVE_VM_LEASE_ID=""
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_CORES=""
   return 0
 }
 
