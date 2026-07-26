@@ -11,6 +11,7 @@ Run:  python3 -m unittest scripts.test_gh_queue_saturation -v
 from __future__ import annotations
 
 import os
+import tempfile
 import sys
 import unittest
 
@@ -81,6 +82,26 @@ class ClassifySaturationTests(unittest.TestCase):
         self.assertTrue(v.stuck_checks)
         self.assertTrue(v.saturated)
 
+    def test_app_cli_is_explicit_and_never_falls_back_to_gh(self):
+        old = os.environ.pop("PULP_SAT_GH_CLI", None)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "must name an explicit"):
+                sat._gh()
+            os.environ["PULP_SAT_GH_CLI"] = "gh"
+            with self.assertRaisesRegex(RuntimeError, "refuses ambient gh"):
+                sat._gh()
+            with tempfile.TemporaryDirectory() as directory:
+                wrapper = os.path.join(directory, "ghapp")
+                with open(wrapper, "w", encoding="utf-8") as destination:
+                    destination.write("#!/bin/sh\n")
+                os.chmod(wrapper, 0o755)
+                os.environ["PULP_SAT_GH_CLI"] = wrapper
+                self.assertEqual(sat._gh(), wrapper)
+        finally:
+            if old is None:
+                os.environ.pop("PULP_SAT_GH_CLI", None)
+            else:
+                os.environ["PULP_SAT_GH_CLI"] = old
     def test_empty_required_labels_matches_any_self_hosted(self):
         # required_labels=∅ → any self-hosted runner counts as capacity
         linux = _runner("linux-ephr", labels=("self-hosted", "Linux"))

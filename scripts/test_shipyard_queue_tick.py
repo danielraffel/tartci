@@ -39,6 +39,7 @@ class QueueTickControlTests(unittest.TestCase):
         ledger_seed: object | None = None,
         extra_env: dict[str, str] | None = None,
         invalid_tmpdir: bool = False,
+        remote_url: str = "https://github.com/owner/repo.git",
     ) -> tuple[subprocess.CompletedProcess[str], str, object | None]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -51,7 +52,7 @@ class QueueTickControlTests(unittest.TestCase):
                     "remote",
                     "add",
                     "origin",
-                    "https://github.com/owner/repo.git",
+                    remote_url,
                 ],
                 check=True,
             )
@@ -224,6 +225,25 @@ exit 98
         self.assertNotIn("FULL-LIVE refused", result.stdout)
         self.assertIn("mode=live", result.stdout)
         self.assertIn("ship-state list --json", calls)
+        self.assertIn("ghapp pr list --repo owner/repo", calls)
+
+    def test_authority_remote_requires_exact_github_hostname(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            remote_url="https://evilgithub.com/owner/repo.git",
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("has no GitHub origin", result.stdout)
+        self.assertNotIn("ghapp", calls)
+
+    def test_authority_remote_accepts_canonical_ssh_form(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            remote_url="git@github.com:owner/repo.git",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("ghapp pr list --repo owner/repo", calls)
 
     def test_live_mode_requires_configured_app_wrapper(self) -> None:
@@ -694,6 +714,38 @@ exit 98
 
 
 class QueueTickInstallerTests(unittest.TestCase):
+    def test_installer_rejects_evilgithub_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            repo = home / "repo"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "https://evilgithub.com/owner/repo.git"],
+                check=True,
+            )
+            wrapper = home / "ghapp"
+            wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            wrapper.chmod(0o755)
+            result = subprocess.run(
+                ["/bin/bash", str(INSTALLER), "--repo-root", str(repo), "--gh-cli", str(wrapper)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("no supported GitHub origin", result.stderr)
+
+    def test_reap_only_requires_explicit_app_wrapper(self) -> None:
+        result = subprocess.run(
+            ["/bin/bash", str(INSTALLER), "--repo-root", ".", "--mode", "reap-only"],
+            cwd=SCRIPT.parents[1],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("all modes require --gh-cli", result.stderr)
+
     def test_installer_deploys_and_verifies_launchd_executable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)

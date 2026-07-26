@@ -107,10 +107,12 @@ class GhCliKnobWiring(unittest.TestCase):
             ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-linux.plist.template",
             ROOT / "launchd" / "com.danielraffel.pulp.qemu-runner-windows.plist.template",
             ROOT / "launchd" / "com.danielraffel.tartci.reap.plist.template",
+            ROOT / "launchd" / "com.danielraffel.pulp.queue-saturation.plist.template",
         )
         for template in templates:
             body = template.read_text(encoding="utf-8")
-            self.assertIn("<key>TARTCI_GH_CLI</key>", body, template.name)
+            key = "PULP_SAT_GH_CLI" if "queue-saturation" in template.name else "TARTCI_GH_CLI"
+            self.assertIn(f"<key>{key}</key>", body, template.name)
             self.assertIn("<string>ghapp</string>", body, template.name)
 
 

@@ -11,7 +11,7 @@ Validates and prints the install plan by default. --install writes the mode-600
 canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
 received the expected paths and the first tick reports healthy. Exactly one
 fleet host should use --authority. The default mode is dry-run; live requires
---authority.
+--authority. Every mode requires an explicit GitHub App wrapper.
 EOF
 }
 
@@ -39,16 +39,16 @@ case "$MODE" in
       echo "--mode live requires --authority" >&2
       exit 2
     }
-    [ -n "$GH_CLI" ] && [ "$(basename "$GH_CLI")" != "gh" ] \
-      && command -v "$GH_CLI" >/dev/null 2>&1 || {
-      echo "--mode live requires --gh-cli with an executable GitHub App wrapper (not gh)" >&2
-      exit 2
-    }
     TICK_APPLY=1
     REAP_ONLY=0
     ;;
   *) echo "invalid mode: $MODE" >&2; usage >&2; exit 2 ;;
 esac
+[ -n "$GH_CLI" ] && [ "$(basename "$GH_CLI")" != "gh" ] \
+  && command -v "$GH_CLI" >/dev/null 2>&1 || {
+  echo "all modes require --gh-cli with an executable GitHub App wrapper (not gh)" >&2
+  exit 2
+}
 
 [ -d "$REPO_ROOT/.git" ] || git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || {
   echo "repo root is not a Git checkout: $REPO_ROOT" >&2
@@ -56,10 +56,21 @@ esac
 }
 REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 REMOTE="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
-case "$REMOTE" in
-  *github.com:*/*|*github.com/*/*) ;;
-  *) echo "repo root has no GitHub origin: $REPO_ROOT" >&2; exit 2 ;;
-esac
+if ! python3 - "$REMOTE" <<'PY' >/dev/null
+import re, sys
+remote = sys.argv[1].strip()
+patterns = (
+    r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+    r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+)
+if not any(re.fullmatch(pattern, remote) for pattern in patterns):
+    raise SystemExit(1)
+PY
+then
+  echo "repo root has no supported GitHub origin: $REPO_ROOT" >&2
+  exit 2
+fi
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.queue-tick.plist.template"
@@ -139,7 +150,7 @@ install -m 755 "$SCRIPT" "$SCRIPT_TMP"
 {
   printf 'SHIPYARD_QUEUE_REPO_ROOT=%s\n' "$REPO_ROOT"
   printf 'SHIPYARD_QUEUE_AUTHORITY=%s\n' "$AUTHORITY"
-  [ -z "$GH_CLI" ] || printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
+  printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
 } > "$CONFIG_TMP"
 chmod 600 "$CONFIG_TMP"
 

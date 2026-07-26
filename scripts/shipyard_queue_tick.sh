@@ -26,7 +26,7 @@
 #       unless this host is the explicitly selected queue authority.
 #   SHIPYARD_QUEUE_REPO_ROOT=<checkout>       required for FULL-LIVE. Shipyard
 #       loads that checkout's mutation_machine policy before GitHub access.
-#   SHIPYARD_QUEUE_GH_CLI=<app-wrapper>        required for FULL-LIVE. Must be
+#   SHIPYARD_QUEUE_GH_CLI=<app-wrapper>        required in every mode. Must be
 #       an explicit executable other than ambient `gh`.
 #   SHIPYARD_QUEUE_CANONICAL_CONFIG=<file>     default:
 #       ~/.config/shipyard/queue-tick.env. A strict, user-owned mode-600 file
@@ -232,8 +232,18 @@ if [ -d "$REPO_ROOT" ]; then
   AUTHORITY_REPO="$(python3 - "$remote" <<'PY'
 import re, sys
 remote = sys.argv[1].strip()
-match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", remote)
-print(match.group(1) if match else "")
+patterns = (
+    r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+    r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+    r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?",
+)
+for pattern in patterns:
+    match = re.fullmatch(pattern, remote)
+    if match:
+        print(f"{match.group(1)}/{match.group(2)}")
+        break
+else:
+    print("")
 PY
 )"
 fi
@@ -267,12 +277,12 @@ fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$authority_matches" != "1" ]; then
   unhealthy "runner tag does not match merge_queue.mutation_machine"
 fi
+[ -n "$GH" ] || unhealthy "queue tick requires SHIPYARD_QUEUE_GH_CLI GitHub App wrapper"
+[ "$(basename "$GH")" != "gh" ] \
+  || unhealthy "queue tick refuses ambient gh; configure a GitHub App wrapper"
+command -v "$GH" >/dev/null 2>&1 \
+  || unhealthy "configured GitHub App wrapper is not executable: $GH"
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
-  [ -n "$GH" ] || unhealthy "FULL-LIVE requires SHIPYARD_QUEUE_GH_CLI GitHub App wrapper"
-  [ "$(basename "$GH")" != "gh" ] \
-    || unhealthy "FULL-LIVE refuses ambient gh; configure a GitHub App wrapper"
-  command -v "$GH" >/dev/null 2>&1 \
-    || unhealthy "configured GitHub App wrapper is not executable: $GH"
   auth_export="$(cd "$REPO_ROOT" && "$SY" auth export --json 2>/dev/null)" \
     || unhealthy "Shipyard effective GitHub auth config is unavailable"
   shipyard_auth_mode="$(printf '%s' "$auth_export" | python3 -c '
@@ -347,11 +357,6 @@ for row in value:
     if not isinstance(row, dict) or type(row.get("number")) is not int:
         raise ValueError("expected typed PR number rows")
 ' 2>/dev/null || unhealthy "GitHub App authority-repo read schema malformed"
-else
-  if [ -z "$GH" ]; then
-    GH="ghapp"
-    command -v "$GH" >/dev/null 2>&1 || GH="gh"
-  fi
 fi
 
 "$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"

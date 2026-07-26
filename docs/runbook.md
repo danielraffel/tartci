@@ -935,7 +935,7 @@ burning the full ~10 min SSH window; and a post-extract integrity check asserts
 
 Install one of the templates in `launchd/` so the supervisor runs under
 `launchd` and survives reboot. The shipped templates are **Pulp's concrete
-instance** — their known labels (`com.danielraffel.pulp.tart-runner`,
+instance** — their known labels (`com.danielraffel.pulp.tart-runner-macos-gate`,
 `com.danielraffel.pulp.tart-runner-macos-release`,
 `com.danielraffel.pulp.tart-runner-linux`, and
 `com.danielraffel.pulp.qemu-runner-windows`) are what the

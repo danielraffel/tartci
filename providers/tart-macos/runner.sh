@@ -152,6 +152,13 @@ RUNNER_NAME="$(derive_runner_name)"
 [ "$PRINT_NAME" = 1 ] && { printf '%s\n' "$RUNNER_NAME"; exit 0; }
 [ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
 
+if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
+  python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
+    --current-label "$TARTCI_LAUNCHD_LABEL" \
+    --runner-name "$RUNNER_NAME" \
+    --state-dir "$STATE_DIR" \
+    || die "another loaded LaunchAgent resolves to this runner/state identity"
+fi
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
 mkdir -p "$STATE_DIR"

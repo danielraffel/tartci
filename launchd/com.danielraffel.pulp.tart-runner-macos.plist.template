@@ -33,21 +33,20 @@
 
          sed -e "s|\$HOME|$HOME|g" \
            launchd/com.danielraffel.pulp.tart-runner-macos.plist.template \
-           > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist"
+           > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-gate.plist"
 
     4. Load:
 
-         launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist"
-         launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.tart-runner"
+         scripts/migrate_macos_gate_agent.sh --apply --attest-external-gui-label-updated
 
        Verify:
 
-         launchctl print "gui/$(id -u)/com.danielraffel.pulp.tart-runner"
+         launchctl print "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-gate"
          tail -F "$HOME/Library/Logs/tartci/tart-runner-macos.log"
 
        Stop:
 
-         launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner"
+         launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-gate"
 
   PILOT vs GRADUATE: default labels below target the non-required
   `pulp-build-vm` pilot lane. After the pilot is green, production Pulp-style
@@ -64,11 +63,10 @@
   excluded from the default VM route because they do not advertise
   `pulp-build-vm`.
 
-  SIDE-BY-SIDE HOSTS: if a host already has a required-lane Pulp LaunchAgent
-  using com.danielraffel.pulp.tart-runner, do not overwrite it. Copy this
-  template to a pilot-specific plist and change, at minimum, Label, log paths,
-  ProgramArguments labels, and TARTCI_RUNNER_LABELS to a non-required pilot
-  label. Load the pilot only after `shipyard runner capacity` shows a free slot.
+  MIGRATION: never run the legacy `com.danielraffel.pulp.tart-runner` label
+  side-by-side with this agent. The migration helper bootouts and removes that
+  exact legacy plist before loading this replacement. A pre-start identity guard
+  independently refuses duplicate loaded labels resolving to one runner/state.
 
   Requires on this host: tart + the macOS golden in TART_HOME, gh authenticated
   for the target repo (repo admin, to mint JIT configs), and ~/.ssh/id_ed25519
@@ -79,7 +77,7 @@
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.danielraffel.pulp.tart-runner</string>
+    <string>com.danielraffel.pulp.tart-runner-macos-gate</string>
 
     <key>ProgramArguments</key>
     <array>
@@ -115,6 +113,8 @@
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>
         <string>ghapp</string>
+        <key>TARTCI_LAUNCHD_LABEL</key>
+        <string>com.danielraffel.pulp.tart-runner-macos-gate</string>
         <key>TART_HOME</key>
         <string>$HOME/VMs</string>
         <key>TARTCI_HOME</key>
