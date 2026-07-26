@@ -100,6 +100,19 @@ class GhCliKnobWiring(unittest.TestCase):
             self.assertNotIn('["gh", "api"', body,
                              f"{p.name} still has a bare gh call in python")
 
+    def test_unattended_linux_and_reap_agents_pin_app_wrapper(self) -> None:
+        templates = (
+            ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-macos.plist.template",
+            ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-macos-release.plist.template",
+            ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-linux.plist.template",
+            ROOT / "launchd" / "com.danielraffel.pulp.qemu-runner-windows.plist.template",
+            ROOT / "launchd" / "com.danielraffel.tartci.reap.plist.template",
+        )
+        for template in templates:
+            body = template.read_text(encoding="utf-8")
+            self.assertIn("<key>TARTCI_GH_CLI</key>", body, template.name)
+            self.assertIn("<string>ghapp</string>", body, template.name)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

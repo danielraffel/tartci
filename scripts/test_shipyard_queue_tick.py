@@ -29,8 +29,9 @@ class QueueTickControlTests(unittest.TestCase):
         states: list[dict[str, object]] | None = None,
         reconcile_rc: int = 0,
         reconcile_ok: bool = True,
+        reconcile_output: str | None = None,
         auto_merge_rc: int = 3,
-        auto_merge_output: str = "",
+        auto_merge_output: str | None = None,
         discard_rc: int = 0,
         gh_state: str = "OPEN",
         gh_state_rc: int = 0,
@@ -60,17 +61,21 @@ class QueueTickControlTests(unittest.TestCase):
                 """#!/bin/sh
 printf '%s\\n' "$*" >> "$CALLS"
 if [ "$1" = "--version" ]; then
-  printf 'shipyard 0.79.0\\n'
+  printf 'shipyard 0.80.0\\n'
+elif [ "$1 $2" = "auth export" ]; then
+  printf '{"schema_version":1,"command":"auth.export","bundle":{"version":2}}\\n'
 elif [ "$1 $2" = "merge-queue status" ]; then
   printf '{"held":%s,"authority_matches":%s}\\n' "$HELD" "$AUTHORITY_MATCHES"
 elif [ "$1 $2" = "ship-state list" ]; then
   printf '%s\\n' "$STATES"
 elif [ "$1 $2" = "ship-state reconcile" ]; then
-  printf '{"results":[{"pr":%s,"ok":%s}]}\\n' "$3" "$RECONCILE_OK"
+  printf 'reconcile-gh-token=%s\\n' "${GH_TOKEN:+set}" >> "$CALLS"
+  printf '%s\\n' "$RECONCILE_OUTPUT"
   exit "$RECONCILE_RC"
 elif [ "$1 $2" = "ship-state discard" ]; then
   exit "$DISCARD_RC"
 elif [ "$1" = "auto-merge" ]; then
+  printf 'auto-merge-gh-token=%s\\n' "${GH_TOKEN:+set}" >> "$CALLS"
   printf '%s\\n' "$AUTO_MERGE_OUTPUT"
   exit "$AUTO_MERGE_RC"
 else
@@ -85,6 +90,10 @@ fi
                 """#!/bin/sh
 printf 'ghapp %s\\n' "$*" >> "$CALLS"
 case "$*" in
+  "auth token")
+    printf 'app-token\\n'
+    exit "$GH_TOKEN_RC"
+    ;;
   "pr list "*)
     printf '[]\\n'
     exit "$GH_REPO_RC"
@@ -106,6 +115,30 @@ exit 98
                 for key, value in os.environ.items()
                 if not key.startswith(("SHIPYARD_", "TARTCI_"))
             }
+            if auto_merge_output is None:
+                auto_merge_output = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "auto-merge",
+                        "event": "in-flight",
+                        "pr": 42,
+                        "evidence": {},
+                    }
+                )
+            if reconcile_output is None:
+                reconcile_output = json.dumps(
+                    {
+                        "schema_version": 1,
+                        "command": "ship-state:reconcile",
+                        "results": [
+                            {
+                                "pr": 42,
+                                "ok": reconcile_ok,
+                                "changes": [],
+                            }
+                        ],
+                    }
+                )
             env.update(
                 {
                     "PATH": f"{root}:/usr/bin:/bin",
@@ -118,18 +151,27 @@ exit 98
                     "SHIPYARD_TICK_APPLY": "1" if apply else "0",
                     "SHIPYARD_TICK_REAP_ONLY": "0",
                     "SHIPYARD_QUEUE_AUTHORITY": "1" if authority else "0",
+                    "SHIPYARD_QUEUE_GH_CLI": "ghapp",
                     "STATES": json.dumps({"states": states or []}),
                     "RECONCILE_RC": str(reconcile_rc),
                     "RECONCILE_OK": "true" if reconcile_ok else "false",
+                    "RECONCILE_OUTPUT": reconcile_output,
                     "DISCARD_RC": str(discard_rc),
                     "AUTO_MERGE_RC": str(auto_merge_rc),
                     "AUTO_MERGE_OUTPUT": auto_merge_output,
                     "GH_STATE": gh_state,
                     "GH_STATE_RC": str(gh_state_rc),
                     "GH_STATE_ERROR": gh_state_error,
-                    "GH_INFO": "MERGEABLE|CLEAN|false",
+                    "GH_INFO": json.dumps(
+                        {
+                            "mergeable": "MERGEABLE",
+                            "mergeStateStatus": "CLEAN",
+                            "isDraft": False,
+                        }
+                    ),
                     "GH_INFO_RC": "0",
                     "GH_REPO_RC": "0",
+                    "GH_TOKEN_RC": "0",
                 }
             )
             if extra_env:
@@ -182,6 +224,41 @@ exit 98
         self.assertNotIn("FULL-LIVE refused", result.stdout)
         self.assertIn("mode=live", result.stdout)
         self.assertIn("ship-state list --json", calls)
+        self.assertIn("ghapp pr list --repo owner/repo", calls)
+
+    def test_live_mode_requires_configured_app_wrapper(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            extra_env={"SHIPYARD_QUEUE_GH_CLI": ""},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("requires SHIPYARD_QUEUE_GH_CLI", result.stdout)
+        self.assertNotIn("ship-state list", calls)
+
+    def test_live_mode_broken_app_auth_fails_even_with_empty_state(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            states=[],
+            extra_env={"GH_REPO_RC": "1"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("authority-repo read failed", result.stdout)
+        self.assertIn("ghapp pr list --repo owner/repo", calls)
+        self.assertNotIn("ship-state list", calls)
+
+    def test_live_mode_broken_app_token_fails_before_state(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            states=[],
+            extra_env={"GH_TOKEN_RC": "1"},
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("could not provide a bounded token", result.stdout)
+        self.assertIn("ghapp auth token", calls)
+        self.assertNotIn("ship-state list", calls)
 
     def test_authority_flag_without_machine_match_is_unhealthy(self) -> None:
         result, calls, _ = self.run_tick(
@@ -205,7 +282,7 @@ exit 98
             calls = root / "calls"
             shipyard = root / "shipyard"
             shipyard.write_text(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nprintf 'shipyard 0.78.0\\n'\n",
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CALLS\"\nprintf 'shipyard 0.79.9\\n'\n",
                 encoding="utf-8",
             )
             shipyard.chmod(0o755)
@@ -229,7 +306,7 @@ exit 98
                 check=False,
             )
             self.assertEqual(result.returncode, 2, result.stderr)
-            self.assertIn("Shipyard 0.79.0 or newer is required", result.stdout)
+            self.assertIn("Shipyard 0.80.0 or newer is required", result.stdout)
             self.assertEqual(calls.read_text(encoding="utf-8").splitlines(), ["--version"])
 
     def test_invalid_tunables_fail_before_shipyard_or_github_reads(self) -> None:
@@ -305,6 +382,27 @@ exit 98
         self.assertIn("ship-state reconcile failed", result.stdout)
         self.assertNotIn("auto-merge 42", calls)
 
+    def test_reconcile_requires_exact_typed_envelope(self) -> None:
+        malformed = (
+            '{"results":[{"pr":42,"ok":true,"changes":[]}]}',
+            '{"schema_version":true,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[]}]}',
+            '{"schema_version":1,"command":"wrong","results":[{"pr":42,"ok":true,"changes":[]}]}',
+            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":true,"ok":true,"changes":[]}]}',
+            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[1]}]}',
+            '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":42,"ok":true,"changes":[]}]} trailing',
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                result, calls, _ = self.run_tick(
+                    held=False,
+                    authority=True,
+                    states=self.stale_open_state(),
+                    reconcile_output=payload,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("ship-state reconcile failed", result.stdout)
+                self.assertNotIn("auto-merge 42", calls)
+
     def test_auto_merge_failure_degrades_tick(self) -> None:
         result, calls, _ = self.run_tick(
             held=False,
@@ -318,7 +416,7 @@ exit 98
         self.assertIn("auto-merge 42", calls)
 
     def test_auto_merge_in_flight_is_healthy_waiting(self) -> None:
-        result, _, _ = self.run_tick(
+        result, calls, _ = self.run_tick(
             held=False,
             authority=True,
             states=self.stale_open_state(),
@@ -326,6 +424,8 @@ exit 98
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("not green yet / in flight", result.stdout)
+        self.assertIn("reconcile-gh-token=set", calls)
+        self.assertIn("auto-merge-gh-token=set", calls)
 
     def test_routine_auto_merge_exit_one_events_are_healthy_waiting_or_stalled(self) -> None:
         for event, message in (
@@ -338,7 +438,19 @@ exit 98
                     authority=True,
                     states=self.stale_open_state(),
                     auto_merge_rc=1,
-                    auto_merge_output=json.dumps({"event": event}),
+                    auto_merge_output=json.dumps(
+                        {
+                            "schema_version": 1,
+                            "command": "auto-merge",
+                            "event": event,
+                            "pr": 42,
+                            **(
+                                {"failing_targets": ["macos"], "evidence": {}}
+                                if event == "target-failed"
+                                else {"validated": "old", "current": "new"}
+                            ),
+                        }
+                    ),
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(message, result.stdout)
@@ -400,6 +512,48 @@ exit 98
         self.assertNotIn("ship-state reconcile 42", calls)
         self.assertNotIn("auto-merge 42", calls)
 
+    def test_malformed_mergeability_types_block_mutation(self) -> None:
+        malformed = (
+            '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":"false"}',
+            '{"mergeable":"BOGUS","mergeStateStatus":"CLEAN","isDraft":false}',
+            '{"mergeable":"MERGEABLE","mergeStateStatus":"BOGUS","isDraft":false}',
+            '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false} trailing',
+            '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false,"extra":1}',
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                result, calls, _ = self.run_tick(
+                    held=False,
+                    authority=True,
+                    states=self.stale_open_state(),
+                    extra_env={"GH_INFO": payload},
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("mergeability schema malformed", result.stdout)
+                self.assertNotIn("ship-state reconcile 42", calls)
+                self.assertNotIn("auto-merge 42", calls)
+
+    def test_auto_merge_success_requires_exact_single_json_verdict(self) -> None:
+        malformed = (
+            '{"event":"merged"} trailing',
+            '{"event":"merged","status":"merged"}',
+            '{"event":true}',
+            '{"message":"already-merged"}',
+            'already-merged',
+            '{"schema_version":true,"command":"auto-merge","event":"merged","pr":42}',
+        )
+        for payload in malformed:
+            with self.subTest(payload=payload):
+                result, _, _ = self.run_tick(
+                    held=False,
+                    authority=True,
+                    states=self.stale_open_state(),
+                    auto_merge_rc=0,
+                    auto_merge_output=payload,
+                )
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("success without a merged verdict", result.stdout)
+
     def test_unreadable_repo_does_not_confirm_pr_not_found(self) -> None:
         result, _, ledger = self.run_tick(
             held=False,
@@ -409,7 +563,7 @@ exit 98
             gh_state_rc=1,
             gh_state_error="HTTP 404: pull request not found",
             ledger_seed={"owner/repo#42": 2},
-            extra_env={"GH_REPO_RC": "1"},
+            extra_env={"GH_REPO_RC": "1", "SHIPYARD_TICK_REAP_ONLY": "1"},
         )
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("not confirmed by a readable repository", result.stdout)
@@ -520,7 +674,7 @@ exit 98
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("shipyard ship-state payload malformed", result.stdout)
                 self.assertIn("ship-state list --json", calls)
-                self.assertNotIn("ghapp", calls)
+                self.assertNotIn("ghapp pr view", calls)
                 self.assertNotIn("ship-state discard", calls)
                 self.assertNotIn("ship-state reconcile", calls)
                 self.assertNotIn("auto-merge", calls)
@@ -560,6 +714,7 @@ class QueueTickInstallerTests(unittest.TestCase):
             fake_bin = home / "bin"
             fake_bin.mkdir()
             (fake_bin / "plutil").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_bin / "ghapp").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             (fake_bin / "launchctl").write_text(
                 """#!/bin/sh
 if [ "$1" = "print" ]; then
@@ -573,7 +728,7 @@ exit 0
 """,
                 encoding="utf-8",
             )
-            for command in ("plutil", "launchctl"):
+            for command in ("plutil", "ghapp", "launchctl"):
                 (fake_bin / command).chmod(0o755)
             env = {
                 key: value
@@ -595,6 +750,8 @@ exit 0
                     "--authority",
                     "--mode",
                     "live",
+                    "--gh-cli",
+                    "ghapp",
                     "--install",
                 ],
                 env=env,
@@ -647,6 +804,88 @@ exit 0
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("requires --authority", result.stderr)
+
+    def test_failed_candidate_rolls_back_prior_bytes_and_loaded_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            repo = home / "repo"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "remote", "add", "origin", "https://github.com/owner/repo.git"],
+                check=True,
+            )
+            install_dir = home / ".local/share/tartci/scripts"
+            config_dir = home / ".config/shipyard"
+            agents = home / "Library/LaunchAgents"
+            logs = home / "Library/Logs"
+            for path in (install_dir, config_dir, agents, logs):
+                path.mkdir(parents=True)
+            installed = install_dir / "shipyard_queue_tick.sh"
+            config = config_dir / "queue-tick.env"
+            plist = agents / "com.danielraffel.shipyard.queue-tick.plist"
+            installed.write_bytes(b"prior-script")
+            config.write_bytes(b"prior-config")
+            plist.write_bytes(b"prior-plist")
+            calls = home / "calls"
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "ghapp").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_bin / "plutil").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_bin / "sleep").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            (fake_bin / "launchctl").write_text(
+                """#!/bin/sh
+printf '%s\\n' "$*" >> "$CALLS"
+case "$1" in
+  print)
+    printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
+    printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+    exit 0
+    ;;
+  kickstart)
+    printf '{"status":"degraded"}\\n' > "$HOME/Library/Logs/shipyard-queue-tick.health.json"
+    exit 0
+    ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            for command in ("ghapp", "plutil", "sleep", "launchctl"):
+                (fake_bin / command).chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "CALLS": str(calls),
+                }
+            )
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--repo-root",
+                    str(repo),
+                    "--authority",
+                    "--mode",
+                    "live",
+                    "--gh-cli",
+                    "ghapp",
+                    "--install",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("rolling back", result.stderr)
+            self.assertEqual(installed.read_bytes(), b"prior-script")
+            self.assertEqual(config.read_bytes(), b"prior-config")
+            self.assertEqual(plist.read_bytes(), b"prior-plist")
+            call_text = calls.read_text(encoding="utf-8")
+            self.assertGreaterEqual(call_text.count("bootstrap"), 2)
+            self.assertGreaterEqual(call_text.count("bootout"), 2)
 
 
 class NoOrchardCleanupTests(unittest.TestCase):

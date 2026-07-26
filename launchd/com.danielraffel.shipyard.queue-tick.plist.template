@@ -20,7 +20,7 @@
   The tick never reimplements merge logic, merges only green+head-matched PRs
   through `shipyard auto-merge`, and discards only GitHub-confirmed
   MERGED/CLOSED records.
-  Requires Shipyard 0.79.0 or newer. Install that release before this plist.
+  Requires Shipyard 0.80.0 or newer. Install that release before this plist.
 
   Install shape (run on each CI host — m1/m3/m5):
 
@@ -31,8 +31,9 @@
 
   The installer renders absolute paths, kickstarts the agent, and requires a
   fresh healthy verdict. After observing the dry-run log, arm exactly one
-  authority in live mode. Use reap-only mode for a non-authority host that
-  should clean terminal ship-state. Do not edit the installed plist by hand.
+  authority in live mode with an explicit GitHub App wrapper. Use reap-only
+  mode for a non-authority host that should clean terminal ship-state. Do not
+  edit the installed plist by hand.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

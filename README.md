@@ -198,7 +198,7 @@ The Shipyard queue janitor is a separate control-plane role from Tart CI runner
 capacity. Never enable its full-live mode fleet-wide. Exactly one host may set
 `SHIPYARD_QUEUE_AUTHORITY=1`, and its stored Shipyard runner tag must match the
 repo's `[merge_queue].mutation_machine`. This integration requires Shipyard
-0.79.0 or newer and must be deployed only after that binary is installed. A
+0.80.0 or newer and must be deployed only after that binary is installed. A
 Shipyard hold on the configured authority stops its tick before GitHub reads;
 non-authority hosts must explicitly use dry-run or
 `SHIPYARD_TICK_REAP_ONLY=1`; an old plist that requests full-live without

@@ -5,7 +5,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage: install_shipyard_queue_tick.sh --repo-root PATH [--authority]
-       [--mode dry-run|reap-only|live] [--install]
+       [--mode dry-run|reap-only|live] [--gh-cli APP-WRAPPER] [--install]
 
 Validates and prints the install plan by default. --install writes the mode-600
 canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
@@ -19,11 +19,13 @@ REPO_ROOT=""
 AUTHORITY=0
 APPLY=0
 MODE="dry-run"
+GH_CLI=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo-root) REPO_ROOT="${2:-}"; shift 2 ;;
     --authority) AUTHORITY=1; shift ;;
     --mode) MODE="${2:-}"; shift 2 ;;
+    --gh-cli) GH_CLI="${2:-}"; shift 2 ;;
     --install) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -35,6 +37,11 @@ case "$MODE" in
   live)
     [ "$AUTHORITY" = "1" ] || {
       echo "--mode live requires --authority" >&2
+      exit 2
+    }
+    [ -n "$GH_CLI" ] && [ "$(basename "$GH_CLI")" != "gh" ] \
+      && command -v "$GH_CLI" >/dev/null 2>&1 || {
+      echo "--mode live requires --gh-cli with an executable GitHub App wrapper (not gh)" >&2
       exit 2
     }
     TICK_APPLY=1
@@ -73,6 +80,7 @@ echo "queue tick install plan:"
 echo "  repo_root=$REPO_ROOT"
 echo "  authority=$AUTHORITY"
 echo "  mode=$MODE"
+echo "  gh_cli=${GH_CLI:-unset}"
 echo "  executable=$INSTALLED_SCRIPT (mode 755)"
 echo "  canonical_config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
@@ -85,23 +93,55 @@ mkdir -p "$INSTALL_DIR" "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$
 SCRIPT_TMP=""
 CONFIG_TMP=""
 PLIST_TMP=""
-trap 'rm -f "$SCRIPT_TMP" "$CONFIG_TMP" "$PLIST_TMP"' EXIT
+BACKUP=""
+PRIOR_LOADED=0
+SWITCH_STARTED=0
+COMMITTED=0
+rollback_and_cleanup() {
+  rc=$?
+  trap - EXIT
+  if [ "$SWITCH_STARTED" = "1" ] && [ "$COMMITTED" != "1" ]; then
+    set +e
+    echo "install failed; rolling back prior queue-tick installation" >&2
+    launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
+    for entry in script config plist; do
+      case "$entry" in
+        script) target="$INSTALLED_SCRIPT" ;;
+        config) target="$CONFIG" ;;
+        plist) target="$PLIST" ;;
+      esac
+      if [ -f "$BACKUP/$entry.present" ]; then
+        cp -p "$BACKUP/$entry" "$target"
+      else
+        rm -f "$target"
+      fi
+    done
+    if [ "$PRIOR_LOADED" = "1" ] && [ -f "$PLIST" ]; then
+      launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || \
+        echo "rollback warning: prior LaunchAgent could not be re-bootstrapped" >&2
+    fi
+  fi
+  rm -f "$SCRIPT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
+  [ -z "$BACKUP" ] || rm -rf "$BACKUP"
+  exit "$rc"
+}
+trap rollback_and_cleanup EXIT
 SCRIPT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick.sh.XXXXXX")"
 CONFIG_TMP="$(mktemp "$HOME/.config/shipyard/.queue-tick.env.XXXXXX")"
 PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.queue-tick.plist.XXXXXX")"
+BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/queue-tick-install-backup.XXXXXX")"
 umask 077
 install -m 755 "$SCRIPT" "$SCRIPT_TMP"
-mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
-[ -x "$INSTALLED_SCRIPT" ] && cmp -s "$SCRIPT" "$INSTALLED_SCRIPT" || {
-  echo "installed queue tick executable failed verification: $INSTALLED_SCRIPT" >&2
+[ -x "$SCRIPT_TMP" ] && cmp -s "$SCRIPT" "$SCRIPT_TMP" || {
+  echo "staged queue tick executable failed verification" >&2
   exit 1
 }
 {
   printf 'SHIPYARD_QUEUE_REPO_ROOT=%s\n' "$REPO_ROOT"
   printf 'SHIPYARD_QUEUE_AUTHORITY=%s\n' "$AUTHORITY"
+  [ -z "$GH_CLI" ] || printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
 } > "$CONFIG_TMP"
 chmod 600 "$CONFIG_TMP"
-mv "$CONFIG_TMP" "$CONFIG"
 
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$PLIST_TMP"
 python3 - "$PLIST_TMP" "$TICK_APPLY" "$REAP_ONLY" <<'PY'
@@ -116,9 +156,28 @@ with open(path, "wb") as destination:
     plistlib.dump(value, destination, sort_keys=False)
 PY
 plutil -lint "$PLIST_TMP" >/dev/null
+
+for entry in script config plist; do
+  case "$entry" in
+    script) target="$INSTALLED_SCRIPT" ;;
+    config) target="$CONFIG" ;;
+    plist) target="$PLIST" ;;
+  esac
+  if [ -e "$target" ]; then
+    cp -p "$target" "$BACKUP/$entry"
+    : > "$BACKUP/$entry.present"
+  fi
+done
+if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+  PRIOR_LOADED=1
+fi
+
+SWITCH_STARTED=1
+launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
+mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
+mv "$CONFIG_TMP" "$CONFIG"
 mv "$PLIST_TMP" "$PLIST"
 
-launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 rm -f "$HEALTH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
@@ -151,4 +210,5 @@ done
   echo "queue tick did not publish a fresh healthy verdict: $HEALTH" >&2
   exit 1
 }
+COMMITTED=1
 echo "installed and started $LABEL in $MODE mode; fresh health verdict is healthy"

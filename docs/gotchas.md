@@ -119,6 +119,26 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   coalesce superseded runs before capacity is offered; never dequeue/requeue a
   PR merely to change its position.
 
+- **An old Linux provider process remains after its recorded owner is gone.**
+  → *Cause:* current doctor output does not yet classify every legacy
+  host-process generation with enough ownership evidence for safe deletion.
+  → *Fix:* treat this as a rollout follow-up. Do not kill by age, command name,
+  or a stale heartbeat alone; an active long job can have a fresh lease/PID
+  while its supervisor heartbeat looks stale. A future owner-aware classifier
+  may remove an orphan only when all of these are proven together: stale state
+  heartbeat, VM absent from Tart, GitHub runner online but idle, recorded owner
+  PID alive but not the currently loaded LaunchAgent supervisor/service owner,
+  and exact post-cleanup verification. Until that classifier exists, inspect
+  the two old-process candidates manually and take no automated action.
+
+- **Doctor warns about a stale heartbeat while the same runner is busy.**
+  → *Cause:* the early state-row check can warn before the later GitHub and
+  lease observations prove that a long job still has a live owner, fresh lease,
+  and busy runner.
+  → *Fix:* do not clean it. Suppressing this false positive is a rollout
+  follow-up: the final classification must clear the warning only when the
+  same runner identity is busy and its current lease/PID ownership is fresh.
+
 ## Windows (QEMU)
 
 - **Install media won't boot — BCD `0xc000000d` (\EFI\Microsoft\Boot\BCD).**

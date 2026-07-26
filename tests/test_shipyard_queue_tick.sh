@@ -30,7 +30,8 @@ OLD_ISO="2020-01-01T00:00:00Z"
 cat > "$BIN/shipyard" <<STUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
-  "--version ") echo "shipyard 0.79.0" ;;
+  "--version ") echo "shipyard 0.80.0" ;;
+  "auth export") echo '{"schema_version":1,"command":"auth.export","bundle":{"version":2}}' ;;
   "merge-queue status")
     [ -f "$WORK/control_fail" ] && exit 1
     if [ -f "$WORK/control_malformed" ]; then echo '{'; else echo '{"held":false,"authority_matches":true}'; fi
@@ -42,7 +43,7 @@ case "\$1 \$2" in
   "ship-state discard") echo "discard \$3" >> "$ACTIONS" ;;
   "ship-state reconcile")
     echo "reconcile \$3" >> "$ACTIONS"
-    printf '{"results":[{"pr":%s,"ok":true}]}\n' "\$3"
+    printf '{"schema_version":1,"command":"ship-state:reconcile","results":[{"pr":%s,"ok":true,"changes":[]}]}\n' "\$3"
     ;;
   *) if [ "\$1" = "auto-merge" ]; then
        echo "automerge \$2" >> "$ACTIONS"
@@ -56,6 +57,7 @@ STUB
 cat > "$BIN/ghapp" <<STUB
 #!/usr/bin/env bash
 # args: pr view <PR> --repo <REPO> --json <FIELDS> --jq <EXPR>
+[ "\${1:-} \${2:-}" = "auth token" ] && { echo "app-token"; exit 0; }
 [ "\${1:-} \${2:-}" = "pr list" ] && { echo "[]"; exit 0; }
 pr=""; fields=""
 while [ \$# -gt 0 ]; do
@@ -79,7 +81,7 @@ exit 0
 STUB
 chmod +x "$BIN/shipyard" "$BIN/ghapp"
 
-echo '{"event":"merged"}' > "$WORK/automerge_out.json"
+echo '{"schema_version":1,"command":"auto-merge","event":"merged","pr":202}' > "$WORK/automerge_out.json"
 
 # ── fixtures: merged, open-green, live, and a foreign-repo record ──
 cat > "$WORK/states.json" <<JSON
@@ -96,10 +98,10 @@ echo "OPEN"         > "$WORK/state_202.txt"   # open-green → auto-merge/held
 echo "OPEN"         > "$WORK/state_303.txt"   # open but live worker → skip
 echo "OPEN"         > "$WORK/state_404.txt"   # foreign repo → never mutate
 echo "OPEN"         > "$WORK/state_505.txt"   # inert draft until not-found test
-echo "MERGEABLE|CLEAN|false" > "$WORK/merge_202.txt"
-echo "MERGEABLE|CLEAN|false" > "$WORK/merge_303.txt"
-echo "MERGEABLE|CLEAN|false" > "$WORK/merge_404.txt"
-echo "MERGEABLE|CLEAN|true"  > "$WORK/merge_505.txt"
+echo '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false}' > "$WORK/merge_202.txt"
+echo '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false}' > "$WORK/merge_303.txt"
+echo '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":false}' > "$WORK/merge_404.txt"
+echo '{"mergeable":"MERGEABLE","mergeStateStatus":"CLEAN","isDraft":true}'  > "$WORK/merge_505.txt"
 
 run() {
   : > "$ACTIONS"
@@ -116,6 +118,7 @@ run() {
     -u TARTCI_VM_LEASE_PRIORITY \
     PATH="$BIN:$PATH" \
     HOME="$WORK" \
+    SHIPYARD_QUEUE_GH_CLI=ghapp \
     SHIPYARD_QUEUE_SELF_REPAIR=0 \
     SHIPYARD_QUEUE_HEALTH_FILE="$WORK/health.json" \
     SHIPYARD_QUEUE_INVALID_LEDGER="$WORK/invalid.json" \

@@ -221,6 +221,23 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 Then install the LaunchAgent once the report is clean. Logs land in
 `~/Library/Logs/tartci/tartci-reap.log`.
 
+All unattended macOS, macOS-release, Linux, Windows, and reap agents explicitly
+set `TARTCI_GH_CLI=ghapp`. Install the wrapper in the LaunchAgent `PATH` on
+every host; no token or secret belongs in a plist. After rendering/loading each
+installed agent, verify launchd received the wrapper selection (examples):
+
+```sh
+launchctl print "gui/$(id -u)/com.danielraffel.pulp.tart-runner-linux" |
+  grep -A1 TARTCI_GH_CLI
+launchctl print "gui/$(id -u)/com.danielraffel.tartci.reap" |
+  grep -A1 TARTCI_GH_CLI
+command -v ghapp
+ghapp api repos/Generous-Corp/pulp --jq .full_name
+```
+
+A missing wrapper is a deployment failure; do not let the unattended process
+fall back to ambient `gh`.
+
 ## Shipyard queue janitor
 
 `com.danielraffel.shipyard.queue-tick.plist.template` runs
@@ -245,6 +262,7 @@ configuration that survives LaunchAgent drift:
 scripts/install_shipyard_queue_tick.sh \
   --repo-root /absolute/path/to/pulp \
   --authority \
+  --gh-cli /absolute/path/to/ghapp \
   --mode dry-run
 # Re-run with --install only after reviewing the plan.
 ```
@@ -257,6 +275,7 @@ dry-run log and health file are clean, arm the single authority explicitly:
 scripts/install_shipyard_queue_tick.sh \
   --repo-root /absolute/path/to/pulp \
   --authority \
+  --gh-cli /absolute/path/to/ghapp \
   --mode live \
   --install
 ```
@@ -274,7 +293,7 @@ and requires `authority_matches=true` before full-live operation. An
 authority-local `shipyard merge-queue hold` causes the configured authority
 tick to exit before any GitHub read; during an incident, run it on that
 authority (and propagate it fleet-wide for consistent operator status). This
-integration requires Shipyard 0.79.0 or newer; install that release before
+integration requires Shipyard 0.80.0 or newer; install that release before
 deploying the script or plist. Missing authority configuration is a hard
 unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
 is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to

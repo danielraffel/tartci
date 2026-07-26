@@ -72,20 +72,6 @@ os = "macos"
 arch = "arm64"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
-# Dormant Orchard shadow target — vocabulary ONLY. Declares the fleet
-# placement target so `tartci profile validate` and `tartci status` know it
-# exists, but NO lane may select `provider = "orchard"` yet (shadow-first: the
-# controller is registered + workers paused; placement is not trusted until the
-# fleet rollout proves it — see the Orchard rollout in the governance plan).
-# `tartci profile validate` hard-fails if any lane references this target.
-[targets."macstudio.macos-arm64-orchard"]
-description = "Mac Studio macOS ARM64 build VM placed by the Orchard controller (shadow-only)."
-provider = "orchard"
-host = "macstudio"
-os = "macos"
-arch = "arm64"
-runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
-
 [targets."macstudio.linux-arm64-vm"]
 description = "Mac Studio Tart Linux ARM64 build VM."
 provider = "tartci"

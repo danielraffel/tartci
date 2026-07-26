@@ -26,6 +26,8 @@
 #       unless this host is the explicitly selected queue authority.
 #   SHIPYARD_QUEUE_REPO_ROOT=<checkout>       required for FULL-LIVE. Shipyard
 #       loads that checkout's mutation_machine policy before GitHub access.
+#   SHIPYARD_QUEUE_GH_CLI=<app-wrapper>        required for FULL-LIVE. Must be
+#       an explicit executable other than ambient `gh`.
 #   SHIPYARD_QUEUE_CANONICAL_CONFIG=<file>     default:
 #       ~/.config/shipyard/queue-tick.env. A strict, user-owned mode-600 file
 #       may self-repair missing ROOT/AUTHORITY values after plist drift.
@@ -34,7 +36,7 @@
 #   SHIPYARD_QUEUE_INVALID_LEDGER=<file>        consecutive-not-found ledger
 #   SHIPYARD_QUEUE_INVALID_THRESHOLD=N          default 3; only then archive
 #       a recoverable ship-state whose PR is repeatedly confirmed nonexistent.
-#   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.79.0. The tick requires
+#   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.80.0. The tick requires
 #       Shipyard's fail-closed merge-queue control surface.
 #   SHIPYARD_TICK_REAP_ONLY=0|1             default 0. With APPLY=1, act on the
 #       proven reap path (discard GitHub-MERGED/CLOSED orphans) but hold the
@@ -55,11 +57,11 @@ SELF_REPAIR="${SHIPYARD_QUEUE_SELF_REPAIR:-1}"
 HEALTH_FILE="${SHIPYARD_QUEUE_HEALTH_FILE:-$HOME/Library/Logs/shipyard-queue-tick.health.json}"
 INVALID_LEDGER="${SHIPYARD_QUEUE_INVALID_LEDGER:-$HOME/.local/state/tartci/shipyard-queue-tick-invalid.json}"
 INVALID_THRESHOLD="${SHIPYARD_QUEUE_INVALID_THRESHOLD:-3}"
-MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.79.0}"
+MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.80.0}"
 REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
 METHOD="${SHIPYARD_TICK_MERGE_METHOD:-merge}"
-GH="ghapp"; command -v ghapp >/dev/null 2>&1 || GH="gh"
+GH="${SHIPYARD_QUEUE_GH_CLI:-}"
 SY="$(command -v shipyard 2>/dev/null || echo "$HOME/.local/bin/shipyard")"
 HOST="$(scutil --get ComputerName 2>/dev/null || hostname)"
 
@@ -130,6 +132,9 @@ load_canonical_config() {
         ;;
       SHIPYARD_QUEUE_AUTHORITY)
         [ -n "$AUTHORITY" ] || AUTHORITY="$value"
+        ;;
+      SHIPYARD_QUEUE_GH_CLI)
+        [ -n "$GH" ] || GH="$value"
         ;;
       ''|'#'*) ;;
       *) unhealthy "canonical config contains unsupported key $key" ;;
@@ -253,7 +258,7 @@ held="${control_flags%%|*}"
 authority_matches="${control_flags##*|}"
 if [ "$held" = "1" ]; then
   log "$HOST: local merge-queue hold active — skip entire tick before GitHub reads"
-  health "healthy" "merge_queue_held" || exit 2
+  health "degraded" "merge_queue_held" || exit 2
   exit 0
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$AUTHORITY" != "1" ]; then
@@ -261,6 +266,92 @@ if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$AUTHORITY" != "1" ]; the
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$authority_matches" != "1" ]; then
   unhealthy "runner tag does not match merge_queue.mutation_machine"
+fi
+if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
+  [ -n "$GH" ] || unhealthy "FULL-LIVE requires SHIPYARD_QUEUE_GH_CLI GitHub App wrapper"
+  [ "$(basename "$GH")" != "gh" ] \
+    || unhealthy "FULL-LIVE refuses ambient gh; configure a GitHub App wrapper"
+  command -v "$GH" >/dev/null 2>&1 \
+    || unhealthy "configured GitHub App wrapper is not executable: $GH"
+  auth_export="$(cd "$REPO_ROOT" && "$SY" auth export --json 2>/dev/null)" \
+    || unhealthy "Shipyard effective GitHub auth config is unavailable"
+  shipyard_auth_mode="$(printf '%s' "$auth_export" | python3 -c '
+import json, os, shutil, sys
+value = json.load(sys.stdin)
+if not isinstance(value, dict) or type(value.get("schema_version")) is not int \
+    or value["schema_version"] != 1:
+    raise ValueError("invalid auth export envelope")
+if value.get("command") != "auth.export" or not isinstance(value.get("bundle"), dict):
+    raise ValueError("invalid auth export payload")
+auth = value["bundle"].get("github", {}).get("auth")
+if auth is None or auth == {} or auth.get("source", "gh-cli") == "gh-cli":
+    print("inject")
+elif (
+    isinstance(auth, dict)
+    and auth.get("source") == "command"
+    and isinstance(auth.get("token_command"), list)
+    and len(auth["token_command"]) > 0
+    and os.path.realpath(shutil.which(auth["token_command"][0]) or auth["token_command"][0])
+        == os.path.realpath(shutil.which(sys.argv[1]) or sys.argv[1])
+):
+    print("configured")
+else:
+    raise ValueError("Shipyard auth is not bound to the configured App wrapper")
+' "$GH" 2>/dev/null)" || unhealthy "Shipyard auth is not bound to configured GitHub App wrapper"
+  APP_TOKEN=""
+  if [ "$shipyard_auth_mode" = "inject" ]; then
+    APP_TOKEN="$(python3 - "$GH" <<'PY' 2>/dev/null
+import re, subprocess, sys
+completed = subprocess.run(
+    [sys.argv[1], "auth", "token"],
+    check=False,
+    capture_output=True,
+    text=True,
+    timeout=15,
+)
+token = completed.stdout.strip()
+if completed.returncode != 0 or not token or re.search(r"[\x00-\x20\x7f]", token):
+    raise SystemExit(1)
+sys.stdout.write(token)
+PY
+)" || unhealthy "GitHub App wrapper could not provide a bounded token"
+  fi
+  shipyard_with_app_auth() {
+    if [ "$shipyard_auth_mode" = "inject" ]; then
+      GH_TOKEN="$APP_TOKEN" "$SY" "$@"
+    else
+      "$SY" "$@"
+    fi
+  }
+  authority_read="$(python3 - "$GH" "$AUTHORITY_REPO" <<'PY' 2>/dev/null
+import subprocess, sys
+completed = subprocess.run(
+    [sys.argv[1], "pr", "list", "--repo", sys.argv[2], "--limit", "1", "--json", "number"],
+    check=False,
+    capture_output=True,
+    text=True,
+    timeout=15,
+)
+if completed.returncode != 0:
+    raise SystemExit(completed.returncode)
+sys.stdout.write(completed.stdout)
+PY
+)" \
+    || unhealthy "GitHub App authority-repo read failed"
+  printf '%s' "$authority_read" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+if not isinstance(value, list):
+    raise ValueError("expected array")
+for row in value:
+    if not isinstance(row, dict) or type(row.get("number")) is not int:
+        raise ValueError("expected typed PR number rows")
+' 2>/dev/null || unhealthy "GitHub App authority-repo read schema malformed"
+else
+  if [ -z "$GH" ]; then
+    GH="ghapp"
+    command -v "$GH" >/dev/null 2>&1 || GH="gh"
+  fi
 fi
 
 "$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"
@@ -414,20 +505,40 @@ while IFS=$'\t' read -r pr repo hbe; do
         waiting=$((waiting+1))
         continue
       fi
-      info="$($GH pr view "$pr" --repo "$repo" --json mergeable,mergeStateStatus,isDraft --jq '"\(.mergeable)|\(.mergeStateStatus)|\(.isDraft)"' 2>/dev/null)"
+      info="$($GH pr view "$pr" --repo "$repo" --json mergeable,mergeStateStatus,isDraft 2>/dev/null)"
       info_status=$?
       if [ "$info_status" -ne 0 ] || [ -z "$info" ]; then
         log "  $repo#$pr: mergeability read failed — skip (fail closed)"
         errs=$((errs+1))
         continue
       fi
-      mergeable="${info%%|*}"; rest="${info#*|}"; mss="${rest%%|*}"; draft="${rest##*|}"
+      info_fields="$(printf '%s' "$info" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+if not isinstance(value, dict) or set(value) != {"mergeable", "mergeStateStatus", "isDraft"}:
+    raise ValueError("unexpected mergeability schema")
+mergeable = value["mergeable"]
+status = value["mergeStateStatus"]
+draft = value["isDraft"]
+if mergeable not in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}:
+    raise ValueError("unexpected mergeable enum")
+if status not in {"BEHIND", "BLOCKED", "CLEAN", "DIRTY", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}:
+    raise ValueError("unexpected merge-state enum")
+if type(draft) is not bool:
+    raise ValueError("draft must be boolean")
+print(f"{mergeable}|{status}|{str(draft).lower()}")
+' 2>/dev/null)" || {
+        log "  $repo#$pr: mergeability schema malformed — skip (fail closed)"
+        errs=$((errs+1))
+        continue
+      }
+      mergeable="${info_fields%%|*}"; rest="${info_fields#*|}"; mss="${rest%%|*}"; draft="${rest##*|}"
       if [ "$draft" = "true" ]; then log "  $repo#$pr: draft — skip"; waiting=$((waiting+1)); continue; fi
       if [ "$mergeable" = "CONFLICTING" ] || [ "$mss" = "DIRTY" ] || [ "$mss" = "BEHIND" ]; then
         log "  $repo#$pr: OPEN not fast-forwardable (mergeable=$mergeable status=$mss) — SURFACE, no auto-rebase"; stalled=$((stalled+1)); continue
       fi
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
-        reconcile_out="$(cd "$REPO_ROOT" && "$SY" ship-state reconcile "$pr" --json 2>/dev/null)"
+        reconcile_out="$(cd "$REPO_ROOT" && shipyard_with_app_auth ship-state reconcile "$pr" --json 2>/dev/null)"
         reconcile_status=$?
         reconcile_ok="$(printf '%s' "$reconcile_out" | python3 -c '
 import json, sys
@@ -435,10 +546,19 @@ expected = int(sys.argv[1])
 value = json.load(sys.stdin)
 results = value.get("results") if isinstance(value, dict) else None
 ok = (
-    isinstance(results, list)
+    type(value.get("schema_version")) is int
+    and value["schema_version"] == 1
+    and value.get("command") == "ship-state:reconcile"
+    and set(value) == {"schema_version", "command", "results"}
+    and isinstance(results, list)
     and len(results) == 1
-    and results[0].get("pr") == expected
+    and isinstance(results[0], dict)
+    and set(results[0]) == {"pr", "ok", "changes"}
+    and type(results[0].get("pr")) is int
+    and results[0]["pr"] == expected
     and results[0].get("ok") is True
+    and isinstance(results[0].get("changes"), list)
+    and all(isinstance(change, str) for change in results[0]["changes"])
 )
 print("1" if ok else "0")
 ' "$pr" 2>/dev/null)"
@@ -448,30 +568,63 @@ print("1" if ok else "0")
           continue
         fi
         AUTO_MERGE_ERROR="$TMP/auto-merge-$pr.err"
-        out="$(cd "$REPO_ROOT" && "$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
+        out="$(cd "$REPO_ROOT" && shipyard_with_app_auth auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
         auto_merge_status=$?
+        auto_merge_event="$(printf '%s' "$out" | python3 -c '
+import json, sys
+expected_pr = int(sys.argv[1])
+value = json.load(sys.stdin)
+if not isinstance(value, dict):
+    raise ValueError("expected object")
+if type(value.get("schema_version")) is not int or value["schema_version"] != 1 \
+    or value.get("command") != "auto-merge":
+    raise ValueError("unexpected envelope")
+if type(value.get("pr")) is not int or value["pr"] != expected_pr:
+    raise ValueError("unexpected PR")
+event = value.get("event")
+if type(event) is not str:
+    raise ValueError("expected typed event")
+common = {"schema_version", "command", "event", "pr"}
+allowed = {
+    "already-merged": common,
+    "enqueued": common,
+    "pr-not-found": common,
+    "in-flight": common | {"evidence"},
+    "target-failed": common | {"failing_targets", "evidence"},
+    "merge-failed": common | {"error"},
+    "superseded-sha": common | {"validated", "current"},
+    "merged": common | ({"cleanup_warning"} if "cleanup_warning" in value else set()),
+}
+if event not in allowed or set(value) != allowed[event]:
+    raise ValueError("unsupported event")
+if event in {"in-flight", "target-failed"} and not (
+    isinstance(value["evidence"], dict)
+    and all(isinstance(key, str) and isinstance(item, str) for key, item in value["evidence"].items())
+):
+    raise ValueError("evidence must be a string map")
+if event == "target-failed" and not (
+    isinstance(value["failing_targets"], list)
+    and all(isinstance(item, str) for item in value["failing_targets"])
+):
+    raise ValueError("failing_targets must be strings")
+for field in ("error", "validated", "current", "cleanup_warning"):
+    if field in value and not isinstance(value[field], str):
+        raise ValueError(f"{field} must be string")
+print(event)
+' "$pr" 2>/dev/null)" || auto_merge_event=""
         if [ "$auto_merge_status" -eq 0 ]; then
-          if grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged' <<<"$out"; then
+          if [ "$auto_merge_event" = "merged" ] || [ "$auto_merge_event" = "already-merged" ]; then
             log "  $repo#$pr: merged"
             merged=$((merged+1))
           else
             log "  $repo#$pr: auto-merge returned success without a merged verdict"
             errs=$((errs+1))
           fi
-        elif [ "$auto_merge_status" -eq 3 ]; then
+        elif [ "$auto_merge_status" -eq 3 ] \
+          && { [ "$auto_merge_event" = "in-flight" ] || [ "$auto_merge_event" = "enqueued" ]; }; then
           log "  $repo#$pr: not green yet / in flight"
           waiting=$((waiting+1))
         else
-          auto_merge_event="$(printf '%s' "$out" | python3 -c '
-import json, sys
-try:
-    value = json.load(sys.stdin)
-except Exception:
-    print("")
-else:
-    event = value.get("event") if isinstance(value, dict) else None
-    print(event if isinstance(event, str) else "")
-' 2>/dev/null)"
           case "$auto_merge_event" in
             target-failed)
               log "  $repo#$pr: required target failed — waiting for a new green head"
