@@ -56,8 +56,6 @@ YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
 # Host-health auto-yield (opt-in; see header): the decision lives in the shared
 # providers/common/host-health.lib.sh, reading TARTCI_HOST_VITALS_YIELD[_ON_WARN]
 # / TARTCI_HOST_VITALS_BIN directly. Empty/0 = OFF (no host_vitals call).
-QUEUE_RUN_LIMIT="${TARTCI_QUEUE_RUN_LIMIT:-20}"
-GH_TIMEOUT="${TARTCI_GH_TIMEOUT_SECS:-15}"
 LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
@@ -242,125 +240,16 @@ PY
 }
 
 queued_work(){
-  python3 - "$REPO" "$WORKFLOW_NAME" "$LABELS" "$QUEUE_RUN_LIMIT" "$GH_TIMEOUT" <<'PY'
-import json
-import os
-import subprocess
-import sys
-
-# Honor TARTCI_GH_CLI (inherited from the exported env) so polling rides the
-# same App bucket as the bash calls; default `gh`.
-GH_CLI = os.environ.get("TARTCI_GH_CLI") or "gh"
-repo, workflow_name, labels_csv, queue_limit, gh_timeout = sys.argv[1:]
-runner_labels = {label.strip() for label in labels_csv.split(",") if label.strip()}
-try:
-    limit = max(1, min(100, int(queue_limit)))
-except ValueError:
-    limit = 20
-try:
-    timeout = max(1, int(gh_timeout))
-except ValueError:
-    timeout = 15
-
-
-def gh_json(path):
-    return json.loads(
-        subprocess.check_output(
-            [GH_CLI, "api", path],
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=timeout,
-        )
-    )
-
-
-# Scan ONLY our workflow's runs, not the global runs list. The global
-# `runs?status=queued` endpoint returns the newest `per_page` runs across ALL workflows; under
-# multi-workflow / multi-PR load those newest runs are dominated by OTHER workflows, so our
-# Build-and-Test runs get crowded out of the window and the fleet can't see queued build legs it
-# should serve — VM-lane starvation under exactly the heavy load we care about. Resolving the
-# workflow id and hitting `workflows/{id}/runs` keeps the window filled with only our runs, so a
-# deep queue of build jobs stays visible. per_page is bumped to 100 (the endpoint max) so a deep
-# backlog is covered in one page.
-_WF_PER_PAGE = 100
-runs = []
-seen = set()
-try:
-    wf_id = None
-    wfs = gh_json(f"repos/{repo}/actions/workflows?per_page=100")
-    for wf in wfs.get("workflows", []):
-        if wf.get("name") == workflow_name:
-            wf_id = wf.get("id")
-            break
-    if wf_id is not None:
-        for status in ("queued", "in_progress"):
-            data = gh_json(
-                f"repos/{repo}/actions/workflows/{wf_id}/runs?status={status}&per_page={_WF_PER_PAGE}"
-            )
-            for run in data.get("workflow_runs", []):
-                run_id = run.get("id")
-                if run_id in seen:
-                    continue
-                seen.add(run_id)
-                runs.append(run)
-    else:
-        # Workflow not found by name (renamed / not yet created) → degrade to the global scan so
-        # behavior is never worse than before.
-        for status in ("queued", "in_progress"):
-            data = gh_json(f"repos/{repo}/actions/runs?status={status}&per_page={limit}")
-            for run in data.get("workflow_runs", []):
-                run_id = run.get("id")
-                if run_id in seen:
-                    continue
-                seen.add(run_id)
-                runs.append(run)
-except Exception:
-    # A scan FAILURE (gh-api timeout / rate-limit / auth degradation / network) is NOT the same as
-    # "no queued work". Emit a distinct sentinel so the loop stays blind-AWARE and can self-restart
-    # to re-establish auth, instead of silently idling as if the queue were empty — the multi-hour
-    # supervisor wedge this guards against (an alive loop printing `queued=0` while jobs pile up).
-    print("ERR")
-    raise SystemExit
-
-# Interleave newest and oldest runs. Newest-first prevents stale records from hiding fresh work,
-# while the oldest slot on every pass prevents a continuous stream of new runs from starving an
-# older eligible gate forever. The scan remains bounded below.
-runs.sort(key=lambda r: r.get("created_at") or "")
-ordered_runs = []
-oldest, newest = 0, len(runs) - 1
-while oldest <= newest:
-    ordered_runs.append(runs[newest])
-    newest -= 1
-    if oldest <= newest:
-        ordered_runs.append(runs[oldest])
-        oldest += 1
-runs = ordered_runs
-_MAX_JOB_FETCHES = 30
-matches = 0
-fetched = 0
-for run in runs:
-    if run.get("name") != workflow_name:
-        continue
-    run_id = run.get("id")
-    if not run_id:
-        continue
-    if fetched >= _MAX_JOB_FETCHES:
-        break
-    fetched += 1
-    try:
-        jobs = gh_json(f"repos/{repo}/actions/runs/{run_id}/jobs")
-    except Exception:
-        continue
-    for job in jobs.get("jobs", []):
-        if job.get("status") != "queued":
-            continue
-        job_labels = {str(label) for label in job.get("labels", []) if str(label)}
-        if job_labels and job_labels.issubset(runner_labels):
-            matches += 1
-    if matches > 0:
-        break  # >= 1 servable job is all the boot gate needs; GitHub assigns the oldest match.
-print(matches)
-PY
+  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+    --repo "$REPO" \
+    --workflow "$WORKFLOW_NAME" \
+    --labels "$LABELS" \
+    --provider tart-macos \
+    --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
+    --state-file "$STATE_DIR/queue-scan.json" \
+    --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
+    --max-age-seconds 0 \
+    --match-labels 1 2>/dev/null || echo ERR
 }
 
 # priority_demand — how many jobs a higher-priority lane currently has WAITING or
@@ -374,10 +263,11 @@ PY
 # BOTH queued and in_progress because a priority run can flip to in_progress
 # (its GitHub-hosted resolver/classify job) before its self-hosted leg is queued.
 #
-# The pure subset matcher below is intentionally identical in shape to the one
-# used elsewhere (reads LABEL_JSON env + job-label JSON lines on stdin, prints a
-# count) so it can be extracted and unit-tested without gh/tart. Non-zero output
-# means "a priority job needs a slot — do not boot the secondary VM".
+# Use the same host-shared discovery cache as queued_work. Priority lanes often
+# watch a second workflow (for example Sanitizers yielding to Build and Test);
+# queue_scan budgets two shared workflows per host and serializes their refreshes.
+# Non-zero output means "a priority job needs a slot — do not boot the secondary
+# VM".
 priority_demand(){
   [ -n "$YIELD_WORKFLOW" ] || { printf '%s\n' 0; return 0; }
   # FAIL CLOSED. If we cannot read priority-lane demand, assume there IS demand
@@ -388,39 +278,18 @@ priority_demand(){
   # advisory lane that idles during a gh outage — strictly safer than risking the
   # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
   # are declared first and assigned separately so `||` actually fires.)
-  local label_json count=0 run_id matches ids run_ids="" st
-  label_json="$(YL="$YIELD_LABELS" python3 -c 'import json, os; print(json.dumps([x.strip() for x in os.environ["YL"].split(",") if x.strip()]))')"
-  for st in queued in_progress; do
-    ids="$("$GH_CLI" api "repos/$REPO/actions/runs?status=$st&per_page=$QUEUE_RUN_LIMIT" \
-      --jq ".workflow_runs[] | select(.name == \"${YIELD_WORKFLOW}\") | .id" 2>/dev/null)" \
-      || { printf '%s\n' 1; return 0; }
-    [ -n "$ids" ] && run_ids="$run_ids$ids"$'\n'
-  done
-  while IFS= read -r run_id; do
-    [ -n "$run_id" ] || continue
-    ids="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs?filter=latest&per_page=100" \
-      --jq '.jobs[] | select(.status == "queued" or .status == "in_progress") | .labels | @json' 2>/dev/null)" \
-      || { printf '%s\n' 1; return 0; }
-    matches="$(printf '%s' "$ids" | LABEL_JSON="$label_json" python3 -c '
-import json, os, sys
-want = {s.lower() for s in json.loads(os.environ["LABEL_JSON"])}
-n = 0
-for line in sys.stdin:
-    try:
-        labels = {s.lower() for s in json.loads(line)}
-    except Exception:
-        continue
-    # A priority job that requests `labels` would land on the priority runner
-    # iff that runner advertises every requested label (labels ⊆ priority set).
-    # Such a job competes for the shared VM cap, so the secondary lane must
-    # stand down while any exist.
-    if labels and labels.issubset(want):
-        n += 1
-print(n)
-')" || { printf '%s\n' 1; return 0; }
-    count=$((count + ${matches:-0}))
-  done <<< "$run_ids"
-  printf '%s\n' "$count"
+  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+    --repo "$REPO" \
+    --workflow "$YIELD_WORKFLOW" \
+    --labels "$YIELD_LABELS" \
+    --job-statuses queued,in_progress \
+    --provider tart-macos-priority \
+    --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-priority" \
+    --state-file "$STATE_DIR/priority-queue-scan.json" \
+    --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
+    --max-age-seconds 0 \
+    --match-labels 1 2>/dev/null \
+    || { printf '%s\n' 1; return 0; }
 }
 
 reclaim_runner_name(){

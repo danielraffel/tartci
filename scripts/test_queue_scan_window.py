@@ -89,6 +89,7 @@ else:
                 "TARTCI_STATE_DIR": str(tmp / "state"),
                 "TARTCI_GH_CLI": "fake-gh",
                 "TARTCI_RUNNER_WORKFLOW_NAME": "Build and Test",
+                "TARTCI_QUEUE_STAGGER_MAX_SECS": "0",
             }
             result = subprocess.run(
                 [
@@ -133,26 +134,6 @@ else:
         result = self._run_print_queue([eligible, *newer_runs], eligible["id"])
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "1", result.stdout + result.stderr)
-
-    def test_all_bounded_provider_scans_interleave_both_queue_edges(self) -> None:
-        for provider in PROVIDERS:
-            body = provider.read_text(encoding="utf-8")
-            self.assertIn(
-                "oldest, newest = 0, len(runs) - 1",
-                body,
-                provider,
-            )
-            self.assertIn(
-                "ordered_runs.append(runs[newest])",
-                body,
-                provider,
-            )
-            self.assertIn(
-                "ordered_runs.append(runs[oldest])",
-                body,
-                provider,
-            )
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

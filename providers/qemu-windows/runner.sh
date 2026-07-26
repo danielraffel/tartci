@@ -50,9 +50,9 @@ WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 # TARTCI_HOST_VITALS_BIN), so a busy shared host backs off ALL local lanes together,
 # not just macOS. Off by default, fail-open, yields on CRITICAL (>=20) always and on
 # WARN (>=10) only when TARTCI_HOST_VITALS_YIELD_ON_WARN is set. See that lib.
-# Ignore stale queued workflow shells by default. Without this guard, old queued
-# runs with no matching self-hosted Windows job can keep waking QEMU forever.
-MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MAX_QUEUED_AGE_SECONDS:-21600}}"
+# Label matching distinguishes stale workflow shells from compatible queued jobs,
+# so compatible work must never age out merely because the queue is deep.
+MAX_QUEUED_AGE_SECONDS="${TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS:-${PULP_RUNNER_MAX_QUEUED_AGE_SECONDS:-0}}"
 KEEP_FAILED="${TARTCI_KEEP_FAILED:-${PULP_KEEP_FAILED:-0}}"
 # By default, only boot when a fresh queued job's requested labels can be
 # satisfied by this runner's labels. This keeps the supervisor safe while repo
@@ -175,7 +175,7 @@ FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.
 [ -n "$FW" ] || die "no edk2-aarch64-code.fd"
 VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
 [ -n "$VARS_TPL" ] || die "no edk2 vars template"
-case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=21600;; esac
+case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
 case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esac
 case "$WIN_MEMORY_MB" in ''|*[!0-9]*) die "invalid TARTCI_WIN_MEMORY_MB='$WIN_MEMORY_MB'";; esac
@@ -200,107 +200,16 @@ delete_runner_registration(){
 }
 
 queued_work(){
-  python3 - "$REPO" "$WORKFLOW_NAME" "$MAX_QUEUED_AGE_SECONDS" "$LABELS" "$QUEUE_MATCH_LABELS" <<'PY' 2>/dev/null || echo ERR   # ERR (not 0) on gh-scan failure: blind != empty
-import datetime as dt
-import json
-import subprocess
-import sys
-
-repo, workflow_name, max_age_raw, labels_csv, match_labels_raw = sys.argv[1:6]
-try:
-    max_age = int(max_age_raw)
-except ValueError:
-    max_age = 21600
-wanted = {label.strip().lower() for label in labels_csv.split(",") if label.strip()}
-match_labels = match_labels_raw.strip().lower() not in {"0", "false", "no"}
-now = dt.datetime.now(dt.timezone.utc)
-
-def gh(path):
-    import os
-    cli = os.environ.get("TARTCI_GH_CLI") or "gh"
-    try:
-        timeout = max(1, int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
-    except ValueError:
-        timeout = 15
-    # timeout is load-bearing for the scan-blindness self-heal: a HUNG gh (stalled TLS / half-open
-    # socket) would otherwise block queued_work forever, so the loop never returns to increment
-    # `blind` and never self-restarts. A timeout kills the child and raises → non-zero exit → `echo ERR`.
-    return json.loads(subprocess.check_output([cli, "api", path], text=True, timeout=timeout))
-
-def is_fresh(created_at):
-    if max_age <= 0:
-        return True
-    try:
-        created = dt.datetime.fromisoformat(created_at.replace("Z", "+00:00"))
-    except ValueError:
-        return False
-    return (now - created).total_seconds() <= max_age
-
-# Scan our workflow's runs, not the GLOBAL runs list: under multi-workflow load other workflows
-# crowd our build runs out of the newest-`per_page` window, hiding queued build legs the fleet
-# should serve (VM-lane starvation under load). Resolve the workflow id and hit workflows/{id}/runs.
-runs = []
-seen = set()
-wf_id = None
-for wf in gh(f"repos/{repo}/actions/workflows?per_page=100").get("workflows", []):
-    if wf.get("name") == workflow_name:
-        wf_id = wf.get("id")
-        break
-if wf_id is not None:
-    run_paths = [f"repos/{repo}/actions/workflows/{wf_id}/runs?status={s}&per_page=100" for s in ("queued", "in_progress")]
-else:
-    run_paths = [f"repos/{repo}/actions/runs?status={s}&per_page=100" for s in ("queued", "in_progress")]
-for _path in run_paths:
-    for run in gh(_path).get("workflow_runs", []):
-        run_id = run.get("id")
-        if run_id in seen:
-            continue
-        seen.add(run_id)
-        runs.append(run)
-
-# Interleave newest and oldest so stale records cannot hide fresh work and continuous fresh work
-# cannot starve an older eligible run. The fetch window remains bounded below.
-runs.sort(key=lambda r: r.get("created_at") or "")
-ordered_runs = []
-oldest, newest = 0, len(runs) - 1
-while oldest <= newest:
-    ordered_runs.append(runs[newest])
-    newest -= 1
-    if oldest <= newest:
-        ordered_runs.append(runs[oldest])
-        oldest += 1
-runs = ordered_runs
-_MAX_JOB_FETCHES = 30
-count = 0
-_fetched = 0
-for run in runs:
-    if run.get("name") != workflow_name:
-        continue
-    if _fetched >= _MAX_JOB_FETCHES:
-        break
-    _fetched += 1
-    jobs = gh(f"repos/{repo}/actions/runs/{run['id']}/jobs?filter=latest&per_page=100").get("jobs", [])
-    for job in jobs:
-        if job.get("status") != "queued":
-            continue
-        job_freshness_ts = (
-            job.get("created_at")
-            or job.get("started_at")
-            or run.get("updated_at")
-            or run.get("created_at")
-            or ""
-        )
-        if not is_fresh(job_freshness_ts):
-            continue
-        labels = {str(label).lower() for label in job.get("labels", [])}
-        if match_labels and (not labels or not labels.issubset(wanted)):
-            continue
-        if not match_labels or labels:
-            count += 1
-    if count > 0:
-        break   # boot gate only needs ">= 1 servable job"; GitHub assigns the oldest match
-print(count)
-PY
+  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+    --repo "$REPO" \
+    --workflow "$WORKFLOW_NAME" \
+    --labels "$LABELS" \
+    --provider qemu-windows \
+    --lane-id "${TARTCI_QUEUE_LANE_ID:-qemu-windows-${TARTCI_RUNNER_SLOT:-$$}}" \
+    --state-file "${TARTCI_STATE_DIR:-$WORKROOT/state}/queue-scan.json" \
+    --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
+    --max-age-seconds "$MAX_QUEUED_AGE_SECONDS" \
+    --match-labels "$QUEUE_MATCH_LABELS" 2>/dev/null || echo ERR
 }
 
 run_one(){ # $1=iteration index
