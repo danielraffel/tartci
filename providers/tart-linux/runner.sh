@@ -182,9 +182,18 @@ for _path in run_paths:
         seen.add(run_id)
         runs.append(run)
 
-# Prefer recent runs so stale `queued` records cannot consume the bounded fetch window and hide
-# newly servable work.
-runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+# Interleave newest and oldest so stale records cannot hide fresh work and continuous fresh work
+# cannot starve an older eligible run. The fetch window remains bounded below.
+runs.sort(key=lambda r: r.get("created_at") or "")
+ordered_runs = []
+oldest, newest = 0, len(runs) - 1
+while oldest <= newest:
+    ordered_runs.append(runs[newest])
+    newest -= 1
+    if oldest <= newest:
+        ordered_runs.append(runs[oldest])
+        oldest += 1
+runs = ordered_runs
 _MAX_JOB_FETCHES = 30
 count = 0
 _fetched = 0
