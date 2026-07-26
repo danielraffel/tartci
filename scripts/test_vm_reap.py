@@ -29,6 +29,16 @@ def write_state(path: Path, **fields: object) -> None:
 
 
 class VmReapTests(unittest.TestCase):
+    def test_github_operations_honor_configured_cli(self) -> None:
+        response = mock.Mock(returncode=0, stdout='[{"runners": []}]', stderr="")
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run", return_value=response) as run:
+            self.assertEqual(vm_reap.github_runners("danielraffel/pulp"), [])
+            vm_reap.delete_runner("danielraffel/pulp", 42, "pulp-vm-01")
+
+        self.assertEqual(run.call_args_list[0].args[0][0], "ghapp")
+        self.assertEqual(run.call_args_list[1].args[0][0], "ghapp")
+
     def run_digest(self, root: Path, *extra: str):
         args = vm_reap.parse_args(
             [
