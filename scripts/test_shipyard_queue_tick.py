@@ -369,6 +369,35 @@ exit 98
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(ledger, {})
 
+    def test_failed_state_read_never_trusts_partial_stdout(self) -> None:
+        for state in ("MERGED", "OPEN"):
+            with self.subTest(state=state):
+                result, calls, _ = self.run_tick(
+                    held=False,
+                    authority=True,
+                    states=self.stale_open_state(),
+                    gh_state=state,
+                    gh_state_rc=1,
+                    gh_state_error="network timeout",
+                )
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("GitHub read failed — skip (fail closed)", result.stdout)
+                self.assertNotIn("ship-state discard 42", calls)
+                self.assertNotIn("ship-state reconcile 42", calls)
+                self.assertNotIn("auto-merge 42", calls)
+
+    def test_failed_mergeability_read_never_trusts_partial_stdout(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            states=self.stale_open_state(),
+            extra_env={"GH_INFO_RC": "1"},
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("mergeability read failed — skip (fail closed)", result.stdout)
+        self.assertNotIn("ship-state reconcile 42", calls)
+        self.assertNotIn("auto-merge 42", calls)
+
     def test_unreadable_repo_does_not_confirm_pr_not_found(self) -> None:
         result, _, ledger = self.run_tick(
             held=False,

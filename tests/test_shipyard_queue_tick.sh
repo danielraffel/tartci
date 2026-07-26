@@ -128,8 +128,8 @@ hasnt(){ grep -q "$1" "$ACTIONS" && fail "unexpected action '$1' — got: $(tr '
 echo "== dry-run: no actions at all =="
 out="$(run SHIPYARD_TICK_APPLY=0)"
 [ -s "$ACTIONS" ] && fail "dry-run took actions: $(cat "$ACTIONS")"
-echo "$out" | grep -q "101: would reap" || fail "dry-run should log would-reap for 101"
-echo "$out" | grep -q "303: live worker" || fail "should skip live worker 303"
+grep -q "101: would reap" <<<"$out" || fail "dry-run should log would-reap for 101"
+grep -q "303: live worker" <<<"$out" || fail "should skip live worker 303"
 echo "  ok"
 
 echo "== reap-only: reap merged, HOLD auto-merge, skip live =="
@@ -145,15 +145,15 @@ has  "discard 101"
 has  "automerge 202"
 hasnt "automerge 404"
 hasnt "discard 303"; hasnt "automerge 303"
-echo "$out" | grep -q "202: merged" || fail "202 should report merged"
-echo "$out" | grep -q "owner/other#404: outside authority repo Generous-Corp/pulp — skip" || fail "foreign repo should be skipped"
+grep -q "202: merged" <<<"$out" || fail "202 should report merged"
+grep -q "owner/other#404: outside authority repo Generous-Corp/pulp — skip" <<<"$out" || fail "foreign repo should be skipped"
 echo "  ok"
 
 echo "== fail-closed: GitHub state read empty -> skip, no action =="
 echo "" > "$WORK/state_101.txt"   # simulate read failure for 101
 out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
 hasnt "discard 101"
-echo "$out" | grep -q "101: GitHub read failed — skip (fail closed)" || fail "101 should fail closed"
+grep -q "101: GitHub read failed — skip (fail closed)" <<<"$out" || fail "101 should fail closed"
 echo "MERGED" > "$WORK/state_101.txt"   # restore
 echo "  ok"
 
@@ -168,7 +168,7 @@ out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=0)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "missing authority should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: FULL-LIVE requires SHIPYARD_QUEUE_REPO_ROOT" || fail "missing root should be actionable"
+grep -q "UNHEALTHY: FULL-LIVE requires SHIPYARD_QUEUE_REPO_ROOT" <<<"$out" || fail "missing root should be actionable"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "health file should be unhealthy"
 hasnt "discard"; hasnt "automerge"
 echo "  ok"
@@ -181,7 +181,7 @@ code=$?
 set -e
 rm "$WORK/control_fail"
 [ "$code" -eq 2 ] || fail "control failure should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: merge-queue control unavailable" || fail "control failure should be loud"
+grep -q "UNHEALTHY: merge-queue control unavailable" <<<"$out" || fail "control failure should be loud"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "control failure health missing"
 hasnt "discard"; hasnt "automerge"
 
@@ -192,7 +192,7 @@ code=$?
 set -e
 rm "$WORK/control_malformed"
 [ "$code" -eq 2 ] || fail "malformed control should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: merge-queue control schema malformed" || fail "malformed control should be loud"
+grep -q "UNHEALTHY: merge-queue control schema malformed" <<<"$out" || fail "malformed control should be loud"
 echo "  ok"
 
 echo "== ship-state read and parse failures are unhealthy and nonzero =="
@@ -203,14 +203,14 @@ code=$?
 set -e
 rm "$WORK/shipstate_fail"
 [ "$code" -eq 2 ] || fail "ship-state read failure should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: shipyard ship-state unavailable" || fail "ship-state failure should be loud"
+grep -q "UNHEALTHY: shipyard ship-state unavailable" <<<"$out" || fail "ship-state failure should be loud"
 printf '{' > "$WORK/states.json"
 set +e
 out="$(run SHIPYARD_TICK_APPLY=0)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "malformed ship-state should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: shipyard ship-state payload malformed" || fail "malformed ship-state should be loud"
+grep -q "UNHEALTHY: shipyard ship-state payload malformed" <<<"$out" || fail "malformed ship-state should be loud"
 # Restore the fixture without duplicating it in the test.
 git_state_fixture="$WORK/states.restore"
 cat > "$git_state_fixture" <<JSON
@@ -235,8 +235,8 @@ out="$(run \
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "health persistence failure should exit 2, got $code"
-echo "$out" | grep -q "HEALTH WRITE FAILED" || fail "health persistence failure should be loud"
-echo "$out" | grep -q "verdict could not be persisted" || fail "missing persistence verdict warning"
+grep -q "HEALTH WRITE FAILED" <<<"$out" || fail "health persistence failure should be loud"
+grep -q "verdict could not be persisted" <<<"$out" || fail "missing persistence verdict warning"
 hasnt "discard"; hasnt "automerge"
 echo "  ok"
 
@@ -252,7 +252,7 @@ out="$(run \
   SHIPYARD_QUEUE_SELF_REPAIR=1 \
   SHIPYARD_QUEUE_CANONICAL_CONFIG="$WORK/canonical.env")"
 has "automerge 202"
-echo "$out" | grep -q "mode=live" || fail "canonical repair should stay full-live"
+grep -q "mode=live" <<<"$out" || fail "canonical repair should stay full-live"
 echo "  ok"
 
 echo "== canonical config must be owned by the current user =="
@@ -273,7 +273,7 @@ code=$?
 set -e
 rm "$BIN/stat"
 [ "$code" -eq 2 ] || fail "foreign-owned canonical config should exit 2, got $code"
-echo "$out" | grep -q "must be owned by uid" || fail "foreign ownership should be loud"
+grep -q "must be owned by uid" <<<"$out" || fail "foreign ownership should be loud"
 hasnt "discard"; hasnt "automerge"
 echo "  ok"
 
@@ -284,7 +284,7 @@ out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "malformed invalid ledger should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "malformed ledger should be loud"
+grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" <<<"$out" || fail "malformed ledger should be loud"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "malformed ledger health missing"
 hasnt "discard"; hasnt "automerge"
 rm "$WORK/invalid.json"
@@ -295,7 +295,7 @@ out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "invalid ledger counter type should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "invalid counter should be loud"
+grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" <<<"$out" || fail "invalid counter should be loud"
 hasnt "discard"; hasnt "automerge"
 rm "$WORK/invalid.json"
 
@@ -308,7 +308,7 @@ out="$(run \
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "invalid ledger write failure should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "ledger write failure should be loud"
+grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" <<<"$out" || fail "ledger write failure should be loud"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "ledger write failure health missing"
 hasnt "discard"; hasnt "automerge"
 echo "  ok"
@@ -317,12 +317,12 @@ echo "== repeated confirmed nonexistent PR is archived only after threshold =="
 echo "Could not resolve to a PullRequest with the number of 505. (HTTP 404)" > "$WORK/state_505.err"
 for expected in 1 2; do
   out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
-  echo "$out" | grep -q "505: confirmed nonexistent ($expected/3)" || fail "missing confirmation $expected"
+  grep -q "505: confirmed nonexistent ($expected/3)" <<<"$out" || fail "missing confirmation $expected"
   hasnt "discard 505"
 done
 out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
 has "discard 505"
-echo "$out" | grep -q "505: quarantined recoverably after 3 confirmed" || fail "third 404 should quarantine"
+grep -q "505: quarantined recoverably after 3 confirmed" <<<"$out" || fail "third 404 should quarantine"
 echo "  ok"
 
 echo "ALL PASS"

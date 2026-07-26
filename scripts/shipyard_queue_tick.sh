@@ -308,8 +308,10 @@ while IFS=$'\t' read -r pr repo hb; do
   fi
   PR_ERROR="$TMP/pr-$pr.err"
   state="$($GH pr view "$pr" --repo "$repo" --json state --jq .state 2>"$PR_ERROR")"
-  if [ -z "$state" ]; then
-    if grep -qiE 'HTTP 404|Could not resolve to a PullRequest|pull request not found' "$PR_ERROR"; then
+  state_status=$?
+  if [ "$state_status" -ne 0 ] || [ -z "$state" ]; then
+    if [ "$state_status" -ne 0 ] \
+      && grep -qiE 'HTTP 404|Could not resolve to a PullRequest|pull request not found' "$PR_ERROR"; then
       if ! "$GH" pr list --repo "$repo" --limit 1 --json number >/dev/null 2>&1; then
         invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
           || unhealthy "invalid-ledger reset failed for $repo#$pr"
@@ -374,7 +376,12 @@ while IFS=$'\t' read -r pr repo hb; do
         continue
       fi
       info="$($GH pr view "$pr" --repo "$repo" --json mergeable,mergeStateStatus,isDraft --jq '"\(.mergeable)|\(.mergeStateStatus)|\(.isDraft)"' 2>/dev/null)"
-      if [ -z "$info" ]; then log "  $repo#$pr: mergeability read failed — skip (fail closed)"; errs=$((errs+1)); continue; fi
+      info_status=$?
+      if [ "$info_status" -ne 0 ] || [ -z "$info" ]; then
+        log "  $repo#$pr: mergeability read failed — skip (fail closed)"
+        errs=$((errs+1))
+        continue
+      fi
       mergeable="${info%%|*}"; rest="${info#*|}"; mss="${rest%%|*}"; draft="${rest##*|}"
       if [ "$draft" = "true" ]; then log "  $repo#$pr: draft — skip"; waiting=$((waiting+1)); continue; fi
       if [ "$mergeable" = "CONFLICTING" ] || [ "$mss" = "DIRTY" ] || [ "$mss" = "BEHIND" ]; then
@@ -405,7 +412,7 @@ print("1" if ok else "0")
         out="$(cd "$REPO_ROOT" && "$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
         auto_merge_status=$?
         if [ "$auto_merge_status" -eq 0 ]; then
-          if echo "$out" | grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged'; then
+          if grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged' <<<"$out"; then
             log "  $repo#$pr: merged"
             merged=$((merged+1))
           else
