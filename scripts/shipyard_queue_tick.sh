@@ -195,14 +195,6 @@ finally:
             pass
 PY
 }
-iso2epoch() {
-  [ -z "${1:-}" ] && { echo 0; return; }
-  local timestamp="${1%%.*}"
-  date -u -j -f "%Y-%m-%dT%H:%M:%S" "$timestamp" +%s 2>/dev/null \
-    || date -u -d "$timestamp" +%s 2>/dev/null \
-    || echo 0
-}
-
 validate_tunables
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/shipyard-queue-tick.XXXXXX")" \
   || unhealthy "could not create queue-tick scratch directory"
@@ -274,12 +266,32 @@ fi
 "$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"
 
 python3 - "$SS" > "$ROWS" <<'PY' || unhealthy "shipyard ship-state payload malformed"
-import json,re,sys
+import datetime,json,re,sys
 d=json.load(open(sys.argv[1]))
 if not isinstance(d, dict) or not isinstance(d.get("states"), list):
     raise ValueError("expected object with states array")
 rows = []
 repo_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+")
+rfc3339_pattern = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+
+def timestamp_epoch(value, field):
+    if value is None or value == "":
+        return 0
+    if not isinstance(value, str) or not rfc3339_pattern.fullmatch(value):
+        raise ValueError(f"state {field} must be empty or RFC3339")
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise ValueError(f"state {field} must be empty or RFC3339") from error
+    if parsed.tzinfo is None:
+        raise ValueError(f"state {field} must carry an RFC3339 offset")
+    return int(parsed.timestamp())
+
 for s in d["states"]:
     if not isinstance(s, dict):
         raise ValueError("state entry must be an object")
@@ -300,25 +312,17 @@ for s in d["states"]:
         raise ValueError("state dispatched_runs must be an array of objects")
     heartbeats = []
     for run in runs:
-        heartbeat = run.get("last_heartbeat_at")
-        if heartbeat is None:
-            heartbeat = ""
-        if not isinstance(heartbeat, str) or re.search(r"[\x00-\x1f\x7f]", heartbeat):
-            raise ValueError("state heartbeat must be a control-free string")
-        heartbeats.append(heartbeat)
-    hb=max(heartbeats, default='')
+        heartbeats.append(
+            timestamp_epoch(run.get("last_heartbeat_at"), "heartbeat")
+        )
+    hb=max(heartbeats, default=0)
     timestamps = []
     for field in ("updated_at", "created_at"):
-        timestamp = s.get(field)
-        if timestamp is None:
-            timestamp = ""
-        if not isinstance(timestamp, str) or re.search(r"[\x00-\x1f\x7f]", timestamp):
-            raise ValueError(f"state {field} must be a control-free string")
-        timestamps.append(timestamp)
+        timestamps.append(timestamp_epoch(s.get(field), field))
     # freshness = most recent of heartbeat / record-write / record-create, so a
     # just-created ship (runs=0, no heartbeat yet) is still treated as live.
     fresh=max([hb, *timestamps])
-    rows.append((pr, repo, fresh))
+    rows.append((pr, repo, str(fresh)))
 for row in rows:
     print("\t".join(row))
 PY
@@ -329,9 +333,8 @@ MODE="dry-run"; [ "$APPLY" = "1" ] && MODE="live"; [ "$APPLY" = "1" ] && [ "$REA
 log "$HOST: $total active record(s); mode=$MODE method=$METHOD"
 merged=0; reaped=0; waiting=0; stalled=0; live=0; errs=0
 
-while IFS=$'\t' read -r pr repo hb; do
+while IFS=$'\t' read -r pr repo hbe; do
   [ -z "$pr" ] && continue
-  hbe=$(iso2epoch "$hb")
   if [ "$hbe" -gt 0 ]; then
     age=$(( now - hbe ))
     if [ "$age" -lt "$FRESH" ]; then

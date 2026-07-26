@@ -1011,8 +1011,11 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 GitHub Actions is the only fleet scheduler. Shipyard supervises queue ordering,
 merge enrollment, and wedge detection; Tart CI owns per-host disposable VM
 capacity and lease governance. Orchard is not used, even if its binary or old
-shadow configuration remains installed on a host. Do not start its controller
-or workers and do not route any profile lane through it.
+shadow configuration remains installed on a host. During an upgrade, run
+`scripts/disable_orchard.sh` to preview the exact two retired labels, then
+`scripts/disable_orchard.sh --apply` to boot them out, remove their installed
+user plists, and verify they are absent. Do not start its controller or workers
+and do not route any profile lane through it.
 
 ## Onboarding a new host
 

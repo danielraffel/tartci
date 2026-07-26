@@ -24,16 +24,15 @@
 
   Install shape (run on each CI host — m1/m3/m5):
 
-    mkdir -p "$HOME/Library/Logs"
-    sed -e "s|\$HOME|$HOME|g" \
-      launchd/com.danielraffel.shipyard.queue-tick.plist.template \
-      > "$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
+    scripts/install_shipyard_queue_tick.sh
 
-    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
-    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.shipyard.queue-tick"
+  Run the installer help command for its repo-root, authority, mode, and apply
+  flags.
 
-  To arm live action after observing the dry-run log, change
-  SHIPYARD_TICK_APPLY below to 1 and re-run the bootstrap/kickstart.
+  The installer renders absolute paths, kickstarts the agent, and requires a
+  fresh healthy verdict. After observing the dry-run log, arm exactly one
+  authority in live mode. Use reap-only mode for a non-authority host that
+  should clean terminal ship-state. Do not edit the installed plist by hand.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

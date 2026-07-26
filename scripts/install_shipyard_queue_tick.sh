@@ -4,26 +4,44 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: install_shipyard_queue_tick.sh --repo-root PATH [--authority] [--install]
+usage: install_shipyard_queue_tick.sh --repo-root PATH [--authority]
+       [--mode dry-run|reap-only|live] [--install]
 
 Validates and prints the install plan by default. --install writes the mode-600
 canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
-received the expected paths. Exactly one fleet host should use --authority.
+received the expected paths and the first tick reports healthy. Exactly one
+fleet host should use --authority. The default mode is dry-run; live requires
+--authority.
 EOF
 }
 
 REPO_ROOT=""
 AUTHORITY=0
 APPLY=0
+MODE="dry-run"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo-root) REPO_ROOT="${2:-}"; shift 2 ;;
     --authority) AUTHORITY=1; shift ;;
+    --mode) MODE="${2:-}"; shift 2 ;;
     --install) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+case "$MODE" in
+  dry-run) TICK_APPLY=0; REAP_ONLY=0 ;;
+  reap-only) TICK_APPLY=1; REAP_ONLY=1 ;;
+  live)
+    [ "$AUTHORITY" = "1" ] || {
+      echo "--mode live requires --authority" >&2
+      exit 2
+    }
+    TICK_APPLY=1
+    REAP_ONLY=0
+    ;;
+  *) echo "invalid mode: $MODE" >&2; usage >&2; exit 2 ;;
+esac
 
 [ -d "$REPO_ROOT/.git" ] || git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || {
   echo "repo root is not a Git checkout: $REPO_ROOT" >&2
@@ -43,6 +61,7 @@ INSTALL_DIR="$HOME/.local/share/tartci/scripts"
 INSTALLED_SCRIPT="$INSTALL_DIR/shipyard_queue_tick.sh"
 CONFIG="$HOME/.config/shipyard/queue-tick.env"
 PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
+HEALTH="$HOME/Library/Logs/shipyard-queue-tick.health.json"
 LABEL="com.danielraffel.shipyard.queue-tick"
 
 [ -f "$TEMPLATE" ] && [ -f "$SCRIPT" ] || {
@@ -53,11 +72,12 @@ LABEL="com.danielraffel.shipyard.queue-tick"
 echo "queue tick install plan:"
 echo "  repo_root=$REPO_ROOT"
 echo "  authority=$AUTHORITY"
+echo "  mode=$MODE"
 echo "  executable=$INSTALLED_SCRIPT (mode 755)"
 echo "  canonical_config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 if [ "$APPLY" != "1" ]; then
-  echo "  mode=dry-run (pass --install to apply)"
+  echo "  action=dry-run (pass --install to apply)"
   exit 0
 fi
 
@@ -84,11 +104,23 @@ chmod 600 "$CONFIG_TMP"
 mv "$CONFIG_TMP" "$CONFIG"
 
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$PLIST_TMP"
+python3 - "$PLIST_TMP" "$TICK_APPLY" "$REAP_ONLY" <<'PY'
+import plistlib, sys
+path, apply, reap_only = sys.argv[1:]
+with open(path, "rb") as source:
+    value = plistlib.load(source)
+environment = value["EnvironmentVariables"]
+environment["SHIPYARD_TICK_APPLY"] = apply
+environment["SHIPYARD_TICK_REAP_ONLY"] = reap_only
+with open(path, "wb") as destination:
+    plistlib.dump(value, destination, sort_keys=False)
+PY
 plutil -lint "$PLIST_TMP" >/dev/null
 mv "$PLIST_TMP" "$PLIST"
 
 launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
+rm -f "$HEALTH"
 launchctl kickstart -k "gui/$(id -u)/$LABEL"
 
 PRINTED="$(launchctl print "gui/$(id -u)/$LABEL")"
@@ -100,4 +132,23 @@ grep -Fq "$INSTALLED_SCRIPT" <<<"$PRINTED" || {
   echo "LaunchAgent did not receive installed queue tick executable" >&2
   exit 1
 }
-echo "installed and started $LABEL"
+healthy=0
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if python3 - "$HEALTH" <<'PY' >/dev/null 2>&1
+import json, sys
+with open(sys.argv[1]) as source:
+    value = json.load(source)
+if not isinstance(value, dict) or value.get("status") != "healthy":
+    raise SystemExit(1)
+PY
+  then
+    healthy=1
+    break
+  fi
+  sleep 1
+done
+[ "$healthy" = "1" ] || {
+  echo "queue tick did not publish a fresh healthy verdict: $HEALTH" >&2
+  exit 1
+}
+echo "installed and started $LABEL in $MODE mode; fresh health verdict is healthy"

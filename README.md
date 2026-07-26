@@ -51,7 +51,9 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
   state), and `tartci profile validate` (check lane selectability).
 - **One scheduler path** — GitHub Actions distributes label-matched jobs,
   Shipyard supervises queue progress, and Tart CI provides governed local VMs.
-  Orchard is not part of the supported or operational fleet path.
+  Orchard is not part of the supported or operational fleet path. Upgraded
+  shadow hosts must run `scripts/disable_orchard.sh --apply` to remove both
+  retired LaunchAgents.
 
 Deep setup — onboarding a host, role derivation, and pool verification — lives
 in [`docs/runbook.md`](docs/runbook.md).

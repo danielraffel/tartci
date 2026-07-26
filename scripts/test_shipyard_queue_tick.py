@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import plistlib
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("shipyard_queue_tick.sh")
 INSTALLER = Path(__file__).with_name("install_shipyard_queue_tick.sh")
+DISABLE_ORCHARD = Path(__file__).with_name("disable_orchard.sh")
 
 
 class QueueTickControlTests(unittest.TestCase):
@@ -494,9 +496,16 @@ exit 98
             {**base, "repo": "owner/repo\tother"},
             {**base, "created_at": 123},
             {**base, "updated_at": "2026-01-01T00:00:00Z\n77"},
+            {**base, "created_at": "not-a-timestamp"},
+            {**base, "updated_at": "2026-01-01T00:00:00"},
+            {**base, "updated_at": "2026-02-30T00:00:00Z"},
             {**base, "dispatched_runs": "not-a-list"},
             {**base, "dispatched_runs": [{"last_heartbeat_at": 123}]},
             {**base, "dispatched_runs": [{"last_heartbeat_at": "now\n77"}]},
+            {
+                **base,
+                "dispatched_runs": [{"last_heartbeat_at": "not-a-timestamp"}],
+            },
         )
         for state in malformed:
             with self.subTest(state=state):
@@ -556,6 +565,9 @@ class QueueTickInstallerTests(unittest.TestCase):
 if [ "$1" = "print" ]; then
   printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
   printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+elif [ "$1" = "kickstart" ]; then
+  mkdir -p "$HOME/Library/Logs"
+  printf '{"status":"healthy"}\\n' > "$HOME/Library/Logs/shipyard-queue-tick.health.json"
 fi
 exit 0
 """,
@@ -575,7 +587,16 @@ exit 0
                 }
             )
             result = subprocess.run(
-                ["/bin/bash", str(INSTALLER), "--repo-root", "repo", "--install"],
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--repo-root",
+                    "repo",
+                    "--authority",
+                    "--mode",
+                    "live",
+                    "--install",
+                ],
                 env=env,
                 cwd=home,
                 text=True,
@@ -596,7 +617,114 @@ exit 0
                 f"SHIPYARD_QUEUE_REPO_ROOT={repo.resolve()}",
                 config.read_text(encoding="utf-8"),
             )
+            self.assertIn(
+                "SHIPYARD_QUEUE_AUTHORITY=1",
+                config.read_text(encoding="utf-8"),
+            )
             self.assertIn("installed and started", result.stdout)
+            with (home / "Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist").open("rb") as source:
+                plist = plistlib.load(source)
+            environment = plist["EnvironmentVariables"]
+            self.assertEqual(environment["SHIPYARD_TICK_APPLY"], "1")
+            self.assertEqual(environment["SHIPYARD_TICK_REAP_ONLY"], "0")
+
+    def test_live_mode_requires_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            result = subprocess.run(
+                [
+                    "/bin/bash",
+                    str(INSTALLER),
+                    "--repo-root",
+                    str(repo),
+                    "--mode",
+                    "live",
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("requires --authority", result.stderr)
+
+
+class NoOrchardCleanupTests(unittest.TestCase):
+    def test_cleanup_is_idempotent_and_verifies_both_labels_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            labels = (
+                "com.danielraffel.tartci.orchard-controller",
+                "com.danielraffel.tartci.orchard-worker",
+            )
+            for label in labels:
+                (agents / f"{label}.plist").write_text("retired", encoding="utf-8")
+            calls = home / "calls"
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "launchctl").write_text(
+                """#!/bin/sh
+printf '%s\\n' "$*" >> "$CALLS"
+case "$1" in
+  bootout) exit 0 ;;
+  print) exit 1 ;;
+esac
+exit 2
+""",
+                encoding="utf-8",
+            )
+            (fake_bin / "launchctl").chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                    "CALLS": str(calls),
+                }
+            )
+            for _ in range(2):
+                result = subprocess.run(
+                    ["/bin/bash", str(DISABLE_ORCHARD), "--apply"],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("LaunchAgents are absent", result.stdout)
+            for label in labels:
+                self.assertFalse((agents / f"{label}.plist").exists())
+                self.assertIn(f"bootout gui/{os.getuid()}/{label}", calls.read_text())
+                self.assertIn(f"print gui/{os.getuid()}/{label}", calls.read_text())
+
+    def test_cleanup_fails_when_a_retired_label_remains_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            fake_bin = home / "bin"
+            fake_bin.mkdir()
+            (fake_bin / "launchctl").write_text(
+                "#!/bin/sh\n[ \"$1\" = print ] && exit 0\nexit 0\n",
+                encoding="utf-8",
+            )
+            (fake_bin / "launchctl").chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(home),
+                    "PATH": f"{fake_bin}:/usr/bin:/bin",
+                }
+            )
+            result = subprocess.run(
+                ["/bin/bash", str(DISABLE_ORCHARD), "--apply"],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("still loaded", result.stderr)
 
 
 if __name__ == "__main__":

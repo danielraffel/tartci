@@ -244,9 +244,26 @@ configuration that survives LaunchAgent drift:
 ```sh
 scripts/install_shipyard_queue_tick.sh \
   --repo-root /absolute/path/to/pulp \
-  --authority
+  --authority \
+  --mode dry-run
 # Re-run with --install only after reviewing the plan.
 ```
+
+The installer removes any previous health verdict before kickstart and succeeds
+only after the newly started tick publishes a fresh healthy verdict. After the
+dry-run log and health file are clean, arm the single authority explicitly:
+
+```sh
+scripts/install_shipyard_queue_tick.sh \
+  --repo-root /absolute/path/to/pulp \
+  --authority \
+  --mode live \
+  --install
+```
+
+Use `--mode reap-only` on a non-authority host that should clean terminal
+ship-state without merging. Never hand-edit the installed plist to change mode;
+re-run the installer so the rendered mode and fresh health proof stay coupled.
 
 Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
 exactly one host whose Shipyard runner tag matches
@@ -269,6 +286,21 @@ responses; generic GitHub errors remain fail-closed and do not increment that
 counter. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
+
+## Retire Orchard on upgrades
+
+Deleting the old templates from a checkout does not stop an already-loaded
+KeepAlive LaunchAgent. Every upgraded host must first preview and then apply the
+idempotent cleanup:
+
+```sh
+scripts/disable_orchard.sh
+scripts/disable_orchard.sh --apply
+```
+
+The apply step boots out the two retired controller/worker labels, removes only
+their exact installed user plists, and fails unless both labels and both plists
+are absent. It is safe to repeat and must be run on every former shadow host.
 
 ## Serving a different repo
 

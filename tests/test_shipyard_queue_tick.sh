@@ -23,8 +23,8 @@ REPO="$WORK/repo"; git init -q "$REPO"
 git -C "$REPO" remote add origin https://github.com/Generous-Corp/pulp.git
 
 # now-ish and long-ago timestamps for heartbeat freshness control.
-NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%S)"
-OLD_ISO="2020-01-01T00:00:00"
+NOW_ISO="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+OLD_ISO="2020-01-01T00:00:00Z"
 
 # ── stub: shipyard ───────────────────────────────────────────────────────
 cat > "$BIN/shipyard" <<STUB
