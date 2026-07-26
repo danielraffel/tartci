@@ -87,6 +87,8 @@
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>
         <string>ghapp</string>
+        <key>TARTCI_ADMISSION_CLEAN_MODE</key>
+        <string>disabled</string>
         <key>TART_HOME</key>
         <string>$TART_HOME</string>
         <key>TARTCI_VM_POLL</key>

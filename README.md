@@ -148,6 +148,27 @@ Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
 
+**Shipyard admission guard (coordinated rollout).** Provider supervisors can
+require a final repository cleanup verdict after the VM is reachable and
+immediately before JIT registration:
+
+```sh
+TARTCI_ADMISSION_CLEAN_MODE=required
+TARTCI_SHIPYARD_CLI=shipyard
+TARTCI_ADMISSION_CLEAN_BASE=main
+```
+
+The default is `disabled` so TartCI can be installed before the matching
+Shipyard command is deployed. Do not set `required` until that host has a
+Shipyard build exposing `runner admission-clean`. Once enabled, only its typed
+`admit` verdict permits `generate-jitconfig`; `defer`, cancellation still in
+flight, auth/API/schema errors, and partial observations all discard the
+unregistered VM and back off for the normal provider poll interval. TartCI does
+not inspect or cancel runs. Authority hosts let Shipyard clean and rescan;
+non-authority hosts admit an already-clean queue or defer until the authority
+tick finishes. This guard is the correctness boundary; a periodic queue-tick
+health marker may avoid a wasteful boot, but never authorizes registration.
+
 **Routing provider API calls off a personal PAT (`TARTCI_GH_CLI`).** Every
 provider polls GitHub each `VM_POLL` seconds on every host (queue check, plus
 JIT mint / runner reclaim / job + run polling). On a shared personal PAT that

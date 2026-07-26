@@ -77,6 +77,8 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
+# shellcheck source=providers/common/admission-clean.lib.sh
+source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -169,6 +171,8 @@ esac; done
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_validate_admission_clean_config "$REPO" "$LABELS" \
+  || die "invalid required Shipyard admission-clean configuration"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
 FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
@@ -213,19 +217,12 @@ queued_work(){
 }
 
 run_one(){ # $1=iteration index
-  local i="$1" jit job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
+  local i="$1" jit="" job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
   local t_start t_booted t_preflight t_runner_done t_done
   local state_dir qemu_started=""
   t_start="$(now_epoch)"
   tartci_check_disk_floor "$WORKROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
-  note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
-  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || die "JIT mint failed (need repo admin)"
-  [ -n "$jit" ] || die "empty JIT config"
 
   local port port_lock jobdir logdir overlay efivars qpid
   read -r port port_lock < <(allocate_ssh_port)
@@ -323,6 +320,39 @@ run_one(){ # $1=iteration index
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
+  if tartci_admission_clean_enabled; then
+    local admission_json="" admission_rc=0
+    write_state admission-check
+    if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
+      admission_rc=0
+    else
+      admission_rc=$?
+    fi
+    [ -z "$admission_json" ] \
+      || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
+    if [ "$admission_rc" -ne 0 ]; then
+      write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      cleanup_job success
+      return "$admission_rc"
+    fi
+  fi
+
+  note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
+  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
+  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        --jq '.encoded_jit_config')" || {
+    note "[$i] JIT mint failed — discarding VM"
+    cleanup_job success
+    return 1
+  }
+  if [ -z "$jit" ]; then
+    note "[$i] empty JIT config — discarding VM"
+    cleanup_job success
+    return 1
+  fi
   note "[$i] vm $job up — ensure runner version + run JIT agent (one job)"
   write_state running
   run_guest_ps_file(){

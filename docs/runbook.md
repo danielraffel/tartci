@@ -843,11 +843,14 @@ tartci serve linux --loop --labels self-hosted,Linux,ARM64,pulp-build-linux,pulp
 tartci serve windows --loop --labels self-hosted,Windows,ARM64,pulp-build-windows,pulp-host-macstudio
 ```
 
-What the supervisor does each job: mint a **Just-In-Time** (single-job) runner
-config via `gh api .../generate-jitconfig` (needs repo admin), clone the golden
-(Linux) or CoW-overlay it on a free SSH port (Windows), run the Actions agent
-once with that JIT config, then discard the VM. The agent processes exactly one
-job and deregisters — no long-lived runner state. The `--loop` gate only boots
+What the supervisor does each job: clone the golden (Linux/macOS) or make a
+CoW overlay on a free SSH port (Windows), wait until the guest is reachable,
+optionally require Shipyard's final admission-clean verdict, then mint a
+**Just-In-Time** (single-job) runner config via
+`gh api .../generate-jitconfig` (needs repo admin). It runs the Actions agent
+once with that JIT config, then discards the VM. Minting after boot avoids
+spending the time-sensitive JIT token during guest startup. The agent processes
+exactly one job and deregisters — no long-lived runner state. The `--loop` gate only boots
 when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
 `Build and Test`. Discovery is intentionally bounded and rotated to keep GitHub
 API use stable. Consequently, `--print-queue` returning `0` means no match in
@@ -855,6 +858,16 @@ that scan window, not that every workflow in the repository was inspected. Use
 `shipyard runner fleet-status --repo OWNER/REPO --json` to diagnose the
 merge-queue front and required contexts; use Tart CI state and logs to diagnose
 VM capacity. `ERR` is the distinct scanner/authentication failure sentinel.
+
+After the coordinated Shipyard deploy, set
+`TARTCI_ADMISSION_CLEAN_MODE=required` on every Linux, macOS, and Windows
+provider LaunchAgent. Optionally set `TARTCI_SHIPYARD_CLI` (default `shipyard`),
+`TARTCI_ADMISSION_CLEAN_BASE` (default `main`), and the bounded
+`TARTCI_ADMISSION_CLEAN_TIMEOUT_SECS` (default 300, range 1..1800). Required
+mode fails closed: a typed `admit` is the only path to JIT registration.
+`defer` or any operational/contract error tears down the still-unregistered VM,
+releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`. Keep the
+mode `disabled` only during the staged TartCI-before-Shipyard rollout.
 Linux and Windows scan queued and in-progress workflow runs for queued jobs and
 add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and

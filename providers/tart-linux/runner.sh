@@ -76,6 +76,8 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
+# shellcheck source=providers/common/admission-clean.lib.sh
+source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
   local status="$1" failure_class="$2" exit_code="$3" runner_name="$4" vm_name="$5" timing_path="$6" log_dir="$7"
@@ -137,7 +139,7 @@ queued_work(){
 }
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
-  local i="$1" vm="linux-ephr-$$-$1" jit lease_cores lease_priority
+  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
@@ -162,13 +164,6 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
   write_state preparing
-  note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
-  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || { tartci_release_vm_lease; die "JIT config mint failed (need repo admin)"; }
-  [ -n "$jit" ] || { tartci_release_vm_lease; die "empty JIT config"; }
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   if ! tart clone "$GOLDEN" "$vm"; then
@@ -211,6 +206,51 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   fi
   t_booted="$(now_epoch)"
+  if tartci_admission_clean_enabled; then
+    local admission_json="" admission_rc=0
+    write_state admission-check
+    if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
+      admission_rc=0
+    else
+      admission_rc=$?
+    fi
+    [ -z "$admission_json" ] \
+      || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
+    if [ "$admission_rc" -ne 0 ]; then
+      write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      tart stop "$vm" >/dev/null 2>&1 || true
+      kill "$rpid" 2>/dev/null || true
+      tart delete "$vm" >/dev/null 2>&1 || true
+      tartci_release_vm_lease
+      delete_state
+      return "$admission_rc"
+    fi
+  fi
+
+  note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
+  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
+  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        --jq '.encoded_jit_config')" || {
+    note "[$i] JIT config mint failed — discarding VM"
+    tart stop "$vm" >/dev/null 2>&1 || true
+    kill "$rpid" 2>/dev/null || true
+    tart delete "$vm" >/dev/null 2>&1 || true
+    tartci_release_vm_lease
+    delete_state
+    return 1
+  }
+  if [ -z "$jit" ]; then
+    note "[$i] empty JIT config — discarding VM"
+    tart stop "$vm" >/dev/null 2>&1 || true
+    kill "$rpid" 2>/dev/null || true
+    tart delete "$vm" >/dev/null 2>&1 || true
+    tartci_release_vm_lease
+    delete_state
+    return 1
+  fi
   note "[$i] vm $vm up at $ip — mounting ccache + launching JIT runner (one job)"
   write_state running
 
@@ -253,6 +293,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
 
 i=0
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_validate_admission_clean_config "$REPO" "$LABELS" \
+  || die "invalid required Shipyard admission-clean configuration"
 
 if [ "$LOOP" = 1 ]; then
   note "ephemeral Linux runner LOOP (Ctrl-C to stop); golden=$GOLDEN labels=$LABELS maxQueuedAge=${MAX_QUEUED_AGE_SECONDS}s queueMatchLabels=$QUEUE_MATCH_LABELS host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
