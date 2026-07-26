@@ -154,6 +154,9 @@ multiplies with each host added. Set `TARTCI_GH_CLI` to a CLI that authenticates
 as a **GitHub App** (e.g. a `ghapp` wrapper that runs `gh` with an App token) to
 move all of it onto the App's separate rate-limit bucket. Default `gh` — generic
 behavior is unchanged; opt in per host via the LaunchAgent env.
+The same setting also governs `tartci doctor --reap` runner reads and cleanup,
+so the fleet health surface cannot silently fall back to an exhausted ambient
+token while the providers themselves use the App.
 
 **Scan-blindness self-heal (why a rate-limited poll can't silently wedge a lane).**
 Each `VM_POLL` the serve loop asks GitHub "are there queued jobs my labels can

@@ -73,6 +73,11 @@ def run_json(argv: list[str]) -> Any:
         raise RuntimeError(f"{' '.join(argv)} returned invalid JSON: {exc}") from exc
 
 
+def github_cli() -> str:
+    """Return the configured GitHub CLI for every janitor API operation."""
+    return os.environ.get("TARTCI_GH_CLI") or "gh"
+
+
 def starts_with_any(name: str, prefixes: list[str]) -> bool:
     return any(name.startswith(prefix) for prefix in prefixes if prefix)
 
@@ -195,7 +200,7 @@ def macos_running_count(vms: list[dict[str, Any]]) -> int:
 def github_runners(repo: str) -> list[dict[str, Any]]:
     data = run_json(
         [
-            "gh",
+            github_cli(),
             "api",
             f"repos/{repo}/actions/runners?per_page=100",
             "--paginate",
@@ -223,7 +228,16 @@ def delete_vm(name: str, running: bool) -> list[str]:
 
 
 def delete_runner(repo: str, runner_id: Any, runner_name: str) -> str:
-    run(["gh", "api", "-X", "DELETE", f"repos/{repo}/actions/runners/{runner_id}"], check=True)
+    run(
+        [
+            github_cli(),
+            "api",
+            "-X",
+            "DELETE",
+            f"repos/{repo}/actions/runners/{runner_id}",
+        ],
+        check=True,
+    )
     return f"github_runner_deleted:{runner_name}:{runner_id}"
 
 
@@ -310,7 +324,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     protected = [p for p in args.protected_names.split(",") if p]
     tart_providers = {"", "tart-macos", "tart-linux"}
 
-    for tool in ("tart", "gh"):
+    for tool in ("tart", github_cli()):
         if shutil.which(tool) is None:
             unreadable.append(f"missing_tool:{tool}")
 
