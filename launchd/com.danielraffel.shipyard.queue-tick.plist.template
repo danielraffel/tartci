@@ -72,7 +72,7 @@
         <key>SHIPYARD_TICK_APPLY</key>
         <string>0</string>
         <key>SHIPYARD_QUEUE_AUTHORITY</key>
-        <string>0</string>
+        <string></string>
         <key>SHIPYARD_QUEUE_REPO_ROOT</key>
         <string></string>
         <key>SHIPYARD_TICK_REAP_ONLY</key>
@@ -81,6 +81,10 @@
         <string>300</string>
         <key>SHIPYARD_TICK_MERGE_METHOD</key>
         <string>merge</string>
+        <key>SHIPYARD_QUEUE_SELF_REPAIR</key>
+        <string>1</string>
+        <key>SHIPYARD_QUEUE_CANONICAL_CONFIG</key>
+        <string>$HOME/.config/shipyard/queue-tick.env</string>
     </dict>
 </dict>
 </plist>

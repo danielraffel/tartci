@@ -238,6 +238,16 @@ never reimplements merge logic, never edits state files, fails closed on any
 GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
 (`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
 `~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1`.
+Use the installer to keep the authority checkout in a mode-600 canonical
+configuration that survives LaunchAgent drift:
+
+```sh
+scripts/install_shipyard_queue_tick.sh \
+  --repo-root /absolute/path/to/pulp \
+  --authority
+# Re-run with --install only after reviewing the plan.
+```
+
 Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
 exactly one host whose Shipyard runner tag matches
 `[merge_queue].mutation_machine`. Other CI Macs may remain dry-run or reap-only
@@ -248,8 +258,15 @@ authority-local `shipyard merge-queue hold` causes the configured authority
 tick to exit before any GitHub read; during an incident, run it on that
 authority (and propagate it fleet-wide for consistent operator status). This
 integration requires Shipyard 0.79.0 or newer; install that release before
-deploying the script or plist. Re-bootstrap after changing the installed
-plist. See the template's header comment for the exact `sed` install recipe.
+deploying the script or plist. Missing authority configuration is a hard
+unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
+is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to
+write that verdict is itself loud and nonzero. Unreadable or malformed queue
+control and ship-state observations are unhealthy rather than successful
+no-ops. A ship-state is
+recoverably archived only after three consecutive, explicit GitHub not-found
+responses; generic GitHub errors remain fail-closed and do not increment that
+counter. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
 

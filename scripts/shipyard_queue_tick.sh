@@ -19,10 +19,18 @@
 #
 # Tunables (env):
 #   SHIPYARD_TICK_APPLY=0|1                 default 0 (dry-run)
-#   SHIPYARD_QUEUE_AUTHORITY=0|1             default 0. FULL-LIVE is refused
+#   SHIPYARD_QUEUE_AUTHORITY=0|1             FULL-LIVE requires explicit 1
 #       unless this host is the explicitly selected queue authority.
 #   SHIPYARD_QUEUE_REPO_ROOT=<checkout>       required for FULL-LIVE. Shipyard
 #       loads that checkout's mutation_machine policy before GitHub access.
+#   SHIPYARD_QUEUE_CANONICAL_CONFIG=<file>     default:
+#       ~/.config/shipyard/queue-tick.env. A strict, user-owned mode-600 file
+#       may self-repair missing ROOT/AUTHORITY values after plist drift.
+#   SHIPYARD_QUEUE_SELF_REPAIR=0|1             default 1
+#   SHIPYARD_QUEUE_HEALTH_FILE=<file>           machine-readable last verdict
+#   SHIPYARD_QUEUE_INVALID_LEDGER=<file>        consecutive-not-found ledger
+#   SHIPYARD_QUEUE_INVALID_THRESHOLD=N          default 3; only then archive
+#       a recoverable ship-state whose PR is repeatedly confirmed nonexistent.
 #   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.79.0. The tick requires
 #       Shipyard's fail-closed merge-queue control surface.
 #   SHIPYARD_TICK_REAP_ONLY=0|1             default 0. With APPLY=1, act on the
@@ -37,8 +45,13 @@
 set -uo pipefail
 
 APPLY="${SHIPYARD_TICK_APPLY:-0}"
-AUTHORITY="${SHIPYARD_QUEUE_AUTHORITY:-0}"
+AUTHORITY="${SHIPYARD_QUEUE_AUTHORITY:-}"
 REPO_ROOT="${SHIPYARD_QUEUE_REPO_ROOT:-}"
+CANONICAL_CONFIG="${SHIPYARD_QUEUE_CANONICAL_CONFIG:-$HOME/.config/shipyard/queue-tick.env}"
+SELF_REPAIR="${SHIPYARD_QUEUE_SELF_REPAIR:-1}"
+HEALTH_FILE="${SHIPYARD_QUEUE_HEALTH_FILE:-$HOME/Library/Logs/shipyard-queue-tick.health.json}"
+INVALID_LEDGER="${SHIPYARD_QUEUE_INVALID_LEDGER:-$HOME/.local/state/tartci/shipyard-queue-tick-invalid.json}"
+INVALID_THRESHOLD="${SHIPYARD_QUEUE_INVALID_THRESHOLD:-3}"
 MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.79.0}"
 REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
@@ -52,6 +65,82 @@ SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [queue-tick] $*"; }
+health() {
+  local status="$1" reason="$2" temp="${HEALTH_FILE}.tmp.$$"
+  if ! mkdir -p "$(dirname "$HEALTH_FILE")" 2>/dev/null; then
+    log "$HOST: HEALTH WRITE FAILED: cannot create $(dirname "$HEALTH_FILE")"
+    return 1
+  fi
+  if ! python3 - "$status" "$reason" "$HOST" "$(ts)" > "$temp" 2>/dev/null <<'PY'
+import json,sys
+print(json.dumps({
+    "schema_version": 1,
+    "status": sys.argv[1],
+    "reason": sys.argv[2],
+    "host": sys.argv[3],
+    "observed_at": sys.argv[4],
+}, sort_keys=True))
+PY
+  then
+    rm -f "$temp"
+    log "$HOST: HEALTH WRITE FAILED: cannot encode $HEALTH_FILE"
+    return 1
+  fi
+  if ! mv "$temp" "$HEALTH_FILE" 2>/dev/null; then
+    rm -f "$temp"
+    log "$HOST: HEALTH WRITE FAILED: cannot publish $HEALTH_FILE"
+    return 1
+  fi
+}
+unhealthy() {
+  log "$HOST: UNHEALTHY: $1"
+  if ! health "unhealthy" "$1"; then
+    log "$HOST: UNHEALTHY verdict could not be persisted"
+  fi
+  exit 2
+}
+load_canonical_config() {
+  [ "$SELF_REPAIR" = "1" ] || return 0
+  [ -f "$CANONICAL_CONFIG" ] || return 0
+  mode="$(stat -f '%Lp' "$CANONICAL_CONFIG" 2>/dev/null || stat -c '%a' "$CANONICAL_CONFIG" 2>/dev/null || echo "")"
+  [ "$mode" = "600" ] || unhealthy "canonical config $CANONICAL_CONFIG must be mode 600"
+  while IFS='=' read -r key value; do
+    case "$key" in
+      SHIPYARD_QUEUE_REPO_ROOT)
+        [ -n "$REPO_ROOT" ] || REPO_ROOT="$value"
+        ;;
+      SHIPYARD_QUEUE_AUTHORITY)
+        [ -n "$AUTHORITY" ] || AUTHORITY="$value"
+        ;;
+      ''|'#'*) ;;
+      *) unhealthy "canonical config contains unsupported key $key" ;;
+    esac
+  done < "$CANONICAL_CONFIG"
+}
+invalid_count() {
+  local repo="$1" pr="$2" outcome="$3"
+  mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || true
+  python3 - "$INVALID_LEDGER" "$repo" "$pr" "$outcome" <<'PY'
+import json, os, sys, tempfile
+path, repo, pr, outcome = sys.argv[1:]
+try:
+    with open(path) as source:
+        data = json.load(source)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+key = f"{repo}#{pr}"
+if outcome == "not_found":
+    data[key] = int(data.get(key, 0)) + 1
+else:
+    data.pop(key, None)
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, temp = tempfile.mkstemp(prefix=".queue-tick-invalid.", dir=os.path.dirname(path))
+with os.fdopen(fd, "w") as out:
+    json.dump(data, out, sort_keys=True)
+os.replace(temp, path)
+print(int(data.get(key, 0)))
+PY
+}
 iso2epoch() {
   [ -z "${1:-}" ] && { echo 0; return; }
   local timestamp="${1%%.*}"
@@ -60,6 +149,7 @@ iso2epoch() {
     || echo 0
 }
 
+load_canonical_config
 installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
 compatible="$(python3 - "$installed" "$MIN_VERSION" <<'PY'
 import re, sys
@@ -71,12 +161,10 @@ print("1" if installed is not None and required is not None and installed >= req
 PY
 )"
 if [ "$compatible" != "1" ]; then
-  log "$HOST: Shipyard $MIN_VERSION or newer is required — skip entire tick (fail closed)"
-  exit 0
+  unhealthy "Shipyard $MIN_VERSION or newer is required"
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ ! -d "$REPO_ROOT" ]; then
-  log "$HOST: FULL-LIVE refused without SHIPYARD_QUEUE_REPO_ROOT checkout; forcing reap-only"
-  REAP_ONLY=1
+  unhealthy "FULL-LIVE requires SHIPYARD_QUEUE_REPO_ROOT checkout (canonical config: $CANONICAL_CONFIG)"
 fi
 CONTROL_CWD="$HOME"
 [ -d "$REPO_ROOT" ] && CONTROL_CWD="$REPO_ROOT"
@@ -92,40 +180,36 @@ PY
 )"
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ -z "$AUTHORITY_REPO" ]; then
-  log "$HOST: FULL-LIVE refused because repo root has no GitHub origin; forcing reap-only"
-  REAP_ONLY=1
+  unhealthy "FULL-LIVE repo root has no GitHub origin"
 fi
 control="$(cd "$CONTROL_CWD" && "$SY" merge-queue status --json 2>/dev/null)" || {
-  log "$HOST: merge-queue control unavailable — skip entire tick (fail closed)"
-  exit 0
+  unhealthy "merge-queue control unavailable"
 }
 held="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("held") else "0")' 2>/dev/null)" || {
-  log "$HOST: merge-queue control malformed — skip entire tick (fail closed)"
-  exit 0
+  unhealthy "merge-queue control malformed"
 }
 authority_matches="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("authority_matches") else "0")' 2>/dev/null)" || {
-  log "$HOST: merge-queue authority status malformed — skip entire tick (fail closed)"
-  exit 0
+  unhealthy "merge-queue authority status malformed"
 }
 if [ "$held" = "1" ]; then
   log "$HOST: local merge-queue hold active — skip entire tick before GitHub reads"
+  health "healthy" "merge_queue_held" || exit 2
   exit 0
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$AUTHORITY" != "1" ]; then
-  log "$HOST: FULL-LIVE refused without SHIPYARD_QUEUE_AUTHORITY=1; forcing reap-only"
-  REAP_ONLY=1
+  unhealthy "FULL-LIVE requires SHIPYARD_QUEUE_AUTHORITY=1"
 fi
 if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$authority_matches" != "1" ]; then
-  log "$HOST: FULL-LIVE refused because runner tag does not match mutation_machine; forcing reap-only"
-  REAP_ONLY=1
+  unhealthy "runner tag does not match merge_queue.mutation_machine"
 fi
 
-"$SY" ship-state list --json 2>/dev/null > "$SS" || { log "$HOST: shipyard ship-state unavailable"; exit 0; }
+"$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"
 
-python3 - "$SS" > "$ROWS" <<'PY'
+python3 - "$SS" > "$ROWS" <<'PY' || unhealthy "shipyard ship-state payload malformed"
 import json,sys
-try: d=json.load(open(sys.argv[1]))
-except Exception: sys.exit(0)
+d=json.load(open(sys.argv[1]))
+if not isinstance(d, dict) or not isinstance(d.get("states"), list):
+    raise ValueError("expected object with states array")
 for s in d.get('states',[]):
     runs=s.get('dispatched_runs') or []
     hb=max((r.get('last_heartbeat_at') or '' for r in runs), default='')
@@ -148,8 +232,31 @@ while IFS=$'\t' read -r pr repo hb; do
     age=$(( now - hbe ))
     if [ "$age" -lt "$FRESH" ]; then log "  $repo#$pr: live worker (hb ${age}s) — skip"; live=$((live+1)); continue; fi
   fi
-  state="$($GH pr view "$pr" --repo "$repo" --json state --jq .state 2>/dev/null)"
-  if [ -z "$state" ]; then log "  $repo#$pr: GitHub read failed — skip (fail closed)"; errs=$((errs+1)); continue; fi
+  PR_ERROR="$TMP/pr-$pr.err"
+  state="$($GH pr view "$pr" --repo "$repo" --json state --jq .state 2>"$PR_ERROR")"
+  if [ -z "$state" ]; then
+    if grep -qiE 'HTTP 404|Could not resolve to a PullRequest|pull request not found' "$PR_ERROR"; then
+      count="$(invalid_count "$repo" "$pr" not_found 2>/dev/null || echo 0)"
+      if [ "$count" -ge "$INVALID_THRESHOLD" ] 2>/dev/null; then
+        if [ "$APPLY" = "1" ] && "$SY" ship-state discard "$pr" >/dev/null 2>&1; then
+          log "  $repo#$pr: quarantined recoverably after $count confirmed not-found reads"
+          invalid_count "$repo" "$pr" reset >/dev/null 2>&1 || true
+          reaped=$((reaped+1))
+        else
+          log "  $repo#$pr: confirmed nonexistent $count times — would quarantine ship-state"
+          stalled=$((stalled+1))
+        fi
+      else
+        log "  $repo#$pr: confirmed nonexistent ($count/$INVALID_THRESHOLD) — hold before quarantine"
+        stalled=$((stalled+1))
+      fi
+    else
+      log "  $repo#$pr: GitHub read failed — skip (fail closed)"
+      errs=$((errs+1))
+    fi
+    continue
+  fi
+  invalid_count "$repo" "$pr" reset >/dev/null 2>&1 || true
   case "$state" in
     MERGED|CLOSED)
       if [ "$APPLY" = "1" ]; then
@@ -181,3 +288,8 @@ while IFS=$'\t' read -r pr repo hb; do
 done < "$ROWS"
 
 log "$HOST: merged=$merged reaped=$reaped waiting=$waiting stalled=$stalled live=$live errs=$errs (mode=$MODE)"
+if [ "$errs" -gt 0 ]; then
+  health "degraded" "github_or_mutation_errors=$errs" || exit 2
+  exit 1
+fi
+health "healthy" "mode=$MODE merged=$merged reaped=$reaped waiting=$waiting stalled=$stalled" || exit 2
