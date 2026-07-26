@@ -12,9 +12,12 @@
 #     `shipyard pr` on them → intended-to-merge set).
 #   * Merges only via `shipyard auto-merge` (no-op unless ALL targets green and
 #     the live head matches the validated SHA — fail closed).
-#   * Discards only when GitHub reports the PR MERGED/CLOSED. OPEN is always kept.
+#   * Recoverably archives only MERGED/CLOSED records or a PR that is absent
+#     for the configured consecutive threshold while its repository is readable.
+#     OPEN is always kept.
 #   * Skips records owned by a live worker (fresh heartbeat).
-#   * Any GitHub read failure → skip that record this pass (fail closed).
+#   * GitHub failures fail closed. Only an explicit PR-not-found response for a
+#     readable repository advances the APPLY-only quarantine ledger.
 #   * DRY-RUN by default. Set SHIPYARD_TICK_APPLY=1 to take action.
 #
 # Tunables (env):
@@ -59,9 +62,6 @@ METHOD="${SHIPYARD_TICK_MERGE_METHOD:-merge}"
 GH="ghapp"; command -v ghapp >/dev/null 2>&1 || GH="gh"
 SY="$(command -v shipyard 2>/dev/null || echo "$HOME/.local/bin/shipyard")"
 HOST="$(scutil --get ComputerName 2>/dev/null || hostname)"
-TMP="$(mktemp -d "${TMPDIR:-/tmp}/shipyard-queue-tick.XXXXXX")" || exit 0
-trap 'rm -rf "$TMP"' EXIT
-SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
 
 ts()  { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log() { echo "$(ts) [queue-tick] $*"; }
@@ -98,6 +98,23 @@ unhealthy() {
     log "$HOST: UNHEALTHY verdict could not be persisted"
   fi
   exit 2
+}
+validate_tunables() {
+  case "$APPLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_APPLY must be 0 or 1" ;; esac
+  case "$REAP_ONLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_REAP_ONLY must be 0 or 1" ;; esac
+  python3 - "$FRESH" "$INVALID_THRESHOLD" <<'PY' >/dev/null 2>&1 || \
+    unhealthy "heartbeat freshness must be 0..604800 and invalid threshold 1..100000"
+import re, sys
+fresh, threshold = sys.argv[1:]
+if not re.fullmatch(r"[0-9]+", fresh) or not 0 <= int(fresh) <= 604800:
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9]+", threshold) or not 1 <= int(threshold) <= 100000:
+    raise SystemExit(1)
+PY
+  case "$METHOD" in
+    merge|squash|rebase) ;;
+    *) unhealthy "SHIPYARD_TICK_MERGE_METHOD must be merge, squash, or rebase" ;;
+  esac
 }
 load_canonical_config() {
   [ "$SELF_REPAIR" = "1" ] || return 0
@@ -147,6 +164,37 @@ os.replace(temp, path)
 print(int(data.get(key, 0)))
 PY
 }
+validate_invalid_ledger() {
+  mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || return 1
+  python3 - "$INVALID_LEDGER" <<'PY'
+import json, os, sys, tempfile
+path = sys.argv[1]
+try:
+    with open(path) as source:
+        data = json.load(source)
+except FileNotFoundError:
+    data = {}
+if not isinstance(data, dict):
+    raise ValueError("invalid ledger must contain a JSON object")
+if any(type(value) is not int or value < 0 for value in data.values()):
+    raise ValueError("invalid ledger counters must be nonnegative integers")
+directory = os.path.dirname(path)
+fd, temp = tempfile.mkstemp(prefix=".queue-tick-ledger-probe.", dir=directory)
+published = f"{temp}.published"
+try:
+    with os.fdopen(fd, "w") as out:
+        json.dump(data, out, sort_keys=True)
+        out.flush()
+        os.fsync(out.fileno())
+    os.replace(temp, published)
+finally:
+    for candidate in (temp, published):
+        try:
+            os.unlink(candidate)
+        except FileNotFoundError:
+            pass
+PY
+}
 iso2epoch() {
   [ -z "${1:-}" ] && { echo 0; return; }
   local timestamp="${1%%.*}"
@@ -155,7 +203,14 @@ iso2epoch() {
     || echo 0
 }
 
+validate_tunables
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/shipyard-queue-tick.XXXXXX")" \
+  || unhealthy "could not create queue-tick scratch directory"
+trap 'rm -rf "$TMP"' EXIT
+SS="$TMP/ship-state.json"; ROWS="$TMP/rows.txt"
+
 load_canonical_config
+validate_invalid_ledger || unhealthy "invalid-ledger integrity/writability check failed"
 installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
 compatible="$(python3 - "$installed" "$MIN_VERSION" <<'PY'
 import re, sys
@@ -191,12 +246,19 @@ fi
 control="$(cd "$CONTROL_CWD" && "$SY" merge-queue status --json 2>/dev/null)" || {
   unhealthy "merge-queue control unavailable"
 }
-held="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("held") else "0")' 2>/dev/null)" || {
-  unhealthy "merge-queue control malformed"
-}
-authority_matches="$(printf '%s' "$control" | python3 -c 'import json,sys; print("1" if json.load(sys.stdin).get("authority_matches") else "0")' 2>/dev/null)" || {
-  unhealthy "merge-queue authority status malformed"
-}
+control_flags="$(printf '%s' "$control" | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+if not isinstance(value, dict):
+    raise ValueError("control must be an object")
+held = value.get("held")
+authority = value.get("authority_matches")
+if type(held) is not bool or type(authority) is not bool:
+    raise ValueError("control booleans must be exact JSON booleans")
+print(f"{int(held)}|{int(authority)}")
+' 2>/dev/null)" || unhealthy "merge-queue control schema malformed"
+held="${control_flags%%|*}"
+authority_matches="${control_flags##*|}"
 if [ "$held" = "1" ]; then
   log "$HOST: local merge-queue hold active — skip entire tick before GitHub reads"
   health "healthy" "merge_queue_held" || exit 2
@@ -236,23 +298,41 @@ while IFS=$'\t' read -r pr repo hb; do
   hbe=$(iso2epoch "$hb")
   if [ "$hbe" -gt 0 ]; then
     age=$(( now - hbe ))
-    if [ "$age" -lt "$FRESH" ]; then log "  $repo#$pr: live worker (hb ${age}s) — skip"; live=$((live+1)); continue; fi
+    if [ "$age" -lt "$FRESH" ]; then
+      invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+        || unhealthy "invalid-ledger reset failed for $repo#$pr"
+      log "  $repo#$pr: live worker (hb ${age}s) — skip"
+      live=$((live+1))
+      continue
+    fi
   fi
   PR_ERROR="$TMP/pr-$pr.err"
   state="$($GH pr view "$pr" --repo "$repo" --json state --jq .state 2>"$PR_ERROR")"
   if [ -z "$state" ]; then
     if grep -qiE 'HTTP 404|Could not resolve to a PullRequest|pull request not found' "$PR_ERROR"; then
+      if ! "$GH" pr list --repo "$repo" --limit 1 --json number >/dev/null 2>&1; then
+        invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+          || unhealthy "invalid-ledger reset failed for $repo#$pr"
+        log "  $repo#$pr: PR not-found was not confirmed by a readable repository — skip"
+        errs=$((errs+1))
+        continue
+      fi
+      if [ "$APPLY" != "1" ]; then
+        log "  $repo#$pr: PR not found — dry-run does not advance quarantine confirmation"
+        stalled=$((stalled+1))
+        continue
+      fi
       count="$(invalid_count "$repo" "$pr" not_found 2>/dev/null)" \
         || unhealthy "invalid-ledger not-found update failed for $repo#$pr"
       if [ "$count" -ge "$INVALID_THRESHOLD" ] 2>/dev/null; then
         if [ "$APPLY" = "1" ]; then
-          invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
-            || unhealthy "invalid-ledger reset failed for $repo#$pr"
           if "$SY" ship-state discard "$pr" >/dev/null 2>&1; then
+            invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+              || unhealthy "invalid-ledger reset failed after durable discard for $repo#$pr"
             log "  $repo#$pr: quarantined recoverably after $count confirmed not-found reads"
             reaped=$((reaped+1))
           else
-            log "  $repo#$pr: quarantine discard failed after safe ledger reset"
+            log "  $repo#$pr: quarantine discard failed; confirmation ledger preserved"
             errs=$((errs+1))
           fi
         else
@@ -264,6 +344,8 @@ while IFS=$'\t' read -r pr repo hb; do
         stalled=$((stalled+1))
       fi
     else
+      invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+        || unhealthy "invalid-ledger reset failed for $repo#$pr"
       log "  $repo#$pr: GitHub read failed — skip (fail closed)"
       errs=$((errs+1))
     fi
@@ -274,8 +356,17 @@ while IFS=$'\t' read -r pr repo hb; do
   case "$state" in
     MERGED|CLOSED)
       if [ "$APPLY" = "1" ]; then
-        if "$SY" ship-state discard "$pr" >/dev/null 2>&1; then log "  $repo#$pr: reaped ($state)"; reaped=$((reaped+1)); else log "  $repo#$pr: discard failed"; errs=$((errs+1)); fi
-      else log "  $repo#$pr: would reap ($state)"; reaped=$((reaped+1)); fi ;;
+        if "$SY" ship-state discard "$pr" >/dev/null 2>&1; then
+          log "  $repo#$pr: reaped ($state)"
+          reaped=$((reaped+1))
+        else
+          log "  $repo#$pr: discard failed"
+          errs=$((errs+1))
+        fi
+      else
+        log "  $repo#$pr: would reap ($state)"
+        reaped=$((reaped+1))
+      fi ;;
     OPEN)
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ] && [ "$repo" != "$AUTHORITY_REPO" ]; then
         log "  $repo#$pr: outside authority repo $AUTHORITY_REPO — skip"
@@ -290,10 +381,63 @@ while IFS=$'\t' read -r pr repo hb; do
         log "  $repo#$pr: OPEN not fast-forwardable (mergeable=$mergeable status=$mss) — SURFACE, no auto-rebase"; stalled=$((stalled+1)); continue
       fi
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
-        (cd "$REPO_ROOT" && "$SY" ship-state reconcile "$pr") >/dev/null 2>&1
-        out="$(cd "$REPO_ROOT" && "$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>&1)"
-        if echo "$out" | grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged'; then log "  $repo#$pr: merged"; merged=$((merged+1))
-        else log "  $repo#$pr: not green yet / no-op"; waiting=$((waiting+1)); fi
+        reconcile_out="$(cd "$REPO_ROOT" && "$SY" ship-state reconcile "$pr" --json 2>/dev/null)"
+        reconcile_status=$?
+        reconcile_ok="$(printf '%s' "$reconcile_out" | python3 -c '
+import json, sys
+expected = int(sys.argv[1])
+value = json.load(sys.stdin)
+results = value.get("results") if isinstance(value, dict) else None
+ok = (
+    isinstance(results, list)
+    and len(results) == 1
+    and results[0].get("pr") == expected
+    and results[0].get("ok") is True
+)
+print("1" if ok else "0")
+' "$pr" 2>/dev/null)"
+        if [ "$reconcile_status" -ne 0 ] || [ "$reconcile_ok" != "1" ]; then
+          log "  $repo#$pr: ship-state reconcile failed — skip auto-merge"
+          errs=$((errs+1))
+          continue
+        fi
+        AUTO_MERGE_ERROR="$TMP/auto-merge-$pr.err"
+        out="$(cd "$REPO_ROOT" && "$SY" auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
+        auto_merge_status=$?
+        if [ "$auto_merge_status" -eq 0 ]; then
+          if echo "$out" | grep -qiE '"(event|status)"[[:space:]]*:[[:space:]]*"(merged|already-merged)"|already-merged'; then
+            log "  $repo#$pr: merged"
+            merged=$((merged+1))
+          else
+            log "  $repo#$pr: auto-merge returned success without a merged verdict"
+            errs=$((errs+1))
+          fi
+        elif [ "$auto_merge_status" -eq 3 ]; then
+          log "  $repo#$pr: not green yet / in flight"
+          waiting=$((waiting+1))
+        else
+          auto_merge_event="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    print("")
+else:
+    event = value.get("event") if isinstance(value, dict) else None
+    print(event if isinstance(event, str) else "")
+' 2>/dev/null)"
+          case "$auto_merge_event" in
+            target-failed)
+              log "  $repo#$pr: required target failed — waiting for a new green head"
+              waiting=$((waiting+1)) ;;
+            superseded-sha)
+              log "  $repo#$pr: ship evidence was superseded — stalled pending re-validation"
+              stalled=$((stalled+1)) ;;
+            *)
+              log "  $repo#$pr: auto-merge failed (exit $auto_merge_status)"
+              errs=$((errs+1)) ;;
+          esac
+        fi
       elif [ "$APPLY" = "1" ]; then
         log "  $repo#$pr: OPEN green — reap-only mode, would attempt shipyard auto-merge (held)"; waiting=$((waiting+1))
       else log "  $repo#$pr: OPEN — would attempt shipyard auto-merge (fail-closed)"; waiting=$((waiting+1)); fi ;;

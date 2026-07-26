@@ -40,7 +40,10 @@ case "\$1 \$2" in
     cat "$WORK/states.json"
     ;;
   "ship-state discard") echo "discard \$3" >> "$ACTIONS" ;;
-  "ship-state reconcile") echo "reconcile \$3" >> "$ACTIONS" ;;
+  "ship-state reconcile")
+    echo "reconcile \$3" >> "$ACTIONS"
+    printf '{"results":[{"pr":%s,"ok":true}]}\n' "\$3"
+    ;;
   *) if [ "\$1" = "auto-merge" ]; then
        echo "automerge \$2" >> "$ACTIONS"
        cat "$WORK/automerge_out.json"
@@ -53,6 +56,7 @@ STUB
 cat > "$BIN/ghapp" <<STUB
 #!/usr/bin/env bash
 # args: pr view <PR> --repo <REPO> --json <FIELDS> --jq <EXPR>
+[ "\${1:-} \${2:-}" = "pr list" ] && { echo "[]"; exit 0; }
 pr=""; fields=""
 while [ \$# -gt 0 ]; do
   case "\$1" in
@@ -100,7 +104,18 @@ echo "MERGEABLE|CLEAN|true"  > "$WORK/merge_505.txt"
 run() {
   : > "$ACTIONS"
   env \
+    -u SHIPYARD_QUEUE_AUTHORITY \
+    -u SHIPYARD_QUEUE_REPO_ROOT \
+    -u SHIPYARD_QUEUE_CANONICAL_CONFIG \
+    -u SHIPYARD_QUEUE_INVALID_THRESHOLD \
+    -u SHIPYARD_QUEUE_MIN_VERSION \
+    -u SHIPYARD_TICK_APPLY \
+    -u SHIPYARD_TICK_REAP_ONLY \
+    -u SHIPYARD_TICK_MERGE_METHOD \
+    -u SHIPYARD_TICK_HEARTBEAT_FRESH_SECS \
+    -u TARTCI_VM_LEASE_PRIORITY \
     PATH="$BIN:$PATH" \
+    HOME="$WORK" \
     SHIPYARD_QUEUE_SELF_REPAIR=0 \
     SHIPYARD_QUEUE_HEALTH_FILE="$WORK/health.json" \
     SHIPYARD_QUEUE_INVALID_LEDGER="$WORK/invalid.json" \
@@ -177,7 +192,7 @@ code=$?
 set -e
 rm "$WORK/control_malformed"
 [ "$code" -eq 2 ] || fail "malformed control should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: merge-queue control malformed" || fail "malformed control should be loud"
+echo "$out" | grep -q "UNHEALTHY: merge-queue control schema malformed" || fail "malformed control should be loud"
 echo "  ok"
 
 echo "== ship-state read and parse failures are unhealthy and nonzero =="
@@ -269,7 +284,7 @@ out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "malformed invalid ledger should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "malformed ledger should be loud"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "malformed ledger should be loud"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "malformed ledger health missing"
 hasnt "discard"; hasnt "automerge"
 rm "$WORK/invalid.json"
@@ -280,7 +295,7 @@ out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "invalid ledger counter type should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "invalid counter should be loud"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "invalid counter should be loud"
 hasnt "discard"; hasnt "automerge"
 rm "$WORK/invalid.json"
 
@@ -293,7 +308,7 @@ out="$(run \
 code=$?
 set -e
 [ "$code" -eq 2 ] || fail "invalid ledger write failure should exit 2, got $code"
-echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "ledger write failure should be loud"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger integrity/writability check failed" || fail "ledger write failure should be loud"
 grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "ledger write failure health missing"
 hasnt "discard"; hasnt "automerge"
 echo "  ok"

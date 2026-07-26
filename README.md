@@ -49,12 +49,12 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
 - **Agent surfaces** — `tartci host-profile` (derived budget), `tartci leases`
   (inspect/acquire/release the store), `tartci status` (provider/capacity/role
   state), and `tartci profile validate` (check lane selectability).
-- **Orchard fleet placement (shadow phase)** — `provider = "orchard"` is valid
-  lane vocabulary but selects nothing yet; a controller + paused workers run
-  shadow-only. See [`docs/runbook.md`](docs/runbook.md).
+- **One scheduler path** — GitHub Actions distributes label-matched jobs,
+  Shipyard supervises queue progress, and Tart CI provides governed local VMs.
+  Orchard is not part of the supported or operational fleet path.
 
-Deep setup — onboarding a host, role derivation, and the Orchard shadow rails —
-lives in [`docs/runbook.md`](docs/runbook.md).
+Deep setup — onboarding a host, role derivation, and pool verification — lives
+in [`docs/runbook.md`](docs/runbook.md).
 
 > **Project Status:** a working lab toolkit, hardening toward turnkey. Wired +
 > proven today: the **Linux Tart lane** (`tartci up linux` — ephemeral clone →
