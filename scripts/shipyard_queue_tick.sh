@@ -274,17 +274,53 @@ fi
 "$SY" ship-state list --json 2>/dev/null > "$SS" || unhealthy "shipyard ship-state unavailable"
 
 python3 - "$SS" > "$ROWS" <<'PY' || unhealthy "shipyard ship-state payload malformed"
-import json,sys
+import json,re,sys
 d=json.load(open(sys.argv[1]))
 if not isinstance(d, dict) or not isinstance(d.get("states"), list):
     raise ValueError("expected object with states array")
-for s in d.get('states',[]):
-    runs=s.get('dispatched_runs') or []
-    hb=max((r.get('last_heartbeat_at') or '' for r in runs), default='')
+rows = []
+repo_pattern = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+")
+for s in d["states"]:
+    if not isinstance(s, dict):
+        raise ValueError("state entry must be an object")
+    pr = s.get("pr")
+    if isinstance(pr, bool) or not (
+        isinstance(pr, int) and pr > 0
+        or isinstance(pr, str) and re.fullmatch(r"[1-9][0-9]*", pr)
+    ):
+        raise ValueError("state pr must be a positive integer")
+    pr = str(pr)
+    repo = s.get("repo")
+    if not isinstance(repo, str) or not repo_pattern.fullmatch(repo):
+        raise ValueError("state repo must be a canonical owner/name slug")
+    runs = s.get("dispatched_runs")
+    if runs is None:
+        runs = []
+    if not isinstance(runs, list) or any(not isinstance(run, dict) for run in runs):
+        raise ValueError("state dispatched_runs must be an array of objects")
+    heartbeats = []
+    for run in runs:
+        heartbeat = run.get("last_heartbeat_at")
+        if heartbeat is None:
+            heartbeat = ""
+        if not isinstance(heartbeat, str) or re.search(r"[\x00-\x1f\x7f]", heartbeat):
+            raise ValueError("state heartbeat must be a control-free string")
+        heartbeats.append(heartbeat)
+    hb=max(heartbeats, default='')
+    timestamps = []
+    for field in ("updated_at", "created_at"):
+        timestamp = s.get(field)
+        if timestamp is None:
+            timestamp = ""
+        if not isinstance(timestamp, str) or re.search(r"[\x00-\x1f\x7f]", timestamp):
+            raise ValueError(f"state {field} must be a control-free string")
+        timestamps.append(timestamp)
     # freshness = most recent of heartbeat / record-write / record-create, so a
     # just-created ship (runs=0, no heartbeat yet) is still treated as live.
-    fresh=max([hb, s.get('updated_at') or '', s.get('created_at') or ''])
-    print(f"{s['pr']}\t{s['repo']}\t{fresh}")
+    fresh=max([hb, *timestamps])
+    rows.append((pr, repo, fresh))
+for row in rows:
+    print("\t".join(row))
 PY
 
 now=$(date -u +%s)

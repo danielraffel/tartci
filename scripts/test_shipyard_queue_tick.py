@@ -479,6 +479,43 @@ exit 98
         self.assertNotIn("ship-state list", calls)
         self.assertEqual(ledger, "corrupt-ledger")
 
+    def test_malformed_state_record_fails_before_github_or_shipyard_mutation(self) -> None:
+        base = {
+            "pr": 42,
+            "repo": "owner/repo",
+            "created_at": "",
+            "updated_at": "",
+            "dispatched_runs": [],
+        }
+        malformed = (
+            {**base, "pr": "999\n42"},
+            {**base, "pr": True},
+            {**base, "repo": "owner/repo\n77\towner/repo"},
+            {**base, "repo": "owner/repo\tother"},
+            {**base, "created_at": 123},
+            {**base, "updated_at": "2026-01-01T00:00:00Z\n77"},
+            {**base, "dispatched_runs": "not-a-list"},
+            {**base, "dispatched_runs": [{"last_heartbeat_at": 123}]},
+            {**base, "dispatched_runs": [{"last_heartbeat_at": "now\n77"}]},
+        )
+        for state in malformed:
+            with self.subTest(state=state):
+                result, calls, _ = self.run_tick(
+                    held=False,
+                    authority=True,
+                    # A valid record before the malformed one proves validation
+                    # is all-or-nothing: no partial row may become actionable.
+                    states=[base, state],
+                    gh_state="MERGED",
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("shipyard ship-state payload malformed", result.stdout)
+                self.assertIn("ship-state list --json", calls)
+                self.assertNotIn("ghapp", calls)
+                self.assertNotIn("ship-state discard", calls)
+                self.assertNotIn("ship-state reconcile", calls)
+                self.assertNotIn("auto-merge", calls)
+
     def test_control_requires_exact_json_booleans(self) -> None:
         for held, authority in (('"false"', "true"), ("false", '"true"')):
             with self.subTest(held=held, authority=authority):
