@@ -104,6 +104,8 @@ load_canonical_config() {
   [ -f "$CANONICAL_CONFIG" ] || return 0
   mode="$(stat -f '%Lp' "$CANONICAL_CONFIG" 2>/dev/null || stat -c '%a' "$CANONICAL_CONFIG" 2>/dev/null || echo "")"
   [ "$mode" = "600" ] || unhealthy "canonical config $CANONICAL_CONFIG must be mode 600"
+  owner="$(stat -f '%u' "$CANONICAL_CONFIG" 2>/dev/null || stat -c '%u' "$CANONICAL_CONFIG" 2>/dev/null || echo "")"
+  [ "$owner" = "$(id -u)" ] || unhealthy "canonical config $CANONICAL_CONFIG must be owned by uid $(id -u)"
   while IFS='=' read -r key value; do
     case "$key" in
       SHIPYARD_QUEUE_REPO_ROOT)
@@ -119,18 +121,22 @@ load_canonical_config() {
 }
 invalid_count() {
   local repo="$1" pr="$2" outcome="$3"
-  mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || true
+  mkdir -p "$(dirname "$INVALID_LEDGER")" 2>/dev/null || return 1
   python3 - "$INVALID_LEDGER" "$repo" "$pr" "$outcome" <<'PY'
 import json, os, sys, tempfile
 path, repo, pr, outcome = sys.argv[1:]
 try:
     with open(path) as source:
         data = json.load(source)
-except (FileNotFoundError, json.JSONDecodeError):
+except FileNotFoundError:
     data = {}
+if not isinstance(data, dict):
+    raise ValueError("invalid ledger must contain a JSON object")
+if any(type(value) is not int or value < 0 for value in data.values()):
+    raise ValueError("invalid ledger counters must be nonnegative integers")
 key = f"{repo}#{pr}"
 if outcome == "not_found":
-    data[key] = int(data.get(key, 0)) + 1
+    data[key] = data.get(key, 0) + 1
 else:
     data.pop(key, None)
 os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -236,12 +242,19 @@ while IFS=$'\t' read -r pr repo hb; do
   state="$($GH pr view "$pr" --repo "$repo" --json state --jq .state 2>"$PR_ERROR")"
   if [ -z "$state" ]; then
     if grep -qiE 'HTTP 404|Could not resolve to a PullRequest|pull request not found' "$PR_ERROR"; then
-      count="$(invalid_count "$repo" "$pr" not_found 2>/dev/null || echo 0)"
+      count="$(invalid_count "$repo" "$pr" not_found 2>/dev/null)" \
+        || unhealthy "invalid-ledger not-found update failed for $repo#$pr"
       if [ "$count" -ge "$INVALID_THRESHOLD" ] 2>/dev/null; then
-        if [ "$APPLY" = "1" ] && "$SY" ship-state discard "$pr" >/dev/null 2>&1; then
-          log "  $repo#$pr: quarantined recoverably after $count confirmed not-found reads"
-          invalid_count "$repo" "$pr" reset >/dev/null 2>&1 || true
-          reaped=$((reaped+1))
+        if [ "$APPLY" = "1" ]; then
+          invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+            || unhealthy "invalid-ledger reset failed for $repo#$pr"
+          if "$SY" ship-state discard "$pr" >/dev/null 2>&1; then
+            log "  $repo#$pr: quarantined recoverably after $count confirmed not-found reads"
+            reaped=$((reaped+1))
+          else
+            log "  $repo#$pr: quarantine discard failed after safe ledger reset"
+            errs=$((errs+1))
+          fi
         else
           log "  $repo#$pr: confirmed nonexistent $count times — would quarantine ship-state"
           stalled=$((stalled+1))
@@ -256,7 +269,8 @@ while IFS=$'\t' read -r pr repo hb; do
     fi
     continue
   fi
-  invalid_count "$repo" "$pr" reset >/dev/null 2>&1 || true
+  invalid_count "$repo" "$pr" reset >/dev/null 2>&1 \
+    || unhealthy "invalid-ledger reset failed for $repo#$pr"
   case "$state" in
     MERGED|CLOSED)
       if [ "$APPLY" = "1" ]; then

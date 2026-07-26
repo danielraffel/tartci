@@ -17,6 +17,7 @@ SCRIPT="$HERE/../scripts/shipyard_queue_tick.sh"
 
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
 BIN="$WORK/bin"; mkdir -p "$BIN"
+REAL_STAT="$(command -v stat)"
 ACTIONS="$WORK/actions.log"; : > "$ACTIONS"
 REPO="$WORK/repo"; git init -q "$REPO"
 git -C "$REPO" remote add origin https://github.com/Generous-Corp/pulp.git
@@ -237,6 +238,64 @@ out="$(run \
   SHIPYARD_QUEUE_CANONICAL_CONFIG="$WORK/canonical.env")"
 has "automerge 202"
 echo "$out" | grep -q "mode=live" || fail "canonical repair should stay full-live"
+echo "  ok"
+
+echo "== canonical config must be owned by the current user =="
+cat > "$BIN/stat" <<STUB
+#!/usr/bin/env bash
+for arg in "\$@"; do
+  if [ "\$arg" = "%u" ]; then echo 999999; exit 0; fi
+done
+exec "$REAL_STAT" "\$@"
+STUB
+chmod +x "$BIN/stat"
+set +e
+out="$(run \
+  SHIPYARD_TICK_APPLY=1 \
+  SHIPYARD_QUEUE_SELF_REPAIR=1 \
+  SHIPYARD_QUEUE_CANONICAL_CONFIG="$WORK/canonical.env")"
+code=$?
+set -e
+rm "$BIN/stat"
+[ "$code" -eq 2 ] || fail "foreign-owned canonical config should exit 2, got $code"
+echo "$out" | grep -q "must be owned by uid" || fail "foreign ownership should be loud"
+hasnt "discard"; hasnt "automerge"
+echo "  ok"
+
+echo "== invalid-ledger read and write failures are unhealthy =="
+printf '{' > "$WORK/invalid.json"
+set +e
+out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
+code=$?
+set -e
+[ "$code" -eq 2 ] || fail "malformed invalid ledger should exit 2, got $code"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "malformed ledger should be loud"
+grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "malformed ledger health missing"
+hasnt "discard"; hasnt "automerge"
+rm "$WORK/invalid.json"
+
+printf '{"Generous-Corp/pulp#101":2.9}' > "$WORK/invalid.json"
+set +e
+out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1)"
+code=$?
+set -e
+[ "$code" -eq 2 ] || fail "invalid ledger counter type should exit 2, got $code"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "invalid counter should be loud"
+hasnt "discard"; hasnt "automerge"
+rm "$WORK/invalid.json"
+
+touch "$WORK/invalid-parent-is-file"
+set +e
+out="$(run \
+  SHIPYARD_TICK_APPLY=1 \
+  SHIPYARD_TICK_REAP_ONLY=1 \
+  SHIPYARD_QUEUE_INVALID_LEDGER="$WORK/invalid-parent-is-file/invalid.json")"
+code=$?
+set -e
+[ "$code" -eq 2 ] || fail "invalid ledger write failure should exit 2, got $code"
+echo "$out" | grep -q "UNHEALTHY: invalid-ledger reset failed" || fail "ledger write failure should be loud"
+grep -q '"status": "unhealthy"' "$WORK/health.json" || fail "ledger write failure health missing"
+hasnt "discard"; hasnt "automerge"
 echo "  ok"
 
 echo "== repeated confirmed nonexistent PR is archived only after threshold =="
