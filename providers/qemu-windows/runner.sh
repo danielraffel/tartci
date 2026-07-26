@@ -258,7 +258,9 @@ for _path in run_paths:
         seen.add(run_id)
         runs.append(run)
 
-runs.sort(key=lambda r: r.get("created_at") or "")   # oldest-first: fairness + urgency under a deep queue
+# Prefer recent runs so stale `queued` records cannot consume the bounded fetch window and hide
+# newly servable work.
+runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
 _MAX_JOB_FETCHES = 30
 count = 0
 _fetched = 0

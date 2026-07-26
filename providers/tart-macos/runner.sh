@@ -322,12 +322,11 @@ except Exception:
     print("ERR")
     raise SystemExit
 
-# Oldest-first so the longest-starved run is checked first (fairness + urgency under a deep queue).
-# The loop only needs to know whether >= 1 servable job exists to boot ONE VM this iteration, so we
-# SHORT-CIRCUIT at the first match instead of fetching jobs for every run — a `jobs` call per run
-# turns a deep backlog into a 60s+ scan that can't keep up with the poll interval. We still bound the
-# no-match case (`_MAX_JOB_FETCHES`) so a large queue of non-servable runs can't stall the scan.
-runs.sort(key=lambda r: r.get("created_at") or "")
+# Newest-first keeps stale run records from consuming the bounded job-fetch window and hiding a
+# newly queued servable job. GitHub can retain runs in `queued` after their useful jobs have already
+# been cancelled or completed; scanning those oldest records first caused a live VM gate to report
+# queued=0 indefinitely once more than `_MAX_JOB_FETCHES` stale records accumulated.
+runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
 _MAX_JOB_FETCHES = 30
 matches = 0
 fetched = 0
