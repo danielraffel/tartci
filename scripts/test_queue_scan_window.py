@@ -31,27 +31,12 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 class QueueScanWindowTests(unittest.TestCase):
-    def test_more_than_thirty_stale_runs_do_not_hide_new_eligible_job(self) -> None:
+    def _run_print_queue(self, runs: list[dict], eligible_id: int) -> subprocess.CompletedProcess:
         with tempfile.TemporaryDirectory() as d:
             tmp = Path(d)
-            stale_runs = [
-                {
-                    "id": 1000 + index,
-                    "name": "Build and Test",
-                    "status": "queued",
-                    "created_at": f"2026-01-01T00:{index:02d}:00Z",
-                }
-                for index in range(31)
-            ]
-            eligible = {
-                "id": 2000,
-                "name": "Build and Test",
-                "status": "queued",
-                "created_at": "2026-01-02T00:00:00Z",
-            }
             payload_path = tmp / "runs.json"
             payload_path.write_text(
-                json.dumps({"workflow_runs": [*stale_runs, eligible]}),
+                json.dumps({"workflow_runs": runs}),
                 encoding="utf-8",
             )
 
@@ -64,13 +49,14 @@ import os
 import sys
 
 path = sys.argv[-1]
+eligible_id = os.environ["ELIGIBLE_ID"]
 if path.endswith("/actions/workflows?per_page=100"):
     print(json.dumps({"workflows": [{"id": 99, "name": "Build and Test"}]}))
 elif "/actions/workflows/99/runs?status=queued" in path:
     print(open(os.environ["RUNS_PAYLOAD"], encoding="utf-8").read())
 elif "/actions/workflows/99/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
-elif "/actions/runs/2000/jobs" in path:
+elif f"/actions/runs/{eligible_id}/jobs" in path:
     print(json.dumps({"jobs": [{
         "status": "queued",
         "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]
@@ -97,6 +83,7 @@ else:
             env = {
                 "HOME": str(tmp),
                 "PATH": os.pathsep.join(base_path),
+                "ELIGIBLE_ID": str(eligible_id),
                 "RUNS_PAYLOAD": str(payload_path),
                 "TART_HOME": str(tmp / "vms"),
                 "TARTCI_STATE_DIR": str(tmp / "state"),
@@ -116,14 +103,52 @@ else:
                 check=False,
                 env=env,
             )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stdout.strip(), "1", result.stdout + result.stderr)
+            return result
 
-    def test_all_bounded_provider_scans_prefer_recent_runs(self) -> None:
+    @staticmethod
+    def _run(run_id: int, created_at: str) -> dict:
+        return {
+            "id": run_id,
+            "name": "Build and Test",
+            "status": "queued",
+            "created_at": created_at,
+        }
+
+    def test_more_than_thirty_stale_runs_do_not_hide_new_eligible_job(self) -> None:
+        stale_runs = [
+            self._run(1000 + index, f"2026-01-01T00:{index:02d}:00Z")
+            for index in range(31)
+        ]
+        eligible = self._run(2000, "2026-01-02T00:00:00Z")
+        result = self._run_print_queue([*stale_runs, eligible], eligible["id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1", result.stdout + result.stderr)
+
+    def test_more_than_thirty_new_runs_do_not_starve_old_eligible_job(self) -> None:
+        eligible = self._run(2000, "2026-01-01T00:00:00Z")
+        newer_runs = [
+            self._run(3000 + index, f"2026-01-02T00:{index:02d}:00Z")
+            for index in range(31)
+        ]
+        result = self._run_print_queue([eligible, *newer_runs], eligible["id"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1", result.stdout + result.stderr)
+
+    def test_all_bounded_provider_scans_interleave_both_queue_edges(self) -> None:
         for provider in PROVIDERS:
             body = provider.read_text(encoding="utf-8")
             self.assertIn(
-                'runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)',
+                "oldest, newest = 0, len(runs) - 1",
+                body,
+                provider,
+            )
+            self.assertIn(
+                "ordered_runs.append(runs[newest])",
+                body,
+                provider,
+            )
+            self.assertIn(
+                "ordered_runs.append(runs[oldest])",
                 body,
                 provider,
             )

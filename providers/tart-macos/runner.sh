@@ -322,11 +322,19 @@ except Exception:
     print("ERR")
     raise SystemExit
 
-# Newest-first keeps stale run records from consuming the bounded job-fetch window and hiding a
-# newly queued servable job. GitHub can retain runs in `queued` after their useful jobs have already
-# been cancelled or completed; scanning those oldest records first caused a live VM gate to report
-# queued=0 indefinitely once more than `_MAX_JOB_FETCHES` stale records accumulated.
-runs.sort(key=lambda r: r.get("created_at") or "", reverse=True)
+# Interleave newest and oldest runs. Newest-first prevents stale records from hiding fresh work,
+# while the oldest slot on every pass prevents a continuous stream of new runs from starving an
+# older eligible gate forever. The scan remains bounded below.
+runs.sort(key=lambda r: r.get("created_at") or "")
+ordered_runs = []
+oldest, newest = 0, len(runs) - 1
+while oldest <= newest:
+    ordered_runs.append(runs[newest])
+    newest -= 1
+    if oldest <= newest:
+        ordered_runs.append(runs[oldest])
+        oldest += 1
+runs = ordered_runs
 _MAX_JOB_FETCHES = 30
 matches = 0
 fetched = 0
