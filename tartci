@@ -243,13 +243,6 @@ cmd_pool() {
 $(tartci_pool_runner_agents "$agents_dir")
 EOF
       echo "runner agents ${action}ed: $n"
-      # Forward-compatible: if an Orchard worker is configured for this host,
-      # pause/resume it too so opt-out also covers Orchard-placed VMs (best-effort).
-      if [ -n "${TARTCI_ORCHARD_URL:-}" ] && command -v orchard >/dev/null 2>&1; then
-        local wv=pause; [ "$sub" = on ] && wv=resume
-        local wname="${TARTCI_ORCHARD_WORKER:-$host}"
-        orchard "$wv" worker "$wname" >/dev/null 2>&1 && echo "  orchard: ${wv}d worker $wname"
-      fi
       if [ "$sub" = off ]; then
         echo "opted OUT: $host finishes in-flight jobs, takes no new CI work"
       else

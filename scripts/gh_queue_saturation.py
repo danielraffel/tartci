@@ -50,7 +50,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -154,7 +153,16 @@ ISSUE_LABEL = "ci"
 
 
 def _gh() -> str:
-    return "ghapp" if shutil.which("ghapp") else "gh"
+    cli = os.environ.get("PULP_SAT_GH_CLI", "").strip()
+    if not cli:
+        raise RuntimeError("PULP_SAT_GH_CLI must name an explicit GitHub App wrapper")
+    if os.path.basename(cli) == "gh":
+        raise RuntimeError("PULP_SAT_GH_CLI refuses ambient gh")
+    if not (os.path.isfile(cli) and os.access(cli, os.X_OK)):
+        from shutil import which
+        if which(cli) is None:
+            raise RuntimeError(f"PULP_SAT_GH_CLI is not executable: {cli}")
+    return cli
 
 
 def _gh_json(args: list[str]) -> object:

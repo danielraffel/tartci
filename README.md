@@ -49,12 +49,14 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
 - **Agent surfaces** — `tartci host-profile` (derived budget), `tartci leases`
   (inspect/acquire/release the store), `tartci status` (provider/capacity/role
   state), and `tartci profile validate` (check lane selectability).
-- **Orchard fleet placement (shadow phase)** — `provider = "orchard"` is valid
-  lane vocabulary but selects nothing yet; a controller + paused workers run
-  shadow-only. See [`docs/runbook.md`](docs/runbook.md).
+- **One scheduler path** — GitHub Actions distributes label-matched jobs,
+  Shipyard supervises queue progress, and Tart CI provides governed local VMs.
+  Orchard is not part of the supported or operational fleet path. Upgraded
+  shadow hosts must run `scripts/disable_orchard.sh --apply` to remove both
+  retired LaunchAgents.
 
-Deep setup — onboarding a host, role derivation, and the Orchard shadow rails —
-lives in [`docs/runbook.md`](docs/runbook.md).
+Deep setup — onboarding a host, role derivation, and pool verification — lives
+in [`docs/runbook.md`](docs/runbook.md).
 
 > **Project Status:** a working lab toolkit, hardening toward turnkey. Wired +
 > proven today: the **Linux Tart lane** (`tartci up linux` — ephemeral clone →
@@ -162,9 +164,12 @@ token while the providers themselves use the App.
 Each `VM_POLL` the serve loop asks GitHub "are there queued jobs my labels can
 serve?" That scan has two outcomes, and the loop keeps them distinct:
 
-- **Normal / "not blind":** the scan succeeds and returns a **count** — `0` means
-  *genuinely no queued work* (idle, correct), `>0` means boot a VM. `--print-queue`
-  prints this number: it's the safe preflight for the loop gate.
+- **Normal / "not blind":** the bounded scan succeeds and returns a **count** —
+  `0` means no matching job was found in the current scan window, while `>0`
+  means boot a VM. A successful `0` proves the scanner and credentials worked;
+  it does **not** prove the repository's complete queue is empty. The scanner
+  deliberately rotates a bounded set of recent runs to control API cost, so a
+  busy repository can expose an older queued job on a later poll.
 - **Blind:** the `gh` scan *fails* (secondary rate-limit / API timeout / a degraded
   or expired token / a network blip). The loop must NOT read that as "no work" —
   doing so is how a supervisor can sit idle for hours (`waiting queued=0`) while the
@@ -183,17 +188,28 @@ keeps scans *succeeding* so the self-heal rarely has to fire. Quick host check:
 `runner.sh --print-queue` should print a number; if it prints `ERR`, that host's
 `gh`/App auth is degraded — fix the token, not the runner.
 
+Use Shipyard's queue-front observation (`shipyard runner fleet-status`) when
+the operational question is whether a required merge gate is making progress.
+Tart CI owns disposable VM capacity and bounded job discovery; Shipyard owns
+queue ordering, required-context classification, enrollment repair, and
+superseded-run policy. Do not add Orchard as a second scheduler.
+
 The Shipyard queue janitor is a separate control-plane role from Tart CI runner
 capacity. Never enable its full-live mode fleet-wide. Exactly one host may set
 `SHIPYARD_QUEUE_AUTHORITY=1`, and its stored Shipyard runner tag must match the
 repo's `[merge_queue].mutation_machine`. This integration requires Shipyard
-0.79.0 or newer and must be deployed only after that binary is installed. A
+0.80.0 or newer and must be deployed only after that binary is installed. A
 Shipyard hold on the configured authority stops its tick before GitHub reads;
-non-authority hosts are forced to reap-only even if an old plist accidentally
-leaves `SHIPYARD_TICK_APPLY=1`. Full-live also requires
+non-authority hosts must explicitly use dry-run or
+`SHIPYARD_TICK_REAP_ONLY=1`; an old plist that requests full-live without
+authority now exits unhealthy rather than silently changing modes. Full-live also requires
 `SHIPYARD_QUEUE_REPO_ROOT` to name the authoritative checkout; the tick runs
 Shipyard there and verifies its runner tag matches that repo's
 `mutation_machine`.
+Treat a full-live tick missing either `SHIPYARD_QUEUE_REPO_ROOT` or
+`SHIPYARD_QUEUE_AUTHORITY=1` as a failed control plane, not a healthy reap-only
+tick. Alert on the nonzero exit and
+`~/Library/Logs/shipyard-queue-tick.health.json`.
 
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
@@ -215,6 +231,17 @@ at its configured in-progress capacity. These Linux/Windows runners are JIT
 ephemeral, so the resolver checks in-progress jobs for each host label rather
 than looking for idle registered GitHub runners. That avoids duplicate VM boots
 and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
+
+The gate supervisors on every participating Mac (currently M1, M3, and M5)
+should advertise `TARTCI_VM_LEASE_PRIORITY=gate`. Advisory supervisors must
+yield to that class. This reserves host-core leases; it does not choose a
+specific GitHub job after a runner boots. GitHub assigns any queued job whose
+requested labels match the ephemeral runner. Therefore required and advisory
+jobs must not share an indistinguishable label set: add a required-gate class
+label to required jobs and a separate advisory class label to coverage,
+snapshot, GPU-proof, and example-validation jobs. Shipyard may coalesce or
+cancel provably redundant workflow runs before boot, but Tart CI must never
+guess queue priority by PR number or mutate the merge queue.
 
 ### Priority-aware idle gate (secondary macOS lanes)
 

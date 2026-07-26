@@ -29,14 +29,9 @@ PULP_DEFAULT_VARS = {
 }
 
 # Target providers tartci understands. `github` = GitHub-hosted; `tartci` = a
-# self-scheduled local Tart/QEMU VM (the runner LaunchAgent path); `orchard` =
-# a VM placed by the Orchard fleet controller. Orchard targets are SHADOW-ONLY
-# for now — vocabulary is accepted so a profile can declare a dormant Orchard
-# target, but a lane must NOT select one until the fleet placement path is
-# proven (see `tartci profile validate` and the governance plan's Orchard
-# rollout). A lane that references an orchard target is a hard validation error.
-VALID_TARGET_PROVIDERS = frozenset({"github", "tartci", "orchard"})
-LANE_SELECTABLE_PROVIDERS = frozenset({"github", "tartci"})
+# self-scheduled local Tart/QEMU VM (the runner LaunchAgent path).
+VALID_TARGET_PROVIDERS = frozenset({"github", "tartci"})
+LANE_SELECTABLE_PROVIDERS = VALID_TARGET_PROVIDERS
 
 
 def load_profile(name: str) -> tuple[Path, dict[str, Any]]:
@@ -101,13 +96,6 @@ def resolve_lanes(profile: dict[str, Any], repo: str) -> list[dict[str, Any]]:
                     warnings.append(
                         f"{target_id} has unknown provider {provider!r}; "
                         f"expected one of {sorted(VALID_TARGET_PROVIDERS)}"
-                    )
-                elif provider not in LANE_SELECTABLE_PROVIDERS:
-                    # Orchard placement is shadow-only until proven — a lane may
-                    # not route to it yet.
-                    warnings.append(
-                        f"{target_id} uses provider {provider!r}, which is not "
-                        f"lane-selectable yet (shadow-only)"
                     )
                 if target.get("arch") == "x64" and provider != "github":
                     warnings.append(f"{target_id} is local x64; treat as smoke until proven")
@@ -244,16 +232,6 @@ def cmd_validate(args: argparse.Namespace) -> int:
                 errors.append(
                     f"{name}: target {target_id!r} has unknown provider {provider!r} "
                     f"(expected one of {sorted(VALID_TARGET_PROVIDERS)})"
-                )
-        for target_id in _iter_lane_target_refs(profile):
-            target = targets.get(target_id)
-            if not isinstance(target, dict):
-                continue
-            provider = target.get("provider")
-            if provider in VALID_TARGET_PROVIDERS and provider not in LANE_SELECTABLE_PROVIDERS:
-                errors.append(
-                    f"{name}: a lane references {target_id!r} (provider {provider!r}), "
-                    f"which is not lane-selectable yet (shadow-only)"
                 )
     if errors:
         for err in sorted(set(errors)):

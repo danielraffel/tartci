@@ -43,16 +43,14 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 
 ### A. From scratch (new pool)
 
-1. **Pick your always-on host** — it becomes the gate anchor (and, if you use
-   Orchard shadow, the controller host). It will derive `dedicated-builder`.
+1. **Pick your always-on host** — it becomes the gate anchor and will derive
+   `dedicated-builder`.
 2. On it: clone tartci → `tartci setup` → bake goldens per lane
    (§2 macOS, §3 Linux, §4 Windows).
 3. Register its GitHub Actions runners with your lane labels; `tartci pool on`.
 4. Verify governed: `tartci host-profile` (role + budgets) and
    `tartci leases status` (store answering).
-5. *(Optional)* start the Orchard shadow controller (see "Orchard fleet
-   placement (shadow phase)").
-6. Add every other Mac via path **B**.
+5. Add every other Mac via path **B**.
 
 ### B. Add one Mac to an existing pool  ← the common case
 
@@ -62,8 +60,7 @@ budgets; pin only if you disagree (see "Onboarding a new host").
    persists the role**, and runs the governor verify gate. A half-provisioned
    host is surfaced rather than reported clean.
 2. **Reachability.** Ensure SSH and (recommended) **Tailscale** so this host and
-   the pool can reach each other by stable name — needed for `goldens sync` and,
-   if used, the Orchard shadow.
+   the pool can reach each other by stable name — needed for `goldens sync`.
 3. **Get goldens without re-baking.** `tartci goldens sync --from <existing-host>`
    pulls the canonical golden(s) over the fastest link (Thunderbolt → LAN →
    Tailscale), verifies, and repoints this host's runner. (Baking per §2–§4 also
@@ -77,11 +74,6 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 6. **Verify governed.** `tartci host-profile` shows the role + core/memory
    budgets; `tartci leases status` shows the store answering. The governor now
    bounds this host's builds + VMs automatically (core + memory admission).
-7. *(Optional) Orchard shadow worker.* If the pool runs the Orchard shadow,
-   register this host as a **paused** worker with derated resources +
-   `org.cirruslabs.tart-vms=0` (see "Orchard fleet placement (shadow phase)").
-   It stays observable and places nothing.
-
 The new Mac is now governed, serving its lanes, and opt-out-able
 (`tartci pool off` finishes in-flight jobs, then takes no new work) exactly like
 the rest of the pool.
@@ -857,7 +849,12 @@ config via `gh api .../generate-jitconfig` (needs repo admin), clone the golden
 once with that JIT config, then discard the VM. The agent processes exactly one
 job and deregisters — no long-lived runner state. The `--loop` gate only boots
 when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
-`Build and Test`.
+`Build and Test`. Discovery is intentionally bounded and rotated to keep GitHub
+API use stable. Consequently, `--print-queue` returning `0` means no match in
+that scan window, not that every workflow in the repository was inspected. Use
+`shipyard runner fleet-status --repo OWNER/REPO --json` to diagnose the
+merge-queue front and required contexts; use Tart CI state and logs to diagnose
+VM capacity. `ERR` is the distinct scanner/authentication failure sentinel.
 Linux and Windows scan queued and in-progress workflow runs for queued jobs and
 add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
@@ -884,6 +881,15 @@ GitHub job timestamps before promoting local routing.
 macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."
+
+Set `TARTCI_VM_LEASE_PRIORITY=gate` on the required-gate supervisors on every
+pool host (M1, M3, and M5), and make advisory supervisors yield. Keep required
+and advisory workflows on distinct class labels. Once a JIT runner is online,
+GitHub—not Tart CI—selects any queued job with a satisfiable label set, so
+identical labels let an optional snapshot, example, coverage, or GPU job consume
+capacity intended for the merge-queue front. Queue order, exact-head
+re-enrollment, bounded reruns, and redundant-run coalescing belong to Shipyard.
+Do not run Orchard alongside Shipyard and Tart CI.
 
 Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_MACOS_GOLDEN` / `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,
@@ -929,7 +935,7 @@ burning the full ~10 min SSH window; and a post-extract integrity check asserts
 
 Install one of the templates in `launchd/` so the supervisor runs under
 `launchd` and survives reboot. The shipped templates are **Pulp's concrete
-instance** — their known labels (`com.danielraffel.pulp.tart-runner`,
+instance** — their known labels (`com.danielraffel.pulp.tart-runner-macos-gate`,
 `com.danielraffel.pulp.tart-runner-macos-release`,
 `com.danielraffel.pulp.tart-runner-linux`, and
 `com.danielraffel.pulp.qemu-runner-windows`) are what the
@@ -1000,35 +1006,16 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   shows the resolved role + capacity. Onboarding persists the role and verifies
   the host is governed — see [Onboarding a new host](#onboarding-a-new-host).
 
-Fleet-level placement on top of these per-host budgets is the Orchard shadow
-phase, below.
+## Fleet scheduling boundary
 
-## Orchard fleet placement (shadow phase)
-
-Orchard (`brew install cirruslabs/cli/orchard`) is the fleet VM-placement layer.
-It is adopted **shadow-first**: registered + observable, but placing nothing.
-Four safety rails keep it off the required `macos` gate's back:
-
-1. **No lane selects it.** `provider = "orchard"` is valid vocabulary, but
-   `tartci profile validate` hard-fails if any lane's `targets` list references
-   an orchard target. The dormant `macstudio.macos-arm64-orchard` target in
-   `profiles/normal-local-fast.toml` exists only to declare the shape.
-2. **Workers are paused.** After each `orchard worker run` (via the
-   `orchard-worker` LaunchAgent), run `orchard pause worker <host>` — the
-   scheduler skips paused workers.
-3. **`org.cirruslabs.tart-vms=0`** in each worker's advertised resources — a hard
-   "no VM fits here" even if unpaused.
-4. **Killable controller.** The controller runs on always-on m3 as its own
-   `orchard-controller` LaunchAgent with an isolated `ORCHARD_HOME`
-   (`~/.orchard-shadow`); `launchctl bootout` is the one-command rollback.
-
-Workers advertise **derated** capacity — each host's `vm_pool_cores` from
-`tartci host-profile` (m3=14, m5=6, m1=3), not physical — so Orchard leaves room
-for the host lease governor and native builds. `tartci status` shows an
-`orchard` block (workers + paused count) when `TARTCI_ORCHARD_URL` is set, and
-`orchard: not configured` otherwise. Host-side macOS≤2 enforcement
-(`macos-vm-cap.lib.sh`, fail-closed) stays authoritative; Orchard placement is
-advisory. Templates: `launchd/com.danielraffel.tartci.orchard-{controller,worker}.plist.template`.
+GitHub Actions is the only fleet scheduler. Shipyard supervises queue ordering,
+merge enrollment, and wedge detection; Tart CI owns per-host disposable VM
+capacity and lease governance. Orchard is not used, even if its binary or old
+shadow configuration remains installed on a host. During an upgrade, run
+`scripts/disable_orchard.sh` to preview the exact two retired labels, then
+`scripts/disable_orchard.sh --apply` to boot them out, remove their installed
+user plists, and verify they are absent. Do not start its controller or workers
+and do not route any profile lane through it.
 
 ## Onboarding a new host
 
@@ -1045,8 +1032,8 @@ installing prereqs + creating stores, it now:
    clean, so a half-provisioned host is visible.
 
 After `tartci setup`, deploy the tartci snapshot to `~/.local/share/tartci`
-(rsync) and — for a CI host — register runners. For fleet placement, follow the
-Orchard shadow steps above. Helpers: `providers/common/onboard.lib.sh`.
+(rsync) and — for a CI host — register runners. Helpers:
+`providers/common/onboard.lib.sh`.
 
 ## Opt a host out of the CI pool (`tartci pool`)
 
@@ -1063,10 +1050,6 @@ lanes change.
 - `tartci pool on` — participation=1 + `launchctl load` the runner agents.
 - `tartci pool status [--json]` — participation state + each runner agent's
   loaded/stopped state.
-
-If `TARTCI_ORCHARD_URL` is set and a worker is configured, `pool off`/`on` also
-best-effort `orchard pause`/`resume` this host's worker, so the switch stays
-correct if a lane is ever cut over to Orchard placement.
 
 ## Non-gate VM lanes are clamped to the non-gate core budget
 

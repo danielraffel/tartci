@@ -27,7 +27,7 @@ With the switch unset, the supervisors create no runtime store and serving
 behavior is unchanged.
 
 The **templates here are Pulp's concrete instance** — the first consumer.
-Their `Label`s are `com.danielraffel.pulp.tart-runner`,
+Their `Label`s are `com.danielraffel.pulp.tart-runner-macos-gate`,
 `com.danielraffel.pulp.tart-runner-macos-release`,
 `com.danielraffel.pulp.tart-runner-linux`, and
 `com.danielraffel.pulp.qemu-runner-windows` because the
@@ -55,12 +55,16 @@ Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
 wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
 capacity and supervisor health will be read from different Tart homes.
 
-If a host already has a required-lane Pulp LaunchAgent using
-`com.danielraffel.pulp.tart-runner`, do not overwrite it during pilot. Install a
-side-by-side pilot plist with a distinct `Label`, log path, and non-required
-runner labels, then load it only after `shipyard runner capacity` shows a free
-slot. Graduate labels later, after the required lane drains and rollback is
-ready.
+The bare `com.danielraffel.pulp.tart-runner` label is retired. Never load it
+beside the replacement: both can resolve to the same runner name and state
+file. Run `scripts/migrate_macos_gate_agent.sh` to inspect the exact plan, then
+re-run with `--apply --attest-external-gui-label-updated` only after the
+external `shipyard-macos-gui` deployment knows the replacement label. The
+helper bootouts/removes only that
+legacy label and installs the
+guarded `com.danielraffel.pulp.tart-runner-macos-gate` replacement. Its
+pre-start uniqueness check refuses to serve if any other loaded Tart macOS
+agent resolves to the same runner name or state file.
 
 When more than one Mac serves the same pool selector, keep the workflow selector
 shared but make each runner name unique. The macOS runner derives its default
@@ -86,7 +90,7 @@ plist) heals it.
 Use the wrapper instead of raw `launchctl` so you can never get this wrong:
 
 ```
-tartci launchd reload com.danielraffel.pulp.tart-runner   # bootout+bootstrap+kickstart
+tartci launchd reload com.danielraffel.pulp.tart-runner-macos-gate
 tartci launchd status                                     # health of every tartci agent
 ```
 
@@ -221,6 +225,23 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 Then install the LaunchAgent once the report is clean. Logs land in
 `~/Library/Logs/tartci/tartci-reap.log`.
 
+All unattended macOS, macOS-release, Linux, Windows, and reap agents explicitly
+set `TARTCI_GH_CLI=ghapp`. Install the wrapper in the LaunchAgent `PATH` on
+every host; no token or secret belongs in a plist. After rendering/loading each
+installed agent, verify launchd received the wrapper selection (examples):
+
+```sh
+launchctl print "gui/$(id -u)/com.danielraffel.pulp.tart-runner-linux" |
+  grep -A1 TARTCI_GH_CLI
+launchctl print "gui/$(id -u)/com.danielraffel.tartci.reap" |
+  grep -A1 TARTCI_GH_CLI
+command -v ghapp
+ghapp api repos/Generous-Corp/pulp --jq .full_name
+```
+
+A missing wrapper is a deployment failure; do not let the unattended process
+fall back to ambient `gh`.
+
 ## Shipyard queue janitor
 
 `com.danielraffel.shipyard.queue-tick.plist.template` runs
@@ -238,6 +259,37 @@ never reimplements merge logic, never edits state files, fails closed on any
 GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
 (`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
 `~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1`.
+Use the installer to keep the authority checkout in a mode-600 canonical
+configuration that survives LaunchAgent drift:
+
+```sh
+scripts/install_shipyard_queue_tick.sh \
+  --repo-root /absolute/path/to/pulp \
+  --authority \
+  --gh-cli /absolute/path/to/ghapp \
+  --mode dry-run
+# Re-run with --install only after reviewing the plan.
+```
+
+The installer removes any previous health verdict before kickstart and succeeds
+only after the newly started tick publishes a fresh healthy verdict. After the
+dry-run log and health file are clean, arm the single authority explicitly:
+
+```sh
+scripts/install_shipyard_queue_tick.sh \
+  --repo-root /absolute/path/to/pulp \
+  --authority \
+  --gh-cli /absolute/path/to/ghapp \
+  --mode live \
+  --install
+```
+
+Use `--mode reap-only` on a non-authority host that should clean terminal
+ship-state without merging. Every mode requires `--gh-cli` pointing to an
+executable GitHub App wrapper; unattended operation never falls back to ambient
+`gh`. Never hand-edit the installed plist to change mode; re-run the installer
+so the rendered mode and fresh health proof stay coupled.
+
 Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
 exactly one host whose Shipyard runner tag matches
 `[merge_queue].mutation_machine`. Other CI Macs may remain dry-run or reap-only
@@ -247,11 +299,33 @@ and requires `authority_matches=true` before full-live operation. An
 authority-local `shipyard merge-queue hold` causes the configured authority
 tick to exit before any GitHub read; during an incident, run it on that
 authority (and propagate it fleet-wide for consistent operator status). This
-integration requires Shipyard 0.79.0 or newer; install that release before
-deploying the script or plist. Re-bootstrap after changing the installed
-plist. See the template's header comment for the exact `sed` install recipe.
+integration requires Shipyard 0.80.0 or newer; install that release before
+deploying the script or plist. Missing authority configuration is a hard
+unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
+is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to
+write that verdict is itself loud and nonzero. Unreadable or malformed queue
+control and ship-state observations are unhealthy rather than successful
+no-ops. A ship-state is
+recoverably archived only after three consecutive, explicit GitHub not-found
+responses; generic GitHub errors remain fail-closed and do not increment that
+counter. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
+
+## Retire Orchard on upgrades
+
+Deleting the old templates from a checkout does not stop an already-loaded
+KeepAlive LaunchAgent. Every upgraded host must first preview and then apply the
+idempotent cleanup:
+
+```sh
+scripts/disable_orchard.sh
+scripts/disable_orchard.sh --apply
+```
+
+The apply step boots out the two retired controller/worker labels, removes only
+their exact installed user plists, and fails unless both labels and both plists
+are absent. It is safe to repeat and must be run on every former shadow host.
 
 ## Serving a different repo
 

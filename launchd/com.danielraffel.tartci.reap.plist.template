@@ -59,6 +59,8 @@
         <string>$HOME</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_GH_CLI</key>
+        <string>ghapp</string>
         <key>TART_HOME</key>
         <string>$HOME/VMs</string>
         <key>TARTCI_HOME</key>

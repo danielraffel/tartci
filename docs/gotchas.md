@@ -93,6 +93,52 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   installed. → *Fix:* run `softwareupdate --install-rosetta --agree-to-license`
   on the Mac and boot with `tart run --rosetta=rosetta <vm>`.
 
+## Queue and pool control
+
+- **All three Macs look healthy, but the required front job is still queued.**
+  → *Cause:* runner process health is not useful-progress health. A bounded
+  scanner can legitimately report `queued=0` for its current window, or GitHub
+  can assign an optional job that shares the required job's labels.
+  → *Fix:* inspect `shipyard runner fleet-status --repo OWNER/REPO --json`,
+  configure M1/M3/M5 gate supervisors with
+  `TARTCI_VM_LEASE_PRIORITY=gate`, and separate required-gate labels from
+  advisory labels.
+
+- **The queue tick is running every five minutes but arms or merges nothing.**
+  → *Cause:* full-live Shipyard execution was launched without
+  `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
+  plane exits unhealthy and takes no GitHub action.
+  → *Fix:* repair the single authority's environment and alert on that
+  configuration error. Do not treat repeated `merged=0` as proof the queue is
+  healthy, and do not add Orchard as a fallback scheduler.
+
+- **A newly booted VM runs an optional job instead of the required gate.**
+  → *Cause:* GitHub chooses among all queued jobs matching the runner's labels;
+  Tart CI cannot retarget a JIT runner after registration.
+  → *Fix:* use distinct required/advisory class labels. Let Shipyard safely
+  coalesce superseded runs before capacity is offered; never dequeue/requeue a
+  PR merely to change its position.
+
+- **An old Linux provider process remains after its recorded owner is gone.**
+  → *Cause:* current doctor output does not yet classify every legacy
+  host-process generation with enough ownership evidence for safe deletion.
+  → *Fix:* treat this as a rollout follow-up. Do not kill by age, command name,
+  or a stale heartbeat alone; an active long job can have a fresh lease/PID
+  while its supervisor heartbeat looks stale. A future owner-aware classifier
+  may remove an orphan only when all of these are proven together: stale state
+  heartbeat, VM absent from Tart, GitHub runner online but idle, recorded owner
+  PID alive but not the currently loaded LaunchAgent supervisor/service owner,
+  and exact post-cleanup verification. Until that classifier exists, inspect
+  the two old-process candidates manually and take no automated action.
+
+- **Doctor warns about a stale heartbeat while the same runner is busy.**
+  → *Cause:* the early state-row check can warn before the later GitHub and
+  lease observations prove that a long job still has a live owner, fresh lease,
+  and busy runner.
+  → *Fix:* do not clean it. Suppressing this false positive is a rollout
+  follow-up: the final classification must clear the warning only when the
+  same runner identity is busy and its current lease/PID ownership is fresh.
+
 ## Windows (QEMU)
 
 - **Install media won't boot — BCD `0xc000000d` (\EFI\Microsoft\Boot\BCD).**
