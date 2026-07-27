@@ -134,19 +134,50 @@ macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 boots a throwaway clone per queued job, and lets the GitHub **workflow** drive
 the build — the host just supplies a clean VM each time. `--loop` keeps serving
 (what the LaunchAgents run); the default is one job then exit (pilot-safe).
-The Windows QEMU loop scans queued and in-progress workflow runs for queued jobs,
+The Linux Tart and Windows QEMU loops scan queued and in-progress workflow runs for queued jobs,
 ignores stale queued jobs older than `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (six
 hours by default), and checks queued job labels by default
-(`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1`). That keeps the supervisor safe to leave
+(`TARTCI_RUNNER_QUEUE_MATCH_LABELS=1`). That keeps each supervisor safe to leave
 loaded while the repo still defaults ordinary Windows jobs to GitHub-hosted
 `windows-latest`; a race-loser VM that boots but never claims a job exits after
 `TARTCI_RUNNER_IDLE_TIMEOUT_SECS` (15 minutes by default), deletes its stale
-GitHub runner registration, and discards the overlay. Ephemeral Windows runner
+GitHub runner registration, and discards its VM/overlay while releasing the
+capacity lease. Linux rechecks the exact runner's GitHub `busy` state at the
+deadline, bounds API-uncertainty retries, and removes a confirmed-idle JIT
+registration during teardown. Linux also exports `CCACHE_DIR=~/.ccache` and requires that
+directory to resolve to the writable host
+virtio-fs share with the expected filesystem tag before JIT registration; a
+missing or incorrectly bound cache
+fails closed instead of silently running cold. Linux exports
+`CMAKE_BUILD_PARALLEL_LEVEL` from `TARTCI_LINUX_BUILD_PARALLEL_LEVEL` (default
+4, capped by the VM lease's core count) so workflow `cmake --build` calls use
+the provisioned VM without requiring workflow changes. Ephemeral Windows runner
 names include a host-derived prefix by default so multiple Macs can serve the
 same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
+
+**Shipyard admission guard (coordinated rollout).** Provider supervisors can
+require a final repository cleanup verdict after the VM is reachable and
+immediately before JIT registration:
+
+```sh
+TARTCI_ADMISSION_CLEAN_MODE=required
+TARTCI_SHIPYARD_CLI=shipyard
+TARTCI_ADMISSION_CLEAN_BASE=main
+```
+
+The default is `disabled` so TartCI can be installed before the matching
+Shipyard command is deployed. Do not set `required` until that host has a
+Shipyard build exposing `runner admission-clean`. Once enabled, only its typed
+`admit` verdict permits `generate-jitconfig`; `defer`, cancellation still in
+flight, auth/API/schema errors, and partial observations all discard the
+unregistered VM and back off for the normal provider poll interval. TartCI does
+not inspect or cancel runs. Authority hosts let Shipyard clean and rescan;
+non-authority hosts admit an already-clean queue or defer until the authority
+tick finishes. This guard is the correctness boundary; a periodic queue-tick
+health marker may avoid a wasteful boot, but never authorizes registration.
 
 **Routing provider API calls off a personal PAT (`TARTCI_GH_CLI`).** Every
 provider polls GitHub each `VM_POLL` seconds on every host (queue check, plus

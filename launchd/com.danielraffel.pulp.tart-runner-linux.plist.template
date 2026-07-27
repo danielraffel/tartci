@@ -87,10 +87,18 @@
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>
         <string>ghapp</string>
+        <key>TARTCI_ADMISSION_CLEAN_MODE</key>
+        <string>disabled</string>
         <key>TART_HOME</key>
         <string>$TART_HOME</string>
         <key>TARTCI_VM_POLL</key>
         <string>10</string>
+        <key>TARTCI_RUNNER_IDLE_TIMEOUT_SECS</key>
+        <string>300</string>
+        <key>TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS</key>
+        <string>21600</string>
+        <key>TARTCI_LINUX_BUILD_PARALLEL_LEVEL</key>
+        <string>4</string>
         <key>TARTCI_LINUX_LOGS</key>
         <string>$HOME/VMs/logs/tartci-linux</string>
     </dict>

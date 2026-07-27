@@ -81,6 +81,7 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CURRENT_IP=""
+CURRENT_REGISTERED_RUNNER=""
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -98,6 +99,8 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
+# shellcheck source=providers/common/admission-clean.lib.sh
+source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -155,7 +158,6 @@ STATE_DIR="$(printf '%s' "$IDENTITY_JSON" | python3 -c 'import json,sys; print(j
 [ "$PRINT_NAME" = 1 ] && { printf '%s\n' "$RUNNER_NAME"; exit 0; }
 [ "$PRINT_EVENT_LOG" = 1 ] && { printf '%s\n' "$EVENT_LOG"; exit 0; }
 [ -n "${PRINT_BOOT_NAME:-}" ] && { printf '%s\n' "$(ephemeral_boot_name "$PRINT_BOOT_NAME")"; exit 0; }
-
 if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
   python3 "$TARTCI_ROOT/scripts/macos_runner_identity_guard.py" \
     --current-label "$TARTCI_LAUNCHD_LABEL" \
@@ -332,6 +334,10 @@ cleanup(){
   discard_current_vm
   tartci_release_vm_lease
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+  if [ -n "$CURRENT_REGISTERED_RUNNER" ]; then
+    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" 2>/dev/null || true
+    CURRENT_REGISTERED_RUNNER=""
+  fi
   reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
   CLEANED_UP=1
   heartbeat stopped
@@ -429,7 +435,7 @@ run_one(){
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" vm; vm="$(ephemeral_boot_name "$i")"
-  local jit label_args=() l boot_log rpid ip="" rc=0
+  local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
@@ -440,6 +446,7 @@ run_one(){
   tartci_check_disk_floor "$TART_HOME" || return $?
   tartci_check_disk_floor "$CACHE_ROOT" || return $?
   CLEANED_UP=0
+  CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
@@ -447,23 +454,19 @@ run_one(){
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
-  heartbeat minting-jit
-  event mint_jit "labels=$LABELS"
-  IFS=',' read -r -a labels_split <<< "$LABELS"
-  for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || { tartci_release_vm_lease; die "JIT config mint failed (need repo admin)"; }
-  [ -n "$jit" ] || { tartci_release_vm_lease; die "empty JIT config"; }
+  lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
+  # Own the unique per-boot name before the foreground clone so signal cleanup
+  # cannot miss a clone completed immediately before the trap is delivered.
+  CURRENT_VM="$vm"
   if ! tart clone "$GOLDEN" "$vm"; then
+    discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  CURRENT_VM="$vm"
   if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
     note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
     discard_current_vm
@@ -487,8 +490,62 @@ run_one(){
   fi
   CURRENT_IP="$ip"
   rm -f "$boot_log"
-  for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && break; sleep 2; done
+  local sshok=0
+  for _ in $(seq 1 90); do
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
+      && { sshok=1; break; }
+    sleep 2
+  done
+  if [ "$sshok" != 1 ]; then
+    note "[$i] no SSH after 180s — discarding unregistered VM"
+    event boot_failed "no_ssh"
+    runtime_emit_complete fail ssh_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
   t_booted="$(now_epoch)"
+  if tartci_admission_clean_enabled; then
+    local admission_json="" admission_rc=0
+    heartbeat admission-check
+    event admission_check "repo=$REPO labels=$LABELS"
+    if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
+      admission_rc=0
+    else
+      admission_rc=$?
+    fi
+    [ -z "$admission_json" ] \
+      || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
+    if [ "$admission_rc" -ne 0 ]; then
+      heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
+        "rc=$admission_rc unregistered=true"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      discard_current_vm
+      tartci_release_vm_lease
+      return "$admission_rc"
+    fi
+  fi
+
+  heartbeat minting-jit
+  event mint_jit "labels=$LABELS"
+  # Claim the exact per-boot registration name before minting. Cleanup can then
+  # reclaim it even when a signal lands immediately after GitHub creates it.
+  CURRENT_REGISTERED_RUNNER="$vm"
+  IFS=',' read -r -a labels_split <<< "$LABELS"
+  for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        --jq '.encoded_jit_config')" || {
+    note "[$i] JIT config mint failed — discarding VM"
+    cleanup
+    return 1
+  }
+  if [ -z "$jit" ]; then
+    note "[$i] empty JIT config — discarding VM"
+    cleanup
+    return 1
+  fi
   note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s job_timeout=${JOB_TIMEOUT}s)"
   event boot_ok "ip=$ip"
   heartbeat idle-wait
@@ -527,6 +584,7 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   reclaim_runner_name "$vm"
+  CURRENT_REGISTERED_RUNNER=""
   heartbeat stopped
   CLEANED_UP=1
   return 0
@@ -536,6 +594,8 @@ i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_validate_admission_clean_config "$REPO" "$LABELS" \
+  || die "invalid required Shipyard admission-clean configuration"
 
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh

@@ -28,6 +28,7 @@ FAILURE_CLASSES = {
     "runner_timeout",
     "idle_timeout",
     "boot_failed",
+    "cache_setup_failed",
     "ssh_failed",
     "jit_failed",
     "runner_nonzero",

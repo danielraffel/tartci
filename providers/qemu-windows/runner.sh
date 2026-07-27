@@ -64,6 +64,14 @@ HOST_SLUG="$(hostname -s 2>/dev/null || hostname)"
 HOST_SLUG="$(printf '%s' "$HOST_SLUG" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' '-' | sed 's/^-*//;s/-*$//')"
 RUNNER_NAME_PREFIX="${TARTCI_RUNNER_NAME_PREFIX:-${PULP_RUNNER_NAME_PREFIX:-win-ephr-${HOST_SLUG:-host}}}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
+CURRENT_WIN_JOB=""
+CURRENT_WIN_JOBDIR=""
+CURRENT_WIN_PORT_LOCK=""
+CURRENT_WIN_QPID=""
+CURRENT_WIN_STATE_DIR=""
+CURRENT_WIN_LEASE_ID_EXPECTED=""
+CURRENT_WIN_CPUS=""
+CURRENT_WIN_CLEANED_UP=1
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -77,6 +85,8 @@ source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 # shellcheck source=providers/common/host-health.lib.sh
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
+# shellcheck source=providers/common/admission-clean.lib.sh
+source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -93,7 +103,7 @@ runtime_emit_complete(){
     --golden "$GOLDEN" \
     --cache-mode unknown \
     --cache-mode-source unknown \
-    --cpu-count "$WIN_CPUS" \
+    --cpu-count "${CURRENT_WIN_CPUS:-$WIN_CPUS}" \
     --ram-mb "$WIN_MEMORY_MB" \
     --status "$status" \
     --failure-class "$failure_class" \
@@ -169,6 +179,8 @@ esac; done
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_validate_admission_clean_config "$REPO" "$LABELS" \
+  || die "invalid required Shipyard admission-clean configuration"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
 FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
@@ -199,6 +211,42 @@ delete_runner_registration(){
   done
 }
 
+cleanup_active_windows_job(){
+  [ "$CURRENT_WIN_CLEANED_UP" = 0 ] || return 0
+  CURRENT_WIN_CLEANED_UP=1
+  if [ -n "$CURRENT_WIN_QPID" ]; then
+    kill -9 "$CURRENT_WIN_QPID" 2>/dev/null || true
+    wait "$CURRENT_WIN_QPID" 2>/dev/null || true
+  fi
+  [ -z "$CURRENT_WIN_JOBDIR" ] || rm -rf "$CURRENT_WIN_JOBDIR"
+  [ -z "$CURRENT_WIN_PORT_LOCK" ] || rm -rf "$CURRENT_WIN_PORT_LOCK"
+  if [ -n "$CURRENT_WIN_LEASE_ID_EXPECTED" ] \
+    && [ "${TARTCI_ACTIVE_VM_LEASE_ID:-}" = "$CURRENT_WIN_LEASE_ID_EXPECTED" ]; then
+    tartci_release_vm_lease
+  fi
+  if [ -n "$CURRENT_WIN_STATE_DIR" ] && [ -n "$CURRENT_WIN_JOB" ]; then
+    tartci_delete_vm_state "$CURRENT_WIN_JOB" "$CURRENT_WIN_STATE_DIR"
+  fi
+  [ -z "$CURRENT_WIN_JOB" ] \
+    || delete_runner_registration "$CURRENT_WIN_JOB" || true
+  CURRENT_WIN_JOB=""
+  CURRENT_WIN_JOBDIR=""
+  CURRENT_WIN_PORT_LOCK=""
+  CURRENT_WIN_QPID=""
+  CURRENT_WIN_STATE_DIR=""
+  CURRENT_WIN_LEASE_ID_EXPECTED=""
+  CURRENT_WIN_CPUS=""
+  return 0
+}
+
+handle_windows_runner_signal(){
+  cleanup_active_windows_job
+  trap - EXIT
+  exit 143
+}
+trap handle_windows_runner_signal INT TERM
+trap cleanup_active_windows_job EXIT
+
 queued_work(){
   python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
@@ -213,27 +261,31 @@ queued_work(){
 }
 
 run_one(){ # $1=iteration index
-  local i="$1" jit job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
+  local i="$1" jit="" job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
+  local effective_win_cpus
   local t_start t_booted t_preflight t_runner_done t_done
   local state_dir qemu_started=""
   t_start="$(now_epoch)"
   tartci_check_disk_floor "$WORKROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
-  note "[$i] minting JIT runner config (labels=$LABELS, ephemeral)"
-  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || die "JIT mint failed (need repo admin)"
-  [ -n "$jit" ] || die "empty JIT config"
 
   local port port_lock jobdir logdir overlay efivars qpid
   read -r port port_lock < <(allocate_ssh_port)
   [ -n "$port" ] && [ -n "$port_lock" ] || die "failed to allocate SSH port"
-  jobdir="$WORKROOT/$job"; mkdir -p "$jobdir"
+  jobdir="$WORKROOT/$job"
+  CURRENT_WIN_JOB="$job"
+  CURRENT_WIN_JOBDIR="$jobdir"
+  CURRENT_WIN_PORT_LOCK="$port_lock"
+  CURRENT_WIN_QPID=""
+  CURRENT_WIN_STATE_DIR=""
+  CURRENT_WIN_LEASE_ID_EXPECTED=""
+  CURRENT_WIN_CPUS=""
+  CURRENT_WIN_CLEANED_UP=0
+  mkdir -p "$jobdir"
   logdir="$LOGROOT/$job"; mkdir -p "$logdir"
   overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
   state_dir="$(tartci_provider_state_dir qemu-windows)"
+  CURRENT_WIN_STATE_DIR="$state_dir"
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \
     TARTCI_STATE_REPO="$REPO" \
@@ -249,42 +301,39 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_KEEP_FAILED="${2:-}" \
     tartci_write_vm_state qemu-windows "$job" "$job" "$1" ephemeral "$state_dir"
   }
-  delete_state(){ tartci_delete_vm_state "$job" "$state_dir"; }
   lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
   lease_mem="$(tartci_vm_lease_mem_mb qemu-windows "$WIN_MEMORY_MB")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
+  # Claim release responsibility before the foreground acquisition so a signal
+  # delivered immediately after success cannot strand the new lease.
+  CURRENT_WIN_LEASE_ID_EXPECTED="vm-qemu-windows-vm-$job"
   tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
     local lease_rc=$?
-    rm -rf "$jobdir"
-    rm -rf "$port_lock"
+    cleanup_active_windows_job
     return "$lease_rc"
   }
-  WIN_CPUS="$lease_cores"
+  effective_win_cpus="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  CURRENT_WIN_CPUS="$effective_win_cpus"
   write_state preparing
 
   note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
   if ! qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
-    tartci_release_vm_lease
-    delete_state
-    rm -rf "$jobdir"
-    rm -rf "$port_lock"
+    cleanup_active_windows_job
     return 1
   fi
   if ! cp "$VARS_TPL" "$efivars"; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
-    tartci_release_vm_lease
-    delete_state
-    rm -rf "$jobdir"
-    rm -rf "$port_lock"
+    cleanup_active_windows_job
     return 1
   fi
-  qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$WIN_CPUS" -m "$WIN_MEMORY_MB" \
+  qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$effective_win_cpus" -m "$WIN_MEMORY_MB" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" -drive if=pflash,format=raw,file="$efivars" \
     -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
     -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=net0 \
     -drive file="$overlay",if=none,id=nvm,format=qcow2 -device nvme,drive=nvm,serial=pulpwin \
-    -display none >"$logdir/qemu.log" 2>&1 & qpid=$!
+    -display none >"$logdir/qemu.log" 2>&1 & CURRENT_WIN_QPID=$!
+  qpid="$CURRENT_WIN_QPID"
   qemu_started="$(tartci_pid_started_at "$qpid")"
   write_state booting
 
@@ -294,15 +343,18 @@ run_one(){ # $1=iteration index
     if [ "$outcome" = "failure" ] && [ "$KEEP_FAILED" = 1 ]; then
       note "[$i] keeping failed VM for inspection: job=$job qemu_pid=$qpid ssh_port=$port dir=$jobdir"
       write_state kept-failed 1
+      CURRENT_WIN_JOB=""
+      CURRENT_WIN_JOBDIR=""
+      CURRENT_WIN_PORT_LOCK=""
+      CURRENT_WIN_QPID=""
+      CURRENT_WIN_STATE_DIR=""
+      CURRENT_WIN_LEASE_ID_EXPECTED=""
+      CURRENT_WIN_CPUS=""
+      CURRENT_WIN_CLEANED_UP=1
       return 0
     fi
     note "[$i] host diagnostics: $logdir"
-    kill "$qpid" 2>/dev/null || true
-    sleep 1
-    rm -rf "$jobdir"
-    rm -rf "$port_lock"
-    tartci_release_vm_lease
-    delete_state
+    cleanup_active_windows_job
   }
 
   wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
@@ -323,6 +375,39 @@ run_one(){ # $1=iteration index
     cleanup_job failure; return 1
   fi
   t_booted="$(now_epoch)"
+  if tartci_admission_clean_enabled; then
+    local admission_json="" admission_rc=0
+    write_state admission-check
+    if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
+      admission_rc=0
+    else
+      admission_rc=$?
+    fi
+    [ -z "$admission_json" ] \
+      || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
+    if [ "$admission_rc" -ne 0 ]; then
+      write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      cleanup_job success
+      return "$admission_rc"
+    fi
+  fi
+
+  note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
+  local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
+  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        --jq '.encoded_jit_config')" || {
+    note "[$i] JIT mint failed — discarding VM"
+    cleanup_job success
+    return 1
+  }
+  if [ -z "$jit" ]; then
+    note "[$i] empty JIT config — discarding VM"
+    cleanup_job success
+    return 1
+  fi
   note "[$i] vm $job up — ensure runner version + run JIT agent (one job)"
   write_state running
   run_guest_ps_file(){
