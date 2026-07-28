@@ -32,6 +32,14 @@ What rotted, and the check that would have caught it:
 7. Tailscale Funnel was never configured on a host, so its daemon could never
    publish a tunnel and thus never registered a webhook at all.
    → `tunnel-active`
+8. Two hosts' gate supervisors advertised `pulp-build-studio` where the required
+   macOS check asks for `pulp-build-vm`, so they were structurally blind to gate
+   work and logged `queued=0` forever. Fleet gate concurrency was 1 instead of 3
+   and the merge queue went five hours without landing a PR.
+   → `gate-labels-match-required`
+9. A failed `migrate_macos_gate_agent.sh` left a host with no gate agent at all,
+   invisible to `tartci pool status`, which still listed it.
+   → `gate-agent-installed`
 
 Read-only. Never mutates a host or GitHub. Exit 0 clean, 1 drift, 2 usage.
 
@@ -198,6 +206,69 @@ def check_token_helper(rep: Report) -> None:
     )
 
 
+def check_gate_labels(rep: Report, repos: list[str]) -> None:
+    """The gate supervisor must advertise EVERY label the required check asks for.
+
+    GitHub assigns a job only to a runner advertising all of the job's labels.
+    A supervisor whose `--labels` omit one of them is *structurally blind*: it
+    scans with its own label set, finds nothing it can serve, logs `queued=0`
+    forever, and boots no VM — while its host looks perfectly healthy and its
+    other runners sit idle.
+
+    This is not hypothetical. On 2026-07-28 two of three hosts advertised
+    `pulp-build-studio` where the required macOS gate asks for `pulp-build-vm`,
+    so fleet gate concurrency was 1 instead of 3 and the merge queue went five
+    hours without landing a PR. Nothing reported it.
+    """
+    plist = (pathlib.Path.home() / "Library/LaunchAgents"
+             / "com.danielraffel.pulp.tart-runner-macos-gate.plist")
+    if not plist.exists():
+        rep.add("gate-agent-installed", None,
+                "no tart-runner-macos-gate plist — this host serves no gate "
+                "work unless a legacy tart-runner agent does it")
+        return
+    text = plist.read_text(errors="replace")
+    advertised: set[str] = set()
+    for line in text.splitlines():
+        if "self-hosted" in line and "<string>" in line:
+            advertised = {p.strip() for p in
+                          line.split("<string>")[1].split("</string>")[0].split(",")}
+            break
+    if not advertised:
+        rep.add("gate-labels-match-required", None, "could not parse plist labels")
+        return
+
+    for repo in repos:
+        for client in ("ghapp", "gh"):
+            rc, out = run([client, "api",
+                           f"repos/{repo}/actions/variables/"
+                           "PULP_LOCAL_MACOS_RUNS_ON_JSON"], timeout=30)
+            if rc == 0:
+                break
+        if rc != 0:
+            continue  # repo may not define a self-hosted macOS gate
+        try:
+            required = set(json.loads(json.loads(out)["value"]))
+        except Exception:
+            continue
+        missing = required - advertised
+        rep.add(
+            f"gate-labels-match-required[{repo}]",
+            not missing,
+            f"advertises={sorted(advertised)}"
+            + (f" MISSING={sorted(missing)} — this host can never take the "
+               "required gate job; it will log queued=0 forever while looking "
+               "healthy" if missing else ""),
+        )
+        # Guard the other direction: extra ADVISORY labels on a gate
+        # registration let GitHub hand the VM an optional job instead, and a
+        # JIT runner cannot be retargeted once registered.
+        extra = {l for l in advertised - required if l.endswith("-secondary")}
+        if extra:
+            rep.add(f"gate-labels-no-advisory[{repo}]", False,
+                    f"advisory labels on the gate registration: {sorted(extra)}")
+
+
 def check_daemon(rep: Report, status: dict | None, repos: list[str]) -> None:
     if status is None:
         rep.add("daemon-running", False,
@@ -291,6 +362,7 @@ def main(argv: list[str]) -> int:
     check_checkout(rep)
     check_token_helper(rep)
     check_daemon(rep, status, args.repo)
+    check_gate_labels(rep, args.repo)
     check_webhooks(rep, status, args.repo)
 
     rc, host = run(["hostname"])
