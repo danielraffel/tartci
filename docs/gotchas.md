@@ -158,6 +158,63 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   checkout freshness and the gate agent; a stale checkout hides the very script
   that repairs it.
 
+- **GitHub has not been able to reach a host for weeks and nothing said so.**
+  A webhook receiver that is unreachable looks exactly like one with nothing to
+  deliver. On 2026-07-28 a Tailscale node had re-registered with a `-1` suffix;
+  the hook still pointed at the old name, whose node had been **offline for 41
+  days**, and every delivery returned `502`. Nobody noticed because nothing
+  observes delivery history.
+  → *Detect:* `scripts/fleet_preflight.py --repo OWNER/NAME` (read-only) checks
+  every invariant that rotted, on the host it runs on. Pair it with a
+  scheduled repo-side check — a host-local script cannot report that its own
+  host is unreachable, so GitHub must be the vantage point for that half.
+  → *Repair:* never hand-edit a hook URL. Shipyard's registrar owns hook
+  lifecycle and re-patches on restart:
+
+  ```sh
+  shipyard daemon refresh --repo OWNER/NAME --repo OWNER/OTHER
+  ```
+
+  Four traps around that command, all observed the same day:
+
+  1. **`gh` is not on the daemon's PATH.** It lives in `/opt/homebrew/bin`,
+     which a **non-interactive** shell omits — so `ssh host 'shipyard daemon
+     refresh …'` starts a daemon that logs `gh CLI not found on PATH` forever
+     and registers nothing. Export a PATH containing `/opt/homebrew/bin` before
+     refreshing, and note the daemon inherits whatever you gave it.
+  2. **Registration needs a verified tunnel.** `refresh` restarts the tunnel, so
+     status immediately after reports `tunnel=inactive · repos=—`. That is
+     normal. Re-running `refresh` to "fix" it restarts the tunnel again and
+     resets the clock — wait, do not retry.
+  3. **A renamed repo fails permanently.** A stale owner (`old/repo` after an
+     org move) makes GitHub answer `301/307 Moved Permanently`, and the
+     registrar's PATCH/POST do not follow redirects. The daemon retries forever.
+     Re-register with the current `OWNER/NAME`.
+  4. **The registrar only manages hooks it created** (tracked in
+     `daemon/registrations.json`). A hook from a renamed node is an untracked
+     **orphan** that keeps failing and duplicates a working one. After a repair,
+     list `repos/OWNER/NAME/hooks` and delete any URL that is not some daemon's
+     current tunnel URL.
+
+  `shipyard daemon status` prints the live tunnel URL and `repos=…`. A daemon
+  registered for a *different* repo answers the request and ignores the events,
+  which looks healthy from outside.
+
+- **Before configuring Tailscale Funnel, check whether you need it at all.**
+  Funnel exists to accept **public internet ingress**, which is what GitHub
+  webhook delivery requires. Shipyard validates the payload HMAC, and Funnel
+  exposes one path rather than the host — but it is still a remotely reachable
+  service on a machine holding source and credentials.
+  Weigh that against what push delivery actually buys: tartci's own demand
+  detection (`queue_scan.py`, `providers/*/runner.sh`) is **pure polling with no
+  webhook dependency**, and a fleet ran for 41 days with one receiver dead and
+  another host with Funnel never configured at all, with no observed
+  consequence. If nothing consumes the events (`shipyard daemon status` showing
+  `subscribers=0` is the tell), poll-only is both simpler and strictly safer.
+  When push latency is genuinely needed, prefer a hosted relay — a small public
+  endpoint that verifies the HMAC and queues events for hosts to **pull** —
+  over exposing a workstation.
+
 - **The queue tick is running every five minutes but arms or merges nothing.**
   → *Cause:* full-live Shipyard execution was launched without
   `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
