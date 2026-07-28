@@ -104,6 +104,60 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   `TARTCI_VM_LEASE_PRIORITY=gate`, and separate required-gate labels from
   advisory labels.
 
+- **macOS runners sit `busy=false` while merge-group jobs stay `queued` for
+  hours.** Observed on `Generous-Corp/pulp` 2026-07-28: nine merge-group runs
+  queued on the head entry, `pulp-studio-02`, `pulp-studio-03` and
+  `pulp-preamble-m5` all idle, nothing merging for ~2h.
+  → *Cause:* idle is not the same as eligible. Pulp's required `macos` gate
+  routes to `["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm"]`, so a
+  runner carrying `pulp-build` + `pulp-build-studio` but **not** `pulp-build-vm`
+  can never take gate work no matter how idle it looks. Only two runners carried
+  `pulp-build-vm`, and both were busy — so effective gate concurrency was 2
+  while four macOS registrations idled.
+  → *Diagnose* (count eligible runners, not idle ones):
+
+  ```sh
+  ghapp api repos/OWNER/REPO/actions/variables \
+    --jq '.variables[] | select(.name=="PULP_LOCAL_MACOS_RUNS_ON_JSON") | .value'
+  ghapp api repos/OWNER/REPO/actions/runners \
+    --jq '[.runners[] | select([.labels[].name]|index("pulp-build-vm"))]
+          | map("\(.name) busy=\(.busy)")'
+  ```
+
+  → *Fix:* add gate-eligible capacity, or accept the concurrency. Do **not**
+  raise the merge queue's `max_entries_to_build` to compensate: extra entries
+  contend for the same eligible runners and the wait simply moves from GitHub's
+  queue into the host lease store.
+
+- **A host's role says `dedicated-builder` but it serves no gate work.**
+  Same incident: the 28-core Mac Studio (`TARTCI_AGENT_BUILD_CAP_CORES=12`,
+  `TARTCI_GATE_RESERVED_CORES=14`) was absent from the gate lane while a 10-core
+  `light` MacBook and an 18-core `dev-overflow` box served it — the gate was
+  running on the two weakest machines.
+  → *Cause:* role and budget describe *capacity*, not *participation*. Gate
+  participation is the presence of the `tart-runner-macos-gate` LaunchAgent. The
+  Studio still had only the legacy `com.danielraffel.pulp.tart-runner` label and
+  had never been migrated.
+  → *Root cause of the drift:* its `~/Code/tartci` checkout was parked on a
+  merged feature branch, 13 commits behind `main` — and
+  `scripts/migrate_macos_gate_agent.sh` did not exist at that commit, so the
+  migration was silently unavailable on exactly the host that needed it.
+  → *Diagnose:*
+
+  ```sh
+  tartci pool status                     # look for tart-runner-macos-gate
+  ls ~/Library/LaunchAgents | grep macos-gate
+  git -C ~/Code/tartci rev-list --count HEAD..origin/main   # 0 == current
+  ```
+
+  → *Fix:* bring the checkout to `main` first, then
+  `scripts/migrate_macos_gate_agent.sh --apply
+  --attest-external-gui-label-updated`. The attestation flag is a human gate —
+  the external `shipyard-macos-gui` deployment must already know the new label —
+  so do not self-attest it from automation. Audit **every** pool host for both
+  checkout freshness and the gate agent; a stale checkout hides the very script
+  that repairs it.
+
 - **The queue tick is running every five minutes but arms or merges nothing.**
   → *Cause:* full-live Shipyard execution was launched without
   `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
