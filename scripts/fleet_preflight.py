@@ -269,7 +269,23 @@ def check_gate_labels(rep: Report, repos: list[str]) -> None:
                     f"advisory labels on the gate registration: {sorted(extra)}")
 
 
-def check_daemon(rep: Report, status: dict | None, repos: list[str]) -> None:
+def check_daemon(rep: Report, status: dict | None, repos: list[str],
+                 poll_only: bool) -> None:
+    """Judge the daemon only when this host is meant to receive events.
+
+    A host can be deliberately POLL-ONLY: no daemon, no tunnel, no webhooks.
+    That is a coherent, supported configuration — tartci's own demand
+    detection is pure polling and needs none of it — so reporting it as drift
+    would make this tool cry wolf about the intended state, which is exactly
+    the "red check everyone learns to ignore" failure it exists to prevent.
+    Only a HALF-configured host is drift: a daemon up with no tunnel, or
+    webhooks pointing at a host that no longer serves them.
+    """
+    if poll_only:
+        rep.add("ingress-mode", True,
+                "poll-only: no daemon, no tunnel, no webhooks — coherent; "
+                "event ingress is off by design")
+        return
     if status is None:
         rep.add("daemon-running", False,
                 "shipyard daemon status unavailable — nothing receives events")
@@ -300,8 +316,11 @@ def check_daemon(rep: Report, status: dict | None, repos: list[str]) -> None:
     )
 
 
-def check_webhooks(rep: Report, status: dict | None, repos: list[str]) -> None:
+def check_webhooks(rep: Report, status: dict | None, repos: list[str],
+                   poll_only: bool) -> None:
     """Compare each repo's hooks against this host's live tunnel URL."""
+    if poll_only:
+        return
     tunnel = ((status or {}).get("tunnel") or {}).get("url") or ""
     for repo in repos:
         for client in ("ghapp", "gh"):
@@ -358,12 +377,36 @@ def main(argv: list[str]) -> int:
         rep.add("shipyard-installed", True, sy)
         status = daemon_status(sy)
 
+    # POLL-ONLY detection: daemon down (or tunnel-less) AND no repo has an
+    # active webhook. Both halves matter — a daemon that is down while hooks
+    # still point here is a genuine outage, not a chosen mode.
+    daemon_down = status is None or not status.get("running") or not (
+        (status.get("tunnel") or {}).get("url")
+    )
+    hooks_exist = False
+    for repo in args.repo:
+        for client in ("ghapp", "gh"):
+            rc, out = run([client, "api", f"repos/{repo}/hooks"], timeout=40)
+            if rc == 0:
+                break
+        if rc != 0:
+            hooks_exist = True  # unknown: assume ingress is expected, fail loud
+            break
+        try:
+            if [h for h in json.loads(out) if h.get("active")]:
+                hooks_exist = True
+                break
+        except Exception:
+            hooks_exist = True
+            break
+    poll_only = daemon_down and not hooks_exist
+
     check_path_tools(rep)
     check_checkout(rep)
     check_token_helper(rep)
-    check_daemon(rep, status, args.repo)
+    check_daemon(rep, status, args.repo, poll_only)
     check_gate_labels(rep, args.repo)
-    check_webhooks(rep, status, args.repo)
+    check_webhooks(rep, status, args.repo, poll_only)
 
     rc, host = run(["hostname"])
     hostname = host.strip() if rc == 0 else "(unknown)"
@@ -378,9 +421,21 @@ def main(argv: list[str]) -> int:
             print(f"{mark} {r['check']}"
                   + (f"  — {r['detail']}" if r["detail"] else ""))
         if rep.failed:
-            print(f"\n{len(rep.failed)} check(s) need attention. Repair with "
-                  "`shipyard daemon refresh --repo … --repo …` from a shell whose "
-                  "PATH includes /opt/homebrew/bin, then re-run.")
+            names = {r["check"] for r in rep.failed}
+            print(f"\n{len(rep.failed)} check(s) need attention.")
+            # Only suggest the daemon repair when an ingress check is what
+            # failed; on a poll-only host it is misleading noise.
+            if any(n.startswith(("daemon-", "tunnel-", "repos-", "webhook-"))
+                   for n in names):
+                print("  Ingress: `shipyard daemon refresh --repo … --repo …` from a "
+                      "shell whose PATH includes /opt/homebrew/bin.")
+            if any(n.startswith("gate-") for n in names):
+                print("  Gate: correct BOTH label sites in the gate plist "
+                      "(ProgramArguments --labels and TARTCI_RUNNER_LABELS), then "
+                      "bootout + bootstrap the agent.")
+            if "checkout-current" in names:
+                print("  Checkout: `git -C ~/Code/tartci checkout main && git pull "
+                      "--ff-only` — a stale checkout hides its own repair scripts.")
         else:
             print("\nno drift.")
     return 1 if rep.failed else 0
