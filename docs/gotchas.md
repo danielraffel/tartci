@@ -158,6 +158,120 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   checkout freshness and the gate agent; a stale checkout hides the very script
   that repairs it.
 
+- **GitHub has not been able to reach a host for weeks and nothing said so.**
+  A webhook receiver that is unreachable looks exactly like one with nothing to
+  deliver. On 2026-07-28 a Tailscale node had re-registered with a `-1` suffix;
+  the hook still pointed at the old name, whose node had been **offline for 41
+  days**, and every delivery returned `502`. Nobody noticed because nothing
+  observes delivery history.
+  → *Detect:* `scripts/fleet_preflight.py --repo OWNER/NAME` (read-only) checks
+  every invariant that rotted, on the host it runs on. Pair it with a
+  scheduled repo-side check — a host-local script cannot report that its own
+  host is unreachable, so GitHub must be the vantage point for that half.
+  → *Repair:* never hand-edit a hook URL. Shipyard's registrar owns hook
+  lifecycle and re-patches on restart:
+
+  ```sh
+  shipyard daemon refresh --repo OWNER/NAME --repo OWNER/OTHER
+  ```
+
+  Four traps around that command, all observed the same day:
+
+  1. **`gh` is not on the daemon's PATH.** It lives in `/opt/homebrew/bin`,
+     which a **non-interactive** shell omits — so `ssh host 'shipyard daemon
+     refresh …'` starts a daemon that logs `gh CLI not found on PATH` forever
+     and registers nothing. Export a PATH containing `/opt/homebrew/bin` before
+     refreshing, and note the daemon inherits whatever you gave it.
+  2. **Registration needs a verified tunnel.** `refresh` restarts the tunnel, so
+     status immediately after reports `tunnel=inactive · repos=—`. That is
+     normal. Re-running `refresh` to "fix" it restarts the tunnel again and
+     resets the clock — wait, do not retry.
+  3. **A renamed repo fails permanently.** A stale owner (`old/repo` after an
+     org move) makes GitHub answer `301/307 Moved Permanently`, and the
+     registrar's PATCH/POST do not follow redirects. The daemon retries forever.
+     Re-register with the current `OWNER/NAME`.
+  4. **The registrar only manages hooks it created** (tracked in
+     `daemon/registrations.json`). A hook from a renamed node is an untracked
+     **orphan** that keeps failing and duplicates a working one. After a repair,
+     list `repos/OWNER/NAME/hooks` and delete any URL that is not some daemon's
+     current tunnel URL.
+
+  `shipyard daemon status` prints the live tunnel URL and `repos=…`. A daemon
+  registered for a *different* repo answers the request and ignores the events,
+  which looks healthy from outside.
+
+- **Before configuring Tailscale Funnel, check whether you need it at all.**
+  Funnel exists to accept **public internet ingress**, which is what GitHub
+  webhook delivery requires. Shipyard validates the payload HMAC, and Funnel
+  exposes one path rather than the host — but it is still a remotely reachable
+  service on a machine holding source and credentials.
+  Weigh that against what push delivery actually buys: tartci's own demand
+  detection (`queue_scan.py`, `providers/*/runner.sh`) is **pure polling with no
+  webhook dependency**, and a fleet ran for 41 days with one receiver dead and
+  another host with Funnel never configured at all, with no observed
+  consequence. If nothing consumes the events (`shipyard daemon status` showing
+  `subscribers=0` is the tell), poll-only is both simpler and strictly safer.
+  When push latency is genuinely needed, prefer a hosted relay — a small public
+  endpoint that verifies the HMAC and queues events for hosts to **pull** —
+  over exposing a workstation.
+
+- **Three idle macOS runners, and the merge queue still lands nothing for hours.**
+  Observed 2026-07-28: fleet gate concurrency was **1** while two hosts' runners
+  sat `busy=false`, and no PR merged for five hours.
+  → *Cause:* GitHub assigns a job only to a runner advertising **every** label
+  the job requests. Pulp's required gate asks for `…,pulp-build,pulp-build-vm`;
+  two hosts' gate supervisors advertised `…,pulp-build,pulp-build-studio`. Those
+  supervisors are then *structurally blind* — `queue_scan.py --match-labels 1`
+  correctly finds nothing they can serve, so they log `queued=0` forever and
+  boot no VM. The scanner is honest; the labels are wrong.
+  → *Diagnose:* count **eligible** runners, never idle ones, and compare the
+  supervisor's advertised set against the required set:
+
+  ```sh
+  ghapp api repos/OWNER/REPO/actions/variables/PULP_LOCAL_MACOS_RUNS_ON_JSON --jq .value
+  grep -o 'self-hosted,macOS[a-zA-Z0-9,.-]*' \
+    ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-gate.plist
+  ```
+
+  `scripts/fleet_preflight.py` does this as `gate-labels-match-required`.
+  → *Fix:* correct **both** label sites in the plist (`ProgramArguments --labels`
+  *and* `TARTCI_RUNNER_LABELS`) to exactly the required set. `runner.sh` passes
+  one `$LABELS` to both the queue scan and the JIT registration, so visibility
+  and assignability are fixed atomically — that identity (scan set == registered
+  set == the workflow's requested set) is what the design assumes.
+  → *Do not* add advisory labels (`*-secondary`) to a gate registration: GitHub
+  may then hand the VM an optional job, and a JIT runner cannot be retargeted
+  after registering. And do not "fix" it from the repo side by pointing the
+  required check at `pulp-build-studio` — that routes the gate to persistent
+  bare-metal runners with warm build dirs (the ODR class).
+
+- **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
+  A run that ends `legacy label remains loaded; refusing replacement startup` →
+  `migration failed; restoring prior LaunchAgent configuration` →
+  `ROLLBACK FAILED: Legacy agent … was not restored` leaves the legacy agent
+  **unloaded and unreplaced**. The host then contributes zero gate capacity.
+  → *Why it hides:* `tartci pool status` still lists the agent (as `stopped`),
+  so a before/after comparison of that output looks identical. Verify
+  *capability*, not presence: `launchctl print gui/$(id -u)/com.danielraffel.pulp.tart-runner`
+  and whether any runner with `pulp-build-vm` exists.
+  → *Recover:* `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist`.
+
+- **`tartci launchd reload <label>` can report FAILED and leave the agent down.**
+  Seen while correcting gate labels. Prefer explicit
+  `launchctl bootout gui/$(id -u)/<label>` then
+  `launchctl bootstrap gui/$(id -u) <plist>`, and confirm `state = running`
+  afterwards — a failed reload is silent apart from the word FAILED, and the
+  host stops serving whatever that agent produced.
+
+- **`reserved_gate_cores` is a floor, not a ceiling.** Easy to misread and get
+  backwards. In `leases.py`, a gate-priority lease is limited by `cfg["total"]`;
+  only *non-gate* leases are limited by `total - reserved_gate_cores`. So on a
+  28-core host with `reserved_gate=14`, two 12-core gate VMs (24 ≤ 26) are both
+  admitted — the 14 exists to stop non-gate work from crowding the gate out, not
+  to cap the gate at 14. Note also that the release lane advertises
+  `pulp-build-vm-release*`, which are *different label strings* from
+  `pulp-build-vm`: an idle release VM cannot absorb gate work.
+
 - **The queue tick is running every five minutes but arms or merges nothing.**
   → *Cause:* full-live Shipyard execution was launched without
   `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
