@@ -128,6 +128,14 @@ macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide and
 `docs/new-repo-agent-guide.md` to onboard a new repo.
 
+**The fleet is not Macs-only.** A Proxmox host (`macpro`, an x86_64 Xeon Mac
+Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux, and
+Windows x64 later. `tart-linux` provisions **arm64** guests and `qemu-windows` is
+Windows-on-**ARM**, so routing an x64 build at either is an architecture change,
+not a relocation. See [`docs/proxmox-macpro.md`](docs/proxmox-macpro.md); it is not
+tartci-managed today, and folding it in as `providers/proxmox-linux` is the
+intended direction.
+
 ### Serve the GitHub Actions pool
 `tartci up` does ONE on-demand build and exits; `tartci serve <os>` is the
 **pool-serving** sibling. It mints a Just-In-Time (single-job) runner config,
@@ -456,6 +464,7 @@ metrics/     dashboard.py + report.py (file-based; no server) + sample.jsonl
 bench/        helper to clone a golden → open in UTM for GUI testing
 scripts/     lint.sh — repo hygiene gate (shellcheck + bash -n + py_compile + TOML)
 docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent onboarding) · gotchas.md
+             proxmox-macpro.md (the x86_64 Proxmox host — NOT tartci-managed yet)
 ```
 
 ## Contributing checks
