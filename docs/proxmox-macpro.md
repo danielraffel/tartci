@@ -14,6 +14,20 @@ tartci* below).
 
 ---
 
+## At a glance
+
+| | |
+|---|---|
+| **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
+| **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
+| **Model** | golden template → linked clone → one job → destroy |
+| **Templates** | `9002` `pulp-linux-golden` (warm) · `9001` (superseded) |
+| **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 slots |
+| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 |
+| **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
+| **Credential** | `/root/.config/pulp/secrets/gh-runner-pat` (600, root) — `Administration: read/write` only |
+| **Rollback** | unset the routing variable; the lane returns to GitHub-hosted |
+
 ## Why it exists
 
 Pulp's CI had a measured problem: **~198 job-minutes of hosted work per PR against
@@ -162,6 +176,37 @@ Note the Linux default is lowercase `pulp`, while Pulp's `build.yml` caches
 directories — worth verifying before trusting either.
 
 ---
+
+## Windows
+
+**Windows runs nightly, not per merge.** It is billed at 2x on GitHub-hosted
+runners, was ~90% of billable Actions spend, and gates nothing — no Windows
+context appears in Pulp's required checks, so the merge queue never waits for it.
+Running it per merge group consumed the hosted pool the *required* checks queue
+behind, doubled by `max_entries_to_build=2`.
+
+Coverage lives in `cross-platform-check.yml`, which builds and tests Windows
+nightly and whose `tracking-issues` job find-or-creates a per-platform issue on
+failure, reopens a closed one, and auto-closes on recovery. Catch, file, do not
+block.
+
+`workflow_dispatch` still runs it on demand for a Windows-touching change.
+
+### The Windows VM on this host
+
+VM `300` (`pulp-win-ci`) — Windows Server 2022 Eval, x86_64 native, 4c/10G/80G,
+q35 + OVMF, virtio disk and NIC. Installed unattended via an `autounattend.xml`
+ISO modelled on `providers/qemu-windows/make-autounattend.sh`, adapted from
+Win11-ARM64 to Server-2022-x64: virtio drivers injected in the `windowsPE` pass so
+Setup can see the disk, OpenSSH Server enabled at first logon, and the operator's
+public key written to `administrators_authorized_keys`.
+
+Unlicensed by design — Server 2022 Eval is 180 days and needs no key. A CI builder
+does not need activation.
+
+Its intended job is the **nightly** Windows run, moving that off 2x-billed hosted
+minutes. Nightly is the right latency class for self-hosted: if the host is down,
+a nightly slips, whereas a required check would strand merges.
 
 ## Operating it
 
