@@ -16,6 +16,30 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   (Rosetta on Linux, Prism on Windows) as a *signal only* — GitHub-hosted x64
   stays the authoritative gate.
 
+- **Tart cannot run on an Intel Mac at all** — not "arm64 guests only", but no
+  Tart. Virtualization.framework supports macOS *guests* only on Apple Silicon; on
+  Intel it offers Linux guests only. So an Intel Mac joining the fleet cannot use
+  the tart provider for anything, and needs a different plan:
+  → *macOS VMs on Intel* require a third-party hypervisor — VMware Fusion (free
+  for personal use, `vmrun` snapshot/revert), Parallels (`prlctl`), or Anka. Apple's
+  EULA allows 2 extra macOS VMs on Apple hardware.
+  → *Or run on metal*, which is usually the better trade on older Intel hardware:
+  fixed VM RAM strands capacity a 6-core box cannot spare, and macOS images are
+  60–80 GB. Register the runner `--ephemeral` and wipe the workspace before **and**
+  after each job (before matters — a run killed mid-job never reached its trap),
+  keeping ccache and the FetchContent source cache *outside* the wiped path. That
+  buys a clean workspace, which is the failure mode reused build dirs actually
+  cause; it does **not** buy clean OS state, and saying so plainly is better than
+  implying a VM-grade guarantee.
+
+- **Python on a fresh macOS is 3.9, and `tomllib` arrived in 3.11.** Any tool that
+  reads a TOML config with `tomllib` will silently fall back to its defaults — a
+  config file that appears installed and does nothing. Seen with Pulp's `daw-smoke`
+  opt-in, which reported `enabled: False` no matter what the file said. Install a
+  modern Python (`uv python install 3.12` needs no sudo) and put it ahead of
+  `/usr/bin` on the runner's PATH. Verify by *parsing the config*, not by checking
+  the file exists.
+
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
   → *Fix:* configure fleet tools with the absolute Tart path, usually
@@ -94,6 +118,31 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   on the Mac and boot with `tart run --rosetta=rosetta <vm>`.
 
 ## Queue and pool control
+
+- **Nothing merges for hours; adding runners does not help.**
+  → *Cause:* the merge queue is building more entries in parallel than the runner
+  pool can serve, so no entry finishes inside `check_response_timeout_minutes` —
+  each times out, requeues and rebuilds, forever. Measured on Pulp 2026-07-30 with
+  `max_entries_to_build: 5`: five merge groups × a full matrix ≈ 50 jobs against a
+  pool serving ~3 at a time gave **6 jobs running, 75 queued, and zero merges in
+  three hours**. Under saturation, parallelism *reduces* throughput — the classic
+  queueing result, and it looks exactly like "we need more machines."
+  → *Fix:* set `max_entries_to_build: 1` so the head entry gets the whole pool, and
+  raise `check_response_timeout_minutes` (60 → 120) so an entry survives a backlog
+  instead of dying mid-flight. On Pulp the first merge landed ~12 minutes later.
+  Adding self-hosted capacity does not fix this, because the starved jobs are on
+  *hosted* labels the new machines do not carry.
+  → *Diagnose before tuning:* count running-vs-queued jobs across active runs. Many
+  running + many queued is real saturation; **few running + many queued is the
+  thrash**. Two plausible causes to rule out first, both cheap: org billing (an
+  exhausted spending limit blocks hosted runs — check that usage nets to $0) and
+  `githubstatus.com` (an Actions incident looks identical from inside).
+
+- **A lane that gates nothing can still block everything.** On the same incident,
+  three Windows jobs were *running* while the required `macos` job sat queued.
+  Windows appears in no required check, so it gated nothing while consuming the
+  slots the gate needed. Audit which lanes run per-merge against which are actually
+  required; move the rest to a schedule.
 
 - **All three Macs look healthy, but the required front job is still queued.**
   → *Cause:* runner process health is not useful-progress health. A bounded
