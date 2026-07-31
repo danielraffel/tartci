@@ -129,7 +129,11 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   queueing result, and it looks exactly like "we need more machines."
   → *Fix:* set `max_entries_to_build: 1` so the head entry gets the whole pool, and
   raise `check_response_timeout_minutes` (60 → 120) so an entry survives a backlog
-  instead of dying mid-flight. On Pulp the first merge landed ~12 minutes later.
+  instead of dying mid-flight. On Pulp the first merge landed **39 minutes** later
+  (it had a backlog to clear) and the queue then settled at **~19 minutes between
+  merges**. Quote the steady-state number, not the recovery one — the first merge
+  out of a jam is not representative, and estimating from it overstates what any
+  further change will buy.
   Adding self-hosted capacity does not fix this, because the starved jobs are on
   *hosted* labels the new machines do not carry.
   → *Diagnose before tuning:* count running-vs-queued jobs across active runs. Many
