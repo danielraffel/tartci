@@ -86,7 +86,9 @@ if [ -f "$OLD_PLIST" ]; then
 elif [ -f "$NEW_PLIST" ]; then
   cp -p "$NEW_PLIST" "$tmp"
 else
-  sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$tmp"
+  : "${TART_HOME:?fresh migration requires the host Tart VM store}"
+  python3 "$ROOT/scripts/render_launchd_template.py" "$TEMPLATE" \
+    --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" > "$tmp"
 fi
 if [ -f "$OLD_PLIST" ] || [ -f "$NEW_PLIST" ]; then
   python3 - "$tmp" "$NEW_LABEL" <<'PY'

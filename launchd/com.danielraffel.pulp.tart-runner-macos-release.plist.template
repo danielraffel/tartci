@@ -16,19 +16,25 @@
 
     1. Install tartci under $HOME so BASH_SOURCE resolves inside a readable tree:
 
-         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/VMs" "$HOME/Library/Logs/tartci"
+         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/Library/Logs/tartci"
          rsync -a "$PWD/" "$HOME/.local/share/tartci/"
          printf '%s\n' '#!/usr/bin/env bash' \
            'exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"' \
            > "$HOME/.local/bin/tartci"
          chmod 755 "$HOME/.local/bin/tartci"
 
-    2. Put macOS goldens under $HOME/VMs.
+    2. Declare this host's VM store explicitly (`$HOME/VMs` on internal-disk
+       hosts, or the dedicated external CI volume where configured):
+
+         export TART_HOME="$HOME/VMs"
+         mkdir -p "$TART_HOME"
 
     3. Render this template with absolute paths:
 
-         sed -e "s|\$HOME|$HOME|g" \
+         : "${TART_HOME:?declare this host's Tart VM store}"
+         python3 scripts/render_launchd_template.py \
            launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template \
+           --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
            > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-release.plist"
 
     4. Load:
@@ -103,7 +109,7 @@
         <key>TARTCI_LAUNCHD_LABEL</key>
         <string>com.danielraffel.pulp.tart-runner-macos-release</string>
         <key>TART_HOME</key>
-        <string>$HOME/VMs</string>
+        <string>$TART_HOME</string>
         <key>TARTCI_HOME</key>
         <string>$HOME/.tartci</string>
         <key>TARTCI_CI_CACHE</key>
