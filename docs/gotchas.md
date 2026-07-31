@@ -156,11 +156,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   The ranges do not overlap. Both hosts carry `pulp-build-vm`, so placement is
   whichever runner grabs the job first — a coin flip worth ~8 minutes on every merge
   that loses it, and it reads as random queue variance rather than a host property.
-  → *Fix:* bias the gate toward the fast hosts and treat the slow one as overflow
-  (`TARTCI_VM_LEASE_PRIORITY=gate` on the fast supervisors), or split the label so
-  the required lane cannot land on the slow host. Removing the slow host from the
-  pool outright trades latency for capacity — only worth it if the fast hosts can
-  absorb peak alone.
+  → *Fix deployed 2026-07-31:* the M3/M5 gate supervisors carry
+  `pulp-gate-fast`, and Pulp's required selector includes it. The M1 supervisor
+  keeps the generic `pulp-build-vm` label, so it remains available for rollback
+  and non-required use but cannot win the serial required gate. The fast
+  supervisors also set `TARTCI_VM_LEASE_PRIORITY=gate`; that reserves host-core
+  leases but does **not** influence GitHub placement by itself.
   → *Before acting, re-measure:* group gate runtimes by host with the ephemeral
   suffix stripped (`pulp-vm-m1-01-67089-59` -> `pulp-vm-m1-01`). Per-runner-instance
   numbers look like n=1 noise and hide the pattern entirely.

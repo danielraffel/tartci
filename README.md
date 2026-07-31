@@ -271,16 +271,17 @@ ephemeral, so the resolver checks in-progress jobs for each host label rather
 than looking for idle registered GitHub runners. That avoids duplicate VM boots
 and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
 
-The gate supervisors on every participating Mac (currently M1, M3, and M5)
-should advertise `TARTCI_VM_LEASE_PRIORITY=gate`. Advisory supervisors must
-yield to that class. This reserves host-core leases; it does not choose a
-specific GitHub job after a runner boots. GitHub assigns any queued job whose
-requested labels match the ephemeral runner. Therefore required and advisory
-jobs must not share an indistinguishable label set: add a required-gate class
-label to required jobs and a separate advisory class label to coverage,
-snapshot, GPU-proof, and example-validation jobs. Shipyard may coalesce or
-cancel provably redundant workflow runs before boot, but Tart CI must never
-guess queue priority by PR number or mutate the merge queue.
+The fast gate supervisors (Pulp: M3 and M5) should advertise
+`TARTCI_VM_LEASE_PRIORITY=gate`; advisory supervisors must yield to that class.
+This reserves host-core leases, but it does not choose a specific GitHub job
+after a runner boots. Host placement needs a label: Pulp's fast supervisors and
+required selector carry `pulp-gate-fast`, while the slower M1 keeps only the
+generic `pulp-build-vm` label for rollback/non-required use. Required and
+advisory jobs likewise must not share an indistinguishable label set: use
+separate class labels for coverage, snapshot, GPU-proof, and example-validation
+jobs. Shipyard may coalesce or cancel provably redundant workflow runs before
+boot, but Tart CI must never guess queue priority by PR number or mutate the
+merge queue.
 
 ### Priority-aware idle gate (secondary macOS lanes)
 
