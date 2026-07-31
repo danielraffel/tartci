@@ -10,16 +10,19 @@
   Install shape:
 
     mkdir -p "$HOME/Library/Logs/tartci"
-    sed -e "s|\$HOME|$HOME|g" \
+    : "${TART_HOME:?declare this host's Tart VM store}"
+    python3 scripts/render_launchd_template.py \
       launchd/com.danielraffel.tartci.reap.plist.template \
+      --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
       > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reap.plist"
 
     launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reap.plist"
     launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.reap"
 
   The template assumes the macOS launchd rule from this directory's README:
-  tartci is installed under $HOME and exposed as $HOME/.local/bin/tartci, while
-  macOS goldens live under $HOME/VMs.
+  tartci is installed under $HOME and exposed as $HOME/.local/bin/tartci. The
+  VM store is a per-host declaration: internal-disk hosts normally use
+  $HOME/VMs, while a host with a dedicated external CI volume may use it.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -62,7 +65,7 @@
         <key>TARTCI_GH_CLI</key>
         <string>ghapp</string>
         <key>TART_HOME</key>
-        <string>$HOME/VMs</string>
+        <string>$TART_HOME</string>
         <key>TARTCI_HOME</key>
         <string>$HOME/.tartci</string>
         <key>TARTCI_STATE_ROOT</key>

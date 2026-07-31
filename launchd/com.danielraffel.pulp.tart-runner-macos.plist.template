@@ -13,26 +13,33 @@
   Keep this plist anchored under $HOME:
   - ProgramArguments points at $HOME/.local/bin/tartci, not a /Volumes checkout.
   - WorkingDirectory is $HOME.
-  - TART_HOME is $HOME/VMs.
+  - TART_HOME is rendered from this host's declared VM store. Most hosts use
+    $HOME/VMs; hosts with a dedicated external CI volume may intentionally use
+    that volume instead.
 
   Install shape (per Mac that hosts the macOS Tart golden):
 
     1. Install tartci under $HOME so BASH_SOURCE resolves inside a readable tree:
 
-         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/VMs" "$HOME/Library/Logs/tartci"
+         mkdir -p "$HOME/.local/share/tartci" "$HOME/.local/bin" "$HOME/Library/Logs/tartci"
          rsync -a "$PWD/" "$HOME/.local/share/tartci/"
          printf '%s\n' '#!/usr/bin/env bash' \
            'exec /bin/bash "$HOME/.local/share/tartci/tartci" "$@"' \
            > "$HOME/.local/bin/tartci"
          chmod 755 "$HOME/.local/bin/tartci"
 
-    2. Put macOS goldens under $HOME/VMs. Avoid /Volumes unless using a signed
-       FDA helper; ordinary LaunchAgents hit TCC there.
+    2. Declare this host's store explicitly and create it. A store on /Volumes
+       requires Full Disk Access for the executable launchd spawns:
+
+         export TART_HOME="$HOME/VMs" # or this host's external CI volume
+         mkdir -p "$TART_HOME"
 
     3. Render this template with absolute paths:
 
-         sed -e "s|\$HOME|$HOME|g" \
+         : "${TART_HOME:?declare this host's Tart VM store}"
+         python3 scripts/render_launchd_template.py \
            launchd/com.danielraffel.pulp.tart-runner-macos.plist.template \
+           --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
            > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-gate.plist"
 
     4. Load:
@@ -118,7 +125,7 @@
         <key>TARTCI_LAUNCHD_LABEL</key>
         <string>com.danielraffel.pulp.tart-runner-macos-gate</string>
         <key>TART_HOME</key>
-        <string>$HOME/VMs</string>
+        <string>$TART_HOME</string>
         <key>TARTCI_HOME</key>
         <string>$HOME/.tartci</string>
         <key>TARTCI_CI_CACHE</key>
