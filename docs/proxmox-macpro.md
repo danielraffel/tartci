@@ -245,6 +245,19 @@ journalctl -u 'pulp-ephemeral-pool@1' -f       # per-job lifecycle
 Add a slot: `systemctl enable --now pulp-ephemeral-pool@3` — but check the governor
 first, and leave headroom if a Windows VM is planned.
 
+Drain without killing active jobs: disabling a unit is not sufficient because
+the already-running service still has `Restart=always`. Runtime-mask each active
+slot, then stop only slots whose runner is still idle. An in-flight slot finishes
+its job, destroys its clone, and cannot restart through the mask:
+
+```sh
+systemctl mask --runtime pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
+systemctl stop pulp-ephemeral-pool@2  # only after proving slot 2 is idle
+# After maintenance:
+systemctl unmask --runtime pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
+systemctl enable --now pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
+```
+
 **Rollback:** unset Pulp's `PULP_LOCAL_LINUX_RUNS_ON_JSON` and the lane returns to
 GitHub-hosted. `runs-on` has **no automatic fallback**, so if this host is down or
 its pool is stopped, jobs routed here queue indefinitely rather than erroring.
@@ -279,6 +292,12 @@ contract edit must land together.
   toward "no free clone id" with nothing saying why. Set the flag where the clone
   is committed to disk, before releasing the lock. The tell in the log is exact —
   a healthy teardown says `destroying clone <id>`.
+- **`systemctl disable` does not drain an active restart loop.** It prevents a
+  unit from starting at boot, but an already-running pool slot still obeys
+  `Restart=always` and provisions another clone 30 seconds after teardown. Do
+  not use `disable --now` on a busy slot: `--now` kills its job. Runtime-mask
+  the unit so its current job can finish and its restart is blocked; stop only a
+  separately verified idle slot. Unmask and enable after maintenance.
 - **Reclaiming a leaked VM by hand: make the guard `return`, not print.** A
   reclaim script that prints `WORKER ACTIVE — DO NOT TOUCH` and then deletes anyway
   is worse than none. Every refusal must exit before the destroy, and an
