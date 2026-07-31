@@ -21,9 +21,9 @@ tartci* below).
 | **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
 | **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
 | **Model** | golden template → linked clone → one job → destroy |
-| **Templates** | `9002` `pulp-linux-golden` (warm) · `9001` (superseded) |
-| **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 slots |
-| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 |
+| **Templates** | `9003` `pulp-linux-golden-warm2` (current) · `9002`, `9001` (superseded) |
+| **Pool** | `pulp-ephemeral-pool@{1,2,3}.service`, 3 slots |
+| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**, freeing 10 GB for slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
 | **Credential** | `/root/.config/pulp/secrets/gh-runner-pat` (600, root) — `Administration: read/write` only |
 | **Rollback** | unset the routing variable; the lane returns to GitHub-hosted |
@@ -175,6 +175,30 @@ Note the Linux default is lowercase `pulp`, while Pulp's `build.yml` caches
 `~/.cache/Pulp/...` (capital P). On a case-sensitive filesystem those are different
 directories — worth verifying before trusting either.
 
+**`FETCHCONTENT_BASE_DIR` is a DIFFERENT cache and does not substitute.** The
+first warm golden (`9002`) carried 3.2 GB of CMake FetchContent *build* trees at
+`~/.cache/pulp/fc`, wired via `FETCHCONTENT_BASE_DIR` in the runner `.env`. That
+is not what `setup.sh` reads. It consults the *source* cache above, found `0`
+entries, and every job re-cloned three.js — ~20 minutes before a line compiled.
+The golden looked warm by every measure except the one that mattered.
+
+Two rules follow:
+
+- Verify the golden by the path the **bootstrap** resolves, not the one you set.
+  On a clone: `du -sm ~/.cache/pulp/fetchcontent-src` should be >1.5 GB, and the
+  `threejs-*` directory alone ~1 GB.
+- **The runner's `.env` is the only file that reaches a job.** Job steps are
+  non-interactive, so `~/.bashrc` and `~/.zprofile` are never sourced. An export
+  that is not in `<runner>/.env` does not exist as far as CI is concerned.
+
+**Proving a golden is warm requires reading the pool log, not the clone.** A clone
+from an *old* golden warms its own cache during its job and then looks identical
+to one that inherited it. The only honest check is `journalctl -u
+'pulp-ephemeral-pool@*' | grep 'linked-cloning golden'` to confirm which template
+a VM came from, plus its age — a 70-second-old clone holding 1.8 GB cannot have
+downloaded it. A check that cannot distinguish the two will report success on the
+wrong evidence.
+
 ---
 
 ## Windows
@@ -246,6 +270,32 @@ contract edit must land together.
 - **An interrupted job leaks a ghost runner.** A completed `--ephemeral` run
   deregisters itself, but a kill/reboot/abort does not — GitHub then schedules to a
   VM that no longer exists. Deregister *before* destroying, in the exit trap.
+- **A teardown guard that is never armed silently disables teardown.** The fix for
+  the VMID race above introduced a `CLONED` flag the exit trap reads before
+  destroying anything — and nothing ever *set* it. Every job logged `nothing to
+  clean (no clone created)` about a clone it had just finished using, so no clone
+  was ever destroyed. The pool was persistent runners wearing an ephemeral name:
+  the reused-build-dir class it exists to close stayed wide open, and VMIDs drained
+  toward "no free clone id" with nothing saying why. Set the flag where the clone
+  is committed to disk, before releasing the lock. The tell in the log is exact —
+  a healthy teardown says `destroying clone <id>`.
+- **Reclaiming a leaked VM by hand: make the guard `return`, not print.** A
+  reclaim script that prints `WORKER ACTIVE — DO NOT TOUCH` and then deletes anyway
+  is worse than none. Every refusal must exit before the destroy, and an
+  *unreachable* guest is a refusal too — a guest that cannot answer cannot testify
+  that it is idle.
+- **Capacity is memory, not cores.** 31 GB with two 8 GB clones and a 10 GB Windows
+  VM leaves nothing; the governor correctly refuses a third clone with
+  `EX_TEMPFAIL`. The Windows VM had also been running for hours serving **no
+  registered runner** — stopping it (`qm shutdown 300`, reversible with `qm start`)
+  freed exactly enough for slot 3. Audit what is *running* against what is
+  *registered* before buying capacity.
+- **Two slots cannot serve a merge queue.** `runs-on` has no fallback, so when both
+  slots are busy a `merge_group` job queues indefinitely and the entry times out and
+  rebuilds forever. Either give the host enough slots to absorb peak, or scope the
+  routing to `pull_request` only and leave `merge_group` on hosted runners. The
+  latter is strictly safer: it captures the capacity without ever putting this host
+  in the merge critical path.
 - **A local `timeout` around a remote `apt-get` proves nothing.** The remote
   process survives the disconnect. Poll for the process; do not hold a session.
 - **`iU` packages mid-`dist-upgrade` are normal**, not damage — apt unpacks
