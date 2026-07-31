@@ -138,6 +138,29 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   exhausted spending limit blocks hosted runs — check that usage nets to $0) and
   `githubstatus.com` (an Actions incident looks identical from inside).
 
+- **Which host serves the required gate is worth ~2x, and nothing chooses it.**
+  With a serial merge queue (`max_entries_to_build: 1`) every merge waits on exactly
+  one macOS gate build, so that job's runtime *is* the throughput floor. Measured on
+  Pulp 2026-07-31, same job, same commit range, n=15:
+
+  | host | n | median | range |
+  |---|---|---|---|
+  | Mac Studio VM (`pulp-studio-01-*`) | 5 | **9.5m** | 8.8-11.0 |
+  | `pulp-vm-01-*` | 5 | 11.4m | 9.0-11.8 |
+  | m1 box (`pulp-vm-m1-01-*`) | 5 | **18.0m** | 15.8-18.8 |
+
+  The ranges do not overlap. Both hosts carry `pulp-build-vm`, so placement is
+  whichever runner grabs the job first — a coin flip worth ~8 minutes on every merge
+  that loses it, and it reads as random queue variance rather than a host property.
+  → *Fix:* bias the gate toward the fast hosts and treat the slow one as overflow
+  (`TARTCI_VM_LEASE_PRIORITY=gate` on the fast supervisors), or split the label so
+  the required lane cannot land on the slow host. Removing the slow host from the
+  pool outright trades latency for capacity — only worth it if the fast hosts can
+  absorb peak alone.
+  → *Before acting, re-measure:* group gate runtimes by host with the ephemeral
+  suffix stripped (`pulp-vm-m1-01-67089-59` -> `pulp-vm-m1-01`). Per-runner-instance
+  numbers look like n=1 noise and hide the pattern entirely.
+
 - **A lane that gates nothing can still block everything.** On the same incident,
   three Windows jobs were *running* while the required `macos` job sat queued.
   Windows appears in no required check, so it gated nothing while consuming the
