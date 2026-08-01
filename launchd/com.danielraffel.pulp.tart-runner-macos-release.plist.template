@@ -120,8 +120,13 @@
         <string>pulp-build-runner:latest</string>
         <key>TARTCI_RUNNER_LABELS</key>
         <string>self-hosted,macOS,ARM64,pulp-build-vm-release</string>
-        <key>TARTCI_RUNNER_WORKFLOW_NAME</key>
-        <string>Release CLI</string>
+        <!-- One supervisor owns this shared-label lane. Keep one exact GitHub
+             Actions workflow display name per line; do not create a competing
+             supervisor for each workflow. -->
+        <key>TARTCI_RUNNER_WORKFLOW_NAMES</key>
+        <string>Release CLI
+Release-path PR gate
+Sign and Release</string>
     </dict>
 </dict>
 </plist>

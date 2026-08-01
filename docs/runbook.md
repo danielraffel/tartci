@@ -851,7 +851,8 @@ optionally require Shipyard's final admission-clean verdict, then mint a
 once with that JIT config, then discards the VM. Minting after boot avoids
 spending the time-sensitive JIT token during guest startup. The agent processes
 exactly one job and deregisters — no long-lived runner state. The `--loop` gate only boots
-when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME`, default
+when there is queued work matching `TARTCI_RUNNER_WORKFLOW_NAME` or any exact
+newline-delimited name in `TARTCI_RUNNER_WORKFLOW_NAMES`, default
 `Build and Test`. Discovery is intentionally bounded and rotated to keep GitHub
 API use stable. Consequently, `--print-queue` returning `0` means no match in
 that scan window, not that every workflow in the repository was inspected. Use
@@ -922,7 +923,8 @@ Do not run Orchard alongside Shipyard and Tart CI.
 Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_MACOS_GOLDEN` / `TARTCI_LINUX_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
-`TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_VERSION` (Windows agent),
+`TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_WORKFLOW_NAMES` (macOS multi-workflow
+lane), `TARTCI_RUNNER_VERSION` (Windows agent),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
 `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
@@ -982,9 +984,12 @@ Build and Test -> self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
 Release CLI    -> self-hosted,macOS,ARM64,pulp-build-vm-release
 ```
 
-Load the Release CLI VM lane only as a separate LaunchAgent filtered with
-`TARTCI_RUNNER_WORKFLOW_NAME=Release CLI`. Do not point Release CLI at the
-Build and Test `pulp-build-vm` lane, and do not flip
+Load the release VM lane only as one separate LaunchAgent filtered with
+newline-delimited `TARTCI_RUNNER_WORKFLOW_NAMES` entries for `Release CLI`,
+`Release-path PR gate`, and `Sign and Release`. The plural setting overrides the
+legacy singular workflow setting; one exact workflow display name belongs on
+each line. Do not create one supervisor per workflow or point release jobs at
+the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 

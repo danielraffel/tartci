@@ -93,7 +93,10 @@ job runner clones the golden, mounts the cache, then executes these.
 - For macOS GitHub Actions serving, keep distinct workflow lanes on distinct
   labels. A build gate can use a shared VM pool label such as `pulp-build-vm`;
   a release workflow should use a separate label such as
-  `pulp-build-vm-release` and its own `TARTCI_RUNNER_WORKFLOW_NAME` filter.
+  `pulp-build-vm-release`. When several exact workflow names share that label,
+  keep one supervisor and put one name per line in
+  `TARTCI_RUNNER_WORKFLOW_NAMES`; a non-empty plural value replaces the legacy
+  singular `TARTCI_RUNNER_WORKFLOW_NAME` filter.
   When more than one host serves a pool, add an extra host-specific label or
   explicit `--name-prefix` so JIT runner names do not collide.
 - For Windows QEMU GitHub Actions serving, install the same qcow2 golden and

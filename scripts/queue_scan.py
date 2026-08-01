@@ -44,6 +44,19 @@ def _fresh(timestamp: str, max_age_seconds: int) -> bool:
 class QueueScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        configured_workflows = (
+            [args.workflow] if isinstance(args.workflow, str) else args.workflow
+        )
+        self.workflows = tuple(
+            dict.fromkeys(
+                workflow
+                for workflow in configured_workflows
+                if isinstance(workflow, str) and workflow
+            )
+        )
+        if not self.workflows:
+            raise ValueError("at least one workflow name is required")
+        self.workflow_set = set(self.workflows)
         self.labels = {label.strip().lower() for label in args.labels.split(",") if label.strip()}
         self.job_statuses = {
             status.strip().lower()
@@ -55,7 +68,7 @@ class QueueScanner:
         namespace = "\0".join(
             (
                 args.repo.lower(),
-                args.workflow,
+                "\0".join(sorted(self.workflows)),
                 ",".join(sorted(self.labels)),
                 args.provider,
                 args.lane_id,
@@ -69,7 +82,9 @@ class QueueScanner:
             f"{base_state_path.stem}.{digest}{suffix}"
         )
         self.lock_path = self.state_path.with_suffix(f"{self.state_path.suffix}.lock")
-        discovery_namespace = "\0".join((args.repo.lower(), args.workflow))
+        discovery_namespace = "\0".join(
+            (args.repo.lower(), *sorted(self.workflows))
+        )
         discovery_digest = hashlib.sha256(
             discovery_namespace.encode("utf-8")
         ).hexdigest()[:16]
@@ -166,23 +181,29 @@ class QueueScanner:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
+        # Keep the focused workflow endpoint for the legacy one-name case.
+        # GitHub has no multi-workflow runs endpoint, so a list uses the bounded
+        # repository runs endpoint and filters exact names in _runs().
+        if len(self.workflows) != 1:
+            return None
+        workflow_name = self.workflows[0]
         cached_id = discovery.get("workflow_id")
         cached_name = discovery.get("workflow_name")
         checked_at = int(discovery.get("workflow_checked_at", 0))
         if (
             isinstance(cached_id, int)
-            and cached_name == self.args.workflow
+            and cached_name == workflow_name
             and self.now - checked_at < self.args.workflow_cache_ttl
         ):
             return cached_id
         workflows = self._gh(f"repos/{self.args.repo}/actions/workflows?per_page=100")
         for workflow in workflows.get("workflows", []):
-            if workflow.get("name") == self.args.workflow:
+            if workflow.get("name") == workflow_name:
                 value = workflow.get("id")
                 if value is not None:
                     workflow_id = int(value)
                     discovery["workflow_id"] = workflow_id
-                    discovery["workflow_name"] = self.args.workflow
+                    discovery["workflow_name"] = workflow_name
                     discovery["workflow_checked_at"] = self.now
                     return workflow_id
         return None
@@ -241,7 +262,10 @@ class QueueScanner:
 
                     for page, page_runs in zip(pages, page_sets):
                         for run in page_runs:
-                            if not isinstance(run, dict) or run.get("name") != self.args.workflow:
+                            if (
+                                not isinstance(run, dict)
+                                or run.get("name") not in self.workflow_set
+                            ):
                                 continue
                             run_id = run.get("id")
                             if not isinstance(run_id, int) or run_id in seen:
@@ -388,6 +412,7 @@ class QueueScanner:
 
         last_backlog_id: int | None = None
         matches = 0
+        matched_job_ids: set[int] = set()
         backlog_id_set = set(backlog_ids)
         for run in candidates:
             run_id = int(run["id"])
@@ -429,11 +454,16 @@ class QueueScanner:
                 ):
                     continue
                 if not self.args.match_labels or job_labels:
+                    job_id = job.get("id")
+                    if isinstance(job_id, int):
+                        if job_id in matched_job_ids:
+                            continue
+                        matched_job_ids.add(job_id)
                     run_matches += 1
             if run_matches:
                 matches += run_matches
                 negative.pop(str(run_id), None)
-                break
+                continue
             negative[str(run_id)] = {
                 "checked_at": self.now,
                 "updated_at": run.get("updated_at"),
@@ -453,7 +483,15 @@ class QueueScanner:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
-    parser.add_argument("--workflow", required=True)
+    parser.add_argument(
+        "--workflow",
+        required=True,
+        action="append",
+        help=(
+            "exact workflow name to scan; repeat for one shared-label lane "
+            "serving multiple workflows"
+        ),
+    )
     parser.add_argument("--labels", required=True)
     parser.add_argument("--job-statuses", default="queued")
     parser.add_argument("--state-file", required=True)
@@ -543,7 +581,13 @@ def main() -> int:
     try:
         if args.stagger_max_seconds:
             identity = "\0".join(
-                (args.repo, args.workflow, args.labels, args.provider, args.lane_id)
+                (
+                    args.repo,
+                    "\0".join(sorted(dict.fromkeys(args.workflow))),
+                    args.labels,
+                    args.provider,
+                    args.lane_id,
+                )
             )
             delay_ms = zlib.crc32(identity.encode("utf-8")) % (
                 args.stagger_max_seconds * 1000

@@ -384,11 +384,14 @@ workflow selector to the full label set. Keep the bare-metal `pulp-build`
 runners online as rollback fallback, but excluded from the default VM route by
 the extra `pulp-build-vm` label.
 
-Keep `Release CLI` on its own macOS VM lane. Serve
+Keep release workflows on their own macOS VM lane. Serve
 `self-hosted,macOS,ARM64,pulp-build-vm-release` from
 `launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template`, then
 move `PULP_RELEASE_MACOS_RUNS_ON_JSON` to that selector only after a real
-Release CLI proof completes. Do not share the Build and Test `pulp-build-vm`
+release proof completes. The template's newline-delimited
+`TARTCI_RUNNER_WORKFLOW_NAMES` lets that one capped supervisor discover
+`Release CLI`, `Release-path PR gate`, and `Sign and Release`; do not create a
+separate supervisor per workflow or share the Build and Test `pulp-build-vm`
 label with release jobs.
 
 ### Reap stale CI residue

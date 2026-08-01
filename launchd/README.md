@@ -9,9 +9,10 @@ counterpart of `tartci serve <os> --loop`.
 ## Generic toolkit vs. Pulp's concrete instance
 
 The **runner scripts are project-agnostic** — repo, golden, labels, and the
-"is there queued work?" workflow name are all env-driven
+"is there queued work?" workflow name or names are all env-driven
 (`TARTCI_RUNNER_REPO`, `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` /
-`TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_WORKFLOW_NAME`).
+`TARTCI_WIN_GOLDEN`, `TARTCI_RUNNER_LABELS`,
+`TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_WORKFLOW_NAMES`).
 
 Runtime measurement is also env-driven and optional. Add these only to hosts
 where you want local timing history for agents or Shipyard import:
@@ -152,7 +153,8 @@ launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
 `Release CLI` is a different workload from `Build and Test`, so serve it with a
 different Tart VM label and LaunchAgent. Use
 `com.danielraffel.pulp.tart-runner-macos-release.plist.template`, which filters
-on `TARTCI_RUNNER_WORKFLOW_NAME=Release CLI` and advertises the shared release
+on the newline-delimited `TARTCI_RUNNER_WORKFLOW_NAMES` list (`Release CLI`,
+`Release-path PR gate`, and `Sign and Release`) and advertises the shared release
 pool label:
 
 ```text
@@ -169,6 +171,19 @@ the intended selector is:
 
 The release lane can stay loaded before the variable is flipped; it will idle
 because queued Release CLI jobs do not request `pulp-build-vm-release` yet.
+
+The plural workflow setting is authoritative when non-empty and replaces the
+legacy singular `TARTCI_RUNNER_WORKFLOW_NAME`. Put one exact Actions workflow
+display name on each line. The runner passes each name as a repeated bounded
+queue-scan filter, aggregates matching jobs, and de-duplicates job IDs. It still
+boots through one supervisor and the same host-wide VM cap, so adding a workflow
+does not add a competing lane or increase VM concurrency. Existing single-name
+agents need no migration.
+
+To migrate an installed release agent, render the current template over its
+plist (preserving that host's `TART_HOME` substitution), then drain/reload the
+single `com.danielraffel.pulp.tart-runner-macos-release` LaunchAgent. Do not load
+one release agent per workflow.
 
 ## Windows QEMU launchd rule
 
