@@ -21,7 +21,7 @@ tartci* below).
 | **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
 | **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
 | **Model** | golden template → linked clone → one job → destroy |
-| **Templates** | `9003` `pulp-linux-golden-warm2` (current) · `9002`, `9001` (superseded) |
+| **Templates** | `9004` `pulp-linux-golden-warm3` (current) · `9003`, `9002`, `9001` (superseded) |
 | **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 enabled slots; slot 3 is an operator-gated expansion |
 | **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
@@ -83,7 +83,7 @@ The same isolation model as `providers/tart-linux`, implemented with Proxmox
 primitives:
 
 ```
-9001  pulp-linux-golden   template — deps + prebuilt Skia + warm ccache
+9004  pulp-linux-golden-warm3   template — deps + prebuilt Skia + warm ccache
 200+  pulp-ci-ephemeral-N linked clone, one job, destroyed
 ```
 
@@ -103,6 +103,11 @@ Why this rather than a persistent runner with a cleanup hook:
 
 Two slots run as `pulp-ephemeral-pool@{1,2}.service`; **systemd restarting a slot
 is what provisions the next clone** — that loop *is* the pool.
+
+VMIDs `200..202` have stable network identities: `192.168.86.251..253` and
+deterministic locally administered MAC addresses. The Actions registration name
+is deliberately different: `pulp-ci-ephemeral-<vmid>-<uuid>` is unique for every
+invocation so an interrupted runner cannot collide with its replacement.
 
 ### Scripts on the host
 
@@ -236,7 +241,7 @@ a nightly slips, whereas a required check would strand merges.
 
 ```sh
 ssh macpro
-qm list                                        # 9001 golden, 200+ ephemeral clones
+qm list                                        # 9004 golden, 200+ ephemeral clones
 systemctl status 'pulp-ephemeral-pool@*'
 systemctl is-enabled pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
 systemctl show pulp-ephemeral-pool@1 pulp-ephemeral-pool@2 -p ExecMainStartTimestamp -p ActiveState -p SubState
@@ -279,6 +284,12 @@ contract edit must land together.
 
 ## Gotchas this host paid for
 
+- **Random clone MACs exhaust the LAN DHCP pool.** A destroyed VM does not release
+  its lease immediately. One random MAC per short CI job accumulated hundreds of
+  live leases on 2026-08-02, leaving healthy clones with only IPv6 and holding the
+  merge queue. Keep the VMID-to-IP/MAC mapping deterministic and the Actions
+  runner name unique; network identity and runner identity solve different
+  incident classes.
 - **Clone before clearing `machine-id` and two VMs share a DHCP lease.** Identical
   `machine-id` → identical DHCP identity → the same IP handed to both. Clear
   `/etc/machine-id`, `/var/lib/dbus/machine-id`, and the SSH host keys *before*
