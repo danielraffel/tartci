@@ -95,7 +95,8 @@ tartci_vm_lease_priority(){
     return 0
   fi
   case ",$labels," in
-    *,pulp-build,*) printf '%s' gate ;;
+    *,pulp-release-pr-gate,*) printf '%s' vm ;;
+    *,pulp-build,*|*,pulp-release-tagged,*) printf '%s' gate ;;
     *) printf '%s' vm ;;
   esac
 }

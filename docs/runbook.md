@@ -991,6 +991,12 @@ Tagged release -> self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-tag
 PR release gate -> self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-pr-gate
 ```
 
+The `pulp-release-tagged` label maps to gate-priority host leases, allowing a
+real release to use reserved cores even when an advisory VM owns the non-gate
+budget. `pulp-release-pr-gate` intentionally stays at ordinary VM priority.
+Conflicting release class labels also fail down to ordinary VM priority.
+An explicit `TARTCI_VM_LEASE_PRIORITY` still overrides label-derived priority.
+
 Load the release VM lane only as one separate LaunchAgent with ordered
 `TARTCI_RUNNER_WORKFLOW_TIERS`: `Release CLI` and `Sign and Release` share the
 first tagged-release class, while `Release-path PR gate` occupies the second.

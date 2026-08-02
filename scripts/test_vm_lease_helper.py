@@ -116,6 +116,24 @@ class VmLeaseHelperTests(unittest.TestCase):
             ["gate gate", "vm nongate", "build nongate", "100 gate", "200 gate", "60 nongate", "0 nongate"],
         )
 
+    def test_tagged_release_gets_gate_lease_but_pr_gate_does_not(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            printf 'tagged=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-tagged)"
+            printf 'pr-gate=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-pr-gate)"
+            printf 'conflict=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-release-tagged,pulp-release-pr-gate)"
+            printf 'override=%s\n' "$(TARTCI_VM_LEASE_PRIORITY=vm tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-release-tagged)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["tagged=gate", "pr-gate=vm", "conflict=vm", "override=vm"],
+        )
+
     def test_non_gate_lease_clamped_to_budget(self) -> None:
         # A non-gate VM lane requesting more than the non-gate budget is clamped
         # down, so it can never be denied for exceeding it nor touch the gate reserve.
