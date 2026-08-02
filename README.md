@@ -273,6 +273,12 @@ and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
 
 The fast gate supervisors (Pulp: M3 and M5) should advertise
 `TARTCI_VM_LEASE_PRIORITY=gate`; advisory supervisors must yield to that class.
+Pulp's exclusive `pulp-release-tagged` class also receives a gate-priority
+lease automatically, so a queued tagged release can use the reserved capacity
+while an advisory VM holds the non-gate budget. The lower-priority
+`pulp-release-pr-gate` class remains ordinary VM work.
+If both mutually exclusive class labels appear, the PR-gate classification
+wins and the lease fails down to ordinary VM priority.
 This reserves host-core leases, but it does not choose a specific GitHub job
 after a runner boots. Host placement needs a label: Pulp's fast supervisors and
 required selector carry `pulp-gate-fast`, while the slower M1 keeps only the
