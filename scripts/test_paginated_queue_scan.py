@@ -339,6 +339,66 @@ class PaginatedQueueScanTests(unittest.TestCase):
             self.assertNotEqual(first.state_path, other_lane.state_path)
             self.assertNotEqual(first.state_path, other_labels.state_path)
 
+    def test_multi_workflow_scan_aggregates_and_deduplicates_matching_jobs(
+        self,
+    ) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        workflows = ["Release CLI", "Release-path PR gate", "Sign and Release"]
+        runs = [
+            {**_run(index + 1, origin + timedelta(minutes=index)), "name": name}
+            for index, name in enumerate(workflows)
+        ]
+        runs.append({**_run(99, origin + timedelta(minutes=4)), "name": "Unrelated"})
+        jobs = {
+            1: [
+                {"id": 10, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+                {"id": 11, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+            ],
+            2: [
+                {"id": 11, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+                {"id": 12, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+            ],
+            3: [
+                {"id": 13, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+                {"id": 14, "status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]},
+            ],
+        }
+        calls: list[str] = []
+
+        def api(path: str) -> dict[str, Any]:
+            calls.append(path)
+            if "/actions/runs?status=queued" in path:
+                return {"workflow_runs": runs}
+            if "/actions/runs?status=in_progress" in path:
+                return {"workflow_runs": []}
+            if "/jobs?" in path:
+                run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+                return {"jobs": jobs.get(run_id, [])}
+            raise AssertionError(f"unexpected API path: {path}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            scanner = self._scanner(
+                "tart-macos",
+                state_file,
+                api,
+                workflow=[*workflows, "Release CLI"],
+            )
+            self.assertEqual(scanner.scan(), 5)
+            reordered = self._scanner(
+                "tart-macos",
+                state_file,
+                api,
+                workflow=list(reversed(workflows)),
+            )
+            self.assertEqual(scanner.state_path, reordered.state_path)
+            self.assertEqual(scanner.discovery_path, reordered.discovery_path)
+
+        self.assertFalse(
+            any(path.endswith("/actions/workflows?per_page=100") for path in calls)
+        )
+        self.assertTrue(any("/actions/runs?status=queued" in path for path in calls))
+
     def test_workflow_id_cache_avoids_repeated_lookup(self) -> None:
         calls: list[str] = []
 

@@ -10,6 +10,9 @@
 # failed poll is never misread as an empty queue. On sustained blindness (ERR for
 # ~TARTCI_SCAN_BLIND_MAX polls ≈ 3 min) the loop self-restarts via `exit 75` (launchd
 # KeepAlive respawns → fresh auth), instead of idling silent for hours (a real 5h wedge).
+# One lane may watch multiple exact workflow names by setting newline-delimited
+# TARTCI_RUNNER_WORKFLOW_NAMES. The plural setting replaces the legacy singular
+# TARTCI_RUNNER_WORKFLOW_NAME; the singular setting remains the default.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -50,6 +53,10 @@ REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
+WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
+WORKFLOW_ARGS=()
+WORKFLOW_DISPLAY=""
+WORKFLOW_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
@@ -80,6 +87,7 @@ CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
+CURRENT_WORKFLOW_NAME=""
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
 CLEANED_UP=0
@@ -92,6 +100,32 @@ note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
+
+configure_workflows(){
+  local workflow
+  if [ -n "$WORKFLOW_NAMES" ]; then
+    while IFS= read -r workflow; do
+      workflow="${workflow%$'\r'}"
+      [ -n "$workflow" ] || continue
+      WORKFLOW_ARGS+=(--workflow "$workflow")
+      if [ -n "$WORKFLOW_DISPLAY" ]; then
+        WORKFLOW_DISPLAY="$WORKFLOW_DISPLAY | $workflow"
+        WORKFLOW_CONFIG="$WORKFLOW_CONFIG
+$workflow"
+      else
+        WORKFLOW_DISPLAY="$workflow"
+        WORKFLOW_CONFIG="$workflow"
+        WORKFLOW_NAME="$workflow"
+      fi
+    done <<< "$WORKFLOW_NAMES"
+    [ "${#WORKFLOW_ARGS[@]}" -gt 0 ] \
+      || die "TARTCI_RUNNER_WORKFLOW_NAMES contains no workflow names"
+  else
+    WORKFLOW_ARGS=(--workflow "$WORKFLOW_NAME")
+    WORKFLOW_DISPLAY="$WORKFLOW_NAME"
+    WORKFLOW_CONFIG="$WORKFLOW_NAME"
+  fi
+}
 
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
@@ -141,6 +175,8 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) usage; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+configure_workflows
 
 IDENTITY_JSON="$(python3 "$TARTCI_ROOT/scripts/macos_runner_identity.py" \
   --name "$RUNNER_NAME" \
@@ -199,7 +235,7 @@ runtime_emit_complete(){
   local status="$1" failure_class="$2" exit_code="$3" timing_path="$4" log_dir="$5"
   python3 "$TARTCI_ROOT/scripts/runtime_measure.py" complete \
     --repo "$REPO" \
-    --workflow "$WORKFLOW_NAME" \
+    --workflow "${CURRENT_WORKFLOW_NAME:-$WORKFLOW_NAME}" \
     --provider tart-macos \
     --platform macos \
     --arch arm64 \
@@ -255,7 +291,7 @@ PY
 queued_work(){
   python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
-    --workflow "$WORKFLOW_NAME" \
+    "${WORKFLOW_ARGS[@]}" \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -346,21 +382,36 @@ trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TE
 trap 'cleanup' EXIT
 
 capture_current_job(){
-  local run_id job_id
+  local run_id run_workflow job_id runner_registration
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
-  while IFS= read -r run_id; do
+  CURRENT_WORKFLOW_NAME=""
+  runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
+  while IFS=$'\t' read -r run_id run_workflow; do
     [ -n "$run_id" ] || continue
-    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" \
-      --jq ".jobs[] | select(.runner_name==\"$RUNNER_NAME\") | select(.status==\"in_progress\") | .id" \
-      2>/dev/null | head -n1 || true)"
+    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" 2>/dev/null \
+      | TARTCI_CAPTURE_RUNNER="$runner_registration" python3 -c '
+import json, os, sys
+runner = os.environ["TARTCI_CAPTURE_RUNNER"]
+for job in json.load(sys.stdin).get("jobs", []):
+    if job.get("runner_name") == runner and job.get("status") == "in_progress":
+        print(job.get("id", ""))
+        break
+' 2>/dev/null | head -n1 || true)"
     if [ -n "$job_id" ]; then
       CURRENT_RUN_ID="$run_id"
       CURRENT_JOB_ID="$job_id"
+      CURRENT_WORKFLOW_NAME="$run_workflow"
       return 0
     fi
-  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" \
-    --jq ".workflow_runs[] | select(.name == \"$WORKFLOW_NAME\") | .id" 2>/dev/null || true)
+  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" 2>/dev/null \
+    | TARTCI_CAPTURE_WORKFLOWS="$WORKFLOW_CONFIG" python3 -c '
+import json, os, sys
+workflows = set(os.environ["TARTCI_CAPTURE_WORKFLOWS"].splitlines())
+for run in json.load(sys.stdin).get("workflow_runs", []):
+    if run.get("name") in workflows and isinstance(run.get("id"), int):
+        print("{}\t{}".format(run["id"], run["name"]))
+' 2>/dev/null || true)
   return 1
 }
 
@@ -449,6 +500,7 @@ run_one(){
   CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
+  CURRENT_WORKFLOW_NAME=""
   reclaim_runner_name "$vm"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
@@ -583,6 +635,7 @@ run_one(){
   CURRENT_IP=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
+  CURRENT_WORKFLOW_NAME=""
   reclaim_runner_name "$vm"
   CURRENT_REGISTERED_RUNNER=""
   heartbeat stopped
@@ -602,7 +655,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
