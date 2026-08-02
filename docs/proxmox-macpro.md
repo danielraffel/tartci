@@ -22,8 +22,8 @@ tartci* below).
 | **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
 | **Model** | golden template → linked clone → one job → destroy |
 | **Templates** | `9003` `pulp-linux-golden-warm2` (current) · `9002`, `9001` (superseded) |
-| **Pool** | `pulp-ephemeral-pool@{1,2,3}.service`, 3 slots |
-| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**, freeing 10 GB for slot 3 |
+| **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 enabled slots; slot 3 is an operator-gated expansion |
+| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
 | **Credential** | `/root/.config/pulp/secrets/gh-runner-pat` (600, root) — `Administration: read/write` only |
 | **Rollback** | unset the routing variable; the lane returns to GitHub-hosted |
@@ -238,9 +238,17 @@ a nightly slips, whereas a required check would strand merges.
 ssh macpro
 qm list                                        # 9001 golden, 200+ ephemeral clones
 systemctl status 'pulp-ephemeral-pool@*'
+systemctl is-enabled pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
+systemctl show pulp-ephemeral-pool@1 pulp-ephemeral-pool@2 -p ExecMainStartTimestamp -p ActiveState -p SubState
 journalctl -u 'pulp-ephemeral-pool@1' -f       # per-job lifecycle
 /usr/local/sbin/macpro-governor.sh status      # capacity and current commitment
 ```
+
+`active (running)` proves only the current process. Both `is-enabled` results
+must also be `enabled`, which proves the two slots rejoin the pool after a host
+restart. After a reboot, compare `uptime -s` with each unit's
+`ExecMainStartTimestamp` and confirm both ephemeral runner registrations return
+online before routing work back to the host.
 
 Add a slot: `systemctl enable --now pulp-ephemeral-pool@3` — but check the governor
 first, and leave headroom if a Windows VM is planned.
