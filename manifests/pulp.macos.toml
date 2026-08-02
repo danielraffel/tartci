@@ -20,12 +20,12 @@ cmake  = "homebrew"
 ninja  = "homebrew"
 python = "3.12"
 rust   = "stable"   # rustup-managed; release-cli.yml builds the Rust `pulp` CLI
+rust_targets = ["x86_64-apple-darwin"] # release-cli's Darwin Intel cross-build
 
 [brew]
-# `rustup` installs the toolchain MANAGER only — the bake must then materialize a
-# real toolchain so cargo/rustc land on PATH (via ~/.cargo/bin). Run one of:
-#   rustup default stable
-#   rustup-init -y --profile minimal --default-toolchain stable --no-modify-path
+# Homebrew's `rustup` is keg-only and does not provide `rustup-init`. The bake
+# must run `rustup default stable`, add `rust_targets`, and expose the keg's
+# proxies through ~/.cargo/bin. The exact verified recipe is in docs/runbook.md.
 # The `stable` pin matches Pulp's experimental/pulp-rs/rust-toolchain.toml, so
 # there's no reproducibility drift vs. the workflow fallback. release-cli.yml
 # keeps a run-time rustup bootstrap as the portability belt; baking it here just

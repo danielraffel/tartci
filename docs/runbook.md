@@ -213,6 +213,37 @@ tart clone ghcr.io/cirruslabs/macos-sequoia-xcode:latest macos-build-base
 tart clone macos-build-base pulp-mac-build
 ```
 
+### Release Rust must be baked, not downloaded per job
+
+Pulp's release lane builds the Rust CLI on both Darwin architectures. The
+`pulp-build-runner` golden must therefore carry stable Cargo plus the Intel
+standard library. Homebrew's `rustup` formula is keg-only and does not include
+`rustup-init`; installing the formula alone is not enough. Before tagging a
+golden, run this as the guest's `admin` user:
+
+```bash
+eval "$(/opt/homebrew/bin/brew shellenv)"
+brew install rustup
+rustup_bin="$(brew --prefix rustup)/bin"
+mkdir -p "$HOME/.cargo/bin"
+for tool in rustup cargo rustc rustdoc rustfmt cargo-clippy clippy-driver; do
+  test ! -x "$rustup_bin/$tool" || ln -sfn "$rustup_bin/$tool" "$HOME/.cargo/bin/$tool"
+done
+export PATH="$HOME/.cargo/bin:$PATH"
+rustup default stable
+rustup component add rustfmt clippy
+rustup target add x86_64-apple-darwin
+```
+
+Verify a fresh clone, not the mutable bake VM: `~/.cargo/bin/cargo --version`,
+`~/.cargo/bin/rustup target list --installed`, and a TLS probe to GitHub must
+all succeed. This keeps releases working during a transient rustup outage and
+proves the state that disposable runners actually inherit. Pulp's release
+workflow deliberately probes `~/.cargo/bin` by absolute path and appends that
+directory to `GITHUB_PATH`, so shell-profile PATH persistence is not required;
+link both `cargo` and `rustup` there so the following Intel-target step inherits
+both commands.
+
 **Cache split (applies to every OS):**
 - **Immutable + expensive → baked into the golden** (Skia/Dawn static libs).
   CoW-shared, ~free per clone.
