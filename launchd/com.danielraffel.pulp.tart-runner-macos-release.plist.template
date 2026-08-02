@@ -120,13 +120,14 @@
         <string>pulp-build-runner:latest</string>
         <key>TARTCI_RUNNER_LABELS</key>
         <string>self-hosted,macOS,ARM64,pulp-build-vm-release</string>
-        <!-- One supervisor owns this shared-label lane. Keep one exact GitHub
-             Actions workflow display name per line; do not create a competing
-             supervisor for each workflow. -->
-        <key>TARTCI_RUNNER_WORKFLOW_NAMES</key>
-        <string>Release CLI
-Release-path PR gate
-Sign and Release</string>
+        <!-- One supervisor owns this release pool. Each line is
+             class-label|exact workflow display name. First-seen labels
+             define strict non-preemptive priority; workflows sharing labels
+             retain GitHub FIFO within that class. -->
+        <key>TARTCI_RUNNER_WORKFLOW_TIERS</key>
+        <string>pulp-release-tagged|Release CLI
+pulp-release-tagged|Sign and Release
+pulp-release-pr-gate|Release-path PR gate</string>
     </dict>
 </dict>
 </plist>

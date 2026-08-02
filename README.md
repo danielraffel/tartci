@@ -388,9 +388,12 @@ Keep release workflows on their own macOS VM lane. Serve
 `self-hosted,macOS,ARM64,pulp-build-vm-release` from
 `launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template`, then
 move `PULP_RELEASE_MACOS_RUNS_ON_JSON` to that selector only after a real
-release proof completes. The template's newline-delimited
-`TARTCI_RUNNER_WORKFLOW_NAMES` lets that one capped supervisor discover
-`Release CLI`, `Release-path PR gate`, and `Sign and Release`; do not create a
+release proof completes. The template's ordered
+`TARTCI_RUNNER_WORKFLOW_TIERS` keeps one capped supervisor while registering
+tagged `Release CLI` / `Sign and Release` runners with
+`pulp-release-tagged`, ahead of `Release-path PR gate` runners registered with
+`pulp-release-pr-gate`. The class labels are mutually exclusive because GitHub,
+not Tart CI, assigns compatible queued jobs after registration. Do not create a
 separate supervisor per workflow or share the Build and Test `pulp-build-vm`
 label with release jobs.
 
