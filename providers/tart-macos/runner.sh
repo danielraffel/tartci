@@ -378,8 +378,6 @@ cleanup(){
   CLEANED_UP=1
   heartbeat stopped
 }
-trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TERM
-trap 'cleanup' EXIT
 
 capture_current_job(){
   local run_id run_workflow job_id runner_registration
@@ -647,6 +645,8 @@ i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TERM
+trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
