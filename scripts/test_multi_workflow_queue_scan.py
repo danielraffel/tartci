@@ -93,9 +93,51 @@ else:
                 check=False,
                 env=env,
             )
+            state_files = list((root / "state").glob("*.state.json"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "3", result.stdout + result.stderr)
+        self.assertEqual(state_files, [], "queue probe clobbered supervisor state")
+
+    def test_local_print_modes_do_not_write_lifecycle_state(self) -> None:
+        for mode in ("--print-priority-demand", "--print-host-health"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_exec(root / "tart", "#!/usr/bin/env bash\nexit 0\n")
+                _write_exec(root / "fake-gh", "#!/usr/bin/env bash\nexit 99\n")
+                search_path = [
+                    str(root),
+                    *[
+                        item
+                        for item in ("/bin", "/usr/bin", "/usr/local/bin")
+                        if Path(item).exists()
+                    ],
+                ]
+                env = {
+                    "HOME": str(root),
+                    "PATH": os.pathsep.join(search_path),
+                    "TART_HOME": str(root / "vms"),
+                    "TARTCI_STATE_DIR": str(root / "state"),
+                    "TARTCI_GH_CLI": "fake-gh",
+                    "TARTCI_RUNNER_LABELS": (
+                        "self-hosted,macOS,ARM64,pulp-build-vm-release"
+                    ),
+                }
+                result = subprocess.run(
+                    ["bash", str(RUNNER), mode],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=env,
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "0")
+                self.assertEqual(
+                    list((root / "state").glob("*.state.json")),
+                    [],
+                    f"{mode} clobbered supervisor state",
+                )
 
     def test_release_template_lists_every_shared_pool_workflow(self) -> None:
         body = RELEASE_TEMPLATE.read_text(encoding="utf-8")
