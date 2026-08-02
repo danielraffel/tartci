@@ -13,6 +13,14 @@
 # One lane may watch multiple exact workflow names by setting newline-delimited
 # TARTCI_RUNNER_WORKFLOW_NAMES. The plural setting replaces the legacy singular
 # TARTCI_RUNNER_WORKFLOW_NAME; the singular setting remains the default.
+# Ordered workflow tiers (opt-in): TARTCI_RUNNER_WORKFLOW_TIERS contains one
+# `class-label|exact workflow name` entry per line. First-seen labels are
+# the priority order; workflows sharing a class label share one FIFO
+# class. The runner scans each class in order and registers its JIT runner with
+# only the selected class labels, so GitHub cannot assign lower-priority work to
+# a runner reserved for a higher-priority class. Before minting a lower-tier JIT
+# config, the supervisor rechecks every higher tier and discards the still-
+# unregistered VM if higher-priority demand arrived during boot.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -54,9 +62,11 @@ LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pu
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
+WORKFLOW_TIERS="${TARTCI_RUNNER_WORKFLOW_TIERS:-}"
 WORKFLOW_ARGS=()
 WORKFLOW_DISPLAY=""
 WORKFLOW_CONFIG=""
+TIER_LABELS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
@@ -81,6 +91,8 @@ PRINT_NAME=0
 PRINT_EVENT_LOG=0
 PRINT_IDENTITY=0
 PRINT_QUEUE=0
+PRINT_SELECTION=0
+PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
 CURRENT_VM=""
@@ -88,6 +100,7 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CURRENT_WORKFLOW_NAME=""
+CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
 CLEANED_UP=0
@@ -102,8 +115,44 @@ now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 
 configure_workflows(){
-  local workflow
-  if [ -n "$WORKFLOW_NAMES" ]; then
+  local entry tier_labels workflow
+  if [ -n "$WORKFLOW_TIERS" ]; then
+    while IFS= read -r entry; do
+      entry="${entry%$'\r'}"
+      [ -n "$entry" ] || continue
+      case "$entry" in
+        *'|'*) ;;
+        *) die "invalid TARTCI_RUNNER_WORKFLOW_TIERS entry (expected additional-labels|workflow): $entry" ;;
+      esac
+      tier_labels="${entry%%|*}"
+      workflow="${entry#*|}"
+      [ -n "$tier_labels" ] && [ -n "$workflow" ] \
+        || die "invalid TARTCI_RUNNER_WORKFLOW_TIERS entry (empty labels/workflow): $entry"
+      case "$tier_labels" in
+        *,*) die "workflow tier must use one exclusive class label, not a comma list: $tier_labels" ;;
+      esac
+      WORKFLOW_ARGS+=(--workflow "$workflow")
+      if [ -n "$WORKFLOW_DISPLAY" ]; then
+        WORKFLOW_DISPLAY="$WORKFLOW_DISPLAY | $workflow"
+        WORKFLOW_CONFIG="$WORKFLOW_CONFIG
+$workflow"
+      else
+        WORKFLOW_DISPLAY="$workflow"
+        WORKFLOW_CONFIG="$workflow"
+        WORKFLOW_NAME="$workflow"
+      fi
+      if ! printf '%s\n' "$TIER_LABELS_CONFIG" | grep -Fxq "$tier_labels"; then
+        if [ -n "$TIER_LABELS_CONFIG" ]; then
+          TIER_LABELS_CONFIG="$TIER_LABELS_CONFIG
+$tier_labels"
+        else
+          TIER_LABELS_CONFIG="$tier_labels"
+        fi
+      fi
+    done <<< "$WORKFLOW_TIERS"
+    [ "${#WORKFLOW_ARGS[@]}" -gt 0 ] \
+      || die "TARTCI_RUNNER_WORKFLOW_TIERS contains no workflow tiers"
+  elif [ -n "$WORKFLOW_NAMES" ]; then
     while IFS= read -r workflow; do
       workflow="${workflow%$'\r'}"
       [ -n "$workflow" ] || continue
@@ -168,6 +217,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-identity) PRINT_IDENTITY=1; shift;;
   --print-boot-name) PRINT_BOOT_NAME="$2"; shift 2;;  # debug/test: emit ephemeral_boot_name <i>
   --print-queue) PRINT_QUEUE=1; shift;;
+  --print-selection) PRINT_SELECTION=1; shift;;
+  --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
@@ -177,6 +228,7 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 configure_workflows
+CURRENT_LABELS="$LABELS"
 
 IDENTITY_JSON="$(python3 "$TARTCI_ROOT/scripts/macos_runner_identity.py" \
   --name "$RUNNER_NAME" \
@@ -220,7 +272,7 @@ heartbeat(){
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -241,7 +293,7 @@ runtime_emit_complete(){
     --arch arm64 \
     --runner-name "$RUNNER_NAME" \
     --vm-name "${CURRENT_VM:-$RUNNER_NAME}" \
-    --labels "$LABELS" \
+    --labels "$CURRENT_LABELS" \
     --run-id "${CURRENT_RUN_ID:-}" \
     --job-id "${CURRENT_JOB_ID:-}" \
     --golden "$GOLDEN" \
@@ -289,6 +341,17 @@ PY
 }
 
 queued_work(){
+  if [ -n "$WORKFLOW_TIERS" ]; then
+    local tier_labels q total=0
+    while IFS= read -r tier_labels; do
+      [ -n "$tier_labels" ] || continue
+      q="$(tier_queued_work "$tier_labels")" || { printf '%s\n' ERR; return 0; }
+      printf '%s' "$q" | grep -qxE '[0-9]+' || { printf '%s\n' ERR; return 0; }
+      total=$((total + q))
+    done <<< "$TIER_LABELS_CONFIG"
+    printf '%s\n' "$total"
+    return 0
+  fi
   python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     "${WORKFLOW_ARGS[@]}" \
@@ -299,6 +362,79 @@ queued_work(){
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
     --match-labels 1 2>/dev/null || echo ERR
+}
+
+tier_workflow_args(){
+  local selected="$1" entry tier_labels workflow
+  while IFS= read -r entry; do
+    entry="${entry%$'\r'}"
+    [ -n "$entry" ] || continue
+    tier_labels="${entry%%|*}"
+    workflow="${entry#*|}"
+    [ "$tier_labels" = "$selected" ] && printf '%s\n' "$workflow"
+  done <<< "$WORKFLOW_TIERS"
+}
+
+tier_queued_work(){
+  local tier_labels="$1" force_refresh="${2:-0}" workflow tier_args=() scan_cmd=()
+  while IFS= read -r workflow; do
+    [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
+  done < <(tier_workflow_args "$tier_labels")
+  [ "${#tier_args[@]}" -gt 0 ] || return 1
+  scan_cmd=(python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+    --repo "$REPO" \
+    "${tier_args[@]}" \
+    --labels "$LABELS,$tier_labels" \
+    --provider tart-macos-tier \
+    --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-$tier_labels" \
+    --state-file "$STATE_DIR/queue-scan.json" \
+    --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
+    --max-age-seconds 0)
+  [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
+  "${scan_cmd[@]}" --match-labels 1 2>/dev/null
+}
+
+# Print `count|registration labels|zero-based tier`. A scan error at any tier is
+# fail-closed: never skip a blind higher class and hand its capacity to a lower
+# one. With no tier config this is the legacy single-label queue scan.
+select_work(){
+  local tier_labels q tier=0
+  if [ -z "$WORKFLOW_TIERS" ]; then
+    q="$(queued_work)"
+    printf '%s|%s|0\n' "$q" "$LABELS"
+    return 0
+  fi
+  while IFS= read -r tier_labels; do
+    [ -n "$tier_labels" ] || continue
+    if ! q="$(tier_queued_work "$tier_labels")"; then
+      printf 'ERR|%s|%s\n' "$LABELS" "$tier"
+      return 0
+    fi
+    if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      printf 'ERR|%s|%s\n' "$LABELS" "$tier"
+      return 0
+    fi
+    if [ "$q" -gt 0 ]; then
+      printf '%s|%s,%s|%s\n' "$q" "$LABELS" "$tier_labels" "$tier"
+      return 0
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  printf '0|%s|%s\n' "$LABELS" "$tier"
+}
+
+higher_priority_demand(){
+  local selected_tier="$1" tier_labels q tier=0
+  [ "$selected_tier" -gt 0 ] || return 1
+  while IFS= read -r tier_labels; do
+    [ -n "$tier_labels" ] || continue
+    [ "$tier" -lt "$selected_tier" ] || break
+    q="$(tier_queued_work "$tier_labels" 1)" || return 0
+    printf '%s' "$q" | grep -qxE '[0-9]+' || return 0
+    [ "$q" -eq 0 ] || return 0
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  return 1
 }
 
 # priority_demand — how many jobs a higher-priority lane currently has WAITING or
@@ -483,7 +619,8 @@ run_one(){
   # Per-boot EPHEMERAL registration name (see ephemeral_boot_name) — never the bare
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
-  local i="$1" vm; vm="$(ephemeral_boot_name "$i")"
+  local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
+  vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
@@ -499,11 +636,12 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
+  CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
-  lease_priority="$(tartci_vm_lease_priority "$LABELS")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$LABELS" "$lease_mem" || return $?
+  lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" || return $?
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
@@ -555,11 +693,19 @@ run_one(){
     return 1
   fi
   t_booted="$(now_epoch)"
+  if higher_priority_demand "$selected_tier"; then
+    note "[$i] higher-priority workflow demand appeared during boot — discarding unregistered tier-$selected_tier VM"
+    event yielded_to_workflow_tier "selected_tier=$selected_tier labels=$selected_labels"
+    discard_current_vm
+    tartci_release_vm_lease
+    CURRENT_LABELS="$LABELS"
+    return 75
+  fi
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     heartbeat admission-check
-    event admission_check "repo=$REPO labels=$LABELS"
-    if admission_json="$(tartci_admission_clean "$REPO" "$LABELS")"; then
+    event admission_check "repo=$REPO labels=$selected_labels"
+    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
       admission_rc=0
     else
       admission_rc=$?
@@ -578,11 +724,11 @@ run_one(){
   fi
 
   heartbeat minting-jit
-  event mint_jit "labels=$LABELS"
+  event mint_jit "labels=$selected_labels tier=$selected_tier"
   # Claim the exact per-boot registration name before minting. Cleanup can then
   # reclaim it even when a signal lands immediately after GitHub creates it.
   CURRENT_REGISTERED_RUNNER="$vm"
-  IFS=',' read -r -a labels_split <<< "$LABELS"
+  IFS=',' read -r -a labels_split <<< "$selected_labels"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
@@ -634,6 +780,7 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
+  CURRENT_LABELS="$LABELS"
   reclaim_runner_name "$vm"
   CURRENT_REGISTERED_RUNNER=""
   heartbeat stopped
@@ -643,6 +790,11 @@ run_one(){
 
 i=0
 [ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
+[ "$PRINT_SELECTION" = 1 ] && { select_work | tr '|' '\t'; exit 0; }
+[ -n "$PRINT_HIGHER_PRIORITY" ] && {
+  if higher_priority_demand "$PRINT_HIGHER_PRIORITY"; then printf '1\n'; else printf '0\n'; fi
+  exit 0
+}
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TERM
@@ -655,7 +807,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
@@ -665,7 +817,9 @@ if [ "$LOOP" = 1 ]; then
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   heartbeat loop
   while true; do
-    q="$(queued_work)"; cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
+    selection="$(select_work)"
+    IFS='|' read -r q selected_labels selected_tier <<< "$selection"
+    cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
     # Blind-aware: a non-numeric `q` (ERR) means the gh queue scan FAILED — do NOT treat it as an
     # empty queue. Count consecutive blind polls; after a sustained window, self-restart for fresh
     # gh auth (the supervisor is idle at the loop top — run_one blocks — so cleanup discards no live
@@ -700,8 +854,9 @@ if [ "$LOOP" = 1 ]; then
     # 0), so this is a no-op for a runner with neither feature enabled.
     if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
-      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p host_health_yield=$hh → booting ephemeral VM"
-      run_one "$i" || sleep "$POLL"
+      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
+      run_one "$i" "$selected_labels" "$selected_tier" || sleep "$POLL"
+      CURRENT_LABELS="$LABELS"
       rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"
@@ -720,6 +875,13 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
-  note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$LABELS"
-  run_one 1
+  selected_labels="$LABELS"; selected_tier=0
+  if [ -n "$WORKFLOW_TIERS" ]; then
+    selection="$(select_work)"
+    IFS='|' read -r q selected_labels selected_tier <<< "$selection"
+    printf '%s' "$q" | grep -qxE '[1-9][0-9]*' \
+      || die "no queued workflow-tier work to select for --once"
+  fi
+  note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
+  run_one 1 "$selected_labels" "$selected_tier"
 fi

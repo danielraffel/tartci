@@ -152,10 +152,9 @@ launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
 
 `Release CLI` is a different workload from `Build and Test`, so serve it with a
 different Tart VM label and LaunchAgent. Use
-`com.danielraffel.pulp.tart-runner-macos-release.plist.template`, which filters
-on the newline-delimited `TARTCI_RUNNER_WORKFLOW_NAMES` list (`Release CLI`,
-`Release-path PR gate`, and `Sign and Release`) and advertises the shared release
-pool label:
+`com.danielraffel.pulp.tart-runner-macos-release.plist.template`, which uses
+ordered `TARTCI_RUNNER_WORKFLOW_TIERS` entries for `Release CLI`, `Sign and
+Release`, and `Release-path PR gate`. Every runner advertises the shared pool:
 
 ```text
 self-hosted,macOS,ARM64,pulp-build-vm-release
@@ -166,18 +165,26 @@ real Release CLI proof claims `pulp-build-vm-release` and completes. After that,
 the intended selector is:
 
 ```json
-["self-hosted","macOS","ARM64","pulp-build-vm-release"]
+["self-hosted","macOS","ARM64","pulp-build-vm-release","pulp-release-tagged"]
 ```
 
-The release lane can stay loaded before the variable is flipped; it will idle
-because queued Release CLI jobs do not request `pulp-build-vm-release` yet.
+Route the PR-time gate through its separate selector:
 
-The plural workflow setting is authoritative when non-empty and replaces the
-legacy singular `TARTCI_RUNNER_WORKFLOW_NAME`. Put one exact Actions workflow
-display name on each line. The runner passes each name as a repeated bounded
-queue-scan filter, aggregates matching jobs, and de-duplicates job IDs. It still
-boots through one supervisor and the same host-wide VM cap, so adding a workflow
-does not add a competing lane or increase VM concurrency. Existing single-name
+```json
+["self-hosted","macOS","ARM64","pulp-build-vm-release","pulp-release-pr-gate"]
+```
+
+Do not switch either workflow selector until the tier-capable supervisor is
+deployed on every host; otherwise newly queued jobs request labels no runner
+advertises.
+
+Each tier line is `class-label|exact workflow display name`. First-seen class
+labels define priority; workflows sharing the same label form one
+GitHub FIFO class. The Pulp template assigns tagged workflows
+`pulp-release-tagged` and the PR gate `pulp-release-pr-gate`. The JIT runner
+advertises only the selected class, preventing an older lower-tier job from
+claiming tagged-release capacity. It still boots through one supervisor and the
+same host-wide VM cap. Existing single-name and plural-name
 agents need no migration.
 
 To migrate an installed release agent, render the current template over its

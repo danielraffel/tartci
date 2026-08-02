@@ -373,7 +373,8 @@ class QueueScanner:
             fetched_at = int(discovery.get("fetched_at", 0))
             cached_runs = discovery.get("runs")
             if (
-                isinstance(cached_runs, list)
+                not self.args.force_refresh
+                and isinstance(cached_runs, list)
                 and self.now - fetched_at < self.args.discovery_ttl
             ):
                 return cached_runs
@@ -515,6 +516,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "12")))
     parser.add_argument("--workflow-cache-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_WORKFLOW_CACHE_TTL_SECS", "86400")))
     parser.add_argument("--discovery-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_DISCOVERY_TTL_SECS", "120")))
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="ignore a shared discovery cache hit for this safety-critical scan",
+    )
     parser.add_argument("--expected-fleet-hosts", type=int, default=int(os.environ.get("TARTCI_QUEUE_EXPECTED_FLEET_HOSTS", "3")))
     parser.add_argument("--expected-discovery-namespaces", type=int, default=int(os.environ.get("TARTCI_QUEUE_EXPECTED_DISCOVERY_NAMESPACES", "4")))
     parser.add_argument("--page-offset-cap", type=int, default=int(os.environ.get("TARTCI_QUEUE_PAGE_OFFSET_CAP", "64")))

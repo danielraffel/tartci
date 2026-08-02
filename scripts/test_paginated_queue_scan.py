@@ -68,6 +68,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
             "max_api_calls": 12,
             "workflow_cache_ttl": 86400,
             "discovery_ttl": 120,
+            "force_refresh": False,
             "expected_fleet_hosts": 3,
             "expected_discovery_namespaces": 4,
             "page_offset_cap": 64,
@@ -414,6 +415,29 @@ class PaginatedQueueScanTests(unittest.TestCase):
             path for path in calls if path.endswith("/actions/workflows?per_page=100")
         ]
         self.assertEqual(len(workflow_calls), 1)
+
+    def test_force_refresh_bypasses_fresh_shared_discovery_cache(self) -> None:
+        calls: list[str] = []
+
+        def api(path: str) -> dict[str, Any]:
+            calls.append(path)
+            return self._base_api([], None)(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            state_file = Path(directory) / "state.json"
+            self.assertEqual(self._scanner("tart-macos", state_file, api).scan(), 0)
+            self.assertEqual(
+                self._scanner(
+                    "tart-macos", state_file, api, force_refresh=True
+                ).scan(),
+                0,
+            )
+        workflow_calls = [
+            path for path in calls if path.endswith("/actions/workflows?per_page=100")
+        ]
+        self.assertEqual(len(workflow_calls), 1)
+        queued_calls = [path for path in calls if "status=queued" in path]
+        self.assertEqual(len(queued_calls), 2)
 
     def test_deleted_cached_workflow_id_is_reresolved_after_404(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
