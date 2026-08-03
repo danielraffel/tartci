@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
@@ -106,6 +107,37 @@ def command_validate_tunables(args: argparse.Namespace) -> None:
         1 <= int(args.threshold) <= 100000
     ):
         raise ValueError("invalid threshold must be 1..100000")
+    if not re.fullmatch(r"[0-9]+", args.command_timeout) or not (
+        1 <= int(args.command_timeout) <= 300
+    ):
+        raise ValueError("command timeout must be 1..300 seconds")
+
+
+def command_run_bounded(args: argparse.Namespace) -> None:
+    if not args.argv:
+        raise ValueError("bounded command must not be empty")
+    process = subprocess.Popen(args.argv, start_new_session=True)
+    try:
+        returncode = process.wait(timeout=args.timeout)
+    except subprocess.TimeoutExpired as error:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.wait()
+        print(
+            f"{args.argv[0]} timed out after {args.timeout}s",
+            file=sys.stderr,
+        )
+        raise SystemExit(124) from error
+    raise SystemExit(returncode)
 
 
 def command_ledger_validate(args: argparse.Namespace) -> None:
@@ -441,7 +473,13 @@ def build_parser() -> argparse.ArgumentParser:
     tunables = commands.add_parser("validate-tunables")
     tunables.add_argument("fresh")
     tunables.add_argument("threshold")
+    tunables.add_argument("command_timeout")
     tunables.set_defaults(func=command_validate_tunables)
+
+    bounded = commands.add_parser("run-bounded")
+    bounded.add_argument("timeout", type=int, choices=range(1, 301))
+    bounded.add_argument("argv", nargs=argparse.REMAINDER)
+    bounded.set_defaults(func=command_run_bounded)
 
     ledger_validate = commands.add_parser("ledger-validate")
     ledger_validate.add_argument("path")

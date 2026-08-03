@@ -249,6 +249,10 @@ Treat a full-live tick missing either `SHIPYARD_QUEUE_REPO_ROOT` or
 `SHIPYARD_QUEUE_AUTHORITY=1` as a failed control plane, not a healthy reap-only
 tick. Alert on the nonzero exit and
 `~/Library/Logs/shipyard-queue-tick.health.json`.
+Each Shipyard reconcile and auto-merge subprocess is bounded to 45 seconds so
+a wedged GitHub child cannot stop the five-minute cadence. Override that bound
+only with `SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS=1..300`; a timeout fails closed
+and publishes degraded health without attempting the mutation.
 
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
