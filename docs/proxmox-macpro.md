@@ -21,7 +21,7 @@ tartci* below).
 | **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
 | **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
 | **Model** | golden template → linked clone → one job → destroy |
-| **Templates** | `9004` `pulp-linux-golden-warm3` (current) · `9003`, `9002`, `9001` (superseded) |
+| **Templates** | `9005` `pulp-linux-golden-warm4` (current) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
 | **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 enabled slots; slot 3 is an operator-gated expansion |
 | **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
@@ -83,7 +83,7 @@ The same isolation model as `providers/tart-linux`, implemented with Proxmox
 primitives:
 
 ```
-9004  pulp-linux-golden-warm3   template — deps + prebuilt Skia + warm ccache
+9005  pulp-linux-golden-warm4   template — deps + prebuilt Skia + warm ccache + gh
 200+  pulp-ci-ephemeral-N linked clone, one job, destroyed
 ```
 
@@ -120,6 +120,10 @@ invocation so an interrupted runner cannot collide with its replacement.
 
 The PAT carries only `Administration: read/write` — enough to mint a registration
 token per job, nothing else.
+It stays on the Proxmox host. The golden includes the uncredentialed `gh`
+executable for Actions steps, while each job authenticates it with the
+short-lived `GITHUB_TOKEN` injected by Actions. Never bake a
+`~/.config/gh/hosts.yml` login into the template.
 
 ### Resource governance
 
@@ -157,6 +161,7 @@ means a golden that *looks* warm and is not.
 | Skia (carries **Dawn**) | prebuilt archive via `fetch_skia_for_release.py linux-x64` | yes — 151 MB |
 | perfetto, yoga | FetchContent | yes |
 | ccache | per-build | yes — warm by building before templating |
+| GitHub CLI (`gh`) | Ubuntu package | yes — preamble/alias jobs call it with their injected `GITHUB_TOKEN` |
 | QuickJS | vendored via CHOC, in-tree | no |
 | V8 | `FindV8.cmake`, opt-in engine backend | only if enabled |
 
@@ -241,7 +246,7 @@ a nightly slips, whereas a required check would strand merges.
 
 ```sh
 ssh macpro
-qm list                                        # 9004 golden, 200+ ephemeral clones
+qm list                                        # 9005 golden, 200+ ephemeral clones
 systemctl status 'pulp-ephemeral-pool@*'
 systemctl is-enabled pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
 systemctl show pulp-ephemeral-pool@1 pulp-ephemeral-pool@2 -p ExecMainStartTimestamp -p ActiveState -p SubState
