@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 
 
@@ -27,6 +28,8 @@ class QueueTickControlTests(unittest.TestCase):
         reconcile_rc: int = 0,
         reconcile_ok: bool = True,
         reconcile_output: str | None = None,
+        reconcile_sleep: int = 0,
+        reconcile_child_sleep: int = 0,
         auto_merge_rc: int = 3,
         auto_merge_output: str | None = None,
         discard_rc: int = 0,
@@ -68,6 +71,10 @@ elif [ "$1 $2" = "ship-state list" ]; then
   printf '%s\\n' "$STATES"
 elif [ "$1 $2" = "ship-state reconcile" ]; then
   printf 'reconcile-gh-token=%s\\n' "${GH_TOKEN:+set}" >> "$CALLS"
+  if [ "$RECONCILE_CHILD_SLEEP" -gt 0 ]; then
+    sleep "$RECONCILE_CHILD_SLEEP" &
+  fi
+  sleep "$RECONCILE_SLEEP"
   printf '%s\\n' "$RECONCILE_OUTPUT"
   exit "$RECONCILE_RC"
 elif [ "$1 $2" = "ship-state discard" ]; then
@@ -154,6 +161,8 @@ exit 98
                     "RECONCILE_RC": str(reconcile_rc),
                     "RECONCILE_OK": "true" if reconcile_ok else "false",
                     "RECONCILE_OUTPUT": reconcile_output,
+                    "RECONCILE_SLEEP": str(reconcile_sleep),
+                    "RECONCILE_CHILD_SLEEP": str(reconcile_child_sleep),
                     "DISCARD_RC": str(discard_rc),
                     "AUTO_MERGE_RC": str(auto_merge_rc),
                     "AUTO_MERGE_OUTPUT": auto_merge_output,
@@ -332,6 +341,8 @@ exit 98
             ("SHIPYARD_TICK_REAP_ONLY", "2", "REAP_ONLY must be 0 or 1"),
             ("SHIPYARD_TICK_HEARTBEAT_FRESH_SECS", "-1", "freshness must be"),
             ("SHIPYARD_QUEUE_INVALID_THRESHOLD", "0", "invalid threshold"),
+            ("SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS", "0", "command timeout"),
+            ("SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS", "301", "command timeout"),
             (
                 "SHIPYARD_TICK_HEARTBEAT_FRESH_SECS",
                 "9223372036854775808",
@@ -383,6 +394,22 @@ exit 98
             states=self.stale_open_state(),
             reconcile_rc=9,
         )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("ship-state reconcile failed", result.stdout)
+        self.assertIn("ship-state reconcile 42", calls)
+        self.assertNotIn("auto-merge 42", calls)
+
+    def test_reconcile_timeout_blocks_auto_merge_without_wedging_tick(self) -> None:
+        started = time.monotonic()
+        result, calls, _ = self.run_tick(
+            held=False,
+            authority=True,
+            states=self.stale_open_state(),
+            reconcile_sleep=2,
+            reconcile_child_sleep=5,
+            extra_env={"SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS": "1"},
+        )
+        self.assertLess(time.monotonic() - started, 4)
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("ship-state reconcile failed", result.stdout)
         self.assertIn("ship-state reconcile 42", calls)

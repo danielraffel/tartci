@@ -36,6 +36,9 @@
 #   SHIPYARD_QUEUE_INVALID_LEDGER=<file>        consecutive-not-found ledger
 #   SHIPYARD_QUEUE_INVALID_THRESHOLD=N          default 3; only then archive
 #       a recoverable ship-state whose PR is repeatedly confirmed nonexistent.
+#   SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS=N        default 45; bounds each
+#       Shipyard reconcile/auto-merge subprocess to 1..300 seconds so one
+#       wedged GitHub read cannot stop the five-minute queue-tick cadence.
 #   SHIPYARD_QUEUE_MIN_VERSION=<semver>       default 0.80.0. The tick requires
 #       Shipyard's fail-closed merge-queue control surface.
 #   SHIPYARD_TICK_REAP_ONLY=0|1             default 0. With APPLY=1, act on the
@@ -57,6 +60,7 @@ SELF_REPAIR="${SHIPYARD_QUEUE_SELF_REPAIR:-1}"
 HEALTH_FILE="${SHIPYARD_QUEUE_HEALTH_FILE:-$HOME/Library/Logs/shipyard-queue-tick.health.json}"
 INVALID_LEDGER="${SHIPYARD_QUEUE_INVALID_LEDGER:-$HOME/.local/state/tartci/shipyard-queue-tick-invalid.json}"
 INVALID_THRESHOLD="${SHIPYARD_QUEUE_INVALID_THRESHOLD:-3}"
+COMMAND_TIMEOUT="${SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS:-45}"
 MIN_VERSION="${SHIPYARD_QUEUE_MIN_VERSION:-0.80.0}"
 REAP_ONLY="${SHIPYARD_TICK_REAP_ONLY:-0}"
 FRESH="${SHIPYARD_TICK_HEARTBEAT_FRESH_SECS:-300}"
@@ -96,8 +100,8 @@ unhealthy() {
 validate_tunables() {
   case "$APPLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_APPLY must be 0 or 1" ;; esac
   case "$REAP_ONLY" in 0|1) ;; *) unhealthy "SHIPYARD_TICK_REAP_ONLY must be 0 or 1" ;; esac
-  python3 "$SUPPORT" validate-tunables "$FRESH" "$INVALID_THRESHOLD" >/dev/null 2>&1 || \
-    unhealthy "heartbeat freshness must be 0..604800 and invalid threshold 1..100000"
+  python3 "$SUPPORT" validate-tunables "$FRESH" "$INVALID_THRESHOLD" "$COMMAND_TIMEOUT" >/dev/null 2>&1 || \
+    unhealthy "heartbeat freshness must be 0..604800, invalid threshold 1..100000, and command timeout 1..300 seconds"
   case "$METHOD" in
     merge|squash|rebase) ;;
     *) unhealthy "SHIPYARD_TICK_MERGE_METHOD must be merge, squash, or rebase" ;;
@@ -202,6 +206,13 @@ if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
       GH_TOKEN="$APP_TOKEN" "$SY" "$@"
     else
       "$SY" "$@"
+    fi
+  }
+  bounded_shipyard_with_app_auth() {
+    if [ "$shipyard_auth_mode" = "inject" ]; then
+      GH_TOKEN="$APP_TOKEN" python3 "$SUPPORT" run-bounded "$COMMAND_TIMEOUT" "$SY" "$@"
+    else
+      python3 "$SUPPORT" run-bounded "$COMMAND_TIMEOUT" "$SY" "$@"
     fi
   }
   python3 "$SUPPORT" authority-read "$GH" "$AUTHORITY_REPO" >/dev/null 2>&1 \
@@ -318,7 +329,7 @@ while IFS=$'\t' read -r pr repo hbe; do
         log "  $repo#$pr: OPEN not fast-forwardable (mergeable=$mergeable status=$mss) — SURFACE, no auto-rebase"; stalled=$((stalled+1)); continue
       fi
       if [ "$APPLY" = "1" ] && [ "$REAP_ONLY" != "1" ]; then
-        reconcile_out="$(cd "$REPO_ROOT" && shipyard_with_app_auth ship-state reconcile "$pr" --json 2>/dev/null)"
+        reconcile_out="$(cd "$REPO_ROOT" && bounded_shipyard_with_app_auth ship-state reconcile "$pr" --json 2>/dev/null)"
         reconcile_status=$?
         reconcile_ok="$(printf '%s' "$reconcile_out" | python3 "$SUPPORT" reconcile-ok "$pr" 2>/dev/null)"
         if [ "$reconcile_status" -ne 0 ] || [ "$reconcile_ok" != "1" ]; then
@@ -327,7 +338,7 @@ while IFS=$'\t' read -r pr repo hbe; do
           continue
         fi
         AUTO_MERGE_ERROR="$TMP/auto-merge-$pr.err"
-        out="$(cd "$REPO_ROOT" && shipyard_with_app_auth auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
+        out="$(cd "$REPO_ROOT" && bounded_shipyard_with_app_auth auto-merge "$pr" --merge-method "$METHOD" --json 2>"$AUTO_MERGE_ERROR")"
         auto_merge_status=$?
         auto_merge_event="$(printf '%s' "$out" | python3 "$SUPPORT" auto-merge-event "$pr" 2>/dev/null)" \
           || auto_merge_event=""
