@@ -60,6 +60,10 @@ GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
+RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.336.0}}"
+RUNNER_SHA256="${TARTCI_RUNNER_SHA256:-${PULP_RUNNER_SHA256:-}}"
+[ -n "$RUNNER_SHA256" ] || [ "$RUNNER_VERSION" != 2.336.0 ] || \
+  RUNNER_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
 WORKFLOW_TIERS="${TARTCI_RUNNER_WORKFLOW_TIERS:-}"
@@ -95,6 +99,7 @@ PRINT_SELECTION=0
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
+PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
@@ -221,11 +226,21 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+case "$RUNNER_VERSION" in
+  ''|*[!0-9.]*) die "invalid Actions Runner version: $RUNNER_VERSION";;
+esac
+[ "$PRINT_RUNNER_VERSION" = 1 ] && { printf '%s\n' "$RUNNER_VERSION"; exit 0; }
+case "$RUNNER_SHA256" in
+  ''|*[!0-9a-fA-F]*) die "set a 64-character TARTCI_RUNNER_SHA256 when overriding Actions Runner version $RUNNER_VERSION";;
+esac
+[ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_RUNNER_SHA256 must contain 64 hexadecimal characters"
 
 configure_workflows
 CURRENT_LABELS="$LABELS"
@@ -557,6 +572,65 @@ cancel_current_run(){
   fi
 }
 
+ensure_runner_version(){
+  local ip="$1"
+  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256'" <<'GUEST'
+set -euo pipefail
+desired="$1"
+expected_sha256="$2"
+runner_dir="$HOME/actions-runner"
+listener="$runner_dir/bin/Runner.Listener"
+current=""
+if [ -x "$listener" ]; then
+  current="$($listener --version 2>/dev/null | head -n1 || true)"
+fi
+
+if [ "$current" != "$desired" ]; then
+  update_dir="$(mktemp -d "$HOME/actions-runner.update.XXXXXX")"
+  backup_dir="$HOME/actions-runner.tartci-backup"
+  cleanup_update(){ rm -rf "$update_dir"; }
+  trap cleanup_update EXIT
+  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
+    "https://github.com/actions/runner/releases/download/v${desired}/actions-runner-osx-arm64-${desired}.tar.gz" \
+    -o "$update_dir/runner.tar.gz"
+  actual_sha256="$(shasum -a 256 "$update_dir/runner.tar.gz" | awk '{print $1}')"
+  [ "$actual_sha256" = "$expected_sha256" ] || {
+    printf 'Actions Runner archive SHA-256 %s does not match expected %s\n' "$actual_sha256" "$expected_sha256" >&2
+    exit 1
+  }
+  tar -xzf "$update_dir/runner.tar.gz" -C "$update_dir"
+  rm "$update_dir/runner.tar.gz"
+  installed="$($update_dir/bin/Runner.Listener --version 2>/dev/null | head -n1 || true)"
+  [ "$installed" = "$desired" ] || {
+    printf 'downloaded Actions Runner version %s, expected %s\n' "$installed" "$desired" >&2
+    exit 1
+  }
+
+  rm -rf "$backup_dir"
+  if [ -d "$runner_dir" ]; then
+    mv "$runner_dir" "$backup_dir"
+    for preserved in .env; do
+      [ ! -f "$backup_dir/$preserved" ] || cp "$backup_dir/$preserved" "$update_dir/$preserved"
+    done
+  fi
+  mv "$update_dir" "$runner_dir"
+  update_dir=""
+  rm -rf "$backup_dir"
+  trap - EXIT
+fi
+
+actual="$($runner_dir/bin/Runner.Listener --version 2>/dev/null | head -n1 || true)"
+[ "$actual" = "$desired" ] || {
+  printf 'Actions Runner version %s does not match required %s\n' "$actual" "$desired" >&2
+  exit 1
+}
+rm -f "$runner_dir/.runner" "$runner_dir/.credentials" \
+  "$runner_dir/.credentials_rsaparams" "$runner_dir/.path" "$runner_dir/jit.cfg"
+printf 'TARTCI_DIAG actions-runner-version=%s\n' "$actual"
+GUEST
+}
+
 run_runner_until_done(){
   local vm="$1" ip="$2" jit="$3"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
@@ -721,6 +795,17 @@ run_one(){
       tartci_release_vm_lease
       return "$admission_rc"
     fi
+  fi
+
+  heartbeat ensuring-runner
+  event runner_version "required=$RUNNER_VERSION"
+  if ! ensure_runner_version "$ip"; then
+    note "[$i] Actions Runner v$RUNNER_VERSION install/verification failed — discarding unregistered VM"
+    event runner_version_failed "required=$RUNNER_VERSION"
+    runtime_emit_complete fail runner_install_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
   fi
 
   heartbeat minting-jit
