@@ -961,7 +961,8 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
 `TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_WORKFLOW_NAMES` (macOS
 equal-priority multi-workflow lane), `TARTCI_RUNNER_WORKFLOW_TIERS` (macOS
-ordered exclusive workflow classes), `TARTCI_RUNNER_VERSION` (Windows agent),
+ordered exclusive workflow classes), `TARTCI_RUNNER_VERSION` (macOS and Windows agent),
+`TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
 `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
