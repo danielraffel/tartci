@@ -469,6 +469,22 @@ descriptions and settings from the same parseable source of truth. See
 [Shipyard profiles](https://github.com/danielraffel/Shipyard/blob/main/docs/profiles.md)
 for the orchestration side.
 
+### Queue admission is per pull request
+
+Routing readiness must never be implemented by globally holding the merge queue
+or disabling auto-merge across the repository. A routing migration may mark
+only its own PRs with the Shipyard opt-out label (normally
+`shipyard:no-auto-merge`) until the restricted runner-group and merge-group
+proofs are complete. Shipyard then leaves those PRs out of admission while
+unrelated eligible PRs continue to enter and drain the protected queue.
+
+The local-first resolver is fail-closed: it selects a local target only when
+the profile's exact label set, live online idle capacity, runner-group scope,
+and health lease all agree. Otherwise it resolves to the hosted target before
+GitHub assigns `runs-on`; GitHub cannot retarget an already queued job. Do not
+use a global queue hold, cancel unrelated merge groups, or disable
+repository-wide auto-merge as a routing safety interlock.
+
 ## Optional pulp-CLI integration
 Soft dependency: if installed, `pulp doctor` reports "local CI VMs: available",
 and `pulp vm up <os>` delegates here. If absent, Pulp is unaffected. Maximally
