@@ -12,6 +12,10 @@ else is already solved in `providers/` + `docs/gotchas.md`.
 ## 0. Decide the shape (answer these before touching a VM)
 
 1. **Which OS lane(s)?** linux / windows / macos. Most projects start with one.
+   Also classify trust before hardware: ordinary same-repository PR, protected
+   merge-group/main, privileged/secret-bearing, release/sign/deploy, fork, or
+   unsupported architecture. Never give two trust classes the same capability
+   label or runner group merely because they use the same host.
 2. **Guest arch is ARM64. Always.** Apple Virtualization and QEMU-on-hvf both
    run ARM64 guests on Apple Silicon — there is no x86 guest. If the project
    ships x86_64, set `target_arch = "x86_64"`, `cross = true`, add an
@@ -125,6 +129,22 @@ job runner clones the golden, mounts the cache, then executes these.
   GitHub-hosted runners.
 - If `pulp` (or another supported CLI) is installed, it can soft-detect this
   toolkit and delegate (`pulp vm up <os>`); absence is never a punishment.
+
+### Fleet onboarding and drift prevention
+
+Use `profiles/normal-local-fast.toml` as the vocabulary contract shared with
+Shipyard. Add a repository stanza for each workflow class you intend to route:
+`pr`, `debug`, `release` (build), `coverage`, and `scheduled`. Declare signing,
+deployment, privileged, and secret-bearing jobs as hosted-only unless a
+separate security review establishes a trusted lane. Do not invent labels in a
+workflow: add a target ID to the catalog, run `tartci profile validate`, then
+have Shipyard resolve the exact selector before dispatch.
+
+Target IDs and `host/lane/slot` identities are stable. Disposable GitHub
+registration names are intentionally unique per boot; supervisors reclaim only
+offline registrations from their own slot. Never restore a static GitHub runner
+name to make monitoring easier. A new repository is hosted-only until its
+profile, image, exact labels, fallback, and one real dispatch proof are present.
 
 ## Invariants (do not violate)
 

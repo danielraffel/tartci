@@ -458,16 +458,56 @@ commented TOML. tartci treats profiles as a read-only contract: they explain
 what each repo wants for `pr`, `release`, `coverage`, `scheduled`, and
 `issue_on_failure`, and they map stable target IDs to concrete GitHub
 `runs-on` selectors. Shipyard can consume that contract as the router, while
-tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` is the
-current Pulp shape: PR macOS and Windows prefer local ARM64 VM runners, while
-ordinary Linux PR work prefers the disposable Mac Pro x64 pool with the exact
-labels `self-hosted,Linux,X64,pulp-build-linux-x64,pulp-host-macpro`; it falls
-back to GitHub only when that pool has no healthy capacity. Scheduled Intel
-Linux/Windows checks remain GitHub-hosted x64. Use
+tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` keeps
+two Mac Pro Linux capabilities deliberately separate:
+
+- same-repository, unprivileged PR and debug work uses the PR-safe label
+  `pulp-pr-safe-linux-x64`, runner group `pulp-pr-safe-build`, and a short
+  PR-specific health lease;
+- protected merge-group/main work uses `pulp-auto-linux-x64`, runner group
+  `pulp-trusted-build`, and its own merge-group lease.
+
+Both selectors include
+`self-hosted,Linux,X64,pulp-build-linux-x64,pulp-host-macpro`, but the distinct
+capability label is mandatory. A PR-safe runner group is restricted to the
+main-owned reusable workflow; a feature-branch workflow does not gain direct
+pool access. Each lane falls back to GitHub before assignment when its lease is
+missing or expired. Native Intel validation prefers the old Intel Mac mini and
+falls back to hosted Intel macOS. Use
 `tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
 descriptions and settings from the same parseable source of truth. See
 [Shipyard profiles](https://github.com/danielraffel/Shipyard/blob/main/docs/profiles.md)
 for the orchestration side.
+
+The profile also defines the fleet naming posture and workflow-class defaults.
+PR/debug work may use the PR-safe lane. Release builds, signing, deployment,
+privileged, fork, untrusted, secret-bearing, and unsupported-architecture work
+remain hosted-only unless they receive a separately reviewed dedicated trust
+contract. The Intel Mac mini is a native `macos` / `x64` compatibility lane,
+not a Tart VM and not a replacement for the authoritative hosted Intel check.
+A missing repository stanza remains hosted-only.
+
+Stable target IDs and `host/lane/slot` identities must not be confused with
+static GitHub runner names. A disposable runner keeps the former for health and
+audit, but registers with a unique per-boot GitHub name and reclaims only an
+offline registration belonging to its own slot. This avoids zombie collisions
+without losing fleet observability.
+
+### Queue admission is per pull request
+
+Routing readiness must never be implemented by globally holding the merge queue
+or disabling auto-merge across the repository. A routing migration may mark
+only its own PRs with the Shipyard opt-out label (normally
+`shipyard:no-auto-merge`) until the restricted runner-group and merge-group
+proofs are complete. Shipyard then leaves those PRs out of admission while
+unrelated eligible PRs continue to enter and drain the protected queue.
+
+The local-first resolver is fail-closed: it selects a local target only when
+the profile's exact label set, live online idle capacity, runner-group scope,
+and health lease all agree. Otherwise it resolves to the hosted target before
+GitHub assigns `runs-on`; GitHub cannot retarget an already queued job. Do not
+use a global queue hold, cancel unrelated merge groups, or disable
+repository-wide auto-merge as a routing safety interlock.
 
 ## Optional pulp-CLI integration
 Soft dependency: if installed, `pulp doctor` reports "local CI VMs: available",

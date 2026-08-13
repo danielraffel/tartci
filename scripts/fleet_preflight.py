@@ -65,6 +65,7 @@ SEARCH_DIRS = ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin",
 # the minimal PATH above. Kept separate so `daemon-can-reach-*` still judges
 # only the system dirs a launchd job actually inherits.
 EXEC_DIRS = SEARCH_DIRS + (f"{pathlib.Path.home()}/.local/bin",)
+TARTCI_BIN = pathlib.Path.home() / ".local" / "bin" / "tartci"
 
 
 def run(argv: list[str], timeout: int = 25) -> tuple[int, str]:
@@ -119,7 +120,13 @@ def daemon_status(sy: str) -> dict | None:
 
 
 def check_path_tools(rep: Report) -> None:
-    """A daemon started from a login-less shell inherits a minimal PATH."""
+    """Check daemon PATH separately from home-backed TartCI installation.
+
+    launchd runner plists invoke TartCI by its absolute home-backed path and
+    include ``~/.local/bin`` in their service PATH. An SSH probe is commonly a
+    non-login shell whose PATH omits that directory; treating ``command -v
+    tartci`` in such a shell as an installation test creates a false outage.
+    """
     for tool in REQUIRED_ON_PATH:
         found = next(
             (d for d in SEARCH_DIRS if pathlib.Path(d, tool).exists()), None
@@ -131,6 +138,12 @@ def check_path_tools(rep: Report) -> None:
             else f"{tool} not in {list(SEARCH_DIRS)} — a daemon launched without "
                  "it registers nothing and logs 'not found on PATH' forever",
         )
+    rep.add(
+        "tartci-installed",
+        TARTCI_BIN.is_file() and os.access(TARTCI_BIN, os.X_OK),
+        f"tartci at {TARTCI_BIN}" if TARTCI_BIN.is_file()
+        else f"tartci missing at {TARTCI_BIN} — install the home-backed wrapper",
+    )
 
 
 def check_checkout(rep: Report) -> None:

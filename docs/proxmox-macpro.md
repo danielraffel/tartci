@@ -22,7 +22,7 @@ supervisors rather than the macOS Tart launchd provider.
 | **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
 | **Model** | golden template → linked clone → one job → destroy |
 | **Templates** | `9005` `pulp-linux-golden-warm4` (current) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
-| **Pool** | `pulp-ephemeral-pool@{1,2}.service`, 2 enabled slots; slot 3 is an operator-gated expansion |
+| **Pool** | Trusted `pulp-ephemeral-pool@{1,2}.service`; PR-safe services must use a separate unit namespace and capability label |
 | **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
 | **Credential** | `/root/.config/pulp/secrets/gh-runner-pat` (600, root) — `Administration: read/write` only |
@@ -101,8 +101,12 @@ Why this rather than a persistent runner with a cleanup hook:
   incident on the macOS runners. Pulp's `build.yml` sets `clean: false` on
   self-hosted, so persistent build dirs across branches are a live hazard.
 
-Two slots run as `pulp-ephemeral-pool@{1,2}.service`; **systemd restarting a slot
-is what provisions the next clone** — that loop *is* the pool.
+Two trusted slots run as `pulp-ephemeral-pool@{1,2}.service`; **systemd restarting
+a slot is what provisions the next clone** — that loop *is* the pool. The
+PR-safe lane must use separate services, runner group, registration-name prefix,
+and label. Sharing a service between `pulp-auto-linux-x64` and
+`pulp-pr-safe-linux-x64` destroys the isolation boundary even if the VM itself
+is disposable.
 
 VMIDs `200..202` have stable network identities: `192.168.86.251..253` and
 deterministic locally administered MAC addresses. The Actions registration name
@@ -276,10 +280,40 @@ systemctl unmask --runtime pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
 systemctl enable --now pulp-ephemeral-pool@1 pulp-ephemeral-pool@2
 ```
 
-**Rollback:** unset Pulp's `PULP_LOCAL_LINUX_RUNS_ON_JSON` and the lane returns to
-GitHub-hosted. `runs-on` has **no automatic fallback**, so if this host is down or
-its pool is stopped, jobs routed here queue indefinitely rather than erroring.
-Unset the variable rather than waiting.
+**Rollback:** stop renewing the applicable lease and unset its selector:
+
+- protected merge-group/main: `PULP_LOCAL_LINUX_LEASE_UNTIL` and
+  `PULP_LOCAL_LINUX_RUNS_ON_JSON`;
+- PR-safe: `PULP_PR_SAFE_LINUX_LEASE_UNTIL` and
+  `PULP_PR_SAFE_LINUX_RUNS_ON_JSON`.
+
+The workflow reads a lease before choosing `runs-on`; GitHub cannot retarget a
+job after assignment. If a host fails after selection, that already-assigned job
+can still wait, but an expired lease sends subsequent jobs to hosted Linux.
+
+### PR-safe activation contract
+
+Do not add `pulp-pr-safe-linux-x64` to the existing trusted services. Activation
+requires all of the following to be true at once:
+
+1. runner group `pulp-pr-safe-build` is selected to `Generous-Corp/pulp` and
+   restricted only to
+   `Generous-Corp/pulp/.github/workflows/pr-safe-linux.yml@refs/heads/main`;
+2. PR-safe services register unique `pulp-pr-safe-ephemeral-*` runners carrying
+   the exact PR-safe selector and no trusted/privileged capability labels;
+3. guests receive no host PAT, GitHub App key, repository credential, or
+   writable host mount; only the per-job GitHub token and disposable guest disk
+   are writable;
+4. teardown revokes/removes the runner registration, destroys the clone, and
+   records assignment and teardown in the service journal;
+5. a real same-repository PR job completes on that exact selector before the
+   profile target is changed from `proven = false` to `proven = true` or the
+   selector/lease producer is enabled.
+
+Forks, `pull_request_target`, release/sign/deploy, secret-bearing jobs, and
+unsupported architectures never use this group. A future host joins by adding
+capacity behind the same capability contract; host labels describe placement,
+while the capability label and group define authorization.
 
 Pulp's `runner_topology.json` declares the lane and `runner-topology-check.yml`
 reconciles it hourly against the live repo variable — so a variable change and its
