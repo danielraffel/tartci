@@ -17,7 +17,7 @@
 # route.
 
 name = "normal-local-fast"
-description = "Fast PRs on local ARM64 VMs with nightly GitHub Intel validation."
+description = "Fast PRs on local disposable ARM64 and Mac Pro Linux x64 capacity with hosted fallback."
 
 [repo."Generous-Corp/pulp".pr.macos]
 strategy = "ordered-fallback"
@@ -26,7 +26,12 @@ github_variable = "PULP_LOCAL_MACOS_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".pr.linux]
 strategy = "ordered-fallback"
-targets = ["macstudio.linux-arm64-vm", "m5.linux-arm64-vm", "github.linux-x64"]
+targets = ["macpro.linux-x64-vm", "github.linux-x64"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request", "merge_group"]
+health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
+health_lease_min_idle = 1
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".pr.windows]
@@ -72,8 +77,18 @@ os = "macos"
 arch = "arm64"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
+[targets."macpro.linux-x64-vm"]
+description = "Mac Pro disposable Linux x64 runner pool; one job per clone, then teardown."
+provider = "tartci"
+host = "macpro"
+os = "linux"
+arch = "x64"
+ephemeral = true
+proven = true
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"]
+
 [targets."macstudio.linux-arm64-vm"]
-description = "Mac Studio Tart Linux ARM64 build VM."
+description = "Mac Studio Tart Linux ARM64 build VM for profiles that explicitly require ARM64."
 provider = "tartci"
 host = "macstudio"
 os = "linux"
@@ -81,7 +96,7 @@ arch = "arm64"
 runs_on_json = ["self-hosted", "Linux", "ARM64", "pulp-build-linux"]
 
 [targets."m5.linux-arm64-vm"]
-description = "M5/blackbook Tart Linux ARM64 overflow build VM."
+description = "M5 Tart Linux ARM64 overflow VM for profiles that explicitly require ARM64."
 provider = "tartci"
 host = "m5"
 os = "linux"

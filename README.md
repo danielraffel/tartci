@@ -459,8 +459,10 @@ what each repo wants for `pr`, `release`, `coverage`, `scheduled`, and
 `issue_on_failure`, and they map stable target IDs to concrete GitHub
 `runs-on` selectors. Shipyard can consume that contract as the router, while
 tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` is the
-current Pulp shape: PR macOS/Linux/Windows prefer local ARM64 VM runners where
-enabled, overflow to GitHub where configured, and scheduled Intel
+current Pulp shape: PR macOS and Windows prefer local ARM64 VM runners, while
+ordinary Linux PR work prefers the disposable Mac Pro x64 pool with the exact
+labels `self-hosted,Linux,X64,pulp-build-linux-x64,pulp-host-macpro`; it falls
+back to GitHub only when that pool has no healthy capacity. Scheduled Intel
 Linux/Windows checks remain GitHub-hosted x64. Use
 `tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
 descriptions and settings from the same parseable source of truth. See

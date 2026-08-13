@@ -36,6 +36,17 @@ class ValidateCommandTests(unittest.TestCase):
     def test_all_profiles_validate_clean(self) -> None:
         self.assertEqual(P.cmd_validate(_ns(name=None)), 0)
 
+    def test_pulp_linux_prefers_macpro_exact_label_contract(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        lane = P.resolve_lanes(profile, "Generous-Corp/pulp")
+        linux = next(row for row in lane if row["context"] == "pr" and row["lane"] == "linux")
+        self.assertEqual(linux["targets"][0]["id"], "macpro.linux-x64-vm")
+        self.assertEqual(
+            linux["targets"][0]["runs_on_json"],
+            ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"],
+        )
+        self.assertEqual(linux["warnings"], [])
+
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
         targets = {"o.vm": {"provider": "orchard"}, "t.vm": {"provider": "tartci"}}
         unknown = [

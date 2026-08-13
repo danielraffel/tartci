@@ -8,9 +8,9 @@ It is written down here because a reader of this repo would otherwise conclude t
 fleet is Macs-only and reach for a Tart provider for x86_64 work — which is the
 specific mistake this host exists to prevent.
 
-**Status:** operational, serving Pulp's Linux x64 advisory lane. Not managed by
-tartci today; folding it in is the intended direction (see *Relationship to
-tartci* below).
+**Status:** operational, serving Pulp's disposable Linux x64 PR lane. The
+profile is managed by tartci/Shipyard; the Linux host uses systemd pool
+supervisors rather than the macOS Tart launchd provider.
 
 ---
 

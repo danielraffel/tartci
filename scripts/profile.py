@@ -97,7 +97,7 @@ def resolve_lanes(profile: dict[str, Any], repo: str) -> list[dict[str, Any]]:
                         f"{target_id} has unknown provider {provider!r}; "
                         f"expected one of {sorted(VALID_TARGET_PROVIDERS)}"
                     )
-                if target.get("arch") == "x64" and provider != "github":
+                if target.get("arch") == "x64" and provider != "github" and not target.get("proven"):
                     warnings.append(f"{target_id} is local x64; treat as smoke until proven")
             if lane_cfg.get("ephemeral_required"):
                 for row in target_rows:
