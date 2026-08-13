@@ -1,5 +1,20 @@
 # tartci gotchas — symptom → cause → fix
 
+## `tartci` looks missing over SSH after it was installed
+
+**Symptom:** `ssh host 'command -v tartci'` returns nothing, while the TartCI
+runner agents are healthy.
+
+**Cause:** non-login SSH shells often omit `~/.local/bin`. The supported
+installation is the absolute home-backed wrapper at `~/.local/bin/tartci`;
+launchd runner plists must invoke that path explicitly and include
+`~/.local/bin` in their service `PATH`.
+
+**Fix:** verify `test -x "$HOME/.local/bin/tartci"` and inspect the relevant
+LaunchAgent, rather than diagnosing from `command -v` alone. Fleet preflight
+reports `daemon-can-reach-*` and `tartci-installed` separately so this PATH
+difference cannot masquerade as missing TartCI.
+
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
