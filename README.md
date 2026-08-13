@@ -458,24 +458,34 @@ commented TOML. tartci treats profiles as a read-only contract: they explain
 what each repo wants for `pr`, `release`, `coverage`, `scheduled`, and
 `issue_on_failure`, and they map stable target IDs to concrete GitHub
 `runs-on` selectors. Shipyard can consume that contract as the router, while
-tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` is the
-current Pulp shape: PR macOS and Windows prefer local ARM64 VM runners, while
-ordinary Linux PR work prefers the disposable Mac Pro x64 pool with the exact
-labels `self-hosted,Linux,X64,pulp-build-linux-x64,pulp-host-macpro`; it falls
-back to GitHub only when that pool has no healthy capacity. Scheduled Intel
-Linux/Windows checks remain GitHub-hosted x64. Use
+tartci remains the VM/provider layer. `profiles/normal-local-fast.toml` keeps
+two Mac Pro Linux capabilities deliberately separate:
+
+- same-repository, unprivileged PR and debug work uses the PR-safe label
+  `pulp-pr-safe-linux-x64`, runner group `pulp-pr-safe-build`, and a short
+  PR-specific health lease;
+- protected merge-group/main work uses `pulp-auto-linux-x64`, runner group
+  `pulp-trusted-build`, and its own merge-group lease.
+
+Both selectors include
+`self-hosted,Linux,X64,pulp-build-linux-x64,pulp-host-macpro`, but the distinct
+capability label is mandatory. A PR-safe runner group is restricted to the
+main-owned reusable workflow; a feature-branch workflow does not gain direct
+pool access. Each lane falls back to GitHub before assignment when its lease is
+missing or expired. Native Intel validation prefers the old Intel Mac mini and
+falls back to hosted Intel macOS. Use
 `tartci profile explain <name> --repo OWNER/REPO --json` when an agent needs
 descriptions and settings from the same parseable source of truth. See
 [Shipyard profiles](https://github.com/danielraffel/Shipyard/blob/main/docs/profiles.md)
 for the orchestration side.
 
 The profile also defines the fleet naming posture and workflow-class defaults.
-`debug` and ordinary release *build* work may use local capacity; signing,
-deployment, privileged, and secret-bearing work is hosted-only unless it has a
-separately reviewed trust contract. The Intel Mac mini is a native `macos` /
-`x64` compatibility lane, not a Tart VM and not a replacement for the
-authoritative hosted Intel check. A missing repository stanza remains
-hosted-only.
+PR/debug work may use the PR-safe lane. Release builds, signing, deployment,
+privileged, fork, untrusted, secret-bearing, and unsupported-architecture work
+remain hosted-only unless they receive a separately reviewed dedicated trust
+contract. The Intel Mac mini is a native `macos` / `x64` compatibility lane,
+not a Tart VM and not a replacement for the authoritative hosted Intel check.
+A missing repository stanza remains hosted-only.
 
 Stable target IDs and `host/lane/slot` identities must not be confused with
 static GitHub runner names. A disposable runner keeps the former for health and

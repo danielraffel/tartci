@@ -12,6 +12,10 @@ else is already solved in `providers/` + `docs/gotchas.md`.
 ## 0. Decide the shape (answer these before touching a VM)
 
 1. **Which OS lane(s)?** linux / windows / macos. Most projects start with one.
+   Also classify trust before hardware: ordinary same-repository PR, protected
+   merge-group/main, privileged/secret-bearing, release/sign/deploy, fork, or
+   unsupported architecture. Never give two trust classes the same capability
+   label or runner group merely because they use the same host.
 2. **Guest arch is ARM64. Always.** Apple Virtualization and QEMU-on-hvf both
    run ARM64 guests on Apple Silicon — there is no x86 guest. If the project
    ships x86_64, set `target_arch = "x86_64"`, `cross = true`, add an

@@ -44,6 +44,10 @@ release_deploy = "github-only"
 coverage = "clean-ephemeral-only"
 scheduled_authoritative = "github-hosted"
 privileged = "github-only"
+fork = "github-only"
+untrusted = "github-only"
+secret_bearing = "github-only"
+unsupported_architecture = "github-only"
 
 [repo."Generous-Corp/pulp".pr.macos]
 strategy = "ordered-fallback"
@@ -52,18 +56,28 @@ github_variable = "PULP_LOCAL_MACOS_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".pr.linux]
 strategy = "ordered-fallback"
-targets = ["macpro.linux-x64-vm", "github.linux-x64"]
+targets = ["macpro.linux-x64-pr-safe-vm", "github.linux-x64"]
+health_lease_variable = "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "pulp-pr-safe-ephemeral-"
+health_lease_min_idle = 1
+github_variable = "PULP_PR_SAFE_LINUX_RUNS_ON_JSON"
+
+[repo."Generous-Corp/pulp".merge_group.linux]
+strategy = "ordered-fallback"
+targets = ["macpro.linux-x64-trusted-vm", "github.linux-x64"]
 health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
-health_lease_events = ["pull_request", "merge_group"]
+health_lease_events = ["merge_group"]
 health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 health_lease_min_idle = 1
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".debug.linux]
 strategy = "ordered-fallback"
-targets = ["macpro.linux-x64-vm", "github.linux-x64"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+targets = ["macpro.linux-x64-pr-safe-vm", "github.linux-x64"]
+health_lease_variable = "PULP_PR_SAFE_LINUX_LEASE_UNTIL"
 health_lease_ttl_seconds = 300
 github_variable = "PULP_LOCAL_LINUX_DEBUG_RUNS_ON_JSON"
 
@@ -78,10 +92,8 @@ targets = ["macstudio.macos-arm64-release-vm", "github.macos-arm64"]
 github_variable = "PULP_RELEASE_MACOS_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".release.linux]
-strategy = "ordered-fallback"
-targets = ["macpro.linux-x64-vm", "github.linux-x64"]
-health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
-health_lease_ttl_seconds = 300
+strategy = "github-only"
+targets = ["github.linux-x64"]
 github_variable = "PULP_RELEASE_LINUX_BUILD_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".release.signing]
@@ -108,7 +120,7 @@ github_variable = "PULP_COVERAGE_WINDOWS_RUNS_ON_JSON"
 [repo."Generous-Corp/pulp".scheduled.nightly_intel]
 enabled = true
 branch = "main"
-targets = ["github.linux-x64", "github.windows-x64"]
+targets = ["macmini.macos-intel-native", "github.macos-intel"]
 issue_on_failure = true
 
 [targets."macstudio.macos-arm64-vm"]
@@ -127,15 +139,33 @@ os = "macos"
 arch = "arm64"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
-[targets."macpro.linux-x64-vm"]
-description = "Mac Pro disposable Linux x64 runner pool; one job per clone, then teardown."
+[targets."macpro.linux-x64-pr-safe-vm"]
+description = "Mac Pro PR-safe disposable Linux x64 pool; same-repository unprivileged PR code only."
+provider = "tartci"
+host = "macpro"
+os = "linux"
+arch = "x64"
+ephemeral = true
+proven = false
+runner_group = "pulp-pr-safe-build"
+workflow_access = ["Generous-Corp/pulp/.github/workflows/pr-safe-linux.yml@refs/heads/main"]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-pr-safe-linux-x64"]
+
+[targets."macpro.linux-x64-trusted-vm"]
+description = "Mac Pro protected-main disposable Linux x64 pool for merge-group and trusted checks."
 provider = "tartci"
 host = "macpro"
 os = "linux"
 arch = "x64"
 ephemeral = true
 proven = true
-runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"]
+runner_group = "pulp-trusted-build"
+workflow_access = [
+  "Generous-Corp/pulp/.github/workflows/build.yml@refs/heads/main",
+  "Generous-Corp/pulp/.github/workflows/vellum-freeze-check.yml@refs/heads/main",
+  "Generous-Corp/pulp/.github/workflows/version-skill-check.yml@refs/heads/main",
+]
+runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro", "pulp-auto-linux-x64"]
 
 [targets."macmini.macos-intel-native"]
 description = "Mac mini native Intel macOS runner; advisory/debug compatibility only."

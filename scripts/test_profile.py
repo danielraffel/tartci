@@ -36,16 +36,55 @@ class ValidateCommandTests(unittest.TestCase):
     def test_all_profiles_validate_clean(self) -> None:
         self.assertEqual(P.cmd_validate(_ns(name=None)), 0)
 
-    def test_pulp_linux_prefers_macpro_exact_label_contract(self) -> None:
+    def test_pulp_pr_linux_prefers_distinct_pr_safe_macpro_contract(self) -> None:
         _, profile = P.load_profile("normal-local-fast")
         lane = P.resolve_lanes(profile, "Generous-Corp/pulp")
         linux = next(row for row in lane if row["context"] == "pr" and row["lane"] == "linux")
-        self.assertEqual(linux["targets"][0]["id"], "macpro.linux-x64-vm")
+        self.assertEqual(linux["targets"][0]["id"], "macpro.linux-x64-pr-safe-vm")
         self.assertEqual(
             linux["targets"][0]["runs_on_json"],
-            ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"],
+            [
+                "self-hosted", "Linux", "X64", "pulp-build-linux-x64",
+                "pulp-host-macpro", "pulp-pr-safe-linux-x64",
+            ],
         )
-        self.assertEqual(linux["warnings"], [])
+        self.assertIn("until proven", " ".join(linux["warnings"]))
+
+    def test_pulp_pr_and_merge_group_linux_cannot_share_group_or_lane_label(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        targets = profile["targets"]
+        pr = targets["macpro.linux-x64-pr-safe-vm"]
+        trusted = targets["macpro.linux-x64-trusted-vm"]
+        self.assertNotEqual(pr["runner_group"], trusted["runner_group"])
+        self.assertIn("pulp-pr-safe-linux-x64", pr["runs_on_json"])
+        self.assertNotIn("pulp-auto-linux-x64", pr["runs_on_json"])
+        self.assertIn("pulp-auto-linux-x64", trusted["runs_on_json"])
+        self.assertNotIn("pulp-pr-safe-linux-x64", trusted["runs_on_json"])
+        self.assertEqual(
+            pr["workflow_access"],
+            ["Generous-Corp/pulp/.github/workflows/pr-safe-linux.yml@refs/heads/main"],
+        )
+
+    def test_privileged_and_release_mutation_policies_are_hosted_only(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        policy = profile["policy"]
+        for key in (
+            "privileged", "fork", "untrusted", "secret_bearing",
+            "unsupported_architecture", "release_signing", "release_deploy",
+        ):
+            self.assertEqual(policy[key], "github-only", key)
+        repo = profile["repo"]["Generous-Corp/pulp"]
+        self.assertEqual(repo["release"]["linux"]["targets"], ["github.linux-x64"])
+        self.assertEqual(repo["release"]["signing"]["targets"], ["github.linux-x64"])
+        self.assertEqual(repo["release"]["deploy"]["targets"], ["github.linux-x64"])
+
+    def test_native_intel_prefers_macmini_with_hosted_fallback(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        nightly = profile["repo"]["Generous-Corp/pulp"]["scheduled"]["nightly_intel"]
+        self.assertEqual(
+            nightly["targets"],
+            ["macmini.macos-intel-native", "github.macos-intel"],
+        )
 
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
         targets = {
