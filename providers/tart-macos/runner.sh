@@ -56,6 +56,11 @@ GH_CLI="$TARTCI_GH_CLI"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
+# Optional read-only SDK prefix for a repository that builds against a host
+# provisioned SDK.  The ordinary Pulp gate does not set this; a Forge VM sets
+# it so its disposable guest sees the same verified prefix as the host.
+SDK_DIR="${TARTCI_RUNNER_SDK_DIR:-}"
+SDK_GUEST_PATH="${TARTCI_RUNNER_SDK_GUEST_PATH:-/Users/admin/Code/pulp-sdk-forge-aumi}"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
@@ -632,12 +637,13 @@ GUEST
 }
 
 run_runner_until_done(){
-  local vm="$1" ip="$2" jit="$3"
+  local vm="$1" ip="$2" jit="$3" sdk_guest_path="${4:-}"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
   local ssh_pid start assigned_at=0 now idle_elapsed job_elapsed assigned=0 warned=0 rc=0
   : >"$runner_log"
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/Library/Caches ~/.ccache-tmp && ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
+     $(if [ -n "$sdk_guest_path" ]; then printf 'mkdir -p %q && ln -sfn %q %q && ' "$(dirname "$sdk_guest_path")" '/Volumes/My Shared Files/pulp-sdk' "$sdk_guest_path"; fi)\
      printf '%s' '$jit' > ~/jit.cfg && eval \"\$(/opt/homebrew/bin/brew shellenv)\" && cd ~/actions-runner && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
     >"$runner_log" 2>&1 & ssh_pid=$!
   start="$(date +%s)"
@@ -737,8 +743,19 @@ run_one(){
     return 1
   fi
   mkdir -p "$CACHE_ROOT/ccache"
+  if [ -n "$SDK_DIR" ] && [ ! -f "$SDK_DIR/lib/cmake/Pulp/PulpConfig.cmake" ]; then
+    note "[$i] configured SDK has no PulpConfig.cmake: $SDK_DIR"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
   boot_log="$(mktemp -t "tart-run-$vm")"
-  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  local tart_dirs=(--dir="ccache:$CACHE_ROOT/ccache") guest_sdk_path=""
+  if [ -n "$SDK_DIR" ]; then
+    tart_dirs+=(--dir="pulp-sdk:$SDK_DIR:ro")
+    guest_sdk_path="$SDK_GUEST_PATH"
+  fi
+  tart run --no-graphics "${tart_dirs[@]}" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat booting
 
@@ -831,7 +848,7 @@ run_one(){
   event boot_ok "ip=$ip"
   heartbeat idle-wait
 
-  run_runner_until_done "$vm" "$ip" "$jit" || rc=$?
+  run_runner_until_done "$vm" "$ip" "$jit" "$guest_sdk_path" || rc=$?
   t_runner_done="$(now_epoch)"
   if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
