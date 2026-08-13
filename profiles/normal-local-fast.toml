@@ -19,6 +19,32 @@
 name = "normal-local-fast"
 description = "Fast PRs on local disposable ARM64 and Mac Pro Linux x64 capacity with hosted fallback."
 
+# Fleet-wide naming posture: target IDs and host/lane/slot IDs are stable
+# operator vocabulary. GitHub registration names are unique per boot for every
+# disposable worker; static names are forbidden because a dead registration
+# can collide with its replacement. Supervisors reclaim only offline
+# registrations from their own slot before registering a new worker.
+[naming]
+target_id = "stable"
+host_id = "stable"
+lane_id = "stable"
+slot_id = "stable"
+github_registration = "ephemeral-per-boot"
+reclaim_scope = "offline-own-slot-only"
+
+# Every workflow class is explicit. New repositories must add their own
+# [repo."OWNER/REPO"] policy before local routing is enabled; an absent policy
+# is hosted-only, never an implicit local route.
+[policy]
+required_gate = "local-first-with-hosted-fallback"
+debug = "local-first-with-hosted-fallback"
+release_build = "local-first-with-hosted-fallback"
+release_signing = "github-only"
+release_deploy = "github-only"
+coverage = "clean-ephemeral-only"
+scheduled_authoritative = "github-hosted"
+privileged = "github-only"
+
 [repo."Generous-Corp/pulp".pr.macos]
 strategy = "ordered-fallback"
 targets = ["macstudio.macos-arm64-vm", "m5.macos-arm64-vm", "github.macos-arm64"]
@@ -34,6 +60,13 @@ health_lease_runner_name_prefix = "pulp-ci-ephemeral-"
 health_lease_min_idle = 1
 github_variable = "PULP_LOCAL_LINUX_RUNS_ON_JSON"
 
+[repo."Generous-Corp/pulp".debug.linux]
+strategy = "ordered-fallback"
+targets = ["macpro.linux-x64-vm", "github.linux-x64"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+github_variable = "PULP_LOCAL_LINUX_DEBUG_RUNS_ON_JSON"
+
 [repo."Generous-Corp/pulp".pr.windows]
 strategy = "ordered-fallback"
 targets = ["macstudio.windows-arm64-qemu", "github.windows-x64"]
@@ -43,6 +76,23 @@ github_variable = "PULP_LOCAL_WINDOWS_RUNS_ON_JSON"
 strategy = "ordered-fallback"
 targets = ["macstudio.macos-arm64-release-vm", "github.macos-arm64"]
 github_variable = "PULP_RELEASE_MACOS_RUNS_ON_JSON"
+
+[repo."Generous-Corp/pulp".release.linux]
+strategy = "ordered-fallback"
+targets = ["macpro.linux-x64-vm", "github.linux-x64"]
+health_lease_variable = "PULP_LOCAL_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+github_variable = "PULP_RELEASE_LINUX_BUILD_RUNS_ON_JSON"
+
+[repo."Generous-Corp/pulp".release.signing]
+strategy = "github-only"
+targets = ["github.linux-x64"]
+github_variable = "PULP_RELEASE_SIGNING_RUNS_ON_JSON"
+
+[repo."Generous-Corp/pulp".release.deploy]
+strategy = "github-only"
+targets = ["github.linux-x64"]
+github_variable = "PULP_RELEASE_DEPLOY_RUNS_ON_JSON"
 
 [repo."Generous-Corp/pulp".coverage.macos]
 strategy = "ordered-fallback"
@@ -86,6 +136,24 @@ arch = "x64"
 ephemeral = true
 proven = true
 runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-host-macpro"]
+
+[targets."macmini.macos-intel-native"]
+description = "Mac mini native Intel macOS runner; advisory/debug compatibility only."
+provider = "shipyard"
+host = "macmini"
+os = "macos"
+arch = "x64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "X64", "pulp-intel-native", "pulp-host-macmini"]
+
+[targets."github.macos-intel"]
+description = "GitHub-hosted macOS Intel authoritative compatibility runner."
+provider = "github"
+os = "macos"
+arch = "x64"
+runs_on_json = "macos-15-intel"
+authoritative_for = ["macos-intel"]
 
 [targets."macstudio.linux-arm64-vm"]
 description = "Mac Studio Tart Linux ARM64 build VM for profiles that explicitly require ARM64."

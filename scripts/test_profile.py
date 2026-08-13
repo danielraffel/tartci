@@ -48,7 +48,11 @@ class ValidateCommandTests(unittest.TestCase):
         self.assertEqual(linux["warnings"], [])
 
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
-        targets = {"o.vm": {"provider": "orchard"}, "t.vm": {"provider": "tartci"}}
+        targets = {
+            "o.vm": {"provider": "orchard"},
+            "t.vm": {"provider": "tartci"},
+            "m.native": {"provider": "shipyard"},
+        }
         unknown = [
             tid for tid, target in targets.items()
             if target.get("provider") not in P.VALID_TARGET_PROVIDERS

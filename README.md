@@ -469,6 +469,20 @@ descriptions and settings from the same parseable source of truth. See
 [Shipyard profiles](https://github.com/danielraffel/Shipyard/blob/main/docs/profiles.md)
 for the orchestration side.
 
+The profile also defines the fleet naming posture and workflow-class defaults.
+`debug` and ordinary release *build* work may use local capacity; signing,
+deployment, privileged, and secret-bearing work is hosted-only unless it has a
+separately reviewed trust contract. The Intel Mac mini is a native `macos` /
+`x64` compatibility lane, not a Tart VM and not a replacement for the
+authoritative hosted Intel check. A missing repository stanza remains
+hosted-only.
+
+Stable target IDs and `host/lane/slot` identities must not be confused with
+static GitHub runner names. A disposable runner keeps the former for health and
+audit, but registers with a unique per-boot GitHub name and reclaims only an
+offline registration belonging to its own slot. This avoids zombie collisions
+without losing fleet observability.
+
 ### Queue admission is per pull request
 
 Routing readiness must never be implemented by globally holding the merge queue

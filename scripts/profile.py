@@ -29,8 +29,9 @@ PULP_DEFAULT_VARS = {
 }
 
 # Target providers tartci understands. `github` = GitHub-hosted; `tartci` = a
-# self-scheduled local Tart/QEMU VM (the runner LaunchAgent path).
-VALID_TARGET_PROVIDERS = frozenset({"github", "tartci"})
+# self-scheduled local Tart/QEMU VM; `shipyard` = a native Shipyard-managed
+# runner such as the Intel Mac mini (not a Tart guest).
+VALID_TARGET_PROVIDERS = frozenset({"github", "tartci", "shipyard"})
 LANE_SELECTABLE_PROVIDERS = VALID_TARGET_PROVIDERS
 
 

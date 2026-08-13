@@ -126,6 +126,22 @@ job runner clones the golden, mounts the cache, then executes these.
 - If `pulp` (or another supported CLI) is installed, it can soft-detect this
   toolkit and delegate (`pulp vm up <os>`); absence is never a punishment.
 
+### Fleet onboarding and drift prevention
+
+Use `profiles/normal-local-fast.toml` as the vocabulary contract shared with
+Shipyard. Add a repository stanza for each workflow class you intend to route:
+`pr`, `debug`, `release` (build), `coverage`, and `scheduled`. Declare signing,
+deployment, privileged, and secret-bearing jobs as hosted-only unless a
+separate security review establishes a trusted lane. Do not invent labels in a
+workflow: add a target ID to the catalog, run `tartci profile validate`, then
+have Shipyard resolve the exact selector before dispatch.
+
+Target IDs and `host/lane/slot` identities are stable. Disposable GitHub
+registration names are intentionally unique per boot; supervisors reclaim only
+offline registrations from their own slot. Never restore a static GitHub runner
+name to make monitoring easier. A new repository is hosted-only until its
+profile, image, exact labels, fallback, and one real dispatch proof are present.
+
 ## Invariants (do not violate)
 
 - ARM64 guests only; x86_64 is cross+emulate, GitHub stays the x64 gate.
