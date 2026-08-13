@@ -61,6 +61,11 @@ CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 # it so its disposable guest sees the same verified prefix as the host.
 SDK_DIR="${TARTCI_RUNNER_SDK_DIR:-}"
 SDK_GUEST_PATH="${TARTCI_RUNNER_SDK_GUEST_PATH:-/Users/admin/Code/pulp-sdk-forge-aumi}"
+# Optional read-only Pulp source checkout for downstream repositories that
+# package Pulp-owned generators.  An SDK is deliberately insufficient for
+# this: it contains headers and libraries, not tools/rack/patch.py.
+TOOLCHAIN_DIR="${TARTCI_RUNNER_TOOLCHAIN_DIR:-}"
+TOOLCHAIN_GUEST_PATH="${TARTCI_RUNNER_TOOLCHAIN_GUEST_PATH:-/Users/admin/Code/pulp-toolchain}"
 # Optional read-only desktop applications for integration suites.  These are
 # mounted from a host that owns the apps and linked only inside the disposable
 # guest; neither an application nor its per-user data is copied into a golden.
@@ -644,7 +649,7 @@ GUEST
 }
 
 run_runner_until_done(){
-  local vm="$1" ip="$2" jit="$3" sdk_guest_path="${4:-}" chrome_guest_path="${5:-}" rack_guest_path="${6:-}"
+  local vm="$1" ip="$2" jit="$3" sdk_guest_path="${4:-}" toolchain_guest_path="${5:-}" chrome_guest_path="${6:-}" rack_guest_path="${7:-}"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
   local ssh_pid start assigned_at=0 now idle_elapsed job_elapsed assigned=0 warned=0 rc=0 guest_links=""
   : >"$runner_log"
@@ -661,6 +666,7 @@ run_runner_until_done(){
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/Library/Caches ~/.ccache-tmp && ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      $(if [ -n "$sdk_guest_path" ]; then printf 'mkdir -p %q && ln -sfn %q %q && ' "$(dirname "$sdk_guest_path")" '/Volumes/My Shared Files/pulp-sdk' "$sdk_guest_path"; fi)\
+     $(if [ -n "$toolchain_guest_path" ]; then printf 'mkdir -p %q && ln -sfn %q %q && ' "$(dirname "$toolchain_guest_path")" '/Volumes/My Shared Files/pulp-toolchain' "$toolchain_guest_path"; fi)\
      $guest_links\
      printf '%s' '$jit' > ~/jit.cfg && eval \"\$(/opt/homebrew/bin/brew shellenv)\" && cd ~/actions-runner && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
     >"$runner_log" 2>&1 & ssh_pid=$!
@@ -768,10 +774,20 @@ run_one(){
     return 1
   fi
   boot_log="$(mktemp -t "tart-run-$vm")"
-  local tart_dirs=(--dir="ccache:$CACHE_ROOT/ccache") guest_sdk_path="" guest_chrome_path="" guest_rack_path=""
+  local tart_dirs=(--dir="ccache:$CACHE_ROOT/ccache") guest_sdk_path="" guest_toolchain_path="" guest_chrome_path="" guest_rack_path=""
   if [ -n "$SDK_DIR" ]; then
     tart_dirs+=(--dir="pulp-sdk:$SDK_DIR:ro")
     guest_sdk_path="$SDK_GUEST_PATH"
+  fi
+  if [ -n "$TOOLCHAIN_DIR" ]; then
+    if [ ! -f "$TOOLCHAIN_DIR/tools/rack/patch.py" ]; then
+      note "[$i] configured Pulp toolchain has no tools/rack/patch.py: $TOOLCHAIN_DIR"
+      discard_current_vm
+      tartci_release_vm_lease
+      return 1
+    fi
+    tart_dirs+=(--dir="pulp-toolchain:$TOOLCHAIN_DIR:ro")
+    guest_toolchain_path="$TOOLCHAIN_GUEST_PATH"
   fi
   if [ -n "$CHROME_APP_DIR" ]; then
     if [ ! -d "$CHROME_APP_DIR" ]; then
@@ -886,7 +902,7 @@ run_one(){
   event boot_ok "ip=$ip"
   heartbeat idle-wait
 
-  run_runner_until_done "$vm" "$ip" "$jit" "$guest_sdk_path" "$guest_chrome_path" "$guest_rack_path" || rc=$?
+  run_runner_until_done "$vm" "$ip" "$jit" "$guest_sdk_path" "$guest_toolchain_path" "$guest_chrome_path" "$guest_rack_path" || rc=$?
   t_runner_done="$(now_epoch)"
   if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
