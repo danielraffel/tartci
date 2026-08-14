@@ -141,7 +141,7 @@ runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
 [targets."macpro.linux-x64-pr-safe-vm"]
 description = "Mac Pro PR-safe disposable Linux x64 pool; same-repository unprivileged PR code only."
-provider = "tartci"
+provider = "proxmox"
 host = "macpro"
 os = "linux"
 arch = "x64"
@@ -153,7 +153,7 @@ runs_on_json = ["self-hosted", "Linux", "X64", "pulp-build-linux-x64", "pulp-hos
 
 [targets."macpro.linux-x64-trusted-vm"]
 description = "Mac Pro protected-main disposable Linux x64 pool for merge-group and trusted checks."
-provider = "tartci"
+provider = "proxmox"
 host = "macpro"
 os = "linux"
 arch = "x64"

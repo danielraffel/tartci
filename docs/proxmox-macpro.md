@@ -8,9 +8,11 @@ It is written down here because a reader of this repo would otherwise conclude t
 fleet is Macs-only and reach for a Tart provider for x86_64 work — which is the
 specific mistake this host exists to prevent.
 
-**Status:** operational, serving Pulp's disposable Linux x64 PR lane. The
-profile is managed by tartci/Shipyard; the Linux host uses systemd pool
-supervisors rather than the macOS Tart launchd provider.
+**Status:** operational, serving Pulp's protected disposable Linux x64 build
+lane through the `pulp-trusted-build` runner group. The
+profile is coordinated by Shipyard, but the Linux host is **not managed by
+TartCI**. It uses Proxmox and systemd pool supervisors rather than Tart and the
+macOS launchd provider.
 
 ---
 
@@ -19,14 +21,14 @@ supervisors rather than the macOS Tart launchd provider.
 | | |
 |---|---|
 | **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
-| **Serves** | Pulp `Linux (x64)` (advisory) · Windows nightly (planned) |
+| **Serves** | Pulp protected `Linux (x64)` merge-group/main builds · Windows x64 later |
 | **Model** | golden template → linked clone → one job → destroy |
 | **Templates** | `9005` `pulp-linux-golden-warm4` (current) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
 | **Pool** | Trusted `pulp-ephemeral-pool@{1,2}.service`; PR-safe services must use a separate unit namespace and capability label |
 | **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
-| **Credential** | `/root/.config/pulp/secrets/gh-runner-pat` (600, root) — `Administration: read/write` only |
-| **Rollback** | unset the routing variable; the lane returns to GitHub-hosted |
+| **Credentials** | Registration PAT for the ephemeral runner service; separate Shipyard GitHub App key/token for policy verification. All root-only and file-backed. |
+| **Rollback** | expire/unset the local Linux lease/selector; subsequent jobs return to GitHub-hosted Linux |
 
 ## Why it exists
 
@@ -120,14 +122,37 @@ invocation so an interrupted runner cannot collide with its replacement.
 /usr/local/sbin/macpro-governor.sh         capacity admission (Tier 1)
 /etc/systemd/system/pulp-ephemeral-pool@.service
 /root/.config/pulp/secrets/gh-runner-pat   fine-grained PAT, mode 600, root
+/root/.config/pulp/secrets/shipyard-local.private-key.pem  App key, mode 600
+/usr/local/bin/ghapp                       App-backed gh wrapper
 ```
 
-The PAT carries only `Administration: read/write` — enough to mint a registration
-token per job, nothing else.
-It stays on the Proxmox host. The golden includes the uncredentialed `gh`
+These credentials have different jobs. The registration PAT mints and removes
+ephemeral runner registrations. The Shipyard App identity reads the organization
+runner group, its selected repositories/workflows, and its live membership so
+the host-side verifier can reject policy drift. Repository `Actions` access is
+not enough for that organization API; the App needs **Self-hosted runners:
+Read-only** (write only if it also changes group configuration or removes
+registrations). Point the service at the wrapper with
+`PULP_LINUX_GH_CLI=/usr/local/bin/ghapp`.
+
+Both credentials stay on the Proxmox host and never enter a guest. The golden
+includes the uncredentialed `gh`
 executable for Actions steps, while each job authenticates it with the
 short-lived `GITHUB_TOKEN` injected by Actions. Never bake a
 `~/.config/gh/hosts.yml` login into the template.
+
+This split is the value of the setup: Shipyard can coordinate and verify one
+fleet while each execution provider keeps its native strengths and isolation
+model. M1/M3/M5 supply disposable Tart macOS VMs, `macpro` supplies native x64
+Linux through Proxmox, and `macmini` supplies native Intel macOS/Metal. That
+preserves architecture-specific coverage, bypasses hosted-runner queue pressure,
+and gives every local lane an auditable admission and teardown boundary without
+pretending the Mac Pro is a TartCI host.
+
+After changing App permissions, approve the installation's pending update and
+mint a fresh token. Cached installation tokens retain their old permission set;
+`403 Resource not accessible by integration` commonly means the installation or
+cache has not caught up with the App definition.
 
 ### Resource governance
 
@@ -385,9 +410,11 @@ contract edit must land together.
 
 ## Relationship to tartci
 
-Today this host is configured with plain Proxmox tooling (`qm`, systemd) and its
-own governor, deliberately: it was stood up to prove the lane before investing in
-abstraction.
+This host is configured with plain Proxmox tooling (`qm`, systemd) and its own
+governor. It is not a TartCI provider. Shipyard is the common coordinator: it
+routes and validates work across this Proxmox pool, TartCI's Apple-Silicon VM
+hosts, and native machines without erasing their different trust and hardware
+contracts.
 
 The natural convergence is for tartci to grow a **`providers/proxmox-linux`** (and
 later `proxmox-windows`) alongside `tart-linux` and `qemu-windows`, so one front
@@ -396,5 +423,6 @@ than this host carrying a parallel governor. The pieces already line up: golden 
 ephemeral clone matches `tart-linux`'s model, and `macpro-governor.sh` is a subset
 of what `tartci leases` already does for Macs.
 
-Until then, treat this page as the authority for `macpro`, and remember the fleet
-is **not** Macs-only.
+That convergence is a possible future design, not the current setup. Until it is
+implemented, treat this page as the authority for `macpro`: do not run TartCI
+commands there or describe its systemd pool as TartCI-managed.

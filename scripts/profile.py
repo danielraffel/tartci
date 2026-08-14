@@ -28,10 +28,11 @@ PULP_DEFAULT_VARS = {
     ("coverage", "windows"): "PULP_COVERAGE_WINDOWS_RUNS_ON_JSON",
 }
 
-# Target providers tartci understands. `github` = GitHub-hosted; `tartci` = a
-# self-scheduled local Tart/QEMU VM; `shipyard` = a native Shipyard-managed
-# runner such as the Intel Mac mini (not a Tart guest).
-VALID_TARGET_PROVIDERS = frozenset({"github", "tartci", "shipyard"})
+# Target providers tartci profiles can describe. `github` = GitHub-hosted;
+# `tartci` = a self-scheduled local Tart/QEMU VM; `proxmox` = an independently
+# managed Proxmox VM pool coordinated by Shipyard; `shipyard` = a native
+# Shipyard-managed runner such as the Intel Mac mini (not a Tart guest).
+VALID_TARGET_PROVIDERS = frozenset({"github", "proxmox", "shipyard", "tartci"})
 LANE_SELECTABLE_PROVIDERS = VALID_TARGET_PROVIDERS
 
 

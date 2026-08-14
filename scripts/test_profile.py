@@ -89,6 +89,7 @@ class ValidateCommandTests(unittest.TestCase):
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
         targets = {
             "o.vm": {"provider": "orchard"},
+            "p.vm": {"provider": "proxmox"},
             "t.vm": {"provider": "tartci"},
             "m.native": {"provider": "shipyard"},
         }

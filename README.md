@@ -133,8 +133,9 @@ Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux, an
 Windows x64 later. `tart-linux` provisions **arm64** guests and `qemu-windows` is
 Windows-on-**ARM**, so routing an x64 build at either is an architecture change,
 not a relocation. See [`docs/proxmox-macpro.md`](docs/proxmox-macpro.md); it is not
-tartci-managed today, and folding it in as `providers/proxmox-linux` is the
-intended direction.
+TartCI-managed. Its Proxmox/systemd runner service is a separate execution
+provider that Shipyard coordinates alongside TartCI. Native Intel macOS/Metal
+checks similarly run directly on `macmini`, not inside TartCI.
 
 ### Serve the GitHub Actions pool
 `tartci up` does ONE on-demand build and exits; `tartci serve <os>` is the
@@ -198,6 +199,18 @@ behavior is unchanged; opt in per host via the LaunchAgent env.
 The same setting also governs `tartci doctor --reap` runner reads and cleanup,
 so the fleet health surface cannot silently fall back to an exhausted ambient
 token while the providers themselves use the App.
+
+If a Shipyard deployment also runs an external organization runner-group policy
+verifier, the App installation needs **Self-hosted runners: Read-only** at the
+organization level. Repository `Actions` access does not grant this. The Mac
+Pro's host-side verifier reads the group's repository,
+workflow, and runner membership boundaries before trusting a host. Grant write
+only when the controller must configure groups or remove registrations. After
+changing an App permission, approve the pending installation update and mint a
+fresh installation token; a cached token keeps the old permissions and returns
+`403 Resource not accessible by integration`. See
+[`docs/runbook.md`](docs/runbook.md#github-app-runner-group-access) for setup and
+the security rationale.
 
 **Scan-blindness self-heal (why a rate-limited poll can't silently wedge a lane).**
 Each `VM_POLL` the serve loop asks GitHub "are there queued jobs my labels can
