@@ -537,6 +537,7 @@ bench/        helper to clone a golden → open in UTM for GUI testing
 scripts/     lint.sh — repo hygiene gate (shellcheck + bash -n + py_compile + TOML)
 docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent onboarding) · gotchas.md
              proxmox-macpro.md (the x86_64 Proxmox host — NOT tartci-managed yet)
+             macmini-metal.md (native Intel macOS/Metal — NOT a Tart VM)
 ```
 
 ## Contributing checks
