@@ -146,6 +146,18 @@ offline registrations from their own slot. Never restore a static GitHub runner
 name to make monitoring easier. A new repository is hosted-only until its
 profile, image, exact labels, fallback, and one real dispatch proof are present.
 
+For the current Vellum profile, the intended capability matrix is explicit:
+Mac Pro native x86_64 Linux for unprivileged PR/build work; M3, M5, and M1
+Tart macOS ARM64 for macOS build work; Mac mini native Intel macOS for a
+separate compatibility canary; and Mac Pro Proxmox Windows only as an
+unproven candidate until a Windows golden and native proof exist. These are
+separate Vellum runner groups and labels, not aliases for Pulp's pools. The
+profile keeps hosted fallback and hosted-only signing/deployment/secret lanes.
+Do not enable a Vellum selector merely because the target is listed: first
+obtain repository-scoped runner administration, prove one disposable job and
+teardown on the intended host, then record the health lease and exact runner
+labels.
+
 ## Invariants (do not violate)
 
 - ARM64 guests only; x86_64 is cross+emulate, GitHub stays the x64 gate.

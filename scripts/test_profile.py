@@ -86,6 +86,34 @@ class ValidateCommandTests(unittest.TestCase):
             ["macmini.macos-intel-native", "github.macos-intel"],
         )
 
+    def test_vellum_has_explicit_local_matrix_and_hosted_fallbacks(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        lanes = P.resolve_lanes(profile, "Generous-Corp/vellum")
+        self.assertEqual(
+            next(row for row in lanes if row["context"] == "pr" and row["lane"] == "linux")["targets"][0]["id"],
+            "macpro.vellum-linux-x64-pr-safe",
+        )
+        macos = next(row for row in lanes if row["context"] == "pr" and row["lane"] == "macos")
+        self.assertEqual(
+            [target["id"] for target in macos["targets"][:3]],
+            [
+                "m3.vellum-macos-arm64-vm",
+                "m5.vellum-macos-arm64-vm",
+                "m1.vellum-macos-arm64-vm",
+            ],
+        )
+        self.assertEqual(macos["targets"][-1]["id"], "github.macos-arm64")
+        intel = next(row for row in lanes if row["context"] == "scheduled" and row["lane"] == "nightly_intel")
+        self.assertEqual(intel["targets"][0]["id"], "macmini.vellum-macos-intel-native")
+
+    def test_vellum_release_mutation_lanes_remain_hosted_only(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        lanes = P.resolve_lanes(profile, "Generous-Corp/vellum")
+        for lane_name in ("signing", "deploy"):
+            lane = next(row for row in lanes if row["context"] == "release" and row["lane"] == lane_name)
+            self.assertEqual(lane["strategy"], "github-only")
+            self.assertEqual(lane["targets"], [profile["targets"]["github.linux-x64"] | {"id": "github.linux-x64"}])
+
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
         targets = {
             "o.vm": {"provider": "orchard"},

@@ -123,6 +123,78 @@ branch = "main"
 targets = ["macmini.macos-intel-native", "github.macos-intel"]
 issue_on_failure = true
 
+# Vellum uses the same capability-first vocabulary, but has its own repository
+# groups/labels and does not inherit Pulp's trust boundary. These entries are
+# planning contracts until a Vellum-scoped registration token, golden proof,
+# and teardown audit exist on the target host.
+[repo."Generous-Corp/vellum".pr.linux]
+strategy = "ordered-fallback"
+targets = ["macpro.vellum-linux-x64-pr-safe", "github.linux-x64"]
+health_lease_variable = "VELLUM_PR_SAFE_LINUX_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request"]
+health_lease_runner_name_prefix = "vellum-pr-safe-ephemeral-"
+health_lease_min_idle = 1
+github_variable = "VELLUM_PR_SAFE_LINUX_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".pr.macos]
+strategy = "ordered-fallback"
+targets = [
+  "m3.vellum-macos-arm64-vm",
+  "m5.vellum-macos-arm64-vm",
+  "m1.vellum-macos-arm64-vm",
+  "github.macos-arm64",
+]
+health_lease_variable = "VELLUM_PR_MACOS_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request", "workflow_dispatch"]
+health_lease_runner_name_prefix = "vellum-macos-ephemeral-"
+health_lease_min_idle = 1
+github_variable = "VELLUM_PR_MACOS_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".pr.windows]
+strategy = "ordered-fallback"
+targets = ["macpro.vellum-windows-x64-qemu", "github.windows-x64"]
+health_lease_variable = "VELLUM_PR_WINDOWS_LEASE_UNTIL"
+health_lease_ttl_seconds = 300
+health_lease_events = ["pull_request", "workflow_dispatch"]
+health_lease_runner_name_prefix = "vellum-windows-ephemeral-"
+health_lease_min_idle = 1
+github_variable = "VELLUM_PR_WINDOWS_RUNS_ON_JSON"
+
+# Build-only release preparation may use a disposable local build, but signing,
+# publication, authority, and deployment remain hosted/trusted.
+[repo."Generous-Corp/vellum".release.macos_build]
+strategy = "ordered-fallback"
+targets = [
+  "m3.vellum-macos-arm64-release-vm",
+  "m5.vellum-macos-arm64-release-vm",
+  "m1.vellum-macos-arm64-release-vm",
+  "github.macos-arm64",
+]
+github_variable = "VELLUM_RELEASE_BUILD_MACOS_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".release.linux_build]
+strategy = "ordered-fallback"
+targets = ["macpro.vellum-linux-x64-release", "github.linux-x64"]
+github_variable = "VELLUM_RELEASE_BUILD_LINUX_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".release.signing]
+strategy = "github-only"
+targets = ["github.linux-x64"]
+github_variable = "VELLUM_RELEASE_SIGNING_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".release.deploy]
+strategy = "github-only"
+targets = ["github.linux-x64"]
+github_variable = "VELLUM_RELEASE_DEPLOY_RUNS_ON_JSON"
+
+[repo."Generous-Corp/vellum".scheduled.nightly_intel]
+enabled = true
+branch = "main"
+targets = ["macmini.vellum-macos-intel-native", "github.macos-intel"]
+issue_on_failure = true
+
 [targets."macstudio.macos-arm64-vm"]
 description = "Mac Studio Tart macOS ARM64 build VM."
 provider = "tartci"
@@ -248,3 +320,109 @@ os = "windows"
 arch = "x64"
 runs_on_json = "windows-latest"
 authoritative_for = ["windows-x64"]
+
+[targets."macpro.vellum-linux-x64-pr-safe"]
+description = "Mac Pro disposable Vellum Linux x64 PR-safe pool; unprivileged same-repository jobs only."
+provider = "proxmox"
+host = "macpro"
+os = "linux"
+arch = "x64"
+ephemeral = true
+proven = false
+runner_group = "vellum-pr-safe-build"
+workflow_access = ["Generous-Corp/vellum/.github/workflows/product-quality.yml@refs/heads/main"]
+runs_on_json = ["self-hosted", "Linux", "X64", "vellum-build-linux-x64", "vellum-host-macpro", "vellum-pr-safe-linux-x64"]
+
+[targets."macpro.vellum-linux-x64-release"]
+description = "Mac Pro disposable Vellum Linux x64 release-build pool; signing and publication remain hosted."
+provider = "proxmox"
+host = "macpro"
+os = "linux"
+arch = "x64"
+ephemeral = true
+proven = false
+runner_group = "vellum-release-build"
+workflow_access = ["Generous-Corp/vellum/.github/workflows/sdk-release.yml@refs/heads/main"]
+runs_on_json = ["self-hosted", "Linux", "X64", "vellum-build-linux-x64", "vellum-host-macpro", "vellum-release-linux-x64"]
+
+[targets."m3.vellum-macos-arm64-vm"]
+description = "M3 Tart Vellum macOS ARM64 disposable build VM."
+provider = "tartci"
+host = "macstudio"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
+
+[targets."m5.vellum-macos-arm64-vm"]
+description = "M5 Tart Vellum macOS ARM64 disposable build VM."
+provider = "tartci"
+host = "m5"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
+
+[targets."m1.vellum-macos-arm64-vm"]
+description = "M1 Tart Vellum macOS ARM64 disposable build VM."
+provider = "tartci"
+host = "m1"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
+
+[targets."m3.vellum-macos-arm64-release-vm"]
+description = "M3 Tart Vellum macOS ARM64 release-build VM; signing remains hosted."
+provider = "tartci"
+host = "macstudio"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m3"]
+
+[targets."m5.vellum-macos-arm64-release-vm"]
+description = "M5 Tart Vellum macOS ARM64 release-build VM; signing remains hosted."
+provider = "tartci"
+host = "m5"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m5"]
+
+[targets."m1.vellum-macos-arm64-release-vm"]
+description = "M1 Tart Vellum macOS ARM64 release-build VM; signing remains hosted."
+provider = "tartci"
+host = "m1"
+os = "macos"
+arch = "arm64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m1"]
+
+[targets."macmini.vellum-macos-intel-native"]
+description = "Mac mini native Intel Vellum compatibility/canary lane; not a Tart VM or arm64 release substitute."
+provider = "shipyard"
+host = "macmini"
+os = "macos"
+arch = "x64"
+ephemeral = true
+proven = false
+runs_on_json = ["self-hosted", "macOS", "X64", "vellum-build-macos-intel", "vellum-host-macmini"]
+
+[targets."macpro.vellum-windows-x64-qemu"]
+description = "Mac Pro Proxmox Windows x64 Vellum canary candidate; requires a Vellum golden and native proof before enablement."
+provider = "proxmox"
+host = "macpro"
+os = "windows"
+arch = "x64"
+ephemeral = true
+proven = false
+runner_group = "vellum-windows-build"
+workflow_access = []
+runs_on_json = ["self-hosted", "Windows", "X64", "vellum-build-windows-x64", "vellum-host-macpro"]
