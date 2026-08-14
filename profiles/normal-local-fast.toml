@@ -353,6 +353,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-macos-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
 
 [targets."m5.vellum-macos-arm64-vm"]
@@ -363,6 +364,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-macos-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
 
 [targets."m1.vellum-macos-arm64-vm"]
@@ -373,6 +375,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-macos-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
 
 [targets."m3.vellum-macos-arm64-release-vm"]
@@ -383,6 +386,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-release-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m3"]
 
 [targets."m5.vellum-macos-arm64-release-vm"]
@@ -393,6 +397,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-release-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m5"]
 
 [targets."m1.vellum-macos-arm64-release-vm"]
@@ -403,6 +408,7 @@ os = "macos"
 arch = "arm64"
 ephemeral = true
 proven = false
+runner_group = "vellum-release-build"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "vellum-release-macos", "vellum-host-m1"]
 
 [targets."macmini.vellum-macos-intel-native"]
@@ -413,6 +419,7 @@ os = "macos"
 arch = "x64"
 ephemeral = true
 proven = false
+runner_group = "vellum-macos-intel"
 runs_on_json = ["self-hosted", "macOS", "X64", "vellum-build-macos-intel", "vellum-host-macmini"]
 
 [targets."macpro.vellum-windows-x64-qemu"]

@@ -114,6 +114,20 @@ class ValidateCommandTests(unittest.TestCase):
             self.assertEqual(lane["strategy"], "github-only")
             self.assertEqual(lane["targets"], [profile["targets"]["github.linux-x64"] | {"id": "github.linux-x64"}])
 
+    def test_vellum_targets_use_distinct_repo_scoped_runner_groups(self) -> None:
+        _, profile = P.load_profile("normal-local-fast")
+        targets = profile["targets"]
+        self.assertEqual(targets["macpro.vellum-linux-x64-pr-safe"]["runner_group"], "vellum-pr-safe-build")
+        self.assertEqual(targets["macpro.vellum-linux-x64-release"]["runner_group"], "vellum-release-build")
+        for target_id in (
+            "m3.vellum-macos-arm64-vm",
+            "m5.vellum-macos-arm64-vm",
+            "m1.vellum-macos-arm64-vm",
+        ):
+            self.assertEqual(targets[target_id]["runner_group"], "vellum-macos-build")
+        self.assertEqual(targets["macmini.vellum-macos-intel-native"]["runner_group"], "vellum-macos-intel")
+        self.assertEqual(targets["macpro.vellum-windows-x64-qemu"]["runner_group"], "vellum-windows-build")
+
     def test_retired_provider_target_is_rejected_as_unknown(self) -> None:
         targets = {
             "o.vm": {"provider": "orchard"},
