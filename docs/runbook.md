@@ -188,6 +188,48 @@ your own secret-transfer path; never commit it). `tartci doctor` runs
 caught the next time anyone runs `tartci doctor` on it. Hosts without Shipyard
 installed stay green (the check is skipped, non-fatal).
 
+### GitHub App runner-group access
+
+The Mac Pro's external policy verifier uses Shipyard's App identity and needs an
+organization permission that TartCI's ordinary repository polling does not:
+**Self-hosted runners: Read-only**. Repository
+`Actions` permission can read runs and jobs, but cannot read
+`/orgs/<org>/actions/runner-groups/...`. The host-side verifier uses those organization
+endpoints to fail closed unless the selected repositories, selected workflows,
+and live runner membership still match the intended trust boundary.
+
+That read access enables more than a dashboard. It lets the deployment
+prove that disposable Tart macOS runners, the separate Proxmox Linux pool, and
+native Intel macOS capacity are attached to the right capability before work is
+admitted. The result is useful local capacity without making a public-repository
+self-hosted runner a general-purpose execution target. Grant **Read & write**
+only to an unattended controller that must configure runner groups or remove
+registrations; observation and verification need read-only access.
+
+This verifier is a host-specific integration, not currently a built-in
+`shipyard runner` check. Runner-group policy also is not a sandbox: any permitted
+workflow can execute the code it checks out. Untrusted PR work still requires a
+disposable guest with no host credentials or writable host mounts, along with
+the repository's fork and approval controls.
+
+Changing the GitHub App definition is only half the operation:
+
+1. Save the new organization permission on the App.
+2. Approve the pending permission update on the organization installation.
+3. Expire or replace any locally cached installation token, then mint a new one.
+4. Verify the exact group with the App-backed CLI:
+
+   ```bash
+   ghapp api orgs/<org>/actions/runner-groups/<group-id>
+   ghapp api orgs/<org>/actions/runner-groups/<group-id>/repositories
+   ghapp api orgs/<org>/actions/runner-groups/<group-id>/runners
+   ```
+
+If the App settings show the permission but these calls return
+`403 Resource not accessible by integration`, first compare the installation's
+approved permissions with the App definition, then refresh the token. Do not
+work around the failure with a broader personal token.
+
 ---
 
 ## 2. macOS lane (Tart)
