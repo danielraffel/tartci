@@ -436,6 +436,27 @@ fleet-level probes never need to infer health from a partially written JSON
 file. `KEEP_FAILED=1` Windows inspection VMs are left alone for the configured
 keep-failed window before becoming reap candidates.
 
+For a repository-scoped ephemeral lane, do not treat GitHub's `busy` bit as
+proof that a worker still exists. The digest distinguishes
+`offline_busy_live_local_owner`, `offline_busy_unconfirmed_local_state`, and
+`offline_busy_orphaned_no_local_owner`. The last state means that no matching
+TartCI state, lease, supervisor, or VM evidence was found; it is an actionable
+reconciliation condition, not ordinary capacity. Agents must capture two
+bounded snapshots, inspect the associated in-progress job, and preserve the
+protected queue while the state is ambiguous. Only an exact documented
+recovery may cancel that stale job and remove its runner registration;
+`--fix` must never bulk-cancel busy runners or reset a shared runner namespace.
+
+For Vellum, use the repository-scoped prefixes and groups from
+`profiles/normal-local-fast.toml` (for example
+`vellum-macos-ephemeral-`/`vellum-macos-build` or
+`vellum-pr-safe-ephemeral-`/`vellum-pr-safe-build`). A fresh worktree reuses
+those live identities and reconciliation rules; it does not register a new
+runner merely because the checkout directory changed. After recovery, require
+one real job assignment and explicit VM/lease/runner teardown before declaring
+the lane healthy or switching the repository selector from its hosted
+fallback.
+
 ### Observe a live macOS runner
 `tartci observe macos` is the read-only operator view for macOS VM jobs. It
 combines the janitor digest, matching GitHub run/job/step state, guest process

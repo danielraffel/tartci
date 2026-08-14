@@ -581,8 +581,19 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                                 problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
                 elif status == "offline" and busy:
                     stale = True
-                    action = "offline_busy_wait_for_github"
-                    problems.append(f"offline_busy_runner:{name}")
+                    # `offline + busy` is not enough to delete a runner: the
+                    # GitHub row may outlive a guest that is still finishing a
+                    # job.  Distinguish the local evidence so an operator or
+                    # Shipyard can make a bounded, exact recovery decision.
+                    if live_fresh_supervisor:
+                        action = "offline_busy_live_local_owner"
+                        problems.append(f"offline_busy_live_local_owner:{name}")
+                    elif state:
+                        action = "offline_busy_unconfirmed_local_state"
+                        problems.append(f"offline_busy_unconfirmed_local_state:{name}")
+                    else:
+                        action = "offline_busy_orphaned_no_local_owner"
+                        problems.append(f"offline_busy_orphaned_no_local_owner:{name}")
                 runner["owned"] = True
                 runner["stale"] = stale
                 runner["action"] = action
@@ -638,6 +649,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "heartbeat_age_secs": runner.get("heartbeat_age_secs"),
                 "owner_pid_alive": runner.get("owner_pid_alive"),
                 "state_file": runner.get("state_file"),
+                "local_ownership": runner.get("action", ""),
             }
             for runner in runners
             if runner.get("owned")

@@ -162,6 +162,32 @@ class VmReapTests(unittest.TestCase):
             self.assertFalse(state.exists())
             self.assertIn(f"state_deleted:{state}", digest["fixed"])
 
+    def test_offline_busy_without_local_owner_is_explicitly_orphaned(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            runner = {
+                "id": 744,
+                "name": "vellum-macos-ephemeral-202",
+                "status": "offline",
+                "busy": True,
+                "labels": [],
+            }
+            args = vm_reap.parse_args([
+                "--repo", "danielraffel/vellum",
+                "--state-root", str(root),
+                "--prefixes", "vellum-",
+            ])
+            with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+                 mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+                 mock.patch.object(vm_reap, "github_runners", return_value=[runner]):
+                digest, rc = vm_reap.build_digest(args)
+
+            self.assertEqual(rc, 1, digest)
+            row = digest["github_runners"][0]
+            self.assertEqual(row["action"], "offline_busy_orphaned_no_local_owner")
+            self.assertEqual(row["local_ownership"], "offline_busy_orphaned_no_local_owner")
+            self.assertIn("offline_busy_orphaned_no_local_owner:vellum-macos-ephemeral-202", digest["problems"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

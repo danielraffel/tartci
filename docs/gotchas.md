@@ -476,3 +476,20 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   → *Cause:* `windows.h` defines macros that clobber identifiers. → *Fix:*
   `#undef` the offending macro right after the `windows.h` include (or define
   `NOMINMAX` where applicable).
+
+## GitHub runner ownership versus local TartCI state
+
+- **GitHub reports an ephemeral runner `busy`, but TartCI reports no VM or
+  lease.** → *Cause:* a lost supervisor can leave a GitHub registration and
+  in-progress job row behind. → *Fix:* run `tartci doctor --reap --json` twice
+  across a bounded interval, capture the runner/job IDs and local evidence, and
+  classify the row as live-owner, unconfirmed, or
+  `offline_busy_orphaned_no_local_owner`. Preserve protected-queue work while
+  an owner is possible. Only the exact documented recovery may cancel that
+  exact stale job and remove its registration; do not bulk-reap busy runners.
+
+- **A new Vellum worktree appears to need a new runner.** → *Cause:* confusing
+  checkout identity with repository/fleet identity. → *Fix:* reuse the Vellum
+  profile's stable prefix, group, labels, lease, and hosted fallback. A
+  worktree change is not a runner registration event. Require a fresh
+  assignment and teardown proof after recovery before changing selectors.
