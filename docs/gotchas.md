@@ -493,3 +493,10 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   profile's stable prefix, group, labels, lease, and hosted fallback. A
   worktree change is not a runner registration event. Require a fresh
   assignment and teardown proof after recovery before changing selectors.
+
+- **The guest can reach `github.com`, but GitHub marks its Runner.Listener
+  offline.** → *Cause:* the Actions broker/control-plane endpoint was blocked
+  or reset; repository-web access alone is not sufficient. → *Fix:* test the
+  resolved `pipelines*.actions.githubusercontent.com` endpoint and
+  `broker.actions.githubusercontent.com` over HTTPS from the guest, record
+  both in the proof, and keep hosted fallback enabled until they pass.

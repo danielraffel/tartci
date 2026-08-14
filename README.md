@@ -457,6 +457,15 @@ one real job assignment and explicit VM/lease/runner teardown before declaring
 the lane healthy or switching the repository selector from its hosted
 fallback.
 
+The disposable guest egress contract must include the Actions runner control
+plane, not only the repository website: `github.com`, the resolved
+`pipelines*.actions.githubusercontent.com` runner endpoint, and
+`broker.actions.githubusercontent.com` must be reachable over HTTPS. A guest
+can successfully `curl https://github.com` while the Runner.Listener remains
+offline if the broker endpoint is blocked or reset. Record both probes in a
+Vellum dispatch proof; fail closed and keep the hosted fallback when the
+broker probe fails.
+
 ### Observe a live macOS runner
 `tartci observe macos` is the read-only operator view for macOS VM jobs. It
 combines the janitor digest, matching GitHub run/job/step state, guest process
