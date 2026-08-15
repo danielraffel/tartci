@@ -288,6 +288,17 @@ ephemeral, so the resolver checks in-progress jobs for each host label rather
 than looking for idle registered GitHub runners. That avoids duplicate VM boots
 and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
 
+An exception-only recovery pool may deliberately let several hosts satisfy one
+shared queued-job label so an offline host cannot strand the job. Preserve a
+practical host preference with the opt-in
+`TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS`: use `0` on the preferred host, a bounded
+delay on the first fallback, and a longer delay on the second fallback. The
+scanner ignores the job until its GitHub queue timestamp reaches that age; it
+does not sleep a supervisor or reserve capacity. GitHub still assigns the job
+once, and any later JIT registration that loses the claim follows normal
+bounded idle teardown. Do not use this for required checks that already have a
+pre-queue host resolver and host-specific labels.
+
 The fast gate supervisors (Pulp: M3 and M5) should advertise
 `TARTCI_VM_LEASE_PRIORITY=gate`; advisory supervisors must yield to that class.
 Pulp's exclusive `pulp-release-tagged` class also receives a gate-priority

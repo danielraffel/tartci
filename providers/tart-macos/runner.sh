@@ -67,6 +67,10 @@ RUNNER_SHA256="${TARTCI_RUNNER_SHA256:-${PULP_RUNNER_SHA256:-}}"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
 WORKFLOW_TIERS="${TARTCI_RUNNER_WORKFLOW_TIERS:-}"
+MIN_QUEUED_AGE="${TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0}"
+case "$MIN_QUEUED_AGE" in
+  ''|*[!0-9]*) printf 'invalid TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS: %s\n' "$MIN_QUEUED_AGE" >&2; exit 1 ;;
+esac
 WORKFLOW_ARGS=()
 WORKFLOW_DISPLAY=""
 WORKFLOW_CONFIG=""
@@ -376,6 +380,7 @@ queued_work(){
     --state-file "$STATE_DIR/queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
+    --min-age-seconds "$MIN_QUEUED_AGE" \
     --match-labels 1 2>/dev/null || echo ERR
 }
 
@@ -404,7 +409,8 @@ tier_queued_work(){
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-$tier_labels" \
     --state-file "$STATE_DIR/queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
-    --max-age-seconds 0)
+    --max-age-seconds 0 \
+    --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
   "${scan_cmd[@]}" --match-labels 1 2>/dev/null
 }

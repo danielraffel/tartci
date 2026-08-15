@@ -41,6 +41,16 @@ def _fresh(timestamp: str, max_age_seconds: int) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - created).total_seconds() <= max_age_seconds
 
 
+def _old_enough(timestamp: str, min_age_seconds: int, now: int) -> bool:
+    if min_age_seconds <= 0:
+        return True
+    try:
+        created = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return False
+    return now - int(created.timestamp()) >= min_age_seconds
+
+
 class QueueScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -447,6 +457,8 @@ class QueueScanner:
                 )
                 if not _fresh(timestamp, self.args.max_age_seconds):
                     continue
+                if not _old_enough(timestamp, self.args.min_age_seconds, self.now):
+                    continue
                 job_labels = {
                     str(label).lower() for label in job.get("labels", []) if str(label)
                 }
@@ -531,6 +543,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagger-max-seconds", type=int, default=int(os.environ.get("TARTCI_QUEUE_STAGGER_MAX_SECS", "4")))
     parser.add_argument("--negative-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEGATIVE_TTL_SECS", "30")))
     parser.add_argument("--max-age-seconds", type=int, default=0)
+    parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
     for field in (
@@ -551,6 +564,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.stagger_max_seconds < 0:
         parser.error("--stagger-max-seconds must be non-negative")
+    if args.min_age_seconds < 0:
+        parser.error("--min-age-seconds must be non-negative")
     statuses = {
         status.strip().lower()
         for status in args.job_statuses.split(",")
