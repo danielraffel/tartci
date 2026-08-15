@@ -938,6 +938,28 @@ that scan window, not that every workflow in the repository was inspected. Use
 merge-queue front and required contexts; use Tart CI state and logs to diagnose
 VM capacity. `ERR` is the distinct scanner/authentication failure sentinel.
 
+For an exception-only workflow whose availability matters more than avoiding a
+rare losing boot, multiple Mac supervisors may watch one shared label. Stagger
+them without long-lived runner registrations:
+
+```bash
+# Preferred M3 recovery worker
+TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS=0
+
+# M5 fallback after five minutes of unclaimed queue time
+TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS=300
+
+# M1 fallback after ten minutes
+TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS=600
+```
+
+Use a distinct runner-name prefix on each host and keep the shared label
+exclusive to that recovery workflow. The minimum age is checked from GitHub's
+job/run timestamp before VM boot and defaults to zero, so every existing lane
+is unchanged. A negative or malformed value fails before the serve loop starts.
+Once GitHub assigns the single job, a returning preferred host cannot preempt
+it; any losing disposable VM reaches the existing bounded idle teardown.
+
 After the coordinated Shipyard deploy, set
 `TARTCI_ADMISSION_CLEAN_MODE=required` on every Linux, macOS, and Windows
 provider LaunchAgent. Optionally set `TARTCI_SHIPYARD_CLI` (default `shipyard`),

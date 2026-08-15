@@ -76,6 +76,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
             "stagger_max_seconds": 0,
             "negative_ttl": 300,
             "max_age_seconds": 0,
+            "min_age_seconds": 0,
             "match_labels": 1,
         }
         values.update(overrides)
@@ -125,6 +126,30 @@ class PaginatedQueueScanTests(unittest.TestCase):
                     self._base_api(runs, eligible["id"]),
                 )
                 self.assertEqual(scanner.scan(), 1)
+
+    def test_minimum_queue_age_delays_then_admits_the_same_job(self) -> None:
+        created = datetime.now(timezone.utc) - timedelta(seconds=30)
+        queued = _run(999, created)
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory) / "state.json"
+            api = self._base_api([queued], queued["id"])
+            early = self._scanner(
+                "tart-macos",
+                state,
+                api,
+                min_age_seconds=60,
+                negative_ttl=1,
+            )
+            self.assertEqual(early.scan(), 0)
+            late = self._scanner(
+                "tart-macos",
+                state,
+                api,
+                min_age_seconds=60,
+                negative_ttl=1,
+            )
+            late.now = early.now + 31
+            self.assertEqual(late.scan(), 1)
 
     def test_rotating_cursor_eventually_reaches_middle_backlog_for_every_provider(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
@@ -737,6 +762,11 @@ print(json.dumps(payload))
             self.assertIn("--shared-cache-file", body, runner)
             self.assertIn("TARTCI_SHARED_QUEUE_CACHE", body, runner)
             self.assertIn("2>/dev/null || echo ERR", body, runner)
+
+    def test_macos_supervisor_passes_opt_in_minimum_queue_age(self) -> None:
+        body = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0", body)
+        self.assertGreaterEqual(body.count('--min-age-seconds "$MIN_QUEUED_AGE"'), 2)
 
     def test_linux_and_windows_do_not_age_out_compatible_queued_jobs(self) -> None:
         for runner in RUNNERS[1:]:
