@@ -13,6 +13,8 @@
   and an alive-but-frozen loop (state=running, stale log, no VM building) — so a
   healthy between-jobs serve loop (fresh "waiting" log), a mid-build supervisor (a
   VM is running), and a deliberately-stopped agent (not loaded) are all left alone.
+  It also reconciles durable pool intent: missing runner jobs are reloaded when
+  participation is ON and remain stopped when participation is OFF.
 
   Install shape:
 

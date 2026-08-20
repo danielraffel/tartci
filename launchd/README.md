@@ -103,14 +103,22 @@ exit-126 wedge above logs nothing (the script never runs), no in-agent logging
 can catch it — recovery must live outside the wedged agent. The watchdog
 (`scripts/tartci_launchd_watchdog.py`) discovers every tartci LaunchAgent, and
 for each reads `launchctl print` (`last exit code`, `state`) plus the log mtime.
-It heals an agent only when it **exited non-zero AND its log has gone stale**
-(the two together distinguish the invisible crash-loop from a healthy
+It heals crash-looping agents when they **exited non-zero AND their log has gone
+stale** (the two together distinguish the invisible crash-loop from a healthy
 between-jobs idle, whose "waiting" log is always fresh). Healing is the same full
 bootout+bootstrap+kickstart, rate-limited (default: max 3 heals per label per
 hour) so a genuinely broken plist logs loudly to
 `~/Library/Logs/tartci/tartci-launchd-watchdog.log` instead of thrashing. It
 never heals itself. Decision logic is covered hermetically by
 `scripts/test_tartci_launchd_watchdog.py` (no launchd needed). Install:
+
+The same pass reconciles durable pool intent. When
+`~/.config/tartci/participate` is absent or `true`, every discovered Pulp or
+Forge `tart-runner` / `qemu-runner` plist is expected to be loaded; an absent
+job is bootstrapped through the normal rate-limited heal path. When the flag is
+`false`, unloaded runners remain intentionally offline and are never
+resurrected. This closes the gap where a host retained an ON flag while its
+runner jobs had disappeared from launchd.
 
 ```
 mkdir -p "$HOME/Library/Logs/tartci"
