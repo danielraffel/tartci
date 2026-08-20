@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
@@ -110,6 +111,59 @@ check(v == "healthy", f"unloaded agent (state None) must be healthy, not resurre
 # Same for a stopped agent that last exited 0 while unloaded.
 v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
 check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
+
+# Missing runner + participation ON is the fleet-offline incident: it must heal.
+v, reason = wd.classify(None, None, log_age_s=None, stale_log_s=STALE,
+                        vm_running=False, expected_loaded=True)
+check(v == "wedged", f"enabled but unloaded runner must be wedged, got {v}: {reason}")
+
+# Participation OFF remains authoritative and must never resurrect a runner.
+v, _ = wd.classify(None, None, log_age_s=None, stale_log_s=STALE,
+                   vm_running=False, expected_loaded=False)
+check(v == "healthy", f"disabled unloaded runner must remain healthy, got {v}")
+
+check(wd.is_pool_runner("com.danielraffel.pulp.tart-runner"),
+      "Pulp tart runner must be pool-controlled")
+check(wd.is_pool_runner("com.danielraffel.forge.tart-runner-macos"),
+      "Forge tart runner must be pool-controlled")
+check(not wd.is_pool_runner("com.danielraffel.tartci.orchard-worker"),
+      "orchard worker must not inherit pool participation")
+
+with tempfile.TemporaryDirectory() as td:
+    participation = os.path.join(td, "participate")
+    check(wd.pool_participating(participation), "missing participation flag defaults ON")
+    with open(participation, "w", encoding="utf-8") as fh:
+        fh.write("false\n")
+    check(not wd.pool_participating(participation), "false participation flag is OFF")
+    with open(participation, "w", encoding="utf-8") as fh:
+        fh.write("true\n")
+    check(wd.pool_participating(participation), "true participation flag is ON")
+
+# Recovery success is verified with a final launchctl print, not inferred from
+# bootstrap/kickstart exit status.
+original_run = wd._run
+calls: list[list[str]] = []
+
+
+def fake_run_ok(cmd: list[str]) -> tuple[int, str, str]:
+    calls.append(cmd)
+    return 0, "", ""
+
+
+wd._run = fake_run_ok
+check(wd.reload_agent("com.danielraffel.pulp.tart-runner", "/tmp/runner.plist"),
+      "reload must succeed when post-recovery launchctl print succeeds")
+check(calls[-1][1] == "print", "reload must finish with launchctl print verification")
+
+
+def fake_run_missing(cmd: list[str]) -> tuple[int, str, str]:
+    return (1, "", "not loaded") if len(cmd) > 1 and cmd[1] == "print" else (0, "", "")
+
+
+wd._run = fake_run_missing
+check(not wd.reload_agent("com.danielraffel.pulp.tart-runner", "/tmp/runner.plist"),
+      "reload must fail when the service is still absent after kickstart")
+wd._run = original_run
 
 
 # ── rate limiter ─────────────────────────────────────────────────────────────

@@ -25,6 +25,9 @@ that heals them — bootout+bootstrap:
      self-heal can't catch). Gated on state=running + no running VM so a
      deliberately-stopped agent is never resurrected and a legit long build
      (which blocks the loop quietly) is never falsely healed.
+  3. Missing-while-enabled — a runner plist exists and durable pool
+     participation is ON, but the service is absent from launchd. Participation
+     OFF remains authoritative and the watchdog never reloads those runners.
 It is rate-limited so a genuinely-broken plist logs loudly instead of thrashing.
 
 Modes
@@ -57,6 +60,7 @@ from typing import Any, NamedTuple
 TARTCI_LABEL_PREFIXES = (
     "com.danielraffel.pulp.tart-runner",
     "com.danielraffel.pulp.qemu-runner",
+    "com.danielraffel.forge.tart-runner",
     "com.danielraffel.tartci.",
 )
 # The watchdog never heals itself (avoid a watchdog reload storm).
@@ -115,6 +119,7 @@ def classify(
     log_age_s: float | None,
     stale_log_s: int,
     vm_running: bool = True,
+    expected_loaded: bool = False,
 ) -> tuple[str, str]:
     """Decide healthy / wedged / unknown from parsed signals. Pure.
 
@@ -131,6 +136,8 @@ def classify(
        self-heal can't catch (it never gets back to the top to increment `blind`).
        The `vm_running` guard is load-bearing: a legit long build blocks the loop
        quietly for up to hours, so we only call it frozen when NO VM is running."""
+    if state is None and expected_loaded:
+        return "wedged", "not loaded while pool participation is enabled"
     if last_exit_code is None or last_exit_code == 0:
         # Alive / cleanly-restarting. The alive-but-frozen signature applies ONLY when the process is
         # genuinely UP: state == "running". A frozen run_one still reports "running" (the process is
@@ -212,16 +219,34 @@ def any_tart_vm_running() -> bool:
 
 
 def gather_health(label: str, plist_path: str, stale_log_s: int,
-                  vm_running: bool = True) -> AgentHealth:
+                  vm_running: bool = True,
+                  pool_participating: bool = False) -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
     log_path = _log_path_from_plist(plist_path)
     log_age: float | None = None
     if log_path and os.path.exists(log_path):
         log_age = max(0.0, utcnow() - os.path.getmtime(log_path))
-    verdict, reason = classify(state, last_exit, log_age, stale_log_s, vm_running)
+    expected_loaded = pool_participating and is_pool_runner(label)
+    verdict, reason = classify(
+        state, last_exit, log_age, stale_log_s, vm_running, expected_loaded
+    )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
+
+
+def is_pool_runner(label: str) -> bool:
+    """Whether LABEL is controlled by the host participation toggle."""
+    return ".tart-runner" in label or ".qemu-runner" in label
+
+
+def pool_participating(path: str) -> bool:
+    """Read durable pool intent. Missing/unrecognised values preserve legacy ON."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read().strip().lower() != "false"
+    except OSError:
+        return True
 
 
 def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
@@ -238,7 +263,12 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
         # already-bootstrapped race: kickstart still forces a fresh start.
         pass
     rc2, _, _ = _run(["launchctl", "kickstart", "-k", f"{dom}/{label}"])
-    return rc2 == 0
+    if rc2 != 0:
+        return False
+    # Prove launchd now owns the service. It may still be starting, so loaded
+    # (rather than state=running) is the correct immediate postcondition.
+    rc3, _, _ = _run(["launchctl", "print", f"{dom}/{label}"])
+    return rc3 == 0
 
 
 # ── rate limiting ────────────────────────────────────────────────────────────
@@ -299,6 +329,10 @@ def main(argv: list[str] | None = None) -> int:
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
                         "Library", "LaunchAgents"))
+    ap.add_argument("--participation-file",
+                    default=os.path.join(
+                        os.environ.get("HOME", os.path.expanduser("~")),
+                        ".config", "tartci", "participate"))
     args = ap.parse_args(argv)
 
     if args.reload:
@@ -316,12 +350,17 @@ def main(argv: list[str] | None = None) -> int:
     # Compute the VM-running guard ONCE per pass (host-wide) — the alive-but-frozen signature only
     # fires when nothing is building, so a legit long build is never healed.
     vm_running = any_tart_vm_running()
-    health = [gather_health(lbl, p, args.stale_log_seconds, vm_running) for lbl, p in agents]
+    participating = pool_participating(args.participation_file)
+    health = [
+        gather_health(lbl, p, args.stale_log_seconds, vm_running, participating)
+        for lbl, p in agents
+    ]
 
     now = utcnow()
     heal_log = load_heal_log(_state_file())
     results: list[dict[str, Any]] = []
     acted = False
+    heal_failed = False
     for h in health:
         entry: dict[str, Any] = {
             "label": h.label, "verdict": h.verdict, "reason": h.reason,
@@ -339,6 +378,7 @@ def main(argv: list[str] | None = None) -> int:
                     stamps.append(now)
                     heal_log[h.label] = stamps
                     acted = True
+                    heal_failed = heal_failed or not ok
             else:
                 entry["action"] = "rate-limited"
                 entry["reason"] += (
@@ -361,11 +401,11 @@ def main(argv: list[str] | None = None) -> int:
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
             print(f"  {mark} {r['label']}: {r['reason']}{act}")
-    # Exit non-zero only in --status when something is wedged (so a doctor/CI
-    # check can notice); the healing path exits 0 (it did its job).
+    # Status reports unresolved wedges. Healing reports failure only when a
+    # reload failed its postcondition; successful recovery exits zero.
     if args.status and wedged:
         return 1
-    return 0
+    return 1 if heal_failed else 0
 
 
 if __name__ == "__main__":
