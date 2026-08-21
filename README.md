@@ -26,12 +26,16 @@ plugins in a DAW.
 
 ### Host resource governance
 
-**Opt a host out** with `tartci pool off` (and back in with `tartci pool on`;
+**Drain a roaming host** with `tartci pool drain` (and bring it back with
+`tartci pool on`; reserve `pool off` for an immediate stop;
 `tartci pool status [--json]` shows state). This host-level switch writes the
-native-build participation flag and immediately unloads the host's CI runner
-agents. It is not a drain command: first prove through the scheduler that every
-runner on the host is idle and locally that no provider VM is running. See the
-runbook for the fail-closed sequence.
+native-build participation flag and a durable admission state. Drain refuses
+new native leases and JIT registrations, lets an already assigned exact job
+finish, and disables runner restart across reconnect/reboot. The persistent
+Actions preamble runner requires a Shipyard routing hold plus authoritative
+idle receipt before tartci will boot it out; without that receipt drain remains
+pending and exits nonzero. `pool off` remains immediate and may terminate work.
+See the runbook.
 
 Shared Macs run CI validation, agent builds, and VM runners on the same
 hardware. Without a shared budget they oversubscribe — two hosts melted in July

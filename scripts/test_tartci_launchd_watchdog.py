@@ -136,6 +136,9 @@ with tempfile.TemporaryDirectory() as td:
         fh.write("false\n")
     check(not wd.pool_participating(participation), "false participation flag is OFF")
     with open(participation, "w", encoding="utf-8") as fh:
+        fh.write("0\n")
+    check(not wd.pool_participating(participation), "numeric zero participation is OFF")
+    with open(participation, "w", encoding="utf-8") as fh:
         fh.write("true\n")
     check(wd.pool_participating(participation), "true participation flag is ON")
 

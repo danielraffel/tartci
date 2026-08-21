@@ -18,7 +18,7 @@
 #   tartci timings [log-root|timing.tsv ...]
 #   tartci runtime <summary|export|recent|backfill|prune|complete>
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
-#   tartci pool <on|off|status> # opt this host in/out of the CI pool (participation + runners)
+#   tartci pool <on|drain|off|status> # durable host admission and participation
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
@@ -258,33 +258,114 @@ cmd_pool() {
   local agents_dir="$HOME/Library/LaunchAgents"
   case "$sub" in
     on|off)
-      local target=1 action=load
-      [ "$sub" = off ] && { target=0; action=unload; }
-      tartci_pool_write_participation "$target"
-      echo "participation: $target ($sub)"
-      local label n=0
+      local target=1
+      [ "$sub" = off ] && target=0
+      if [ "$sub" = off ]; then
+        # Emergency stop deliberately bypasses the cooperative JIT-start lock.
+        tartci_pool_write_participation 0
+        tartci_pool_write_state off
+      else
+        tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+        # A held-idle receipt authorizes exactly one drain era. Reopening the
+        # pool invalidates it before admission becomes visible again.
+        rm -f "$TARTCI_POOL_PERSISTENT_HOLD_FILE"
+        tartci_pool_write_state on
+        tartci_pool_write_participation 1
+      fi
+      echo "state: $sub; participation: $target"
+      local label n=0 launchd_target
       while IFS= read -r label; do
         [ -n "$label" ] || continue
-        if launchctl "$action" "$agents_dir/$label.plist" 2>/dev/null; then
-          echo "  ${action}ed $label"; n=$((n + 1))
+        launchd_target="$(tartci_pool_launchd_target "$label")"
+        if [ "$sub" = off ]; then
+          launchctl disable "$launchd_target" >/dev/null 2>&1 || true
+          if launchctl bootout "$launchd_target" >/dev/null 2>&1; then
+            echo "  booted out $label"; n=$((n + 1))
+          else
+            echo "  (already stopped: $label)"
+          fi
         else
-          echo "  ($action skipped: $label)"
+          launchctl enable "$launchd_target" >/dev/null 2>&1 || true
+          if launchctl print "$launchd_target" >/dev/null 2>&1 \
+            || launchctl bootstrap "gui/$(id -u)" "$agents_dir/$label.plist" >/dev/null 2>&1; then
+            echo "  enabled $label"; n=$((n + 1))
+          else
+            echo "  (enable skipped: $label)"
+          fi
         fi
       done <<EOF
 $(tartci_pool_runner_agents "$agents_dir")
 EOF
-      echo "runner agents ${action}ed: $n"
+      [ "$sub" = off ] || tartci_pool_lock_release
+      echo "runner agents changed: $n"
       if [ "$sub" = off ]; then
         echo "opted OUT: $host agents unloaded immediately (pool off is not a drain)"
       else
         echo "opted IN: $host is participating in the CI pool"
       fi
       ;;
+    repair-lock)
+      local owner=""
+      [ "$(tartci_pool_read_participation)" = 0 ] \
+        && [ "$(tartci_pool_read_state)" != on ] \
+        || { echo "refusing lock repair while admission is open; run pool off first" >&2; return 5; }
+      owner="$(cat "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true)"
+      case "$owner" in
+        ''|*[!0-9]*) ;;
+        *) kill -0 "$owner" 2>/dev/null \
+          && { echo "refusing lock repair: owner pid $owner is alive" >&2; return 5; } ;;
+      esac
+      rm -f "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true
+      rmdir "$TARTCI_POOL_TRANSITION_LOCK" 2>/dev/null || true
+      [ ! -d "$TARTCI_POOL_TRANSITION_LOCK" ] \
+        || { echo "lock repair failed: $TARTCI_POOL_TRANSITION_LOCK remains" >&2; return 5; }
+      echo "repaired orphaned pool transition lock"
+      ;;
+    drain)
+      # Close both native and provider admission before waiting for a provider
+      # already inside the serialized JIT-start boundary.
+      tartci_pool_write_participation 0
+      tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+      # Persist no-new-admission before touching any process. Native leases see
+      # participation=0; cooperative providers observe pool-state=draining.
+      tartci_pool_write_state draining
+      local label launchd_target
+      while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        launchd_target="$(tartci_pool_launchd_target "$label")"
+        launchctl disable "$launchd_target" >/dev/null 2>&1 || true
+      done <<EOF
+$(tartci_pool_runner_agents "$agents_dir")
+EOF
+      tartci_pool_lock_release
+      # Ephemeral providers finish their blocking run_one and then wait at the
+      # admission gate. Only hosts with a persistent Actions service need the
+      # detached receipt watcher; provider-only hosts terminalize immediately.
+      local persistent_agents
+      persistent_agents="$(tartci_pool_runner_agents "$agents_dir" | grep '^actions[.]runner[.]' || true)"
+      if [ -n "$persistent_agents" ]; then
+        mkdir -p "$HOME/Library/Logs/tartci"
+        nohup "$HERE/tartci" pool _drain-watch \
+          >>"$HOME/Library/Logs/tartci/pool-drain.log" 2>&1 </dev/null &
+      fi
+      if [ -n "$persistent_agents" ] && ! tartci_pool_persistent_hold_ready; then
+        echo "drain pending: persistent runners require Shipyard held-idle receipt at $TARTCI_POOL_PERSISTENT_HOLD_FILE" >&2
+        return 3
+      fi
+      echo "draining: $host admits no new leases/jobs; assigned work may finish"
+      ;;
+    _drain-watch)
+      while [ "$(tartci_pool_read_state)" = draining ]; do
+        tartci_pool_quiesce_persistent_agents "$agents_dir" && exit 0
+        sleep "${TARTCI_POOL_DRAIN_POLL_SECONDS:-2}"
+      done
+      ;;
     status)
       local part; part="$(tartci_pool_read_participation)"
+      local state; state="$(tartci_pool_read_state)"
       if [ "${1:-}" = "--json" ]; then
-        printf '{"host":"%s","participating":%s,"runners":[' \
-          "$host" "$([ "$part" = 1 ] && echo true || echo false)"
+        printf '{"host":"%s","state":"%s","participating":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)"
         local first=1 label loaded
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -297,6 +378,7 @@ EOF
         printf ']}\n'
       else
         echo "host: $host"
+        echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
         echo "runner agents:"
         local label loaded any=0
@@ -310,7 +392,7 @@ EOF
         [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
       fi
       ;;
-    *) echo "usage: tartci pool <on|off|status> [--json]"; return 2 ;;
+    *) echo "usage: tartci pool <on|drain|off|status|repair-lock> [--json]"; return 2 ;;
   esac
 }
 

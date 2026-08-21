@@ -29,6 +29,8 @@ set -euo pipefail
 # fresh auth). See the README 'Scan-blindness self-heal' section.
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/pool.lib.sh
+source "$TARTCI_ROOT/providers/common/pool.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -338,6 +340,7 @@ run_one(){ # $1=iteration index
   write_state booting
 
   cleanup_job(){
+    tartci_pool_lock_release
     local outcome="${1:-success}"
     delete_runner_registration "$job" || true
     if [ "$outcome" = "failure" ] && [ "$KEEP_FAILED" = 1 ]; then
@@ -396,14 +399,27 @@ run_one(){ # $1=iteration index
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  if ! tartci_pool_lock_acquire; then
+    note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
+    cleanup_job success
+    return 75
+  fi
+  if ! tartci_pool_admission_open; then
+    tartci_pool_lock_release
+    note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
+    cleanup_job success
+    return 75
+  fi
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
+    tartci_pool_lock_release
     note "[$i] JIT mint failed — discarding VM"
     cleanup_job success
     return 1
   }
   if [ -z "$jit" ]; then
+    tartci_pool_lock_release
     note "[$i] empty JIT config — discarding VM"
     cleanup_job success
     return 1
@@ -615,6 +631,7 @@ exit $LASTEXITCODE'
   while kill -0 "$runner_pid" 2>/dev/null; do
     if [ "$runner_assigned" = 0 ] && grep -q 'Running job:' "$runner_output" 2>/dev/null; then
       runner_assigned=1
+      tartci_pool_lock_release
     fi
     if [ "$runner_assigned" = 0 ]; then
       now="$(now_epoch)"
@@ -628,6 +645,7 @@ exit $LASTEXITCODE'
     fi
     sleep 5
   done
+  tartci_pool_lock_release
   wait "$runner_pid" || run_status=$?
   if [ "$runner_timed_out" = 1 ]; then
     run_status=124
@@ -690,6 +708,11 @@ if [ "$LOOP" = 1 ]; then
   blind=0
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   while true; do
+    if ! tartci_pool_admission_open; then
+      note "pool $(tartci_pool_read_state) — no new Windows admission; waiting ${POLL}s"
+      sleep "$POLL"
+      continue
+    fi
     q="$(queued_work)"
     if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
       blind=$((blind + 1))
@@ -714,6 +737,7 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
   note "ephemeral Windows runner ONCE; golden=$(basename "$GOLDEN") labels=$LABELS preflight=$PREFLIGHT_MODE cpus=$WIN_CPUS mem=${WIN_MEMORY_MB}MB"
   run_one 1
 fi

@@ -74,9 +74,10 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 6. **Verify governed.** `tartci host-profile` shows the role + core/memory
    budgets; `tartci leases status` shows the store answering. The governor now
    bounds this host's builds + VMs automatically (core + memory admission).
-The new Mac is now governed, serving its lanes, and opt-out-able exactly like
-the rest of the pool. `tartci pool off` unloads its agents immediately, so use
-it only after the scheduler and local VM probes both prove the host idle.
+The new Mac is now governed, serving its lanes, and drainable exactly like the
+rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
+`pool off` unloads its agents immediately and remains an emergency/idle-only
+operation.
 
 ---
 
@@ -1249,23 +1250,75 @@ After `tartci setup`, deploy the tartci snapshot to `~/.local/share/tartci`
 (rsync) and — for a CI host — register runners. Helpers:
 `providers/common/onboard.lib.sh`.
 
-## Opt a host out of the CI pool (`tartci pool`)
+## Drain or opt a host out of the CI pool (`tartci pool`)
 
-`tartci pool {on|off|status}` is the host-level participation switch — "this
+`tartci pool {on|drain|off|status}` is the host-level participation switch — "this
 machine, not now". It is deliberately decoupled from the per-lane GUI toggles
 and from any placement engine, so opting a Mac out can't silently vanish when
 lanes change.
 
+- `tartci pool drain` — atomically persist native participation `0`, then
+  `pool-state=draining`, before process changes. Every tartci provider requires
+  both records to be open, so the first write closes native and JIT admission.
+  Every tartci provider also checks this
+  at its idle loop and again immediately before JIT minting. An assigned JIT
+  job keeps its exact lease and finishes; an unregistered VM is discarded.
+  Runner LaunchAgents are disabled so reboot cannot re-admit work. A detached
+  local watcher retires a persistent `actions.runner.*` service only after
+  Shipyard has removed the host from routing, confirmed every such runner idle,
+  and atomically published `held-idle` at
+  `~/.config/tartci/persistent-runner-admission-hold`. This includes host
+  preamble runners that do not match the tart-runner naming family. Without
+  that authoritative receipt, `pool drain` leaves the durable provider/native
+  gates closed but exits 3 and reports drain pending; local worker absence is
+  not accepted because it misses the accepted-job-before-worker-spawn race.
+  The state survives terminal disconnect and reboot.
 - `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
-  (the lease governor then refuses native-build leases here) **and**
-  `launchctl unload` this host's CI runner agents (`com.danielraffel.pulp.*-runner-*`
-  and `actions.runner.*`). The unload is immediate and can terminate an active
-  provider job. This is **not** a drain: disable new placement first, prove all
-  of the host's runners `busy=false` through GitHub, and prove no local provider
-  VM/process is active before running it.
-- `tartci pool on` — participation=1 + `launchctl load` the runner agents.
-- `tartci pool status [--json]` — participation state + each runner agent's
+  and `pool-state=off`, disable restart, and immediately boot out every runner
+  agent. It deliberately bypasses a provider's cooperative JIT-start lock, so
+  it can terminate active work; use drain for normal roaming.
+- `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
+  bootstrap the installed runner agents. This is the only transition that
+  reopens provider admission, so a reconnect cannot leave a half-on host.
+- `tartci pool status [--json]` — durable state + participation + each runner agent's
   loaded/stopped state.
+- `tartci pool repair-lock` — recover a transition lock orphaned by power loss,
+  reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
+  `draining`, participation `0`) and the recorded owner PID is dead. If an
+  orphan blocks rejoin, run `pool off`, then `pool repair-lock`, then `pool on`.
+
+Drain is deliberately not a second scheduler. New jobs keep their existing
+shared GitHub labels, so GitHub may assign them to another eligible host (for
+example M1/M3 after M5 drains). If connectivity disappears after assignment,
+do not manufacture a duplicate while ownership is ambiguous: let the GitHub
+job reach a terminal lost-runner result and let Shipyard reconcile its exact
+receipt before retry/reassignment. On rejoin, `tartci pool status` must still
+say `draining`; run `tartci doctor --reap --json` to classify stale registrations
+and local ownership, verify no active lease/guest remains, and only then run
+`tartci pool on`. An `offline_busy_unconfirmed_local_state` or
+`offline_busy_orphaned_no_local_owner` result is a reconciliation hold, not
+permission for tartci to guess or delete live/ambiguous state.
+
+### Idle-only maintenance for very large reused checkouts
+
+Shipyard should decide *when* a host is eligible; tartci only supplies the
+provider-side safety boundary. Treat `git count-objects -vH` pack count >=64 or
+`size-pack` >=20 GiB as a maintenance candidate, and >=128 packs or >=50 GiB as
+urgent. These are scheduling thresholds, never permission to delete.
+
+Maintenance may run only while the pool is `draining` or `off`, the lease store
+has no active leases, no `Runner.Worker`, Tart/QEMU guest, Git lock file, or
+checkout process exists, and the workspace identity is unchanged between the
+first probe and execution. Ambiguous or dirty workspaces are retained and
+reported. Prefer bounded `git maintenance run --task=incremental-repack` for
+pack consolidation; do not run full `git gc`, prune objects, or delete a reused
+workspace automatically. Recheck free space before and after, because repacking
+temporarily needs additional disk.
+
+For future jobs, avoid creating the problem: use shallow fetch for ordinary CI
+(`fetch-depth: 1`, no tags) or a blob-filtered checkout when history is needed.
+A request for full history in a repository already measuring tens of GiB should
+be an explicit workflow exception, not the remote-runner default.
 
 ## Non-gate VM lanes are clamped to the non-gate core budget
 

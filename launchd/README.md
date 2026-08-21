@@ -113,7 +113,7 @@ never heals itself. Decision logic is covered hermetically by
 `scripts/test_tartci_launchd_watchdog.py` (no launchd needed). Install:
 
 The same pass reconciles durable pool intent. When
-`~/.config/tartci/participate` is absent or `true`, every discovered Pulp or
+`~/.config/tartci/native-build-participation` is absent or `1`, every discovered Pulp or
 Forge `tart-runner` / `qemu-runner` plist is expected to be loaded; an absent
 job is bootstrapped through the normal rate-limited heal path. When the flag is
 `false`, unloaded runners remain intentionally offline and are never
