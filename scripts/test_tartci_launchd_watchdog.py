@@ -12,8 +12,10 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 from __future__ import annotations
 
 import os
+import plistlib
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
@@ -111,6 +113,70 @@ check(v == "healthy", f"unloaded agent (state None) must be healthy, not resurre
 # Same for a stopped agent that last exited 0 while unloaded.
 v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
 check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
+
+
+# ── persistent Actions runner installation drift ──────────────────────────
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    agents = root / "LaunchAgents"
+    agents.mkdir()
+    missing = root / "actions-runner-pulp-preamble" / "runsvc.sh"
+    actions_plist = agents / "actions.runner.Generous-Corp-pulp.pulp-preamble-m3.plist"
+    with actions_plist.open("wb") as fh:
+        plistlib.dump(
+            {
+                "Label": "actions.runner.Generous-Corp-pulp.pulp-preamble-m3",
+                "ProgramArguments": [str(missing)],
+                "StandardOutPath": str(root / "runner.log"),
+            },
+            fh,
+        )
+    unrelated = agents / "com.apple.unrelated.plist"
+    with unrelated.open("wb") as fh:
+        plistlib.dump({"Label": "com.apple.unrelated", "Program": "/bin/true"}, fh)
+
+    discovered = wd.discover_agents(str(agents))
+    check(
+        discovered
+        == [("actions.runner.Generous-Corp-pulp.pulp-preamble-m3", str(actions_plist))],
+        f"persistent Actions runner must be discovered without unrelated agents: {discovered!r}",
+    )
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (0, "state = spawn scheduled\nlast exit code = 78\n", "")
+        health = wd.gather_health(
+            discovered[0][0], discovered[0][1], STALE, vm_running=False
+        )
+    finally:
+        wd._run = original_run
+    check(
+        health.verdict == "broken",
+        f"missing runsvc must be broken, got {health.verdict}",
+    )
+    check(str(missing) in health.reason, "missing executable path must be actionable")
+    check("reload cannot repair" in health.reason, "must refuse blind kickstart repair")
+
+    missing.parent.mkdir()
+    missing.write_text("#!/bin/sh\n")
+    old_log = root / "runner.log"
+    old_log.write_text("idle runner\n")
+    os.utime(old_log, (0, 0))
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (0, "state = running\nlast exit code = (never exited)\n", "")
+        health = wd.gather_health(
+            discovered[0][0], discovered[0][1], STALE, vm_running=False
+        )
+    finally:
+        wd._run = original_run
+    check(
+        health.verdict == "healthy",
+        f"present runsvc must use normal health path, got {health}",
+    )
+    check(
+        "runtime health is owned by Shipyard" in health.reason,
+        "persistent Actions services must never enter TartCI stale-log healing",
+    )
 
 # Missing runner + participation ON is the fleet-offline incident: it must heal.
 v, reason = wd.classify(None, None, log_age_s=None, stale_log_s=STALE,

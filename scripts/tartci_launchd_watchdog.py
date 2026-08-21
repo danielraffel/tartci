@@ -30,9 +30,14 @@ that heals them — bootout+bootstrap:
      OFF remains authoritative and the watchdog never reloads those runners.
 It is rate-limited so a genuinely-broken plist logs loudly instead of thrashing.
 
+The same pass audits persistent GitHub Actions runner LaunchAgents
+(`actions.runner.*`). If one still has a plist but its declared executable has
+disappeared, reload cannot recreate the runner installation. That condition is
+reported as non-healable `broken` drift with a versioned recovery pointer.
+
 Modes
 -----
-  (default)         scan all tartci LaunchAgents, heal the wedged ones
+  (default)         scan managed TartCI + Actions LaunchAgents; heal reloadable wedges
   --status          report health only; never act (exit 0)
   --reload LABEL    force a full bootout+bootstrap+kickstart of one label
   --dry-run         report what heal WOULD do; never act
@@ -63,6 +68,7 @@ TARTCI_LABEL_PREFIXES = (
     "com.danielraffel.forge.tart-runner",
     "com.danielraffel.tartci.",
 )
+ACTIONS_RUNNER_LABEL_PREFIX = "actions.runner."
 # The watchdog never heals itself (avoid a watchdog reload storm).
 SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 
@@ -88,7 +94,7 @@ class AgentHealth(NamedTuple):
     state: str | None          # "running" | "spawn scheduled" | None (not loaded)
     last_exit_code: int | None
     log_age_s: float | None    # None when the log is missing
-    verdict: str               # "healthy" | "wedged" | "unknown"
+    verdict: str               # "healthy" | "wedged" | "broken" | "unknown"
     reason: str
 
 
@@ -176,7 +182,7 @@ def _domain() -> str:
 
 
 def discover_agents(launch_agents_dir: str) -> list[tuple[str, str]]:
-    """Return (label, plist_path) for every tartci-owned LaunchAgent plist."""
+    """Return every tartci or persistent Actions runner LaunchAgent plist."""
     out: list[tuple[str, str]] = []
     seen: set[str] = set()
     for path in sorted(glob.glob(os.path.join(launch_agents_dir, "*.plist"))):
@@ -188,7 +194,9 @@ def discover_agents(launch_agents_dir: str) -> list[tuple[str, str]]:
         label = data.get("Label", "")
         if label == SELF_LABEL or label in seen:
             continue
-        if label.startswith(TARTCI_LABEL_PREFIXES):
+        if label.startswith(TARTCI_LABEL_PREFIXES) or label.startswith(
+            ACTIONS_RUNNER_LABEL_PREFIX
+        ):
             seen.add(label)
             out.append((label, path))
     return out
@@ -201,6 +209,22 @@ def _log_path_from_plist(plist_path: str) -> str | None:
     except Exception:
         return None
     return data.get("StandardOutPath") or data.get("StandardErrorPath")
+
+
+def _program_path_from_plist(plist_path: str) -> str | None:
+    """Return the executable declared by a LaunchAgent, if one is explicit."""
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return None
+    program = data.get("Program")
+    if isinstance(program, str) and program:
+        return program
+    arguments = data.get("ProgramArguments")
+    if isinstance(arguments, list) and arguments and isinstance(arguments[0], str):
+        return arguments[0]
+    return None
 
 
 def any_tart_vm_running() -> bool:
@@ -227,6 +251,28 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     log_age: float | None = None
     if log_path and os.path.exists(log_path):
         log_age = max(0.0, utcnow() - os.path.getmtime(log_path))
+    program_path = _program_path_from_plist(plist_path)
+    if (
+        label.startswith(ACTIONS_RUNNER_LABEL_PREFIX)
+        and program_path
+        and os.path.isabs(program_path)
+        and not os.path.isfile(program_path)
+    ):
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "broken",
+            f"declared runner executable is missing: {program_path}; reload cannot repair "
+            "a deleted installation — follow launchd/README.md#persistent-actions-runner-install-missing",
+        )
+    if label.startswith(ACTIONS_RUNNER_LABEL_PREFIX):
+        # Persistent Actions runners do not emit TartCI's poll heartbeat. Their
+        # logs may be quiet while idle or throughout a long job, so applying
+        # the stale-log classifier below could bootout a healthy runner. This
+        # watchdog owns only the fail-closed installation-presence audit for
+        # these services; Actions runtime/job health stays with Shipyard.
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "healthy",
+            "declared runner executable exists; runtime health is owned by Shipyard",
+        )
     expected_loaded = pool_participating and is_pool_runner(label)
     verdict, reason = classify(
         state, last_exit, log_age, stale_log_s, vm_running, expected_loaded
@@ -367,7 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     heal_failed = False
     for h in health:
         entry: dict[str, Any] = {
-            "label": h.label, "verdict": h.verdict, "reason": h.reason,
+            "label": h.label, "plist": h.plist,
+            "verdict": h.verdict, "reason": h.reason,
             "state": h.state, "last_exit_code": h.last_exit_code,
             "log_age_s": None if h.log_age_s is None else int(h.log_age_s),
         }
@@ -394,20 +441,20 @@ def main(argv: list[str] | None = None) -> int:
     if acted:
         save_heal_log(_state_file(), heal_log)
 
-    wedged = [r for r in results if r["verdict"] == "wedged"]
+    unhealthy = [r for r in results if r["verdict"] in {"wedged", "broken"}]
     if args.json:
         print(json.dumps({"ts": _iso(now), "agents": results}, indent=2))
     else:
         if not results:
-            print("launchd-watchdog: no tartci LaunchAgents found")
+            print("launchd-watchdog: no managed runner LaunchAgents found")
         for r in results:
-            mark = {"healthy": "✓", "wedged": "✗", "unknown": "?"}.get(
+            mark = {"healthy": "✓", "wedged": "✗", "broken": "✗", "unknown": "?"}.get(
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
             print(f"  {mark} {r['label']}: {r['reason']}{act}")
     # Status reports unresolved wedges. Healing reports failure only when a
     # reload failed its postcondition; successful recovery exits zero.
-    if args.status and wedged:
+    if args.status and unhealthy:
         return 1
     return 1 if heal_failed else 0
 
