@@ -129,6 +129,35 @@ launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
 ```
 
+### Persistent Actions runner install missing
+
+The watchdog also audits `actions.runner.*` LaunchAgents. If a plist survives
+but its absolute `Program` or first `ProgramArguments` executable is gone,
+status is `broken`, not `wedged`. A full reload cannot recreate a deleted runner
+tree, so the watchdog deliberately does not thrash `launchctl`.
+
+Recover only after GitHub proves the exact runner is absent or `offline` and
+not busy. Reinstall the reviewed Actions runner archive at the exact directory
+reported by the watchdog, verify the release SHA-256, and re-register the exact
+name and role labels with `config.sh --unattended --replace --disableupdate`.
+Then use the runner's supported service lifecycle rather than editing launchd
+state by hand:
+
+```sh
+cd /absolute/runner/directory/from-the-watchdog
+./svc.sh uninstall 2>/dev/null || true
+./svc.sh install
+./svc.sh start
+./svc.sh status
+```
+
+Require all three postconditions: `runsvc.sh` exists, `launchctl print
+gui/$(id -u)/<exact-label>` is running, and the GitHub runners API reports the
+exact name online with the intended role label (for example `pulp-preamble`).
+Use the GitHub App wrapper for API and registration-token calls so a stripped
+SSH shell or personal-token quota cannot create a false diagnosis. If GitHub
+reports busy or returns unknown state, stop; do not replace the registration.
+
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
