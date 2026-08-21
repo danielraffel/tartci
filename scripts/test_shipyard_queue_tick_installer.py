@@ -13,6 +13,9 @@ import unittest
 
 SCRIPT = Path(__file__).with_name("shipyard_queue_tick.sh")
 SUPPORT = Path(__file__).with_name("shipyard_queue_tick_support.py")
+SERVICE = Path(__file__).with_name("shipyard_queue_service_tick.sh")
+SERVICE_SUPPORT = Path(__file__).with_name("shipyard_queue_service_tick.py")
+STEWARD = Path(__file__).with_name("shipyard_steward_tick.sh")
 INSTALLER = Path(__file__).with_name("install_shipyard_queue_tick.sh")
 
 
@@ -99,11 +102,17 @@ class QueueTickInstallerTests(unittest.TestCase):
             (fake_bin / "launchctl").write_text(
                 """#!/bin/sh
 if [ "$1" = "print" ]; then
+  [ ! -f "$HOME/booted-out" ] || exit 1
   printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
-  printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+  printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_service_tick.sh"
+elif [ "$1" = "bootout" ]; then
+  touch "$HOME/booted-out"
+elif [ "$1" = "bootstrap" ]; then
+  rm -f "$HOME/booted-out"
 elif [ "$1" = "kickstart" ]; then
   mkdir -p "$HOME/Library/Logs"
   printf '{"status":"healthy"}\\n' > "$HOME/Library/Logs/shipyard-queue-tick.health.json"
+  printf '{"status":"healthy"}\\n' > "$HOME/Library/Logs/shipyard-steward-tick.health.json"
 fi
 exit 0
 """,
@@ -149,11 +158,17 @@ exit 0
                 home
                 / ".local/share/tartci/scripts/shipyard_queue_tick_support.py"
             )
+            installed_service = home / ".local/share/tartci/scripts/shipyard_queue_service_tick.sh"
+            installed_service_support = home / ".local/share/tartci/scripts/shipyard_queue_service_tick.py"
+            installed_steward = home / ".local/share/tartci/scripts/shipyard_steward_tick.sh"
             self.assertTrue(os.access(installed, os.X_OK))
             self.assertEqual(installed.read_bytes(), SCRIPT.read_bytes())
             self.assertEqual(
                 installed_support.read_bytes(), SUPPORT.read_bytes()
             )
+            self.assertEqual(installed_service.read_bytes(), SERVICE.read_bytes())
+            self.assertEqual(installed_service_support.read_bytes(), SERVICE_SUPPORT.read_bytes())
+            self.assertEqual(installed_steward.read_bytes(), STEWARD.read_bytes())
             config = home / ".config/shipyard/queue-tick.env"
             self.assertIn(
                 f"SHIPYARD_QUEUE_REPO_ROOT={repo.resolve()}",
@@ -163,7 +178,7 @@ exit 0
                 "SHIPYARD_QUEUE_AUTHORITY=1",
                 config.read_text(encoding="utf-8"),
             )
-            self.assertIn("fresh health verdict is healthy", result.stdout)
+            self.assertIn("queue and steward health verdicts are healthy", result.stdout)
             with (
                 home
                 / "Library/LaunchAgents/"
@@ -221,10 +236,16 @@ exit 0
                 path.mkdir(parents=True)
             installed = install_dir / "shipyard_queue_tick.sh"
             installed_support = install_dir / "shipyard_queue_tick_support.py"
+            installed_service = install_dir / "shipyard_queue_service_tick.sh"
+            installed_service_support = install_dir / "shipyard_queue_service_tick.py"
+            installed_steward = install_dir / "shipyard_steward_tick.sh"
             config = config_dir / "queue-tick.env"
             plist = agents / "com.danielraffel.shipyard.queue-tick.plist"
             installed.write_bytes(b"prior-script")
             installed_support.write_bytes(b"prior-support")
+            installed_service.write_bytes(b"prior-service")
+            installed_service_support.write_bytes(b"prior-service-support")
+            installed_steward.write_bytes(b"prior-steward")
             config.write_bytes(b"prior-config")
             plist.write_bytes(b"prior-plist")
             calls = home / "calls"
@@ -239,8 +260,17 @@ exit 0
 printf '%s\\n' "$*" >> "$CALLS"
 case "$1" in
   print)
+    [ ! -f "$HOME/booted-out" ] || exit 1
     printf '%s\\n' "$HOME/.config/shipyard/queue-tick.env"
-    printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh"
+    printf '%s\\n' "$HOME/.local/share/tartci/scripts/shipyard_queue_service_tick.sh"
+    exit 0
+    ;;
+  bootout)
+    touch "$HOME/booted-out"
+    exit 0
+    ;;
+  bootstrap)
+    rm -f "$HOME/booted-out"
     exit 0
     ;;
   kickstart)
@@ -287,10 +317,15 @@ exit 0
             self.assertEqual(
                 installed_support.read_bytes(), b"prior-support"
             )
+            self.assertEqual(installed_service.read_bytes(), b"prior-service")
+            self.assertEqual(installed_service_support.read_bytes(), b"prior-service-support")
+            self.assertEqual(installed_steward.read_bytes(), b"prior-steward")
             self.assertEqual(config.read_bytes(), b"prior-config")
             self.assertEqual(plist.read_bytes(), b"prior-plist")
             call_text = calls.read_text(encoding="utf-8")
-            self.assertGreaterEqual(call_text.count("bootstrap"), 2)
+            self.assertGreaterEqual(
+                call_text.count("bootstrap"), 2, result.stderr
+            )
             self.assertGreaterEqual(call_text.count("bootout"), 2)
 
 

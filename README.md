@@ -267,6 +267,17 @@ a wedged GitHub child cannot stop the five-minute cadence. Override that bound
 only with `SHIPYARD_QUEUE_COMMAND_TIMEOUT_SECS=1..300`; a timeout fails closed
 and publishes degraded health without attempting the mutation.
 
+On the single live authority, that same five-minute service also runs
+deterministic `shipyard runner steward` across `Generous-Corp/pulp`,
+`Generous-Corp/forge`, and `Generous-Corp/vellum`. The steward and legacy
+ship-state lanes start concurrently, publish separate health, and have separate
+bounds, so a stalled repository scan cannot postpone cleanup. The legacy lane
+is forced to reap-only while the steward owns queue advancement, avoiding
+competing mutations. This path uses no model. It requires Shipyard 0.97.1 or
+newer; see `launchd/README.md` for the exact command, reports, and installer
+acceptance checks. Total 180-second steward and 240-second cleanup backstops
+keep preflight hangs inside the five-minute cadence.
+
 To serve across reboots, install a LaunchAgent
 from `launchd/` (the Shipyard macOS GUI's "Serve CI builds from this Mac" switch
 toggles those agents). Emulated x86_64 stays on the on-demand `up` lane (smoke /

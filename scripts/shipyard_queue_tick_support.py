@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -113,30 +114,99 @@ def command_validate_tunables(args: argparse.Namespace) -> None:
         raise ValueError("command timeout must be 1..300 seconds")
 
 
+def _process_group_alive(process_group: int) -> bool:
+    try:
+        os.killpg(process_group, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _reap_process_group(process: subprocess.Popen[bytes]) -> None:
+    process_group = process.pid
+    deadline = time.monotonic() + 2
+    while _process_group_alive(process_group) and time.monotonic() < deadline:
+        process.poll()
+        time.sleep(0.05)
+    if _process_group_alive(process_group):
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
 def command_run_bounded(args: argparse.Namespace) -> None:
     if not args.argv:
         raise ValueError("bounded command must not be empty")
-    process = subprocess.Popen(args.argv, start_new_session=True)
+
+    class ForwardedSignal(Exception):
+        def __init__(self, signum: int) -> None:
+            self.signum = signum
+
+    handled_signals = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
+    prior_handlers = {
+        signum: signal.getsignal(signum) for signum in handled_signals
+    }
+    process: subprocess.Popen[bytes] | None = None
+    registering = True
+    deferred_signal: int | None = None
+
+    def forward_signal(signum: int, _frame: object) -> None:
+        nonlocal deferred_signal
+        if registering:
+            if deferred_signal is None:
+                deferred_signal = signum
+            return
+        for handled in handled_signals:
+            signal.signal(handled, signal.SIG_IGN)
+        if process is not None:
+            try:
+                os.killpg(process.pid, signum)
+            except ProcessLookupError:
+                pass
+        # Unwind Popen.wait before trying to reap; waiting recursively from a
+        # Python signal handler can deadlock on subprocess's internal lock.
+        raise ForwardedSignal(signum)
+
+    for signum in handled_signals:
+        signal.signal(signum, forward_signal)
     try:
-        returncode = process.wait(timeout=args.timeout)
+        try:
+            process = subprocess.Popen(args.argv, start_new_session=True)
+        finally:
+            registering = False
+        try:
+            if deferred_signal is not None:
+                forward_signal(deferred_signal, None)
+            returncode = process.wait(timeout=args.timeout)
+        except ForwardedSignal as interruption:
+            _reap_process_group(process)
+            raise SystemExit(128 + interruption.signum) from None
     except subprocess.TimeoutExpired as error:
         try:
             os.killpg(process.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
+        _reap_process_group(process)
         print(
             f"{args.argv[0]} timed out after {args.timeout}s",
             file=sys.stderr,
         )
         raise SystemExit(124) from error
+    finally:
+        registering = False
+        for signum, handler in prior_handlers.items():
+            signal.signal(signum, handler)
     raise SystemExit(returncode)
 
 

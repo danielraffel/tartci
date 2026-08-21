@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -14,6 +18,8 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import shipyard_queue_tick_support as support
+
+SUPPORT = Path(__file__).with_name("shipyard_queue_tick_support.py")
 
 
 class QueueTickSupportTests(unittest.TestCase):
@@ -143,6 +149,101 @@ class QueueTickSupportTests(unittest.TestCase):
                 json.loads(path.read_text(encoding="utf-8")),
                 {"owner/repo#42": 1},
             )
+
+    def test_run_bounded_forwards_service_termination_to_child_group(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            started = root / "started"
+            stopped = root / "stopped"
+            process_group = root / "process-group"
+            child = root / "child.py"
+            child.write_text(
+                """import os, pathlib, signal, subprocess, sys, time
+started, stopped, process_group = map(pathlib.Path, sys.argv[1:])
+def stop(_signum, _frame):
+    stopped.touch()
+    raise SystemExit(0)
+for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+    signal.signal(signum, stop)
+subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)",
+])
+process_group.write_text(str(os.getpgrp()))
+started.touch()
+while True:
+    time.sleep(1)
+""",
+                encoding="utf-8",
+            )
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SUPPORT),
+                    "run-bounded",
+                    "30",
+                    sys.executable,
+                    str(child),
+                    str(started),
+                    str(stopped),
+                    str(process_group),
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline and not started.exists():
+                time.sleep(0.02)
+            self.assertTrue(started.exists())
+            process.send_signal(signal.SIGTERM)
+            self.assertEqual(process.wait(timeout=5), 128 + signal.SIGTERM)
+            self.assertTrue(stopped.exists())
+            group = int(process_group.read_text(encoding="utf-8"))
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(group, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.02)
+            else:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                self.fail("bounded child process group survived termination")
+
+    def test_run_bounded_defers_signal_until_child_is_registered(self) -> None:
+        class FakeProcess:
+            pid = 4242
+
+            def poll(self) -> None:
+                return None
+
+            def wait(self, timeout: int | None = None) -> int:
+                return 0
+
+        fake_process = FakeProcess()
+
+        def spawn(*_args: object, **_kwargs: object) -> FakeProcess:
+            os.kill(os.getpid(), signal.SIGTERM)
+            return fake_process
+
+        args = type(
+            "Args",
+            (),
+            {"argv": ["shipyard", "runner", "steward"], "timeout": 30},
+        )()
+        with (
+            mock.patch.object(support.subprocess, "Popen", side_effect=spawn),
+            mock.patch.object(support.os, "killpg") as killpg,
+            self.assertRaises(SystemExit) as raised,
+        ):
+            support.command_run_bounded(args)
+        self.assertEqual(raised.exception.code, 128 + signal.SIGTERM)
+        killpg.assert_any_call(fake_process.pid, signal.SIGTERM)
+        killpg.assert_any_call(fake_process.pid, signal.SIGKILL)
 
 
 if __name__ == "__main__":

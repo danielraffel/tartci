@@ -275,14 +275,41 @@ fall back to ambient `gh`.
 ## Shipyard queue janitor
 
 `com.danielraffel.shipyard.queue-tick.plist.template` runs
-`scripts/shipyard_queue_tick.sh` every 5 min to make the Shipyard ship-queue
+`scripts/shipyard_queue_service_tick.sh` every 5 min to make the Shipyard ship-queue
 progress **independent of any interactive session** — so a cmux restart or a
 Claude session running out of quota can no longer strand a validated PR or leak
-ship-state. Per active ship-state whose worker is not live, it: reaps records
-whose PR GitHub reports merged/closed (`shipyard ship-state discard`), drives
-open green PRs to merge via shipyard's own fail-closed `auto-merge` (no-op
-unless all targets green and the live head matches the validated SHA), and
-surfaces (does not auto-rebase) behind/DIRTY PRs.
+ship-state. The service starts two isolated children concurrently: the existing
+ship-state janitor in reap-only mode and a deterministic cross-repository
+steward for Pulp, Forge, and Vellum. This prevents two queue writers racing the
+same exact head while preserving terminal ship-state cleanup. The steward
+command is exactly:
+
+```sh
+shipyard runner steward \
+  --repo Generous-Corp/pulp \
+  --repo Generous-Corp/forge \
+  --repo Generous-Corp/vellum \
+  --apply --json
+```
+
+The steward is enabled only in full-live apply mode on the explicit mutation authority,
+uses Shipyard's configured GitHub App auth, and makes no model calls. It has a
+separate 120-second bound (`SHIPYARD_STEWARD_TIMEOUT_SECS=1..240`), health at
+`~/Library/Logs/shipyard-steward-tick.health.json`, and last JSON report at
+`~/Library/Logs/shipyard-steward-tick.json`. A timeout or malformed result
+degrades only that lane; legacy cleanup has already been started in parallel.
+The supervisor also enforces total deadlines over preflight and execution:
+180 seconds for stewardship and 240 seconds for cleanup, configurable with
+`SHIPYARD_SERVICE_STEWARD_TIMEOUT_SECS` and
+`SHIPYARD_SERVICE_LEGACY_TIMEOUT_SECS` (both 1..280). Thus a hung preflight or
+legacy GitHub read cannot suppress later five-minute ticks.
+
+Per active ship-state whose worker is not live, the legacy lane reaps records
+whose PR GitHub reports merged/closed (`shipyard ship-state discard`) and
+surfaces (does not auto-rebase) behind/DIRTY PRs. Its historical auto-merge
+path remains available to direct script callers, but the installed concurrent
+service forces that child to reap-only because `runner steward` owns queue
+advancement.
 
 Safe-by-construction: acts only on PRs that already have a ship-state record,
 never reimplements merge logic, never edits state files, fails closed on any
@@ -319,6 +346,11 @@ ship-state without merging. Every mode requires `--gh-cli` pointing to an
 executable GitHub App wrapper; unattended operation never falls back to ambient
 `gh`. Never hand-edit the installed plist to change mode; re-run the installer
 so the rendered mode and fresh health proof stay coupled.
+The installer refuses to replace a running prior generation. Wait for its
+current tick to finish and rerun; it confirms bootout and process quiescence
+before installing the new writer so old and new authority processes cannot
+overlap. If an orphan is detected after bootout, the prior LaunchAgent remains
+unloaded until the operator reruns the installer after quiescence.
 
 Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
 exactly one host whose Shipyard runner tag matches
@@ -329,10 +361,12 @@ and requires `authority_matches=true` before full-live operation. An
 authority-local `shipyard merge-queue hold` causes the configured authority
 tick to exit before any GitHub read; during an incident, run it on that
 authority (and propagate it fleet-wide for consistent operator status). This
-integration requires Shipyard 0.80.0 or newer; install that release before
+legacy integration requires Shipyard 0.80.0 or newer. The combined service
+requires Shipyard 0.97.1 or newer; install that release before
 deploying the script or plist. Missing authority configuration is a hard
 unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
-is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to
+is written to `~/Library/Logs/shipyard-queue-tick.health.json`; the installer
+requires both it and the steward health file to be freshly healthy. Inability to
 write that verdict is itself loud and nonzero. Unreadable or malformed queue
 control and ship-state observations are unhealthy rather than successful
 no-ops. A ship-state is

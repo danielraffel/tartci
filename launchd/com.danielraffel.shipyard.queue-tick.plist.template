@@ -2,25 +2,22 @@
 <!--
   launchd template for the per-host Shipyard queue janitor.
 
-  Runs scripts/shipyard_queue_tick.sh periodically to drive in-flight
-  ship-state to completion (via shipyard's OWN fail-closed `auto-merge`) and
-  reap orphaned records (merged/closed PRs), INDEPENDENT of any interactive
-  session. See planning/2026-06-30-ship-queue-resilience-design.md in the pulp
-  repo for the full design + adversarial review.
+  Runs scripts/shipyard_queue_service_tick.sh periodically. The supervisor
+  starts legacy ship-state cleanup and deterministic Pulp/Forge/Vellum runner
+  stewardship concurrently, with separate health/reporting. Neither lane can
+  prevent the other from running. No model is involved.
 
   SAFETY: three-stage rollout, most-reversible first.
     1. DRY-RUN (APPLY=0)                — logs only; observe the log.
     2. REAP-ONLY (APPLY=1, REAP_ONLY=1) — acts on the proven path (discard
        GitHub-confirmed MERGED/CLOSED orphans) but HOLDS the auto-merge action
        in surface-only mode. Enable this once dry-run has baked.
-    3. FULL-LIVE (APPLY=1, REAP_ONLY=0, QUEUE_AUTHORITY=1) — also drives
-       OPEN+green ship-state PRs through `shipyard auto-merge`. Enable on
-       exactly one fleet host after the auto-merge branch has been observed
-       firing correctly on a real PR.
-  The tick never reimplements merge logic, merges only green+head-matched PRs
-  through `shipyard auto-merge`, and discards only GitHub-confirmed
-  MERGED/CLOSED records.
-  Requires Shipyard 0.80.0 or newer. Install that release before this plist.
+    3. FULL-LIVE (APPLY=1, QUEUE_AUTHORITY=1) — the supervisor keeps legacy
+       ship-state work reap-only and enables deterministic cross-repository
+       `shipyard runner steward`. Enable on exactly one fleet host.
+  Neither lane reimplements merge logic. The steward delegates exact-head queue
+  policy to Shipyard; cleanup discards only GitHub-confirmed MERGED/CLOSED
+  records. Requires Shipyard 0.97.1 or newer.
 
   Install shape (run on each CI host — m1/m3/m5):
 
@@ -45,7 +42,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh</string>
+        <string>$HOME/.local/share/tartci/scripts/shipyard_queue_service_tick.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
