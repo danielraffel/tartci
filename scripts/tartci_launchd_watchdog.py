@@ -241,10 +241,14 @@ def is_pool_runner(label: str) -> bool:
 
 
 def pool_participating(path: str) -> bool:
-    """Read durable pool intent. Missing/unrecognised values preserve legacy ON."""
+    """Read durable pool intent. Missing/unrecognised values preserve legacy ON.
+
+    `tartci pool` and Shipyard use the numeric 1/0 contract; accepting the old
+    true/false spelling keeps deployed hosts compatible.
+    """
     try:
         with open(path, encoding="utf-8") as fh:
-            return fh.read().strip().lower() != "false"
+            return fh.read().strip().lower() not in {"0", "false", "off", "draining"}
     except OSError:
         return True
 
@@ -332,7 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--participation-file",
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
-                        ".config", "tartci", "participate"))
+                        ".config", "tartci", "native-build-participation"))
     args = ap.parse_args(argv)
 
     if args.reload:

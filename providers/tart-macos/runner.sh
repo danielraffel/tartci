@@ -43,6 +43,8 @@
 set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/pool.lib.sh
+source "$TARTCI_ROOT/providers/common/pool.lib.sh"
 export TART_HOME="${TART_HOME:-$HOME/VMs}"
 # GitHub CLI used for every API call (queue polling, JIT mint, runner reclaim,
 # job/run polling, cancel). Default `gh` (the personal/host auth) keeps generic
@@ -523,6 +525,7 @@ discard_current_vm(){
 }
 
 cleanup(){
+  tartci_pool_lock_release
   [ "$CLEANED_UP" = 1 ] && return 0
   discard_current_vm
   tartci_release_vm_lease
@@ -652,6 +655,7 @@ run_runner_until_done(){
     idle_elapsed=$((now - start))
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
+      tartci_pool_lock_release
       assigned_at="$now"
       for _ in $(seq 1 6); do
         capture_current_job && break
@@ -815,6 +819,19 @@ run_one(){
   fi
 
   heartbeat minting-jit
+  if ! tartci_pool_lock_acquire; then
+    note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 75
+  fi
+  if ! tartci_pool_admission_open; then
+    tartci_pool_lock_release
+    note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 75
+  fi
   event mint_jit "labels=$selected_labels tier=$selected_tier"
   # Claim the exact per-boot registration name before minting. Cleanup can then
   # reclaim it even when a signal lands immediately after GitHub creates it.
@@ -824,11 +841,13 @@ run_one(){
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
+    tartci_pool_lock_release
     note "[$i] JIT config mint failed — discarding VM"
     cleanup
     return 1
   }
   if [ -z "$jit" ]; then
+    tartci_pool_lock_release
     note "[$i] empty JIT config — discarding VM"
     cleanup
     return 1
@@ -838,6 +857,7 @@ run_one(){
   heartbeat idle-wait
 
   run_runner_until_done "$vm" "$ip" "$jit" || rc=$?
+  tartci_pool_lock_release
   t_runner_done="$(now_epoch)"
   if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
@@ -908,6 +928,12 @@ if [ "$LOOP" = 1 ]; then
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   heartbeat loop
   while true; do
+    if ! tartci_pool_admission_open; then
+      note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
+      heartbeat draining
+      sleep "$POLL"
+      continue
+    fi
     selection="$(select_work)"
     IFS='|' read -r q selected_labels selected_tier <<< "$selection"
     cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
@@ -966,6 +992,7 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"

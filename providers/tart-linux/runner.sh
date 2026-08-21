@@ -35,6 +35,8 @@ set -euo pipefail
 # fresh auth). See the README 'Scan-blindness self-heal' section.
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# shellcheck source=providers/common/pool.lib.sh
+source "$TARTCI_ROOT/providers/common/pool.lib.sh"
 export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
@@ -92,6 +94,7 @@ source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 source "$TARTCI_ROOT/providers/common/runner-assignment.lib.sh"
 
 discard_current_linux_vm(){
+  tartci_pool_lock_release
   [ "$CURRENT_CLEANED_UP" = 0 ] || return 0
   CURRENT_CLEANED_UP=1
   if [ -n "$CURRENT_RUNNER_PID" ]; then
@@ -260,7 +263,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     TARTCI_STATE_QEMU_PID_STARTED_AT="$(if [ -n "$rpid" ]; then tartci_pid_started_at "$rpid"; fi)" \
     tartci_write_vm_state tart-linux "$vm" "$vm" "$1" ephemeral "$state_dir"
   }
-  mark_runner_assigned(){ write_state job-running; }
+  mark_runner_assigned(){ tartci_pool_lock_release; write_state job-running; }
   lease_cores="$(tartci_vm_lease_cores tart-linux)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-linux)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
@@ -351,6 +354,17 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     fi
   fi
 
+  if ! tartci_pool_lock_acquire; then
+    note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
+    discard_current_linux_vm
+    return 75
+  fi
+  if ! tartci_pool_admission_open; then
+    tartci_pool_lock_release
+    note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
+    discard_current_linux_vm
+    return 75
+  fi
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
   for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
@@ -361,11 +375,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config')" || {
+    tartci_pool_lock_release
     note "[$i] JIT config mint failed — discarding VM"
     discard_current_linux_vm
     return 1
   }
   if [ -z "$jit" ]; then
+    tartci_pool_lock_release
     note "[$i] empty JIT config — discarding VM"
     discard_current_linux_vm
     return 1
@@ -394,6 +410,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   else
     run_status=$?
   fi
+  tartci_pool_lock_release
   t_runner_done="$(now_epoch)"
   prefix_guest_log "$logdir/runner-output.log"
 
@@ -440,6 +457,11 @@ if [ "$LOOP" = 1 ]; then
   blind=0
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   while true; do
+    if ! tartci_pool_admission_open; then
+      note "pool $(tartci_pool_read_state) — no new Linux admission; waiting ${POLL}s"
+      sleep "$POLL"
+      continue
+    fi
     q="$(queued_work)"
     if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
       blind=$((blind + 1))
@@ -464,6 +486,7 @@ if [ "$LOOP" = 1 ]; then
     fi
   done
 else
+  tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
   note "ephemeral Linux runner ONCE; golden=$GOLDEN labels=$LABELS"
   run_one 1
 fi
