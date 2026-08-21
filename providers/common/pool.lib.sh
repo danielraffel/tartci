@@ -23,6 +23,9 @@ TARTCI_POOL_TRANSITION_LOCK="${TARTCI_POOL_TRANSITION_LOCK:-$HOME/.config/tartci
 # Read participation: 1 = participating, 0 = opted out. Absent means
 # participating — opting out is an explicit act, and a missing/garbage file must
 # never silently pull a host out of the pool.
+# The optional path is an intentional test seam; production callers use the
+# host-level default, so ShellCheck cannot see a shell caller passing `$1`.
+# shellcheck disable=SC2120
 tartci_pool_read_participation() {
   local f="${1:-$TARTCI_POOL_PARTICIPATION_FILE}"
   if [ -f "$f" ]; then
@@ -47,6 +50,8 @@ tartci_pool_write_participation() {
 # on = admit work, draining = finish assigned work but admit nothing new,
 # off = immediate stop. The separate state keeps the existing numeric
 # participation contract intact for Shipyard/native-build leases.
+# The optional path is an intentional test seam; see read_participation above.
+# shellcheck disable=SC2120
 tartci_pool_read_state() {
   local f="${1:-$TARTCI_POOL_STATE_FILE}"
   if [ -f "$f" ]; then
@@ -112,11 +117,15 @@ tartci_pool_agent_pid() {
     | awk '/^[[:space:]]*pid = [0-9]+/ { print $3; exit }'
 }
 
+# Optional paths on the helpers below are deterministic test seams. Production
+# always uses the configured host-global files/lock.
+# shellcheck disable=SC2120
 tartci_pool_persistent_hold_ready() {
   local f="${1:-$TARTCI_POOL_PERSISTENT_HOLD_FILE}"
   [ -f "$f" ] && [ "$(tr -d '[:space:]' < "$f" 2>/dev/null)" = held-idle ]
 }
 
+# shellcheck disable=SC2120
 tartci_pool_lock_acquire() {
   local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}" attempt=0
   mkdir -p "$(dirname "$lock")"
@@ -134,6 +143,7 @@ tartci_pool_lock_acquire() {
   return 1
 }
 
+# shellcheck disable=SC2120
 tartci_pool_lock_release() {
   local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}"
   [ "$(cat "$lock/pid" 2>/dev/null || true)" = "$$" ] || return 0
