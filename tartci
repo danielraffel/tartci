@@ -120,7 +120,38 @@ cmd_observe() {
 cmd_setup() {
   echo "tartci setup — installing prereqs (idempotent) + creating stores"
   if command -v brew >/dev/null 2>&1; then
-    brew list cirruslabs/cli/tart >/dev/null 2>&1 || brew install cirruslabs/cli/tart || true
+    local sw_vers_bin="${TARTCI_SW_VERS_BIN:-/usr/bin/sw_vers}" macos_major
+    [ -x "$sw_vers_bin" ] || {
+      echo "tartci setup: cannot determine macOS version ($sw_vers_bin missing)" >&2
+      return 1
+    }
+    macos_major="$($sw_vers_bin -productVersion | cut -d. -f1)"
+    case "$macos_major" in
+      ''|*[!0-9]*) echo "tartci setup: invalid macOS major version: $macos_major" >&2; return 1 ;;
+    esac
+    if [ "$macos_major" -lt 15 ]; then
+      # Both taps' current Softnet formula requires Sequoia. Preserve a working
+      # pre-existing Tart binary, but never claim a fresh formula install is
+      # compatible with Ventura/Sonoma.
+      if command -v tart >/dev/null 2>&1; then
+        echo "tartci setup: retaining existing Tart on macOS $macos_major; upgrade to macOS 15+ before migrating to openai/tools" >&2
+      else
+        echo "tartci setup: current Tart formulae require macOS 15+; upgrade macOS before fresh onboarding (an existing compatible Tart binary may be retained)" >&2
+        return 1
+      fi
+    else
+      if brew list cirruslabs/cli/tart >/dev/null 2>&1 || \
+         brew list cirruslabs/cli/softnet >/dev/null 2>&1; then
+        echo "tartci setup: a legacy cirruslabs/cli Tart or Softnet keg is installed; migrate at an idle boundary (docs/runbook.md)" >&2
+        return 1
+      fi
+      if ! brew list openai/tools/tart >/dev/null 2>&1; then
+        brew tap openai/tools
+        brew trust --formula openai/tools/softnet
+        brew trust --formula openai/tools/tart
+        brew install openai/tools/tart
+      fi
+    fi
     for f in qemu sshpass jq gh; do brew list "$f" >/dev/null 2>&1 || brew install "$f" || true; done
   else
     echo "Homebrew not found — install it first: https://brew.sh"; return 1
@@ -244,7 +275,7 @@ $(tartci_pool_runner_agents "$agents_dir")
 EOF
       echo "runner agents ${action}ed: $n"
       if [ "$sub" = off ]; then
-        echo "opted OUT: $host finishes in-flight jobs, takes no new CI work"
+        echo "opted OUT: $host agents unloaded immediately (pool off is not a drain)"
       else
         echo "opted IN: $host is participating in the CI pool"
       fi

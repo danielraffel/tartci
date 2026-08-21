@@ -7,8 +7,9 @@
 #   1. native-build participation file  -> the lease governor refuses to place a
 #      native-build lease on an opted-out host (covers non-launchd build paths).
 #   2. runner LaunchAgents unloaded      -> the host's GitHub Actions / tartci
-#      serve runners stop polling, so GitHub routes new jobs elsewhere. Runners
-#      are long-lived, so this drains gracefully: in-flight jobs finish.
+#      serve runners stop polling. launchctl unload is immediate and can stop
+#      an active provider job; callers must prove scheduler + local idleness
+#      before using `pool off`. This command is not a drain operation.
 #
 # Pure logic lives here (participation r/w, agent enumeration) so it is unit
 # testable; the dispatcher's cmd_pool wires launchctl + JSON on top.
