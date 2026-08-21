@@ -39,7 +39,7 @@ Environment:
 USAGE
 }
 
-command -v tart >/dev/null 2>&1 || die "tart not installed (brew install cirruslabs/cli/tart)"
+command -v tart >/dev/null 2>&1 || die "tart not installed (brew install openai/tools/tart)"
 command -v ssh >/dev/null 2>&1 || die "ssh not installed"
 
 while [ $# -gt 0 ]; do case "$1" in

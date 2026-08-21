@@ -26,7 +26,12 @@ plugins in a DAW.
 
 ### Host resource governance
 
-**Opt a host out** with `tartci pool off` (and back in with `tartci pool on`; `tartci pool status [--json]` shows state). This host-level switch writes the native-build participation flag *and* unloads the host's CI runner agents, so the Mac finishes in-flight jobs and takes no new CI work — decoupled from any per-lane GUI toggle or placement engine.
+**Opt a host out** with `tartci pool off` (and back in with `tartci pool on`;
+`tartci pool status [--json]` shows state). This host-level switch writes the
+native-build participation flag and immediately unloads the host's CI runner
+agents. It is not a drain command: first prove through the scheduler that every
+runner on the host is idle and locally that no provider VM is running. See the
+runbook for the fail-closed sequence.
 
 Shared Macs run CI validation, agent builds, and VM runners on the same
 hardware. Without a shared budget they oversubscribe — two hosts melted in July
@@ -287,6 +292,18 @@ at its configured in-progress capacity. These Linux/Windows runners are JIT
 ephemeral, so the resolver checks in-progress jobs for each host label rather
 than looking for idle registered GitHub runners. That avoids duplicate VM boots
 and avoids queued self-hosted jobs that cannot later spill to GitHub-hosted.
+
+Tart's maintained upstream and Homebrew channel are now `openai/tart` and
+`openai/tools/tart`. New hosts use `brew install openai/tools/tart`; do not add
+the retired `cirruslabs/cli` tap. Existing hosts require a one-at-a-time,
+idle-boundary tap migration because Homebrew refuses same-named formulae from
+both taps. Preserve fleet capacity by proving scheduler and VM idleness before
+taking only one host out of participation, prefetched uninstall/install with
+rollback, then a real ephemeral VM canary before moving to the next host. See
+the runbook for the exact sequence. Remote health probes use
+`/opt/homebrew/bin/tart` (or the host profile's explicit `tart_bin`) rather than
+ambient `command -v`: a stripped SSH shell commonly omits Homebrew and must be
+reported as launch-environment drift, not as an absent Tart installation.
 
 An exception-only recovery pool may deliberately let several hosts satisfy one
 shared queued-job label so an offline host cannot strand the job. Preserve a

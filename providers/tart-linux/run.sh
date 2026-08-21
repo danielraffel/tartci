@@ -45,7 +45,7 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
-command -v tart >/dev/null 2>&1 || die "tart not installed (brew install cirruslabs/cli/tart)"
+command -v tart >/dev/null 2>&1 || die "tart not installed (brew install openai/tools/tart)"
 
 while [ $# -gt 0 ]; do case "$1" in
   --golden) GOLDEN="$2"; shift 2;;

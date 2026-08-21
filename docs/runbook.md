@@ -74,9 +74,9 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 6. **Verify governed.** `tartci host-profile` shows the role + core/memory
    budgets; `tartci leases status` shows the store answering. The governor now
    bounds this host's builds + VMs automatically (core + memory admission).
-The new Mac is now governed, serving its lanes, and opt-out-able
-(`tartci pool off` finishes in-flight jobs, then takes no new work) exactly like
-the rest of the pool.
+The new Mac is now governed, serving its lanes, and opt-out-able exactly like
+the rest of the pool. `tartci pool off` unloads its agents immediately, so use
+it only after the scheduler and local VM probes both prove the host idle.
 
 ---
 
@@ -85,11 +85,80 @@ the rest of the pool.
 **Tools (scripted by `./tartci setup`; manual fallback shown):**
 
 ```bash
-brew install cirruslabs/cli/tart qemu sshpass
+brew install openai/tools/tart qemu sshpass
 # qemu     — Windows VM substrate (hvf accel)
 # tart     — macOS + Linux VM substrate (Apple Virtualization)
 # sshpass  — non-interactive first-boot SSH during provisioning
 ```
+
+Tart moved from `cirruslabs/tart` to `openai/tart`; use the official
+`openai/tools/tart` formula on macOS 15 or later. Its Softnet dependency
+currently requires macOS 15, as does the legacy tap's current Softnet formula.
+On Ventura/Sonoma, `tartci setup` preserves a working pre-existing Tart binary
+but refuses a fresh formula install; upgrade that host to macOS 15 or later
+before fresh onboarding or channel migration. Do not replace Tart while a VM or
+provider job is running. To migrate an existing host from the old tap, first prevent new
+placement on that host in the scheduler and prove every runner belonging to it
+reports `busy=false`. Then prove the local provider has no guest or `tart run`
+process. The exact scheduler query depends on the repository and host labels;
+do not substitute an empty local process list for the authoritative runner-busy
+check. Only after both checks are terminal-idle may you invoke `pool off`, which
+unloads LaunchAgents immediately rather than draining them:
+
+```bash
+gh api repos/OWNER/REPO/actions/runners --paginate \
+  --jq '.runners[] | select(.name | contains("HOST_TAG")) | [.name,.status,.busy] | @tsv'
+# Every runner for this host must report busy=false, and routing/admission for
+# the host must remain disabled for the duration of the migration.
+
+pgrep -fl 'tart run'                      # must print no active VM process
+/opt/homebrew/bin/tart list --format json # every entry must report Running=false
+tartci pool off                           # immediate unload; NOT a drain
+
+# Cache both sides before removing either installed keg. The legacy bottles are
+# the offline rollback path if installation of the new channel fails.
+brew fetch --force cirruslabs/cli/softnet cirruslabs/cli/tart
+
+brew tap openai/tools
+brew trust --formula openai/tools/softnet
+brew trust --formula openai/tools/tart
+brew fetch --force openai/tools/softnet openai/tools/tart
+brew uninstall cirruslabs/cli/tart cirruslabs/cli/softnet
+if ! brew install openai/tools/softnet openai/tools/tart; then
+  # Remove either partially installed new keg before restoring the cached old
+  # channel. `reinstall` is invalid because the legacy kegs were uninstalled.
+  brew list openai/tools/tart >/dev/null 2>&1 && \
+    brew uninstall openai/tools/tart || true
+  brew list openai/tools/softnet >/dev/null 2>&1 && \
+    brew uninstall openai/tools/softnet || true
+  HOMEBREW_NO_AUTO_UPDATE=1 brew install \
+    cirruslabs/cli/softnet cirruslabs/cli/tart
+  exit 1
+fi
+/opt/homebrew/bin/tart --version
+
+tartci doctor
+# Dispatch one non-required canary job that requires the unique HOST_CANARY
+# label, then drive it directly through the governed ephemeral provider while
+# normal host routing remains disabled. This path owns the VM lease as well as
+# clone, boot/network, shared mount, job execution, release, and discard.
+TARTCI_GH_CLI=ghapp tartci serve macos --once --repo OWNER/REPO \
+  --labels self-hosted,macOS,ARM64,HOST_CANARY
+tartci leases status
+/opt/homebrew/bin/tart list --format json # canary clone must be gone
+tartci pool on
+tartci pool status
+```
+
+Canary one overflow host first, then migrate remaining hosts one at a time at
+natural idle boundaries. Require that one-shot workflow to finish terminal-green
+and prove inventory, CoW clone, VM boot/network, shared-directory mount, discard,
+governor lease accounting, and restored runner participation before advancing.
+The guarded install above removes partial new
+kegs and restores the prefetched legacy formulae on failure; never leave a
+half-migrated host marked healthy. Remove the obsolete Cirrus tap only after
+every provider host reports the intended version and completes a real ephemeral
+job.
 
 **A VM store directory, excluded from Spotlight** (large disks should never be
 indexed — it wastes IO and CPU):
@@ -153,6 +222,10 @@ all point at the same Tart store. If one uses default `tart` state and another
 uses `TART_HOME`, capacity and cleanup will disagree.
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
+Do not diagnose installation state from raw `ssh host 'command -v tart'` output:
+that command can fail solely because a stripped non-login shell omitted
+`/opt/homebrew/bin`. Probe the configured absolute binary and report
+`installed but unreachable from launch environment` separately from `absent`.
 
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
@@ -1186,8 +1259,10 @@ lanes change.
 - `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
   (the lease governor then refuses native-build leases here) **and**
   `launchctl unload` this host's CI runner agents (`com.danielraffel.pulp.*-runner-*`
-  and `actions.runner.*`). Runners are long-lived, so this drains gracefully:
-  in-flight jobs finish, GitHub routes new jobs to other Macs.
+  and `actions.runner.*`). The unload is immediate and can terminate an active
+  provider job. This is **not** a drain: disable new placement first, prove all
+  of the host's runners `busy=false` through GitHub, and prove no local provider
+  VM/process is active before running it.
 - `tartci pool on` — participation=1 + `launchctl load` the runner agents.
 - `tartci pool status [--json]` — participation state + each runner agent's
   loaded/stopped state.

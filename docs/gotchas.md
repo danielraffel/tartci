@@ -59,7 +59,17 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
   → *Fix:* configure fleet tools with the absolute Tart path, usually
   `/opt/homebrew/bin/tart`, and pass the intended store explicitly as
-  `TART_HOME=/Users/<you>/VMs` (or the host's absolute Tart store path).
+  `TART_HOME=/Users/<you>/VMs` (or the host's absolute Tart store path). Treat
+  `installed but unreachable from this launch environment` as a distinct
+  status from `absent`; never infer absence from ambient `command -v` alone.
+
+- **`tartci setup` still finds `cirruslabs/cli/tart`.**
+  → *Cause:* Tart moved to `openai/tart`, and Homebrew will not install the
+  same-named `openai/tools/tart` formula while the old tap's keg is installed.
+  → *Fix:* take the host out of the pool, wait for zero running Tart VMs,
+  prefetch the new formulae, uninstall the old Tart/Softnet kegs, install
+  `openai/tools/tart`, and canary one host at a time using the runbook. Do not
+  perform the tap migration underneath an active VM.
 
 ## Linux (Tart)
 
