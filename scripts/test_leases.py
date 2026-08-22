@@ -48,6 +48,9 @@ class LeaseCliTestCase(unittest.TestCase):
         reserved: int = 0,
         mem_mb: int | None = None,
         capacity_mem_mb: int = 0,
+        disk_path: Path | None = None,
+        disk_growth_mb: int = 0,
+        disk_floor_mb: int = 0,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         # Core-axis tests keep the memory axis OFF (capacity_mem_mb=0) so they
@@ -57,6 +60,15 @@ class LeaseCliTestCase(unittest.TestCase):
         extra: list[str] = ["--capacity-mem-mb", str(capacity_mem_mb)]
         if mem_mb is not None:
             extra += ["--mem-mb", str(mem_mb)]
+        if disk_path is not None:
+            extra += [
+                "--disk-path",
+                str(disk_path),
+                "--disk-growth-mb",
+                str(disk_growth_mb),
+                "--disk-floor-mb",
+                str(disk_floor_mb),
+            ]
         return self.run_cli(
             "acquire",
             "--id",
@@ -319,6 +331,151 @@ class LeaseMemoryAxisTests(LeaseCliTestCase):
         )
         self.assertTrue(body["ok"])  # axis off → an absurd mem request is still granted
         self.assertNotIn("used_mem_mb", body["capacity"])
+
+
+class LeaseDiskAxisTests(LeaseCliTestCase):
+    def test_disk_denial_reports_free_reserved_and_required(self) -> None:
+        free_mb = leases.disk_probe(self.tmp.name)["free_bytes"] // (1024 * 1024)
+        floor_mb = max(0, free_mb - 128)
+        self.acquire(
+            "a",
+            1,
+            disk_path=Path(self.tmp.name),
+            disk_growth_mb=96,
+            disk_floor_mb=floor_mb,
+        )
+        denied = self.acquire(
+            "b",
+            1,
+            disk_path=Path(self.tmp.name),
+            disk_growth_mb=96,
+            disk_floor_mb=floor_mb,
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "disk_capacity_exceeded")
+        self.assertTrue(body["exceeded_axis"]["disk"])
+        self.assertEqual(body["disk"]["reserved_bytes"], 96 * 1024 * 1024)
+        self.assertEqual(body["disk"]["requested_bytes"], 96 * 1024 * 1024)
+        self.assertGreater(body["disk"]["required_bytes"], body["disk"]["free_bytes"])
+
+    def test_success_reports_preexisting_reserved_and_new_requested(self) -> None:
+        first = json.loads(
+            self.acquire(
+                "first",
+                1,
+                disk_path=Path(self.tmp.name),
+                disk_growth_mb=1,
+            ).stdout
+        )
+        self.assertEqual(first["disk"]["reserved_bytes"], 0)
+        self.assertEqual(first["disk"]["requested_bytes"], 1024 * 1024)
+        second = json.loads(
+            self.acquire(
+                "second",
+                1,
+                disk_path=Path(self.tmp.name),
+                disk_growth_mb=2,
+            ).stdout
+        )
+        self.assertEqual(second["disk"]["reserved_bytes"], 1024 * 1024)
+        self.assertEqual(second["disk"]["requested_bytes"], 2 * 1024 * 1024)
+
+    def test_concurrent_acquire_cannot_overcommit_one_volume(self) -> None:
+        free_mb = leases.disk_probe(self.tmp.name)["free_bytes"] // (1024 * 1024)
+        floor_mb = max(0, free_mb - 256)
+        common = [
+            sys.executable,
+            str(SCRIPT),
+            "acquire",
+            "--cores",
+            "1",
+            "--capacity",
+            "8",
+            "--capacity-mem-mb",
+            "0",
+            "--reserved-gate-cores",
+            "0",
+            "--pid",
+            str(self.pid),
+            "--disk-path",
+            self.tmp.name,
+            "--disk-growth-mb",
+            "160",
+            "--disk-floor-mb",
+            str(floor_mb),
+            "--store-dir",
+            str(self.store),
+            "--json",
+        ]
+        procs = [
+            subprocess.Popen([*common, "--id", lease_id], text=True, stdout=subprocess.PIPE)
+            for lease_id in ("concurrent-a", "concurrent-b")
+        ]
+        results = []
+        for proc in procs:
+            stdout, _ = proc.communicate(timeout=10)
+            results.append((proc.returncode, json.loads(stdout)))
+        self.assertEqual(sorted(rc for rc, _ in results), [0, 75])
+        status = json.loads(self.run_cli("status").stdout)
+        self.assertEqual(len(status["leases"]), 1)
+        self.assertEqual(status["disk_volumes"][0]["reserved_bytes"], 160 * 1024 * 1024)
+
+    def test_release_removes_disk_reservation(self) -> None:
+        self.acquire(
+            "disk-release",
+            1,
+            disk_path=Path(self.tmp.name),
+            disk_growth_mb=1,
+        )
+        released = json.loads(self.run_cli("release", "--id", "disk-release").stdout)
+        self.assertTrue(released["ok"])
+        status = json.loads(self.run_cli("status").stdout)
+        self.assertEqual(status["leases"], [])
+        self.assertEqual(status["disk_volumes"], [])
+
+    def test_distinct_devices_do_not_share_reservations(self) -> None:
+        records = [{"disk_device_id": "dev-a", "disk_growth_bytes": 90}]
+        probe = {
+            "device_id": "dev-b",
+            "mount_path": "/b",
+            "reservation_path": "/b/store",
+            "free_bytes": 100,
+        }
+        state = leases.disk_capacity(records, probe, requested_bytes=20, floor_bytes=30)
+        self.assertEqual(state["reserved_bytes"], 0)
+        self.assertEqual(state["required_bytes"], 50)
+
+    def test_dead_owner_reap_releases_disk_reservation(self) -> None:
+        exited = subprocess.Popen([sys.executable, "-c", "pass"])
+        exited.wait(timeout=5)
+        now = leases.iso(leases.utcnow())
+        probe = leases.disk_probe(self.tmp.name)
+        self.store.mkdir()
+        leases.write_records(
+            self.store,
+            [
+                {
+                    "id": "dead-disk-owner",
+                    "lease_size_cores": 1,
+                    "priority": 40,
+                    "pid": exited.pid,
+                    "process_start_time": "Mon Jan  1 00:00:00 2001",
+                    "host_boot_time": leases.host_boot_time(),
+                    "disk_device_id": probe["device_id"],
+                    "disk_reservation_path": self.tmp.name,
+                    "disk_growth_bytes": 1024,
+                    "disk_floor_bytes": 0,
+                    "created_at": now,
+                    "heartbeat_at": now,
+                }
+            ],
+        )
+        status = json.loads(self.run_cli("reap").stdout)
+        self.assertEqual(status["leases"], [])
+        self.assertEqual(status["disk_volumes"], [])
+        self.assertEqual(status["reaped"][0]["id"], "dead-disk-owner")
 
 
 class LeaseMinimalPathTests(unittest.TestCase):

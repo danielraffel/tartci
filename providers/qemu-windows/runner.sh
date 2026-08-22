@@ -309,7 +309,7 @@ run_one(){ # $1=iteration index
   # Claim release responsibility before the foreground acquisition so a signal
   # delivered immediately after success cannot strand the new lease.
   CURRENT_WIN_LEASE_ID_EXPECTED="vm-qemu-windows-vm-$job"
-  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
+  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" "$WORKROOT" || {
     local lease_rc=$?
     cleanup_active_windows_job
     return "$lease_rc"

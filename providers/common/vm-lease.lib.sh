@@ -3,6 +3,8 @@
 
 : "${TARTCI_VM_LEASES:=1}"
 : "${TARTCI_VM_LEASE_HEARTBEAT_SECS:=30}"
+: "${TARTCI_VM_DISK_GROWTH_GB:=24}"
+: "${TARTCI_VM_DISK_FREE_FLOOR_GB:=25}"
 
 tartci_vm_lease_note(){
   if command -v note >/dev/null 2>&1; then
@@ -88,6 +90,22 @@ tartci_vm_lease_mem_mb(){
   printf '%s' "$value"
 }
 
+# Worst-case writable growth charged to the VM/overlay store. Pulp's observed
+# full macOS gate grew its store by about 19 GiB; 24 GiB is the conservative
+# fleet default, while provider/host overrides keep lighter or heavier lanes
+# configurable without changing runner identity or routing.
+tartci_vm_lease_disk_growth_gb(){
+  local provider="$1" value=""
+  case "$provider" in
+    tart-macos) value="${TARTCI_MACOS_VM_DISK_GROWTH_GB:-}" ;;
+    tart-linux) value="${TARTCI_LINUX_VM_DISK_GROWTH_GB:-}" ;;
+    qemu-windows) value="${TARTCI_WIN_VM_DISK_GROWTH_GB:-}" ;;
+  esac
+  [ -n "$value" ] || value="${TARTCI_VM_DISK_GROWTH_GB:-24}"
+  case "$value" in ''|*[!0-9]*) value=24 ;; esac
+  printf '%s' "$value"
+}
+
 tartci_vm_lease_priority(){
   local labels="${1:-}"
   if [ -n "${TARTCI_VM_LEASE_PRIORITY:-}" ]; then
@@ -140,7 +158,7 @@ tartci_stop_vm_lease_heartbeat(){
 }
 
 tartci_acquire_vm_lease(){
-  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" lease_id rc=0 out
+  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}" lease_id rc=0 out
   tartci_positive_int_or_empty "$cores" || cores=1
   if ! tartci_vm_leases_enabled; then
     TARTCI_ACTIVE_VM_LEASE_ID=""
@@ -173,11 +191,29 @@ tartci_acquire_vm_lease(){
   if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
     mem_args=(--mem-mb "$mem_mb")
   fi
+  local disk_args=() disk_growth_gb disk_floor_gb disk_summary=""
+  if [ -n "$disk_path" ]; then
+    case "$kind" in
+      tart-macos-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb tart-macos)" ;;
+      tart-linux-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb tart-linux)" ;;
+      qemu-windows-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb qemu-windows)" ;;
+      *) disk_growth_gb="${TARTCI_VM_DISK_GROWTH_GB:-24}" ;;
+    esac
+    disk_floor_gb="${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}"
+    case "$disk_growth_gb" in ''|*[!0-9]*) tartci_vm_lease_note "invalid disk growth: $disk_growth_gb"; return 75 ;; esac
+    case "$disk_floor_gb" in ''|*[!0-9]*) tartci_vm_lease_note "invalid disk floor: $disk_floor_gb"; return 75 ;; esac
+    disk_args=(
+      --disk-path "$disk_path"
+      --disk-growth-mb "$((disk_growth_gb * 1024))"
+      --disk-floor-mb "$((disk_floor_gb * 1024))"
+    )
+  fi
   lease_id="vm-$kind-$vm_name"
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
     --id "$lease_id" \
     --cores "$cores" \
     ${mem_args[@]+"${mem_args[@]}"} \
+    ${disk_args[@]+"${disk_args[@]}"} \
     --priority "$priority" \
     --pid "$$" \
     --kind "$kind" \
@@ -194,7 +230,10 @@ tartci_acquire_vm_lease(){
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
   tartci_start_vm_lease_heartbeat "$lease_id"
-  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority"
+  if [ -n "$disk_path" ]; then
+    disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
+  fi
+  tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
   return 0
 }
 

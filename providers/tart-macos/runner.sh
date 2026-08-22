@@ -725,7 +725,7 @@ run_one(){
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" || return $?
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" || return $?
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"

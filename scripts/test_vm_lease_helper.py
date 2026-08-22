@@ -237,6 +237,33 @@ class VmLeaseHelperTests(unittest.TestCase):
         # cores*per-job estimate.
         self.assertEqual(proc.stdout.strip(), "9000")
 
+    def test_acquire_atomically_records_vm_store_growth(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store_path = Path(td) / "vm-store"
+            store_path.mkdir()
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=1
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease unit-vm 2 tart-macos-vm gate labels 8192 {store_path}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["disk_growth_bytes"], r["disk_reservation_path"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), f"{1024**3} {store_path.resolve()}")
+
     def test_tart_cpu_set_uses_acquired_core_count(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

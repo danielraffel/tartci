@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 import time
@@ -258,6 +259,74 @@ def record_has_explicit_mem(record: dict[str, Any]) -> bool:
     return "lease_size_mem_mb" in record
 
 
+def disk_probe(path_text: str) -> dict[str, Any]:
+    """Resolve a path to its filesystem identity and current free space.
+
+    The requested directory may not exist yet during provider admission. Walk
+    to the nearest existing ancestor, then bind the reservation to st_dev so
+    aliases and different directories on the same volume share one budget.
+    """
+    requested = pathlib.Path(path_text).expanduser().resolve(strict=False)
+    probe = requested
+    while not probe.exists() and probe != probe.parent:
+        probe = probe.parent
+    if not probe.exists():
+        raise ValueError(f"cannot resolve disk reservation path {path_text!r}")
+    device = probe.stat().st_dev
+    mount = probe
+    while mount != mount.parent:
+        parent = mount.parent
+        try:
+            if parent.stat().st_dev != device:
+                break
+        except OSError:
+            break
+        mount = parent
+    free = shutil.disk_usage(probe).free
+    return {
+        "device_id": str(device),
+        "mount_path": str(mount),
+        "reservation_path": str(requested),
+        "probe_path": str(probe),
+        "free_bytes": int(free),
+    }
+
+
+def record_disk_bytes(record: dict[str, Any]) -> int:
+    return max(0, record_int(record, "disk_growth_bytes"))
+
+
+def disk_capacity(
+    records: list[dict[str, Any]],
+    probe: dict[str, Any],
+    requested_bytes: int,
+    floor_bytes: int,
+) -> dict[str, Any]:
+    same_device = [
+        record
+        for record in records
+        if str(record.get("disk_device_id") or "") == probe["device_id"]
+    ]
+    reserved = sum(record_disk_bytes(record) for record in same_device)
+    active_floor = max(
+        [record_int(record, "disk_floor_bytes") for record in same_device] + [0]
+    )
+    effective_floor = max(floor_bytes, active_floor)
+    required = effective_floor + reserved + requested_bytes
+    return {
+        "device_id": probe["device_id"],
+        "mount_path": probe["mount_path"],
+        "reservation_path": probe["reservation_path"],
+        "free_bytes": probe["free_bytes"],
+        "floor_bytes": effective_floor,
+        "reserved_bytes": reserved,
+        "requested_bytes": requested_bytes,
+        "required_bytes": required,
+        "available_after_reservations_bytes": max(0, probe["free_bytes"] - reserved),
+        "reservation_count": len(same_device),
+    }
+
+
 def reclaim(records: list[dict[str, Any]], stale_secs: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     now = utcnow()
     boot = host_boot_time()
@@ -381,11 +450,25 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
         active, reaped, problems = reclaim(records, int(args.stale_secs))
         if len(active) != len(records):
             write_records(store_dir, active)
+    disk_volumes: list[dict[str, Any]] = []
+    seen_devices: set[str] = set()
+    for record in active:
+        device_id = str(record.get("disk_device_id") or "")
+        path = str(record.get("disk_reservation_path") or "")
+        if not device_id or not path or device_id in seen_devices:
+            continue
+        seen_devices.add(device_id)
+        try:
+            probe = disk_probe(path)
+            disk_volumes.append(disk_capacity(active, probe, 0, 0))
+        except (OSError, ValueError) as exc:
+            problems.append(f"disk_probe_failed:{device_id}:{exc}")
     return {
-        "schema": 2,
+        "schema": 3,
         "store_dir": str(store_dir),
-        "mode": "provider VM runners acquire host-core leases when enabled",
+        "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
         "capacity": usage(active, cfg),
+        "disk_volumes": sorted(disk_volumes, key=lambda row: row["device_id"]),
         "leases": sort_records(active),
         "reaped": reaped_summary(reaped),
         "problems": problem_summary(problems),
@@ -403,9 +486,25 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     lease_id = args.id or str(uuid.uuid4())
     now = iso(utcnow())
 
+    disk: dict[str, Any] | None = None
+    requested_disk_bytes = 0
+    disk_floor_bytes = 0
+    if getattr(args, "disk_path", None):
+        requested_disk_mb = int(getattr(args, "disk_growth_mb", 0) or 0)
+        disk_floor_mb = int(getattr(args, "disk_floor_mb", 0) or 0)
+        if requested_disk_mb < 0 or disk_floor_mb < 0:
+            raise ValueError("disk growth and floor must be non-negative")
+        requested_disk_bytes = requested_disk_mb * 1024 * 1024
+        disk_floor_bytes = disk_floor_mb * 1024 * 1024
+
     with locked_store(store_dir):
         records = load_records(store_dir)
         active, reaped, problems = reclaim(records, int(args.stale_secs))
+        # The free-space probe is deliberately inside the same host-state lock
+        # as reservation accounting and record commit. Moving it above this
+        # boundary recreates the race this axis exists to close.
+        if getattr(args, "disk_path", None):
+            disk = disk_probe(args.disk_path)
         if any(str(record.get("id")) == lease_id for record in active):
             write_records(store_dir, active)
             return {
@@ -436,19 +535,38 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             cfg["total_mem_mb"] > 0
             and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
         )
-        if total_exceeded or class_exceeded or mem_exceeded:
+        disk_state = (
+            disk_capacity(active, disk, requested_disk_bytes, disk_floor_bytes)
+            if disk is not None
+            else None
+        )
+        disk_exceeded = bool(
+            disk_state is not None and disk_state["free_bytes"] < disk_state["required_bytes"]
+        )
+        if total_exceeded or class_exceeded or mem_exceeded or disk_exceeded:
             write_records(store_dir, active)
             core_axis = total_exceeded or class_exceeded
-            reason = "capacity_exceeded" if core_axis else "memory_exceeded"
+            reason = (
+                "capacity_exceeded"
+                if core_axis
+                else "memory_exceeded"
+                if mem_exceeded
+                else "disk_capacity_exceeded"
+            )
             return {
                 "ok": False,
                 "reason": reason,
-                "exceeded_axis": {"cores": core_axis, "memory": mem_exceeded},
+                "exceeded_axis": {
+                    "cores": core_axis,
+                    "memory": mem_exceeded,
+                    "disk": disk_exceeded,
+                },
                 "requested_cores": lease_size,
                 "requested_mem_mb": req_mem,
                 "priority": priority,
                 "priority_class": priority_class,
                 "capacity": current_usage,
+                "disk": disk_state,
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
@@ -473,12 +591,26 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "created_at": now,
             "heartbeat_at": now,
         }
+        if disk is not None:
+            record.update(
+                {
+                    "disk_device_id": disk["device_id"],
+                    "disk_mount_path": disk["mount_path"],
+                    "disk_reservation_path": disk["reservation_path"],
+                    "disk_growth_bytes": requested_disk_bytes,
+                    "disk_floor_bytes": disk_floor_bytes,
+                }
+            )
         active.append(record)
         write_records(store_dir, active)
         return {
             "ok": True,
             "lease": record,
             "capacity": usage(active, cfg),
+            # Preserve the admission-time view: reserved is the pre-existing
+            # commitment and requested is this lease. Status reports the
+            # post-commit aggregate separately.
+            "disk": disk_state,
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
         }, 0
@@ -542,6 +674,15 @@ def emit(result: dict[str, Any], json_output: bool) -> None:
                 f"priority={record.get('priority')} kind={record.get('command_kind')} "
                 f"owner={record.get('owner') or '-'}"
             )
+        gib = 1024**3
+        for disk in result.get("disk_volumes", []):
+            print(
+                "  disk "
+                f"device={disk['device_id']} mount={disk['mount_path']} "
+                f"free={disk['free_bytes'] / gib:.1f}GiB "
+                f"reserved={disk['reserved_bytes'] / gib:.1f}GiB "
+                f"required={disk['required_bytes'] / gib:.1f}GiB"
+            )
         return
     print(json.dumps(result, sort_keys=True))
 
@@ -593,6 +734,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     acquire_parser.add_argument("--label", default="")
     acquire_parser.add_argument("--job-id", default="")
     acquire_parser.add_argument("--vm-name", default="")
+    acquire_parser.add_argument(
+        "--disk-path",
+        help="VM/overlay store path whose filesystem receives the growth reservation",
+    )
+    acquire_parser.add_argument(
+        "--disk-growth-mb",
+        type=int,
+        default=0,
+        help="worst-case disk growth to reserve on --disk-path's filesystem",
+    )
+    acquire_parser.add_argument(
+        "--disk-floor-mb",
+        type=int,
+        default=0,
+        help="free-space safety floor retained after all active/requested growth",
+    )
 
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)

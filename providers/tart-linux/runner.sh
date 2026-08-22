@@ -271,7 +271,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   CURRENT_STATE_DIR="$state_dir"
   CURRENT_LEASE_ACTIVE=1
   CURRENT_CLEANED_UP=0
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" || {
     local lease_rc=$?
     discard_current_linux_vm
     return "$lease_rc"
