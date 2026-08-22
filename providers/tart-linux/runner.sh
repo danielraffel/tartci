@@ -249,8 +249,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
   tartci_check_disk_floor "$TART_HOME" || return $?
+  tartci_prepare_disk_root "$LOGROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
-  logdir="$LOGROOT/$vm"; mkdir -p "$logdir"
+  logdir="$LOGROOT/$vm"
+  tartci_prepare_disk_root "$logdir" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \
@@ -271,7 +273,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   CURRENT_STATE_DIR="$state_dir"
   CURRENT_LEASE_ACTIVE=1
   CURRENT_CLEANED_UP=0
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" || {
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" || {
     local lease_rc=$?
     discard_current_linux_vm
     return "$lease_rc"
@@ -287,7 +289,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # The name is unique to this supervisor/iteration. Claim it before the
   # foreground clone so a TERM delivered at clone completion cannot strand it.
   CURRENT_VM_OWNED=1
-  if ! tart clone "$GOLDEN" "$vm"; then
+  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
     discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
@@ -298,9 +300,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
-  mkdir -p "$CACHE_ROOT/ccache-linux"
+  tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux" || {
+    discard_current_linux_vm
+    runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
+    return 1
+  }
   local boot_log; boot_log="$logdir/tart-run.log"
-  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   write_state booting
 

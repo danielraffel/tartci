@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "providers" / "common" / "vm-lease.lib.sh"
 STATE_HELPER = ROOT / "providers" / "common" / "vm-state.lib.sh"
 MACOS_RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
+LINUX_RUNNER = ROOT / "providers" / "tart-linux" / "runner.sh"
+WINDOWS_RUNNER = ROOT / "providers" / "qemu-windows" / "runner.sh"
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -44,12 +46,15 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_ROOT
                 export TARTCI_LEASE_DIR={Path(td) / "leases"}
                 export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
                 export TARTCI_ROLE=light
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
-                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux
+                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 8192 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; s=json.load(sys.stdin); r=s["leases"][0]; print(r["id"], r["lease_size_cores"], r["command_kind"], r["vm_name"], r["label"])'
                 tartci_release_vm_lease
@@ -81,6 +86,451 @@ class VmLeaseHelperTests(unittest.TestCase):
             proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_disabled_leases_run_finite_and_exec_guarded_commands_directly(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            export TARTCI_ROOT={ROOT}
+            export TARTCI_VM_LEASES=0
+            source {HELPER}
+            tartci_acquire_vm_lease break-glass 2 tart-linux-vm vm labels
+            tartci_vm_lease_guard_run /usr/bin/printf 'run-ok\\n'
+            tartci_vm_lease_guard_exec /usr/bin/printf 'exec-ok\\n'
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["run-ok", "exec-ok"])
+
+    def test_disabled_environment_without_admission_authority_fails_closed(self) -> None:
+        for helper in ("tartci_vm_lease_guard_run", "tartci_vm_lease_guard_exec"):
+            with self.subTest(helper=helper):
+                script = textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    export TARTCI_ROOT={ROOT}
+                    export TARTCI_VM_LEASES=0
+                    export TARTCI_VM_LEASE_BYPASS_AUTHORIZED=1
+                    export _tartci_vm_lease_bypass_state=authorized
+                    source {HELPER}
+                    if {helper} /usr/bin/true; then
+                      exit 99
+                    else
+                      test "$?" -eq 75
+                    fi
+                    """
+                )
+                proc = _run_bash(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_mode_change_cannot_forget_or_bypass_an_active_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                export TARTCI_VM_LEASES=1
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease governed 1 tart-linux-vm vm labels 1024 {Path(td)}
+                original="$TARTCI_ACTIVE_VM_LEASE_ID"
+                TARTCI_VM_LEASES=0
+                if tartci_acquire_vm_lease bypass 1 tart-linux-vm vm labels 1024 {Path(td)}; then
+                  exit 99
+                else
+                  test "$?" -eq 75
+                fi
+                test "$TARTCI_ACTIVE_VM_LEASE_ID" = "$original"
+                tartci_release_vm_lease
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; print(len(json.load(sys.stdin)["leases"]))'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_break_glass_authority_is_revoked_by_release_or_mode_change(self) -> None:
+        for revoke in (
+            "tartci_release_vm_lease",
+            "TARTCI_VM_LEASES=1",
+        ):
+            with self.subTest(revoke=revoke):
+                script = textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    export TARTCI_ROOT={ROOT}
+                    export TARTCI_VM_LEASES=0
+                    source {HELPER}
+                    tartci_acquire_vm_lease break-glass 2 tart-linux-vm vm labels
+                    {revoke}
+                    if tartci_vm_lease_guard_run /usr/bin/true; then
+                      exit 99
+                    else
+                      test "$?" -eq 75
+                    fi
+                    """
+                )
+                proc = _run_bash(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_enabled_guard_helpers_fail_closed_without_an_active_lease(self) -> None:
+        for helper in ("tartci_vm_lease_guard_run", "tartci_vm_lease_guard_exec"):
+            with self.subTest(helper=helper):
+                script = textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    export TARTCI_ROOT={ROOT}
+                    export TARTCI_VM_LEASES=1
+                    source {HELPER}
+                    if {helper} /usr/bin/true; then
+                      exit 99
+                    else
+                      test "$?" -eq 75
+                    fi
+                    """
+                )
+                proc = _run_bash(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_shared_disk_parser_preserves_disable_spellings_and_rejects_garbage(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            for value in 0 false FALSE off OFF no NO; do
+              printf '%s=%s\n' "$value" "$(tartci_disk_gb_or_zero TEST_SIZE "$value" 24)"
+            done
+            printf 'number=%s\n' "$(tartci_disk_gb_or_zero TEST_SIZE 7 24)"
+            if tartci_disk_gb_or_zero TEST_SIZE malformed 24 >/dev/null; then
+              exit 99
+            else
+              printf 'invalid_rc=%s\n' "$?"
+            fi
+            printf 'defaults=%s/%s\n' "$TARTCI_VM_DISK_GROWTH_GB" "$TARTCI_VM_DISK_FREE_FLOOR_GB"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "0=0",
+                "false=0",
+                "FALSE=0",
+                "off=0",
+                "OFF=0",
+                "no=0",
+                "NO=0",
+                "number=7",
+                "invalid_rc=75",
+                "defaults=24/25",
+            ],
+        )
+
+    def test_disable_spellings_flow_through_vm_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=no
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=off
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease disabled-disk 1 tart-linux-vm vm labels 1024 {Path(td)}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["disk_growth_bytes"], r["disk_floor_bytes"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0 0")
+
+    def test_configured_storage_root_is_never_created_by_floor_check(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "offline-volume" / "vm-store"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                # Disabling the numeric floor is not permission to create a
+                # missing configured store on the fallback filesystem.
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=off
+                note() {{ :; }}
+                source {STATE_HELPER}
+                if tartci_check_disk_floor {missing}; then
+                  exit 99
+                else
+                  rc=$?
+                fi
+                test "$rc" -eq 75
+                test ! -e {missing}
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(missing.exists())
+
+    def test_prepare_disk_root_creates_cold_leaf_on_validated_parent_device(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "cold-start" / "logs" / "provider"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                source {STATE_HELPER}
+                tartci_prepare_disk_root {missing}
+                tartci_check_disk_floor {missing}
+                test -d {missing}
+                """
+            )
+            proc = _run_bash(script, env={"HOME": td})
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(missing.is_dir())
+
+    def test_prepare_disk_root_covers_all_cold_default_path_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as home_td, tempfile.TemporaryDirectory(
+            dir="/tmp"
+        ) as tmp_td:
+            fake_home = Path(home_td)
+            fake_tmp = Path(tmp_td)
+            roots = (
+                ("macos-cache", fake_home / ".cache" / "pulp-ci"),
+                ("macos-logs", fake_home / "VMs" / "logs" / "tartci-macos"),
+                ("linux-logs", fake_home / "VMs" / "logs" / "tartci-linux"),
+                ("linux-cache", fake_home / ".cache" / "tartci" / "ccache-linux"),
+                ("windows-work", fake_tmp / "tartci-win"),
+                ("windows-logs", fake_tmp / "tartci-win" / "logs"),
+            )
+            for provider_root, root in roots:
+                with self.subTest(provider_root=provider_root, root=root):
+                    proc = _run_bash(
+                        f"source {STATE_HELPER}; tartci_prepare_disk_root {root}",
+                        env={"HOME": str(fake_home), "TMPDIR": str(fake_tmp)},
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(root.is_dir())
+
+    def test_prepare_disk_root_refuses_missing_tmp_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing_tmp = Path(td) / "reboot-tmp-not-ready"
+            target = missing_tmp / "tartci-win"
+            proc = _run_bash(
+                textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    source {STATE_HELPER}
+                    if tartci_prepare_disk_root {target}; then
+                      exit 99
+                    fi
+                    test ! -e {missing_tmp}
+                    """
+                ),
+                env={"TMPDIR": str(missing_tmp)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(missing_tmp.exists())
+
+    def test_prepare_disk_root_refuses_missing_custom_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_home = Path(td) / "home"
+            fake_tmp = Path(td) / "tmp"
+            fake_home.mkdir()
+            fake_tmp.mkdir()
+            missing_parent = Path(td) / "offline-custom-parent"
+            target = missing_parent / "provider-leaf"
+            proc = _run_bash(
+                textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    source {STATE_HELPER}
+                    if tartci_prepare_disk_root {target}; then
+                      exit 99
+                    fi
+                    test ! -e {missing_parent}
+                    """
+                ),
+                env={"HOME": str(fake_home), "TMPDIR": str(fake_tmp)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(missing_parent.exists())
+
+    def test_prepare_disk_root_refuses_symlink_escape_beneath_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as home_td, tempfile.TemporaryDirectory() as outside_td:
+            fake_home = Path(home_td)
+            outside = Path(outside_td)
+            (fake_home / "cache-link").symlink_to(outside, target_is_directory=True)
+            target = fake_home / "cache-link" / "provider"
+            proc = _run_bash(
+                textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    source {STATE_HELPER}
+                    if tartci_prepare_disk_root {target}; then
+                      exit 99
+                    fi
+                    """
+                ),
+                env={"HOME": home_td},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse((outside / "provider").exists())
+
+    def test_prepare_disk_root_refuses_missing_external_mount(self) -> None:
+        missing = Path("/Volumes") / f"tartci-missing-{os.getpid()}" / "cache"
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {STATE_HELPER}
+            if tartci_prepare_disk_root {missing}; then
+              exit 99
+            fi
+            test ! -e {missing}
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(missing.exists())
+
+    def test_prepare_disk_root_refuses_wrong_declared_device_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "work"
+            actual_device = Path(td).stat().st_dev
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source {STATE_HELPER}
+                if tartci_prepare_disk_root {missing} '' {actual_device + 1}; then
+                  exit 99
+                fi
+                test ! -e {missing}
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(missing.exists())
+
+    def test_prepare_disk_root_refuses_declared_path_that_is_not_a_mount(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            fake_mount = Path(td) / "ordinary-directory"
+            fake_mount.mkdir()
+            target = fake_mount / "provider"
+            proc = _run_bash(
+                textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    source {STATE_HELPER}
+                    if tartci_prepare_disk_root {target} {fake_mount}; then
+                      exit 99
+                    fi
+                    test ! -e {target}
+                    """
+                )
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(target.exists())
+
+    def test_external_volume_mount_is_inferred_for_identity_pinning(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Workshop/Code/tart
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "/Volumes/Workshop")
+
+    def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
+        expected = {
+            MACOS_RUNNER: (
+                "tartci_vm_lease_guard_run tart clone",
+                "tartci_vm_lease_guard_exec tart run",
+            ),
+            LINUX_RUNNER: (
+                "tartci_vm_lease_guard_run tart clone",
+                "tartci_vm_lease_guard_exec tart run",
+            ),
+            WINDOWS_RUNNER: (
+                "tartci_vm_lease_guard_run qemu-img create",
+                "tartci_vm_lease_guard_exec qemu-system-aarch64",
+            ),
+        }
+        for runner, guarded_commands in expected.items():
+            with self.subTest(runner=runner):
+                body = runner.read_text(encoding="utf-8")
+                for guarded_command in guarded_commands:
+                    self.assertIn(guarded_command, body)
+                self.assertIn("tartci_acquire_vm_lease", body)
+
+    def test_all_vm_providers_prepare_cold_auxiliary_roots(self) -> None:
+        expected = {
+            MACOS_RUNNER: ('tartci_prepare_disk_root "$CACHE_ROOT"',),
+            LINUX_RUNNER: (
+                'tartci_prepare_disk_root "$LOGROOT"',
+                'tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux"',
+            ),
+            WINDOWS_RUNNER: (
+                'tartci_prepare_disk_root "$WORKROOT"',
+                'tartci_prepare_disk_root "$LOGROOT"',
+            ),
+        }
+        for runner, prepared_roots in expected.items():
+            with self.subTest(runner=runner):
+                body = runner.read_text(encoding="utf-8")
+                for prepared_root in prepared_roots:
+                    self.assertIn(prepared_root, body)
+
+    def test_providers_do_not_recreate_validated_host_roots_with_mkdir(self) -> None:
+        forbidden = {
+            MACOS_RUNNER: (
+                'mkdir -p "$MACOS_LOGROOT',
+                'mkdir -p "$CACHE_ROOT',
+            ),
+            LINUX_RUNNER: (
+                'mkdir -p "$LOGROOT',
+                'mkdir -p "$CACHE_ROOT',
+            ),
+            WINDOWS_RUNNER: (
+                'mkdir -p "$WORKROOT',
+                'mkdir -p "$LOGROOT',
+                'mkdir -p "$jobdir',
+                'mkdir -p "$logdir',
+            ),
+        }
+        for runner, path_writers in forbidden.items():
+            body = runner.read_text(encoding="utf-8")
+            for path_writer in path_writers:
+                with self.subTest(runner=runner, path_writer=path_writer):
+                    self.assertNotIn(path_writer, body)
+
+    def test_windows_port_locks_stay_relative_to_open_validated_root(self) -> None:
+        body = WINDOWS_RUNNER.read_text(encoding="utf-8")
+        allocator = body[body.index("allocate_ssh_port(){") : body.index("PRINT_HOST_HEALTH=0")]
+        self.assertNotIn("os.makedirs(root", allocator)
+        self.assertNotIn("os.path.realpath(root)", allocator)
+        self.assertIn("root_fd = os.open(root, flags)", allocator)
+        self.assertIn("os.mkdir(lock_name, dir_fd=root_fd)", allocator)
+        self.assertIn("os.rmdir(lock_name, dir_fd=root_fd)", allocator)
+        self.assertIn("release_ssh_port_lock", allocator)
+        self.assertIn("info.st_ino", allocator)
 
     def test_provider_core_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(
@@ -147,12 +597,14 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # force non-gate budget = 3
                 # explicit tiny mem so the core clamp is isolated from the memory axis
-                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 printf 'effective=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES"
@@ -178,11 +630,13 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # non-gate budget = 3 (must be ignored for gate)
-                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024
+                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 """
@@ -223,10 +677,12 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=65536
                 export TARTCI_ROLE=light
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
-                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 9000
+                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 9000 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_mem_mb"])'
                 """
@@ -236,6 +692,33 @@ class VmLeaseHelperTests(unittest.TestCase):
         # The VM lease charged its real memory footprint (9000 MB), not a
         # cores*per-job estimate.
         self.assertEqual(proc.stdout.strip(), "9000")
+
+    def test_acquire_atomically_records_vm_store_growth(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store_path = Path(td) / "vm-store"
+            store_path.mkdir()
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=1
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease unit-vm 2 tart-macos-vm gate labels 8192 {store_path}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["disk_growth_bytes"], r["disk_reservation_path"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), f"{1024**3} {store_path.resolve()}")
 
     def test_tart_cpu_set_uses_acquired_core_count(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -1213,6 +1213,52 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   memory-budget)`, so a build is refused when it would exhaust RAM even if cores
   are free. Legacy core-only records are estimated as `cores × per-job memory`
   so a mixed store never over-admits.
+- **Disk as a third, per-volume axis** — macOS/Linux Tart clones reserve growth
+  against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN_WORK`.
+  Device ID, not a spelling of the path, is the accounting key, so aliases on
+  one volume contend while internal and external stores remain independent. The
+  free-space check and reservation commit occur under the same `leases.lock`
+  transaction as CPU/RAM admission. JSON status and denial records emit
+  `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
+  diagnosis.
+
+  Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
+  charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
+  exceeds the approximately 19 GiB store growth observed during a Pulp full
+  gate. Override only from measured evidence, globally or with
+  `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_GROWTH_GB`. Zero or `false`/`off`/`no`
+  disables growth charging or the floor respectively; this is the rollback,
+  but it restores the old concurrent-admission race and should be temporary.
+  Existing core/memory leases remain readable. A live legacy **VM** lease has
+  unknown disk growth, so new VM admission fails closed until that VM finishes
+  and its supervisor is restarted on the upgraded tartci snapshot; native build
+  leases remain backward-compatible. During a rolling upgrade, first drain VMs
+  owned by the old supervisor snapshot, then restart that provider on the new
+  snapshot and verify its lease store before admitting another VM. Do not
+  restart every provider together or edit a live lease JSON record to bypass the
+  mixed-version denial: the denial is the compatibility fence that prevents an
+  old unaccounted VM from sharing a supposedly reserved volume.
+  Normal exit and signal cleanup release the unified lease; dead-owner reaping
+  releases its disk reservation after a crash or reboot, but an exact live
+  Tart/QEMU guardian keeps the lease after its supervisor dies. Storage roots
+  must already exist; admission never creates a missing configured root. Paths
+  under `/Volumes/<name>` are pinned to that mount automatically. Other hosts
+  can persist an equivalent check with
+  `TARTCI_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` or the provider-specific
+  `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` overrides.
+  The recorded `st_dev` device ID is an identity for the current boot: it joins
+  path aliases and detects a changed filesystem while leases are live, but it
+  is not guaranteed stable across reboot or device remapping. Prefer the
+  expected mount path as the durable external-volume assertion. Configure an
+  expected device ID only on hosts where it is stable, or refresh that value as
+  part of the host boot check before providers are enabled.
+  Provider cache, log, and Windows work leaves are the cold-start exception:
+  the supervisor creates a missing leaf relative to an already-open authority
+  parent, verifies it stays on that parent's device, and refuses a
+  `/Volumes/<name>/...` path unless `<name>` is an actual mounted filesystem.
+  Home-backed defaults use the existing home directory as authority; ephemeral
+  defaults use an already-existing `TMPDIR` or `/tmp`. A missing temporary root
+  is a failed reboot/session prerequisite and is never recreated from `/`.
 - **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
   its cores + `hw.model` — **dedicated-builder**, **dev-overflow**, or
   **light** — each carrying a core budget *and* a memory budget. `tartci

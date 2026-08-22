@@ -711,9 +711,10 @@ run_one(){
   t_start="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
-    mkdir -p "$logdir"
+    tartci_prepare_disk_root "$logdir" || return $?
   fi
   tartci_check_disk_floor "$TART_HOME" || return $?
+  tartci_prepare_disk_root "$CACHE_ROOT" || return $?
   tartci_check_disk_floor "$CACHE_ROOT" || return $?
   CLEANED_UP=0
   CURRENT_REGISTERED_RUNNER=""
@@ -725,7 +726,7 @@ run_one(){
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" || return $?
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" || return $?
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
@@ -733,7 +734,7 @@ run_one(){
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
   CURRENT_VM="$vm"
-  if ! tart clone "$GOLDEN" "$vm"; then
+  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
@@ -746,9 +747,14 @@ run_one(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  mkdir -p "$CACHE_ROOT/ccache"
+  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
   boot_log="$(mktemp -t "tart-run-$vm")"
-  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat booting
 

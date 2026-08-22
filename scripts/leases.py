@@ -16,6 +16,14 @@ import uuid
 from typing import Any, Iterator
 
 import host_profile
+import lease_cli
+from lease_disk import (
+    disk_capacity,
+    disk_identity_conflicts,
+    disk_probe,
+    record_disk_bytes,
+    record_has_complete_disk_accounting,
+)
 
 try:
     import fcntl
@@ -30,6 +38,10 @@ PRIORITY_CLASSES = {
     "runner": 80,
     "gate": 100,
 }
+
+
+def is_vm_kind(value: Any) -> bool:
+    return str(value or "").endswith("-vm")
 
 
 def utcnow() -> dt.datetime:
@@ -120,24 +132,70 @@ def process_identity(pid: int) -> dict[str, Any]:
     return identity
 
 
-def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
+def identity_matches(
+    record: dict[str, Any],
+    *,
+    pid_key: str,
+    start_key: str,
+    boot_key: str,
+    current_boot: str,
+    require_start: bool = False,
+) -> bool:
     try:
-        pid = int(record.get("pid"))
+        pid = int(record.get(pid_key))
     except (TypeError, ValueError):
         return False
     if pid <= 0:
         return False
-    boot = current_boot if current_boot is not None else host_boot_time()
-    record_boot = str(record.get("host_boot_time") or "")
-    if record_boot and record_boot != "unknown" and boot != "unknown" and record_boot != boot:
+    record_boot = str(record.get(boot_key) or "")
+    if (
+        record_boot
+        and record_boot != "unknown"
+        and current_boot != "unknown"
+        and record_boot != current_boot
+    ):
         return False
     current_start = pid_start(pid)
     if not current_start:
         return False
-    expected_start = str(record.get("process_start_time") or "").strip()
+    expected_start = str(record.get(start_key) or "").strip()
     if expected_start:
         return current_start == " ".join(expected_start.split())
-    return True
+    return not require_start
+
+
+def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
+    boot = current_boot if current_boot is not None else host_boot_time()
+    # A committed guardian is an ownership transfer, not a fallback. Otherwise
+    # a still-live supervisor can mask a crashed Tart/QEMU writer forever (most
+    # visibly for Windows KEEP_FAILED jobs). A finite guard-run wrapper also
+    # records its exact writer child, which remains authoritative if the wrapper
+    # dies while that child is still modifying the clone/overlay.
+    if is_vm_kind(record.get("command_kind")) and "guardian_pid" in record:
+        if identity_matches(
+            record,
+            pid_key="guardian_pid",
+            start_key="guardian_process_start_time",
+            boot_key="guardian_host_boot_time",
+            current_boot=boot,
+            require_start=True,
+        ):
+            return True
+        return record.get("guardian_mode") == "managed-child" and identity_matches(
+            record,
+            pid_key="guardian_writer_pid",
+            start_key="guardian_writer_process_start_time",
+            boot_key="guardian_writer_host_boot_time",
+            current_boot=boot,
+            require_start=True,
+        )
+    return identity_matches(
+        record,
+        pid_key="pid",
+        start_key="process_start_time",
+        boot_key="host_boot_time",
+        current_boot=boot,
+    )
 
 
 def default_store_dir() -> pathlib.Path:
@@ -381,15 +439,40 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
         active, reaped, problems = reclaim(records, int(args.stale_secs))
         if len(active) != len(records):
             write_records(store_dir, active)
-    return {
-        "schema": 2,
-        "store_dir": str(store_dir),
-        "mode": "provider VM runners acquire host-core leases when enabled",
-        "capacity": usage(active, cfg),
-        "leases": sort_records(active),
-        "reaped": reaped_summary(reaped),
-        "problems": problem_summary(problems),
-    }
+        # Keep the record set and its disk probes in one transaction. Otherwise
+        # a concurrent acquire/release can pair stale reservations with current
+        # free bytes and publish a state that never existed.
+        disk_volumes: list[dict[str, Any]] = []
+        seen_devices: set[str] = set()
+        for record in active:
+            device_id = str(record.get("disk_device_id") or "")
+            path = str(record.get("disk_reservation_path") or "")
+            if is_vm_kind(record.get("command_kind")) and not record_has_complete_disk_accounting(
+                record
+            ):
+                problems.append(f"legacy_vm_disk_accounting_unknown:{record.get('id')}")
+            if not device_id or not path or device_id in seen_devices:
+                continue
+            seen_devices.add(device_id)
+            try:
+                probe = disk_probe(
+                    path,
+                    expected_device_id=device_id,
+                    expected_mount_path=str(record.get("disk_mount_path") or ""),
+                )
+                disk_volumes.append(disk_capacity(active, probe, 0, 0))
+            except (OSError, ValueError) as exc:
+                problems.append(f"disk_probe_failed:{device_id}:{exc}")
+        return {
+            "schema": 3,
+            "store_dir": str(store_dir),
+            "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
+            "capacity": usage(active, cfg),
+            "disk_volumes": sorted(disk_volumes, key=lambda row: row["device_id"]),
+            "leases": sort_records(active),
+            "reaped": reaped_summary(reaped),
+            "problems": problem_summary(problems),
+        }
 
 
 def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -403,9 +486,52 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     lease_id = args.id or str(uuid.uuid4())
     now = iso(utcnow())
 
+    if is_vm_kind(args.kind) and not getattr(args, "disk_path", None):
+        return {
+            "ok": False,
+            "reason": "vm_disk_path_required",
+            "id": lease_id,
+            "kind": args.kind,
+        }, 75
+
+    disk: dict[str, Any] | None = None
+    requested_disk_bytes = 0
+    disk_floor_bytes = 0
+    if getattr(args, "disk_path", None):
+        requested_disk_mb = int(getattr(args, "disk_growth_mb", 0) or 0)
+        disk_floor_mb = int(getattr(args, "disk_floor_mb", 0) or 0)
+        if requested_disk_mb < 0 or disk_floor_mb < 0:
+            raise ValueError("disk growth and floor must be non-negative")
+        requested_disk_bytes = requested_disk_mb * 1024 * 1024
+        disk_floor_bytes = disk_floor_mb * 1024 * 1024
+
     with locked_store(store_dir):
         records = load_records(store_dir)
         active, reaped, problems = reclaim(records, int(args.stale_secs))
+        # The free-space probe is deliberately inside the same host-state lock
+        # as reservation accounting and record commit. Moving it above this
+        # boundary recreates the race this axis exists to close.
+        if getattr(args, "disk_path", None):
+            try:
+                disk = disk_probe(
+                    args.disk_path,
+                    expected_device_id=str(
+                        getattr(args, "disk_expected_device_id", "") or ""
+                    ),
+                    expected_mount_path=str(
+                        getattr(args, "disk_expected_mount_path", "") or ""
+                    ),
+                )
+            except (OSError, ValueError) as exc:
+                write_records(store_dir, active)
+                return {
+                    "ok": False,
+                    "reason": "disk_root_unavailable",
+                    "id": lease_id,
+                    "error": str(exc),
+                    "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems),
+                }, 75
         if any(str(record.get("id")) == lease_id for record in active):
             write_records(store_dir, active)
             return {
@@ -415,6 +541,34 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 73
+        legacy_vm_ids = [
+            str(record.get("id") or "")
+            for record in active
+            if is_vm_kind(record.get("command_kind"))
+            and not record_has_complete_disk_accounting(record)
+        ]
+        if disk is not None and legacy_vm_ids:
+            write_records(store_dir, active)
+            return {
+                "ok": False,
+                "reason": "legacy_vm_disk_accounting_unknown",
+                "id": lease_id,
+                "legacy_vm_lease_ids": sorted(legacy_vm_ids),
+                "reaped": reaped_summary(reaped),
+                "problems": problem_summary(problems),
+            }, 75
+        disk_conflicts = disk_identity_conflicts(active, disk) if disk is not None else []
+        if disk_conflicts:
+            write_records(store_dir, active)
+            return {
+                "ok": False,
+                "reason": "disk_device_changed_with_live_reservations",
+                "id": lease_id,
+                "disk": disk,
+                "conflicting_leases": disk_conflicts,
+                "reaped": reaped_summary(reaped),
+                "problems": problem_summary(problems),
+            }, 75
         current_usage = usage(active, cfg)
         limit = cfg["total"]
         used_for_limit = current_usage["used_cores"]
@@ -436,19 +590,38 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             cfg["total_mem_mb"] > 0
             and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
         )
-        if total_exceeded or class_exceeded or mem_exceeded:
+        disk_state = (
+            disk_capacity(active, disk, requested_disk_bytes, disk_floor_bytes)
+            if disk is not None
+            else None
+        )
+        disk_exceeded = bool(
+            disk_state is not None and disk_state["free_bytes"] < disk_state["required_bytes"]
+        )
+        if total_exceeded or class_exceeded or mem_exceeded or disk_exceeded:
             write_records(store_dir, active)
             core_axis = total_exceeded or class_exceeded
-            reason = "capacity_exceeded" if core_axis else "memory_exceeded"
+            reason = (
+                "capacity_exceeded"
+                if core_axis
+                else "memory_exceeded"
+                if mem_exceeded
+                else "disk_capacity_exceeded"
+            )
             return {
                 "ok": False,
                 "reason": reason,
-                "exceeded_axis": {"cores": core_axis, "memory": mem_exceeded},
+                "exceeded_axis": {
+                    "cores": core_axis,
+                    "memory": mem_exceeded,
+                    "disk": disk_exceeded,
+                },
                 "requested_cores": lease_size,
                 "requested_mem_mb": req_mem,
                 "priority": priority,
                 "priority_class": priority_class,
                 "capacity": current_usage,
+                "disk": disk_state,
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
@@ -473,15 +646,214 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "created_at": now,
             "heartbeat_at": now,
         }
+        if disk is not None:
+            record.update(
+                {
+                    "disk_device_id": disk["device_id"],
+                    "disk_mount_path": disk["mount_path"],
+                    "disk_reservation_path": disk["reservation_path"],
+                    "disk_logical_path": disk["logical_path"],
+                    "disk_growth_bytes": requested_disk_bytes,
+                    "disk_floor_bytes": disk_floor_bytes,
+                    "disk_expected_device_id": str(
+                        getattr(args, "disk_expected_device_id", "") or ""
+                    ),
+                    "disk_expected_mount_path": str(
+                        getattr(args, "disk_expected_mount_path", "") or ""
+                    ),
+                }
+            )
         active.append(record)
         write_records(store_dir, active)
         return {
             "ok": True,
             "lease": record,
             "capacity": usage(active, cfg),
+            # Preserve the admission-time view: reserved is the pre-existing
+            # commitment and requested is this lease. Status reports the
+            # post-commit aggregate separately.
+            "disk": disk_state,
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
         }, 0
+
+
+GUARDIAN_FIELDS = (
+    "guardian_pid",
+    "guardian_process_start_time",
+    "guardian_host_boot_time",
+    "guardian_process_group_id",
+    "guardian_session_id",
+    "guardian_mode",
+    "guardian_writer_pid",
+    "guardian_writer_process_start_time",
+    "guardian_writer_host_boot_time",
+    "guardian_writer_process_group_id",
+    "guardian_writer_session_id",
+)
+
+
+def guarded_argv(args: argparse.Namespace, command: str) -> list[str]:
+    argv = list(args.argv)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        raise ValueError(f"{command} requires a command after --")
+    return argv
+
+
+def guardian_identity_matches(
+    record: dict[str, Any], identity: dict[str, Any], *, writer: bool = False
+) -> bool:
+    prefix = "guardian_writer_" if writer else "guardian_"
+    return (
+        record.get(f"{prefix}pid") == identity["pid"]
+        and record.get(f"{prefix}process_start_time") == identity["process_start_time"]
+        and record.get(f"{prefix}host_boot_time") == identity["host_boot_time"]
+    )
+
+
+def attach_guardian(
+    args: argparse.Namespace, identity: dict[str, Any], *, mode: str
+) -> None:
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    if not identity["process_start_time"]:
+        raise RuntimeError("cannot prove exact VM guardian process start identity")
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        target = next((record for record in active if record.get("id") == args.id), None)
+        if target is None:
+            write_records(store_dir, active)
+            raise ValueError(
+                f"cannot guard missing lease {args.id}; "
+                f"reaped={reaped_summary(reaped)} problems={problem_summary(problems)}"
+            )
+        if not is_vm_kind(target.get("command_kind")):
+            raise ValueError(f"lease {args.id} is not a VM lease")
+        if "guardian_pid" in target:
+            raise ValueError(f"lease {args.id} already has an authoritative guardian")
+        target.update(
+            {
+                "guardian_pid": identity["pid"],
+                "guardian_process_start_time": identity["process_start_time"],
+                "guardian_host_boot_time": identity["host_boot_time"],
+                "guardian_process_group_id": identity["process_group_id"],
+                "guardian_session_id": identity["session_id"],
+                "guardian_mode": mode,
+            }
+        )
+        write_records(store_dir, active)
+
+
+def attach_guardian_writer(
+    args: argparse.Namespace,
+    guardian: dict[str, Any],
+    writer: dict[str, Any],
+) -> None:
+    if not writer["process_start_time"]:
+        raise RuntimeError("cannot prove exact guarded writer process start identity")
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        target = next((record for record in records if record.get("id") == args.id), None)
+        if target is None or not guardian_identity_matches(target, guardian):
+            raise ValueError(f"guardian lost ownership of lease {args.id} before writer start")
+        if target.get("guardian_mode") != "managed-child":
+            raise ValueError(f"lease {args.id} is not a managed-child guardian")
+        target.update(
+            {
+                "guardian_writer_pid": writer["pid"],
+                "guardian_writer_process_start_time": writer["process_start_time"],
+                "guardian_writer_host_boot_time": writer["host_boot_time"],
+                "guardian_writer_process_group_id": writer["process_group_id"],
+                "guardian_writer_session_id": writer["session_id"],
+            }
+        )
+        write_records(store_dir, records)
+
+
+def finish_guard_run(
+    args: argparse.Namespace,
+    guardian: dict[str, Any],
+    writer: dict[str, Any] | None,
+) -> None:
+    """Return ownership to a live supervisor, or remove the completed lease."""
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        target = next((record for record in records if record.get("id") == args.id), None)
+        if target is None:
+            return
+        if not guardian_identity_matches(target, guardian):
+            raise ValueError(f"guardian lost ownership of lease {args.id} during writer run")
+        if writer is not None and not guardian_identity_matches(target, writer, writer=True):
+            raise ValueError(f"guarded writer identity changed for lease {args.id}")
+        if identity_matches(
+            target,
+            pid_key="pid",
+            start_key="process_start_time",
+            boot_key="host_boot_time",
+            current_boot=host_boot_time(),
+        ):
+            for field in GUARDIAN_FIELDS:
+                target.pop(field, None)
+        else:
+            records.remove(target)
+        write_records(store_dir, records)
+
+
+def guard_exec(args: argparse.Namespace) -> int:
+    """Atomically make this process the lease guardian, then exec the VM writer."""
+    argv = guarded_argv(args, "guard-exec")
+    identity = process_identity(os.getpid())
+    attach_guardian(args, identity, mode="exec")
+    os.execvpe(argv[0], argv, dict(os.environ))
+    return 127  # pragma: no cover - exec either replaces this process or raises.
+
+
+def guard_run(args: argparse.Namespace) -> int:
+    """Run a finite disk writer only after exact durable ownership is recorded."""
+    argv = guarded_argv(args, "guard-run")
+    guardian = process_identity(os.getpid())
+    attach_guardian(args, guardian, mode="managed-child")
+
+    read_fd, write_fd = os.pipe()
+    writer_pid = os.fork()
+    if writer_pid == 0:  # pragma: no branch - child either execs or exits.
+        os.close(write_fd)
+        try:
+            token = os.read(read_fd, 1)
+            os.close(read_fd)
+            if token != b"1":
+                os._exit(126)
+            os.execvpe(argv[0], argv, dict(os.environ))
+        except OSError as exc:
+            os.write(2, f"guard-run exec failed: {exc}\n".encode())
+            os._exit(127)
+
+    os.close(read_fd)
+    writer: dict[str, Any] | None = None
+    try:
+        writer = process_identity(writer_pid)
+        attach_guardian_writer(args, guardian, writer)
+        os.write(write_fd, b"1")
+    except Exception:
+        os.close(write_fd)
+        os.waitpid(writer_pid, 0)
+        finish_guard_run(args, guardian, writer=None)
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+
+    _, status = os.waitpid(writer_pid, 0)
+    finish_guard_run(args, guardian, writer)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
 
 
 def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -542,67 +914,27 @@ def emit(result: dict[str, Any], json_output: bool) -> None:
                 f"priority={record.get('priority')} kind={record.get('command_kind')} "
                 f"owner={record.get('owner') or '-'}"
             )
+        gib = 1024**3
+        for disk in result.get("disk_volumes", []):
+            print(
+                "  disk "
+                f"device={disk['device_id']} mount={disk['mount_path']} "
+                f"free={disk['free_bytes'] / gib:.1f}GiB "
+                f"reserved={disk['reserved_bytes'] / gib:.1f}GiB "
+                f"required={disk['required_bytes'] / gib:.1f}GiB"
+            )
         return
     print(json.dumps(result, sort_keys=True))
 
 
-def add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--store-dir", default=str(default_store_dir()))
-    parser.add_argument("--capacity", type=int, help="override lease capacity (cores)")
-    parser.add_argument(
-        "--capacity-mem-mb",
-        type=int,
-        help="override memory lease capacity in MB (0 disables the memory axis)",
-    )
-    parser.add_argument("--reserved-gate-cores", type=int, help="cores withheld from non-gate leases")
-    parser.add_argument("--gate-priority", type=int, default=PRIORITY_CLASSES["gate"])
-    parser.add_argument("--stale-secs", type=int, default=int(os.environ.get("TARTCI_LEASE_STALE_SECS", "300")))
-    parser.add_argument("--role", choices=host_profile.VALID_ROLES)
-    parser.add_argument("--role-file")
-    parser.add_argument("--host-cores", type=int)
-    parser.add_argument("--model")
-    parser.add_argument("--json", action="store_true")
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    if not raw or raw[0].startswith("-"):
-        raw = ["status", *raw]
-    parser = argparse.ArgumentParser(prog="tartci leases")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    status = sub.add_parser("status", aliases=["list"], help="show active leases")
-    add_common(status)
-
-    reap_parser = sub.add_parser("reap", help="reclaim dead-owner leases and show status")
-    add_common(reap_parser)
-
-    acquire_parser = sub.add_parser("acquire", help="acquire a core lease")
-    add_common(acquire_parser)
-    acquire_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
-    acquire_parser.add_argument(
-        "--mem-mb",
-        type=int,
-        help="memory this lease consumes in MB; omitted → cores * per-job estimate",
+    return lease_cli.parse_args(
+        argv,
+        default_store_dir=str(default_store_dir()),
+        priority_classes=PRIORITY_CLASSES,
+        valid_roles=host_profile.VALID_ROLES,
+        stale_secs=int(os.environ.get("TARTCI_LEASE_STALE_SECS", "300")),
     )
-    acquire_parser.add_argument("--priority", default="build")
-    acquire_parser.add_argument("--pid", type=int)
-    acquire_parser.add_argument("--id")
-    acquire_parser.add_argument("--kind", default="unknown")
-    acquire_parser.add_argument("--owner", default="")
-    acquire_parser.add_argument("--label", default="")
-    acquire_parser.add_argument("--job-id", default="")
-    acquire_parser.add_argument("--vm-name", default="")
-
-    release_parser = sub.add_parser("release", help="release a lease by id")
-    add_common(release_parser)
-    release_parser.add_argument("--id", required=True)
-
-    heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
-    add_common(heartbeat_parser)
-    heartbeat_parser.add_argument("--id", required=True)
-
-    return parser.parse_args(raw)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -617,6 +949,10 @@ def main(argv: list[str] | None = None) -> int:
             result, rc = release(args)
         elif args.command == "heartbeat":
             result, rc = heartbeat(args)
+        elif args.command == "guard-exec":
+            return guard_exec(args)
+        elif args.command == "guard-run":
+            return guard_run(args)
         else:
             raise ValueError(f"unknown command {args.command}")
     except Exception as exc:  # noqa: BLE001

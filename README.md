@@ -50,6 +50,14 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
   `min(core-budget, memory-budget)`, so a build that would exhaust RAM is refused
   even when CPU is free. Legacy core-only records are estimated as
   `cores × per-job memory` so a mixed store never over-admits.
+- **Disk growth as a per-volume admission axis** — VM runners reserve their
+  worst-case writable growth in the same locked transaction as cores and
+  memory. Admission retains a free-space safety floor after active reservations
+  plus the new request, keyed by filesystem device so two supervisors cannot
+  independently pass a stale `df` check. The defaults are a 25 GiB floor and a
+  configurable 24 GiB VM growth allowance, sized above the roughly 19 GiB
+  observed Pulp full-gate growth. Shared ccache and baked CoW dependencies stay
+  outside this accounting and are not copied per job.
 - **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
   its cores + `hw.model`: **dedicated-builder**, **dev-overflow**, or **light**,
   each with both a core budget and a memory budget. `tartci host-profile` emits
@@ -97,7 +105,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci status --json    # host-local provider/capacity/profile state for agents
 ./tartci host-profile --json  # derived role budget; read-only
-./tartci leases status --json # host-wide core lease store; does not acquire capacity
+./tartci leases status --json # host-wide core/memory/per-volume disk reservations
 ./tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 ./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
 ./tartci runtime summary --repo owner/repo --run-id 123 --json
