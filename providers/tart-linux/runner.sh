@@ -251,7 +251,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   tartci_check_disk_floor "$TART_HOME" || return $?
   tartci_prepare_disk_root "$LOGROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
-  logdir="$LOGROOT/$vm"; mkdir -p "$logdir"
+  logdir="$LOGROOT/$vm"
+  tartci_prepare_disk_root "$logdir" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \

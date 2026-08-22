@@ -918,6 +918,71 @@ raise SystemExit(rc)
         self.assertEqual(state["reserved_bytes"], 0)
         self.assertEqual(state["required_bytes"], 50)
 
+    def test_live_same_path_device_change_blocks_new_admission(self) -> None:
+        self.acquire(
+            "existing-device",
+            1,
+            disk_path=Path(self.tmp.name),
+            disk_growth_mb=1,
+        )
+        records = leases.load_records(self.store)
+        self.assertEqual(len(records), 1)
+        records[0]["disk_device_id"] = "previous-device"
+        leases.write_records(self.store, records)
+
+        args = leases.parse_args(
+            [
+                "acquire",
+                "--id",
+                "after-remount",
+                "--cores",
+                "1",
+                "--capacity",
+                "8",
+                "--capacity-mem-mb",
+                "0",
+                "--reserved-gate-cores",
+                "0",
+                "--pid",
+                str(self.pid),
+                "--kind",
+                "tart-linux-vm",
+                "--disk-path",
+                self.tmp.name,
+                "--disk-growth-mb",
+                "1",
+                "--store-dir",
+                str(self.store),
+                "--json",
+            ]
+        )
+        result, rc = leases.acquire(args)
+        self.assertEqual(rc, 75)
+        self.assertEqual(
+            result["reason"], "disk_device_changed_with_live_reservations"
+        )
+        self.assertEqual(result["conflicting_leases"][0]["id"], "existing-device")
+        self.assertEqual(len(leases.load_records(self.store)), 1)
+
+    def test_retargeted_logical_path_conflicts_across_devices(self) -> None:
+        records = [
+            {
+                "id": "before-retarget",
+                "disk_device_id": "dev-a",
+                "disk_logical_path": "/configured/vm-store",
+                "disk_reservation_path": "/mounted-a/vm-store",
+                "disk_mount_path": "/mounted-a",
+            }
+        ]
+        probe = {
+            "device_id": "dev-b",
+            "logical_path": "/configured/vm-store",
+            "reservation_path": "/mounted-b/vm-store",
+            "mount_path": "/mounted-b",
+        }
+        conflicts = leases.disk_identity_conflicts(records, probe)
+        self.assertEqual([row["id"] for row in conflicts], ["before-retarget"])
+
     def test_dead_owner_reap_releases_disk_reservation(self) -> None:
         exited = subprocess.Popen([sys.executable, "-c", "pass"])
         exited.wait(timeout=5)

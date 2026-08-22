@@ -30,101 +30,15 @@ tartci_pid_started_at(){
   ps -p "$pid" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//'
 }
 
-# Create a missing per-provider cache/log/work leaf without ever walking through
-# a missing external mount. The nearest existing ancestor is opened first and
-# all new components are created relative to that directory descriptor, keeping
-# a mount disappearance from redirecting creation onto its parent filesystem.
-# /Volumes/<name>/... paths additionally require <name> to be a real mount.
+# Create a missing per-provider cache/log/work leaf beneath an authoritative,
+# already-existing parent: HOME for home-backed defaults, TMPDIR (or /tmp) for
+# ephemeral defaults, an actual /Volumes mount, or the immediate parent of a
+# custom path. All components are opened relative to that parent's descriptor,
+# without symlink following, and must remain on its validated device.
 tartci_prepare_disk_root(){
   local path="$1" expected_mount="${2:-}" expected_device="${3:-}"
-  python3 - "$path" "$expected_mount" "$expected_device" <<'PY'
-import os
-import pathlib
-import sys
-
-target = pathlib.Path(sys.argv[1]).expanduser()
-expected_mount_text = sys.argv[2]
-expected_device = sys.argv[3]
-if not target.is_absolute():
-    target = pathlib.Path.cwd() / target
-target = pathlib.Path(os.path.abspath(os.fspath(target)))
-
-missing = []
-ancestor = target
-while not ancestor.exists():
-    missing.append(ancestor.name)
-    if ancestor == ancestor.parent:
-        raise SystemExit(f"cannot resolve existing parent for configured disk root: {target}")
-    ancestor = ancestor.parent
-if not ancestor.is_dir():
-    raise SystemExit(f"configured disk-root parent is not a directory: {ancestor}")
-
-parts = target.parts
-mount = None
-if expected_mount_text:
-    mount = pathlib.Path(expected_mount_text).expanduser()
-    if not mount.is_absolute():
-        mount = pathlib.Path.cwd() / mount
-    mount = pathlib.Path(os.path.abspath(os.fspath(mount)))
-elif len(parts) >= 3 and parts[1] == "Volumes":
-    mount = pathlib.Path("/Volumes") / parts[2]
-if mount is not None:
-    if not mount.is_dir():
-        raise SystemExit(f"refusing to create disk root through missing external mount: {mount}")
-    try:
-        mount = mount.resolve(strict=True)
-        mount_device = mount.stat().st_dev
-        mount_root = mount
-        while mount_root != mount_root.parent:
-            if mount_root.parent.stat().st_dev != mount_device:
-                break
-            mount_root = mount_root.parent
-        if mount_root != mount:
-            raise SystemExit(f"refusing to create disk root through unmounted volume path: {mount}")
-        if expected_device and str(mount_device) != expected_device:
-            raise SystemExit(
-                f"disk device mismatch for configured root {target}: "
-                f"expected {expected_device}, got {mount_device}"
-            )
-    except OSError as exc:
-        raise SystemExit(f"cannot validate external mount {mount}: {exc}") from exc
-
-ancestor = ancestor.resolve(strict=True)
-physical_target = ancestor.joinpath(*reversed(missing))
-if mount is not None:
-    try:
-        physical_target.relative_to(mount)
-    except ValueError as exc:
-        raise SystemExit(
-            f"configured disk root {target} is outside expected mount {mount}"
-        ) from exc
-elif expected_device and str(ancestor.stat().st_dev) != expected_device:
-    raise SystemExit(
-        f"disk device mismatch for configured root {target}: "
-        f"expected {expected_device}, got {ancestor.stat().st_dev}"
-    )
-
-flags = os.O_RDONLY
-flags |= getattr(os, "O_DIRECTORY", 0)
-flags |= getattr(os, "O_NOFOLLOW", 0)
-fd = os.open(ancestor, flags)
-try:
-    device = os.fstat(fd).st_dev
-    for name in reversed(missing):
-        try:
-            os.mkdir(name, mode=0o755, dir_fd=fd)
-        except FileExistsError:
-            pass
-        next_fd = os.open(name, flags, dir_fd=fd)
-        os.close(fd)
-        fd = next_fd
-        if os.fstat(fd).st_dev != device:
-            raise SystemExit(
-                f"disk device changed while creating configured root: {target}"
-            )
-finally:
-    os.close(fd)
-PY
+  python3 "${BASH_SOURCE[0]%/*}/../../scripts/lease_disk.py" prepare-root \
+    --path "$path" --expected-mount "$expected_mount" --expected-device "$expected_device"
 }
 
 tartci_check_disk_floor(){

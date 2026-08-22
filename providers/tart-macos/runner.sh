@@ -710,9 +710,8 @@ run_one(){
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
-    tartci_prepare_disk_root "$MACOS_LOGROOT" || return $?
     logdir="$MACOS_LOGROOT/$vm"
-    mkdir -p "$logdir"
+    tartci_prepare_disk_root "$logdir" || return $?
   fi
   tartci_check_disk_floor "$TART_HOME" || return $?
   tartci_prepare_disk_root "$CACHE_ROOT" || return $?
@@ -748,7 +747,12 @@ run_one(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  mkdir -p "$CACHE_ROOT/ccache"
+  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
+    return 1
+  fi
   boot_log="$(mktemp -t "tart-run-$vm")"
   tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"

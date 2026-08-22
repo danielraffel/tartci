@@ -69,6 +69,8 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 CURRENT_WIN_JOB=""
 CURRENT_WIN_JOBDIR=""
 CURRENT_WIN_PORT_LOCK=""
+CURRENT_WIN_PORT_LOCK_DEVICE=""
+CURRENT_WIN_PORT_LOCK_INODE=""
 CURRENT_WIN_QPID=""
 CURRENT_WIN_STATE_DIR=""
 CURRENT_WIN_LEASE_ID_EXPECTED=""
@@ -128,41 +130,76 @@ allocate_ssh_port(){
   python3 - "$WORKROOT/port-locks" <<'PY'
 import os
 import random
-import shutil
 import socket
+import stat
 import sys
 import time
 
 root = sys.argv[1]
-os.makedirs(root, exist_ok=True)
-now = time.time()
-for name in os.listdir(root):
-    path = os.path.join(root, name)
-    try:
-        if os.path.isdir(path) and now - os.stat(path).st_mtime > 24 * 60 * 60:
-            shutil.rmtree(path)
-    except OSError:
-        pass
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+root_fd = os.open(root, flags)
+try:
+    root_stat = os.fstat(root_fd)
+    now = time.time()
+    for name in os.listdir(root_fd):
+        try:
+            info = os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode) and now - info.st_mtime > 24 * 60 * 60:
+                # Port locks are empty marker directories. Never recurse through
+                # an unexpected entry or reopen the validated root by path.
+                os.rmdir(name, dir_fd=root_fd)
+        except OSError:
+            pass
 
-for _ in range(200):
-    port = random.randint(20000, 60999)
-    lock = os.path.join(root, f"{port}.lock")
-    try:
-        os.mkdir(lock)
-    except FileExistsError:
-        continue
-    sock = socket.socket()
-    try:
-        sock.bind(("127.0.0.1", port))
-    except OSError:
-        shutil.rmtree(lock, ignore_errors=True)
-        continue
-    finally:
-        sock.close()
-    print(port, lock)
-    raise SystemExit(0)
+    for _ in range(200):
+        port = random.randint(20000, 60999)
+        lock_name = f"{port}.lock"
+        try:
+            os.mkdir(lock_name, dir_fd=root_fd)
+        except FileExistsError:
+            continue
+        sock = socket.socket()
+        try:
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            try:
+                os.rmdir(lock_name, dir_fd=root_fd)
+            except OSError:
+                pass
+            continue
+        finally:
+            sock.close()
+        print(port, lock_name, root_stat.st_dev, root_stat.st_ino)
+        raise SystemExit(0)
+finally:
+    os.close(root_fd)
 
 raise SystemExit("no available SSH port after 200 attempts")
+PY
+}
+
+release_ssh_port_lock(){
+  local name="$1" expected_device="$2" expected_inode="$3"
+  python3 - "$WORKROOT/port-locks" "$name" "$expected_device" "$expected_inode" <<'PY'
+import os
+import re
+import sys
+
+root, name, expected_device, expected_inode = sys.argv[1:]
+if not re.fullmatch(r"[0-9]+[.]lock", name):
+    raise SystemExit("invalid port-lock name")
+flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+root_fd = os.open(root, flags)
+try:
+    info = os.fstat(root_fd)
+    if str(info.st_dev) != expected_device or str(info.st_ino) != expected_inode:
+        raise SystemExit("port-lock root identity changed; refusing cleanup")
+    try:
+        os.rmdir(name, dir_fd=root_fd)
+    except FileNotFoundError:
+        pass
+finally:
+    os.close(root_fd)
 PY
 }
 
@@ -221,7 +258,11 @@ cleanup_active_windows_job(){
     wait "$CURRENT_WIN_QPID" 2>/dev/null || true
   fi
   [ -z "$CURRENT_WIN_JOBDIR" ] || rm -rf "$CURRENT_WIN_JOBDIR"
-  [ -z "$CURRENT_WIN_PORT_LOCK" ] || rm -rf "$CURRENT_WIN_PORT_LOCK"
+  if [ -n "$CURRENT_WIN_PORT_LOCK" ]; then
+    release_ssh_port_lock "$CURRENT_WIN_PORT_LOCK" \
+      "$CURRENT_WIN_PORT_LOCK_DEVICE" "$CURRENT_WIN_PORT_LOCK_INODE" \
+      || note "refusing unsafe port-lock cleanup name=$CURRENT_WIN_PORT_LOCK"
+  fi
   if [ -n "$CURRENT_WIN_LEASE_ID_EXPECTED" ] \
     && [ "${TARTCI_ACTIVE_VM_LEASE_ID:-}" = "$CURRENT_WIN_LEASE_ID_EXPECTED" ]; then
     tartci_release_vm_lease
@@ -234,6 +275,8 @@ cleanup_active_windows_job(){
   CURRENT_WIN_JOB=""
   CURRENT_WIN_JOBDIR=""
   CURRENT_WIN_PORT_LOCK=""
+  CURRENT_WIN_PORT_LOCK_DEVICE=""
+  CURRENT_WIN_PORT_LOCK_INODE=""
   CURRENT_WIN_QPID=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
@@ -266,29 +309,47 @@ run_one(){ # $1=iteration index
   local i="$1" jit="" job="${RUNNER_NAME_PREFIX}-$$-$1" lease_cores lease_priority
   local effective_win_cpus
   local t_start t_booted t_preflight t_runner_done t_done
-  local state_dir qemu_started=""
+  local state_dir qemu_started="" prepare_rc=0
   t_start="$(now_epoch)"
   tartci_prepare_disk_root "$WORKROOT" \
     "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
     "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" || return $?
   tartci_prepare_disk_root "$LOGROOT" || return $?
+  tartci_prepare_disk_root "$WORKROOT/port-locks" || return $?
   tartci_check_disk_floor "$WORKROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
 
-  local port port_lock jobdir logdir overlay efivars qpid
-  read -r port port_lock < <(allocate_ssh_port)
-  [ -n "$port" ] && [ -n "$port_lock" ] || die "failed to allocate SSH port"
+  local port port_lock port_lock_device port_lock_inode jobdir logdir overlay efivars qpid
+  read -r port port_lock port_lock_device port_lock_inode < <(allocate_ssh_port)
+  [ -n "$port" ] && [ -n "$port_lock" ] \
+    && [ -n "$port_lock_device" ] && [ -n "$port_lock_inode" ] \
+    || die "failed to allocate SSH port"
   jobdir="$WORKROOT/$job"
   CURRENT_WIN_JOB="$job"
   CURRENT_WIN_JOBDIR="$jobdir"
   CURRENT_WIN_PORT_LOCK="$port_lock"
+  CURRENT_WIN_PORT_LOCK_DEVICE="$port_lock_device"
+  CURRENT_WIN_PORT_LOCK_INODE="$port_lock_inode"
   CURRENT_WIN_QPID=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
   CURRENT_WIN_CPUS=""
   CURRENT_WIN_CLEANED_UP=0
-  mkdir -p "$jobdir"
-  logdir="$LOGROOT/$job"; mkdir -p "$logdir"
+  if tartci_prepare_disk_root "$jobdir"; then
+    :
+  else
+    prepare_rc=$?
+    cleanup_active_windows_job
+    return "$prepare_rc"
+  fi
+  logdir="$LOGROOT/$job"
+  if tartci_prepare_disk_root "$logdir"; then
+    :
+  else
+    prepare_rc=$?
+    cleanup_active_windows_job
+    return "$prepare_rc"
+  fi
   overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
   state_dir="$(tartci_provider_state_dir qemu-windows)"
   CURRENT_WIN_STATE_DIR="$state_dir"
@@ -300,7 +361,7 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_WORK_DIR="$jobdir" \
     TARTCI_STATE_LOG_DIR="$logdir" \
     TARTCI_STATE_OVERLAY="$overlay" \
-    TARTCI_STATE_PORT_LOCK="$port_lock" \
+    TARTCI_STATE_PORT_LOCK="$WORKROOT/port-locks/$port_lock" \
     TARTCI_STATE_SSH_PORT="$port" \
     TARTCI_STATE_QEMU_PID="${qpid:-}" \
     TARTCI_STATE_QEMU_PID_STARTED_AT="$qemu_started" \
@@ -353,6 +414,8 @@ run_one(){ # $1=iteration index
       CURRENT_WIN_JOB=""
       CURRENT_WIN_JOBDIR=""
       CURRENT_WIN_PORT_LOCK=""
+      CURRENT_WIN_PORT_LOCK_DEVICE=""
+      CURRENT_WIN_PORT_LOCK_INODE=""
       CURRENT_WIN_QPID=""
       CURRENT_WIN_STATE_DIR=""
       CURRENT_WIN_LEASE_ID_EXPECTED=""
@@ -449,7 +512,6 @@ try {
 } catch {
   Write-Output "TARTCI_DIAG early-clock-sync-failed=$($_.Exception.Message)"
 }' | iconv -t UTF-16LE | base64)"
-  mkdir -p "$logdir"
   wsh "powershell -NoProfile -EncodedCommand $enc_clock" >"$logdir/early-clock.log" 2>&1 \
     || note "[$i] early clock sync failed"
 
@@ -585,7 +647,6 @@ $jitPath="C:\actions-runner\jit.cfg"
   if (Test-Path $jitPath) {
   Write-Output ("TARTCI_DIAG jit-cfg-bytes=" + (Get-Item $jitPath).Length)
 }'
-  mkdir -p "$logdir"
   run_guest_ps_file "C:\actions-runner\tartci-preflight.ps1" "$ps_preflight" >"$logdir/preflight.log" 2>&1 \
     || note "[$i] preflight diagnostics failed"
   t_preflight="$(now_epoch)"
@@ -628,7 +689,6 @@ exit $LASTEXITCODE'
   local run_status=0
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
-  mkdir -p "$logdir"
   run_guest_ps_file "C:\actions-runner\tartci-runner.ps1" "$ps_run" >"$runner_output" 2>&1 &
   runner_pid=$!
   runner_start="$(now_epoch)"
@@ -673,7 +733,6 @@ if (Test-Path $diagDir) {
 } else {
   Write-Output "TARTCI_DIAG no-runner-diag-dir"
 }' | iconv -t UTF-16LE | base64)"
-  mkdir -p "$logdir"
   wsh "powershell -NoProfile -EncodedCommand $enc_after" >"$logdir/runner-diag.log" 2>&1 || true
   t_done="$(now_epoch)"
   prefix_guest_log "$logdir/runner-diag.log"

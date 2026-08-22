@@ -6,6 +6,12 @@
 : "${TARTCI_VM_DISK_GROWTH_GB:=24}"
 : "${TARTCI_VM_DISK_FREE_FLOOR_GB:=25}"
 
+# Process-local admission state. Bash arrays are not inherited from the
+# environment, and the unconditional reset prevents a forged scalar from being
+# mistaken for authority when this helper is sourced.
+unset _tartci_vm_lease_bypass_state 2>/dev/null || true
+declare -a _tartci_vm_lease_bypass_state=()
+
 # shellcheck source=providers/common/disk-capacity.lib.sh
 source "${BASH_SOURCE[0]%/*}/disk-capacity.lib.sh"
 
@@ -193,15 +199,20 @@ tartci_stop_vm_lease_heartbeat(){
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}" lease_id rc=0 out
   tartci_positive_int_or_empty "$cores" || cores=1
+  if [ -n "${TARTCI_ACTIVE_VM_LEASE_ID:-}" ]; then
+    tartci_vm_lease_note "refusing to acquire $kind lease for $vm_name while ${TARTCI_ACTIVE_VM_LEASE_ID} is active"
+    return 75
+  fi
+  # Authorization to run without a guardian is issued only by this admission
+  # entry point. Guard helpers must not turn a later mutation of the public
+  # environment knob into an ungoverned writer bypass.
+  _tartci_vm_lease_bypass_state=()
   if ! tartci_vm_leases_enabled; then
     TARTCI_ACTIVE_VM_LEASE_ID=""
     # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
     TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+    _tartci_vm_lease_bypass_state=(authorized)
     return 0
-  fi
-  if [ -n "${TARTCI_ACTIVE_VM_LEASE_ID:-}" ]; then
-    tartci_vm_lease_note "refusing to acquire $kind lease for $vm_name while ${TARTCI_ACTIVE_VM_LEASE_ID} is active"
-    return 75
   fi
   # Clamp a NON-GATE VM lane to the host's non-gate core budget
   # (lease_capacity - reserved_gate). A non-gate lane can never lease more than
@@ -290,9 +301,10 @@ tartci_vm_lease_guard_exec(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
   [ -n "$lease_id" ] || {
     # The documented operator-only break-glass mode has no durable lease to
-    # guard. Bypass only when that mode is explicitly disabled; an unexpected
-    # missing lease in normal governed mode remains a hard refusal.
-    if ! tartci_vm_leases_enabled; then
+    # guard. Bypass only after tartci_acquire_vm_lease authoritatively observed
+    # that explicit disable; rereading a mutable environment knob is not proof.
+    if [ "${_tartci_vm_lease_bypass_state[0]:-}" = authorized ] \
+      && ! tartci_vm_leases_enabled; then
       exec "$@"
     fi
     tartci_vm_lease_note "cannot start VM guardian without an active lease"
@@ -306,9 +318,10 @@ tartci_vm_lease_guard_exec(){
 tartci_vm_lease_guard_run(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
   [ -n "$lease_id" ] || {
-    # See guard_exec: this is the finite-writer half of the same explicit
-    # break-glass contract, not a fallback after an enabled-mode lease failure.
-    if ! tartci_vm_leases_enabled; then
+    # See guard_exec: this is the finite-writer half of the same acquisition-
+    # authorized break-glass contract, not a fallback after a lease failure.
+    if [ "${_tartci_vm_lease_bypass_state[0]:-}" = authorized ] \
+      && ! tartci_vm_leases_enabled; then
       "$@"
       return $?
     fi
@@ -320,13 +333,17 @@ tartci_vm_lease_guard_run(){
 
 tartci_release_vm_lease(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}" rc=0
-  [ -n "$lease_id" ] || return 0
-  tartci_stop_vm_lease_heartbeat
-  if tartci_vm_leases_enabled; then
-    python3 "$TARTCI_ROOT/scripts/leases.py" release --id "$lease_id" --json >/dev/null 2>&1 || rc=$?
-    [ "$rc" -eq 0 ] || tartci_vm_lease_note "lease release reported rc=$rc for $lease_id"
+  if [ -z "$lease_id" ]; then
+    _tartci_vm_lease_bypass_state=()
+    return 0
   fi
+  tartci_stop_vm_lease_heartbeat
+  # An acquired lease remains authoritative even if configuration changes.
+  # Always release by exact ID; the current public enable knob is irrelevant.
+  python3 "$TARTCI_ROOT/scripts/leases.py" release --id "$lease_id" --json >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 0 ] || tartci_vm_lease_note "lease release reported rc=$rc for $lease_id"
   TARTCI_ACTIVE_VM_LEASE_ID=""
+  _tartci_vm_lease_bypass_state=()
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES=""
   return 0

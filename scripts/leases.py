@@ -9,7 +9,6 @@ import datetime as dt
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import time
@@ -17,6 +16,14 @@ import uuid
 from typing import Any, Iterator
 
 import host_profile
+import lease_cli
+from lease_disk import (
+    disk_capacity,
+    disk_identity_conflicts,
+    disk_probe,
+    record_disk_bytes,
+    record_has_complete_disk_accounting,
+)
 
 try:
     import fcntl
@@ -309,108 +316,6 @@ def record_has_explicit_mem(record: dict[str, Any]) -> bool:
     return "lease_size_mem_mb" in record
 
 
-def disk_probe(
-    path_text: str,
-    *,
-    expected_device_id: str = "",
-    expected_mount_path: str = "",
-) -> dict[str, Any]:
-    """Resolve a path to its filesystem identity and current free space.
-
-    Provider storage roots are provisioned state, not per-job scratch paths.
-    They must already exist: walking to an ancestor can silently redirect an
-    offline /Volumes store onto the internal Data volume. Bind aliases and
-    different directories on the same mounted filesystem to st_dev.
-    """
-    try:
-        requested = pathlib.Path(path_text).expanduser().resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
-        raise ValueError(
-            f"configured disk reservation root does not exist: {path_text!r}"
-        ) from exc
-    if not requested.is_dir():
-        raise ValueError(
-            f"configured disk reservation root is not a directory: {path_text!r}"
-        )
-    device = requested.stat().st_dev
-    mount = requested
-    while mount != mount.parent:
-        parent = mount.parent
-        try:
-            if parent.stat().st_dev != device:
-                break
-        except OSError:
-            break
-        mount = parent
-    if expected_device_id and str(device) != str(expected_device_id):
-        raise ValueError(
-            f"disk device mismatch for {path_text!r}: expected {expected_device_id}, got {device}"
-        )
-    if expected_mount_path:
-        try:
-            expected_mount = pathlib.Path(expected_mount_path).expanduser().resolve(strict=True)
-        except (OSError, RuntimeError) as exc:
-            raise ValueError(
-                f"expected disk mount does not exist: {expected_mount_path!r}"
-            ) from exc
-        if mount != expected_mount:
-            raise ValueError(
-                f"disk mount mismatch for {path_text!r}: expected {expected_mount}, got {mount}"
-            )
-    free = shutil.disk_usage(requested).free
-    return {
-        "device_id": str(device),
-        "mount_path": str(mount),
-        "reservation_path": str(requested),
-        "probe_path": str(requested),
-        "free_bytes": int(free),
-    }
-
-
-def record_disk_bytes(record: dict[str, Any]) -> int:
-    return max(0, record_int(record, "disk_growth_bytes"))
-
-
-def record_has_complete_disk_accounting(record: dict[str, Any]) -> bool:
-    return bool(
-        record.get("disk_device_id")
-        and record.get("disk_reservation_path")
-        and "disk_growth_bytes" in record
-        and "disk_floor_bytes" in record
-    )
-
-
-def disk_capacity(
-    records: list[dict[str, Any]],
-    probe: dict[str, Any],
-    requested_bytes: int,
-    floor_bytes: int,
-) -> dict[str, Any]:
-    same_device = [
-        record
-        for record in records
-        if str(record.get("disk_device_id") or "") == probe["device_id"]
-    ]
-    reserved = sum(record_disk_bytes(record) for record in same_device)
-    active_floor = max(
-        [record_int(record, "disk_floor_bytes") for record in same_device] + [0]
-    )
-    effective_floor = max(floor_bytes, active_floor)
-    required = effective_floor + reserved + requested_bytes
-    return {
-        "device_id": probe["device_id"],
-        "mount_path": probe["mount_path"],
-        "reservation_path": probe["reservation_path"],
-        "free_bytes": probe["free_bytes"],
-        "floor_bytes": effective_floor,
-        "reserved_bytes": reserved,
-        "requested_bytes": requested_bytes,
-        "required_bytes": required,
-        "available_after_reservations_bytes": max(0, probe["free_bytes"] - reserved),
-        "reservation_count": len(same_device),
-    }
-
-
 def reclaim(records: list[dict[str, Any]], stale_secs: int) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
     now = utcnow()
     boot = host_boot_time()
@@ -652,6 +557,18 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 75
+        disk_conflicts = disk_identity_conflicts(active, disk) if disk is not None else []
+        if disk_conflicts:
+            write_records(store_dir, active)
+            return {
+                "ok": False,
+                "reason": "disk_device_changed_with_live_reservations",
+                "id": lease_id,
+                "disk": disk,
+                "conflicting_leases": disk_conflicts,
+                "reaped": reaped_summary(reaped),
+                "problems": problem_summary(problems),
+            }, 75
         current_usage = usage(active, cfg)
         limit = cfg["total"]
         used_for_limit = current_usage["used_cores"]
@@ -735,6 +652,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "disk_device_id": disk["device_id"],
                     "disk_mount_path": disk["mount_path"],
                     "disk_reservation_path": disk["reservation_path"],
+                    "disk_logical_path": disk["logical_path"],
                     "disk_growth_bytes": requested_disk_bytes,
                     "disk_floor_bytes": disk_floor_bytes,
                     "disk_expected_device_id": str(
@@ -1009,105 +927,14 @@ def emit(result: dict[str, Any], json_output: bool) -> None:
     print(json.dumps(result, sort_keys=True))
 
 
-def add_common(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--store-dir", default=str(default_store_dir()))
-    parser.add_argument("--capacity", type=int, help="override lease capacity (cores)")
-    parser.add_argument(
-        "--capacity-mem-mb",
-        type=int,
-        help="override memory lease capacity in MB (0 disables the memory axis)",
-    )
-    parser.add_argument("--reserved-gate-cores", type=int, help="cores withheld from non-gate leases")
-    parser.add_argument("--gate-priority", type=int, default=PRIORITY_CLASSES["gate"])
-    parser.add_argument("--stale-secs", type=int, default=int(os.environ.get("TARTCI_LEASE_STALE_SECS", "300")))
-    parser.add_argument("--role", choices=host_profile.VALID_ROLES)
-    parser.add_argument("--role-file")
-    parser.add_argument("--host-cores", type=int)
-    parser.add_argument("--model")
-    parser.add_argument("--json", action="store_true")
-
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    raw = list(sys.argv[1:] if argv is None else argv)
-    if not raw or raw[0].startswith("-"):
-        raw = ["status", *raw]
-    parser = argparse.ArgumentParser(prog="tartci leases")
-    sub = parser.add_subparsers(dest="command", required=True)
-
-    status = sub.add_parser("status", aliases=["list"], help="show active leases")
-    add_common(status)
-
-    reap_parser = sub.add_parser("reap", help="reclaim dead-owner leases and show status")
-    add_common(reap_parser)
-
-    acquire_parser = sub.add_parser("acquire", help="acquire a core lease")
-    add_common(acquire_parser)
-    acquire_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
-    acquire_parser.add_argument(
-        "--mem-mb",
-        type=int,
-        help="memory this lease consumes in MB; omitted → cores * per-job estimate",
+    return lease_cli.parse_args(
+        argv,
+        default_store_dir=str(default_store_dir()),
+        priority_classes=PRIORITY_CLASSES,
+        valid_roles=host_profile.VALID_ROLES,
+        stale_secs=int(os.environ.get("TARTCI_LEASE_STALE_SECS", "300")),
     )
-    acquire_parser.add_argument("--priority", default="build")
-    acquire_parser.add_argument("--pid", type=int)
-    acquire_parser.add_argument("--id")
-    acquire_parser.add_argument("--kind", default="unknown")
-    acquire_parser.add_argument("--owner", default="")
-    acquire_parser.add_argument("--label", default="")
-    acquire_parser.add_argument("--job-id", default="")
-    acquire_parser.add_argument("--vm-name", default="")
-    acquire_parser.add_argument(
-        "--disk-path",
-        help="VM/overlay store path whose filesystem receives the growth reservation",
-    )
-    acquire_parser.add_argument(
-        "--disk-growth-mb",
-        type=int,
-        default=0,
-        help="worst-case disk growth to reserve on --disk-path's filesystem",
-    )
-    acquire_parser.add_argument(
-        "--disk-floor-mb",
-        type=int,
-        default=0,
-        help="free-space safety floor retained after all active/requested growth",
-    )
-    acquire_parser.add_argument(
-        "--disk-expected-device-id",
-        default="",
-        help="optional persisted filesystem device identity for --disk-path",
-    )
-    acquire_parser.add_argument(
-        "--disk-expected-mount-path",
-        default="",
-        help="optional expected mounted filesystem root for --disk-path",
-    )
-
-    release_parser = sub.add_parser("release", help="release a lease by id")
-    add_common(release_parser)
-    release_parser.add_argument("--id", required=True)
-
-    heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
-    add_common(heartbeat_parser)
-    heartbeat_parser.add_argument("--id", required=True)
-
-    guard_parser = sub.add_parser(
-        "guard-exec",
-        help="atomically attach this process as a VM lease guardian, then exec a command",
-    )
-    add_common(guard_parser)
-    guard_parser.add_argument("--id", required=True)
-    guard_parser.add_argument("argv", nargs=argparse.REMAINDER)
-
-    guard_run_parser = sub.add_parser(
-        "guard-run",
-        help="guard a finite VM disk writer and return ownership to its supervisor",
-    )
-    add_common(guard_run_parser)
-    guard_run_parser.add_argument("--id", required=True)
-    guard_run_parser.add_argument("argv", nargs=argparse.REMAINDER)
-
-    return parser.parse_args(raw)
 
 
 def main(argv: list[str] | None = None) -> int:
