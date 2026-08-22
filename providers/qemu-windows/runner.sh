@@ -329,7 +329,7 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
     return 1
   fi
-  qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$effective_win_cpus" -m "$WIN_MEMORY_MB" \
+  tartci_vm_lease_guard_exec qemu-system-aarch64 -name "$job" -accel hvf -machine virt,highmem=on -cpu host -smp "$effective_win_cpus" -m "$WIN_MEMORY_MB" \
     -drive if=pflash,format=raw,readonly=on,file="$FW" -drive if=pflash,format=raw,file="$efivars" \
     -device ramfb -device qemu-xhci,id=usb -device usb-kbd -device usb-tablet \
     -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:$port-:22" -device virtio-net-pci,netdev=net0 \

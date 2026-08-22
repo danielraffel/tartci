@@ -4,6 +4,9 @@
 : "${TARTCI_STATE_ROOT:=$HOME/.tartci/state}"
 : "${TARTCI_VM_DISK_FREE_FLOOR_GB:=25}"
 
+# shellcheck source=providers/common/disk-capacity.lib.sh
+source "${BASH_SOURCE[0]%/*}/disk-capacity.lib.sh"
+
 tartci_vm_state_note(){
   if command -v note >/dev/null 2>&1; then
     note "$*"
@@ -29,15 +32,15 @@ tartci_pid_started_at(){
 
 tartci_check_disk_floor(){
   local path="$1" floor_gb="${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}" probe avail_kb floor_kb
-  case "$floor_gb" in
-    0|false|FALSE|off|OFF|no|NO|"") return 0 ;;
-    *[!0-9]*) tartci_vm_state_note "invalid TARTCI_VM_DISK_FREE_FLOOR_GB=$floor_gb"; return 75 ;;
-  esac
-  mkdir -p "$path" 2>/dev/null || true
+  if ! floor_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_FREE_FLOOR_GB "$floor_gb" 25)"; then
+    return 75
+  fi
+  if [ ! -d "$path" ]; then
+    tartci_vm_state_note "refusing VM admission: configured disk root does not exist: $path"
+    return 75
+  fi
+  [ "$floor_gb" -gt 0 ] || return 0
   probe="$path"
-  while [ ! -e "$probe" ] && [ "$probe" != "/" ]; do
-    probe="$(dirname "$probe")"
-  done
   avail_kb="$(df -Pk "$probe" 2>/dev/null | awk 'NR==2 {print $4}')"
   case "$avail_kb" in ''|*[!0-9]*) tartci_vm_state_note "cannot read free disk for $probe"; return 75 ;; esac
   floor_kb=$((floor_gb * 1024 * 1024))

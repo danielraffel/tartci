@@ -1214,23 +1214,33 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   are free. Legacy core-only records are estimated as `cores × per-job memory`
   so a mixed store never over-admits.
 - **Disk as a third, per-volume axis** — macOS/Linux Tart clones reserve growth
-  against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN`. Device ID,
-  not a spelling of the path, is the accounting key, so aliases on one volume
-  contend while internal and external stores remain independent. The free-space
-  check and reservation commit occur under the same `leases.lock` transaction
-  as CPU/RAM admission. JSON status and denial records emit `free_bytes`,
-  `reserved_bytes`, `requested_bytes`, and `required_bytes` for diagnosis.
+  against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN_WORK`.
+  Device ID, not a spelling of the path, is the accounting key, so aliases on
+  one volume contend while internal and external stores remain independent. The
+  free-space check and reservation commit occur under the same `leases.lock`
+  transaction as CPU/RAM admission. JSON status and denial records emit
+  `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
+  diagnosis.
 
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full
   gate. Override only from measured evidence, globally or with
-  `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_GROWTH_GB`. A value of zero disables growth
-  charging or the floor respectively; this is the rollback, but it restores the
-  old concurrent-admission race and should be temporary. Existing core/memory
-  leases remain readable and simply carry no disk reservation until renewed.
+  `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_GROWTH_GB`. Zero or `false`/`off`/`no`
+  disables growth charging or the floor respectively; this is the rollback,
+  but it restores the old concurrent-admission race and should be temporary.
+  Existing core/memory leases remain readable. A live legacy **VM** lease has
+  unknown disk growth, so new VM admission fails closed until that VM finishes
+  and its supervisor is restarted on the upgraded tartci snapshot; native build
+  leases remain backward-compatible.
   Normal exit and signal cleanup release the unified lease; dead-owner reaping
-  releases its disk reservation after a crash or reboot.
+  releases its disk reservation after a crash or reboot, but an exact live
+  Tart/QEMU guardian keeps the lease after its supervisor dies. Storage roots
+  must already exist; admission never creates a missing configured root. Paths
+  under `/Volumes/<name>` are pinned to that mount automatically. Other hosts
+  can persist an equivalent check with
+  `TARTCI_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` or the provider-specific
+  `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` overrides.
 - **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
   its cores + `hw.model` — **dedicated-builder**, **dev-overflow**, or
   **light** — each carrying a core budget *and* a memory budget. `tartci

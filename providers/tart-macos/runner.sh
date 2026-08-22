@@ -748,7 +748,7 @@ run_one(){
   fi
   mkdir -p "$CACHE_ROOT/ccache"
   boot_log="$(mktemp -t "tart-run-$vm")"
-  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat booting
 

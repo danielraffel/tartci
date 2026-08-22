@@ -33,6 +33,10 @@ PRIORITY_CLASSES = {
 }
 
 
+def is_vm_kind(value: Any) -> bool:
+    return str(value or "").endswith("-vm")
+
+
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -121,24 +125,60 @@ def process_identity(pid: int) -> dict[str, Any]:
     return identity
 
 
-def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
+def identity_matches(
+    record: dict[str, Any],
+    *,
+    pid_key: str,
+    start_key: str,
+    boot_key: str,
+    current_boot: str,
+    require_start: bool = False,
+) -> bool:
     try:
-        pid = int(record.get("pid"))
+        pid = int(record.get(pid_key))
     except (TypeError, ValueError):
         return False
     if pid <= 0:
         return False
-    boot = current_boot if current_boot is not None else host_boot_time()
-    record_boot = str(record.get("host_boot_time") or "")
-    if record_boot and record_boot != "unknown" and boot != "unknown" and record_boot != boot:
+    record_boot = str(record.get(boot_key) or "")
+    if (
+        record_boot
+        and record_boot != "unknown"
+        and current_boot != "unknown"
+        and record_boot != current_boot
+    ):
         return False
     current_start = pid_start(pid)
     if not current_start:
         return False
-    expected_start = str(record.get("process_start_time") or "").strip()
+    expected_start = str(record.get(start_key) or "").strip()
     if expected_start:
         return current_start == " ".join(expected_start.split())
-    return True
+    return not require_start
+
+
+def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
+    boot = current_boot if current_boot is not None else host_boot_time()
+    if identity_matches(
+        record,
+        pid_key="pid",
+        start_key="process_start_time",
+        boot_key="host_boot_time",
+        current_boot=boot,
+    ):
+        return True
+    # Provider supervisors hand the lease to the exact long-lived Tart/QEMU
+    # child before exec. A dead parent must not release disk/core/RAM while that
+    # child can still write; exact PID + start time + boot identity also avoids
+    # preserving a lease after PID reuse.
+    return is_vm_kind(record.get("command_kind")) and identity_matches(
+        record,
+        pid_key="guardian_pid",
+        start_key="guardian_process_start_time",
+        boot_key="guardian_host_boot_time",
+        current_boot=boot,
+        require_start=True,
+    )
 
 
 def default_store_dir() -> pathlib.Path:
@@ -259,21 +299,31 @@ def record_has_explicit_mem(record: dict[str, Any]) -> bool:
     return "lease_size_mem_mb" in record
 
 
-def disk_probe(path_text: str) -> dict[str, Any]:
+def disk_probe(
+    path_text: str,
+    *,
+    expected_device_id: str = "",
+    expected_mount_path: str = "",
+) -> dict[str, Any]:
     """Resolve a path to its filesystem identity and current free space.
 
-    The requested directory may not exist yet during provider admission. Walk
-    to the nearest existing ancestor, then bind the reservation to st_dev so
-    aliases and different directories on the same volume share one budget.
+    Provider storage roots are provisioned state, not per-job scratch paths.
+    They must already exist: walking to an ancestor can silently redirect an
+    offline /Volumes store onto the internal Data volume. Bind aliases and
+    different directories on the same mounted filesystem to st_dev.
     """
-    requested = pathlib.Path(path_text).expanduser().resolve(strict=False)
-    probe = requested
-    while not probe.exists() and probe != probe.parent:
-        probe = probe.parent
-    if not probe.exists():
-        raise ValueError(f"cannot resolve disk reservation path {path_text!r}")
-    device = probe.stat().st_dev
-    mount = probe
+    try:
+        requested = pathlib.Path(path_text).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError(
+            f"configured disk reservation root does not exist: {path_text!r}"
+        ) from exc
+    if not requested.is_dir():
+        raise ValueError(
+            f"configured disk reservation root is not a directory: {path_text!r}"
+        )
+    device = requested.stat().st_dev
+    mount = requested
     while mount != mount.parent:
         parent = mount.parent
         try:
@@ -282,18 +332,42 @@ def disk_probe(path_text: str) -> dict[str, Any]:
         except OSError:
             break
         mount = parent
-    free = shutil.disk_usage(probe).free
+    if expected_device_id and str(device) != str(expected_device_id):
+        raise ValueError(
+            f"disk device mismatch for {path_text!r}: expected {expected_device_id}, got {device}"
+        )
+    if expected_mount_path:
+        try:
+            expected_mount = pathlib.Path(expected_mount_path).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(
+                f"expected disk mount does not exist: {expected_mount_path!r}"
+            ) from exc
+        if mount != expected_mount:
+            raise ValueError(
+                f"disk mount mismatch for {path_text!r}: expected {expected_mount}, got {mount}"
+            )
+    free = shutil.disk_usage(requested).free
     return {
         "device_id": str(device),
         "mount_path": str(mount),
         "reservation_path": str(requested),
-        "probe_path": str(probe),
+        "probe_path": str(requested),
         "free_bytes": int(free),
     }
 
 
 def record_disk_bytes(record: dict[str, Any]) -> int:
     return max(0, record_int(record, "disk_growth_bytes"))
+
+
+def record_has_complete_disk_accounting(record: dict[str, Any]) -> bool:
+    return bool(
+        record.get("disk_device_id")
+        and record.get("disk_reservation_path")
+        and "disk_growth_bytes" in record
+        and "disk_floor_bytes" in record
+    )
 
 
 def disk_capacity(
@@ -450,29 +524,40 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
         active, reaped, problems = reclaim(records, int(args.stale_secs))
         if len(active) != len(records):
             write_records(store_dir, active)
-    disk_volumes: list[dict[str, Any]] = []
-    seen_devices: set[str] = set()
-    for record in active:
-        device_id = str(record.get("disk_device_id") or "")
-        path = str(record.get("disk_reservation_path") or "")
-        if not device_id or not path or device_id in seen_devices:
-            continue
-        seen_devices.add(device_id)
-        try:
-            probe = disk_probe(path)
-            disk_volumes.append(disk_capacity(active, probe, 0, 0))
-        except (OSError, ValueError) as exc:
-            problems.append(f"disk_probe_failed:{device_id}:{exc}")
-    return {
-        "schema": 3,
-        "store_dir": str(store_dir),
-        "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
-        "capacity": usage(active, cfg),
-        "disk_volumes": sorted(disk_volumes, key=lambda row: row["device_id"]),
-        "leases": sort_records(active),
-        "reaped": reaped_summary(reaped),
-        "problems": problem_summary(problems),
-    }
+        # Keep the record set and its disk probes in one transaction. Otherwise
+        # a concurrent acquire/release can pair stale reservations with current
+        # free bytes and publish a state that never existed.
+        disk_volumes: list[dict[str, Any]] = []
+        seen_devices: set[str] = set()
+        for record in active:
+            device_id = str(record.get("disk_device_id") or "")
+            path = str(record.get("disk_reservation_path") or "")
+            if is_vm_kind(record.get("command_kind")) and not record_has_complete_disk_accounting(
+                record
+            ):
+                problems.append(f"legacy_vm_disk_accounting_unknown:{record.get('id')}")
+            if not device_id or not path or device_id in seen_devices:
+                continue
+            seen_devices.add(device_id)
+            try:
+                probe = disk_probe(
+                    path,
+                    expected_device_id=device_id,
+                    expected_mount_path=str(record.get("disk_mount_path") or ""),
+                )
+                disk_volumes.append(disk_capacity(active, probe, 0, 0))
+            except (OSError, ValueError) as exc:
+                problems.append(f"disk_probe_failed:{device_id}:{exc}")
+        return {
+            "schema": 3,
+            "store_dir": str(store_dir),
+            "mode": "provider VM runners atomically acquire host core, memory, and per-volume disk-growth leases when enabled",
+            "capacity": usage(active, cfg),
+            "disk_volumes": sorted(disk_volumes, key=lambda row: row["device_id"]),
+            "leases": sort_records(active),
+            "reaped": reaped_summary(reaped),
+            "problems": problem_summary(problems),
+        }
 
 
 def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -485,6 +570,14 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         raise ValueError("lease cores must be positive")
     lease_id = args.id or str(uuid.uuid4())
     now = iso(utcnow())
+
+    if is_vm_kind(args.kind) and not getattr(args, "disk_path", None):
+        return {
+            "ok": False,
+            "reason": "vm_disk_path_required",
+            "id": lease_id,
+            "kind": args.kind,
+        }, 75
 
     disk: dict[str, Any] | None = None
     requested_disk_bytes = 0
@@ -504,7 +597,26 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         # as reservation accounting and record commit. Moving it above this
         # boundary recreates the race this axis exists to close.
         if getattr(args, "disk_path", None):
-            disk = disk_probe(args.disk_path)
+            try:
+                disk = disk_probe(
+                    args.disk_path,
+                    expected_device_id=str(
+                        getattr(args, "disk_expected_device_id", "") or ""
+                    ),
+                    expected_mount_path=str(
+                        getattr(args, "disk_expected_mount_path", "") or ""
+                    ),
+                )
+            except (OSError, ValueError) as exc:
+                write_records(store_dir, active)
+                return {
+                    "ok": False,
+                    "reason": "disk_root_unavailable",
+                    "id": lease_id,
+                    "error": str(exc),
+                    "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems),
+                }, 75
         if any(str(record.get("id")) == lease_id for record in active):
             write_records(store_dir, active)
             return {
@@ -514,6 +626,22 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "reaped": reaped_summary(reaped),
                 "problems": problem_summary(problems),
             }, 73
+        legacy_vm_ids = [
+            str(record.get("id") or "")
+            for record in active
+            if is_vm_kind(record.get("command_kind"))
+            and not record_has_complete_disk_accounting(record)
+        ]
+        if disk is not None and legacy_vm_ids:
+            write_records(store_dir, active)
+            return {
+                "ok": False,
+                "reason": "legacy_vm_disk_accounting_unknown",
+                "id": lease_id,
+                "legacy_vm_lease_ids": sorted(legacy_vm_ids),
+                "reaped": reaped_summary(reaped),
+                "problems": problem_summary(problems),
+            }, 75
         current_usage = usage(active, cfg)
         limit = cfg["total"]
         used_for_limit = current_usage["used_cores"]
@@ -599,6 +727,12 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "disk_reservation_path": disk["reservation_path"],
                     "disk_growth_bytes": requested_disk_bytes,
                     "disk_floor_bytes": disk_floor_bytes,
+                    "disk_expected_device_id": str(
+                        getattr(args, "disk_expected_device_id", "") or ""
+                    ),
+                    "disk_expected_mount_path": str(
+                        getattr(args, "disk_expected_mount_path", "") or ""
+                    ),
                 }
             )
         active.append(record)
@@ -614,6 +748,43 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "reaped": reaped_summary(reaped),
             "problems": problem_summary(problems),
         }, 0
+
+
+def guard_exec(args: argparse.Namespace) -> int:
+    """Atomically make this process the lease guardian, then exec the VM writer."""
+    argv = list(args.argv)
+    if argv and argv[0] == "--":
+        argv = argv[1:]
+    if not argv:
+        raise ValueError("guard-exec requires a command after --")
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    identity = process_identity(os.getpid())
+    if not identity["process_start_time"]:
+        raise RuntimeError("cannot prove exact VM guardian process start identity")
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        target = next((record for record in active if record.get("id") == args.id), None)
+        if target is None:
+            write_records(store_dir, active)
+            raise ValueError(
+                f"cannot guard missing lease {args.id}; "
+                f"reaped={reaped_summary(reaped)} problems={problem_summary(problems)}"
+            )
+        if not is_vm_kind(target.get("command_kind")):
+            raise ValueError(f"lease {args.id} is not a VM lease")
+        target.update(
+            {
+                "guardian_pid": identity["pid"],
+                "guardian_process_start_time": identity["process_start_time"],
+                "guardian_host_boot_time": identity["host_boot_time"],
+                "guardian_process_group_id": identity["process_group_id"],
+                "guardian_session_id": identity["session_id"],
+            }
+        )
+        write_records(store_dir, active)
+    os.execvpe(argv[0], argv, dict(os.environ))
+    return 127  # pragma: no cover - exec either replaces this process or raises.
 
 
 def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -750,6 +921,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=0,
         help="free-space safety floor retained after all active/requested growth",
     )
+    acquire_parser.add_argument(
+        "--disk-expected-device-id",
+        default="",
+        help="optional persisted filesystem device identity for --disk-path",
+    )
+    acquire_parser.add_argument(
+        "--disk-expected-mount-path",
+        default="",
+        help="optional expected mounted filesystem root for --disk-path",
+    )
 
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)
@@ -758,6 +939,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
     add_common(heartbeat_parser)
     heartbeat_parser.add_argument("--id", required=True)
+
+    guard_parser = sub.add_parser(
+        "guard-exec",
+        help="atomically attach this process as a VM lease guardian, then exec a command",
+    )
+    add_common(guard_parser)
+    guard_parser.add_argument("--id", required=True)
+    guard_parser.add_argument("argv", nargs=argparse.REMAINDER)
 
     return parser.parse_args(raw)
 
@@ -774,6 +963,8 @@ def main(argv: list[str] | None = None) -> int:
             result, rc = release(args)
         elif args.command == "heartbeat":
             result, rc = heartbeat(args)
+        elif args.command == "guard-exec":
+            return guard_exec(args)
         else:
             raise ValueError(f"unknown command {args.command}")
     except Exception as exc:  # noqa: BLE001

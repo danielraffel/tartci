@@ -300,7 +300,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   mkdir -p "$CACHE_ROOT/ccache-linux"
   local boot_log; boot_log="$logdir/tart-run.log"
-  tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   write_state booting
 

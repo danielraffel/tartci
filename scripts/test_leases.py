@@ -9,8 +9,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import leases
 
@@ -51,6 +53,10 @@ class LeaseCliTestCase(unittest.TestCase):
         disk_path: Path | None = None,
         disk_growth_mb: int = 0,
         disk_floor_mb: int = 0,
+        disk_expected_device_id: str = "",
+        disk_expected_mount_path: str = "",
+        kind: str = "test",
+        pid: int | None = None,
         check: bool = True,
     ) -> subprocess.CompletedProcess[str]:
         # Core-axis tests keep the memory axis OFF (capacity_mem_mb=0) so they
@@ -69,6 +75,10 @@ class LeaseCliTestCase(unittest.TestCase):
                 "--disk-floor-mb",
                 str(disk_floor_mb),
             ]
+            if disk_expected_device_id:
+                extra += ["--disk-expected-device-id", disk_expected_device_id]
+            if disk_expected_mount_path:
+                extra += ["--disk-expected-mount-path", disk_expected_mount_path]
         return self.run_cli(
             "acquire",
             "--id",
@@ -82,9 +92,9 @@ class LeaseCliTestCase(unittest.TestCase):
             "--priority",
             priority,
             "--pid",
-            str(self.pid),
+            str(self.pid if pid is None else pid),
             "--kind",
-            "test",
+            kind,
             "--owner",
             "unittest",
             *extra,
@@ -170,6 +180,20 @@ class LeaseStoreIntegrityTests(LeaseCliTestCase):
 
 
 class LeaseReclaimTests(unittest.TestCase):
+    def test_vm_guardian_without_exact_start_identity_is_not_trusted(self) -> None:
+        identity = leases.process_identity(os.getpid())
+        record = {
+            "id": "inexact-guardian",
+            "pid": 99999999,
+            "process_start_time": "Mon Jan  1 00:00:00 2001",
+            "host_boot_time": leases.host_boot_time(),
+            "command_kind": "qemu-windows-vm",
+            "guardian_pid": os.getpid(),
+            "guardian_process_start_time": "",
+            "guardian_host_boot_time": identity["host_boot_time"],
+        }
+        self.assertFalse(leases.owner_matches(record))
+
     def test_reclaims_dead_owner_even_with_fresh_heartbeat(self) -> None:
         exited = subprocess.Popen([sys.executable, "-c", "pass"])
         exited.wait(timeout=5)
@@ -334,6 +358,254 @@ class LeaseMemoryAxisTests(LeaseCliTestCase):
 
 
 class LeaseDiskAxisTests(LeaseCliTestCase):
+    def test_vm_acquire_requires_explicit_disk_accounting(self) -> None:
+        denied = self.acquire(
+            "diskless-vm",
+            1,
+            kind="tart-linux-vm",
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "vm_disk_path_required")
+        self.assertFalse((self.store / "leases.json").exists())
+
+    def test_live_legacy_diskless_vm_blocks_only_new_vm_admission(self) -> None:
+        self.acquire("legacy-source", 1)
+        store_file = self.store / "leases.json"
+        records = json.loads(store_file.read_text(encoding="utf-8"))
+        records[0]["command_kind"] = "tart-linux-vm"
+        records[0].pop("disk_device_id", None)
+        records[0].pop("disk_reservation_path", None)
+        records[0].pop("disk_growth_bytes", None)
+        records[0].pop("disk_floor_bytes", None)
+        store_file.write_text(json.dumps(records), encoding="utf-8")
+
+        # Native work remains backward-compatible while the old VM drains.
+        self.assertEqual(self.acquire("native-build", 1).returncode, 0)
+        denied = self.acquire(
+            "new-vm",
+            1,
+            kind="tart-macos-vm",
+            disk_path=Path(self.tmp.name),
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "legacy_vm_disk_accounting_unknown")
+        self.assertEqual(body["legacy_vm_lease_ids"], ["legacy-source"])
+
+        status = self.run_cli("status", check=False)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn(
+            "legacy_vm_disk_accounting_unknown:legacy-source",
+            json.loads(status.stdout)["problems"],
+        )
+
+    def test_missing_disk_root_is_typed_and_never_created(self) -> None:
+        missing = Path(self.tmp.name) / "offline-volume" / "vm-store"
+        denied = self.acquire(
+            "missing-root",
+            1,
+            kind="qemu-windows-vm",
+            disk_path=missing,
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "disk_root_unavailable")
+        self.assertIn("does not exist", body["error"])
+        self.assertFalse(missing.exists())
+
+        loop_a = Path(self.tmp.name) / "loop-a"
+        loop_b = Path(self.tmp.name) / "loop-b"
+        loop_a.symlink_to(loop_b)
+        loop_b.symlink_to(loop_a)
+        cyclic = self.acquire(
+            "cyclic-root",
+            1,
+            kind="tart-linux-vm",
+            disk_path=loop_a,
+            check=False,
+        )
+        self.assertEqual(cyclic.returncode, 75)
+        self.assertEqual(json.loads(cyclic.stdout)["reason"], "disk_root_unavailable")
+
+    def test_expected_device_and_mount_identity_fail_closed(self) -> None:
+        probe = leases.disk_probe(self.tmp.name)
+        wrong_device = self.acquire(
+            "wrong-device",
+            1,
+            kind="tart-macos-vm",
+            disk_path=Path(self.tmp.name),
+            disk_expected_device_id=f"{probe['device_id']}-wrong",
+            check=False,
+        )
+        self.assertEqual(wrong_device.returncode, 75)
+        self.assertEqual(json.loads(wrong_device.stdout)["reason"], "disk_root_unavailable")
+
+        wrong_mount = Path(self.tmp.name) / "not-the-mount"
+        wrong_mount.mkdir()
+        denied_mount = self.acquire(
+            "wrong-mount",
+            1,
+            kind="tart-macos-vm",
+            disk_path=Path(self.tmp.name),
+            disk_expected_mount_path=str(wrong_mount),
+            check=False,
+        )
+        self.assertEqual(denied_mount.returncode, 75)
+        self.assertEqual(
+            json.loads(denied_mount.stdout)["reason"],
+            "disk_root_unavailable",
+        )
+
+    def test_path_aliases_share_one_filesystem_reservation(self) -> None:
+        real_store = Path(self.tmp.name) / "real-store"
+        alias_store = Path(self.tmp.name) / "alias-store"
+        real_store.mkdir()
+        alias_store.symlink_to(real_store, target_is_directory=True)
+        self.acquire(
+            "real",
+            1,
+            kind="tart-macos-vm",
+            disk_path=real_store,
+            disk_growth_mb=1,
+        )
+        self.acquire(
+            "alias",
+            1,
+            kind="tart-linux-vm",
+            disk_path=alias_store,
+            disk_growth_mb=2,
+        )
+        status = json.loads(self.run_cli("status").stdout)
+        self.assertEqual(len(status["disk_volumes"]), 1)
+        self.assertEqual(status["disk_volumes"][0]["reservation_count"], 2)
+        self.assertEqual(status["disk_volumes"][0]["reserved_bytes"], 3 * 1024 * 1024)
+
+    def test_guardian_keeps_vm_lease_after_supervisor_dies(self) -> None:
+        supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        guardian: subprocess.Popen[str] | None = None
+        try:
+            self.acquire(
+                "kept-failed-vm",
+                1,
+                kind="qemu-windows-vm",
+                pid=supervisor.pid,
+                disk_path=Path(self.tmp.name),
+            )
+            guardian = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "guard-exec",
+                    "--id",
+                    "kept-failed-vm",
+                    "--store-dir",
+                    str(self.store),
+                    "--",
+                    "/bin/sleep",
+                    "60",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                records = leases.load_records(self.store)
+                if records and records[0].get("guardian_pid") == guardian.pid:
+                    break
+                if guardian.poll() is not None:
+                    stdout, stderr = guardian.communicate()
+                    self.fail(
+                        f"guardian exited before handoff rc={guardian.returncode} "
+                        f"stdout={stdout} stderr={stderr}"
+                    )
+                time.sleep(0.05)
+            else:
+                self.fail("guardian identity was not committed before timeout")
+
+            supervisor.terminate()
+            supervisor.wait(timeout=5)
+            held = json.loads(self.run_cli("status").stdout)
+            self.assertEqual([row["id"] for row in held["leases"]], ["kept-failed-vm"])
+            self.assertEqual(held["leases"][0]["guardian_pid"], guardian.pid)
+
+            guardian.terminate()
+            guardian.communicate(timeout=5)
+            released = json.loads(self.run_cli("status").stdout)
+            self.assertEqual(released["leases"], [])
+            self.assertEqual(released["reaped"][0]["id"], "kept-failed-vm")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.terminate()
+                supervisor.wait(timeout=5)
+            if guardian is not None and guardian.poll() is None:
+                guardian.terminate()
+            if guardian is not None:
+                guardian.communicate(timeout=5)
+
+    def test_status_disk_snapshot_holds_lock_against_release(self) -> None:
+        self.acquire(
+            "snapshot",
+            1,
+            disk_path=Path(self.tmp.name),
+            disk_growth_mb=1,
+        )
+        original_probe = leases.disk_probe
+        release_proc: subprocess.Popen[str] | None = None
+        release_attempted = Path(self.tmp.name) / "release-attempted"
+
+        def probe_while_release_waits(*args: object, **kwargs: object) -> dict[str, object]:
+            nonlocal release_proc
+            release_code = """
+import json
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+import leases
+
+pathlib.Path(sys.argv[3]).write_text("attempted", encoding="utf-8")
+parsed = leases.parse_args(
+    ["release", "--id", "snapshot", "--store-dir", sys.argv[2], "--json"]
+)
+result, rc = leases.release(parsed)
+print(json.dumps(result))
+raise SystemExit(rc)
+"""
+            release_proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    release_code,
+                    str(SCRIPT.parent),
+                    str(self.store),
+                    str(release_attempted),
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while not release_attempted.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(release_attempted.exists(), "release process did not start")
+            time.sleep(0.1)
+            self.assertIsNone(release_proc.poll(), "release escaped the status transaction lock")
+            return original_probe(*args, **kwargs)
+
+        args = leases.parse_args(["status", "--store-dir", str(self.store), "--json"])
+        with mock.patch.object(leases, "disk_probe", side_effect=probe_while_release_waits):
+            digest = leases.status_digest(args)
+        self.assertEqual([row["id"] for row in digest["leases"]], ["snapshot"])
+        self.assertEqual(digest["disk_volumes"][0]["reserved_bytes"], 1024 * 1024)
+        self.assertIsNotNone(release_proc)
+        stdout, stderr = release_proc.communicate(timeout=5)
+        self.assertEqual(release_proc.returncode, 0, f"stdout={stdout} stderr={stderr}")
+
     def test_disk_denial_reports_free_reserved_and_required(self) -> None:
         free_mb = leases.disk_probe(self.tmp.name)["free_bytes"] // (1024 * 1024)
         floor_mb = max(0, free_mb - 128)

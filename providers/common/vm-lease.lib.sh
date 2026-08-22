@@ -6,6 +6,9 @@
 : "${TARTCI_VM_DISK_GROWTH_GB:=24}"
 : "${TARTCI_VM_DISK_FREE_FLOOR_GB:=25}"
 
+# shellcheck source=providers/common/disk-capacity.lib.sh
+source "${BASH_SOURCE[0]%/*}/disk-capacity.lib.sh"
+
 tartci_vm_lease_note(){
   if command -v note >/dev/null 2>&1; then
     note "$*"
@@ -102,7 +105,37 @@ tartci_vm_lease_disk_growth_gb(){
     qemu-windows) value="${TARTCI_WIN_VM_DISK_GROWTH_GB:-}" ;;
   esac
   [ -n "$value" ] || value="${TARTCI_VM_DISK_GROWTH_GB:-24}"
-  case "$value" in ''|*[!0-9]*) value=24 ;; esac
+  tartci_disk_gb_or_zero TARTCI_VM_DISK_GROWTH_GB "$value" 24
+}
+
+tartci_vm_lease_disk_expected_device_id(){
+  local provider="$1" value="${TARTCI_VM_DISK_EXPECTED_DEVICE_ID:-}"
+  case "$provider" in
+    tart-macos) value="${TARTCI_MACOS_VM_DISK_EXPECTED_DEVICE_ID:-$value}" ;;
+    tart-linux) value="${TARTCI_LINUX_VM_DISK_EXPECTED_DEVICE_ID:-$value}" ;;
+    qemu-windows) value="${TARTCI_WIN_VM_DISK_EXPECTED_DEVICE_ID:-$value}" ;;
+  esac
+  printf '%s' "$value"
+}
+
+tartci_vm_lease_disk_expected_mount_path(){
+  local provider="$1" disk_path="$2" value="${TARTCI_VM_DISK_EXPECTED_MOUNT_PATH:-}"
+  case "$provider" in
+    tart-macos) value="${TARTCI_MACOS_VM_DISK_EXPECTED_MOUNT_PATH:-$value}" ;;
+    tart-linux) value="${TARTCI_LINUX_VM_DISK_EXPECTED_MOUNT_PATH:-$value}" ;;
+    qemu-windows) value="${TARTCI_WIN_VM_DISK_EXPECTED_MOUNT_PATH:-$value}" ;;
+  esac
+  # A missing /Volumes/<name> mount must never spill onto the internal Data
+  # volume. Infer the declared external mount when the host did not provide an
+  # even stricter persisted device/mount identity.
+  if [ -z "$value" ]; then
+    case "$disk_path" in
+      /Volumes/*)
+        local volume_tail="${disk_path#/Volumes/}"
+        value="/Volumes/${volume_tail%%/*}"
+        ;;
+    esac
+  fi
   printf '%s' "$value"
 }
 
@@ -191,22 +224,34 @@ tartci_acquire_vm_lease(){
   if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
     mem_args=(--mem-mb "$mem_mb")
   fi
-  local disk_args=() disk_growth_gb disk_floor_gb disk_summary=""
+  local disk_args=() disk_growth_gb disk_floor_gb disk_summary="" disk_provider=""
+  local disk_expected_device_id="" disk_expected_mount_path=""
   if [ -n "$disk_path" ]; then
     case "$kind" in
-      tart-macos-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb tart-macos)" ;;
-      tart-linux-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb tart-linux)" ;;
-      qemu-windows-vm) disk_growth_gb="$(tartci_vm_lease_disk_growth_gb qemu-windows)" ;;
-      *) disk_growth_gb="${TARTCI_VM_DISK_GROWTH_GB:-24}" ;;
+      tart-macos-vm) disk_provider=tart-macos ;;
+      tart-linux-vm) disk_provider=tart-linux ;;
+      qemu-windows-vm) disk_provider=qemu-windows ;;
+      *) disk_provider=unknown ;;
     esac
-    disk_floor_gb="${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}"
-    case "$disk_growth_gb" in ''|*[!0-9]*) tartci_vm_lease_note "invalid disk growth: $disk_growth_gb"; return 75 ;; esac
-    case "$disk_floor_gb" in ''|*[!0-9]*) tartci_vm_lease_note "invalid disk floor: $disk_floor_gb"; return 75 ;; esac
+    if [ "$disk_provider" = unknown ]; then
+      if ! disk_growth_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_GROWTH_GB "${TARTCI_VM_DISK_GROWTH_GB:-24}" 24)"; then
+        return 75
+      fi
+    elif ! disk_growth_gb="$(tartci_vm_lease_disk_growth_gb "$disk_provider")"; then
+      return 75
+    fi
+    if ! disk_floor_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_FREE_FLOOR_GB "${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}" 25)"; then
+      return 75
+    fi
+    disk_expected_device_id="$(tartci_vm_lease_disk_expected_device_id "$disk_provider")"
+    disk_expected_mount_path="$(tartci_vm_lease_disk_expected_mount_path "$disk_provider" "$disk_path")"
     disk_args=(
       --disk-path "$disk_path"
       --disk-growth-mb "$((disk_growth_gb * 1024))"
       --disk-floor-mb "$((disk_floor_gb * 1024))"
     )
+    [ -z "$disk_expected_device_id" ] || disk_args+=(--disk-expected-device-id "$disk_expected_device_id")
+    [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi
   lease_id="vm-$kind-$vm_name"
   out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
@@ -235,6 +280,19 @@ tartci_acquire_vm_lease(){
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
   return 0
+}
+
+# Start the actual VM writer as the exact lease guardian. The backgrounded
+# function process is replaced first by leases.py and then by the requested
+# Tart/QEMU process, so $! remains the same PID across the atomic record update
+# and exec. There is no parent-starts-child/attaches-child crash gap.
+tartci_vm_lease_guard_exec(){
+  local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
+  [ -n "$lease_id" ] || {
+    tartci_vm_lease_note "cannot start VM guardian without an active lease"
+    return 75
+  }
+  exec python3 "$TARTCI_ROOT/scripts/leases.py" guard-exec --id "$lease_id" -- "$@"
 }
 
 tartci_release_vm_lease(){

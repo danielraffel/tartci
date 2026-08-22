@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "providers" / "common" / "vm-lease.lib.sh"
 STATE_HELPER = ROOT / "providers" / "common" / "vm-state.lib.sh"
 MACOS_RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
+LINUX_RUNNER = ROOT / "providers" / "tart-linux" / "runner.sh"
+WINDOWS_RUNNER = ROOT / "providers" / "qemu-windows" / "runner.sh"
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -46,10 +48,12 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_CORES=8
                 export TARTCI_ROLE=light
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
-                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux
+                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 8192 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; s=json.load(sys.stdin); r=s["leases"][0]; print(r["id"], r["lease_size_cores"], r["command_kind"], r["vm_name"], r["label"])'
                 tartci_release_vm_lease
@@ -81,6 +85,115 @@ class VmLeaseHelperTests(unittest.TestCase):
             proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "0")
+
+    def test_shared_disk_parser_preserves_disable_spellings_and_rejects_garbage(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            for value in 0 false FALSE off OFF no NO; do
+              printf '%s=%s\n' "$value" "$(tartci_disk_gb_or_zero TEST_SIZE "$value" 24)"
+            done
+            printf 'number=%s\n' "$(tartci_disk_gb_or_zero TEST_SIZE 7 24)"
+            if tartci_disk_gb_or_zero TEST_SIZE malformed 24 >/dev/null; then
+              exit 99
+            else
+              printf 'invalid_rc=%s\n' "$?"
+            fi
+            printf 'defaults=%s/%s\n' "$TARTCI_VM_DISK_GROWTH_GB" "$TARTCI_VM_DISK_FREE_FLOOR_GB"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            [
+                "0=0",
+                "false=0",
+                "FALSE=0",
+                "off=0",
+                "OFF=0",
+                "no=0",
+                "NO=0",
+                "number=7",
+                "invalid_rc=75",
+                "defaults=24/25",
+            ],
+        )
+
+    def test_disable_spellings_flow_through_vm_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=no
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=off
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_acquire_vm_lease disabled-disk 1 tart-linux-vm vm labels 1024 {Path(td)}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["disk_growth_bytes"], r["disk_floor_bytes"])'
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0 0")
+
+    def test_configured_storage_root_is_never_created_by_floor_check(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "offline-volume" / "vm-store"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                # Disabling the numeric floor is not permission to create a
+                # missing configured store on the fallback filesystem.
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=off
+                note() {{ :; }}
+                source {STATE_HELPER}
+                if tartci_check_disk_floor {missing}; then
+                  exit 99
+                else
+                  rc=$?
+                fi
+                test "$rc" -eq 75
+                test ! -e {missing}
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(missing.exists())
+
+    def test_external_volume_mount_is_inferred_for_identity_pinning(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Workshop/Code/tart
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout, "/Volumes/Workshop")
+
+    def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
+        expected = {
+            MACOS_RUNNER: "tartci_vm_lease_guard_exec tart run",
+            LINUX_RUNNER: "tartci_vm_lease_guard_exec tart run",
+            WINDOWS_RUNNER: "tartci_vm_lease_guard_exec qemu-system-aarch64",
+        }
+        for runner, guarded_command in expected.items():
+            with self.subTest(runner=runner):
+                body = runner.read_text(encoding="utf-8")
+                self.assertIn(guarded_command, body)
+                self.assertIn("tartci_acquire_vm_lease", body)
 
     def test_provider_core_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(
@@ -147,12 +260,14 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # force non-gate budget = 3
                 # explicit tiny mem so the core clamp is isolated from the memory axis
-                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux 1024 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 printf 'effective=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES"
@@ -178,11 +293,13 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=262144
                 export TARTCI_ROLE=dedicated-builder
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
                 tartci_profile_value() {{ echo 3; }}   # non-gate budget = 3 (must be ignored for gate)
-                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024
+                tartci_acquire_vm_lease gate-vm 5 tart-macos-vm gate pulp-build 1024 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_cores"])'
                 """
@@ -223,10 +340,12 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_HOST_MEM_MB=65536
                 export TARTCI_ROLE=light
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
                 note() {{ :; }}
                 source {HELPER}
                 trap tartci_release_vm_lease EXIT
-                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 9000
+                tartci_acquire_vm_lease unit-vm 2 tart-linux-vm vm self-hosted,Linux 9000 {Path(td)}
                 python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
                   python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["lease_size_mem_mb"])'
                 """
