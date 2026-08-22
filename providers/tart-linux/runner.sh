@@ -249,6 +249,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
   tartci_check_disk_floor "$TART_HOME" || return $?
+  tartci_prepare_disk_root "$LOGROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
   logdir="$LOGROOT/$vm"; mkdir -p "$logdir"
   state_dir="$(tartci_provider_state_dir tart-linux)"
@@ -298,7 +299,11 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
-  mkdir -p "$CACHE_ROOT/ccache-linux"
+  tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux" || {
+    discard_current_linux_vm
+    runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
+    return 1
+  }
   local boot_log; boot_log="$logdir/tart-run.log"
   tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"

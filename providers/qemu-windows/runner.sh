@@ -268,6 +268,10 @@ run_one(){ # $1=iteration index
   local t_start t_booted t_preflight t_runner_done t_done
   local state_dir qemu_started=""
   t_start="$(now_epoch)"
+  tartci_prepare_disk_root "$WORKROOT" \
+    "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
+    "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" || return $?
+  tartci_prepare_disk_root "$LOGROOT" || return $?
   tartci_check_disk_floor "$WORKROOT" || return $?
   tartci_check_disk_floor "$LOGROOT" || return $?
 

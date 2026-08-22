@@ -710,10 +710,12 @@ run_one(){
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
+    tartci_prepare_disk_root "$MACOS_LOGROOT" || return $?
     logdir="$MACOS_LOGROOT/$vm"
     mkdir -p "$logdir"
   fi
   tartci_check_disk_floor "$TART_HOME" || return $?
+  tartci_prepare_disk_root "$CACHE_ROOT" || return $?
   tartci_check_disk_floor "$CACHE_ROOT" || return $?
   CLEANED_UP=0
   CURRENT_REGISTERED_RUNNER=""

@@ -87,6 +87,40 @@ class VmLeaseHelperTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "0")
 
+    def test_disabled_leases_run_finite_and_exec_guarded_commands_directly(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            export TARTCI_ROOT={ROOT}
+            export TARTCI_VM_LEASES=0
+            source {HELPER}
+            tartci_vm_lease_guard_run /usr/bin/printf 'run-ok\\n'
+            tartci_vm_lease_guard_exec /usr/bin/printf 'exec-ok\\n'
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["run-ok", "exec-ok"])
+
+    def test_enabled_guard_helpers_fail_closed_without_an_active_lease(self) -> None:
+        for helper in ("tartci_vm_lease_guard_run", "tartci_vm_lease_guard_exec"):
+            with self.subTest(helper=helper):
+                script = textwrap.dedent(
+                    f"""
+                    set -euo pipefail
+                    export TARTCI_ROOT={ROOT}
+                    export TARTCI_VM_LEASES=1
+                    source {HELPER}
+                    if {helper} /usr/bin/true; then
+                      exit 99
+                    else
+                      test "$?" -eq 75
+                    fi
+                    """
+                )
+                proc = _run_bash(script)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
     def test_shared_disk_parser_preserves_disable_spellings_and_rejects_garbage(self) -> None:
         script = textwrap.dedent(
             f"""
@@ -172,6 +206,79 @@ class VmLeaseHelperTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertFalse(missing.exists())
 
+    def test_prepare_disk_root_creates_cold_leaf_on_validated_parent_device(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "cold-start" / "logs" / "provider"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                source {STATE_HELPER}
+                tartci_prepare_disk_root {missing}
+                tartci_check_disk_floor {missing}
+                test -d {missing}
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertTrue(missing.is_dir())
+
+    def test_prepare_disk_root_covers_all_cold_default_path_shapes(self) -> None:
+        with tempfile.TemporaryDirectory() as home_td, tempfile.TemporaryDirectory(
+            dir="/tmp"
+        ) as tmp_td:
+            fake_home = Path(home_td)
+            fake_tmp = Path(tmp_td)
+            roots = (
+                fake_home / ".cache" / "pulp-ci",
+                fake_home / "VMs" / "logs" / "tartci-macos",
+                fake_home / "VMs" / "logs" / "tartci-linux",
+                fake_home / ".cache" / "tartci" / "ccache-linux",
+                fake_tmp / "tartci-win",
+                fake_tmp / "tartci-win" / "logs",
+            )
+            for root in roots:
+                with self.subTest(root=root):
+                    proc = _run_bash(
+                        f"source {STATE_HELPER}; tartci_prepare_disk_root {root}"
+                    )
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertTrue(root.is_dir())
+
+    def test_prepare_disk_root_refuses_missing_external_mount(self) -> None:
+        missing = Path("/Volumes") / f"tartci-missing-{os.getpid()}" / "cache"
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {STATE_HELPER}
+            if tartci_prepare_disk_root {missing}; then
+              exit 99
+            fi
+            test ! -e {missing}
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertFalse(missing.exists())
+
+    def test_prepare_disk_root_refuses_wrong_declared_device_before_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "cold-start" / "work"
+            actual_device = Path(td).stat().st_dev
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                source {STATE_HELPER}
+                if tartci_prepare_disk_root {missing} '' {actual_device + 1}; then
+                  exit 99
+                fi
+                test ! -e {missing}
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertFalse(missing.exists())
+
     def test_external_volume_mount_is_inferred_for_identity_pinning(self) -> None:
         script = textwrap.dedent(
             f"""
@@ -205,6 +312,24 @@ class VmLeaseHelperTests(unittest.TestCase):
                 for guarded_command in guarded_commands:
                     self.assertIn(guarded_command, body)
                 self.assertIn("tartci_acquire_vm_lease", body)
+
+    def test_all_vm_providers_prepare_cold_auxiliary_roots(self) -> None:
+        expected = {
+            MACOS_RUNNER: ('tartci_prepare_disk_root "$CACHE_ROOT"',),
+            LINUX_RUNNER: (
+                'tartci_prepare_disk_root "$LOGROOT"',
+                'tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux"',
+            ),
+            WINDOWS_RUNNER: (
+                'tartci_prepare_disk_root "$WORKROOT"',
+                'tartci_prepare_disk_root "$LOGROOT"',
+            ),
+        }
+        for runner, prepared_roots in expected.items():
+            with self.subTest(runner=runner):
+                body = runner.read_text(encoding="utf-8")
+                for prepared_root in prepared_roots:
+                    self.assertIn(prepared_root, body)
 
     def test_provider_core_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(

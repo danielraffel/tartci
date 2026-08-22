@@ -1252,6 +1252,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   expected mount path as the durable external-volume assertion. Configure an
   expected device ID only on hosts where it is stable, or refresh that value as
   part of the host boot check before providers are enabled.
+  Provider cache, log, and Windows work leaves are the cold-start exception:
+  the supervisor creates a missing leaf relative to an already-open existing
+  parent directory, verifies it stays on that parent's device, and refuses a
+  `/Volumes/<name>/...` path unless `<name>` is an actual mounted filesystem.
+  This lets home-backed leaves and `/tmp` recover after reboot without allowing
+  a missing external volume to spill VM data onto the internal disk.
 - **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
   its cores + `hw.model` — **dedicated-builder**, **dev-overflow**, or
   **light** — each carrying a core budget *and* a memory budget. `tartci

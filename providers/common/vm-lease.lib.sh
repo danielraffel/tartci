@@ -289,6 +289,12 @@ tartci_acquire_vm_lease(){
 tartci_vm_lease_guard_exec(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
   [ -n "$lease_id" ] || {
+    # The documented operator-only break-glass mode has no durable lease to
+    # guard. Bypass only when that mode is explicitly disabled; an unexpected
+    # missing lease in normal governed mode remains a hard refusal.
+    if ! tartci_vm_leases_enabled; then
+      exec "$@"
+    fi
     tartci_vm_lease_note "cannot start VM guardian without an active lease"
     return 75
   }
@@ -300,6 +306,12 @@ tartci_vm_lease_guard_exec(){
 tartci_vm_lease_guard_run(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
   [ -n "$lease_id" ] || {
+    # See guard_exec: this is the finite-writer half of the same explicit
+    # break-glass contract, not a fallback after an enabled-mode lease failure.
+    if ! tartci_vm_leases_enabled; then
+      "$@"
+      return $?
+    fi
     tartci_vm_lease_note "cannot start guarded VM writer without an active lease"
     return 75
   }
