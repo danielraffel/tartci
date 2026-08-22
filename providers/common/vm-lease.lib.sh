@@ -295,6 +295,17 @@ tartci_vm_lease_guard_exec(){
   exec python3 "$TARTCI_ROOT/scripts/leases.py" guard-exec --id "$lease_id" -- "$@"
 }
 
+# Finite clone/overlay writers need the same crash-safe handoff as the VM, but
+# ownership must return to the provider supervisor after the command exits.
+tartci_vm_lease_guard_run(){
+  local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
+  [ -n "$lease_id" ] || {
+    tartci_vm_lease_note "cannot start guarded VM writer without an active lease"
+    return 75
+  }
+  python3 "$TARTCI_ROOT/scripts/leases.py" guard-run --id "$lease_id" -- "$@"
+}
+
 tartci_release_vm_lease(){
   local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}" rc=0
   [ -n "$lease_id" ] || return 0

@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -546,6 +548,203 @@ class LeaseDiskAxisTests(LeaseCliTestCase):
                 guardian.terminate()
             if guardian is not None:
                 guardian.communicate(timeout=5)
+
+    def test_dead_guardian_reaps_even_while_keep_failed_supervisor_lives(self) -> None:
+        self.acquire(
+            "windows-keep-failed",
+            1,
+            kind="qemu-windows-vm",
+            disk_path=Path(self.tmp.name),
+        )
+        guardian = subprocess.Popen(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "guard-exec",
+                "--id",
+                "windows-keep-failed",
+                "--store-dir",
+                str(self.store),
+                "--",
+                "/bin/sleep",
+                "60",
+            ],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                records = leases.load_records(self.store)
+                if records and records[0].get("guardian_pid") == guardian.pid:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("guardian identity was not committed before timeout")
+            guardian.terminate()
+            guardian.communicate(timeout=5)
+            released = json.loads(self.run_cli("status").stdout)
+            self.assertEqual(released["leases"], [])
+            self.assertEqual(released["reaped"][0]["id"], "windows-keep-failed")
+        finally:
+            if guardian.poll() is None:
+                guardian.terminate()
+                guardian.communicate(timeout=5)
+
+    def test_guard_run_records_exact_writer_and_survives_supervisor_death(self) -> None:
+        supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        guard: subprocess.Popen[str] | None = None
+        writer_pid = 0
+        try:
+            self.acquire(
+                "clone-writer",
+                1,
+                kind="tart-macos-vm",
+                pid=supervisor.pid,
+                disk_path=Path(self.tmp.name),
+            )
+            guard = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "guard-run",
+                    "--id",
+                    "clone-writer",
+                    "--store-dir",
+                    str(self.store),
+                    "--",
+                    "/bin/sleep",
+                    "60",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                records = leases.load_records(self.store)
+                if records and records[0].get("guardian_writer_pid"):
+                    writer_pid = int(records[0]["guardian_writer_pid"])
+                    self.assertEqual(records[0]["guardian_pid"], guard.pid)
+                    self.assertEqual(records[0]["guardian_mode"], "managed-child")
+                    self.assertTrue(records[0]["guardian_writer_process_start_time"])
+                    self.assertTrue(records[0]["guardian_writer_host_boot_time"])
+                    break
+                if guard.poll() is not None:
+                    stdout, stderr = guard.communicate()
+                    self.fail(
+                        f"guard-run exited before handoff rc={guard.returncode} "
+                        f"stdout={stdout} stderr={stderr}"
+                    )
+                time.sleep(0.05)
+            else:
+                self.fail("guarded writer identity was not committed before timeout")
+
+            supervisor.terminate()
+            supervisor.wait(timeout=5)
+            guard.terminate()
+            guard.wait(timeout=5)
+            held = json.loads(self.run_cli("status").stdout)
+            self.assertEqual([row["id"] for row in held["leases"]], ["clone-writer"])
+            self.assertEqual(held["leases"][0]["guardian_writer_pid"], writer_pid)
+
+            os.kill(writer_pid, signal.SIGTERM)
+            deadline = time.monotonic() + 5
+            while leases.pid_start(writer_pid) and time.monotonic() < deadline:
+                time.sleep(0.05)
+            released = json.loads(self.run_cli("status").stdout)
+            self.assertEqual(released["leases"], [])
+            self.assertEqual(released["reaped"][0]["id"], "clone-writer")
+        finally:
+            if supervisor.poll() is None:
+                supervisor.terminate()
+                supervisor.wait(timeout=5)
+            if guard is not None and guard.poll() is None:
+                guard.terminate()
+                guard.communicate(timeout=5)
+            if writer_pid and leases.pid_start(writer_pid):
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(writer_pid, signal.SIGKILL)
+            if guard is not None:
+                for stream in (guard.stdout, guard.stderr):
+                    if stream is not None:
+                        stream.close()
+
+    def test_guard_run_returns_ownership_to_live_supervisor(self) -> None:
+        self.acquire(
+            "clone-complete",
+            1,
+            kind="tart-linux-vm",
+            disk_path=Path(self.tmp.name),
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPT),
+                "guard-run",
+                "--id",
+                "clone-complete",
+                "--store-dir",
+                str(self.store),
+                "--",
+                "/usr/bin/true",
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        records = leases.load_records(self.store)
+        self.assertEqual([record["id"] for record in records], ["clone-complete"])
+        self.assertNotIn("guardian_pid", records[0])
+        held = json.loads(self.run_cli("status").stdout)
+        self.assertEqual([row["id"] for row in held["leases"]], ["clone-complete"])
+
+    def test_guard_run_releases_after_writer_finishes_with_dead_supervisor(self) -> None:
+        supervisor = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+        try:
+            self.acquire(
+                "orphaned-clone",
+                1,
+                kind="tart-linux-vm",
+                pid=supervisor.pid,
+                disk_path=Path(self.tmp.name),
+            )
+            guard = subprocess.Popen(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "guard-run",
+                    "--id",
+                    "orphaned-clone",
+                    "--store-dir",
+                    str(self.store),
+                    "--",
+                    "/bin/sleep",
+                    "1",
+                ],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                records = leases.load_records(self.store)
+                if records and records[0].get("guardian_writer_pid"):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("guarded writer identity was not committed before timeout")
+            supervisor.terminate()
+            supervisor.wait(timeout=5)
+            stdout, stderr = guard.communicate(timeout=5)
+            self.assertEqual(guard.returncode, 0, f"stdout={stdout} stderr={stderr}")
+            self.assertEqual(leases.load_records(self.store), [])
+        finally:
+            if supervisor.poll() is None:
+                supervisor.terminate()
+                supervisor.wait(timeout=5)
 
     def test_status_disk_snapshot_holds_lock_against_release(self) -> None:
         self.acquire(

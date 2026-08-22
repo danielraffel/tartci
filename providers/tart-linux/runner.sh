@@ -287,7 +287,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # The name is unique to this supervisor/iteration. Claim it before the
   # foreground clone so a TERM delivered at clone completion cannot strand it.
   CURRENT_VM_OWNED=1
-  if ! tart clone "$GOLDEN" "$vm"; then
+  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
     discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1

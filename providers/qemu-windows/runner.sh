@@ -319,7 +319,7 @@ run_one(){ # $1=iteration index
   write_state preparing
 
   note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
-  if ! qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
+  if ! tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     cleanup_active_windows_job
     return 1

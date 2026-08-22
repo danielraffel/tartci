@@ -46,6 +46,7 @@ class VmLeaseHelperTests(unittest.TestCase):
                 export TARTCI_ROOT
                 export TARTCI_LEASE_DIR={Path(td) / "leases"}
                 export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
                 export TARTCI_ROLE=light
                 export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
                 export TARTCI_VM_DISK_GROWTH_GB=0
@@ -185,14 +186,24 @@ class VmLeaseHelperTests(unittest.TestCase):
 
     def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
         expected = {
-            MACOS_RUNNER: "tartci_vm_lease_guard_exec tart run",
-            LINUX_RUNNER: "tartci_vm_lease_guard_exec tart run",
-            WINDOWS_RUNNER: "tartci_vm_lease_guard_exec qemu-system-aarch64",
+            MACOS_RUNNER: (
+                "tartci_vm_lease_guard_run tart clone",
+                "tartci_vm_lease_guard_exec tart run",
+            ),
+            LINUX_RUNNER: (
+                "tartci_vm_lease_guard_run tart clone",
+                "tartci_vm_lease_guard_exec tart run",
+            ),
+            WINDOWS_RUNNER: (
+                "tartci_vm_lease_guard_run qemu-img create",
+                "tartci_vm_lease_guard_exec qemu-system-aarch64",
+            ),
         }
-        for runner, guarded_command in expected.items():
+        for runner, guarded_commands in expected.items():
             with self.subTest(runner=runner):
                 body = runner.read_text(encoding="utf-8")
-                self.assertIn(guarded_command, body)
+                for guarded_command in guarded_commands:
+                    self.assertIn(guarded_command, body)
                 self.assertIn("tartci_acquire_vm_lease", body)
 
     def test_provider_core_overrides_and_fallbacks(self) -> None:

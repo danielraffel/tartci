@@ -733,7 +733,7 @@ run_one(){
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
   CURRENT_VM="$vm"
-  if ! tart clone "$GOLDEN" "$vm"; then
+  if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"

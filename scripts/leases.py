@@ -159,25 +159,35 @@ def identity_matches(
 
 def owner_matches(record: dict[str, Any], current_boot: str | None = None) -> bool:
     boot = current_boot if current_boot is not None else host_boot_time()
-    if identity_matches(
+    # A committed guardian is an ownership transfer, not a fallback. Otherwise
+    # a still-live supervisor can mask a crashed Tart/QEMU writer forever (most
+    # visibly for Windows KEEP_FAILED jobs). A finite guard-run wrapper also
+    # records its exact writer child, which remains authoritative if the wrapper
+    # dies while that child is still modifying the clone/overlay.
+    if is_vm_kind(record.get("command_kind")) and "guardian_pid" in record:
+        if identity_matches(
+            record,
+            pid_key="guardian_pid",
+            start_key="guardian_process_start_time",
+            boot_key="guardian_host_boot_time",
+            current_boot=boot,
+            require_start=True,
+        ):
+            return True
+        return record.get("guardian_mode") == "managed-child" and identity_matches(
+            record,
+            pid_key="guardian_writer_pid",
+            start_key="guardian_writer_process_start_time",
+            boot_key="guardian_writer_host_boot_time",
+            current_boot=boot,
+            require_start=True,
+        )
+    return identity_matches(
         record,
         pid_key="pid",
         start_key="process_start_time",
         boot_key="host_boot_time",
         current_boot=boot,
-    ):
-        return True
-    # Provider supervisors hand the lease to the exact long-lived Tart/QEMU
-    # child before exec. A dead parent must not release disk/core/RAM while that
-    # child can still write; exact PID + start time + boot identity also avoids
-    # preserving a lease after PID reuse.
-    return is_vm_kind(record.get("command_kind")) and identity_matches(
-        record,
-        pid_key="guardian_pid",
-        start_key="guardian_process_start_time",
-        boot_key="guardian_host_boot_time",
-        current_boot=boot,
-        require_start=True,
     )
 
 
@@ -750,15 +760,45 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         }, 0
 
 
-def guard_exec(args: argparse.Namespace) -> int:
-    """Atomically make this process the lease guardian, then exec the VM writer."""
+GUARDIAN_FIELDS = (
+    "guardian_pid",
+    "guardian_process_start_time",
+    "guardian_host_boot_time",
+    "guardian_process_group_id",
+    "guardian_session_id",
+    "guardian_mode",
+    "guardian_writer_pid",
+    "guardian_writer_process_start_time",
+    "guardian_writer_host_boot_time",
+    "guardian_writer_process_group_id",
+    "guardian_writer_session_id",
+)
+
+
+def guarded_argv(args: argparse.Namespace, command: str) -> list[str]:
     argv = list(args.argv)
     if argv and argv[0] == "--":
         argv = argv[1:]
     if not argv:
-        raise ValueError("guard-exec requires a command after --")
+        raise ValueError(f"{command} requires a command after --")
+    return argv
+
+
+def guardian_identity_matches(
+    record: dict[str, Any], identity: dict[str, Any], *, writer: bool = False
+) -> bool:
+    prefix = "guardian_writer_" if writer else "guardian_"
+    return (
+        record.get(f"{prefix}pid") == identity["pid"]
+        and record.get(f"{prefix}process_start_time") == identity["process_start_time"]
+        and record.get(f"{prefix}host_boot_time") == identity["host_boot_time"]
+    )
+
+
+def attach_guardian(
+    args: argparse.Namespace, identity: dict[str, Any], *, mode: str
+) -> None:
     store_dir = pathlib.Path(args.store_dir).expanduser()
-    identity = process_identity(os.getpid())
     if not identity["process_start_time"]:
         raise RuntimeError("cannot prove exact VM guardian process start identity")
     with locked_store(store_dir):
@@ -773,6 +813,8 @@ def guard_exec(args: argparse.Namespace) -> int:
             )
         if not is_vm_kind(target.get("command_kind")):
             raise ValueError(f"lease {args.id} is not a VM lease")
+        if "guardian_pid" in target:
+            raise ValueError(f"lease {args.id} already has an authoritative guardian")
         target.update(
             {
                 "guardian_pid": identity["pid"],
@@ -780,11 +822,120 @@ def guard_exec(args: argparse.Namespace) -> int:
                 "guardian_host_boot_time": identity["host_boot_time"],
                 "guardian_process_group_id": identity["process_group_id"],
                 "guardian_session_id": identity["session_id"],
+                "guardian_mode": mode,
             }
         )
         write_records(store_dir, active)
+
+
+def attach_guardian_writer(
+    args: argparse.Namespace,
+    guardian: dict[str, Any],
+    writer: dict[str, Any],
+) -> None:
+    if not writer["process_start_time"]:
+        raise RuntimeError("cannot prove exact guarded writer process start identity")
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        target = next((record for record in records if record.get("id") == args.id), None)
+        if target is None or not guardian_identity_matches(target, guardian):
+            raise ValueError(f"guardian lost ownership of lease {args.id} before writer start")
+        if target.get("guardian_mode") != "managed-child":
+            raise ValueError(f"lease {args.id} is not a managed-child guardian")
+        target.update(
+            {
+                "guardian_writer_pid": writer["pid"],
+                "guardian_writer_process_start_time": writer["process_start_time"],
+                "guardian_writer_host_boot_time": writer["host_boot_time"],
+                "guardian_writer_process_group_id": writer["process_group_id"],
+                "guardian_writer_session_id": writer["session_id"],
+            }
+        )
+        write_records(store_dir, records)
+
+
+def finish_guard_run(
+    args: argparse.Namespace,
+    guardian: dict[str, Any],
+    writer: dict[str, Any] | None,
+) -> None:
+    """Return ownership to a live supervisor, or remove the completed lease."""
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        target = next((record for record in records if record.get("id") == args.id), None)
+        if target is None:
+            return
+        if not guardian_identity_matches(target, guardian):
+            raise ValueError(f"guardian lost ownership of lease {args.id} during writer run")
+        if writer is not None and not guardian_identity_matches(target, writer, writer=True):
+            raise ValueError(f"guarded writer identity changed for lease {args.id}")
+        if identity_matches(
+            target,
+            pid_key="pid",
+            start_key="process_start_time",
+            boot_key="host_boot_time",
+            current_boot=host_boot_time(),
+        ):
+            for field in GUARDIAN_FIELDS:
+                target.pop(field, None)
+        else:
+            records.remove(target)
+        write_records(store_dir, records)
+
+
+def guard_exec(args: argparse.Namespace) -> int:
+    """Atomically make this process the lease guardian, then exec the VM writer."""
+    argv = guarded_argv(args, "guard-exec")
+    identity = process_identity(os.getpid())
+    attach_guardian(args, identity, mode="exec")
     os.execvpe(argv[0], argv, dict(os.environ))
     return 127  # pragma: no cover - exec either replaces this process or raises.
+
+
+def guard_run(args: argparse.Namespace) -> int:
+    """Run a finite disk writer only after exact durable ownership is recorded."""
+    argv = guarded_argv(args, "guard-run")
+    guardian = process_identity(os.getpid())
+    attach_guardian(args, guardian, mode="managed-child")
+
+    read_fd, write_fd = os.pipe()
+    writer_pid = os.fork()
+    if writer_pid == 0:  # pragma: no branch - child either execs or exits.
+        os.close(write_fd)
+        try:
+            token = os.read(read_fd, 1)
+            os.close(read_fd)
+            if token != b"1":
+                os._exit(126)
+            os.execvpe(argv[0], argv, dict(os.environ))
+        except OSError as exc:
+            os.write(2, f"guard-run exec failed: {exc}\n".encode())
+            os._exit(127)
+
+    os.close(read_fd)
+    writer: dict[str, Any] | None = None
+    try:
+        writer = process_identity(writer_pid)
+        attach_guardian_writer(args, guardian, writer)
+        os.write(write_fd, b"1")
+    except Exception:
+        os.close(write_fd)
+        os.waitpid(writer_pid, 0)
+        finish_guard_run(args, guardian, writer=None)
+        raise
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(write_fd)
+
+    _, status = os.waitpid(writer_pid, 0)
+    finish_guard_run(args, guardian, writer)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return 128 + os.WTERMSIG(status)
+    return 1
 
 
 def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -948,6 +1099,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     guard_parser.add_argument("--id", required=True)
     guard_parser.add_argument("argv", nargs=argparse.REMAINDER)
 
+    guard_run_parser = sub.add_parser(
+        "guard-run",
+        help="guard a finite VM disk writer and return ownership to its supervisor",
+    )
+    add_common(guard_run_parser)
+    guard_run_parser.add_argument("--id", required=True)
+    guard_run_parser.add_argument("argv", nargs=argparse.REMAINDER)
+
     return parser.parse_args(raw)
 
 
@@ -965,6 +1124,8 @@ def main(argv: list[str] | None = None) -> int:
             result, rc = heartbeat(args)
         elif args.command == "guard-exec":
             return guard_exec(args)
+        elif args.command == "guard-run":
+            return guard_run(args)
         else:
             raise ValueError(f"unknown command {args.command}")
     except Exception as exc:  # noqa: BLE001

@@ -1232,7 +1232,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Existing core/memory leases remain readable. A live legacy **VM** lease has
   unknown disk growth, so new VM admission fails closed until that VM finishes
   and its supervisor is restarted on the upgraded tartci snapshot; native build
-  leases remain backward-compatible.
+  leases remain backward-compatible. During a rolling upgrade, first drain VMs
+  owned by the old supervisor snapshot, then restart that provider on the new
+  snapshot and verify its lease store before admitting another VM. Do not
+  restart every provider together or edit a live lease JSON record to bypass the
+  mixed-version denial: the denial is the compatibility fence that prevents an
+  old unaccounted VM from sharing a supposedly reserved volume.
   Normal exit and signal cleanup release the unified lease; dead-owner reaping
   releases its disk reservation after a crash or reboot, but an exact live
   Tart/QEMU guardian keeps the lease after its supervisor dies. Storage roots
@@ -1241,6 +1246,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   can persist an equivalent check with
   `TARTCI_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` or the provider-specific
   `TARTCI_{MACOS,LINUX,WIN}_VM_DISK_EXPECTED_{DEVICE_ID,MOUNT_PATH}` overrides.
+  The recorded `st_dev` device ID is an identity for the current boot: it joins
+  path aliases and detects a changed filesystem while leases are live, but it
+  is not guaranteed stable across reboot or device remapping. Prefer the
+  expected mount path as the durable external-volume assertion. Configure an
+  expected device ID only on hosts where it is stable, or refresh that value as
+  part of the host boot check before providers are enabled.
 - **Role profiles** (`scripts/host_profile.py`) — each host derives a role from
   its cores + `hw.model` — **dedicated-builder**, **dev-overflow**, or
   **light** — each carrying a core budget *and* a memory budget. `tartci
