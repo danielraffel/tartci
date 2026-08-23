@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.network.http-connect-ssh-relay</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>$HOME/.local/share/tartci/scripts/http_connect_ssh_relay.py</string>
+        <string>--allow-route</string>
+        <string>127.0.0.0/8=127.0.0.1</string>
+        <string>--allow-route</string>
+        <string>192.168.64.0/24=192.168.64.1</string>
+        <string>--relay-host</string>
+        <string>$TARTCI_HTTP_RELAY_PRIMARY</string>
+        <string>--relay-host</string>
+        <string>$TARTCI_HTTP_RELAY_SECONDARY</string>
+        <string>--allow-host-suffix</string>
+        <string>github.com</string>
+        <string>--allow-host-suffix</string>
+        <string>githubusercontent.com</string>
+        <string>--allow-host-suffix</string>
+        <string>actions.githubusercontent.com</string>
+        <string>--allow-host-suffix</string>
+        <string>blob.core.windows.net</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
+</dict>
+</plist>

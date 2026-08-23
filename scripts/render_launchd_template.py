@@ -37,6 +37,13 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("template", type=Path)
     parser.add_argument("--set", action="append", default=[], type=parse_setting)
+    parser.add_argument(
+        "--environment",
+        action="append",
+        default=[],
+        type=parse_setting,
+        help="inject an EnvironmentVariables NAME=value entry",
+    )
     args = parser.parse_args()
     replacements = dict(args.set)
 
@@ -48,6 +55,9 @@ def main() -> int:
     source = re.sub(rb"<!--.*?-->", b"", source, flags=re.DOTALL)
     value = plistlib.loads(source)
     rendered = replace_strings(value, replacements)
+    environment = rendered.setdefault("EnvironmentVariables", {})
+    for name, setting in args.environment:
+        environment[name] = setting
     plistlib.dump(rendered, sys.stdout.buffer, sort_keys=False)
     return 0
 

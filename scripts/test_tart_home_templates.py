@@ -59,6 +59,31 @@ class TartHomeTemplateTests(unittest.TestCase):
         value = plistlib.loads(result.stdout)
         self.assertEqual(value["EnvironmentVariables"]["TART_HOME"], tart_home)
 
+    def test_renderer_injects_host_specific_environment(self) -> None:
+        result = subprocess.run(
+            [
+                "python3",
+                str(ROOT / "scripts/render_launchd_template.py"),
+                str(TART_TEMPLATES[0]),
+                "--set",
+                "TART_HOME=/tmp/VMs",
+                "--set",
+                "HOME=/Users/tester",
+                "--environment",
+                "HTTP_PROXY=http://127.0.0.1:49125",
+                "--environment",
+                "TARTCI_GUEST_HTTP_PROXY=http://192.168.64.1:49125",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        environment = plistlib.loads(result.stdout)["EnvironmentVariables"]
+        self.assertEqual(environment["HTTP_PROXY"], "http://127.0.0.1:49125")
+        self.assertEqual(
+            environment["TARTCI_GUEST_HTTP_PROXY"],
+            "http://192.168.64.1:49125",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
