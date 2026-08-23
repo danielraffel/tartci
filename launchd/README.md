@@ -95,6 +95,54 @@ tartci launchd reload com.danielraffel.pulp.tart-runner-macos-gate
 tartci launchd status                                     # health of every tartci agent
 ```
 
+### Host and Tart-guest HTTP relay routing
+
+Do not give a host-side controller Tart's bridge address. On a host whose
+direct GitHub TLS path is measurably unreliable, render that host's controller
+with an explicit loopback HTTP CONNECT proxy and give only disposable guests
+the bridge address:
+
+```sh
+python3 scripts/render_launchd_template.py \
+  launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template \
+  --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
+  --environment "HTTP_PROXY=http://127.0.0.1:49125" \
+  --environment "HTTPS_PROXY=http://127.0.0.1:49125" \
+  --environment "TARTCI_GUEST_HTTP_PROXY=http://192.168.64.1:49125" \
+  > "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-release.plist"
+```
+
+`providers/tart-macos/runner.sh` writes `TARTCI_GUEST_HTTP_PROXY` into the
+ephemeral Actions runner's `.env`; it never copies the host loopback address.
+Reload the controller with `bootout` plus `bootstrap`, then confirm its live
+`launchctl print` environment. `kickstart` retains the old environment.
+
+The optional `com.danielraffel.network.http-connect-ssh-relay` agent runs a
+restricted CONNECT listener for loopback and Tart's bridge subnet. Each allowed
+client CIDR is paired with the exact local destination address, so a matching
+physical LAN cannot enter through the host's LAN interface. Render both
+relay hosts so loss of one Mac fails over before accepting a CONNECT request:
+
+```sh
+python3 scripts/render_launchd_template.py \
+  launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template \
+  --set "HOME=$HOME" \
+  --set "TARTCI_HTTP_RELAY_PRIMARY=macmini" \
+  --set "TARTCI_HTTP_RELAY_SECONDARY=m1" \
+  > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.http-connect-ssh-relay.plist"
+```
+
+Its non-tartci label intentionally keeps this silent network service outside
+the runner stale-log watchdog. The relay opens the requested public endpoint
+through SSH and waits for a positive ready marker before acknowledging CONNECT,
+then uses a fresh SSH transport per request. Do not add a persistent
+ControlMaster: a live but wedged multiplex socket can accept local connections
+while preventing every controller and guest from completing TLS. Before
+deployment, require repeated bounded `curl` and App-authenticated GitHub calls
+through `127.0.0.1:49125`; test `192.168.64.1:49125` from inside a disposable
+guest. Keep this opt-in and measured per host rather than exporting proxy
+variables globally or applying it fleet-wide.
+
 ## LaunchAgent self-heal watchdog
 
 `com.danielraffel.tartci.launchd-watchdog.plist.template` runs

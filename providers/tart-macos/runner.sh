@@ -65,6 +65,13 @@ LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pu
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.336.0}}"
 RUNNER_SHA256="${TARTCI_RUNNER_SHA256:-${PULP_RUNNER_SHA256:-}}"
+GUEST_HTTP_PROXY="${TARTCI_GUEST_HTTP_PROXY:-}"
+if [ -n "$GUEST_HTTP_PROXY" ]; then
+  [[ "$GUEST_HTTP_PROXY" =~ ^http://192\.168\.64\.1:([0-9]{1,5})$ ]] \
+    || { printf 'invalid TARTCI_GUEST_HTTP_PROXY: expected http://192.168.64.1:PORT\n' >&2; exit 1; }
+  [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[1]}" -le 65535 ] \
+    || { printf 'invalid TARTCI_GUEST_HTTP_PROXY port\n' >&2; exit 1; }
+fi
 [ -n "$RUNNER_SHA256" ] || [ "$RUNNER_VERSION" != 2.336.0 ] || \
   RUNNER_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
@@ -585,10 +592,16 @@ cancel_current_run(){
 ensure_runner_version(){
   local ip="$1"
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256'" <<'GUEST'
+    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY'" <<'GUEST'
 set -euo pipefail
 desired="$1"
 expected_sha256="$2"
+guest_http_proxy="$3"
+if [ -n "$guest_http_proxy" ]; then
+  export HTTP_PROXY="$guest_http_proxy" HTTPS_PROXY="$guest_http_proxy"
+  export http_proxy="$guest_http_proxy" https_proxy="$guest_http_proxy"
+  export NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1"
+fi
 runner_dir="$HOME/actions-runner"
 listener="$runner_dir/bin/Runner.Listener"
 current=""
@@ -653,9 +666,10 @@ run_runner_until_done(){
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\" && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
+     if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
      mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      printf '%s' '$jit' > ~/jit.cfg && eval \"\$(/opt/homebrew/bin/brew shellenv)\" && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
