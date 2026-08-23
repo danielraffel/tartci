@@ -323,7 +323,9 @@ mkdir -p "$CCACHE_DIR"
 export CCACHE_BASEDIR="$HOME/pulp"
 export CCACHE_NOHASHDIR=true
 export CCACHE_SLOPPINESS=time_macros,pch_defines
-export CCACHE_DEPEND=true
+export CCACHE_NODEPEND=true
+export CCACHE_COMPILERCHECK=content
+unset CCACHE_DEPEND
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"; mkdir -p "$CCACHE_TEMPDIR"
 
 cd "$HOME/pulp"

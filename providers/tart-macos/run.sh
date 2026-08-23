@@ -60,7 +60,8 @@ esac; done
 [ -d "$SRC" ] || die "--src <checkout-dir> must exist (got: $SRC)"
 SRC="$(cd "$SRC" && pwd)"
 VM="${VM:-macos-job-$$}"
-mkdir -p "$CACHE_ROOT"/{ccache,fetchcontent-src}
+FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
+mkdir -p "$CACHE_ROOT/ccache" "$FETCHCONTENT_SOURCE_ROOT"
 
 cleanup(){
   if [ "$KEEP" = 1 ]; then note "--keep: leaving $VM (delete with: tart delete $VM)"; return; fi
@@ -83,7 +84,7 @@ boot_log="$(mktemp -t "tart-macos-run-$VM")"
 tart run --no-graphics \
   --dir="src:$SRC:ro" \
   --dir="ccache:$CACHE_ROOT/ccache" \
-  --dir="fetchcontent:$CACHE_ROOT/fetchcontent-src" \
+  --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro" \
   "$VM" >"$boot_log" 2>&1 & RPID=$!
 
 IP=""
@@ -111,7 +112,8 @@ eval "$(/opt/homebrew/bin/brew shellenv)"
 SHARED="/Volumes/My Shared Files"
 ln -sfn "$SHARED/src" "$HOME/src"
 ln -sfn "$SHARED/ccache" "$HOME/ccache"
-ln -sfn "$SHARED/fetchcontent" "$HOME/fetchcontent"
+mkdir -p "$HOME/Library/Caches/Pulp/fetchcontent-src"
+rsync -a "$SHARED/fetchcontent/" "$HOME/Library/Caches/Pulp/fetchcontent-src/"
 
 export CCACHE_DIR="$HOME/ccache"
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
@@ -123,7 +125,7 @@ export CCACHE_NODEPEND=true
 unset CCACHE_DEPEND
 export CCACHE_SLOPPINESS=time_macros
 export SKIA_DIR="$HOME/pulp-skia-build"
-export FETCHCONTENT_BASE_DIR="$HOME/fetchcontent"
+export PULP_SHARED_FETCHCONTENT_SOURCE_DIR="$HOME/Library/Caches/Pulp/fetchcontent-src"
 
 ccache --zero-stats >/dev/null 2>&1 || true
 BUILD="$HOME/build"
