@@ -400,7 +400,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # mount regression cannot silently turn every ephemeral job cold.
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
+     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
+     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
      export CCACHE_DIR=\"\$HOME/.ccache\" && \
+     export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
      export CMAKE_BUILD_PARALLEL_LEVEL='$build_parallel_effective' && \
      printf 'TARTCI_DIAG ccache_dir=%s\n' \"\$CCACHE_DIR\" && \
      printf 'TARTCI_DIAG cmake_build_parallel_level=%s\n' \"\$CMAKE_BUILD_PARALLEL_LEVEL\" && \
