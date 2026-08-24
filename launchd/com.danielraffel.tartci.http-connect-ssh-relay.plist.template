@@ -25,6 +25,8 @@
         <string>actions.githubusercontent.com</string>
         <string>--allow-host-suffix</string>
         <string>blob.core.windows.net</string>
+        <string>--allow-host-suffix</string>
+        <string>crates.io</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
