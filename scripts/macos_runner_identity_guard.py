@@ -15,6 +15,10 @@ from macos_runner_identity import resolve_plist_identity
 
 
 LABEL_PREFIX = "com.danielraffel.pulp.tart-runner"
+KNOWN_NON_MACOS_RUNNERS = (
+    re.compile(r"(?:^|/)providers/tart-linux/runner\.sh$"),
+    re.compile(r"(?:^|/)providers/qemu-windows/runner\.sh$"),
+)
 
 
 def _cached_spec(text: str) -> dict:
@@ -51,6 +55,22 @@ def _plausible_runner_label(label: str) -> bool:
         or "tart-runner" in normalized
         or "tart-macos" in normalized
         or "tartci.macos" in normalized
+    )
+
+
+def _known_non_macos_provider(program_arguments: list[str]) -> bool:
+    invocation = list(program_arguments)
+    while invocation and invocation[0] in ("/bin/bash", "/bin/sh", "bash", "sh"):
+        invocation.pop(0)
+    if not invocation:
+        return False
+    if any(pattern.search(invocation[0]) for pattern in KNOWN_NON_MACOS_RUNNERS):
+        return True
+    return (
+        len(invocation) >= 3
+        and re.search(r"(?:^|/)tartci$", invocation[0]) is not None
+        and invocation[1] == "serve"
+        and invocation[2] in ("linux", "windows")
     )
 
 
@@ -137,6 +157,8 @@ def main() -> int:
             continue
         candidate_args = [str(value) for value in plist.get("ProgramArguments", [])]
         candidate_env = plist.get("EnvironmentVariables", {})
+        if _known_non_macos_provider(candidate_args):
+            continue
         direct_runner = any(
             re.search(r"(?:tart-macos/runner\.sh|tools/ci/tart-runner\.sh)$", value)
             for value in candidate_args

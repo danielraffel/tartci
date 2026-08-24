@@ -19,6 +19,32 @@ from macos_runner_identity import resolve_plist_identity  # noqa: E402
 
 
 class MacosRunnerIdentityGuardTests(unittest.TestCase):
+    def test_known_non_macos_provider_matching_is_exact(self) -> None:
+        known = (
+            ["/bin/bash", "/opt/tartci/providers/tart-linux/runner.sh", "--loop"],
+            ["/bin/bash", "/opt/tartci/providers/qemu-windows/runner.sh", "--loop"],
+            ["/bin/bash", "/Users/test/.local/bin/tartci", "serve", "linux", "--loop"],
+            ["/Users/test/.local/bin/tartci", "serve", "windows"],
+        )
+        for arguments in known:
+            with self.subTest(arguments=arguments):
+                self.assertTrue(guard._known_non_macos_provider(arguments))
+
+        unknown = (
+            ["/opt/tartci/providers/tart-unknown/runner.sh", "--loop"],
+            ["/opt/tartci/providers/tart-linux/runner.sh.wrapper", "--loop"],
+            ["/Users/test/.local/bin/tartci", "serve", "freebsd"],
+            ["/Users/test/.local/bin/tartci", "inspect", "linux"],
+            ["/unknown/wrapper", "serve", "linux"],
+            [
+                "/opt/tartci/providers/tart-macos/runner.sh",
+                "/opt/tartci/providers/tart-linux/runner.sh",
+            ],
+        )
+        for arguments in unknown:
+            with self.subTest(arguments=arguments):
+                self.assertFalse(guard._known_non_macos_provider(arguments))
+
     def test_launchctl_parser_uses_services_and_bare_arguments(self) -> None:
         domain = """
 endpoint destination = com.apple.xpc.launchd.domain.user.501
@@ -154,6 +180,94 @@ exit 0
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_loaded_linux_provider_is_positively_ignored(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            linux_label = "com.danielraffel.pulp.tart-runner-linux"
+            with (agents / f"{linux_label}.plist").open("wb") as destination:
+                plistlib.dump(
+                    {
+                        "Label": linux_label,
+                        "ProgramArguments": [
+                            "/bin/bash",
+                            "/Users/danielraffel/.local/share/tartci/providers/tart-linux/runner.sh",
+                            "--loop",
+                        ],
+                    },
+                    destination,
+                )
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-vm-m5-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unknown_provider_under_tart_runner_label_stays_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            unknown_label = "com.danielraffel.pulp.tart-runner-unknown"
+            with (agents / f"{unknown_label}.plist").open("wb") as destination:
+                plistlib.dump(
+                    {
+                        "Label": unknown_label,
+                        "ProgramArguments": [
+                            "/bin/bash",
+                            "/Users/danielraffel/.local/share/tartci/providers/tart-unknown/runner.sh",
+                            "--loop",
+                        ],
+                    },
+                    destination,
+                )
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-vm-m5-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(
+                f"cannot prove plausible Tart runner {unknown_label} is unrelated",
+                result.stderr,
+            )
 
     def test_plausible_program_only_runner_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
