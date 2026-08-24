@@ -122,6 +122,7 @@ CURRENT_WORKFLOW_NAME=""
 CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
+CURRENT_AQUA_LABEL=""
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -521,15 +522,25 @@ reclaim_runner_name(){
   tart delete "$name" >/dev/null 2>&1 || true
 }
 
+stop_current_aqua_runner(){
+  if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+      "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
 discard_current_vm(){
   [ -n "$CURRENT_VM" ] || return 0
   note "stopping — tearing down in-flight VM $CURRENT_VM"
+  stop_current_aqua_runner
   [ -n "$CURRENT_RPID" ] && kill -9 "$CURRENT_RPID" 2>/dev/null || true
   tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
   tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
   CURRENT_VM=""
   CURRENT_RPID=""
   CURRENT_IP=""
+  CURRENT_AQUA_LABEL=""
 }
 
 cleanup(){
@@ -657,8 +668,19 @@ GUEST
 run_runner_until_done(){
   local vm="$1" ip="$2" jit="$3"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
+  local aqua_label="com.tartci.aqua.$vm"
   local ssh_pid start assigned_at=0 now idle_elapsed job_elapsed assigned=0 warned=0 rc=0
   : >"$runner_log"
+  # Claim the guest secret/service cleanup target before the first byte crosses
+  # SSH, so a failed stream or pending signal cannot leave an unowned JIT file.
+  CURRENT_AQUA_LABEL="$aqua_label"
+  if ! printf '%s' "$jit" | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "umask 077; root=\"\$HOME/.tartci/aqua-runner/$aqua_label\"; mkdir -p \"\$root\"; cat >\"\$root/jit.cfg\""; then
+    note "[$vm] failed to stream JIT config into the guest"
+    stop_current_aqua_runner
+    return 1
+  fi
+  jit=""
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
@@ -672,7 +694,7 @@ run_runner_until_done(){
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
      mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
-     printf '%s' '$jit' > ~/jit.cfg && eval \"\$(/opt/homebrew/bin/brew shellenv)\" && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
+     \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
     >"$runner_log" 2>&1 & ssh_pid=$!
   start="$(date +%s)"
   while kill -0 "$ssh_pid" 2>/dev/null; do
@@ -722,6 +744,22 @@ run_runner_until_done(){
   wait "$ssh_pid" || rc=$?
   sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
+}
+
+install_and_preflight_aqua_runner(){
+  local ip="$1" vm="$2" aqua_label
+  aqua_label="com.tartci.aqua.$vm"
+  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'umask 077; mkdir -p ~/.tartci/bin; cat > ~/.tartci/bin/guest-aqua-runner.sh; chmod 700 ~/.tartci/bin/guest-aqua-runner.sh' \
+    <"$TARTCI_ROOT/providers/tart-macos/guest-aqua-runner.sh"; then
+    note "[$vm] failed to install Aqua runner launcher"
+    return 1
+  fi
+  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "\$HOME/.tartci/bin/guest-aqua-runner.sh preflight '$aqua_label'"; then
+    note "[$vm] console Aqua session preflight failed — refusing to mint JIT config"
+    return 1
+  fi
 }
 
 run_one(){
@@ -858,6 +896,16 @@ run_one(){
     return 1
   fi
 
+  heartbeat aqua-preflight
+  event aqua_preflight "uid=501 vm=$vm"
+  if ! install_and_preflight_aqua_runner "$ip" "$vm"; then
+    event aqua_preflight_failed "uid=501 unregistered=true"
+    runtime_emit_complete fail aqua_preflight_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
+  fi
+
   heartbeat minting-jit
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
@@ -903,6 +951,7 @@ run_one(){
 
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
+  stop_current_aqua_runner
   tart stop "$vm" >/dev/null 2>&1 || true
   kill "$rpid" 2>/dev/null || true
   sleep 2
@@ -928,6 +977,7 @@ run_one(){
   CURRENT_VM=""
   CURRENT_RPID=""
   CURRENT_IP=""
+  CURRENT_AQUA_LABEL=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
