@@ -27,6 +27,8 @@
         <string>blob.core.windows.net</string>
         <string>--allow-host-suffix</string>
         <string>crates.io</string>
+        <string>--allow-host-suffix</string>
+        <string>sigstore.dev</string>
     </array>
     <key>RunAtLoad</key>
     <true/>
