@@ -13,11 +13,23 @@ STAT="${TARTCI_GUEST_STAT:-/usr/bin/stat}"
 ID="${TARTCI_GUEST_ID:-/usr/bin/id}"
 PGREP="${TARTCI_GUEST_PGREP:-/usr/bin/pgrep}"
 SLEEP="${TARTCI_GUEST_SLEEP:-/bin/sleep}"
+PLUTIL="${TARTCI_GUEST_PLUTIL:-/usr/bin/plutil}"
 EXPECTED_UID="${TARTCI_AQUA_EXPECTED_UID:-501}"
 WAIT_SECS="${TARTCI_AQUA_WAIT_SECS:-120}"
 READY_SECS="${TARTCI_AQUA_READY_SECS:-30}"
 SELF="$0"
 case "$SELF" in /*) ;; *) SELF="$PWD/$SELF" ;; esac
+
+# Bash 5 runs EXIT traps after unwinding the calling function's local scope.
+# Keep every value needed for fail-closed cleanup at script scope.
+PREFLIGHT_CLEANUP_LABEL=""
+PREFLIGHT_CLEANUP_ROOT=""
+RUNNER_CHILD_JIT_FILE=""
+RUNNER_CHILD_STATE_DIR=""
+RUNNER_CLEANUP_LABEL=""
+RUNNER_CLEANUP_JIT_FILE=""
+RUNNER_CLEANUP_PLIST=""
+RUNNER_CLEANUP_TAIL_PID=""
 
 note(){ printf 'TARTCI_AQUA %s\n' "$*" >&2; }
 die(){ note "ERROR $*"; exit 78; }
@@ -111,11 +123,47 @@ write_plist(){
     printf '%s\n' '</dict></plist>'
   } >"$plist"
   chmod 600 "$plist"
-  /usr/bin/plutil -lint "$plist" >/dev/null
+  "$PLUTIL" -lint "$plist" >/dev/null \
+    || die "generated LaunchAgent plist failed validation"
 }
 
 bootout(){
   "$LAUNCHCTL" bootout "gui/$EXPECTED_UID/$1" >/dev/null 2>&1 || true
+}
+
+cleanup_preflight(){
+  local label="${PREFLIGHT_CLEANUP_LABEL:-}" root="${PREFLIGHT_CLEANUP_ROOT:-}"
+  PREFLIGHT_CLEANUP_LABEL=""
+  PREFLIGHT_CLEANUP_ROOT=""
+  [ -z "$label" ] || bootout "$label"
+  [ -z "$root" ] || rm -rf "$root"
+}
+
+finish_runner_child(){
+  local rc=$? jit_file="${RUNNER_CHILD_JIT_FILE:-}" state_dir="${RUNNER_CHILD_STATE_DIR:-}"
+  local tmp
+  [ -z "$jit_file" ] || rm -f "$jit_file"
+  if [ -n "$state_dir" ]; then
+    tmp="$state_dir/exit.tmp.$$"
+    printf '%s\n' "$rc" >"$tmp"
+    mv "$tmp" "$state_dir/exit"
+  fi
+}
+
+cleanup_runner(){
+  local label="${RUNNER_CLEANUP_LABEL:-}" jit_file="${RUNNER_CLEANUP_JIT_FILE:-}"
+  local plist="${RUNNER_CLEANUP_PLIST:-}" tail_pid="${RUNNER_CLEANUP_TAIL_PID:-}"
+  RUNNER_CLEANUP_LABEL=""
+  RUNNER_CLEANUP_JIT_FILE=""
+  RUNNER_CLEANUP_PLIST=""
+  RUNNER_CLEANUP_TAIL_PID=""
+  if [ -n "$tail_pid" ]; then
+    kill "$tail_pid" >/dev/null 2>&1 || true
+    wait "$tail_pid" 2>/dev/null || true
+  fi
+  [ -z "$label" ] || bootout "$label"
+  [ -z "$jit_file" ] || rm -f "$jit_file"
+  [ -z "$plist" ] || rm -f "$plist"
 }
 
 run_probe(){
@@ -163,7 +211,8 @@ preflight(){
   rm -rf "$root"
   umask 077
   mkdir -p "$root"
-  cleanup_preflight(){ bootout "$label"; rm -rf "$root"; }
+  PREFLIGHT_CLEANUP_LABEL="$label"
+  PREFLIGHT_CLEANUP_ROOT="$root"
   trap cleanup_preflight EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -178,15 +227,9 @@ preflight(){
 runner_child(){
   local expected_asid="$1" runner_dir="$2" jit_file="$3" state_dir="$4" runner_log="$5"
   local actual_asid console_asid tmp rc jit_config
-  # shellcheck disable=SC2329 # invoked through the EXIT trap below
-  finish(){
-    rc=$?
-    rm -f "$jit_file"
-    tmp="$state_dir/exit.tmp.$$"
-    printf '%s\n' "$rc" >"$tmp"
-    mv "$tmp" "$state_dir/exit"
-  }
-  trap finish EXIT
+  RUNNER_CHILD_JIT_FILE="$jit_file"
+  RUNNER_CHILD_STATE_DIR="$state_dir"
+  trap finish_runner_child EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
@@ -227,15 +270,9 @@ run_runner(){
   mkdir -p "$root"
   rm -f "$root/ready" "$root/exit" "$runner_log"
   [ -s "$jit_file" ] || die "missing JIT config file: $jit_file"
-  cleanup_runner(){
-    if [ -n "$tail_pid" ]; then
-      kill "$tail_pid" >/dev/null 2>&1 || true
-      wait "$tail_pid" 2>/dev/null || true
-      tail_pid=""
-    fi
-    bootout "$label"
-    rm -f "$jit_file" "$plist"
-  }
+  RUNNER_CLEANUP_LABEL="$label"
+  RUNNER_CLEANUP_JIT_FILE="$jit_file"
+  RUNNER_CLEANUP_PLIST="$plist"
   trap 'cleanup_runner' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
@@ -264,6 +301,7 @@ run_runner(){
   note "live-ok uid=$EXPECTED_UID asid=$expected_asid label=$label"
   touch "$runner_log"
   tail -n +1 -F "$runner_log" & tail_pid=$!
+  RUNNER_CLEANUP_TAIL_PID="$tail_pid"
   while [ ! -s "$root/exit" ]; do
     if ! "$LAUNCHCTL" print "gui/$EXPECTED_UID/$label" >/dev/null 2>&1; then
       "$SLEEP" 1

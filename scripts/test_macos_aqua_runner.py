@@ -120,6 +120,28 @@ class AquaRunnerTest(unittest.TestCase):
         self.fake_pgrep = self.bin / "pgrep"
         self.fake_pgrep.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         self.fake_pgrep.chmod(0o700)
+        self.fake_plutil = self.bin / "plutil"
+        self.fake_plutil.write_text(
+            textwrap.dedent(
+                """\
+                #!/usr/bin/env python3
+                import os
+                import pathlib
+                import plistlib
+                import sys
+
+                if len(sys.argv) != 3 or sys.argv[1] != "-lint":
+                    raise SystemExit(64)
+                with open(sys.argv[2], "rb") as stream:
+                    plistlib.load(stream)
+                pathlib.Path(os.environ["FAKE_PLUTIL_LOG"]).write_text(
+                    " ".join(sys.argv[1:]), encoding="utf-8"
+                )
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.fake_plutil.chmod(0o700)
         self.env = os.environ.copy()
         self.env.update(
             {
@@ -129,6 +151,8 @@ class AquaRunnerTest(unittest.TestCase):
                 "TARTCI_GUEST_LAUNCHCTL": str(self.launchctl),
                 "TARTCI_GUEST_STAT": str(self.fake_stat),
                 "TARTCI_GUEST_PGREP": str(self.fake_pgrep),
+                "TARTCI_GUEST_PLUTIL": str(self.fake_plutil),
+                "FAKE_PLUTIL_LOG": str(self.home / "plutil.log"),
                 "TARTCI_AQUA_EXPECTED_UID": str(os.getuid()),
                 "TARTCI_AQUA_WAIT_SECS": "0",
                 "TARTCI_AQUA_READY_SECS": "5",
@@ -181,12 +205,29 @@ class AquaRunnerTest(unittest.TestCase):
         calls = (self.home / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn(f"bootstrap gui/{os.getuid()}", calls)
         self.assertIn(f"kickstart -k gui/{os.getuid()}/com.tartci.test", calls)
+        plutil = (self.home / "plutil.log").read_text(encoding="utf-8")
+        self.assertIn("-lint", plutil)
+
+    def test_plutil_rejection_returns_78_and_cleans_preflight(self) -> None:
+        self.fake_plutil.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
+        result = self.invoke("preflight")
+        self.assertEqual(result.returncode, 78, result.stderr)
+        self.assertIn("plist failed validation", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+        self.assertFalse((self.home / "launchctl-state.json").exists())
+        self.assertFalse(
+            (self.home / ".tartci/aqua-runner/com.tartci.test.preflight").exists()
+        )
 
     def test_preflight_fails_closed_without_aqua_session_and_never_bootstraps(self) -> None:
         self.env["FAKE_AQUA_SESSION"] = "Background"
         result = self.invoke("preflight")
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("healthy console Aqua session", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+        self.assertFalse(
+            (self.home / ".tartci/aqua-runner/com.tartci.test.preflight").exists()
+        )
         calls = (self.home / "launchctl.log").read_text(encoding="utf-8")
         self.assertNotIn("bootstrap", calls)
 
@@ -218,6 +259,8 @@ class AquaRunnerTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(jit.exists())
         self.assertIn("failed its live ASID guard", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+        self.assertFalse((self.home / "launchctl-state.json").exists())
 
     def test_disconnect_signal_boots_out_launchagent_and_scrubs_jit(self) -> None:
         marker = self.home / "runner-ran"
