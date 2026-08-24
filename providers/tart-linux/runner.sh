@@ -90,6 +90,8 @@ source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
+# shellcheck source=providers/common/network-interface-policy.lib.sh
+source "$TARTCI_ROOT/providers/common/network-interface-policy.lib.sh"
 # shellcheck source=providers/common/runner-assignment.lib.sh
 source "$TARTCI_ROOT/providers/common/runner-assignment.lib.sh"
 
@@ -449,6 +451,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
 
 i=0
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_network_interface_preflight "$TARTCI_ROOT" \
+  || die "host network-interface policy preflight failed"
 tartci_validate_runner_idle_timeout "$IDLE_TIMEOUT" \
   || die "invalid Linux runner assignment timeout configuration"
 tartci_validate_bounded_positive_integer \

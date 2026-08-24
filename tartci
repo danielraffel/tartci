@@ -9,6 +9,7 @@
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
+#   tartci network-policy [--apply] [--json] # inspect/correct host interface preference
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
@@ -99,6 +100,10 @@ cmd_status() {
 
 cmd_host_profile() {
   exec python3 "$HERE/scripts/host_profile.py" "$@"
+}
+
+cmd_network_policy() {
+  exec python3 "$HERE/scripts/network_interface_policy.py" "$@"
 }
 
 cmd_leases() {
@@ -402,6 +407,7 @@ case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
+  network-policy) shift; cmd_network_policy "$@" ;;
   leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   observe) shift; cmd_observe "$@" ;;

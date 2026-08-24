@@ -91,6 +91,8 @@ source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
+# shellcheck source=providers/common/network-interface-policy.lib.sh
+source "$TARTCI_ROOT/providers/common/network-interface-policy.lib.sh"
 
 runtime_emit_complete(){
   [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ] || return 0
@@ -218,6 +220,8 @@ esac; done
 # Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
 # print-exits precede any golden/VM requirement).
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+tartci_network_interface_preflight "$TARTCI_ROOT" \
+  || die "host network-interface policy preflight failed"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 

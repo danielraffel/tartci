@@ -79,6 +79,28 @@ rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
 `pool off` unloads its agents immediately and remains an emergency/idle-only
 operation.
 
+### Host interface preference
+
+Run `tartci network-policy` to inspect the host without changing it. Every
+supported `tartci serve` supervisor runs `tartci network-policy --apply` after
+its read-only `--print-*` exits and before it can create a runner or VM.
+
+On macOS, when both links are healthy, Ethernet is kept ahead of Wi-Fi in the
+network-service order. The correction is idempotent and preserves the relative
+order of VPNs and every other service. If wired Ethernet is absent or down,
+healthy Wi-Fi is an accepted fallback; this is the normal M1/M5 configuration
+and is not an error. A confirmed order drift that cannot be corrected blocks a
+new runner rather than repeatedly launching work through the known-wrong path.
+
+Linux is report-only: `tartci network-policy --json` records the default route
+device and gateway but never calls macOS tooling or changes Linux networking.
+For `macpro`, the expected device is `vmbr0` (backed by `enp11s0`); service-order
+changes belong in Proxmox/Linux configuration.
+
+`TARTCI_NETWORK_POLICY=report` keeps the preflight read-only, and
+`TARTCI_NETWORK_POLICY=off` is the explicit emergency rollback. The default is
+`apply`; unknown values fail before runner admission.
+
 ---
 
 ## 1. Prereqs + host setup

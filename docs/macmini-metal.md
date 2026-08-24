@@ -37,6 +37,12 @@ TartCI owns the disposable Tart provider, while the Proxmox and bare-metal
 providers expose the same health, assignment, teardown, and hosted-fallback
 contract without pretending they are Tart VMs.
 
+The macmini's current wired path is Ethernet `en0` (`192.168.86.20`). Before a
+native runner starts, use the same `tartci network-policy --apply` preflight as
+the VM hosts: healthy Ethernet must precede Wi-Fi, while Wi-Fi remains the
+fallback if the cable or address disappears. The check is service-name agnostic
+and preserves VPN/other-service ordering.
+
 ## Bring-up checklist
 
 1. Confirm Intel identity, supported macOS/Xcode/Metal versions, disk space,
@@ -49,4 +55,3 @@ contract without pretending they are Tart VMs.
    the repository profile.
 5. Enable the selector only after the canary passes; expire it immediately on
    stale heartbeat, failed wipe, or capacity loss.
-

@@ -61,6 +61,12 @@ network   wired, bridged to vmbr0
 gpu       2x AMD Tahiti LE (GCN 1.0)
 ```
 
+Network policy on this host is Linux report-only. `tartci network-policy
+--json` should report the default route on `vmbr0` (backed by `enp11s0`), but it
+must never run `networksetup` or rewrite Proxmox interface order. Correct drift
+through the Linux/Proxmox network configuration, then re-run the report before
+admitting new work.
+
 Roughly **1.5–2x a GitHub-hosted runner** (4 vCPU / 16 GB), and with no queue.
 
 ### Two hardware facts that constrain what it can do
