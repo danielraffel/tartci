@@ -62,18 +62,21 @@ import os, select, socket, sys
 peer = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=int(sys.argv[3]))
 peer.settimeout(None)
 os.write(1, b"READY\\n")
+inputs = [0, peer]
 while True:
-    readable, _, _ = select.select([0, peer], [], [])
-    if 0 in readable:
-        data = os.read(0, 65536)
-        if not data:
-            break
-        peer.sendall(data)
+    readable, _, _ = select.select(inputs, [], [])
     if peer in readable:
         data = peer.recv(65536)
         if not data:
             break
         os.write(1, data)
+    if 0 in readable:
+        data = os.read(0, 65536)
+        if data:
+            peer.sendall(data)
+        else:
+            peer.shutdown(socket.SHUT_WR)
+            inputs.remove(0)
 """
 
 
@@ -214,18 +217,20 @@ class ConnectHandler(socketserver.BaseRequestHandler):
                     >= self.config.tunnel_idle_timeout
                 ):
                     break
-                if self.request in readable:
-                    data = self.request.recv(65536)
-                    if not data:
-                        break
-                    local_stream.sendall(data)
-                    last_activity = time.monotonic()
                 if local_stream in readable:
                     data = local_stream.recv(65536)
                     if not data:
                         break
                     self.request.sendall(data)
                     last_activity = time.monotonic()
+                if self.request in readable:
+                    data = self.request.recv(65536)
+                    if data:
+                        local_stream.sendall(data)
+                        last_activity = time.monotonic()
+                    else:
+                        local_stream.shutdown(socket.SHUT_WR)
+                        sockets.remove(self.request)
         except TimeoutError:
             pass
         finally:

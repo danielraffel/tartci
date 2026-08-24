@@ -55,6 +55,18 @@ class HttpConnectSshRelayTests(unittest.TestCase):
         self.assertIn("while True:", tunnel)
         self.assertNotIn("while bridge.poll() is None:", tunnel)
 
+    def test_half_close_drains_peer_before_shutdown(self) -> None:
+        source = PATH.read_text()
+        remote = source[source.index('REMOTE_BRIDGE = """') : source.index('def remote_bridge_command')]
+        self.assertLess(remote.index("if peer in readable:"), remote.index("if 0 in readable:"))
+        self.assertIn("peer.shutdown(socket.SHUT_WR)", remote)
+        local = source[source.index("sockets = [self.request, local_stream]") :]
+        self.assertLess(
+            local.index("if local_stream in readable:"),
+            local.index("if self.request in readable:"),
+        )
+        self.assertIn("local_stream.shutdown(socket.SHUT_WR)", local)
+
     def test_guest_proxy_is_bridge_only_and_replaces_stale_values(self) -> None:
         runner = (ROOT / "providers/tart-macos/runner.sh").read_text()
         self.assertIn("^http://192\\.168\\.64\\.1:", runner)
