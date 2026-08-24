@@ -67,6 +67,43 @@ class HttpConnectSshRelayTests(unittest.TestCase):
         )
         self.assertIn("local_stream.shutdown(socket.SHUT_WR)", local)
 
+    def test_remote_write_all_survives_interrupts_and_partial_writes(self) -> None:
+        class PartialOS:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.output = bytearray()
+
+            def write(self, _fd: int, data: memoryview) -> int:
+                self.calls += 1
+                if self.calls == 1:
+                    raise InterruptedError
+                written = min(2, len(data))
+                self.output.extend(data[:written])
+                return written
+
+        partial_os = PartialOS()
+        namespace = {"os": partial_os}
+        exec(relay.REMOTE_BRIDGE_WRITE_ALL, namespace)
+        namespace["write_all"](1, b"READY\nTLS-payload")
+        self.assertEqual(bytes(partial_os.output), b"READY\nTLS-payload")
+        self.assertGreater(partial_os.calls, 2)
+
+    def test_remote_write_all_rejects_zero_byte_progress(self) -> None:
+        class ZeroOS:
+            @staticmethod
+            def write(_fd: int, _data: memoryview) -> int:
+                return 0
+
+        namespace = {"os": ZeroOS()}
+        exec(relay.REMOTE_BRIDGE_WRITE_ALL, namespace)
+        with self.assertRaises(BrokenPipeError):
+            namespace["write_all"](1, b"payload")
+
+    def test_remote_bridge_uses_write_all_for_ready_and_payload(self) -> None:
+        self.assertIn('write_all(1, b"READY\\n")', relay.REMOTE_BRIDGE)
+        self.assertIn("write_all(1, data)", relay.REMOTE_BRIDGE)
+        self.assertNotIn("os.write(1,", relay.REMOTE_BRIDGE)
+
     def test_guest_proxy_is_bridge_only_and_replaces_stale_values(self) -> None:
         runner = (ROOT / "providers/tart-macos/runner.sh").read_text()
         self.assertIn("^http://192\\.168\\.64\\.1:", runner)
