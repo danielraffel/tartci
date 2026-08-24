@@ -57,11 +57,26 @@ def parse_connect_target(request: bytes) -> tuple[str, int] | None:
     return (host, port) if 1 <= port <= 65535 else None
 
 
+REMOTE_BRIDGE_WRITE_ALL = """\
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except InterruptedError:
+            continue
+        if written <= 0:
+            raise BrokenPipeError("zero-byte write to relay stream")
+        view = view[written:]
+"""
+
+
 REMOTE_BRIDGE = """\
 import os, select, socket, sys
+""" + REMOTE_BRIDGE_WRITE_ALL + """\
 peer = socket.create_connection((sys.argv[1], int(sys.argv[2])), timeout=int(sys.argv[3]))
 peer.settimeout(None)
-os.write(1, b"READY\\n")
+write_all(1, b"READY\\n")
 inputs = [0, peer]
 while True:
     readable, _, _ = select.select(inputs, [], [])
@@ -69,7 +84,7 @@ while True:
         data = peer.recv(65536)
         if not data:
             break
-        os.write(1, data)
+        write_all(1, data)
     if 0 in readable:
         data = os.read(0, 65536)
         if data:
