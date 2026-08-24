@@ -28,6 +28,17 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
         self.assertTrue(relay.host_is_allowed("static.crates.io", suffixes))
         self.assertFalse(relay.host_is_allowed("evilcrates.io", suffixes))
 
+    def test_launchd_allows_bounded_sigstore_attestation_endpoints(self) -> None:
+        template = (
+            ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
+        ).read_text()
+        self.assertIn("<string>sigstore.dev</string>", template)
+        suffixes = ("sigstore.dev",)
+        self.assertTrue(relay.host_is_allowed("fulcio.sigstore.dev", suffixes))
+        self.assertTrue(relay.host_is_allowed("rekor.sigstore.dev", suffixes))
+        self.assertTrue(relay.host_is_allowed("search.sigstore.dev", suffixes))
+        self.assertFalse(relay.host_is_allowed("evilsigstore.dev", suffixes))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
