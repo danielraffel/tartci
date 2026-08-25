@@ -16,7 +16,10 @@ INSTALLER = Path(__file__).with_name("install_shipyard_steward_scheduler.sh")
 
 class StewardSchedulerInstallerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        # Exercise the installer's protected-path contract from a private,
+        # user-owned ancestor on both macOS and Linux CI.  A fixture rooted in
+        # world-writable /tmp is intentionally rejected by the product.
+        self.temporary = tempfile.TemporaryDirectory(dir=Path.home())
         self.root = Path(self.temporary.name)
         self.home = self.root / "home"
         self.bin = self.root / "bin"

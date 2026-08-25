@@ -21,7 +21,11 @@ SCRIPT = Path(__file__).with_name("shipyard_steward_scheduler.py")
 
 class StewardSchedulerTests(unittest.TestCase):
     def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory()
+        # The scheduler deliberately rejects state below a directory writable
+        # by other local users.  Linux commonly places tempfile's default
+        # beneath world-writable /tmp, which makes the fixture violate the
+        # production trust contract before the behavior under test can run.
+        self.temporary = tempfile.TemporaryDirectory(dir=Path.home())
         self.root = Path(self.temporary.name)
         self.calls = self.root / "calls"
         self.shipyard = (self.root / "shipyard").resolve()
