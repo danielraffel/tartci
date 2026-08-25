@@ -17,6 +17,11 @@ RELEASE_TEMPLATE = (
     / "launchd"
     / "com.danielraffel.pulp.tart-runner-macos-release.plist.template"
 )
+GATE_TEMPLATE = (
+    ROOT
+    / "launchd"
+    / "com.danielraffel.pulp.tart-runner-macos.plist.template"
+)
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -25,6 +30,29 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 class MultiWorkflowQueueScanTests(unittest.TestCase):
+    def test_gate_template_prioritizes_merge_groups_with_generic_fallback(self) -> None:
+        body = GATE_TEMPLATE.read_text(encoding="utf-8")
+        generic = (
+            "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast"
+        )
+        self.assertIn(f"<string>{generic}</string>", body)
+        self.assertIn(
+            "<key>TARTCI_VM_LEASE_PRIORITY</key>\n"
+            "        <string>gate</string>",
+            body,
+        )
+        self.assertIn("<key>TARTCI_RUNNER_WORKFLOW_TIERS</key>", body)
+        self.assertIn(
+            "<string>pulp-build-merge-group|Build and Test\n"
+            "pulp-build-pr-head|Build and Test</string>",
+            body,
+        )
+        self.assertLess(
+            body.index("pulp-build-merge-group|Build and Test"),
+            body.index("pulp-build-pr-head|Build and Test"),
+        )
+        self.assertNotIn("pulp-build-merge-group,pulp-build-pr-head", body)
+
     def test_tier_rejects_nonexclusive_comma_label_set(self) -> None:
         env = {
             **os.environ,

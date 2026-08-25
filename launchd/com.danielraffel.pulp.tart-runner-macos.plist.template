@@ -55,16 +55,23 @@
 
          launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.tart-runner-macos-gate"
 
-  PILOT vs GRADUATE: default labels below target the non-required
-  `pulp-build-vm` pilot lane. After the pilot is green, production Pulp-style
-  required macOS routing uses BOTH labels:
+  The default labels below are the production fast-gate base. Event-class
+  labels are added by TARTCI_RUNNER_WORKFLOW_TIERS at registration time:
 
-    self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
+    merge_group -> pulp-build-merge-group
+    pull_request -> pulp-build-pr-head
 
-  Then route the workflow selector to that full set, for example:
+  Keep the generic base labels on every tier during the compatibility window.
+  They let already-queued jobs that request the pre-tier selector still claim
+  a runner. Once this template is deployed on every fast-gate host, build.yml
+  may append the appropriate event-class label to its configured selector.
+  Roll back in the opposite order: stop appending the workflow label first,
+  then remove the tier configuration after generic jobs are draining again.
 
-    PULP_LOCAL_MACOS_RUNS_ON_JSON=["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm"]
-    PULP_LOCAL_MAC_RUNNER_LABEL=pulp-build-vm
+  The configured selector remains the reviewed generic base, for example:
+
+    PULP_LOCAL_MACOS_RUNS_ON_JSON=["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm","pulp-gate-fast"]
+    PULP_LOCAL_MAC_RUNNER_LABEL=pulp-gate-fast
 
   Keep bare-metal `pulp-build` runners online as rollback fallback. They remain
   excluded from the default VM route because they do not advertise
@@ -94,7 +101,7 @@
         <string>macos</string>
         <string>--loop</string>
         <string>--labels</string>
-        <string>self-hosted,macOS,ARM64,pulp-build-vm</string>
+        <string>self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -135,9 +142,12 @@
         <key>TARTCI_MACOS_GOLDEN</key>
         <string>pulp-build-runner:latest</string>
         <key>TARTCI_RUNNER_LABELS</key>
-        <string>self-hosted,macOS,ARM64,pulp-build-vm</string>
-        <key>TARTCI_RUNNER_WORKFLOW_NAME</key>
-        <string>Build and Test</string>
+        <string>self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast</string>
+        <key>TARTCI_VM_LEASE_PRIORITY</key>
+        <string>gate</string>
+        <key>TARTCI_RUNNER_WORKFLOW_TIERS</key>
+        <string>pulp-build-merge-group|Build and Test
+pulp-build-pr-head|Build and Test</string>
     </dict>
 </dict>
 </plist>
