@@ -1,4 +1,5 @@
 schema = 1
+name = "m1-macos-fleet"
 
 # This file describes staged capacity, not activation. Rendering it neither
 # changes the durable pool-off state nor loads a LaunchAgent.
