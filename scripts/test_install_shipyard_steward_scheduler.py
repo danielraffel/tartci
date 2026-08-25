@@ -69,6 +69,14 @@ esac
             encoding="utf-8",
         )
         launchctl.chmod(0o755)
+        plutil = self.bin / "plutil"
+        plutil.write_text(
+            """#!/bin/sh
+[ "$1" = "-lint" ] && [ -f "$2" ]
+""",
+            encoding="utf-8",
+        )
+        plutil.chmod(0o755)
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
