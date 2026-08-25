@@ -20,7 +20,7 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-TOP_KEYS = {"schema", "host", "lane"}
+TOP_KEYS = {"schema", "name", "host", "lane"}
 HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
@@ -42,6 +42,10 @@ def load(path: Path) -> dict:
     unknown = set(data) - TOP_KEYS
     if unknown:
         fail(f"unknown top-level keys: {sorted(unknown)}")
+    if "name" in data and (
+        not isinstance(data["name"], str) or not SAFE_ID.fullmatch(data["name"])
+    ):
+        fail("name must be a stable lowercase profile identifier")
     host = data.get("host") or {}
     if not isinstance(host, dict):
         fail("host must be a table")
