@@ -59,6 +59,11 @@ SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
+HOST_CCACHE="${TARTCI_MACOS_HOST_CCACHE:-1}"
+case "$HOST_CCACHE" in
+  0|1) ;;
+  *) printf 'invalid TARTCI_MACOS_HOST_CCACHE: expected 0 or 1\n' >&2; exit 1 ;;
+esac
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
@@ -66,12 +71,39 @@ RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.336.0}}"
 RUNNER_SHA256="${TARTCI_RUNNER_SHA256:-${PULP_RUNNER_SHA256:-}}"
 GUEST_HTTP_PROXY="${TARTCI_GUEST_HTTP_PROXY:-}"
+GUEST_PROXY_PORT=""
 if [ -n "$GUEST_HTTP_PROXY" ]; then
   [[ "$GUEST_HTTP_PROXY" =~ ^http://192\.168\.64\.1:([0-9]{1,5})$ ]] \
     || { printf 'invalid TARTCI_GUEST_HTTP_PROXY: expected http://192.168.64.1:PORT\n' >&2; exit 1; }
-  [ "${BASH_REMATCH[1]}" -ge 1 ] && [ "${BASH_REMATCH[1]}" -le 65535 ] \
+  GUEST_PROXY_PORT="${BASH_REMATCH[1]}"
+  [ "$GUEST_PROXY_PORT" -ge 1 ] && [ "$GUEST_PROXY_PORT" -le 65535 ] \
     || { printf 'invalid TARTCI_GUEST_HTTP_PROXY port\n' >&2; exit 1; }
 fi
+SOFTNET_PROXY_ONLY="${TARTCI_TART_SOFTNET_PROXY_ONLY:-0}"
+SOFTNET_BIN="${TARTCI_SOFTNET_BIN:-/usr/local/libexec/tartci/softnet}"
+case "$SOFTNET_PROXY_ONLY" in
+  0|1) ;;
+  *) printf 'invalid TARTCI_TART_SOFTNET_PROXY_ONLY: expected 0 or 1\n' >&2; exit 1 ;;
+esac
+TART_NETWORK_ARGS=(--no-graphics)
+if [ "$SOFTNET_PROXY_ONLY" = 1 ]; then
+  [ -n "$GUEST_HTTP_PROXY" ] || {
+    printf 'TARTCI_TART_SOFTNET_PROXY_ONLY=1 requires TARTCI_GUEST_HTTP_PROXY\n' >&2
+    exit 1
+  }
+  [ -x "$SOFTNET_BIN" ] || {
+    printf 'TARTCI_TART_SOFTNET_PROXY_ONLY=1 requires pinned Softnet at %s\n' "$SOFTNET_BIN" >&2
+    exit 1
+  }
+  # Permit replies only for flows initiated by the host (SSH), then deny every
+  # guest-initiated IPv4 destination. This is Softnet's stateful @host rule,
+  # not a gateway CIDR exception: the guest still cannot initiate a connection
+  # to any service on 192.168.64.1. The SSH reverse forward exposes the CONNECT
+  # proxy on guest loopback without opening a gateway port.
+  TART_NETWORK_ARGS+=(--net-softnet-allow="in @host" --net-softnet-block=0.0.0.0/0)
+fi
+EFFECTIVE_GUEST_HTTP_PROXY="$GUEST_HTTP_PROXY"
+[ "$SOFTNET_PROXY_ONLY" = 1 ] && EFFECTIVE_GUEST_HTTP_PROXY="http://127.0.0.1:$GUEST_PROXY_PORT"
 [ -n "$RUNNER_SHA256" ] || [ "$RUNNER_VERSION" != 2.336.0 ] || \
   RUNNER_SHA256="8e8839c49b7060b6b2154f4931f815df330c27f167d53ef2239ee3dfce28b079"
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
@@ -114,6 +146,7 @@ PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
 PRINT_RUNNER_VERSION=0
+PRINT_NETWORK_POLICY=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
@@ -123,6 +156,9 @@ CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
 CURRENT_AQUA_LABEL=""
+CURRENT_PROXY_TUNNEL_PID=""
+PENDING_STATIC_RUNNER_RECLAIM=0
+TEARDOWN_BLOCKED=0
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -242,6 +278,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
+  --print-network-policy) PRINT_NETWORK_POLICY=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
@@ -256,6 +293,31 @@ case "$RUNNER_SHA256" in
   ''|*[!0-9a-fA-F]*) die "set a 64-character TARTCI_RUNNER_SHA256 when overriding Actions Runner version $RUNNER_VERSION";;
 esac
 [ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_RUNNER_SHA256 must contain 64 hexadecimal characters"
+
+if [ "$PRINT_NETWORK_POLICY" = 1 ]; then
+  python3 - "$SOFTNET_PROXY_ONLY" "$EFFECTIVE_GUEST_HTTP_PROXY" "$HOST_CCACHE" "${TART_NETWORK_ARGS[@]}" <<'PY'
+import json
+import sys
+
+enabled = sys.argv[1] == "1"
+host_ccache = sys.argv[3] == "1"
+print(json.dumps({
+    "version": 1,
+    "enforced": enabled,
+    "scope": "tart-macos-disposable-vm",
+    "default": "deny" if enabled else "allow",
+    "guest_proxy": sys.argv[2] or None,
+    "gateway_allow": [],
+    "host_initiated_stateful_allow": enabled,
+    "implicit_bootstrap": ["dhcp_v4_client"] if enabled else [],
+    "non_ipv4_egress": "drop_by_softnet_0.23.0" if enabled else None,
+    "proxy_transport": "host-initiated-ssh-reverse-forward" if enabled else None,
+    "writable_host_mounts": ["ccache"] if host_ccache else [],
+    "tart_run_args": sys.argv[4:],
+}, sort_keys=True))
+PY
+  exit 0
+fi
 
 configure_workflows
 CURRENT_LABELS="$LABELS"
@@ -510,52 +572,303 @@ priority_demand(){
 }
 
 reclaim_runner_name(){
-  local name="$1" id attempt
-  for attempt in $(seq 1 18); do
-    id="$("$GH_CLI" api "repos/$REPO/actions/runners" --paginate \
-          --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
-    [ -n "$id" ] || break
+  local name="$1" id attempt inventory
+  # Attempts 1-18 may delete; attempt 19 is the final read-only absence proof.
+  for attempt in $(seq 1 19); do
+    inventory="$(capture_command_bounded 20 "$GH_CLI" api --paginate --slurp \
+      "repos/$REPO/actions/runners?per_page=100")" || {
+      note "runner inventory is indeterminate while reclaiming '$name'"
+      return 1
+    }
+    id="$(TARTCI_RUNNER_INVENTORY="$inventory" python3 - "$name" <<'PY'
+import json
+import os
+import sys
+
+name = sys.argv[1]
+try:
+    pages = json.loads(os.environ["TARTCI_RUNNER_INVENTORY"])
+except Exception:
+    raise SystemExit(1)
+if not isinstance(pages, list):
+    raise SystemExit(1)
+for page in pages:
+    if not isinstance(page, dict) or not isinstance(page.get("runners"), list):
+        raise SystemExit(1)
+    for runner in page["runners"]:
+        if isinstance(runner, dict) and runner.get("name") == name:
+            print(runner.get("id", ""))
+            raise SystemExit(0)
+PY
+    )" || return 1
+    [ -n "$id" ] || return 0
+    [ "$attempt" -lt 19 ] || break
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" >/dev/null 2>&1 && break
+    capture_command_bounded 20 "$GH_CLI" api -X DELETE \
+      "repos/$REPO/actions/runners/$id" >/dev/null || true
     sleep 10
   done
-  tart delete "$name" >/dev/null 2>&1 || true
+  note "runner registration absence is unconfirmed for '$name'"
+  return 1
 }
 
 stop_current_aqua_runner(){
+  local stop_pid
   if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
       "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
-      >/dev/null 2>&1 || true
+      >/dev/null 2>&1 & stop_pid=$!
+    wait_process_bounded "$stop_pid" 10
   fi
 }
 
+tart_vm_exists_or_unknown(){
+  local vm="$1" inventory
+  inventory="$(capture_command_bounded 10 tart list --format json)" || return 0
+  TARTCI_VM_INVENTORY="$inventory" python3 - "$vm" <<'PY'
+import json
+import os
+import sys
+
+name = sys.argv[1]
+try:
+    entries = json.loads(os.environ["TARTCI_VM_INVENTORY"])
+except Exception:
+    raise SystemExit(0)
+if not isinstance(entries, list):
+    raise SystemExit(0)
+for entry in entries:
+    if isinstance(entry, dict) and (entry.get("Name") == name or entry.get("name") == name):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+vm_lease_absence_proved(){
+  local lease_id="$1" inventory
+  inventory="$(capture_command_bounded_allow_warning 10 python3 "$TARTCI_ROOT/scripts/leases.py" status --json)" \
+    || return 1
+  TARTCI_LEASE_INVENTORY="$inventory" python3 - "$lease_id" <<'PY'
+import json
+import os
+import sys
+
+lease_id = sys.argv[1]
+try:
+    payload = json.loads(os.environ["TARTCI_LEASE_INVENTORY"])
+except Exception:
+    raise SystemExit(1)
+leases = payload.get("leases")
+problems = payload.get("problems")
+if not isinstance(leases, list) or not isinstance(problems, list):
+    raise SystemExit(1)
+for lease in leases:
+    if isinstance(lease, dict) and lease.get("id") == lease_id:
+        raise SystemExit(1)
+for problem in problems:
+    if isinstance(problem, str) and problem.rsplit(":", 1)[-1] == lease_id:
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
+release_current_vm_lease_proved(){
+  local lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}"
+  local lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-}"
+  [ -n "$lease_id" ] || return 0
+  tartci_release_vm_lease
+  if vm_lease_absence_proved "$lease_id"; then
+    return 0
+  fi
+  # Fail closed. If release failed, the supervisor is still the recorded owner;
+  # restore its process-local identity and heartbeat instead of admitting a new
+  # writer. If status itself failed after a successful release, the next cleanup
+  # pass will prove absence before clearing this conservative hold.
+  TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
+  TARTCI_ACTIVE_VM_LEASE_CORES="$lease_cores"
+  tartci_start_vm_lease_heartbeat "$lease_id"
+  note "durable lease absence is unconfirmed for $lease_id; preserving authority"
+  event teardown_unconfirmed "lease=$lease_id lease_preserved=true"
+  TEARDOWN_BLOCKED=1
+  return 1
+}
+
 discard_current_vm(){
+  local stop_pid delete_rc=0
   [ -n "$CURRENT_VM" ] || return 0
   note "stopping — tearing down in-flight VM $CURRENT_VM"
   stop_current_aqua_runner
-  [ -n "$CURRENT_RPID" ] && kill -9 "$CURRENT_RPID" 2>/dev/null || true
-  tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
+  if [ -n "$CURRENT_PROXY_TUNNEL_PID" ]; then
+    terminate_process_bounded "$CURRENT_PROXY_TUNNEL_PID" 5
+    CURRENT_PROXY_TUNNEL_PID=""
+  fi
+  tart stop "$CURRENT_VM" >/dev/null 2>&1 & stop_pid=$!
+  wait_process_bounded "$stop_pid" 10
+  if [ -n "$CURRENT_RPID" ] && ! wait_process_exit_bounded "$CURRENT_RPID" 10; then
+    note "VM guardian remains live after stop; preserving identity and lease for $CURRENT_VM"
+    event teardown_unconfirmed "vm=$CURRENT_VM guardian_live=true lease_preserved=true"
+    TEARDOWN_BLOCKED=1
+    return 1
+  fi
+  CURRENT_RPID=""
+  tartci_vm_lease_guard_run tart delete "$CURRENT_VM" >/dev/null 2>&1 || delete_rc=$?
+  if tart_vm_exists_or_unknown "$CURRENT_VM"; then
+    note "VM deletion is unconfirmed (delete_rc=$delete_rc); preserving identity and lease for $CURRENT_VM"
+    event teardown_unconfirmed "vm=$CURRENT_VM delete_rc=$delete_rc lease_preserved=true"
+    TEARDOWN_BLOCKED=1
+    return 1
+  fi
   CURRENT_VM=""
   CURRENT_RPID=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""
 }
 
+start_proxy_tunnel(){
+  local ip="$1"
+  [ "$SOFTNET_PROXY_ONLY" = 1 ] || return 0
+  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" \
+    -N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 \
+    -o ForwardAgent=no -o ForwardX11=no -o RequestTTY=no \
+    -R "127.0.0.1:$GUEST_PROXY_PORT:127.0.0.1:$GUEST_PROXY_PORT" \
+    "$VM_USER@$ip" >/dev/null 2>&1 &
+  CURRENT_PROXY_TUNNEL_PID=$!
+  sleep 1
+  kill -0 "$CURRENT_PROXY_TUNNEL_PID" 2>/dev/null || {
+    wait "$CURRENT_PROXY_TUNNEL_PID" 2>/dev/null || true
+    CURRENT_PROXY_TUNNEL_PID=""
+    return 1
+  }
+}
+
+guest_probe_must_be_blocked(){
+  local ip="$1" command="$2" marker output
+  marker="TARTCI_EXPECTED_BLOCKED_${RANDOM}_$$"
+  output="$(ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "if $command; then exit 42; else printf '%s' '$marker'; fi")" || return 1
+  [ "$output" = "$marker" ]
+}
+
+verify_proxy_boundary(){
+  local ip="$1"
+  [ "$SOFTNET_PROXY_ONLY" = 1 ] || return 0
+  # Softnet currently enforces IPv4 rules only. Refuse an image with an IPv6
+  # default route rather than silently exposing an ungoverned escape path.
+  ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'route -n get -inet6 default >/dev/null 2>&1' || return 1
+  local no_proxy='env -u HTTPS_PROXY -u HTTP_PROXY -u ALL_PROXY -u https_proxy -u http_proxy -u all_proxy'
+  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    'command -v curl >/dev/null && command -v nc >/dev/null' || return 1
+  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "HTTPS_PROXY='$EFFECTIVE_GUEST_HTTP_PROXY' NO_PROXY=localhost curl -fsS --max-time 20 https://github.com/robots.txt >/dev/null" \
+    || return 1
+  guest_probe_must_be_blocked "$ip" \
+    "$no_proxy curl --noproxy '*' -fsS --connect-timeout 3 --max-time 5 https://github.com/robots.txt >/dev/null 2>&1" \
+    || return 1
+  guest_probe_must_be_blocked "$ip" \
+    "nc -z -w 3 192.168.64.1 '$GUEST_PROXY_PORT' >/dev/null 2>&1" \
+    || return 1
+  guest_probe_must_be_blocked "$ip" \
+    "$no_proxy curl --noproxy '*' -kfsS --connect-timeout 3 --max-time 5 https://1.1.1/ >/dev/null 2>&1" \
+    || return 1
+}
+
+proxy_connect_probe(){
+  local target="$1"
+  python3 - "$GUEST_PROXY_PORT" "$target" <<'PY'
+import socket
+import sys
+
+port = int(sys.argv[1])
+target = sys.argv[2]
+with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+    sock.settimeout(5)
+    request = f"CONNECT {target}:443 HTTP/1.1\r\nHost: {target}:443\r\n\r\n"
+    sock.sendall(request.encode("ascii"))
+    response = b""
+    while b"\r\n\r\n" not in response and len(response) < 4096:
+        chunk = sock.recv(4096 - len(response))
+        if not chunk:
+            break
+        response += chunk
+raise SystemExit(0 if response.startswith(b"HTTP/1.1 200") else 1)
+PY
+}
+
+host_proxy_endpoint_healthy_bounded(){
+  local attempt
+  for attempt in 1 2 3; do
+    if proxy_connect_probe github.com || proxy_connect_probe crates.io; then
+      return 0
+    fi
+    [ "$attempt" = 3 ] || sleep 1
+  done
+  return 1
+}
+
 cleanup(){
+  local teardown_vm="${CURRENT_VM:-${CURRENT_REGISTERED_RUNNER:-}}"
+  [ -z "$teardown_vm" ] || PENDING_STATIC_RUNNER_RECLAIM=1
   tartci_pool_lock_release
   [ "$CLEANED_UP" = 1 ] && return 0
-  discard_current_vm
-  tartci_release_vm_lease
+  discard_current_vm || { heartbeat cleanup-blocked; return 1; }
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
   if [ -n "$CURRENT_REGISTERED_RUNNER" ]; then
-    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" 2>/dev/null || true
+    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" \
+      || { TEARDOWN_BLOCKED=1; heartbeat cleanup-blocked; return 1; }
     CURRENT_REGISTERED_RUNNER=""
   fi
-  reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
+  if [ "$PENDING_STATIC_RUNNER_RECLAIM" = 1 ]; then
+    reclaim_runner_name "$RUNNER_NAME" \
+      || { TEARDOWN_BLOCKED=1; heartbeat cleanup-blocked; return 1; }
+    PENDING_STATIC_RUNNER_RECLAIM=0
+  fi
+  release_current_vm_lease_proved || { heartbeat cleanup-blocked; return 1; }
+  if [ -n "$teardown_vm" ]; then
+    CURRENT_VM="$teardown_vm"
+    event teardown "cleanup=signal vm_absent=true runner_absent=true lease_absent=true"
+    CURRENT_VM=""
+  fi
   CLEANED_UP=1
   heartbeat stopped
+}
+
+hold_teardown_until_proved(){
+  event teardown_hold "same_supervisor=true"
+  trap '' INT TERM
+  while [ "$TEARDOWN_BLOCKED" = 1 ]; do
+    heartbeat cleanup-blocked
+    note "teardown authority held by supervisor PID $$; retrying exact cleanup in 30s"
+    sleep 30
+    if cleanup; then
+      TEARDOWN_BLOCKED=0
+      event teardown_hold_recovered "same_supervisor=true"
+      trap handle_supervisor_signal INT TERM
+      return 0
+    fi
+  done
+}
+
+handle_supervisor_signal(){
+  trap '' INT TERM
+  event supervisor_signal "INT/TERM"
+  if ! cleanup; then
+    TEARDOWN_BLOCKED=1
+    hold_teardown_until_proved
+  fi
+  trap - EXIT
+  exit 143
+}
+
+handle_supervisor_exit(){
+  local rc=$?
+  trap - EXIT
+  trap '' INT TERM
+  if ! cleanup; then
+    TEARDOWN_BLOCKED=1
+    hold_teardown_until_proved
+  fi
+  exit "$rc"
 }
 
 capture_current_job(){
@@ -566,14 +879,15 @@ capture_current_job(){
   runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
   while IFS=$'\t' read -r run_id run_workflow; do
     [ -n "$run_id" ] || continue
-    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" 2>/dev/null \
+    job_id="$("$GH_CLI" api --paginate --slurp "repos/$REPO/actions/runs/$run_id/jobs?per_page=100" 2>/dev/null \
       | TARTCI_CAPTURE_RUNNER="$runner_registration" python3 -c '
 import json, os, sys
 runner = os.environ["TARTCI_CAPTURE_RUNNER"]
-for job in json.load(sys.stdin).get("jobs", []):
-    if job.get("runner_name") == runner and job.get("status") == "in_progress":
-        print(job.get("id", ""))
-        break
+for page in json.load(sys.stdin):
+    for job in page.get("jobs", []):
+        if job.get("runner_name") == runner and job.get("status") == "in_progress":
+            print(job.get("id", ""))
+            raise SystemExit
 ' 2>/dev/null | head -n1 || true)"
     if [ -n "$job_id" ]; then
       CURRENT_RUN_ID="$run_id"
@@ -581,13 +895,14 @@ for job in json.load(sys.stdin).get("jobs", []):
       CURRENT_WORKFLOW_NAME="$run_workflow"
       return 0
     fi
-  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" 2>/dev/null \
+  done < <("$GH_CLI" api --paginate --slurp "repos/$REPO/actions/runs?status=in_progress&per_page=100" 2>/dev/null \
     | TARTCI_CAPTURE_WORKFLOWS="$WORKFLOW_CONFIG" python3 -c '
 import json, os, sys
 workflows = set(os.environ["TARTCI_CAPTURE_WORKFLOWS"].splitlines())
-for run in json.load(sys.stdin).get("workflow_runs", []):
-    if run.get("name") in workflows and isinstance(run.get("id"), int):
-        print("{}\t{}".format(run["id"], run["name"]))
+for page in json.load(sys.stdin):
+    for run in page.get("workflow_runs", []):
+        if run.get("name") in workflows and isinstance(run.get("id"), int):
+            print("{}\t{}".format(run["id"], run["name"]))
 ' 2>/dev/null || true)
   return 1
 }
@@ -600,17 +915,124 @@ cancel_current_run(){
   fi
 }
 
+cancel_current_run_bounded(){
+  local cancel_pid
+  cancel_current_run >/dev/null 2>&1 & cancel_pid=$!
+  for _ in $(seq 1 10); do
+    kill -0 "$cancel_pid" 2>/dev/null || { wait "$cancel_pid" 2>/dev/null || true; return 0; }
+    sleep 1
+  done
+  terminate_process_tree "$cancel_pid" TERM
+  sleep 1
+  terminate_process_tree "$cancel_pid" KILL
+  wait "$cancel_pid" 2>/dev/null || true
+}
+
+terminate_process_tree(){
+  local pid="$1" signal="$2" child
+  while IFS= read -r child; do
+    [ -z "$child" ] || terminate_process_tree "$child" "$signal"
+  done < <(pgrep -P "$pid" 2>/dev/null || true)
+  kill -s "$signal" "$pid" 2>/dev/null || true
+}
+
+capture_command_bounded(){
+  local seconds="$1" output_file command_pid rc=0
+  shift
+  output_file="$(mktemp -t tartci-capture)" || return 1
+  "$@" >"$output_file" 2>/dev/null & command_pid=$!
+  for _ in $(seq 1 "$seconds"); do
+    if ! kill -0 "$command_pid" 2>/dev/null; then
+      wait "$command_pid" || rc=$?
+      [ "$rc" -eq 0 ] && cat "$output_file"
+      /usr/bin/unlink "$output_file" >/dev/null 2>&1 || true
+      return "$rc"
+    fi
+    sleep 1
+  done
+  terminate_process_tree "$command_pid" TERM
+  sleep 1
+  terminate_process_tree "$command_pid" KILL
+  wait "$command_pid" 2>/dev/null || true
+  /usr/bin/unlink "$output_file" >/dev/null 2>&1 || true
+  return 124
+}
+
+capture_command_bounded_allow_warning(){
+  local seconds="$1" output_file command_pid rc=0
+  shift
+  output_file="$(mktemp -t tartci-capture-warning)" || return 1
+  "$@" >"$output_file" 2>/dev/null & command_pid=$!
+  for _ in $(seq 1 "$seconds"); do
+    if ! kill -0 "$command_pid" 2>/dev/null; then
+      wait "$command_pid" || rc=$?
+      if [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; then
+        cat "$output_file"
+        /usr/bin/unlink "$output_file" >/dev/null 2>&1 || true
+        return 0
+      fi
+      /usr/bin/unlink "$output_file" >/dev/null 2>&1 || true
+      return "$rc"
+    fi
+    sleep 1
+  done
+  terminate_process_tree "$command_pid" TERM
+  sleep 1
+  terminate_process_tree "$command_pid" KILL
+  wait "$command_pid" 2>/dev/null || true
+  /usr/bin/unlink "$output_file" >/dev/null 2>&1 || true
+  return 124
+}
+
+terminate_process_bounded(){
+  local pid="$1" seconds="${2:-10}"
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 "$seconds"); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+    sleep 1
+  done
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+wait_process_bounded(){
+  local pid="$1" seconds="${2:-10}"
+  for _ in $(seq 1 "$seconds"); do
+    kill -0 "$pid" 2>/dev/null || { wait "$pid" 2>/dev/null || true; return 0; }
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
+
+wait_process_exit_bounded(){
+  local pid="$1" seconds="${2:-10}"
+  for _ in $(seq 1 "$seconds"); do
+    if ! kill -0 "$pid" 2>/dev/null; then
+      wait "$pid" 2>/dev/null || true
+      return 0
+    fi
+    sleep 1
+  done
+  return 124
+}
+
 ensure_runner_version(){
   local ip="$1"
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY'" <<'GUEST'
+    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$EFFECTIVE_GUEST_HTTP_PROXY' '$SOFTNET_PROXY_ONLY'" <<'GUEST'
 set -euo pipefail
 desired="$1"
 expected_sha256="$2"
 guest_http_proxy="$3"
+proxy_only="$4"
 if [ -n "$guest_http_proxy" ]; then
-  export HTTP_PROXY="$guest_http_proxy" HTTPS_PROXY="$guest_http_proxy"
-  export http_proxy="$guest_http_proxy" https_proxy="$guest_http_proxy"
+  export HTTPS_PROXY="$guest_http_proxy" https_proxy="$guest_http_proxy"
+  if [ "$proxy_only" != 1 ]; then
+    export HTTP_PROXY="$guest_http_proxy" http_proxy="$guest_http_proxy"
+  fi
   export NO_PROXY="127.0.0.1,localhost,::1" no_proxy="127.0.0.1,localhost,::1"
 fi
 runner_dir="$HOME/actions-runner"
@@ -670,6 +1092,8 @@ run_runner_until_done(){
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
   local aqua_label="com.tartci.aqua.$vm"
   local ssh_pid start assigned_at=0 now idle_elapsed job_elapsed assigned=0 warned=0 rc=0
+  local last_proxy_probe=0
+  local cancel_pid="" tart_stop_pid=""
   : >"$runner_log"
   # Claim the guest secret/service cleanup target before the first byte crosses
   # SSH, so a failed stream or pending signal cannot leave an unowned JIT file.
@@ -683,7 +1107,7 @@ run_runner_until_done(){
   jit=""
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
-     ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
+     if [ '$HOST_CCACHE' = 1 ]; then ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache; else if [ -L ~/Library/Caches/ccache ]; then rm -f ~/Library/Caches/ccache; fi; mkdir -p ~/Library/Caches/ccache; fi && \
      export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\" && \
@@ -691,14 +1115,38 @@ run_runner_until_done(){
      awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
-     if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
+     if [ -n '$EFFECTIVE_GUEST_HTTP_PROXY' ]; then if [ '$SOFTNET_PROXY_ONLY' != 1 ]; then printf '%s\n' 'HTTP_PROXY=$EFFECTIVE_GUEST_HTTP_PROXY' 'http_proxy=$EFFECTIVE_GUEST_HTTP_PROXY' >> .env.tartci; fi; printf '%s\n' 'HTTPS_PROXY=$EFFECTIVE_GUEST_HTTP_PROXY' 'https_proxy=$EFFECTIVE_GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
      mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
     >"$runner_log" 2>&1 & ssh_pid=$!
   start="$(date +%s)"
   while kill -0 "$ssh_pid" 2>/dev/null; do
+    if [ "$SOFTNET_PROXY_ONLY" = 1 ] && \
+       ! kill -0 "$CURRENT_PROXY_TUNNEL_PID" 2>/dev/null; then
+      event proxy_tunnel_lost "vm=$vm run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}"
+      cancel_current_run_bounded & cancel_pid=$!
+      terminate_process_bounded "$ssh_pid" 5
+      tart stop "$CURRENT_VM" >/dev/null 2>&1 & tart_stop_pid=$!
+      wait_process_bounded "$tart_stop_pid" 10
+      [ -z "$CURRENT_RPID" ] || wait_process_exit_bounded "$CURRENT_RPID" 10 || true
+      wait_process_bounded "$cancel_pid" 12
+      return 125
+    fi
     now="$(date +%s)"
+    if [ "$SOFTNET_PROXY_ONLY" = 1 ] && [ $((now - last_proxy_probe)) -ge 30 ]; then
+      if ! host_proxy_endpoint_healthy_bounded; then
+        event proxy_endpoint_lost "vm=$vm run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}"
+        cancel_current_run_bounded & cancel_pid=$!
+        terminate_process_bounded "$ssh_pid" 5
+        tart stop "$CURRENT_VM" >/dev/null 2>&1 & tart_stop_pid=$!
+        wait_process_bounded "$tart_stop_pid" 10
+        [ -z "$CURRENT_RPID" ] || wait_process_exit_bounded "$CURRENT_RPID" 10 || true
+        wait_process_bounded "$cancel_pid" 12
+        return 125
+      fi
+      last_proxy_probe="$now"
+    fi
     idle_elapsed=$((now - start))
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
@@ -769,63 +1217,77 @@ run_one(){
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
+  local stop_pid="" delete_rc=0
   local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
+  if [ "$SOFTNET_PROXY_ONLY" = 1 ] && \
+     ! python3 "$TARTCI_ROOT/scripts/verify_macos_softnet_install.py" --path "$SOFTNET_BIN" >/dev/null; then
+    note "[$i] pinned Softnet enrollment is not verified — refusing hardened VM boot"
+    event boot_failed "softnet_install_unverified"
+    return 1
+  fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
     tartci_prepare_disk_root "$logdir" || return $?
   fi
   tartci_check_disk_floor "$TART_HOME" || return $?
-  tartci_prepare_disk_root "$CACHE_ROOT" || return $?
-  tartci_check_disk_floor "$CACHE_ROOT" || return $?
+  if [ "$HOST_CCACHE" = 1 ]; then
+    tartci_prepare_disk_root "$CACHE_ROOT" || return $?
+    tartci_check_disk_floor "$CACHE_ROOT" || return $?
+  fi
   CLEANED_UP=0
   CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_LABELS="$selected_labels"
-  reclaim_runner_name "$vm"
+  if ! reclaim_runner_name "$vm"; then
+    note "[$i] pre-boot JIT runner absence is unconfirmed — refusing VM admission"
+    event boot_deferred "runner_absence_unconfirmed=true unregistered=true"
+    return 1
+  fi
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" || return $?
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
-  note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
+  note "[$i] clone $GOLDEN → $vm (CoW) + boot with host_ccache=$HOST_CCACHE"
   event clone_start "golden=$GOLDEN"
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
   CURRENT_VM="$vm"
   if ! tartci_vm_lease_guard_run tart clone "$GOLDEN" "$vm"; then
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
   if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
     note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  if ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
-    discard_current_vm
-    tartci_release_vm_lease
+  if [ "$HOST_CCACHE" = 1 ] && ! tartci_prepare_disk_root "$CACHE_ROOT/ccache"; then
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
   if ! tartci_prepare_disk_root "$FETCHCONTENT_SOURCE_ROOT"; then
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
   boot_log="$(mktemp -t "tart-run-$vm")"
-  tartci_vm_lease_guard_exec tart run --no-graphics \
-    --dir="ccache:$CACHE_ROOT/ccache" \
-    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro" \
+  local tart_dirs=(--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro")
+  [ "$HOST_CCACHE" = 0 ] || tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")
+  PATH="$(dirname "$SOFTNET_BIN"):$PATH" tartci_vm_lease_guard_run tart run "${TART_NETWORK_ARGS[@]}" \
+    "${tart_dirs[@]}" \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat booting
@@ -834,8 +1296,8 @@ run_one(){
   if [ -z "$ip" ]; then
     note "[$i] no IP after 120s — last tart run lines:"; tail -10 "$boot_log" >&2 2>/dev/null || true
     rm -f "$boot_log"; event boot_failed "no_ip"; runtime_emit_complete fail boot_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 1
   fi
   CURRENT_IP="$ip"
@@ -850,16 +1312,32 @@ run_one(){
     note "[$i] no SSH after 180s — discarding unregistered VM"
     event boot_failed "no_ssh"
     runtime_emit_complete fail ssh_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
+    return 1
+  fi
+  if ! start_proxy_tunnel "$ip"; then
+    note "[$i] proxy-only reverse forward failed — discarding unregistered VM"
+    event boot_failed "proxy_tunnel"
+    runtime_emit_complete fail proxy_tunnel_failed 1 "" "$logdir"
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
+    return 1
+  fi
+  if ! verify_proxy_boundary "$ip"; then
+    note "[$i] proxy-only network proof failed before JIT mint — discarding unregistered VM"
+    event boot_failed "proxy_boundary"
+    runtime_emit_complete fail proxy_boundary_failed 1 "" "$logdir"
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 1
   fi
   t_booted="$(now_epoch)"
   if higher_priority_demand "$selected_tier"; then
     note "[$i] higher-priority workflow demand appeared during boot — discarding unregistered tier-$selected_tier VM"
     event yielded_to_workflow_tier "selected_tier=$selected_tier labels=$selected_labels"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     CURRENT_LABELS="$LABELS"
     return 75
   fi
@@ -879,8 +1357,8 @@ run_one(){
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
         "rc=$admission_rc unregistered=true"
       note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
-      discard_current_vm
-      tartci_release_vm_lease
+      discard_current_vm || return 1
+      release_current_vm_lease_proved || return 1
       return "$admission_rc"
     fi
   fi
@@ -891,8 +1369,8 @@ run_one(){
     note "[$i] Actions Runner v$RUNNER_VERSION install/verification failed — discarding unregistered VM"
     event runner_version_failed "required=$RUNNER_VERSION"
     runtime_emit_complete fail runner_install_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 1
   fi
 
@@ -901,23 +1379,23 @@ run_one(){
   if ! install_and_preflight_aqua_runner "$ip" "$vm"; then
     event aqua_preflight_failed "uid=501 unregistered=true"
     runtime_emit_complete fail aqua_preflight_failed 1 "" "$logdir"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 1
   fi
 
   heartbeat minting-jit
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 75
   fi
   if ! tartci_pool_admission_open; then
     tartci_pool_lock_release
     note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
-    discard_current_vm
-    tartci_release_vm_lease
+    discard_current_vm || return 1
+    release_current_vm_lease_proved || return 1
     return 75
   fi
   event mint_jit "labels=$selected_labels tier=$selected_tier"
@@ -950,13 +1428,36 @@ run_one(){
   if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
   note "[$i] discarding ephemeral VM $vm"
-  event teardown "rc=$rc"
+  event teardown_start "rc=$rc"
   stop_current_aqua_runner
-  tart stop "$vm" >/dev/null 2>&1 || true
-  kill "$rpid" 2>/dev/null || true
-  sleep 2
-  tart delete "$vm" >/dev/null 2>&1 || true
-  tartci_release_vm_lease
+  if [ -n "$CURRENT_PROXY_TUNNEL_PID" ]; then
+    terminate_process_bounded "$CURRENT_PROXY_TUNNEL_PID" 5
+    CURRENT_PROXY_TUNNEL_PID=""
+  fi
+  tart stop "$vm" >/dev/null 2>&1 & stop_pid=$!
+  wait_process_bounded "$stop_pid" 10
+  if ! wait_process_exit_bounded "$rpid" 10; then
+    note "[$i] VM guardian remains live after stop — preserving lease and runner identity"
+    event teardown_unconfirmed "vm=$vm guardian_live=true lease_preserved=true"
+    TEARDOWN_BLOCKED=1
+    return 1
+  fi
+  CURRENT_RPID=""
+  delete_rc=0
+  tartci_vm_lease_guard_run tart delete "$vm" >/dev/null 2>&1 || delete_rc=$?
+  if tart_vm_exists_or_unknown "$vm"; then
+    note "[$i] VM deletion is unconfirmed (delete_rc=$delete_rc) — preserving lease and runner identity"
+    event teardown_unconfirmed "vm=$vm delete_rc=$delete_rc lease_preserved=true"
+    TEARDOWN_BLOCKED=1
+    return 1
+  fi
+  if ! reclaim_runner_name "$vm"; then
+    note "[$i] JIT runner deletion is unconfirmed — preserving identity and lease"
+    event teardown_unconfirmed "vm=$vm runner_absence_unconfirmed=true lease_preserved=true"
+    TEARDOWN_BLOCKED=1
+    return 1
+  fi
+  CURRENT_REGISTERED_RUNNER=""
   t_done="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     {
@@ -974,6 +1475,8 @@ run_one(){
       runtime_emit_complete fail source_failure "$rc" "$logdir/timing.tsv" "$logdir"
     fi
   fi
+  release_current_vm_lease_proved || return 1
+  event teardown "rc=$rc vm_absent=true runner_absent=true lease_absent=true"
   CURRENT_VM=""
   CURRENT_RPID=""
   CURRENT_IP=""
@@ -982,8 +1485,6 @@ run_one(){
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_LABELS="$LABELS"
-  reclaim_runner_name "$vm"
-  CURRENT_REGISTERED_RUNNER=""
   heartbeat stopped
   CLEANED_UP=1
   return 0
@@ -998,8 +1499,8 @@ i=0
 }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
-trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TERM
-trap 'cleanup' EXIT
+trap handle_supervisor_signal INT TERM
+trap handle_supervisor_exit EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
@@ -1062,7 +1563,10 @@ if [ "$LOOP" = 1 ]; then
     if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
-      run_one "$i" "$selected_labels" "$selected_tier" || sleep "$POLL"
+      if ! run_one "$i" "$selected_labels" "$selected_tier"; then
+        [ "$TEARDOWN_BLOCKED" = 0 ] || hold_teardown_until_proved
+        sleep "$POLL"
+      fi
       CURRENT_LABELS="$LABELS"
       rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
@@ -1091,5 +1595,9 @@ else
       || die "no queued workflow-tier work to select for --once"
   fi
   note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
-  run_one 1 "$selected_labels" "$selected_tier"
+  run_one 1 "$selected_labels" "$selected_tier" || {
+    run_rc=$?
+    [ "$TEARDOWN_BLOCKED" = 0 ] || hold_teardown_until_proved
+    exit "$run_rc"
+  }
 fi

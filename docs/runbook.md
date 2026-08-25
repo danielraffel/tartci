@@ -151,6 +151,53 @@ tartci pool on
 tartci pool status
 ```
 
+For a disposable lane that must not reach the internet or LAN directly, set
+both of these in its LaunchAgent and reload the service (a kickstart retains
+the old cached environment):
+
+```bash
+TARTCI_GUEST_HTTP_PROXY=http://192.168.64.1:49125
+TARTCI_TART_SOFTNET_PROXY_ONLY=1
+TARTCI_MACOS_HOST_CCACHE=0
+tartci serve macos --print-network-policy
+```
+
+The effective Tart boot uses Softnet's stateful `--net-softnet-allow="in @host"`
+followed by `--net-softnet-block=0.0.0.0/0`, with no gateway CIDR exception.
+The allow rule admits only replies to host-initiated flows; it does not let the
+guest initiate connections to host services. Softnet also admits its narrowly
+validated DHCPv4 bootstrap/renewal traffic and drops non-ARP/non-IPv4 frames.
+TartCI then opens a host-initiated SSH reverse forward from guest
+`127.0.0.1:PORT` to the existing host CONNECT proxy. This avoids granting the
+guest access to unrelated services on the vmnet gateway; HTTPS hostnames are
+resolved by the host proxy rather than by the guest. Plaintext HTTP is
+intentionally unavailable because the relay accepts CONNECT only. Before activating a required lane,
+prove in a disposable canary that a proxied request succeeds, the same request
+with proxy variables removed fails, direct gateway proxy/public IPv4/literal
+IPv6 connections fail, host SSH still works, and teardown removes the VM and JIT
+runner. This is opt-in so existing general-purpose lanes retain their current
+network behavior until separately canaried.
+
+Softnet itself requires root only during vmnet/DHCP initialization and then
+drops privileges. Its upstream-supported installation prerequisite is either a
+root-owned SUID Softnet binary or narrowly configured passwordless sudo. Treat
+that as an explicit host enrollment step: do not silently weaken the network
+policy when privilege is absent, and rerun the canary after every Softnet
+upgrade because Homebrew may replace the executable and its mode.
+
+TartCI pins and verifies the enrolled binary before every hardened boot:
+
+```bash
+python3 scripts/verify_macos_softnet_install.py
+```
+
+The verifier requires the exact supported version and SHA-256 at the immutable
+`/usr/local/libexec/tartci/softnet` path, root ownership of the file and every
+parent directory, the setuid bit, no symlink, and no group/world write
+permission. TartCI prepends only that root-owned directory when launching Tart.
+A Homebrew upgrade therefore cannot silently replace the enrolled executable;
+an operator must explicitly review and copy/re-enroll the new binary.
+
 Canary one overflow host first, then migrate remaining hosts one at a time at
 natural idle boundaries. Require that one-shot workflow to finish terminal-green
 and prove inventory, CoW clone, VM boot/network, shared-directory mount, discard,

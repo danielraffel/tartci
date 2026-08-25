@@ -108,14 +108,16 @@ class HttpConnectSshRelayTests(unittest.TestCase):
         runner = (ROOT / "providers/tart-macos/runner.sh").read_text()
         self.assertIn("^http://192\\.168\\.64\\.1:", runner)
         self.assertIn("HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy", runner)
-        self.assertIn("HTTP_PROXY=$GUEST_HTTP_PROXY", runner)
+        self.assertIn("HTTPS_PROXY=$EFFECTIVE_GUEST_HTTP_PROXY", runner)
+        self.assertIn("'HTTP_PROXY=$EFFECTIVE_GUEST_HTTP_PROXY'", runner)
+        self.assertIn("if [ '$SOFTNET_PROXY_ONLY' != 1 ]", runner)
         self.assertIn("NO_PROXY=127.0.0.1,localhost,::1", runner)
         self.assertIn(
-            '"bash -s -- \'$RUNNER_VERSION\' \'$RUNNER_SHA256\' \'$GUEST_HTTP_PROXY\'"',
+            '"bash -s -- \'$RUNNER_VERSION\' \'$RUNNER_SHA256\' \'$EFFECTIVE_GUEST_HTTP_PROXY\' \'$SOFTNET_PROXY_ONLY\'"',
             runner,
         )
         self.assertLess(
-            runner.index('export HTTP_PROXY="$guest_http_proxy"'),
+            runner.index('export HTTPS_PROXY="$guest_http_proxy"'),
             runner.index("curl -fsSL --retry 3"),
         )
 

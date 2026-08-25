@@ -280,7 +280,7 @@ class ProviderIntegrationTests(unittest.TestCase):
                     )
                 else:
                     self.assertIn(
-                        "tartci_release_vm_lease", blocked_path
+                        "release_current_vm_lease_proved", blocked_path
                     )
 
 

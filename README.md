@@ -145,6 +145,23 @@ macOS runner golden, mounts source read-only plus ccache/FetchContent, builds in
 `docs/runbook.md` for the from-scratch, gotcha-by-gotcha guide and
 `docs/new-repo-agent-guide.md` to onboard a new repo.
 
+Disposable macOS pool runners can opt into a proxy-only egress boundary with
+`TARTCI_TART_SOFTNET_PROXY_ONLY=1` and
+`TARTCI_GUEST_HTTP_PROXY=http://192.168.64.1:PORT`. Tart then boots each guest
+with Softnet blocking `0.0.0.0/0` and no destination exception. After host SSH
+is ready, TartCI creates a host-initiated reverse forward that exposes only the
+existing CONNECT proxy on guest loopback; direct guest internet, LAN, and host
+gateway traffic remain denied. The opt-in fails closed if the proxy, Softnet,
+or tunnel is unavailable. Inspect the exact effective policy without booting a VM via
+`tartci serve macos --print-network-policy`. Hardened guests use Softnet's
+stateful host-initiated-flow rule plus a deny-all IPv4 rule; the sole HTTPS
+path is a host-initiated SSH reverse forward to the existing loopback CONNECT
+relay. Plaintext HTTP is intentionally unavailable because the relay accepts
+CONNECT only. No gateway CIDR is exposed to guest-initiated traffic.
+Set `TARTCI_MACOS_HOST_CCACHE=0` on hostile-input lanes to replace the writable
+host ccache mount with guest-local cache storage; the read-only FetchContent
+seed remains available and is copied into the disposable guest.
+
 **The fleet is not Macs-only.** A Proxmox host (`macpro`, an x86_64 Xeon Mac
 Pro) serves the lanes Apple Silicon structurally cannot — native x64 Linux, and
 Windows x64 later. `tart-linux` provisions **arm64** guests and `qemu-windows` is

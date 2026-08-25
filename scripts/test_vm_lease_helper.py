@@ -462,7 +462,8 @@ class VmLeaseHelperTests(unittest.TestCase):
         expected = {
             MACOS_RUNNER: (
                 "tartci_vm_lease_guard_run tart clone",
-                "tartci_vm_lease_guard_exec tart run",
+                "tartci_vm_lease_guard_run tart run",
+                "tartci_vm_lease_guard_run tart delete",
             ),
             LINUX_RUNNER: (
                 "tartci_vm_lease_guard_run tart clone",
