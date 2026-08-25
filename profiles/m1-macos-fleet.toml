@@ -1,0 +1,40 @@
+schema = 1
+
+# This file describes staged capacity, not activation. Rendering it neither
+# changes the durable pool-off state nor loads a LaunchAgent.
+[host]
+id = "m1"
+home = "/Users/danielraffel"
+tart_home = "/Users/danielraffel/VMs"
+cache_root = "/Users/danielraffel/.cache/pulp-ci"
+log_root = "/Users/danielraffel/Library/Logs/tartci"
+
+[[lane]]
+id = "pulp-gate"
+repo = "Generous-Corp/pulp"
+golden = "pulp-build-runner:latest"
+priority = "vm"
+min_queued_age_seconds = 600
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+
+[[lane.tier]]
+label = "pulp-build-merge-group"
+workflow = "Build and Test"
+
+[[lane]]
+id = "forge-gate"
+repo = "Generous-Corp/forge"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
+workflows = ["protected macOS build"]
+
+[[lane]]
+id = "vellum-gate"
+repo = "Generous-Corp/vellum"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 600
+labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
+workflows = ["Locked macOS GPU proof", "README clean release proof"]
