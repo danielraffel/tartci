@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sys
@@ -187,6 +188,49 @@ class VmReapTests(unittest.TestCase):
             self.assertEqual(row["action"], "offline_busy_orphaned_no_local_owner")
             self.assertEqual(row["local_ownership"], "offline_busy_orphaned_no_local_owner")
             self.assertIn("offline_busy_orphaned_no_local_owner:vellum-macos-ephemeral-202", digest["problems"])
+
+    def test_fresh_ephemeral_jit_runner_matches_live_owner_by_vm_name(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            pid = os.getpid()
+            ephemeral_name = "pulp-studio-01-12345-1"
+            write_state(
+                root / "macos" / "pulp-studio-01.state.json",
+                ts=dt.datetime.now(dt.timezone.utc).isoformat().replace("+00:00", "Z"),
+                provider="tart-macos",
+                runner="pulp-studio-01",
+                vm=ephemeral_name,
+                supervisor_pid=str(pid),
+                supervisor_pid_started_at=vm_reap.pid_start(pid),
+            )
+            runner = {
+                "id": 745,
+                "name": ephemeral_name,
+                "status": "offline",
+                "busy": False,
+                "labels": [],
+            }
+            args = vm_reap.parse_args([
+                "--repo", "danielraffel/pulp",
+                "--state-root", str(root),
+                "--prefixes", "pulp-studio-01-",
+                "--fix",
+            ])
+            with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+                 mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+                 mock.patch.object(vm_reap, "github_runners", return_value=[runner]), \
+                 mock.patch.object(vm_reap, "delete_runner") as delete_runner:
+                digest, rc = vm_reap.build_digest(args)
+
+            self.assertEqual(rc, 0, digest)
+            row = digest["github_runners"][0]
+            self.assertEqual(row["action"], "wait_for_live_supervisor")
+            self.assertTrue(row["owner_pid_alive"])
+            self.assertEqual(
+                row["state_file"],
+                str(root / "macos" / "pulp-studio-01.state.json"),
+            )
+            delete_runner.assert_not_called()
 
 
 if __name__ == "__main__":

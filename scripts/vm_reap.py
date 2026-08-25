@@ -547,7 +547,15 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 name = str(runner.get("name") or "")
                 if not starts_with_any(name, prefixes):
                     continue
+                # Ephemeral JIT registrations use the per-boot VM name while
+                # the state record's `runner` field remains the stable lane
+                # identity (for example `pulp-studio-01`).  Match either exact
+                # identity before classifying an offline row as ownerless;
+                # otherwise the janitor can delete a freshly minted runner in
+                # the short offline window before its guest connects.
                 state = states_by_runner.get(name)
+                if state is None:
+                    state = states_by_vm.get(name)
                 state_age = int((state or {}).get("_age_secs") or 0) if state else None
                 state_provider = str((state or {}).get("provider") or "")
                 owner_pid_alive = bool((state or {}).get("_owner_pid_alive")) if state else None
