@@ -37,6 +37,12 @@ idle receipt before tartci will boot it out; without that receipt drain remains
 pending and exits nonzero. `pool off` remains immediate and may terminate work.
 See the runbook.
 
+On a host whose governed budget supports two full macOS guests, use
+`tartci gate-slot2 install` to preview the canonical event-class slot-2 profile.
+Apply it only while the pool is drained/off; `tartci pool on` then loads both
+managed supervisors. See `launchd/README.md` for the collision, routing, and
+rollback contract.
+
 Shared Macs run CI validation, agent builds, and VM runners on the same
 hardware. Without a shared budget they oversubscribe — two hosts melted in July
 2026, one CPU-bound, one memory-bound/OOM. tartci is the per-host governor:

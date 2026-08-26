@@ -67,6 +67,34 @@ guarded `com.danielraffel.pulp.tart-runner-macos-gate` replacement. Its
 pre-start uniqueness check refuses to serve if any other loaded Tart macOS
 agent resolves to the same runner name or state file.
 
+### Managed second macOS gate slot
+
+Hosts whose governed CPU and memory budgets admit two 6-core, 8-GiB guests may
+install one additional Pulp gate supervisor with the canonical
+`com.danielraffel.pulp.tart-runner-macos-gate-slot2` label. Render and validate
+the profile without changing launchd:
+
+```sh
+tartci gate-slot2 render --home "$HOME" --tart-home "$TART_HOME" --output /tmp/gate-slot2.plist
+tartci gate-slot2 validate /tmp/gate-slot2.plist \
+  --sibling "$HOME/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-macos-gate.plist"
+tartci gate-slot2 install
+```
+
+The install command is dry-run by default. At a terminal pool-drain/off
+boundary, `tartci gate-slot2 install --apply` atomically installs the plist but
+does not load it. A later `tartci pool on` loads both managed gate supervisors.
+The slot has its own launchd label, runner-name prefix, state directory, queue
+lane ID, event/job logs, and `--slot 2`, while intentionally sharing the host's
+`TART_HOME` and artifact cache. Its event-class-v2 profile serves merge groups
+before PR heads and never advertises the legacy `pulp-gate-fast` selector.
+
+The `com.danielraffel.pulp.tart-runner-*` name makes the slot visible to
+`tartci pool status/on/off`, the launchd watchdog, and Shipyard's dynamically
+discovered CI-serving lanes. Do not hand-launch a duplicate provider process or
+copy an older generic slot plist; the renderer and sibling validator are the
+ownership boundary.
+
 When more than one Mac serves the same pool selector, keep the workflow selector
 shared but make each runner name unique. The macOS runner derives its default
 name from the last `pulp-build-*` label, so a host may add an extra host-specific
