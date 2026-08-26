@@ -358,12 +358,14 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   and whether any runner with `pulp-build-vm` exists.
   → *Recover:* `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner.plist`.
 
-- **`tartci launchd reload <label>` can report FAILED and leave the agent down.**
-  Seen while correcting gate labels. Prefer explicit
-  `launchctl bootout gui/$(id -u)/<label>` then
-  `launchctl bootstrap gui/$(id -u) <plist>`, and confirm `state = running`
-  afterwards — a failed reload is silent apart from the word FAILED, and the
-  host stops serving whatever that agent produced.
+- **Older `tartci launchd reload <label>` could report FAILED and leave the
+  agent down.** `bootout` may return before a LaunchAgent's `ExitTimeOut`
+  teardown completes, so an immediate bootstrap races the still-loaded job.
+  Current TartCI reads the loaded job's effective timeout from `launchctl
+  print`, adds a termination margin, proves absence before bootstrap, and
+  fails closed if teardown exceeds that allowance. If operating an older
+  deployment, wait for absence explicitly before bootstrapping the plist and
+  always confirm the final service is loaded.
 
 - **`reserved_gate_cores` is a floor, not a ceiling.** Easy to misread and get
   backwards. In `leases.py`, a gate-priority lease is limited by `cfg["total"]`;

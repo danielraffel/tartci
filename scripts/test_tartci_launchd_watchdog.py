@@ -59,6 +59,17 @@ check(exit_code is None, f"healthy '(never exited)' → None, got {exit_code!r}"
 
 state, exit_code = wd.parse_launchctl_print("")
 check(state is None and exit_code is None, "empty print → (None, None)")
+check(wd.parse_launchctl_exit_timeout("exit timeout = 5\n") == 5.0,
+      "loaded exit timeout must parse")
+check(wd.parse_launchctl_exit_timeout("exit timeout = 0\n") == 0.0,
+      "infinite loaded exit timeout must remain distinguishable")
+check(wd.parse_launchctl_exit_timeout("") is None,
+      "missing loaded exit timeout must remain unknown")
+check(wd.launchctl_reports_absent(
+          113, 'Could not find service "x" in domain for user gui: 501'),
+      "launchctl not-found response must prove absence")
+check(not wd.launchctl_reports_absent(1, "permission denied"),
+      "generic launchctl failure must not prove absence")
 
 
 # ── classify ─────────────────────────────────────────────────────────────────
@@ -210,29 +221,85 @@ with tempfile.TemporaryDirectory() as td:
 
 # Recovery success is verified with a final launchctl print, not inferred from
 # bootstrap/kickstart exit status.
+reload_plist_dir = tempfile.TemporaryDirectory()
+reload_plist = Path(reload_plist_dir.name) / "runner.plist"
+with reload_plist.open("wb") as fh:
+    plistlib.dump({}, fh)
 original_run = wd._run
 calls: list[list[str]] = []
+reload_state = {"phase": "loaded", "drain_prints": 0}
 
 
 def fake_run_ok(cmd: list[str]) -> tuple[int, str, str]:
     calls.append(cmd)
+    action = cmd[1]
+    if action == "bootout":
+        reload_state["phase"] = "draining"
+        return 0, "", ""
+    if action == "print" and reload_state["phase"] == "draining":
+        reload_state["drain_prints"] += 1
+        if reload_state["drain_prints"] == 1:
+            return 0, "state = running\n", ""
+        reload_state["phase"] = "unloaded"
+        return 113, "", "Could not find service"
+    if action == "bootstrap":
+        reload_state["phase"] = "loaded"
+    if action == "print" and reload_state["phase"] == "loaded":
+        return 0, "state = running\nexit timeout = 5\n", ""
     return 0, "", ""
 
 
 wd._run = fake_run_ok
-check(wd.reload_agent("com.danielraffel.pulp.tart-runner", "/tmp/runner.plist"),
+check(wd.reload_agent("com.danielraffel.pulp.tart-runner", str(reload_plist)),
       "reload must succeed when post-recovery launchctl print succeeds")
 check(calls[-1][1] == "print", "reload must finish with launchctl print verification")
+check(reload_state["drain_prints"] == 2,
+      "reload must wait until asynchronous bootout is absent before bootstrap")
 
 
 def fake_run_missing(cmd: list[str]) -> tuple[int, str, str]:
-    return (1, "", "not loaded") if len(cmd) > 1 and cmd[1] == "print" else (0, "", "")
+    return ((113, "", "Could not find service")
+            if len(cmd) > 1 and cmd[1] == "print" else (0, "", ""))
 
 
 wd._run = fake_run_missing
-check(not wd.reload_agent("com.danielraffel.pulp.tart-runner", "/tmp/runner.plist"),
+check(not wd.reload_agent("com.danielraffel.pulp.tart-runner", str(reload_plist)),
       "reload must fail when the service is still absent after kickstart")
 wd._run = original_run
+
+calls = []
+wd._run = lambda cmd: (
+    calls.append(cmd)
+    or (0, "state = running\nexit timeout = 0\n", "")
+)
+check(not wd.reload_agent("com.example.infinite", str(reload_plist)),
+      "loaded infinite teardown must refuse reload")
+check(not any(cmd[1] == "bootout" for cmd in calls),
+      "loaded infinite teardown refusal must happen before bootout")
+wd._run = original_run
+
+calls = []
+absent_state = {"loaded": False}
+
+
+def fake_absent_then_loaded(cmd: list[str]) -> tuple[int, str, str]:
+    calls.append(cmd)
+    if cmd[1] == "print":
+        if absent_state["loaded"]:
+            return 0, "state = running\nexit timeout = 0\n", ""
+        return 113, "", "Could not find service"
+    if cmd[1] == "bootstrap":
+        absent_state["loaded"] = True
+    return 0, "", ""
+
+
+wd._run = fake_absent_then_loaded
+check(wd.reload_agent("com.example.absent-infinite", str(reload_plist)),
+      "already-absent infinite-timeout job must bootstrap without teardown")
+check(not any(cmd[1] == "bootout" for cmd in calls),
+      "already-absent job must not be booted out")
+wd._run = original_run
+reload_plist_dir.cleanup()
 
 
 # ── rate limiter ─────────────────────────────────────────────────────────────
