@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
+import re
 import stat
 import subprocess
 import tempfile
@@ -193,6 +195,75 @@ else:
             "pulp-release-pr-gate|Release-path PR gate</string>",
             body,
         )
+
+    def test_release_template_yields_to_required_build_work(self) -> None:
+        source = re.sub(rb"<!--.*?-->", b"", RELEASE_TEMPLATE.read_bytes(), flags=re.DOTALL)
+        config = plistlib.loads(source)["EnvironmentVariables"]
+        self.assertEqual(config["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+        self.assertEqual(config["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"], "60")
+
+        for job_class in (
+            "pulp-gate-fast",
+            "pulp-build-pr-head",
+            "pulp-build-merge-group",
+        ):
+            with self.subTest(job_class=job_class), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                _write_exec(root / "tart", "#!/usr/bin/env bash\nexit 0\n")
+                _write_exec(
+                    root / "fake-gh",
+                    """#!/usr/bin/env python3
+import json
+import os
+import sys
+
+path = sys.argv[-1]
+if path.endswith("/actions/workflows?per_page=100"):
+    print(json.dumps({"workflows": [{"id": 99, "name": "Build and Test"}]}))
+elif "/actions/workflows/99/runs?status=queued" in path:
+    print(json.dumps({"workflow_runs": [{
+        "id": 1, "name": "Build and Test", "status": "queued",
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z"
+    }]}))
+elif "/actions/workflows/99/runs?status=in_progress" in path:
+    print(json.dumps({"workflow_runs": []}))
+elif "/actions/runs/1/jobs?" in path:
+    print(json.dumps({"jobs": [{
+        "id": 101, "status": "queued",
+        "labels": ["self-hosted", "macOS", "ARM64", "pulp-build",
+                   "pulp-build-vm", os.environ["JOB_CLASS"]]
+    }]}))
+else:
+    raise SystemExit(f"unexpected API path: {path}")
+""",
+                )
+                search_path = [
+                    str(root),
+                    *[item for item in ("/bin", "/usr/bin", "/usr/local/bin") if Path(item).exists()],
+                ]
+                env = {
+                    "HOME": str(root),
+                    "PATH": os.pathsep.join(search_path),
+                    "TART_HOME": str(root / "vms"),
+                    "TARTCI_STATE_DIR": str(root / "state"),
+                    "TARTCI_GH_CLI": "fake-gh",
+                    "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+                    "TARTCI_RUNNER_LABELS": config["TARTCI_RUNNER_LABELS"],
+                    "TARTCI_YIELD_TO_WORKFLOW_NAME": config["TARTCI_YIELD_TO_WORKFLOW_NAME"],
+                    "TARTCI_YIELD_TO_LABELS": config["TARTCI_YIELD_TO_LABELS"],
+                    "TARTCI_QUEUE_STAGGER_MAX_SECS": "0",
+                    "JOB_CLASS": job_class,
+                }
+                result = subprocess.run(
+                    ["bash", str(RUNNER), "--print-priority-demand"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "1")
 
     def test_tier_selection_prefers_tagged_work_over_older_pr_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
