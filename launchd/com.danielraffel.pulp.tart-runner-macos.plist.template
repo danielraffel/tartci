@@ -61,12 +61,13 @@
     merge_group -> pulp-build-merge-group
     pull_request -> pulp-build-pr-head
 
-  Keep the generic base labels on every tier during the compatibility window.
-  They let already-queued jobs that request the pre-tier selector still claim
-  a runner. Once this template is deployed on every fast-gate host, build.yml
-  may append the appropriate event-class label to its configured selector.
-  Roll back in the opposite order: stop appending the workflow label first,
-  then remove the tier configuration after generic jobs are draining again.
+  The shipped mode is `legacy`, so deploying these bytes does not add API work
+  or change assignment. Set `observe` on one drained host to keep generic-label
+  assignment while emitting a bounded parity sample every 15 minutes. Promote
+  one drained host at a time to `event-class-v2`. In V2, `pulp-gate-fast` is
+  removed from the advertised base and exactly one event-class label is added;
+  an older generic-only job therefore cannot claim the JIT runner. Roll back by
+  restoring `observe` before removing event labels from queued workflow jobs.
 
   The configured selector remains the reviewed generic base, for example:
 
@@ -143,11 +144,17 @@
         <string>pulp-build-runner:latest</string>
         <key>TARTCI_RUNNER_LABELS</key>
         <string>self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast</string>
-        <key>TARTCI_VM_LEASE_PRIORITY</key>
-        <string>gate</string>
         <key>TARTCI_RUNNER_WORKFLOW_TIERS</key>
         <string>pulp-build-merge-group|Build and Test
 pulp-build-pr-head|Build and Test</string>
+        <key>TARTCI_RUNNER_ASSIGNMENT_MODE</key>
+        <string>legacy</string>
+        <key>TARTCI_ASSIGNMENT_V2_OMIT_LABELS</key>
+        <string>pulp-gate-fast</string>
+        <key>TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS</key>
+        <string>pulp-gate-fast</string>
+        <key>TARTCI_ASSIGNMENT_V2_CLASS_LABELS</key>
+        <string>pulp-build-merge-group,pulp-build-pr-head</string>
     </dict>
 </dict>
 </plist>
