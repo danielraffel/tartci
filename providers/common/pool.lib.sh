@@ -98,6 +98,7 @@ tartci_pool_runner_agents() {
     case "$b" in
       com.danielraffel.pulp.tart-runner|com.danielraffel.pulp.tart-runner-*|\
       com.danielraffel.pulp.qemu-runner|com.danielraffel.pulp.qemu-runner-*|\
+      com.danielraffel.tartci.tart-runner-*|\
       actions.runner.*)
         # NB: the bare `tart-runner` (no suffix) is the macOS GATE lane — it MUST
         # be matched, or `pool off` would leave the gate serving despite

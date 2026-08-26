@@ -11,6 +11,8 @@
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
+#   tartci fleet-macos <validate|render> CONFIG # validate/render dormant generic VM lanes
+#   tartci tart-image-sync ... # resumable, checksum-verified Tart golden transfer
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
 #   tartci setup               # brew-install prereqs + create local stores
 #   tartci bench <os> [name]   # clone a golden → open in UTM for GUI/DAW testing
@@ -107,6 +109,14 @@ cmd_leases() {
 
 cmd_profile() {
   exec python3 "$HERE/scripts/profile.py" "$@"
+}
+
+cmd_fleet_macos() {
+  exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$@"
+}
+
+cmd_tart_image_sync() {
+  exec "$HERE/scripts/tart_image_sync.sh" "$@"
 }
 
 cmd_observe() {
@@ -404,6 +414,8 @@ case "${1:-help}" in
   host-profile) shift; cmd_host_profile "$@" ;;
   leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
+  fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  tart-image-sync) shift; cmd_tart_image_sync "$@" ;;
   observe) shift; cmd_observe "$@" ;;
   setup)   cmd_setup ;;
   bench)   shift; cmd_bench "$@" ;;
