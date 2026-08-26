@@ -194,6 +194,11 @@ same label without repo-scoped runner-name collisions.
 Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
+The macOS JIT runner also enforces a bounded warm-cache capacity through
+`TARTCI_CCACHE_MAX_SIZE` (default `40G`) in the Actions runner environment, so
+each disposable VM shares compiler objects without falling back to ccache's
+small process default. Set a smaller value explicitly on space-constrained
+hosts; depend mode remains disabled regardless of this capacity setting.
 
 Pulp's merge-group/PR-head gate can use the staged event-class assignment V2
 mode. It removes the legacy `pulp-gate-fast` selector from JIT advertisements,

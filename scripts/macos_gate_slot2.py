@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import plistlib
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ ABSOLUTE_PATH = (
 )
 
 
-def slot2_profile(home: str, tart_home: str) -> dict[str, Any]:
+def slot2_profile(home: str, tart_home: str, ccache_max_size: str = "40G") -> dict[str, Any]:
     state_dir = f"{home}/.tartci/state/macos-gate-slot2"
     log_path = f"{home}/Library/Logs/tartci/tart-runner-macos-gate-slot2.log"
     labels = ",".join(BASE_LABELS)
@@ -66,6 +67,7 @@ def slot2_profile(home: str, tart_home: str) -> dict[str, Any]:
             "TART_HOME": tart_home,
             "TARTCI_HOME": f"{home}/.tartci",
             "TARTCI_CI_CACHE": f"{home}/.cache/pulp-ci",
+            "TARTCI_CCACHE_MAX_SIZE": ccache_max_size,
             "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
             "TARTCI_MACOS_GOLDEN": "pulp-build-runner:latest",
             "TARTCI_RUNNER_LABELS": labels,
@@ -144,6 +146,9 @@ def validate_slot2(value: dict[str, Any], sibling: dict[str, Any] | None = None)
             "legacy generic label leaked into ProgramArguments")
     _expect(errors, env.get("PATH") == ABSOLUTE_PATH.format(home=env.get("HOME", "")),
             "PATH must include absolute Homebrew, local-wrapper, and system paths")
+    ccache_max_size = str(env.get("TARTCI_CCACHE_MAX_SIZE", ""))
+    _expect(errors, re.fullmatch(r"[1-9][0-9]*[KMGT]", ccache_max_size) is not None,
+            "TARTCI_CCACHE_MAX_SIZE must be a positive ccache size such as 40G")
     for key in ("TARTCI_STATE_DIR", "TARTCI_EVENT_LOG", "TARTCI_MACOS_LOGS", "TARTCI_QUEUE_LANE_ID", "TARTCI_RUNNER_NAME_PREFIX"):
         _expect(errors, bool(env.get(key)), f"{key} must be explicit")
     _expect(errors, value.get("StandardOutPath") == value.get("StandardErrorPath"),
@@ -176,6 +181,11 @@ def validate_slot2(value: dict[str, Any], sibling: dict[str, Any] | None = None)
                 )
                 _expect(errors, primary_cache == slot2_cache,
                         "both gate supervisors must share TARTCI_CI_CACHE")
+                primary_ccache_max = str(
+                    sibling_env.get("TARTCI_CCACHE_MAX_SIZE") or "40G"
+                )
+                _expect(errors, primary_ccache_max == ccache_max_size,
+                        "both gate supervisors must share TARTCI_CCACHE_MAX_SIZE")
                 primary_queue = str(sibling_env.get(
                     "TARTCI_QUEUE_LANE_ID", f"{primary_identity.runner_name}-1"
                 ))
@@ -221,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
     render = sub.add_parser("render")
     render.add_argument("--home", required=True)
     render.add_argument("--tart-home", required=True)
+    render.add_argument("--ccache-max-size", default="40G")
     render.add_argument("--output", type=Path)
     validate = sub.add_parser("validate")
     validate.add_argument("plist", type=Path)
@@ -228,7 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "render":
-            value = slot2_profile(args.home, args.tart_home)
+            value = slot2_profile(args.home, args.tart_home, args.ccache_max_size)
             errors = validate_slot2(value)
             if errors:
                 raise ValueError("; ".join(errors))

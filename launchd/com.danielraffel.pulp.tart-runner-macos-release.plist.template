@@ -114,6 +114,8 @@
         <string>$HOME/.tartci</string>
         <key>TARTCI_CI_CACHE</key>
         <string>$HOME/.cache/pulp-ci</string>
+        <key>TARTCI_CCACHE_MAX_SIZE</key>
+        <string>40G</string>
         <key>TARTCI_RUNNER_REPO</key>
         <string>Generous-Corp/pulp</string>
         <key>TARTCI_MACOS_GOLDEN</key>

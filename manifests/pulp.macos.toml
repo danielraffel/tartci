@@ -56,7 +56,11 @@ variant = "darwin-arm64-gpu"
 path    = "/Users/admin/pulp-skia-build"
 
 [caches]
-ccache_max = "5G"
+# Pulp's current macOS full build is cache-dominated. Five GiB churned the
+# shared cache close to its ceiling during ordinary merge-group traffic and
+# discarded useful objects between exact heads. Forty GiB matches the Linux
+# lane while remaining bounded on the smallest participating Mac.
+ccache_max = "40G"
 
 [mounts]
 ccache          = "${TARTCI_CACHE}/pulp/ccache"

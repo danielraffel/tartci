@@ -14,6 +14,8 @@ LINUX_DIRECT = ROOT / "providers/tart-linux/run.sh"
 LINUX_JIT = ROOT / "providers/tart-linux/runner.sh"
 MAC_DIRECT = ROOT / "providers/tart-macos/run.sh"
 MAC_JIT = ROOT / "providers/tart-macos/runner.sh"
+MAC_GATE_TEMPLATE = ROOT / "launchd/com.danielraffel.pulp.tart-runner-macos.plist.template"
+MAC_RELEASE_TEMPLATE = ROOT / "launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template"
 
 
 class CacheRoutingTests(unittest.TestCase):
@@ -69,6 +71,15 @@ class CacheRoutingTests(unittest.TestCase):
             "PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s",
             mac,
         )
+
+    def test_macos_jit_enforces_bounded_warm_cache_capacity(self) -> None:
+        body = MAC_JIT.read_text(encoding="utf-8")
+        self.assertIn('CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"', body)
+        self.assertIn("CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR", body)
+        self.assertIn("'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE'", body)
+        for template in (MAC_GATE_TEMPLATE, MAC_RELEASE_TEMPLATE):
+            self.assertIn("<key>TARTCI_CCACHE_MAX_SIZE</key>", template.read_text())
+            self.assertIn("<string>40G</string>", template.read_text())
 
 
 if __name__ == "__main__":

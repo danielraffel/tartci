@@ -28,6 +28,9 @@ class PulpMacosManifest(unittest.TestCase):
         self.assertIn("x86_64-apple-darwin", toolchain["rust_targets"])
         self.assertIn("rustup", self.manifest["brew"]["packages"])
 
+    def test_ccache_capacity_preserves_cross_head_warmth(self) -> None:
+        self.assertEqual(self.manifest["caches"]["ccache_max"], "40G")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

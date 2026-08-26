@@ -79,6 +79,7 @@ class MacosGateSlot2Tests(unittest.TestCase):
         self.assertEqual(env["TARTCI_MACOS_VM_CORES"], "6")
         self.assertEqual(env["TARTCI_MACOS_VM_MEM_MB"], "8192")
         self.assertEqual(env["TART_HOME"], str(self.tart_home))
+        self.assertEqual(env["TARTCI_CCACHE_MAX_SIZE"], "40G")
 
     def test_validator_rejects_malformed_plist_without_platform_tools(self) -> None:
         self.slot2.write_text("not a plist")
@@ -123,6 +124,7 @@ class MacosGateSlot2Tests(unittest.TestCase):
     def test_mutated_shared_and_separate_surfaces_fail_closed(self) -> None:
         mutations = {
             "cache": ("TARTCI_CI_CACHE", str(self.root / "other-cache"), "share TARTCI_CI_CACHE"),
+            "cache-cap": ("TARTCI_CCACHE_MAX_SIZE", "12G", "share TARTCI_CCACHE_MAX_SIZE"),
             "queue": ("TARTCI_QUEUE_LANE_ID", "pulp-vm-01-1", "TARTCI_QUEUE_LANE_ID"),
             "event": (
                 "TARTCI_EVENT_LOG",
