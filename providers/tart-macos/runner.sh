@@ -65,6 +65,9 @@ GH_CLI="$TARTCI_GH_CLI"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
+CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"
+[[ "$CCACHE_MAX_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]] \
+  || { printf 'invalid TARTCI_CCACHE_MAX_SIZE: expected a positive ccache size such as 40G\n' >&2; exit 1; }
 FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
@@ -707,12 +710,12 @@ run_runner_until_done(){
   ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
-     export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
+     export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
      mkdir -p \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\" && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$/' .env > .env.tartci && \
-     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$/' .env > .env.tartci && \
+     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
      mv .env.tartci .env && \

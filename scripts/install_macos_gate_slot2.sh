@@ -36,6 +36,13 @@ PY
   echo "gate-slot2 install could not resolve TART_HOME from the primary plist" >&2
   exit 2
 }
+CCACHE_MAX_SIZE="$(python3 - "$PRIMARY_PLIST" <<'PY'
+import plistlib, sys
+with open(sys.argv[1], "rb") as source:
+    value = plistlib.load(source)
+print(value.get("EnvironmentVariables", {}).get("TARTCI_CCACHE_MAX_SIZE") or "40G")
+PY
+)"
 
 mkdir -p "$AGENTS_DIR" "$HOME/Library/Logs/tartci"
 candidate="$(mktemp "$AGENTS_DIR/.macos-gate-slot2.plist.XXXXXX")"
@@ -52,7 +59,8 @@ cleanup() {
 trap cleanup EXIT
 
 python3 "$ROOT/scripts/macos_gate_slot2.py" render \
-  --home "$HOME" --tart-home "$TART_HOME" --output "$candidate"
+  --home "$HOME" --tart-home "$TART_HOME" \
+  --ccache-max-size "$CCACHE_MAX_SIZE" --output "$candidate"
 # The canonical validator parses through Python plistlib before enforcing the
 # profile contract. Keep this portable so hosted Linux can prove the installer;
 # launchd receives the same plistlib-serialized bytes on macOS.
@@ -63,6 +71,7 @@ echo "macOS gate slot-2 install plan:"
 echo "  primary=$DOMAIN/$PRIMARY_LABEL (unchanged)"
 echo "  install=$DOMAIN/$LABEL ($TARGET)"
 echo "  tart_home=$TART_HOME (shared)"
+echo "  ccache_max_size=$CCACHE_MAX_SIZE (shared)"
 echo "  resources=6 cores, 8192 MiB; host cap=2"
 echo "  routing=merge-group first, then PR-head; event-class-v2"
 echo "  activation=deferred to tartci pool on"
