@@ -120,6 +120,18 @@
         <string>pulp-build-runner:latest</string>
         <key>TARTCI_RUNNER_LABELS</key>
         <string>self-hosted,macOS,ARM64,pulp-build-vm-release</string>
+        <!-- Release work is lower priority than protected Build and Test work
+             on the same two-guest Apple host. The synthetic superset covers
+             both PR-head and merge-group selectors used by that workflow. -->
+        <key>TARTCI_YIELD_TO_WORKFLOW_NAME</key>
+        <string>Build and Test</string>
+        <key>TARTCI_YIELD_TO_LABELS</key>
+        <string>self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast,pulp-build-pr-head,pulp-build-merge-group</string>
+        <!-- If release work disappears after this VM boots, release the slot
+             promptly instead of holding half the host for the 15-minute
+             default assignment timeout. -->
+        <key>TARTCI_RUNNER_IDLE_TIMEOUT_SECS</key>
+        <string>60</string>
         <!-- One supervisor owns this release pool. Each line is
              class-label|exact workflow display name. First-seen labels
              define strict non-preemptive priority; workflows sharing labels

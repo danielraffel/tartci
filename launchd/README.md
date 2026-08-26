@@ -145,6 +145,12 @@ ephemeral Actions runner's `.env`; it never copies the host loopback address.
 Reload the controller with `bootout` plus `bootstrap`, then confirm its live
 `launchctl print` environment. `kickstart` retains the old environment.
 
+The Pulp release supervisor yields its shared Apple VM slot whenever required
+`Build and Test` PR-head or merge-group work is queued or running. Its
+unassigned JIT timeout is intentionally 60 seconds, bounding the case where a
+release job disappears after boot but before assignment. A tagged release that
+has already claimed the runner remains non-preemptive.
+
 The optional `com.danielraffel.network.http-connect-ssh-relay` agent runs a
 restricted CONNECT listener for loopback and Tart's bridge subnet. Each allowed
 client CIDR is paired with the exact local destination address, so a matching
