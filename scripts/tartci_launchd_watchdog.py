@@ -119,6 +119,19 @@ def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
     return state, last_exit
 
 
+def parse_launchctl_exit_timeout(text: str) -> float | None:
+    """Extract the loaded job's effective launchd teardown allowance."""
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith("exit timeout = "):
+            try:
+                value = float(line[len("exit timeout = "):].strip())
+            except ValueError:
+                return None
+            return value if value >= 0 else None
+    return None
+
+
 def classify(
     state: str | None,
     last_exit_code: int | None,
@@ -299,6 +312,24 @@ def pool_participating(path: str) -> bool:
         return True
 
 
+def launchctl_reports_absent(rc: int, stderr: str) -> bool:
+    """Whether launchctl specifically proved that a service is not loaded."""
+    return rc == 113 and "Could not find service" in stderr
+
+
+def wait_until_unloaded(label: str, timeout_s: float = 10.0,
+                        poll_s: float = 0.1) -> bool:
+    """Wait for launchd to finish an asynchronous service teardown."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        rc, _, err = _run(["launchctl", "print", f"{_domain()}/{label}"])
+        if launchctl_reports_absent(rc, err):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(poll_s)
+
+
 def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
     """Full bootout+bootstrap+kickstart — the ONLY thing that clears a stale
     cached job spec. `kickstart -k` alone re-runs the stale spec, so we never
@@ -306,12 +337,27 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
     dom = _domain()
     if dry_run:
         return True
-    # bootout may fail if not currently loaded — that's fine, bootstrap re-reads.
-    _run(["launchctl", "bootout", f"{dom}/{label}"])
-    rc, _, err = _run(["launchctl", "bootstrap", dom, plist_path])
+    loaded_rc, loaded_out, loaded_err = _run(
+        ["launchctl", "print", f"{dom}/{label}"]
+    )
+    if loaded_rc == 0:
+        exit_timeout = parse_launchctl_exit_timeout(loaded_out)
+        if exit_timeout is None or exit_timeout == 0:
+            # Zero is infinite; a missing value is likewise not a safe bound.
+            # Refuse before bootout because no bounded reload can prove when it
+            # is safe to bootstrap the replacement.
+            return False
+        _run(["launchctl", "bootout", f"{dom}/{label}"])
+        # launchctl bootout can return before the cached job's ExitTimeOut
+        # teardown completes. Prove it is gone before loading the new plist.
+        if not wait_until_unloaded(label, timeout_s=exit_timeout + 5.0):
+            return False
+    elif not launchctl_reports_absent(loaded_rc, loaded_err):
+        # A permission/domain/IPC error is not proof that bootstrap is safe.
+        return False
+    rc, _, _ = _run(["launchctl", "bootstrap", dom, plist_path])
     if rc != 0:
-        # already-bootstrapped race: kickstart still forces a fresh start.
-        pass
+        return False
     rc2, _, _ = _run(["launchctl", "kickstart", "-k", f"{dom}/{label}"])
     if rc2 != 0:
         return False

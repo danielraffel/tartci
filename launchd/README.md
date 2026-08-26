@@ -123,6 +123,16 @@ tartci launchd reload com.danielraffel.pulp.tart-runner-macos-gate
 tartci launchd status                                     # health of every tartci agent
 ```
 
+The wrapper treats `bootout` as asynchronous: before mutation it reads the
+loaded job's effective `exit timeout` from `launchctl print`, adds a five-second
+termination margin, and waits for that job to become absent before
+bootstrapping the replacement plist.
+Bootstrapping immediately after `bootout` can otherwise fail while teardown is
+still in progress and leave the host with no runner. A teardown that exceeds
+its own declared allowance fails closed without attempting bootstrap. An
+A loaded job with an infinite or unknown timeout is refused before `bootout`.
+An already-absent job has no teardown risk and is bootstrapped directly.
+
 ### Host and Tart-guest HTTP relay routing
 
 Do not give a host-side controller Tart's bridge address. On a host whose
