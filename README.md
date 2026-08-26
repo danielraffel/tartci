@@ -140,6 +140,11 @@ with `TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or
 break-glass debugging. Tart-backed macOS/Linux runners apply the lease size with
 `tart set --cpu` after cloning and before boot; QEMU Windows passes the leased
 size through `-smp`.
+
+macOS admission inventory is bounded by one shared
+five-second budget so a wedged `tart list` or `tart get` cannot freeze every
+supervisor on a host; override it with `TARTCI_TART_INVENTORY_TIMEOUT_SECS`.
+Inventory failure remains fail-closed at the configured macOS hard cap.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]

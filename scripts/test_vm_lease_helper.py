@@ -806,6 +806,7 @@ class RunningMacosVmsFailClosedTests(unittest.TestCase):
                 f"""
                 set -euo pipefail
                 export PATH={tmp}:$PATH
+                export TARTCI_ROOT={ROOT}
                 export TARTCI_MACOS_HARD_MAX=2
                 {self.function}
                 running_macos_vms

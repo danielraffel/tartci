@@ -360,36 +360,15 @@ runtime_emit_complete(){
 }
 
 running_macos_vms(){
-  local payload fail_closed
+  local count fail_closed inventory_timeout
   fail_closed="${TARTCI_MACOS_HARD_MAX:-2}"
-  if ! payload="$(tart list --format json 2>/dev/null)"; then
+  inventory_timeout="${TARTCI_TART_INVENTORY_TIMEOUT_SECS:-5}"
+  if ! count="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+      --timeout-seconds "$inventory_timeout" 2>/dev/null)"; then
     printf '%s\n' "$fail_closed"
     return 0
   fi
-  TARTCI_TART_LIST_JSON="$payload" python3 - "$fail_closed" <<'PY' || printf '%s\n' "$fail_closed"
-import json, os, subprocess, sys
-try:
-    vms = json.loads(os.environ["TARTCI_TART_LIST_JSON"])
-except Exception:
-    print(sys.argv[1])
-    raise SystemExit
-n = 0
-for vm in vms if isinstance(vms, list) else []:
-    if not str(vm.get("State", vm.get("state", ""))).lower().startswith("run"):
-        continue
-    name = vm.get("Name") or vm.get("name")
-    os_name = ""
-    if name:
-        try:
-            out = subprocess.check_output(["tart", "get", str(name), "--format", "json"], text=True, stderr=subprocess.DEVNULL)
-            os_name = str(json.loads(out).get("OS", "")).lower()
-        except Exception:
-            os_name = ""
-    # Missing OS is conservative: count it against the macOS cap.
-    if os_name in ("", "darwin", "macos"):
-        n += 1
-print(n)
-PY
+  printf '%s\n' "$count"
 }
 
 queued_work(){
