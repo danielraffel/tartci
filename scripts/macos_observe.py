@@ -11,25 +11,14 @@ import subprocess
 import sys
 from typing import Any
 
+from bounded_subprocess import DESCENDANT_LEAK_EXIT_CODE, TIMEOUT_EXIT_CODE, run_bounded
+
 
 HERE = pathlib.Path(__file__).resolve().parent
 
 
 def run(argv: list[str], *, timeout: int = 20) -> subprocess.CompletedProcess[str]:
-    try:
-        return subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        return subprocess.CompletedProcess(
-            argv,
-            124,
-            stdout=exc.stdout or "",
-            stderr=exc.stderr or f"timed out after {timeout}s",
-        )
+    return run_bounded(argv, timeout=timeout, operation="macos_observe_child")
 
 
 def run_json(argv: list[str], *, timeout: int = 20) -> Any:
@@ -37,6 +26,17 @@ def run_json(argv: list[str], *, timeout: int = 20) -> Any:
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or f"{' '.join(argv)} failed with {proc.returncode}")
     return json.loads(proc.stdout or "null")
+
+
+def unreadable_digest(problem: str) -> dict[str, Any]:
+    return {
+        "host": "",
+        "capacity": {},
+        "supervisors": [],
+        "github_runners": [],
+        "vms": [],
+        "problems": [problem],
+    }
 
 
 def load_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
@@ -54,19 +54,26 @@ def load_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         args.protected_names,
         "--macos-cap",
         str(args.macos_cap),
+        "--tart-timeout-secs",
+        str(args.tart_timeout),
+        "--github-timeout-secs",
+        str(args.gh_timeout),
+        "--observation-timeout-secs",
+        str(args.digest_timeout),
     ]
-    proc = run(argv, timeout=args.gh_timeout + 20)
+    # This process-safety deadline is intentionally independent of the
+    # observation budget passed to vm_reap. The latter charges only external
+    # Tart/GitHub probes; ordinary state parsing and local ownership checks must
+    # not consume it.
+    proc = run(argv, timeout=args.digest_process_timeout)
+    if proc.returncode == TIMEOUT_EXIT_CODE:
+        return unreadable_digest("observe_digest_timeout"), proc.returncode
+    if proc.returncode == DESCENDANT_LEAK_EXIT_CODE:
+        return unreadable_digest("observe_digest_descendant_leak"), proc.returncode
     try:
         digest = json.loads(proc.stdout or "{}")
     except json.JSONDecodeError:
-        digest = {
-            "host": "",
-            "capacity": {},
-            "supervisors": [],
-            "github_runners": [],
-            "vms": [],
-            "problems": [f"observe_digest_parse_failed:{proc.stderr.strip()}"],
-        }
+        digest = unreadable_digest(f"observe_digest_parse_failed:{proc.stderr.strip()}")
     return digest, proc.returncode
 
 
@@ -347,6 +354,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--ssh-timeout", type=int, default=10)
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--tart-timeout", type=int, default=10)
+    parser.add_argument("--digest-timeout", type=float, default=float(os.environ.get("TARTCI_OBSERVATION_TIMEOUT_SECS", "60")))
+    parser.add_argument(
+        "--digest-process-timeout",
+        type=float,
+        default=float(os.environ.get("TARTCI_DIGEST_PROCESS_TIMEOUT_SECS", "300")),
+        help="independent wall-clock safety bound for the complete vm_reap child",
+    )
     parser.add_argument("--process-limit", type=int, default=40)
     parser.add_argument("--process-line-width", type=int, default=280)
     parser.add_argument("--ctest-tail-lines", type=int, default=60)
