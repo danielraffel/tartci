@@ -46,9 +46,11 @@ TARTCI_ASSIGNMENT_V2_CLASS_LABELS=pulp-build-merge-group,pulp-build-pr-head
 ```
 
 The shipped Pulp template remains `legacy`. Deploy those bytes first, then
-enable `observe` on one drained host at a time. Keep exactly one dynamic macOS
-gate supervisor per host; its ordered tiers serve both classes, with merge-group
-first. Do not create a supervisor per event class. Confirm from the rendered
+enable `observe` on one drained host at a time. Keep one dynamic macOS gate
+supervisor per governed slot; each supervisor's ordered tiers serve both
+classes, with merge-group first. A host may add only the canonical managed
+slot-2 profile when its governor can admit two complete guests. Do not create a
+supervisor per event class or an ad-hoc duplicate process. Confirm from the rendered
 LaunchAgent environment (or set the same env explicitly):
 
 ```bash
@@ -98,3 +100,10 @@ supervisor, which rechecks pool admission before boot and again before mint.
 Run `tartci doctor --reap --json` only under its normal ownership rules to clear
 confirmed stale per-boot registrations/VMs. Never reuse a static runner name or
 manually edit the lease store.
+
+For a two-slot host, install slot 2 only through `tartci gate-slot2 install`.
+The profile fixes the lane at 6 cores and 8192 MiB, shares `TART_HOME`, and
+separates launchd identity, runner identity, queue lane, state, and logs. Its
+raw labels already omit `pulp-gate-fast`; validation fails closed if the legacy
+selector is reintroduced or either supervisor resolves to the same runner/state
+identity.

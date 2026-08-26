@@ -12,6 +12,7 @@
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render> CONFIG # validate/render dormant generic VM lanes
+#   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
 #   tartci tart-image-sync ... # resumable, checksum-verified Tart golden transfer
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
 #   tartci setup               # brew-install prereqs + create local stores
@@ -113,6 +114,15 @@ cmd_profile() {
 
 cmd_fleet_macos() {
   exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$@"
+}
+
+cmd_gate_slot2() {
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    render|validate) exec python3 "$HERE/scripts/macos_gate_slot2.py" "$sub" "$@" ;;
+    install) exec "$HERE/scripts/install_macos_gate_slot2.sh" "$@" ;;
+    *) echo "usage: tartci gate-slot2 <render|validate|install> [...]"; return 2 ;;
+  esac
 }
 
 cmd_tart_image_sync() {
@@ -415,6 +425,7 @@ case "${1:-help}" in
   leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  gate-slot2) shift; cmd_gate_slot2 "$@" ;;
   tart-image-sync) shift; cmd_tart_image_sync "$@" ;;
   observe) shift; cmd_observe "$@" ;;
   setup)   cmd_setup ;;
