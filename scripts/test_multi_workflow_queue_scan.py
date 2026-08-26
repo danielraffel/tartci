@@ -30,17 +30,13 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 class MultiWorkflowQueueScanTests(unittest.TestCase):
-    def test_gate_template_prioritizes_merge_groups_with_generic_fallback(self) -> None:
+    def test_gate_template_keeps_v2_dormant_before_canary_activation(self) -> None:
         body = GATE_TEMPLATE.read_text(encoding="utf-8")
         generic = (
             "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast"
         )
         self.assertIn(f"<string>{generic}</string>", body)
-        self.assertIn(
-            "<key>TARTCI_VM_LEASE_PRIORITY</key>\n"
-            "        <string>gate</string>",
-            body,
-        )
+        self.assertNotIn("<key>TARTCI_VM_LEASE_PRIORITY</key>", body)
         self.assertIn("<key>TARTCI_RUNNER_WORKFLOW_TIERS</key>", body)
         self.assertIn(
             "<string>pulp-build-merge-group|Build and Test\n"
@@ -51,7 +47,11 @@ class MultiWorkflowQueueScanTests(unittest.TestCase):
             body.index("pulp-build-merge-group|Build and Test"),
             body.index("pulp-build-pr-head|Build and Test"),
         )
-        self.assertNotIn("pulp-build-merge-group,pulp-build-pr-head", body)
+        self.assertIn(
+            "<key>TARTCI_RUNNER_ASSIGNMENT_MODE</key>\n"
+            "        <string>legacy</string>",
+            body,
+        )
 
     def test_tier_rejects_nonexclusive_comma_label_set(self) -> None:
         env = {

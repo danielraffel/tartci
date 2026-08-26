@@ -184,6 +184,13 @@ Repo / golden / labels are env-driven (`TARTCI_RUNNER_REPO`,
 `TARTCI_LINUX_GOLDEN` / `TARTCI_MACOS_GOLDEN` / `TARTCI_WIN_GOLDEN`,
 `TARTCI_RUNNER_LABELS`); see each `providers/*/runner.sh` header.
 
+Pulp's merge-group/PR-head gate can use the staged event-class assignment V2
+mode. It removes the legacy `pulp-gate-fast` selector from JIT advertisements,
+requires the queued job's class token, exhaustively and fail-closed scans all
+pages, and freshly revalidates higher plus selected demand before minting. The
+shipped LaunchAgent remains in legacy mode; bounded observation, promotion, and rollback are documented in
+[`docs/assignment-v2-rollout.md`](docs/assignment-v2-rollout.md).
+
 **Shipyard admission guard (coordinated rollout).** Provider supervisors can
 require a final repository cleanup verdict after the VM is reachable and
 immediately before JIT registration:

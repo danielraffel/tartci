@@ -147,10 +147,28 @@ tartci_vm_lease_disk_expected_mount_path(){
 
 tartci_vm_lease_priority(){
   local labels="${1:-}"
+  case ",$labels," in
+    *,pulp-build-merge-group,*pulp-build-pr-head,*|*,pulp-build-pr-head,*pulp-build-merge-group,*)
+      printf '%s' vm
+      return 0
+      ;;
+  esac
   if [ -n "${TARTCI_VM_LEASE_PRIORITY:-}" ]; then
     printf '%s' "$TARTCI_VM_LEASE_PRIORITY"
     return 0
   fi
+  case ",$labels," in
+    *,pulp-build-merge-group,*)
+      # Both event classes retain gate-reserved capacity, while merge-group
+      # demand sorts above PR-head demand in status/admission ordering.
+      printf '%s' 110
+      return 0
+      ;;
+    *,pulp-build-pr-head,*)
+      printf '%s' 100
+      return 0
+      ;;
+  esac
   case ",$labels," in
     *,pulp-release-pr-gate,*) printf '%s' vm ;;
     *,pulp-build,*|*,pulp-release-tagged,*) printf '%s' gate ;;

@@ -584,6 +584,24 @@ class VmLeaseHelperTests(unittest.TestCase):
             ["tagged=gate", "pr-gate=vm", "conflict=vm", "override=vm"],
         )
 
+    def test_merge_group_lease_sorts_above_pr_head(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            printf 'merge=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-merge-group)"
+            printf 'pr=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-pr-head)"
+            printf 'conflict=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-merge-group,pulp-build-pr-head)"
+            printf 'explicit=%s\n' "$(TARTCI_VM_LEASE_PRIORITY=vm tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-merge-group)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["merge=110", "pr=100", "conflict=vm", "explicit=vm"],
+        )
+
     def test_non_gate_lease_clamped_to_budget(self) -> None:
         # A non-gate VM lane requesting more than the non-gate budget is clamped
         # down, so it can never be denied for exceeding it nor touch the gate reserve.

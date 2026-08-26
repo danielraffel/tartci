@@ -21,6 +21,13 @@
 # a runner reserved for a higher-priority class. Before minting a lower-tier JIT
 # config, the supervisor rechecks every higher tier and discards the still-
 # unregistered VM if higher-priority demand arrived during boot.
+# Exclusive event-class assignment V2 is staged with
+# TARTCI_RUNNER_ASSIGNMENT_MODE=legacy|observe|event-class-v2. `legacy` is the
+# code default. `observe` preserves legacy minting while logging legacy/V2
+# parity. V2 strips TARTCI_ASSIGNMENT_V2_OMIT_LABELS from the base, advertises
+# exactly one allowed class, requires that class on the queued job, consumes all
+# run/job pages fail closed, and freshly rechecks higher + selected demand at
+# the final pre-mint boundary. See docs/assignment-v2-rollout.md.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -77,6 +84,14 @@ fi
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
 WORKFLOW_TIERS="${TARTCI_RUNNER_WORKFLOW_TIERS:-}"
+ASSIGNMENT_MODE="${TARTCI_RUNNER_ASSIGNMENT_MODE:-legacy}"
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+ASSIGNMENT_V2_OMIT_LABELS="${TARTCI_ASSIGNMENT_V2_OMIT_LABELS:-pulp-gate-fast}"
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+ASSIGNMENT_V2_REQUIRED_OMIT_LABELS="${TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS:-pulp-gate-fast}"
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+ASSIGNMENT_V2_CLASS_LABELS="${TARTCI_ASSIGNMENT_V2_CLASS_LABELS:-pulp-build-merge-group,pulp-build-pr-head}"
+ASSIGNMENT_V2_BASE_LABELS=""
 MIN_QUEUED_AGE="${TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0}"
 case "$MIN_QUEUED_AGE" in
   ''|*[!0-9]*) printf 'invalid TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS: %s\n' "$MIN_QUEUED_AGE" >&2; exit 1 ;;
@@ -110,6 +125,8 @@ PRINT_EVENT_LOG=0
 PRINT_IDENTITY=0
 PRINT_QUEUE=0
 PRINT_SELECTION=0
+PRINT_ASSIGNMENT_PARITY=0
+PRINT_PRE_MINT_SELECTION=""
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
@@ -204,6 +221,8 @@ source "$TARTCI_ROOT/providers/common/vm-state.lib.sh"
 source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 # shellcheck source=providers/common/admission-clean.lib.sh
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
+# shellcheck source=providers/tart-macos/assignment-v2.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -238,6 +257,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-boot-name) PRINT_BOOT_NAME="$2"; shift 2;;  # debug/test: emit ephemeral_boot_name <i>
   --print-queue) PRINT_QUEUE=1; shift;;
   --print-selection) PRINT_SELECTION=1; shift;;
+  --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
+  --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
@@ -258,6 +279,7 @@ esac
 [ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_RUNNER_SHA256 must contain 64 hexadecimal characters"
 
 configure_workflows
+tartci_assignment_v2_configure
 CURRENT_LABELS="$LABELS"
 
 IDENTITY_JSON="$(python3 "$TARTCI_ROOT/scripts/macos_runner_identity.py" \
@@ -395,6 +417,14 @@ queued_work(){
     --match-labels 1 2>/dev/null || echo ERR
 }
 
+print_queued_work(){
+  if [ "$ASSIGNMENT_MODE" = event-class-v2 ]; then
+    tartci_assignment_v2_total_demand
+  else
+    queued_work
+  fi
+}
+
 tier_workflow_args(){
   local selected="$1" entry tier_labels workflow
   while IFS= read -r entry; do
@@ -430,7 +460,21 @@ tier_queued_work(){
 # fail-closed: never skip a blind higher class and hand its capacity to a lower
 # one. With no tier config this is the legacy single-label queue scan.
 select_work(){
-  local tier_labels q tier=0
+  local tier_labels q tier=0 legacy_selection v2_selection
+  if [ "$ASSIGNMENT_MODE" = observe ]; then
+    legacy_selection="$(ASSIGNMENT_MODE=legacy select_work)"
+    v2_selection="$(tartci_assignment_v2_observe)"
+    if [ -n "$v2_selection" ]; then
+      note "assignment-v2 observe legacy=$legacy_selection v2=$v2_selection"
+      event assignment_v2_observe "legacy=$legacy_selection v2=$v2_selection"
+    fi
+    printf '%s\n' "$legacy_selection"
+    return 0
+  fi
+  if [ "$ASSIGNMENT_MODE" = event-class-v2 ]; then
+    tartci_assignment_v2_select
+    return 0
+  fi
   if [ -z "$WORKFLOW_TIERS" ]; then
     q="$(queued_work)"
     printf '%s|%s|0\n' "$q" "$LABELS"
@@ -855,7 +899,7 @@ run_one(){
     return 1
   fi
   t_booted="$(now_epoch)"
-  if higher_priority_demand "$selected_tier"; then
+  if [ "$ASSIGNMENT_MODE" != event-class-v2 ] && higher_priority_demand "$selected_tier"; then
     note "[$i] higher-priority workflow demand appeared during boot — discarding unregistered tier-$selected_tier VM"
     event yielded_to_workflow_tier "selected_tier=$selected_tier labels=$selected_labels"
     discard_current_vm
@@ -916,6 +960,16 @@ run_one(){
   if ! tartci_pool_admission_open; then
     tartci_pool_lock_release
     note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 75
+  fi
+  if [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
+     && ! tartci_assignment_v2_pre_mint_valid "$selected_tier"; then
+    tartci_pool_lock_release
+    note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
+    event assignment_v2_pre_mint_denied \
+      "selected_tier=$selected_tier labels=$selected_labels"
     discard_current_vm
     tartci_release_vm_lease
     return 75
@@ -990,8 +1044,18 @@ run_one(){
 }
 
 i=0
-[ "$PRINT_QUEUE" = 1 ] && { queued_work; exit 0; }
+[ "$PRINT_QUEUE" = 1 ] && { print_queued_work; exit 0; }
 [ "$PRINT_SELECTION" = 1 ] && { select_work | tr '|' '\t'; exit 0; }
+[ "$PRINT_ASSIGNMENT_PARITY" = 1 ] && {
+  [ "$ASSIGNMENT_MODE" != legacy ] \
+    || die "--print-assignment-parity requires TARTCI_RUNNER_ASSIGNMENT_MODE=observe or event-class-v2"
+  tartci_assignment_v2_parity
+  exit 0
+}
+[ -n "$PRINT_PRE_MINT_SELECTION" ] && {
+  if tartci_assignment_v2_pre_mint_valid "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
+  exit 0
+}
 [ -n "$PRINT_HIGHER_PRIORITY" ] && {
   if higher_priority_demand "$PRINT_HIGHER_PRIORITY"; then printf '1\n'; else printf '0\n'; fi
   exit 0
@@ -1008,7 +1072,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
