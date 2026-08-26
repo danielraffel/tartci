@@ -163,6 +163,57 @@ class VmReapTests(unittest.TestCase):
             self.assertFalse(state.exists())
             self.assertIn(f"state_deleted:{state}", digest["fixed"])
 
+    def test_no_vm_state_reap_is_scoped_to_configured_prefixes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            selected = root / "macos" / "selected-lane.state.json"
+            unrelated = root / "macos" / "unrelated-lane.state.json"
+            write_state(selected, provider="tart-macos", runner="selected-lane")
+            write_state(unrelated, provider="tart-macos", runner="unrelated-lane")
+            args = vm_reap.parse_args([
+                "--repo", "danielraffel/pulp",
+                "--state-root", str(root),
+                "--prefixes", "selected-",
+                "--fix",
+            ])
+
+            with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+                 mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+                 mock.patch.object(vm_reap, "github_runners", return_value=[]):
+                digest, rc = vm_reap.build_digest(args)
+
+            self.assertEqual(rc, 0, digest)
+            self.assertFalse(selected.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertEqual(digest["fixed"], [f"state_deleted:{selected}"])
+
+    def test_prefix_match_does_not_replace_missing_vm_ownership_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            unrelated = root / "macos" / "unrelated-lane.state.json"
+            write_state(unrelated, provider="tart-macos", runner="unrelated-lane")
+            args = vm_reap.parse_args([
+                "--repo", "danielraffel/pulp",
+                "--state-root", str(root),
+                "--prefixes", "selected-",
+                "--fix",
+            ])
+            stopped_vms = [
+                {"Name": "selected-one", "State": "stopped"},
+                {"Name": "selected-two", "State": "stopped"},
+            ]
+
+            with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+                 mock.patch.object(vm_reap, "tart_vms", return_value=stopped_vms), \
+                 mock.patch.object(vm_reap, "github_runners", return_value=[]), \
+                 mock.patch.object(vm_reap, "delete_vm") as delete_vm:
+                digest, rc = vm_reap.build_digest(args)
+
+            self.assertEqual(rc, 0, digest)
+            self.assertTrue(unrelated.exists())
+            self.assertEqual([row["owned"] for row in digest["vms"]], [False, False])
+            delete_vm.assert_not_called()
+
     def test_offline_busy_without_local_owner_is_explicitly_orphaned(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "state"
