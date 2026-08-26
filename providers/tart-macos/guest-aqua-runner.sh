@@ -54,7 +54,9 @@ extract_asid(){
 }
 
 process_asid(){
-  "$LAUNCHCTL" print "pid/$1" 2>/dev/null | extract_asid
+  local process_domain
+  process_domain="$("$LAUNCHCTL" print "pid/$1" 2>/dev/null)" || return 1
+  extract_asid <<<"$process_domain"
 }
 
 xml_escape(){
@@ -67,41 +69,60 @@ xml_escape(){
   printf '%s' "$value"
 }
 
-aqua_snapshot(){
+aqua_snapshot_detail(){
   local actual_uid actual_user console_user domain domain_uid asid
-  actual_uid="$($ID -u)" || return 1
-  actual_user="$($ID -un)" || return 1
-  [ "$actual_uid" = "$EXPECTED_UID" ] || return 1
-  console_user="$($STAT -f %Su /dev/console 2>/dev/null)" || return 1
-  [ "$console_user" = "$actual_user" ] || return 1
-  domain="$($LAUNCHCTL print "gui/$EXPECTED_UID" 2>/dev/null)" || return 1
-  printf '%s\n' "$domain" | grep -Eq '^[[:space:]]*session = Aqua$' || return 1
-  domain_uid="$(printf '%s\n' "$domain" | awk '
+  actual_uid="$($ID -u)" || { printf 'fail\tid-unavailable\n'; return 1; }
+  actual_user="$($ID -un)" || { printf 'fail\tuser-unavailable\n'; return 1; }
+  [ "$actual_uid" = "$EXPECTED_UID" ] \
+    || { printf 'fail\tuid-mismatch:%s\n' "$actual_uid"; return 1; }
+  console_user="$($STAT -f %Su /dev/console 2>/dev/null)" \
+    || { printf 'fail\tconsole-user-unavailable\n'; return 1; }
+  [ "$console_user" = "$actual_user" ] \
+    || { printf 'fail\tconsole-user-mismatch:%s\n' "$console_user"; return 1; }
+  domain="$($LAUNCHCTL print "gui/$EXPECTED_UID" 2>/dev/null)" \
+    || { printf 'fail\tgui-domain-unavailable\n'; return 1; }
+  grep -Eq '^[[:space:]]*session = Aqua$' <<<"$domain" \
+    || { printf 'fail\tnon-aqua-domain\n'; return 1; }
+  domain_uid="$(awk '
     /security context = \{/ { in_security = 1; next }
     in_security && /^[[:space:]]*}/ { in_security = 0 }
     in_security && /uid = [0-9]+/ { sub(/^.*uid = /, ""); sub(/[^0-9].*$/, ""); print; exit }
-  ')"
-  [ "$domain_uid" = "$EXPECTED_UID" ] || return 1
-  asid="$(printf '%s\n' "$domain" | extract_asid)"
-  case "$asid" in ''|*[!0-9]*|0) return 1 ;; esac
-  "$PGREP" -x WindowServer >/dev/null 2>&1 || return 1
-  printf '%s\n' "$asid"
+  ' <<<"$domain")"
+  [ "$domain_uid" = "$EXPECTED_UID" ] \
+    || { printf 'fail\tdomain-uid-mismatch:%s\n' "${domain_uid:-missing}"; return 1; }
+  asid="$(extract_asid <<<"$domain")"
+  case "$asid" in
+    ''|*[!0-9]*|0) printf 'fail\tinvalid-asid:%s\n' "${asid:-missing}"; return 1 ;;
+  esac
+  "$PGREP" -x WindowServer >/dev/null 2>&1 \
+    || { printf 'fail\twindowserver-unavailable\n'; return 1; }
+  printf 'ok\t%s\n' "$asid"
+}
+
+aqua_snapshot(){
+  local snapshot state value
+  snapshot="$(aqua_snapshot_detail 2>/dev/null || true)"
+  IFS=$'\t' read -r state value <<<"$snapshot"
+  [ "$state" = ok ] || return 1
+  printf '%s\n' "$value"
 }
 
 wait_for_aqua(){
-  local elapsed=0 asid=""
+  local elapsed=0 snapshot="" state="" value="" last_reason="no-snapshot"
   case "$WAIT_SECS" in ''|*[!0-9]*) die "invalid wait timeout: $WAIT_SECS" ;; esac
   while [ "$elapsed" -le "$WAIT_SECS" ]; do
-    asid="$(aqua_snapshot 2>/dev/null || true)"
-    if [ -n "$asid" ]; then
-      printf '%s\n' "$asid"
+    snapshot="$(aqua_snapshot_detail 2>/dev/null || true)"
+    IFS=$'\t' read -r state value <<<"$snapshot"
+    if [ "$state" = ok ]; then
+      printf '%s\n' "$value"
       return 0
     fi
+    [ "$state" != fail ] || last_reason="${value:-unknown}"
     [ "$elapsed" -lt "$WAIT_SECS" ] || break
     "$SLEEP" 1
     elapsed=$((elapsed + 1))
   done
-  die "healthy console Aqua session gui/$EXPECTED_UID did not become ready within ${WAIT_SECS}s"
+  die "healthy console Aqua session gui/$EXPECTED_UID did not become ready within ${WAIT_SECS}s (last=$last_reason)"
 }
 
 write_plist(){

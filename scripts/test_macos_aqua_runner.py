@@ -54,6 +54,9 @@ if args[:1] == ["print"] and len(args) == 2:
 \t\tasid = {os.environ.get("FAKE_DOMAIN_ASID", "100123")}
 \t}}
 }}''')
+        if os.environ.get("FAKE_AQUA_LARGE_DOMAIN") == "1":
+            for index in range(20000):
+                print(f"\tservice-{index} = idle")
         raise SystemExit(0)
     if target.startswith("pid/"):
         print(f'''{target} = {{
@@ -62,6 +65,9 @@ if args[:1] == ["print"] and len(args) == 2:
 \t\tasid = {os.environ.get("FAKE_PROCESS_ASID", "100123")}
 \t}}
 }}''')
+        if os.environ.get("FAKE_AQUA_LARGE_DOMAIN") == "1":
+            for index in range(20000):
+                print(f"\tprocess-property-{index} = idle")
         raise SystemExit(0)
     state = load()
     pid = state.get("pid")
@@ -208,6 +214,12 @@ class AquaRunnerTest(unittest.TestCase):
         plutil = (self.home / "plutil.log").read_text(encoding="utf-8")
         self.assertIn("-lint", plutil)
 
+    def test_preflight_accepts_large_launchctl_domain_without_pipefail_false_negative(self) -> None:
+        self.env["FAKE_AQUA_LARGE_DOMAIN"] = "1"
+        result = self.invoke("preflight")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("preflight-ok", result.stderr)
+
     def test_plutil_rejection_returns_78_and_cleans_preflight(self) -> None:
         self.fake_plutil.write_text("#!/bin/sh\nexit 1\n", encoding="utf-8")
         result = self.invoke("preflight")
@@ -224,6 +236,7 @@ class AquaRunnerTest(unittest.TestCase):
         result = self.invoke("preflight")
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("healthy console Aqua session", result.stderr)
+        self.assertIn("last=non-aqua-domain", result.stderr)
         self.assertNotIn("unbound variable", result.stderr)
         self.assertFalse(
             (self.home / ".tartci/aqua-runner/com.tartci.test.preflight").exists()
