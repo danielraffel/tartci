@@ -53,7 +53,9 @@ trap cleanup EXIT
 
 python3 "$ROOT/scripts/macos_gate_slot2.py" render \
   --home "$HOME" --tart-home "$TART_HOME" --output "$candidate"
-plutil -lint "$candidate" >/dev/null
+# The canonical validator parses through Python plistlib before enforcing the
+# profile contract. Keep this portable so hosted Linux can prove the installer;
+# launchd receives the same plistlib-serialized bytes on macOS.
 python3 "$ROOT/scripts/macos_gate_slot2.py" validate \
   "$candidate" --sibling "$PRIMARY_PLIST" >/dev/null
 

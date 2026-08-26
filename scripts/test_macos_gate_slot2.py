@@ -80,6 +80,12 @@ class MacosGateSlot2Tests(unittest.TestCase):
         self.assertEqual(env["TARTCI_MACOS_VM_MEM_MB"], "8192")
         self.assertEqual(env["TART_HOME"], str(self.tart_home))
 
+    def test_validator_rejects_malformed_plist_without_platform_tools(self) -> None:
+        self.slot2.write_text("not a plist")
+        result = self.validate()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("gate-slot2:", result.stderr)
+
     def test_mutated_identity_collision_is_rejected(self) -> None:
         self.assertEqual(self.render().returncode, 0)
         slot2 = plistlib.loads(self.slot2.read_bytes())
