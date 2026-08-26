@@ -6,14 +6,23 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import macos_observe
 import vm_reap
+from bounded_subprocess import (
+    DESCENDANT_LEAK_EXIT_CODE,
+    ObservationError,
+    TIMEOUT_EXIT_CODE,
+    run_bounded,
+)
 
 
 def write_state(path: Path, **fields: object) -> None:
@@ -30,15 +39,171 @@ def write_state(path: Path, **fields: object) -> None:
 
 
 class VmReapTests(unittest.TestCase):
+    def test_macos_observer_digest_process_deadline_is_independent_of_probe_budget(self) -> None:
+        args = macos_observe.parse_args(
+            ["--digest-timeout", "55", "--digest-process-timeout", "123"]
+        )
+
+        self.assertEqual(args.digest_timeout, 55)
+        self.assertEqual(args.digest_process_timeout, 123)
+
+    def test_observation_budget_bounds_extra_running_vm_probes(self) -> None:
+        budget = vm_reap.ObservationBudget(0.1)
+        running = [
+            {"Name": f"extra-{index}", "State": "running"}
+            for index in range(20)
+        ]
+
+        with mock.patch.object(
+            vm_reap,
+            "observe_json",
+            side_effect=lambda *_args, **_kwargs: time.sleep(0.04) or {"OS": "macos"},
+        ):
+            with self.assertRaises(ObservationError) as raised:
+                vm_reap.macos_running_count(running, timeout=1, budget=budget)
+
+        self.assertEqual(raised.exception.problem_code, "tart_get_timeout")
+
+    def test_observation_budget_does_not_charge_non_observation_work(self) -> None:
+        budget = vm_reap.ObservationBudget(0.2)
+        time.sleep(0.05)
+        with mock.patch.object(vm_reap, "observe_json", return_value={}) as observe:
+            budget.run_json(["fake"], 1, "github_runners")
+
+        self.assertGreater(observe.call_args.kwargs["timeout"], 0.19)
+
+    def test_macos_observer_outer_timeout_returns_typed_valid_digest(self) -> None:
+        args = macos_observe.parse_args([])
+        timeout = subprocess.CompletedProcess([], TIMEOUT_EXIT_CODE, "", "timed out")
+        with mock.patch.object(macos_observe, "run", return_value=timeout):
+            digest, returncode = macos_observe.load_digest(args)
+
+        self.assertEqual(returncode, TIMEOUT_EXIT_CODE)
+        self.assertEqual(digest["problems"], ["observe_digest_timeout"])
+        self.assertEqual(json.loads(json.dumps(digest)), digest)
+
+    def assert_process_gone(self, pid: int) -> None:
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.02)
+        self.fail(f"process {pid} survived bounded observation cleanup")
+
+    def test_bounded_observation_times_out_hanging_leaf(self) -> None:
+        started = time.monotonic()
+        result = run_bounded(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=0.1,
+            operation="hanging_leaf",
+        )
+
+        self.assertEqual(result.returncode, TIMEOUT_EXIT_CODE)
+        self.assertIn("timed out", result.stderr)
+        self.assertLess(time.monotonic() - started, 2.0)
+
+    def test_bounded_observation_kills_grandchild_that_retains_stdout(self) -> None:
+        source = """
+import subprocess, sys
+child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+print(child.pid, flush=True)
+"""
+        result = run_bounded(
+            [sys.executable, "-c", source],
+            timeout=1,
+            operation="retained_stdout",
+        )
+
+        self.assertEqual(result.returncode, DESCENDANT_LEAK_EXIT_CODE)
+        self.assertIn("unexpected descendant", result.stderr)
+        grandchild_pid = int(result.stdout.strip())
+        self.assert_process_gone(grandchild_pid)
+
+    def test_clone_lock_transition_returns_typed_json_then_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            bin_dir = root / "bin"
+            state_root = root / "state"
+            lock = root / "clone.lock"
+            bin_dir.mkdir()
+            lock.write_text("held", encoding="utf-8")
+            tart = bin_dir / "tart"
+            tart.write_text(
+                """#!/usr/bin/env python3
+import json, os, sys, time
+lock = os.environ['FAKE_TART_CLONE_LOCK']
+if sys.argv[1] == 'list':
+    while os.path.exists(lock):
+        time.sleep(0.02)
+    print(json.dumps([]))
+elif sys.argv[1] == 'get':
+    print(json.dumps({'OS': 'macos'}))
+else:
+    raise SystemExit(2)
+""",
+                encoding="utf-8",
+            )
+            tart.chmod(0o755)
+            ghapp = bin_dir / "ghapp"
+            ghapp.write_text("#!/bin/sh\nprintf '%s\\n' '[{\"runners\":[]}]'\n", encoding="utf-8")
+            ghapp.chmod(0o755)
+            argv = [
+                sys.executable,
+                str(Path(vm_reap.__file__)),
+                "--json",
+                "--state-root",
+                str(state_root),
+                "--tart-timeout-secs",
+                "1",
+                "--github-timeout-secs",
+                "5",
+            ]
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{bin_dir}:{env['PATH']}",
+                    "TARTCI_GH_CLI": "ghapp",
+                    "FAKE_TART_CLONE_LOCK": str(lock),
+                }
+            )
+
+            started = time.monotonic()
+            blocked = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            blocked_json = json.loads(blocked.stdout)
+            self.assertEqual(blocked.returncode, 2, blocked.stderr)
+            self.assertLess(time.monotonic() - started, 2.5)
+            self.assertIn("tart_list_timeout", blocked_json["problems"])
+            self.assertIsNone(blocked_json["capacity"]["running_macos_vms"])
+
+            lock.unlink()
+            recovered = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=10)
+            recovered_json = json.loads(recovered.stdout)
+            self.assertEqual(recovered.returncode, 0, recovered_json)
+            self.assertEqual(recovered_json["problems"], [])
+            self.assertEqual(recovered_json["capacity"]["running_macos_vms"], 0)
+
+    def test_observation_error_exposes_stable_timeout_code(self) -> None:
+        with self.assertRaises(ObservationError) as raised:
+            vm_reap.observe_json(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                timeout=0.1,
+                operation="github_runners",
+            )
+
+        self.assertEqual(raised.exception.problem_code, "github_runners_timeout")
+
     def test_github_operations_honor_configured_cli(self) -> None:
         response = mock.Mock(returncode=0, stdout='[{"runners": []}]', stderr="")
         with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
-             mock.patch.object(vm_reap, "run", return_value=response) as run:
+             mock.patch.object(vm_reap, "run_bounded", return_value=response) as observe_run, \
+             mock.patch.object(vm_reap, "run", return_value=response) as mutate_run:
             self.assertEqual(vm_reap.github_runners("danielraffel/pulp"), [])
             vm_reap.delete_runner("danielraffel/pulp", 42, "pulp-vm-01")
 
-        self.assertEqual(run.call_args_list[0].args[0][0], "ghapp")
-        self.assertEqual(run.call_args_list[1].args[0][0], "ghapp")
+        self.assertEqual(observe_run.call_args.args[0][0], "ghapp")
+        self.assertEqual(mutate_run.call_args.args[0][0], "ghapp")
 
     def run_digest(self, root: Path, *extra: str):
         args = vm_reap.parse_args(

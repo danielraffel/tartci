@@ -25,6 +25,33 @@ import sys
 import time
 from typing import Any
 
+from bounded_subprocess import ObservationError, require_success, run_bounded
+
+
+class ObservationBudget:
+    """One elapsed-command budget shared by read-only external probes."""
+
+    def __init__(self, total_seconds: float) -> None:
+        if total_seconds <= 0:
+            raise ValueError("observation timeout must be positive")
+        self.remaining_seconds = total_seconds
+
+    def run_json(self, argv: list[str], limit: float, operation: str) -> Any:
+        if self.remaining_seconds <= 0:
+            raise ObservationError(operation, "timeout", "total observation deadline exhausted")
+        started = time.monotonic()
+        try:
+            return observe_json(
+                argv,
+                timeout=min(limit, self.remaining_seconds),
+                operation=operation,
+            )
+        finally:
+            self.remaining_seconds = max(
+                0.0,
+                self.remaining_seconds - (time.monotonic() - started),
+            )
+
 
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
@@ -71,6 +98,17 @@ def run_json(argv: list[str]) -> Any:
         return json.loads(proc.stdout or "null")
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{' '.join(argv)} returned invalid JSON: {exc}") from exc
+
+
+def observe_json(argv: list[str], *, timeout: float, operation: str) -> Any:
+    proc = require_success(
+        run_bounded(argv, timeout=timeout, operation=operation),
+        operation=operation,
+    )
+    try:
+        return json.loads(proc.stdout or "null")
+    except json.JSONDecodeError as exc:
+        raise ObservationError(operation, "invalid_json", str(exc)) from exc
 
 
 def github_cli() -> str:
@@ -159,8 +197,16 @@ def load_states(state_dirs: list[pathlib.Path], now: dt.datetime) -> tuple[list[
     return states, problems
 
 
-def tart_vms() -> list[dict[str, Any]]:
-    data = run_json(["tart", "list", "--format", "json", "--source", "local"])
+def tart_vms(
+    timeout: float = 15.0,
+    budget: ObservationBudget | None = None,
+) -> list[dict[str, Any]]:
+    argv = ["tart", "list", "--format", "json", "--source", "local"]
+    data = (
+        budget.run_json(argv, timeout, "tart_list")
+        if budget
+        else observe_json(argv, timeout=timeout, operation="tart_list")
+    )
     if not isinstance(data, list):
         return []
     return data
@@ -178,7 +224,11 @@ def is_running_state(state: str) -> bool:
     return state.lower().startswith("run")
 
 
-def macos_running_count(vms: list[dict[str, Any]]) -> int:
+def macos_running_count(
+    vms: list[dict[str, Any]],
+    timeout: float = 15.0,
+    budget: ObservationBudget | None = None,
+) -> int:
     count = 0
     for vm in vms:
         state = vm_state(vm)
@@ -188,8 +238,15 @@ def macos_running_count(vms: list[dict[str, Any]]) -> int:
         os_name = ""
         if name:
             try:
-                detail = run_json(["tart", "get", name, "--format", "json"])
+                argv = ["tart", "get", name, "--format", "json"]
+                detail = (
+                    budget.run_json(argv, timeout, "tart_get")
+                    if budget
+                    else observe_json(argv, timeout=timeout, operation="tart_get")
+                )
                 os_name = str(detail.get("OS", "")).lower()
+            except ObservationError:
+                raise
             except Exception:
                 os_name = ""
         if os_name in ("", "darwin", "macos"):
@@ -197,15 +254,22 @@ def macos_running_count(vms: list[dict[str, Any]]) -> int:
     return count
 
 
-def github_runners(repo: str) -> list[dict[str, Any]]:
-    data = run_json(
-        [
-            github_cli(),
-            "api",
-            f"repos/{repo}/actions/runners?per_page=100",
-            "--paginate",
-            "--slurp",
-        ]
+def github_runners(
+    repo: str,
+    timeout: float = 15.0,
+    budget: ObservationBudget | None = None,
+) -> list[dict[str, Any]]:
+    argv = [
+        github_cli(),
+        "api",
+        f"repos/{repo}/actions/runners?per_page=100",
+        "--paginate",
+        "--slurp",
+    ]
+    data = (
+        budget.run_json(argv, timeout, "github_runners")
+        if budget
+        else observe_json(argv, timeout=timeout, operation="github_runners")
     )
     runners: list[dict[str, Any]] = []
     if isinstance(data, dict):
@@ -315,6 +379,7 @@ def stop_pid(pid_value: Any, expected_start: Any) -> bool:
 
 def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     now = utcnow()
+    observation_budget = ObservationBudget(args.observation_timeout_secs)
     problems: list[str] = []
     fixed: list[str] = []
     unreadable: list[str] = []
@@ -346,12 +411,19 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
 
     if not unreadable:
         try:
-            raw_vms = tart_vms()
+            raw_vms = tart_vms(args.tart_timeout_secs, observation_budget)
+            running_macos = macos_running_count(
+                raw_vms,
+                args.tart_timeout_secs,
+                observation_budget,
+            )
+        except ObservationError as exc:
+            raw_vms = []
+            unreadable.append(exc.problem_code)
         except Exception as exc:  # noqa: BLE001
             raw_vms = []
             unreadable.append(f"tart_unreadable:{exc}")
         else:
-            running_macos = macos_running_count(raw_vms)
             capacity = {
                 "macos_cap": args.macos_cap,
                 "running_macos_vms": running_macos,
@@ -543,7 +615,13 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
     if not unreadable:
         try:
-            runners = github_runners(args.repo)
+            runners = github_runners(
+                args.repo,
+                args.github_timeout_secs,
+                observation_budget,
+            )
+        except ObservationError as exc:
+            unreadable.append(exc.problem_code)
         except Exception as exc:  # noqa: BLE001
             unreadable.append(f"github_unreadable:{exc}")
         else:
@@ -626,6 +704,9 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "running_age_secs": args.running_age_secs,
             "heartbeat_stale_secs": args.heartbeat_stale_secs,
             "keep_failed_age_secs": args.keep_failed_age_secs,
+            "tart_timeout_secs": args.tart_timeout_secs,
+            "github_timeout_secs": args.github_timeout_secs,
+            "observation_timeout_secs": args.observation_timeout_secs,
         },
         "capacity": capacity,
         "supervisors": [
@@ -702,6 +783,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--running-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_RUNNING_AGE_SECS", "10800")))
     parser.add_argument("--heartbeat-stale-secs", type=int, default=int(os.environ.get("TARTCI_REAP_HEARTBEAT_STALE_SECS", "900")))
     parser.add_argument("--keep-failed-age-secs", type=int, default=int(os.environ.get("TARTCI_REAP_KEEP_FAILED_AGE_SECS", "86400")))
+    parser.add_argument("--tart-timeout-secs", type=float, default=float(os.environ.get("TARTCI_TART_TIMEOUT_SECS", "15")))
+    parser.add_argument("--github-timeout-secs", type=float, default=float(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
+    parser.add_argument("--observation-timeout-secs", type=float, default=float(os.environ.get("TARTCI_OBSERVATION_TIMEOUT_SECS", "60")))
     return parser.parse_args(argv)
 
 
