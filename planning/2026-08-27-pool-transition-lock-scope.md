@@ -1,6 +1,6 @@
 # Pool transition lock scope
 
-Status: implementation and local validation complete; PR published
+Status: PR validation complete; rollout gated on merge and first-host proof
 
 Base: `origin/main` at `1d2f2ae9d5aa15cec4a513be35c75d59980a9400`
 
@@ -49,4 +49,8 @@ require the authoritative Shipyard held-idle receipt.
   overall correctness `patch is correct` at confidence 0.89.
 - Implementation commit: `0b4e9c09ea0da3bcee039e971b3d447cc8e6f0f5`.
 - PR: `danielraffel/tartci#131`.
-- PR exact-head CI result: pending.
+- Published receipt head `0e80f1388039ec9809bb991993019c751b8ff3fe`
+  passed PR run `33114701961` (`lint`, including full unit and shell tests) in
+  2m16s.
+- No host deployment or live-fleet mutation has been performed. Merge remains
+  required before the one-host idle-boundary rollout proof above.
