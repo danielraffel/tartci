@@ -115,6 +115,10 @@ tartci_pool_launchd_target() {
   printf 'gui/%s/%s\n' "${TARTCI_POOL_UID:-$(id -u)}" "$1"
 }
 
+tartci_pool_agent_loaded() {
+  launchctl print "$(tartci_pool_launchd_target "$1")" >/dev/null 2>&1
+}
+
 tartci_pool_agent_pid() {
   launchctl print "$(tartci_pool_launchd_target "$1")" 2>/dev/null \
     | awk '/^[[:space:]]*pid = [0-9]+/ { print $3; exit }'

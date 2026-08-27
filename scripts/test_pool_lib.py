@@ -181,6 +181,69 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
         self.assertEqual([l for l in proc.stdout.splitlines() if l != "rc=0"], [])
 
 
+class RunnerAgentLoadedTests(unittest.TestCase):
+    def _fake_launchctl(self, td: str) -> Path:
+        bindir = Path(td) / "bin"
+        bindir.mkdir()
+        launchctl = bindir / "launchctl"
+        launchctl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import signal\n"
+            "import sys\n"
+            "signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n"
+            "label = 'com.example.loaded'\n"
+            "if sys.argv[1] == 'print':\n"
+            "    raise SystemExit(0 if sys.argv[2] == f'gui/501/{label}' else 3)\n"
+            "if sys.argv[1] == 'list':\n"
+            "    print(f'42\\t0\\t{label}')\n"
+            "    for index in range(100000):\n"
+            "        print(f'{index}\\t0\\tcom.example.tail.{index}')\n"
+            "    raise SystemExit(0)\n"
+            "raise SystemExit(2)\n"
+        )
+        launchctl.chmod(0o755)
+        return bindir
+
+    def test_loaded_probe_uses_exact_launchd_domain_target(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bindir = self._fake_launchctl(td)
+            proc = _bash(
+                f"source {LIB}; "
+                "tartci_pool_agent_loaded com.example.loaded; echo loaded=$?; "
+                "tartci_pool_agent_loaded com.example.absent; echo absent=$?",
+                {
+                    "PATH": f"{bindir}:{os.environ['PATH']}",
+                    "TARTCI_POOL_UID": "501",
+                },
+            )
+            self.assertEqual(proc.stdout.splitlines(), ["loaded=0", "absent=3"], proc.stderr)
+
+    def test_loaded_probe_avoids_early_match_pipefail(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bindir = self._fake_launchctl(td)
+            proc = _bash(
+                f"source {LIB}; set -o pipefail; "
+                "launchctl list | grep -qF com.example.loaded; legacy=$?; "
+                "tartci_pool_agent_loaded com.example.loaded; current=$?; "
+                "echo legacy=$legacy current=$current",
+                {
+                    "PATH": f"{bindir}:{os.environ['PATH']}",
+                    "TARTCI_POOL_UID": "501",
+                },
+            )
+            fields = dict(field.split("=") for field in proc.stdout.strip().split())
+            self.assertNotEqual(fields["legacy"], "0", proc.stderr)
+            self.assertEqual(fields["current"], "0", proc.stderr)
+
+    def test_pool_status_uses_loaded_probe_for_both_output_modes(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        status = source.index("    status)", source.index("cmd_pool()"))
+        end = source.index('    *) echo "usage: tartci pool', status)
+        body = source[status:end]
+        self.assertEqual(body.count('tartci_pool_agent_loaded "$label"'), 2)
+        self.assertNotIn("launchctl list", body)
+
+
 class PersistentRunnerDrainTests(unittest.TestCase):
     def _fake_path(self, td: str) -> tuple[Path, Path]:
         bindir = Path(td) / "bin"
