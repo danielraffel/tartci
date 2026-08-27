@@ -12,7 +12,7 @@
 #   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
-#   tartci fleet-macos <validate|render> CONFIG # validate/render dormant generic VM lanes
+#   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
 #   tartci tart-image-sync ... # resumable, checksum-verified Tart golden transfer
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
@@ -118,7 +118,16 @@ cmd_profile() {
 }
 
 cmd_fleet_macos() {
-  exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$@"
+  local sub="${1:-}"; shift || true
+  case "$sub" in
+    validate|render|write-receipt|verify-installed)
+      exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
+      ;;
+    install)
+      exec "$HERE/scripts/install_macos_fleet.sh" "$@"
+      ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install> ..."; return 2 ;;
+  esac
 }
 
 cmd_gate_slot2() {
@@ -316,6 +325,21 @@ cmd_pool() {
         tartci_pool_write_state off
       else
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+        local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
+        local fleet_plists
+        fleet_plists="$(find "$agents_dir" -maxdepth 1 \
+          -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' \
+          -print 2>/dev/null || true)"
+        if [ -n "$fleet_plists" ] || [ -f "$fleet_receipt" ]; then
+          if [ ! -f "$fleet_receipt" ] \
+            || ! python3 "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
+              --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+              --agents-dir "$agents_dir" >/dev/null; then
+            tartci_pool_lock_release
+            echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
+            return 7
+          fi
+        fi
         # A host-local network profile is an opt-in admission prerequisite.
         # Converge and prove its relay before making participation visible or
         # loading controllers; absent/disabled profiles are a strict no-op.

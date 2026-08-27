@@ -27,6 +27,34 @@ Rendering never installs or loads a LaunchAgent. Stable host/lane identifiers
 are local operational vocabulary; actual GitHub runner names remain ephemeral
 per boot through the existing Tart provider.
 
+## Install while admission is closed
+
+Do not copy rendered plists or bootstrap individual lanes by hand. The managed
+installer is dry-run by default and owns publication, declared legacy-agent
+retirement, and the receipt that `tartci pool on` verifies before admitting
+work:
+
+```sh
+tartci pool status --json
+tartci fleet-macos install profiles/m1-macos-fleet.toml
+tartci fleet-macos install profiles/m1-macos-fleet.toml --apply
+tartci pool on
+```
+
+`--apply` requires terminal `pool off` state and refuses any loaded target or
+declared replacement LaunchAgent. The locked profile `host.id` must exactly
+match the machine's durable `shipyard runner tag`. It atomically publishes only
+profile-rendered
+plists, moves explicitly declared legacy plists into the recoverable
+`~/Library/LaunchAgents/.tartci-retired/` archive, writes an exact digest
+receipt from a locked profile snapshot installed at
+`~/.config/tartci/macos-fleet-profile.toml`, and leaves admission closed. If
+fleet plists exist without a valid
+receipt, or the profile/plists change afterward, `pool on` fails closed before
+changing durable participation. `pool off` continues to discover and stop all
+runner agents; the receipt narrows installation authority, not emergency-stop
+coverage.
+
 Pulp exposes only the merge-group event tier. A lower PR tier is intentionally
 absent until the provider can recheck higher-priority demand after the bounded
 Shipyard admission wait; otherwise a PR could consume a slot for a merge-group

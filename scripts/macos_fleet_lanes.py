@@ -8,6 +8,8 @@ loads, enables, drains, or otherwise mutates a host runner pool.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import plistlib
 import re
@@ -24,10 +26,13 @@ TOP_KEYS = {"schema", "name", "host", "lane"}
 HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
-    "min_queued_age_seconds",
+    "min_queued_age_seconds", "replaces_launchd_labels",
 }
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
+REPLACED_AGENT = re.compile(
+    r"^com[.]danielraffel[.][a-z0-9.-]+[.]tart-runner-[a-z0-9.-]+$"
+)
 
 
 def fail(message: str) -> None:
@@ -67,7 +72,12 @@ def load(path: Path) -> dict:
         fail("Tart and log roots may not be the host home directory itself")
     if not lanes:
         fail("at least one [[lane]] is required")
+    generated_labels = {
+        f"com.danielraffel.tartci.tart-runner-macos-fleet.{host['id']}.{lane.get('id', '')}"
+        for lane in lanes if isinstance(lane, dict)
+    }
     seen: set[str] = set()
+    replaced: set[str] = set()
     for lane in lanes:
         if not isinstance(lane, dict):
             fail("each lane must be a table")
@@ -108,6 +118,20 @@ def load(path: Path) -> dict:
             fail(f"lane {lane_id}: tier must be an array of tables")
         if bool(workflows) == bool(tiers):
             fail(f"lane {lane_id}: declare exactly one of workflows or [[lane.tier]]")
+        replacements = lane.get("replaces_launchd_labels") or []
+        if (not isinstance(replacements, list)
+                or not all(isinstance(value, str)
+                           and REPLACED_AGENT.fullmatch(value)
+                           for value in replacements)
+                or len(replacements) != len(set(replacements))):
+            fail(f"lane {lane_id}: replaces_launchd_labels must contain unique owned LaunchAgent labels")
+        overlap = replaced.intersection(replacements)
+        if overlap:
+            fail(f"replacement LaunchAgent labels must be unique across lanes: {sorted(overlap)}")
+        generated_overlap = generated_labels.intersection(replacements)
+        if generated_overlap:
+            fail(f"replacement LaunchAgent labels may not name rendered fleet agents: {sorted(generated_overlap)}")
+        replaced.update(replacements)
         for tier in tiers:
             if not isinstance(tier, dict):
                 fail(f"lane {lane_id}: each tier must be a table")
@@ -123,6 +147,92 @@ def load(path: Path) -> dict:
             if label in labels:
                 fail(f"lane {lane_id}: tier label must be exclusive, not a base label")
     return data
+
+
+def rendered_plists(data: dict) -> dict[str, bytes]:
+    host_id = data["host"]["id"]
+    result: dict[str, bytes] = {}
+    for lane in data["lane"]:
+        name = f"com.danielraffel.tartci.tart-runner-macos-fleet.{host_id}.{lane['id']}.plist"
+        result[name] = plistlib.dumps(lane_plist(data, lane), sort_keys=False)
+    return result
+
+
+def replacements(data: dict) -> list[str]:
+    return [label for lane in data["lane"] for label in lane.get("replaces_launchd_labels", [])]
+
+
+def write_receipt(config: Path, agents_dir: Path, output: Path) -> None:
+    data = load(config)
+    expected = rendered_plists(data)
+    digests: dict[str, str] = {}
+    for name, body in expected.items():
+        installed = agents_dir / name
+        if installed.is_symlink() or not installed.is_file() or installed.read_bytes() != body:
+            fail(f"installed plist does not match rendered profile: {installed}")
+        digests[name] = hashlib.sha256(body).hexdigest()
+    installed_names = {
+        path.name for path in agents_dir.glob(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist"
+        )
+    }
+    if installed_names != set(expected):
+        fail("installed fleet plist set does not exactly match the profile")
+    for label in replacements(data):
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent is still installable: {label}")
+    receipt = {
+        "schema": 1,
+        "profile": data.get("name", config.stem),
+        "config_path": str(config.resolve()),
+        "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+        "agents_dir": str(agents_dir.resolve()),
+        "plists": digests,
+        "retired_launchd_labels": replacements(data),
+    }
+    output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+
+
+def verify_receipt(path: Path, config: Path, agents_dir: Path) -> None:
+    try:
+        receipt = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"could not read install receipt {path}: {exc}")
+    if not isinstance(receipt, dict) or receipt.get("schema") != 1:
+        fail("install receipt schema must be 1")
+    config = config.resolve()
+    agents_dir = agents_dir.resolve()
+    if (Path(receipt.get("config_path", "")).resolve() != config
+            or Path(receipt.get("agents_dir", "")).resolve() != agents_dir):
+        fail("install receipt paths do not match the canonical installed paths")
+    if not config.is_file() or not agents_dir.is_dir():
+        fail("install receipt config_path and agents_dir must exist")
+    if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
+        fail("installed fleet profile digest does not match its receipt")
+    data = load(config)
+    expected = rendered_plists(data)
+    recorded = receipt.get("plists")
+    if not isinstance(recorded, dict) or set(recorded) != set(expected):
+        fail("install receipt plist set does not match the profile")
+    installed_names = {
+        installed.name for installed in agents_dir.glob(
+            "com.danielraffel.tartci.tart-runner-macos-fleet.*.plist"
+        )
+    }
+    if installed_names != set(expected):
+        fail("installed fleet plist set does not exactly match the profile")
+    for name, body in expected.items():
+        installed = agents_dir / name
+        digest = hashlib.sha256(body).hexdigest()
+        if (recorded.get(name) != digest or installed.is_symlink()
+                or not installed.is_file() or installed.read_bytes() != body):
+            fail(f"installed fleet plist failed receipt verification: {installed}")
+    expected_retired = replacements(data)
+    if receipt.get("retired_launchd_labels") != expected_retired:
+        fail("install receipt retired-label set does not match the profile")
+    for label in expected_retired:
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent became installable again: {label}")
 
 
 def lane_plist(data: dict, lane: dict) -> dict:
@@ -180,17 +290,32 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("config", type=Path)
         if name == "render":
             cmd.add_argument("--output", required=True, type=Path)
+    receipt = sub.add_parser("write-receipt")
+    receipt.add_argument("config", type=Path)
+    receipt.add_argument("--agents-dir", required=True, type=Path)
+    receipt.add_argument("--output", required=True, type=Path)
+    verify = sub.add_parser("verify-installed")
+    verify.add_argument("receipt", type=Path)
+    verify.add_argument("--config", required=True, type=Path)
+    verify.add_argument("--agents-dir", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "verify-installed":
+            verify_receipt(args.receipt, args.config, args.agents_dir)
+            print(f"verified installed macOS fleet receipt: {args.receipt}")
+            return 0
         data = load(args.config)
         if args.command == "validate":
             print(f"valid: host={data['host']['id']} lanes={len(data['lane'])} activation=unchanged")
             return 0
+        if args.command == "write-receipt":
+            write_receipt(args.config, args.agents_dir, args.output)
+            print(args.output)
+            return 0
         args.output.mkdir(parents=True, exist_ok=True)
-        for lane in data["lane"]:
-            target = args.output / f"com.danielraffel.tartci.tart-runner-macos-fleet.{data['host']['id']}.{lane['id']}.plist"
-            with target.open("wb") as handle:
-                plistlib.dump(lane_plist(data, lane), handle, sort_keys=False)
+        for name, body in rendered_plists(data).items():
+            target = args.output / name
+            target.write_bytes(body)
             print(target)
         print("rendered only: no LaunchAgent was installed, loaded, enabled, or activated", file=sys.stderr)
         return 0

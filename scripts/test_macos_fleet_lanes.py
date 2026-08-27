@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import plistlib
+import json
+import tomllib
 import subprocess
 import tempfile
 import unittest
@@ -43,6 +45,62 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_VM_LEASE_PRIORITY"], "vm")
             self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
             self.assertNotIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
+            self.assertEqual(
+                ["com.danielraffel.pulp.tart-runner-macos-gate"],
+                next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "pulp-gate")["replaces_launchd_labels"],
+            )
+            self.assertEqual(
+                ["com.danielraffel.forge.tart-runner-macos"],
+                next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "forge-gate")["replaces_launchd_labels"],
+            )
+            self.assertEqual(
+                ["com.danielraffel.vellum.tart-runner-macos"],
+                next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "vellum-gate")["replaces_launchd_labels"],
+            )
+
+    def test_receipt_verifies_exact_plists_and_rejects_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            render = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "render", str(CONFIG), "--output", str(agents)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(render.returncode, 0, render.stderr)
+            receipt = root / "receipt.json"
+            write = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "write-receipt", str(CONFIG),
+                 "--agents-dir", str(agents), "--output", str(receipt)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(write.returncode, 0, write.stderr)
+            self.assertEqual(json.loads(receipt.read_text())["schema"], 1)
+            verify = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(verify.returncode, 0, verify.stderr)
+            stale = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.removed.plist"
+            stale.write_bytes(next(agents.glob("*.plist")).read_bytes())
+            extra = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(extra.returncode, 2)
+            self.assertIn("does not exactly match", extra.stderr)
+            stale.unlink()
+            target = next(agents.glob("*.plist"))
+            target.write_bytes(target.read_bytes() + b"\n")
+            rejected = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(rejected.returncode, 2)
+            self.assertIn("failed receipt verification", rejected.stderr)
 
     def test_invalid_config_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -154,6 +212,32 @@ workflows=["Build"]
                     text=True, capture_output=True, check=False,
                 )
                 self.assertEqual(result.returncode, 2, body)
+
+    def test_replacement_cannot_name_a_rendered_fleet_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "self-replacing.toml"
+            bad.write_text('''schema=1
+name="self-replacing"
+[host]
+id="m1"
+home="/h"
+tart_home="/v"
+cache_root="/c"
+log_root="/l"
+[[lane]]
+id="forge"
+repo="Generous-Corp/forge"
+golden="g"
+labels=["self-hosted","macOS","ARM64"]
+workflows=["Build"]
+replaces_launchd_labels=["com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge"]
+''')
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("may not name rendered", result.stderr)
 
 
 if __name__ == "__main__":

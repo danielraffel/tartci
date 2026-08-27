@@ -17,6 +17,7 @@ golden = "pulp-build-runner:latest"
 priority = "vm"
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -30,6 +31,7 @@ priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
 workflows = ["protected macOS build"]
+replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
 
 [[lane]]
 id = "vellum-gate"
@@ -39,3 +41,4 @@ priority = "gate"
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
+replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]

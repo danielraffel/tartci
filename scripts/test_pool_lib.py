@@ -139,6 +139,8 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
             "com.danielraffel.pulp.tart-runner-linux.plist",
             "com.danielraffel.pulp.tart-runner-macos-gate-slot2.plist",
             "com.danielraffel.pulp.qemu-runner-windows.plist",
+            "com.danielraffel.forge.tart-runner-macos.plist",
+            "com.danielraffel.vellum.tart-runner-macos.plist",
             "com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge-gate.plist",
             "actions.runner.danielraffel-pulp.pulp-preamble-m5.plist",
         ):
@@ -163,11 +165,13 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
                 got,
                 [
                     "actions.runner.danielraffel-pulp.pulp-preamble-m5",
+                    "com.danielraffel.forge.tart-runner-macos",
                     "com.danielraffel.pulp.qemu-runner-windows",
                     "com.danielraffel.pulp.tart-runner",
                     "com.danielraffel.pulp.tart-runner-linux",
                     "com.danielraffel.pulp.tart-runner-macos-gate-slot2",
                     "com.danielraffel.tartci.tart-runner-macos-fleet.m1.forge-gate",
+                    "com.danielraffel.vellum.tart-runner-macos",
                 ],
             )
 
