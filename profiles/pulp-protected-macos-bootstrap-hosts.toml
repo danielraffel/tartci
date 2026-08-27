@@ -1,0 +1,16 @@
+schema = 1
+name = "pulp-protected-macos-bootstrap-hosts"
+repo = "Generous-Corp/pulp"
+workflow = ".github/workflows/build.yml"
+
+# Literal downloads in the protected macOS workflow. Keep this list in sync
+# when the workflow adds or changes a direct external bootstrap URL.
+literal_hosts = [
+  "storage.googleapis.com", # pinned Chrome-for-Testing archive
+]
+
+# Hosts reached transitively by the workflow's Homebrew bootstrap/update step.
+transitive_hosts = [
+  "ghcr.io",           # portable Ruby package
+  "formulae.brew.sh",  # signed formula/package manifests
+]
