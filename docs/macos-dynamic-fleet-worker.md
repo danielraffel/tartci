@@ -14,6 +14,23 @@ uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
 `TART_HOME`.
 
+Every managed lane also declares its exact non-Default GitHub runner group.
+The renderer exports that value as `TARTCI_RUNNER_GROUP_ID`; omitting it would
+silently register disposable runners in Default even when a workflow requests
+a protected group, leaving the job queued while VMs repeatedly start and exit.
+The checked-in IDs were verified against the live organization runner-group
+API and workflow routing on 2026-08-27:
+
+| Lane | Group ID | GitHub runner group | Live access evidence |
+|---|---:|---|---|
+| Pulp | 3 | `pulp-trusted-build` | Selected to Pulp and restricted to protected `pulp/.github/workflows/build.yml@refs/heads/main` |
+| Forge | 11 | `forge-pr-safe-build` | Selected to Forge and restricted to protected `forge/.github/workflows/build.yml@refs/heads/main` |
+| Vellum | 8 | `vellum-macos-build` | Selected to Vellum; its GPU and README macOS workflows use `VELLUM_MACOS_RUNS_ON_JSON` |
+
+Runner-group IDs are organization state, not values to infer from repository
+names. Re-verify the live group name, selected repository, and protected
+workflow access before changing any checked-in ID.
+
 ## Stage without activation
 
 ```sh
