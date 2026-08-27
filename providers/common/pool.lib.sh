@@ -158,6 +158,20 @@ tartci_pool_lock_release() {
   rmdir "$lock" 2>/dev/null || true
 }
 
+# End the host-global mint/drain transition only after this supervisor owns a
+# live listener process. From this point through assignment or idle teardown,
+# the listener's provider state, VM lease, and cleanup trap are the durable
+# ownership boundary; drain disables provider restart but does not kill it.
+# This keeps the accepted-job-before-Runner.Worker interval protected without
+# serializing unrelated repository listeners behind an idle JIT registration.
+tartci_pool_lock_handoff_to_listener() {
+  local listener_pid="$1"
+  case "$listener_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(cat "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true)" = "$$" ] || return 1
+  kill -0 "$listener_pid" 2>/dev/null || return 1
+  tartci_pool_lock_release
+}
+
 # Return success when PARENT owns a Runner.Worker descendant. Inspection errors
 # fail closed as busy; a drain must never stop a job because process evidence
 # was unavailable.

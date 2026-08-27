@@ -127,6 +127,59 @@ class AdmissionStateTests(unittest.TestCase):
             self.assertEqual(proc.stdout.strip(), "open=1", proc.stderr)
 
 
+class TransitionLockHandoffTests(unittest.TestCase):
+    def test_live_listener_handoff_releases_global_transition_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            proc = _bash(
+                f"source {LIB}; "
+                "tartci_pool_lock_acquire; "
+                "sleep 30 & listener=$!; "
+                "tartci_pool_lock_handoff_to_listener \"$listener\"; handoff=$?; "
+                "kill -0 \"$listener\" && alive=yes || alive=no; "
+                "tartci_pool_lock_acquire; reacquire=$?; tartci_pool_lock_release; "
+                "kill \"$listener\"; wait \"$listener\" 2>/dev/null || true; "
+                f"[ -d {lock} ] && held=yes || held=no; "
+                "echo handoff=$handoff alive=$alive reacquire=$reacquire held=$held",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(
+                proc.stdout.strip(),
+                "handoff=0 alive=yes reacquire=0 held=no",
+                proc.stderr,
+            )
+
+    def test_dead_listener_keeps_transition_lock_owned_for_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            proc = _bash(
+                f"source {LIB}; "
+                "tartci_pool_lock_acquire; "
+                "(exit 0) & listener=$!; wait \"$listener\"; "
+                "tartci_pool_lock_handoff_to_listener \"$listener\"; rc=$?; "
+                f"[ -d {lock} ] && held=yes || held=no; "
+                "tartci_pool_lock_release; echo rc=$rc held=$held",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(proc.stdout.strip(), "rc=1 held=yes", proc.stderr)
+
+    def test_listener_cannot_handoff_an_unowned_transition_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            lock.mkdir()
+            (lock / "pid").write_text("999999\n")
+            proc = _bash(
+                f"source {LIB}; "
+                "sleep 30 & listener=$!; "
+                "tartci_pool_lock_handoff_to_listener \"$listener\"; rc=$?; "
+                "kill \"$listener\"; wait \"$listener\" 2>/dev/null || true; "
+                f"[ -d {lock} ] && held=yes || held=no; "
+                "echo rc=$rc held=$held",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(proc.stdout.strip(), "rc=1 held=yes", proc.stderr)
+
+
 class RunnerAgentEnumerationTests(unittest.TestCase):
     def _fixture_dir(self, td: str) -> Path:
         d = Path(td) / "LaunchAgents"
@@ -516,6 +569,37 @@ class ProviderAdmissionContractTests(unittest.TestCase):
                 release = source.find("tartci_pool_lock_release", mint)
                 self.assertGreater(lock, mint - 1600, f"missing mint lock in {relative}")
                 self.assertGreater(release, mint, f"mint lock not released in {relative}")
+
+    def test_every_provider_hands_transition_to_live_listener_before_waiting(self) -> None:
+        cases = {
+            "providers/tart-linux/runner.sh": ("CURRENT_RUNNER_PID=$!", "tartci_monitor_runner_assignment"),
+            "providers/qemu-windows/runner.sh": ("runner_pid=$!", "runner_start=\"$(now_epoch)\""),
+        }
+        for relative, (spawn, wait_boundary) in cases.items():
+            with self.subTest(provider=relative):
+                source = (ROOT / relative).read_text()
+                mint = source.rindex("generate-jitconfig")
+                spawn_at = source.index(spawn, mint)
+                handoff = source.index("tartci_pool_lock_handoff_to_listener", spawn_at)
+                wait_at = source.index(wait_boundary, handoff)
+                self.assertLess(spawn_at, handoff)
+                self.assertLess(handoff, wait_at)
+
+        mac = (ROOT / "providers/tart-macos/runner.sh").read_text()
+        run_listener = mac[
+            mac.index("run_runner_until_done(){") : mac.index("install_and_preflight_aqua_runner(){")
+        ]
+        spawn_at = run_listener.index("ssh_pid=$!")
+        handoff = run_listener.index("tartci_pool_lock_handoff_to_listener", spawn_at)
+        wait_at = run_listener.index("start=\"$(date +%s)\"", handoff)
+        self.assertLess(spawn_at, handoff)
+        self.assertLess(handoff, wait_at)
+
+        windows = (ROOT / "providers/qemu-windows/runner.sh").read_text()
+        linux = (ROOT / "providers/tart-linux/runner.sh").read_text()
+        self.assertNotIn("assigned=1\n      tartci_pool_lock_release", mac)
+        self.assertNotIn("runner_assigned=1\n      tartci_pool_lock_release", windows)
+        self.assertNotIn("mark_runner_assigned(){ tartci_pool_lock_release", linux)
 
     def test_drain_closes_shared_participation_before_state_transition(self) -> None:
         source = (ROOT / "tartci").read_text()

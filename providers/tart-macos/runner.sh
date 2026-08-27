@@ -722,13 +722,18 @@ run_runner_until_done(){
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
     >"$runner_log" 2>&1 & ssh_pid=$!
+  if ! tartci_pool_lock_handoff_to_listener "$ssh_pid"; then
+    note "[$vm] listener exited before pool transition handoff"
+    kill "$ssh_pid" 2>/dev/null || true
+    wait "$ssh_pid" 2>/dev/null || true
+    return 1
+  fi
   start="$(date +%s)"
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
-      tartci_pool_lock_release
       assigned_at="$now"
       for _ in $(seq 1 6); do
         capture_current_job && break
