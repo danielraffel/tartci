@@ -177,10 +177,12 @@ tartci_pool_pid_tree_has_worker() {
 }
 
 # A stock persistent Actions listener has no safe local drain primitive: worker
-# absence misses the accepted-job-before-worker-spawn interval. Shipyard policy
-# must first remove this host from routing and publish an exact `held-idle`
-# receipt after the scheduler reports every persistent runner idle. Only then
-# may tartci perform the provider-side bootout. No second scheduler lives here.
+# absence misses the accepted-job-before-worker-spawn interval. An authoritative
+# Shipyard integration must first remove this host from routing and publish an
+# exact `held-idle` receipt after the scheduler reports every persistent runner
+# idle. The supported CLI does not currently ship that producer; never invent
+# the receipt locally. Only then may tartci perform the provider-side bootout.
+# No second scheduler lives here.
 tartci_pool_quiesce_persistent_agents_unlocked() {
   local dir="${1:-$HOME/Library/LaunchAgents}" label pid pending=0 target persistent=""
   persistent="$(tartci_pool_runner_agents "$dir" | grep '^actions[.]runner[.]' || true)"

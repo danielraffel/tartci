@@ -34,7 +34,10 @@ new native leases and JIT registrations, lets an already assigned exact job
 finish, and disables runner restart across reconnect/reboot. The persistent
 Actions preamble runner requires a Shipyard routing hold plus authoritative
 idle receipt before tartci will boot it out; without that receipt drain remains
-pending and exits nonzero. `pool off` remains immediate and may terminate work.
+pending and exits nonzero. The current supported Shipyard CLI does not produce
+this receipt; do not create it by hand. Persistent-runner drains therefore stay
+fail-closed until an authoritative producer is deployed. `pool off` remains
+immediate and may terminate work.
 See the runbook.
 
 On a host whose governed budget supports two full macOS guests, use

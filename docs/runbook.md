@@ -1311,13 +1311,16 @@ lanes change.
   job keeps its exact lease and finishes; an unregistered VM is discarded.
   Runner LaunchAgents are disabled so reboot cannot re-admit work. A detached
   local watcher retires a persistent `actions.runner.*` service only after
-  Shipyard has removed the host from routing, confirmed every such runner idle,
-  and atomically published `held-idle` at
+  an authoritative Shipyard integration has removed the host from routing,
+  confirmed every such runner idle, and atomically published `held-idle` at
   `~/.config/tartci/persistent-runner-admission-hold`. This includes host
-  preamble runners that do not match the tart-runner naming family. Without
-  that authoritative receipt, `pool drain` leaves the durable provider/native
-  gates closed but exits 3 and reports drain pending; local worker absence is
-  not accepted because it misses the accepted-job-before-worker-spawn race.
+  preamble runners that do not match the tart-runner naming family. The current
+  supported Shipyard CLI does not include that integration or any command that
+  produces this receipt. Do not write the file manually: without an
+  authoritative producer, `pool drain` deliberately leaves the durable
+  provider/native gates closed, exits 3, and reports drain pending. Local worker
+  absence is not accepted because it misses the
+  accepted-job-before-worker-spawn race.
   The state survives terminal disconnect and reboot.
 - `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
   and `pool-state=off`, disable restart, and immediately boot out every runner

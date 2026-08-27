@@ -313,6 +313,16 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json]"
+  case "$sub" in
+    -h|--help|help) echo "$pool_usage"; return 0 ;;
+  esac
+  local arg
+  for arg in "$@"; do
+    case "$arg" in
+      -h|--help) echo "$pool_usage"; return 0 ;;
+    esac
+  done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
   local agents_dir="$HOME/Library/LaunchAgents"
   case "$sub" in
@@ -431,7 +441,7 @@ EOF
           >>"$HOME/Library/Logs/tartci/pool-drain.log" 2>&1 </dev/null &
       fi
       if [ -n "$persistent_agents" ] && ! tartci_pool_persistent_hold_ready; then
-        echo "drain pending: persistent runners require Shipyard held-idle receipt at $TARTCI_POOL_PERSISTENT_HOLD_FILE" >&2
+        echo "drain pending: persistent runners require an authoritative Shipyard held-idle receipt at $TARTCI_POOL_PERSISTENT_HOLD_FILE; no supported producer is currently shipped, so do not create this receipt manually" >&2
         return 3
       fi
       echo "draining: $host admits no new leases/jobs; assigned work may finish"

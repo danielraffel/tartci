@@ -244,6 +244,75 @@ class RunnerAgentLoadedTests(unittest.TestCase):
         self.assertNotIn("launchctl list", body)
 
 
+class PoolCommandHelpTests(unittest.TestCase):
+    def _run_pool(
+        self, root: Path, *args: str
+    ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
+        home = root / "home"
+        agents = home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        (agents / "actions.runner.owner.repo.preamble.plist").write_text("plist\n")
+
+        state = root / "state"
+        participation = root / "participation"
+        state.write_text("on\n")
+        participation.write_text("1\n")
+
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        launchctl_log = root / "launchctl.log"
+        nohup_log = root / "nohup.log"
+        for name, body in {
+            "scutil": "#!/bin/sh\nprintf 'test-host\\n'\n",
+            "launchctl": "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$FAKE_LAUNCHCTL_LOG\"\n",
+            "nohup": "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$FAKE_NOHUP_LOG\"\n",
+        }.items():
+            script = fake_bin / name
+            script.write_text(body)
+            script.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
+                "FAKE_NOHUP_LOG": str(nohup_log),
+                "TARTCI_POOL_STATE_FILE": str(state),
+                "TARTCI_POOL_PARTICIPATION_FILE": str(participation),
+                "TARTCI_POOL_TRANSITION_LOCK": str(root / "lock"),
+                "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(
+                    root / "persistent-runner-admission-hold"
+                ),
+            }
+        )
+        proc = subprocess.run(
+            [str(ROOT / "tartci"), "pool", *args],
+            cwd=ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        return proc, launchctl_log, nohup_log
+
+    def test_help_is_read_only_for_every_pool_subcommand(self) -> None:
+        for subcommand in (None, "on", "drain", "off", "status", "repair-lock"):
+            with self.subTest(
+                subcommand=subcommand
+            ), tempfile.TemporaryDirectory() as td:
+                root = Path(td)
+                args = ("--help",) if subcommand is None else (subcommand, "--help")
+                proc, launchctl_log, nohup_log = self._run_pool(root, *args)
+
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertIn("usage: tartci pool", proc.stdout)
+                self.assertEqual((root / "participation").read_text(), "1\n")
+                self.assertEqual((root / "state").read_text(), "on\n")
+                self.assertFalse(launchctl_log.exists(), f"launchctl called for {subcommand}")
+                self.assertFalse(nohup_log.exists(), f"watcher launched for {subcommand}")
+
+
 class PersistentRunnerDrainTests(unittest.TestCase):
     def _fake_path(self, td: str) -> tuple[Path, Path]:
         bindir = Path(td) / "bin"
