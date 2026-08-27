@@ -1,0 +1,47 @@
+schema = 1
+name = "m3-macos-fleet"
+
+# Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
+# operator vocabulary, but install authority is bound to that exact live tag.
+[host]
+id = "studio"
+home = "/Users/danielraffel"
+tart_home = "/Volumes/Workshop/VMs"
+cache_root = "/Users/danielraffel/.cache/pulp-ci"
+log_root = "/Users/danielraffel/Library/Logs/tartci"
+
+[[lane]]
+id = "pulp-gate"
+repo = "Generous-Corp/pulp"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm", "pulp-gate-fast"]
+replaces_launchd_labels = [
+  "com.danielraffel.pulp.tart-runner",
+  "com.danielraffel.pulp.tart-runner-slot2",
+]
+
+[[lane.tier]]
+label = "pulp-build-merge-group"
+workflow = "Build and Test"
+
+[[lane]]
+id = "forge-gate"
+repo = "Generous-Corp/forge"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
+workflows = ["protected macOS build"]
+replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
+
+[[lane]]
+id = "vellum-gate"
+repo = "Generous-Corp/vellum"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
+workflows = ["Locked macOS GPU proof", "README clean release proof"]
+replaces_launchd_labels = []

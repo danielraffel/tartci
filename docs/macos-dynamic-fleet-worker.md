@@ -7,15 +7,19 @@ capacity cap, durable pool switch, Tart store, and cache. A supervisor boots a
 VM only after it sees an exact matching queued job and acquires a governed
 lease. Failed queue discovery is fail-closed.
 
-`profiles/m1-macos-fleet.toml` is the first host declaration. M1 and M5 use
-`$HOME/VMs`; M3 uses `/Volumes/Workshop/VMs`. Paths are absolute in rendered
-LaunchAgents because minimal launchd/SSH environments must not guess `HOME`,
-`PATH`, or `TART_HOME`.
+The checked-in declarations are `profiles/{m1,m3,m5}-macos-fleet.toml`. M1 and
+M5 use `$HOME/VMs`; M3 uses `/Volumes/Workshop/VMs`. M3's durable Shipyard host
+tag is `studio`, so its profile binds `host.id = "studio"` even though the file
+uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
+because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
+`TART_HOME`.
 
 ## Stage without activation
 
 ```sh
 ./tartci fleet-macos validate profiles/m1-macos-fleet.toml
+./tartci fleet-macos validate profiles/m3-macos-fleet.toml
+./tartci fleet-macos validate profiles/m5-macos-fleet.toml
 out="$(mktemp -d)"
 ./tartci fleet-macos render profiles/m1-macos-fleet.toml --output "$out"
 for file in "$out"/*.plist; do plutil -lint "$file"; done
@@ -55,7 +59,7 @@ changing durable participation. `pool off` continues to discover and stop all
 runner agents; the receipt narrows installation authority, not emergency-stop
 coverage.
 
-Pulp exposes only the merge-group event tier. A lower PR tier is intentionally
+Each host's Pulp lane exposes only the merge-group event tier. A lower PR tier is intentionally
 absent until the provider can recheck higher-priority demand after the bounded
 Shipyard admission wait; otherwise a PR could consume a slot for a merge-group
 that arrived during admission. Forge and Vellum use their
@@ -68,7 +72,8 @@ measurements put it materially behind M3/M5, and the settled placement contract
 keeps it on generic rollback/non-required work with a ten-minute queue-age
 delay. Making M1 a second required merge-group worker requires fresh comparative
 timings and a separately reviewed contract/workflow change; this host profile
-does not silently reverse that incident-bought decision.
+does not silently reverse that incident-bought decision. M3 and M5 retain the
+required `pulp-gate-fast` capability their live gate controllers already carry.
 
 ## Rejoin and offline behavior
 

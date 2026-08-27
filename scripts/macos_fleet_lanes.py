@@ -31,7 +31,8 @@ LANE_KEYS = {
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
 REPLACED_AGENT = re.compile(
-    r"^com[.]danielraffel[.][a-z0-9.-]+[.]tart-runner-[a-z0-9.-]+$"
+    r"^com[.]danielraffel[.](?:pulp[.]tart-runner|"
+    r"[a-z0-9.-]+[.]tart-runner-[a-z0-9.-]+)$"
 )
 
 
