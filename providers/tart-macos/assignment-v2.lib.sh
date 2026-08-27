@@ -119,6 +119,10 @@ tartci_assignment_v2_select(){
   printf '%s\n' "$cached_value"
 }
 
+tartci_assignment_v2_invalidate_selection(){
+  rm -f "$STATE_DIR/$RUNNER_NAME.assignment-v2-selection.cache"
+}
+
 tartci_assignment_v2_observe(){
   local interval now stamp_file last=0 tmp selection
   interval="${TARTCI_ASSIGNMENT_V2_OBSERVE_INTERVAL_SECS:-900}"
@@ -178,4 +182,18 @@ tartci_assignment_v2_pre_mint_valid(){
     tier=$((tier + 1))
   done <<< "$TIER_LABELS_CONFIG"
   [ "$tier" -gt "$selected_tier" ]
+}
+
+# A denied pre-mint check proves the cached selection is no longer authority:
+# the selected job was claimed/cancelled, a higher class arrived, or GitHub was
+# uncertain. Drop that cache before returning so the supervisor's next pass
+# performs a live scan and can immediately fall through to another eligible
+# class instead of repeatedly booting for the stale class until the TTL expires.
+tartci_assignment_v2_pre_mint_admit(){
+  local selected_tier="$1"
+  if tartci_assignment_v2_pre_mint_valid "$selected_tier"; then
+    return 0
+  fi
+  tartci_assignment_v2_invalidate_selection
+  return 1
 }
