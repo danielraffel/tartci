@@ -26,6 +26,8 @@
         <string>--allow-host-suffix</string>
         <string>ghcr.io</string>
         <string>--allow-host-suffix</string>
+        <string>formulae.brew.sh</string>
+        <string>--allow-host-suffix</string>
         <string>blob.core.windows.net</string>
         <string>--allow-host-suffix</string>
         <string>crates.io</string>
