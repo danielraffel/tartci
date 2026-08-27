@@ -34,12 +34,21 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
         suffixes = tuple(contract["literal_hosts"] + contract["transitive_hosts"])
         self.assertEqual(
             set(suffixes),
-            {"ghcr.io", "formulae.brew.sh", "storage.googleapis.com"},
+            {
+                "api.vcvrack.com",
+                "formulae.brew.sh",
+                "ghcr.io",
+                "registry.npmjs.org",
+                "storage.googleapis.com",
+            },
         )
         for suffix in suffixes:
             self.assertIn(f"<string>{suffix}</string>", template)
             self.assertTrue(relay.host_is_allowed(suffix, suffixes))
             self.assertFalse(relay.host_is_allowed(f"evil{suffix}", suffixes))
+            self.assertFalse(
+                relay.host_is_allowed(f"{suffix}.evil.example", suffixes)
+            )
         self.assertNotIn("<string>brew.sh</string>", template)
         self.assertNotIn("<string>homebrew.org</string>", template)
 
