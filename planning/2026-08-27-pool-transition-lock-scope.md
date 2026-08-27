@@ -1,6 +1,6 @@
 # Pool transition lock scope
 
-Status: implementation and local validation complete; publication pending
+Status: implementation and local validation complete; PR published
 
 Base: `origin/main` at `1d2f2ae9d5aa15cec4a513be35c75d59980a9400`
 
@@ -47,4 +47,6 @@ require the authoritative Shipyard held-idle receipt.
 - `./scripts/lint.sh`: passed (40 shell scripts, 77 Python files, all TOML).
 - Autoreview (`--mode local`, Codex): clean, no accepted/actionable findings,
   overall correctness `patch is correct` at confidence 0.89.
-- Commit, pushed head, PR URL, and CI result: pending.
+- Implementation commit: `0b4e9c09ea0da3bcee039e971b3d447cc8e6f0f5`.
+- PR: `danielraffel/tartci#131`.
+- PR exact-head CI result: pending.
