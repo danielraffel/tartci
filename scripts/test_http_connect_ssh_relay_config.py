@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -18,17 +19,27 @@ SPEC.loader.exec_module(relay)
 
 
 class HttpConnectSshRelayConfigTests(unittest.TestCase):
-    def test_launchd_allows_only_proven_homebrew_bootstrap_endpoints(self) -> None:
+    def test_launchd_covers_protected_macos_bootstrap_host_contract(self) -> None:
         template = (
             ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
         ).read_text()
-        self.assertIn("<string>ghcr.io</string>", template)
-        self.assertIn("<string>formulae.brew.sh</string>", template)
-        suffixes = ("ghcr.io", "formulae.brew.sh")
-        self.assertTrue(relay.host_is_allowed("ghcr.io", suffixes))
-        self.assertTrue(relay.host_is_allowed("formulae.brew.sh", suffixes))
-        self.assertFalse(relay.host_is_allowed("evilghcr.io", suffixes))
-        self.assertFalse(relay.host_is_allowed("evilformulae.brew.sh", suffixes))
+        contract = tomllib.loads(
+            (
+                ROOT / "profiles/pulp-protected-macos-bootstrap-hosts.toml"
+            ).read_text()
+        )
+        self.assertEqual(contract["schema"], 1)
+        self.assertEqual(contract["repo"], "Generous-Corp/pulp")
+        self.assertEqual(contract["workflow"], ".github/workflows/build.yml")
+        suffixes = tuple(contract["literal_hosts"] + contract["transitive_hosts"])
+        self.assertEqual(
+            set(suffixes),
+            {"ghcr.io", "formulae.brew.sh", "storage.googleapis.com"},
+        )
+        for suffix in suffixes:
+            self.assertIn(f"<string>{suffix}</string>", template)
+            self.assertTrue(relay.host_is_allowed(suffix, suffixes))
+            self.assertFalse(relay.host_is_allowed(f"evil{suffix}", suffixes))
         self.assertNotIn("<string>brew.sh</string>", template)
         self.assertNotIn("<string>homebrew.org</string>", template)
 
