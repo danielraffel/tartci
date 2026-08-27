@@ -119,7 +119,11 @@ def load(path: Path) -> dict:
             fail(f"lane {lane_id}: tier must be an array of tables")
         if bool(workflows) == bool(tiers):
             fail(f"lane {lane_id}: declare exactly one of workflows or [[lane.tier]]")
-        replacements = lane.get("replaces_launchd_labels") or []
+        replacements = (
+            lane["replaces_launchd_labels"]
+            if "replaces_launchd_labels" in lane
+            else []
+        )
         if (not isinstance(replacements, list)
                 or not all(isinstance(value, str)
                            and REPLACED_AGENT.fullmatch(value)

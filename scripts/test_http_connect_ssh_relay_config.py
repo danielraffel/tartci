@@ -52,6 +52,28 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
         self.assertNotIn("<string>brew.sh</string>", template)
         self.assertNotIn("<string>homebrew.org</string>", template)
 
+    def test_launchd_covers_release_node_bootstrap_host_contract(self) -> None:
+        template = (
+            ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
+        ).read_text()
+        contract = tomllib.loads(
+            (ROOT / "profiles/pulp-release-macos-bootstrap-hosts.toml").read_text()
+        )
+        self.assertEqual(contract["schema"], 1)
+        self.assertEqual(contract["repo"], "Generous-Corp/pulp")
+        self.assertEqual(contract["workflow"], ".github/workflows/release-cli.yml")
+        self.assertEqual(
+            contract["bootstrap_entrypoint"],
+            "tools/scripts/prepare_node_runtime.py",
+        )
+        suffixes = tuple(contract["literal_hosts"] + contract["transitive_hosts"])
+        self.assertEqual(suffixes, ("nodejs.org",))
+        self.assertIn("<string>nodejs.org</string>", template)
+        self.assertTrue(relay.host_is_allowed("nodejs.org", suffixes))
+        self.assertTrue(relay.host_is_allowed("www.nodejs.org", suffixes))
+        self.assertFalse(relay.host_is_allowed("evilnodejs.org", suffixes))
+        self.assertFalse(relay.host_is_allowed("nodejs.org.evil.example", suffixes))
+
     def test_launchd_allows_bounded_cargo_registry_endpoints(self) -> None:
         template = (
             ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"

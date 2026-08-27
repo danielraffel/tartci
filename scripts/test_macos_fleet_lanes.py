@@ -326,6 +326,36 @@ replaces_launchd_labels=["REPLACEMENT"]
             self.assertEqual(denied.returncode, 2)
             self.assertIn("replaces_launchd_labels", denied.stderr)
 
+    def test_supplied_replacement_labels_must_be_an_array_even_when_falsy(self) -> None:
+        base = '''schema=1
+name="replacement-type-check"
+[host]
+id="m1"
+home="/h"
+tart_home="/v"
+cache_root="/c"
+log_root="/l"
+[[lane]]
+id="forge"
+repo="Generous-Corp/forge"
+golden="g"
+labels=["self-hosted","macOS","ARM64"]
+workflows=["Build"]
+replaces_launchd_labels=REPLACEMENT
+'''
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, replacement in (("empty-string", '""'), ("empty-table", "{}")):
+                with self.subTest(name=name):
+                    profile = root / f"{name}.toml"
+                    profile.write_text(base.replace("REPLACEMENT", replacement))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(profile)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("replaces_launchd_labels", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
