@@ -1,0 +1,10 @@
+# Copy only to a host whose direct GitHub TLS path was measured unreliable:
+#   ~/.config/tartci/network-profile.toml
+schema_version = 1
+
+[http_connect_relay]
+enabled = true
+relay_hosts = ["macmini", "m1"]
+github_cli = "ghapp"
+github_probe_repo = "Generous-Corp/pulp"
+probe_timeout_seconds = 15

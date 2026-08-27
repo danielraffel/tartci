@@ -9,6 +9,7 @@
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
+#   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render> CONFIG # validate/render dormant generic VM lanes
@@ -102,6 +103,10 @@ cmd_status() {
 
 cmd_host_profile() {
   exec python3 "$HERE/scripts/host_profile.py" "$@"
+}
+
+cmd_network_profile() {
+  exec python3 "$HERE/scripts/network_profile.py" "$@"
 }
 
 cmd_leases() {
@@ -264,7 +269,32 @@ cmd_launchd() {
   case "$sub" in
     reload) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --reload "$@" ;;
     status) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
-    heal)   exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" "$@" ;;
+    heal)
+      # Reboot/offline rejoin convergence includes the optional per-host relay
+      # profile. Keep the watchdog's JSON output singular and pass dry-run
+      # through without forwarding unrelated watchdog flags.
+      local network_args=(reconcile --quiet)
+      local arg
+      local json_requested=0
+      for arg in "$@"; do
+        [ "$arg" = "--dry-run" ] && network_args+=(--dry-run)
+        [ "$arg" = "--json" ] && json_requested=1
+      done
+      if [ "$json_requested" -eq 1 ]; then
+        network_args=(reconcile --json)
+        for arg in "$@"; do
+          [ "$arg" = "--dry-run" ] && network_args+=(--dry-run)
+        done
+        local network_output
+        if ! network_output="$(python3 "$HERE/scripts/network_profile.py" "${network_args[@]}")"; then
+          printf '%s\n' "$network_output"
+          return 6
+        fi
+      else
+        python3 "$HERE/scripts/network_profile.py" "${network_args[@]}" || return 6
+      fi
+      exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" "$@"
+      ;;
     *) echo "usage: tartci launchd <reload <label> | status | heal> [--dry-run] [--json]"; return 2 ;;
   esac
 }
@@ -286,6 +316,14 @@ cmd_pool() {
         tartci_pool_write_state off
       else
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+        # A host-local network profile is an opt-in admission prerequisite.
+        # Converge and prove its relay before making participation visible or
+        # loading controllers; absent/disabled profiles are a strict no-op.
+        if ! python3 "$HERE/scripts/network_profile.py" reconcile --quiet --pool-lock-held; then
+          tartci_pool_lock_release
+          echo "pool on refused: opt-in network profile did not converge" >&2
+          return 6
+        fi
         # A held-idle receipt authorizes exactly one drain era. Reopening the
         # pool invalidates it before admission becomes visible again.
         rm -f "$TARTCI_POOL_PERSISTENT_HOLD_FILE"
@@ -422,6 +460,7 @@ case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
+  network-profile) shift; cmd_network_profile "$@" ;;
   leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;

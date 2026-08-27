@@ -111,6 +111,7 @@ git clone <this-repo> tartci && cd tartci
 ./tartci metrics report   # text build/cache table (or `metrics dashboard` for HTML)
 ./tartci status --json    # host-local provider/capacity/profile state for agents
 ./tartci host-profile --json  # derived role budget; read-only
+./tartci network-profile status --json # opt-in per-host relay intent/drift
 ./tartci leases status --json # host-wide core/memory/per-volume disk reservations
 ./tartci profile plan normal-local-fast --repo Generous-Corp/pulp --json
 ./tartci timings          # summarize per-job Windows/Linux VM timing.tsv files
