@@ -30,6 +30,10 @@
         <string>--allow-host-suffix</string>
         <string>storage.googleapis.com</string>
         <string>--allow-host-suffix</string>
+        <string>registry.npmjs.org</string>
+        <string>--allow-host-suffix</string>
+        <string>api.vcvrack.com</string>
+        <string>--allow-host-suffix</string>
         <string>blob.core.windows.net</string>
         <string>--allow-host-suffix</string>
         <string>crates.io</string>
