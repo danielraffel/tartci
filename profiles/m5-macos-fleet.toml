@@ -1,10 +1,8 @@
 schema = 1
-name = "m1-macos-fleet"
+name = "m5-macos-fleet"
 
-# This file describes staged capacity, not activation. Rendering it neither
-# changes the durable pool-off state nor loads a LaunchAgent.
 [host]
-id = "m1"
+id = "m5"
 home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
@@ -14,10 +12,13 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
 golden = "pulp-build-runner:latest"
-priority = "vm"
-min_queued_age_seconds = 600
-labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
-replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm", "pulp-gate-fast"]
+replaces_launchd_labels = [
+  "com.danielraffel.pulp.tart-runner-macos-gate",
+  "com.danielraffel.pulp.tart-runner-macos-gate-slot2",
+]
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -31,14 +32,14 @@ priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
 workflows = ["protected macOS build"]
-replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
+replaces_launchd_labels = []
 
 [[lane]]
 id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 golden = "pulp-build-runner:latest"
 priority = "gate"
-min_queued_age_seconds = 600
-labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
-replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
+replaces_launchd_labels = []

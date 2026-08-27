@@ -1,12 +1,12 @@
 schema = 1
-name = "m1-macos-fleet"
+name = "m3-macos-fleet"
 
-# This file describes staged capacity, not activation. Rendering it neither
-# changes the durable pool-off state nor loads a LaunchAgent.
+# Shipyard's durable host tag for M3 is `studio`. The profile name remains M3
+# operator vocabulary, but install authority is bound to that exact live tag.
 [host]
-id = "m1"
+id = "studio"
 home = "/Users/danielraffel"
-tart_home = "/Users/danielraffel/VMs"
+tart_home = "/Volumes/Workshop/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 
@@ -14,10 +14,13 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
 golden = "pulp-build-runner:latest"
-priority = "vm"
-min_queued_age_seconds = 600
-labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
-replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm", "pulp-gate-fast"]
+replaces_launchd_labels = [
+  "com.danielraffel.pulp.tart-runner",
+  "com.danielraffel.pulp.tart-runner-slot2",
+]
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -38,7 +41,7 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 golden = "pulp-build-runner:latest"
 priority = "gate"
-min_queued_age_seconds = 600
-labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m1"]
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
-replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
+replaces_launchd_labels = []

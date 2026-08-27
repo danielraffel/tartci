@@ -1,0 +1,14 @@
+schema = 1
+name = "pulp-release-macos-bootstrap-hosts"
+repo = "Generous-Corp/pulp"
+workflow = ".github/workflows/release-cli.yml"
+bootstrap_entrypoint = "tools/scripts/prepare_node_runtime.py"
+
+# The release workflow invokes the bootstrap entrypoint above to download a
+# pinned official Node.js archive. Keep this exact host synchronized with that
+# source-owned bootstrap rather than broadening the relay to a parent suffix.
+literal_hosts = [
+  "nodejs.org",
+]
+
+transitive_hosts = []
