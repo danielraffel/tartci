@@ -947,7 +947,7 @@ run_one(){
     return 75
   fi
   if [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
-     && ! tartci_assignment_v2_pre_mint_valid "$selected_tier"; then
+     && ! tartci_assignment_v2_pre_mint_admit "$selected_tier"; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM"
     event assignment_v2_pre_mint_denied \
@@ -1035,7 +1035,7 @@ i=0
   exit 0
 }
 [ -n "$PRINT_PRE_MINT_SELECTION" ] && {
-  if tartci_assignment_v2_pre_mint_valid "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
+  if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
   exit 0
 }
 [ -n "$PRINT_HIGHER_PRIORITY" ] && {

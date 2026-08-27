@@ -163,6 +163,26 @@ class AssignmentV2Tests(unittest.TestCase):
         preempted = self._runner("--print-pre-mint-selection", "1")
         self.assertEqual(preempted.stdout.strip(), "0", preempted.stderr)
 
+    def test_pre_mint_denial_invalidates_stale_class_and_falls_through(self) -> None:
+        self._state(merge=True, pr=True)
+        selected = self._runner("--print-selection")
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(selected.stdout.strip().split("\t")[2], "0")
+
+        # Preserve the cached tier-0 selection while the live queue changes:
+        # another host claimed the merge-group job, leaving PR-head work.
+        self.state.write_text(json.dumps({"pr": True}), encoding="utf-8")
+        denied = self._runner("--print-pre-mint-selection", "0")
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        self.assertEqual(denied.stdout.strip(), "0")
+
+        replacement = self._runner("--print-selection")
+        self.assertEqual(replacement.returncode, 0, replacement.stderr)
+        fields = replacement.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1")
+        self.assertEqual(fields[2], "1")
+        self.assertIn("pulp-build-pr-head", fields[1].split(","))
+
     def test_api_failure_denies_selection(self) -> None:
         self._state(api_fail=True)
         result = self._runner("--print-selection")
