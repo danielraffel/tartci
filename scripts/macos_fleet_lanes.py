@@ -11,19 +11,24 @@ import argparse
 import hashlib
 import json
 import os
+import posixpath
 import plistlib
 import re
 import sys
 import tomllib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-TOP_KEYS = {"schema", "name", "host", "lane"}
+TOP_KEYS = {"schema", "name", "host", "stacked_images", "lane"}
 HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
+STACKED_IMAGE_KEYS = {
+    "enabled", "minimum_macos_major", "minimum_tart_version",
+    "registry_username_file", "registry_token_file", "flat_rollback",
+}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -72,6 +77,43 @@ def load(path: Path) -> dict:
             fail(f"host.{key} must be an absolute path")
     if host["tart_home"] == host["home"] or host["log_root"] == host["home"]:
         fail("Tart and log roots may not be the host home directory itself")
+    stacked = data.get("stacked_images")
+    if stacked is not None and not isinstance(stacked, dict):
+        fail("stacked_images must be a table")
+    if stacked is not None:
+        unknown = set(stacked) - STACKED_IMAGE_KEYS
+        if unknown:
+            fail(f"unknown stacked_images keys: {sorted(unknown)}")
+        if set(stacked) != STACKED_IMAGE_KEYS:
+            fail("stacked_images must declare every rollout and rollback field")
+        if type(stacked["enabled"]) is not bool:
+            fail("stacked_images.enabled must be a boolean")
+        if stacked["enabled"]:
+            fail("stacked_images.enabled cannot be true before provider support and benchmark graduation")
+        if type(stacked["minimum_macos_major"]) is not int or stacked["minimum_macos_major"] < 27:
+            fail("stacked_images.minimum_macos_major must be an integer of at least 27")
+        if (not isinstance(stacked["minimum_tart_version"], str)
+                or not re.fullmatch(r"[0-9]+[.][0-9]+[.][0-9]+", stacked["minimum_tart_version"])):
+            fail("stacked_images.minimum_tart_version must be a semantic version")
+        secret_root = PurePosixPath(host["home"]) / ".config/pulp/secrets"
+        secret_paths: list[PurePosixPath] = []
+        for key in ("registry_username_file", "registry_token_file"):
+            value = stacked[key]
+            if not isinstance(value, str):
+                fail(f"stacked_images.{key} must be an absolute host-local Pulp secret path")
+            normalized = PurePosixPath(posixpath.normpath(value))
+            try:
+                relative = normalized.relative_to(secret_root)
+            except ValueError:
+                relative = None
+            if (not normalized.is_absolute() or normalized.as_posix() != value
+                    or relative is None or not relative.parts):
+                fail(f"stacked_images.{key} must be an absolute host-local Pulp secret path")
+            secret_paths.append(normalized)
+        if secret_paths[0] == secret_paths[1]:
+            fail("stacked_images registry username and token paths must be distinct")
+        if not isinstance(stacked["flat_rollback"], str) or not stacked["flat_rollback"].strip():
+            fail("stacked_images.flat_rollback must name the retained flat golden")
     if not lanes:
         fail("at least one [[lane]] is required")
     generated_labels = {
