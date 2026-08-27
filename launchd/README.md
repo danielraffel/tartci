@@ -140,6 +140,39 @@ direct GitHub TLS path is measurably unreliable, render that host's controller
 with an explicit loopback HTTP CONNECT proxy and give only disposable guests
 the bridge address:
 
+The durable source is the opt-in host file
+`~/.config/tartci/network-profile.toml` (copy the commented shape from
+`docs/examples/host-network-profile.toml`). `tartci network-profile status`
+shows its intended relay and controller drift;
+`tartci network-profile reconcile` renders the existing restricted relay
+template, proves an authenticated GitHub request through loopback, injects the
+fixed host/guest addresses into every installed macOS controller, and applies
+changed plists with a full bootout/bootstrap. It refuses controller reloads
+while any Tart VM is running and records the exact successfully loaded plist
+generation so an interrupted reload is retried. An absent profile is a no-op
+until it has owned relay state, so this does not impose a fleet-wide proxy.
+Both uppercase and lowercase proxy variables are owned, and `NO_PROXY` plus
+`no_proxy` are constrained to loopback; stale controller environment cannot
+bypass the measured relay path. The host address remains
+`http://127.0.0.1:49125`, while only guests receive
+`http://192.168.64.1:49125`.
+After first apply, removing or disabling the profile fails pool admission rather
+than silently leaving unprobed proxy state. Supported rollback is explicit and
+idle: `tartci pool off`, remove/disable the profile, then run
+`tartci network-profile rollback`. Rollback refuses running VMs or loaded
+controllers, restores pre-profile environment/relay state, and removes the
+ownership receipt only after convergence.
+
+`tartci pool on` runs that reconciliation before reopening admission. The
+launchd watchdog does the same on every heal pass, covering reboot and offline
+rejoin. If the relay or authenticated probe is unhealthy, both paths fail
+closed instead of loading a scan-blind controller. Do not put relay hostnames,
+GitHub tokens, or proxy variables in shell startup files; the profile records
+only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
+While pool participation is off, reconciliation loads and proves only the
+relay, writes controller intent to disk, and records it as staged; it never
+starts a disabled controller. `pool on` then bootstraps those exact files.
+
 ```sh
 python3 scripts/render_launchd_template.py \
   launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template \
@@ -173,7 +206,7 @@ python3 scripts/render_launchd_template.py \
   --set "HOME=$HOME" \
   --set "TARTCI_HTTP_RELAY_PRIMARY=macmini" \
   --set "TARTCI_HTTP_RELAY_SECONDARY=m1" \
-  > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.http-connect-ssh-relay.plist"
+  > "$HOME/Library/LaunchAgents/com.danielraffel.network.http-connect-ssh-relay.plist"
 ```
 
 Its non-tartci label intentionally keeps this silent network service outside

@@ -24,6 +24,8 @@
         <string>--allow-host-suffix</string>
         <string>actions.githubusercontent.com</string>
         <string>--allow-host-suffix</string>
+        <string>ghcr.io</string>
+        <string>--allow-host-suffix</string>
         <string>blob.core.windows.net</string>
         <string>--allow-host-suffix</string>
         <string>crates.io</string>
