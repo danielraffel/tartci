@@ -451,7 +451,7 @@ EOF
         local first=1 label loaded
         while IFS= read -r label; do
           [ -n "$label" ] || continue
-          loaded=false; launchctl list 2>/dev/null | grep -qF "$label" && loaded=true
+          loaded=false; tartci_pool_agent_loaded "$label" && loaded=true
           [ "$first" = 1 ] || printf ','
           printf '{"label":"%s","loaded":%s}' "$label" "$loaded"; first=0
         done <<EOF
@@ -466,7 +466,7 @@ EOF
         local label loaded any=0
         while IFS= read -r label; do
           [ -n "$label" ] || continue; any=1
-          loaded=stopped; launchctl list 2>/dev/null | grep -qF "$label" && loaded=loaded
+          loaded=stopped; tartci_pool_agent_loaded "$label" && loaded=loaded
           printf '  %-56s %s\n' "$label" "$loaded"
         done <<EOF
 $(tartci_pool_runner_agents "$agents_dir")
