@@ -18,14 +18,17 @@ SPEC.loader.exec_module(relay)
 
 
 class HttpConnectSshRelayConfigTests(unittest.TestCase):
-    def test_launchd_allows_proven_homebrew_portable_ruby_registry_only(self) -> None:
+    def test_launchd_allows_only_proven_homebrew_bootstrap_endpoints(self) -> None:
         template = (
             ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
         ).read_text()
         self.assertIn("<string>ghcr.io</string>", template)
-        suffixes = ("ghcr.io",)
+        self.assertIn("<string>formulae.brew.sh</string>", template)
+        suffixes = ("ghcr.io", "formulae.brew.sh")
         self.assertTrue(relay.host_is_allowed("ghcr.io", suffixes))
+        self.assertTrue(relay.host_is_allowed("formulae.brew.sh", suffixes))
         self.assertFalse(relay.host_is_allowed("evilghcr.io", suffixes))
+        self.assertFalse(relay.host_is_allowed("evilformulae.brew.sh", suffixes))
         self.assertNotIn("<string>brew.sh</string>", template)
         self.assertNotIn("<string>homebrew.org</string>", template)
 
