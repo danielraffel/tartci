@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import plistlib
 import subprocess
 import sys
 import tempfile
@@ -62,6 +63,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             [[lane]]
             id = "forge-gate"
             repo = "Generous-Corp/forge"
+            runner_group_id = 11
             golden = "pulp-build-runner:latest"
             labels = ["self-hosted", "macOS", "ARM64", "forge-gate-fast"]
             workflows = ["protected macOS build"]
@@ -102,6 +104,11 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         installed = list(self.agents.glob("*macos-fleet*.plist"))
         self.assertEqual(1, len(installed))
+        self.assertEqual(
+            plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
+            ["TARTCI_RUNNER_GROUP_ID"],
+            "11",
+        )
         self.assertFalse(self.legacy.exists())
         self.assertFalse(stale.exists())
         retired = list((self.agents / ".tartci-retired").rglob("*.retired"))

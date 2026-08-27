@@ -17,6 +17,11 @@ HOST_CONFIGS = {
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
 }
+RUNNER_GROUP_IDS = {
+    "Generous-Corp/pulp": 3,
+    "Generous-Corp/forge": 11,
+    "Generous-Corp/vellum": 8,
+}
 
 
 class MacosFleetLaneTests(unittest.TestCase):
@@ -46,6 +51,32 @@ class MacosFleetLaneTests(unittest.TestCase):
                     lane for lane in data["lane"] if lane["id"] == "pulp-gate"
                 )["labels"]
                 self.assertEqual("pulp-gate-fast" in pulp_labels, expected[host_id][2])
+                self.assertEqual(
+                    {lane["repo"]: lane["runner_group_id"] for lane in data["lane"]},
+                    RUNNER_GROUP_IDS,
+                )
+                with tempfile.TemporaryDirectory() as td:
+                    rendered = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "render", str(config),
+                         "--output", td],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                    values = [
+                        plistlib.loads(path.read_bytes())
+                        for path in Path(td).glob("*.plist")
+                    ]
+                    self.assertEqual(
+                        {
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_GROUP_ID"]
+                            for value in values
+                        },
+                        {
+                            repo: str(group_id)
+                            for repo, group_id in RUNNER_GROUP_IDS.items()
+                        },
+                    )
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
         m3 = tomllib.loads(HOST_CONFIGS["studio"].read_text())
@@ -92,6 +123,14 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/danielraffel/Library/Logs/tartci") for value in values))
             repos = {value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"] for value in values}
             self.assertEqual(repos, {"Generous-Corp/pulp", "Generous-Corp/forge", "Generous-Corp/vellum"})
+            self.assertEqual(
+                {
+                    value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
+                    value["EnvironmentVariables"]["TARTCI_RUNNER_GROUP_ID"]
+                    for value in values
+                },
+                {repo: str(group_id) for repo, group_id in RUNNER_GROUP_IDS.items()},
+            )
             pulp = next(value for value in values if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"].endswith("/pulp"))
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_VM_LEASE_PRIORITY"], "vm")
@@ -178,6 +217,7 @@ log_root="/l"
 [[lane]]
 id="forge"
 repo="Generous-Corp/forge"
+runner_group_id=11
 golden="g"
 labels=["self-hosted","macOS","ARM64"]
 workflows="Build"
@@ -188,6 +228,42 @@ workflows="Build"
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("string array", result.stderr)
+
+    def test_protected_runner_group_id_is_required_and_non_default(self) -> None:
+        base = '''schema=1
+[host]
+id="m1"
+home="/h"
+tart_home="/v"
+cache_root="/c"
+log_root="/l"
+[[lane]]
+id="forge"
+repo="Generous-Corp/forge"
+runner_group_id=GROUP
+golden="g"
+labels=["self-hosted","macOS","ARM64"]
+workflows=["Build"]
+'''
+        fixtures = {
+            "missing": base.replace("runner_group_id=GROUP\n", ""),
+            "default": base.replace("GROUP", "1"),
+            "zero": base.replace("GROUP", "0"),
+            "negative": base.replace("GROUP", "-1"),
+            "boolean": base.replace("GROUP", "true"),
+            "string": base.replace("GROUP", '"11"'),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    bad = Path(td) / f"runner-group-{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn("runner_group_id", result.stderr)
 
     def test_scalar_types_fail_closed_without_traceback(self) -> None:
         fixtures = [
@@ -202,6 +278,7 @@ log_root="/l"
 [[lane]]
 id="x"
 repo="Generous-Corp/pulp"
+runner_group_id=3
 golden=true
 labels=["self-hosted","macOS","ARM64"]
 workflows=["Build"]
@@ -216,6 +293,7 @@ log_root="/l"
 [[lane]]
 id="x"
 repo="Generous-Corp/pulp"
+runner_group_id=3
 golden="g"
 min_queued_age_seconds=true
 labels=["self-hosted","macOS","ARM64"]
@@ -244,6 +322,7 @@ log_root="/l"
 [[lane]]
 id="x"
 repo="Generous-Corp/pulp"
+runner_group_id=3
 golden="g"
 labels=["self-hosted","macOS","ARM64"]
 workflows=["Build"]
@@ -279,6 +358,7 @@ log_root="/l"
 [[lane]]
 id="forge"
 repo="Generous-Corp/forge"
+runner_group_id=11
 golden="g"
 labels=["self-hosted","macOS","ARM64"]
 workflows=["Build"]
@@ -303,6 +383,7 @@ log_root="/l"
 [[lane]]
 id="forge"
 repo="Generous-Corp/forge"
+runner_group_id=11
 golden="g"
 labels=["self-hosted","macOS","ARM64"]
 workflows=["Build"]
@@ -338,6 +419,7 @@ log_root="/l"
 [[lane]]
 id="forge"
 repo="Generous-Corp/forge"
+runner_group_id=11
 golden="g"
 labels=["self-hosted","macOS","ARM64"]
 workflows=["Build"]

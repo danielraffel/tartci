@@ -13,6 +13,7 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
+runner_group_id = 3
 golden = "pulp-build-runner:latest"
 priority = "vm"
 min_queued_age_seconds = 600
@@ -26,6 +27,7 @@ workflow = "Build and Test"
 [[lane]]
 id = "forge-gate"
 repo = "Generous-Corp/forge"
+runner_group_id = 11
 golden = "pulp-build-runner:latest"
 priority = "gate"
 min_queued_age_seconds = 0
@@ -36,6 +38,7 @@ replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
 [[lane]]
 id = "vellum-gate"
 repo = "Generous-Corp/vellum"
+runner_group_id = 8
 golden = "pulp-build-runner:latest"
 priority = "gate"
 min_queued_age_seconds = 600

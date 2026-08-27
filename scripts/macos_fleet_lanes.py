@@ -26,7 +26,7 @@ TOP_KEYS = {"schema", "name", "host", "lane"}
 HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
-    "min_queued_age_seconds", "replaces_launchd_labels",
+    "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
 }
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -93,6 +93,12 @@ def load(path: Path) -> dict:
         seen.add(lane_id)
         if not isinstance(lane.get("repo"), str) or not REPO.fullmatch(lane["repo"]):
             fail(f"lane {lane_id}: repo must be OWNER/REPO")
+        runner_group_id = lane.get("runner_group_id")
+        if type(runner_group_id) is not int or runner_group_id <= 1:
+            fail(
+                f"lane {lane_id}: runner_group_id must be an explicit "
+                "non-Default GitHub runner group integer"
+            )
         labels = lane.get("labels") or []
         if (not isinstance(labels, list) or not labels
                 or not all(isinstance(value, str) and value for value in labels)
@@ -253,6 +259,7 @@ def lane_plist(data: dict, lane: dict) -> dict:
         "TARTCI_GH_CLI": "ghapp",
         "TARTCI_LAUNCHD_LABEL": label,
         "TARTCI_RUNNER_REPO": lane["repo"],
+        "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),
         "TARTCI_RUNNER_LABELS": ",".join(lane["labels"]),
         "TARTCI_MACOS_GOLDEN": lane["golden"],
         "TARTCI_VM_LEASE_PRIORITY": lane.get("priority", "gate"),
