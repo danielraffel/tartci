@@ -35,10 +35,8 @@ labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "for
 # PR runs are surfaced as the trigger workflow; protected-main proofs may invoke
 # the reusable callee directly. Watch both names on the same runner contract.
 workflows = ["build", "protected macOS build"]
-# This command is a host-local, secret-free wrapper. It reads the M1 stackbench
-# credential only for GitHub's runner generate-jitconfig endpoint; normal fleet
-# control-plane traffic remains on the Shipyard App wrapper (ghapp).
-jit_github_cli = "tartci-m1-stackbench-jit-gh"
+# The macOS-27 stackbench credential is registry-only. JIT registration stays
+# on the default Shipyard App route; do not repurpose registry credentials.
 replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
 
 [[lane]]

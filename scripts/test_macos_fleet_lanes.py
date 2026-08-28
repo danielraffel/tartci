@@ -149,10 +149,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "forge-gate")["replaces_launchd_labels"],
             )
             forge = next(value for value in values if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"].endswith("/forge"))
-            self.assertEqual(
-                forge["EnvironmentVariables"]["TARTCI_JIT_GH_CLI"],
-                "tartci-m1-stackbench-jit-gh",
-            )
+            self.assertNotIn("TARTCI_JIT_GH_CLI", forge["EnvironmentVariables"])
             self.assertNotIn("TARTCI_JIT_GH_CLI", pulp["EnvironmentVariables"])
             self.assertEqual(
                 ["com.danielraffel.vellum.tart-runner-macos"],
