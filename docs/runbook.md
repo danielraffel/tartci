@@ -272,6 +272,32 @@ organization permission that TartCI's ordinary repository polling does not:
 endpoints to fail closed unless the selected repositories, selected workflows,
 and live runner membership still match the intended trust boundary.
 
+### JIT registration preflight (all macOS fleet hosts)
+
+Keep `TARTCI_GH_CLI=ghapp` for every M1, M3, and M5 lane. For runner group `1`,
+TartCI uses the repository runner endpoint. Any non-default group uses the
+organization JIT endpoint:
+
+```bash
+ghapp api -X POST orgs/<org>/actions/runners/generate-jitconfig \
+  -f name=<unique-disposable-name> -F runner_group_id=<group-id> \
+  -f 'labels[]=self-hosted' -f 'labels[]=macOS' -f 'labels[]=ARM64'
+# Read .runner.id from the response, then remove the disposable registration.
+ghapp api -X DELETE orgs/<org>/actions/runners/<runner-id>
+```
+
+This is an authorization probe only; it must not start a VM, dispatch a
+workflow, or leave a runner record. A repository-endpoint 404 is not evidence
+that the App cannot mint the organization endpoint. If the exact probe fails,
+leave the lane's JIT denial fuse intact and repair the App installation or its
+approved organization permission. Never fall back to ambient `gh`, a registry
+credential, an image-pull token, or a project experiment token.
+
+The M1 macOS-27 stackbench credential is GHCR-only. GHCR harnesses pin
+`/usr/bin/curl` because an M1 PATH-shadowing wrapper once appended a second
+Authorization header and caused a false 401. This curl rule is unrelated to
+the Actions JIT path.
+
 That read access enables more than a dashboard. It lets the deployment
 prove that disposable Tart macOS runners, the separate Proxmox Linux pool, and
 native Intel macOS capacity are attached to the right capability before work is

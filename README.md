@@ -252,6 +252,16 @@ credential solely for the GitHub runner-registration edge may set
 `generate-jitconfig` uses that override. Never put a token in a plist and never
 silently fall back from `ghapp` to ambient `gh`.
 
+For a non-default organization runner group, TartCI mints through
+`orgs/<org>/actions/runners/generate-jitconfig`, not the repository endpoint.
+The normal Shipyard App route is therefore also the JIT route unless a fresh,
+exact endpoint probe proves otherwise. Before changing any lane, use `ghapp` to
+mint one uniquely named disposable configuration for the exact group and label
+set, then delete its returned runner record. A repository-endpoint 404 does not
+prove that the App lacks organization-runner permission. A 401, 403, or 404 from
+the exact organization endpoint is a fail-closed authorization problem: do not
+boot a VM, retry with ambient `gh`, or substitute an unrelated token.
+
 The dynamic macOS fleet profile supports this as the optional per-lane
 `jit_github_cli` field. It accepts only an executable name (not a shell command
 or token); the renderer emits it as `TARTCI_JIT_GH_CLI` for that lane alone.
@@ -260,6 +270,13 @@ exact organization runner-group JIT endpoint. Do not repurpose a registry,
 package, image-pull, or experiment credential for JIT registration. The M1
 Forge gate deliberately uses the default `TARTCI_GH_CLI=ghapp` route: its
 macOS-27 stackbench credential is registry-only.
+
+**Registry tooling is not runner tooling.** The M1 macOS-27 stackbench
+credential is for GHCR push/pull only, never Actions registration. Its GHCR
+harness must invoke `/usr/bin/curl` explicitly: a PATH-shadowing curl wrapper
+previously injected a second `Authorization` header and produced a misleading
+401. Keep this GHCR exception file-backed and mode 0600; never transfer it into
+a LaunchAgent, a runner guest, or a JIT wrapper.
 
 If GitHub rejects JIT registration with 401, 403, or 404, the macOS provider
 records a keyed admission-denial receipt under its state directory. The key
