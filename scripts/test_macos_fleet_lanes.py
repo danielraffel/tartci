@@ -55,6 +55,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     {lane["repo"]: lane["runner_group_id"] for lane in data["lane"]},
                     RUNNER_GROUP_IDS,
                 )
+                self.assertEqual(
+                    next(lane for lane in data["lane"] if lane["id"] == "forge-gate")["workflows"],
+                    ["build", "protected macOS build"],
+                )
                 with tempfile.TemporaryDirectory() as td:
                     rendered = subprocess.run(
                         [str(ROOT / "tartci"), "fleet-macos", "render", str(config),
