@@ -133,6 +133,7 @@ PRINT_EVENT_LOG=0
 PRINT_IDENTITY=0
 PRINT_QUEUE=0
 PRINT_SELECTION=0
+PRINT_RUNNER_API_ROOT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
 PRINT_HIGHER_PRIORITY=""
@@ -248,6 +249,29 @@ usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 # the top-level shell's PID); $1 is the monotonic per-boot index.
 ephemeral_boot_name(){ printf '%s-%s-%s' "$RUNNER_NAME" "$$" "$1"; }
 
+configure_runner_api_root(){
+  local runner_org runner_repo
+  case "$RUNNER_GROUP_ID" in
+    ''|0*|*[!0-9]*) die "invalid TARTCI_RUNNER_GROUP_ID: expected a positive integer";;
+  esac
+  case "$REPO" in
+    ''|/*|*/|*/*/*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+    */*) runner_org="${REPO%%/*}"; runner_repo="${REPO#*/}";;
+    *) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+  esac
+  case "$runner_org" in
+    -*|*-|*[!A-Za-z0-9-]*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+  esac
+  case "$runner_repo" in
+    *[!A-Za-z0-9_.-]*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+  esac
+  if [ "$RUNNER_GROUP_ID" = 1 ]; then
+    RUNNER_API_ROOT="repos/$REPO/actions/runners"
+    return
+  fi
+  RUNNER_API_ROOT="orgs/$runner_org/actions/runners"
+}
+
 while [ $# -gt 0 ]; do case "$1" in
   --loop) LOOP=1; shift;;
   --once) LOOP=0; shift;;
@@ -271,11 +295,15 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
+  --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+configure_runner_api_root
+[ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
 
 case "$RUNNER_VERSION" in
   ''|*[!0-9.]*) die "invalid Actions Runner version: $RUNNER_VERSION";;
@@ -555,11 +583,11 @@ priority_demand(){
 reclaim_runner_name(){
   local name="$1" id attempt
   for attempt in $(seq 1 18); do
-    id="$("$GH_CLI" api "repos/$REPO/actions/runners" --paginate \
+    id="$("$GH_CLI" api "$RUNNER_API_ROOT" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    "$GH_CLI" api -X DELETE "repos/$REPO/actions/runners/$id" >/dev/null 2>&1 && break
+    "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$id" >/dev/null 2>&1 && break
     sleep 10
   done
   tart delete "$name" >/dev/null 2>&1 || true
@@ -985,7 +1013,7 @@ run_one(){
   IFS=',' read -r -a labels_split <<< "$selected_labels"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   local jit_error="$STATE_DIR/$vm.jit-error"
-  jit="$("$JIT_GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  jit="$("$JIT_GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
