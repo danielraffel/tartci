@@ -59,6 +59,17 @@ class MacosFleetLaneTests(unittest.TestCase):
                     next(lane for lane in data["lane"] if lane["id"] == "forge-gate")["workflows"],
                     ["build", "protected macOS build"],
                 )
+                self.assertEqual(
+                    data["stacked_images"],
+                    {
+                        "enabled": False,
+                        "minimum_macos_major": 27,
+                        "minimum_tart_version": "2.36.0",
+                        "registry_username_file": "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username",
+                        "registry_token_file": "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token",
+                        "flat_rollback": "pulp-build-runner:latest",
+                    },
+                )
                 with tempfile.TemporaryDirectory() as td:
                     rendered = subprocess.run(
                         [str(ROOT / "tartci"), "fleet-macos", "render", str(config),
@@ -81,6 +92,15 @@ class MacosFleetLaneTests(unittest.TestCase):
                             for repo, group_id in RUNNER_GROUP_IDS.items()
                         },
                     )
+                    self.assertTrue(all(
+                        not any(
+                            key.startswith("TARTCI_STACKED_")
+                            or key.startswith("TARTCI_REGISTRY_")
+                            or key == "TARTCI_FLAT_ROLLBACK_GOLDEN"
+                            for key in value["EnvironmentVariables"]
+                        )
+                        for value in values
+                    ))
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
         m3 = tomllib.loads(HOST_CONFIGS["studio"].read_text())
@@ -210,6 +230,50 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("absolute path", result.stderr)
+
+    def test_stacked_images_cannot_activate_before_graduation(self) -> None:
+        body = CONFIG.read_text().replace("enabled = false", "enabled = true", 1)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "premature-stacked.toml"
+            bad.write_text(body)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("before provider support and benchmark graduation", result.stderr)
+
+    def test_stacked_image_secret_paths_reject_noncanonical_traversal(self) -> None:
+        token = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
+        fixtures = {
+            "terminal-parent": token.replace("ghcr-stackbench-token", ".."),
+            "terminal-current": token.replace("ghcr-stackbench-token", "."),
+            "nested-parent": token.replace("ghcr-stackbench-token", "nested/../token"),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, path in fixtures.items():
+                with self.subTest(name=name):
+                    bad = Path(td) / f"stacked-secret-{name}.toml"
+                    bad.write_text(CONFIG.read_text().replace(token, path, 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn("absolute host-local Pulp secret path", result.stderr)
+
+    def test_stacked_image_secret_paths_must_be_distinct(self) -> None:
+        username = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username"
+        token = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "stacked-secret-identical.toml"
+            bad.write_text(CONFIG.read_text().replace(token, username, 1))
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn("username and token paths must be distinct", result.stderr)
 
     def test_scalar_workflow_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:

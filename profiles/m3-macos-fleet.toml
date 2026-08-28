@@ -10,6 +10,14 @@ tart_home = "/Volumes/Workshop/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 
+[stacked_images]
+enabled = false
+minimum_macos_major = 27
+minimum_tart_version = "2.36.0"
+registry_username_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-username"
+registry_token_file = "/Users/danielraffel/.config/pulp/secrets/ghcr-stackbench-token"
+flat_rollback = "pulp-build-runner:latest"
+
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"

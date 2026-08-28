@@ -14,6 +14,25 @@ uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
 `TART_HOME`.
 
+Each host profile also carries a dormant `[stacked_images]` contract. It keeps
+stacked-disk adoption explicit and host-local: macOS and Tart minimum versions,
+the retained flat rollback golden, and paths to separate GHCR username/token
+files under `~/.config/pulp/secrets`. Provision those files independently on
+each host as current-user-owned mode `0600` regular files. Secret values are
+never committed, copied into a golden, rendered into a plist, or passed on
+argv. Credential paths remain validated dormant profile metadata and are not
+rendered into runner LaunchAgents. The same package credential may be installed
+on M1, M3, and M5, but its presence is not activation authority.
+
+`stacked_images.enabled` is checked in as `false` on all three hosts and the
+validator currently rejects `true`. Keep it that way while the fully
+provisioned flat/stacked/stacked-plus-safe-cache comparison remains DEFER.
+Graduation requires a measured decision, provider support for immutable pinned
+parents plus private writable overlays, exact digest provenance, safe cache
+boundaries, and a flat rollback canary. The enabling change must update the
+validator/provider and the reviewed host profile together; editing a live plist
+or setting an ambient environment variable is not a supported shortcut.
+
 Every managed lane also declares its exact non-Default GitHub runner group.
 The renderer exports that value as `TARTCI_RUNNER_GROUP_ID`; omitting it would
 silently register disposable runners in Default even when a workflow requests
@@ -43,6 +62,25 @@ for file in "$out"/*.plist; do plutil -lint "$file"; done
 # Before any separately authorized install/bootstrap on M1:
 ssh m1-lan 'mkdir -p "$HOME/Library/Logs/tartci"'
 ```
+
+Before a future stacked-image canary on any host, validate only metadata and
+authorization without displaying credential values:
+
+```sh
+registry_secret_ok() {
+  [ "$#" -eq 1 ] &&
+    [ ! -L "$1" ] &&
+    [ -f "$1" ] &&
+    [ "$(stat -f '%u' "$1")" = "$(id -u)" ] &&
+    [ "$(stat -f '%Lp' "$1")" = 600 ] &&
+    [ -s "$1" ]
+}
+registry_secret_ok "$HOME/.config/pulp/secrets/ghcr-stackbench-username" &&
+  registry_secret_ok "$HOME/.config/pulp/secrets/ghcr-stackbench-token"
+```
+
+Use the reviewed registry auth probe for effective pull/push verification; do
+not print, source, or copy the files through an interactive command transcript.
 
 Rendering never installs or loads a LaunchAgent. Stable host/lane identifiers
 are local operational vocabulary; actual GitHub runner names remain ephemeral
