@@ -691,11 +691,15 @@ exit $LASTEXITCODE'
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed
   run_guest_ps_file "C:\actions-runner\tartci-runner.ps1" "$ps_run" >"$runner_output" 2>&1 &
   runner_pid=$!
+  if ! tartci_pool_lock_handoff_to_listener "$runner_pid"; then
+    note "[$i] listener exited before pool transition handoff"
+    cleanup_job success
+    return 1
+  fi
   runner_start="$(now_epoch)"
   while kill -0 "$runner_pid" 2>/dev/null; do
     if [ "$runner_assigned" = 0 ] && grep -q 'Running job:' "$runner_output" 2>/dev/null; then
       runner_assigned=1
-      tartci_pool_lock_release
     fi
     if [ "$runner_assigned" = 0 ]; then
       now="$(now_epoch)"

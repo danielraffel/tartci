@@ -1309,6 +1309,12 @@ lanes change.
   Every tartci provider also checks this
   at its idle loop and again immediately before JIT minting. An assigned JIT
   job keeps its exact lease and finishes; an unregistered VM is discarded.
+  The host-global transition lock covers only that final admission check, JIT
+  mint, and successful listener spawn. Once a live listener is owned by its
+  provider state, VM lease, and cleanup trap, the global lock is released so an
+  idle secondary repository listener cannot block unrelated JIT minting. Drain
+  disables restart but does not terminate that in-flight listener, including
+  the interval after GitHub accepts a job and before `Runner.Worker` appears.
   Runner LaunchAgents are disabled so reboot cannot re-admit work. A detached
   local watcher retires a persistent `actions.runner.*` service only after
   an authoritative Shipyard integration has removed the host from routing,

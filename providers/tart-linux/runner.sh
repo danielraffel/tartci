@@ -265,7 +265,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     TARTCI_STATE_QEMU_PID_STARTED_AT="$(if [ -n "$rpid" ]; then tartci_pid_started_at "$rpid"; fi)" \
     tartci_write_vm_state tart-linux "$vm" "$vm" "$1" ephemeral "$state_dir"
   }
-  mark_runner_assigned(){ tartci_pool_lock_release; write_state job-running; }
+  mark_runner_assigned(){ write_state job-running; }
   lease_cores="$(tartci_vm_lease_cores tart-linux)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-linux)"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
@@ -411,6 +411,11 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
      [ \"\$runner_umask\" = 0022 ] && ./run.sh --jitconfig \"\$(cat ~/jit.cfg)\"" \
     >"$logdir/runner-output.log" 2>&1 &
   CURRENT_RUNNER_PID=$!
+  if ! tartci_pool_lock_handoff_to_listener "$CURRENT_RUNNER_PID"; then
+    note "[$i] listener exited before pool transition handoff"
+    discard_current_linux_vm
+    return 1
+  fi
   if tartci_monitor_runner_assignment \
     "$CURRENT_RUNNER_PID" "$logdir/runner-output.log" "$IDLE_TIMEOUT" \
     discard_current_linux_vm 5 mark_runner_assigned \
