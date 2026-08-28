@@ -252,6 +252,14 @@ credential solely for the GitHub runner-registration edge may set
 `generate-jitconfig` uses that override. Never put a token in a plist and never
 silently fall back from `ghapp` to ambient `gh`.
 
+The dynamic macOS fleet profile supports this as the optional per-lane
+`jit_github_cli` field. It accepts only an executable name (not a shell command
+or token); the renderer emits it as `TARTCI_JIT_GH_CLI` for that lane alone.
+The M1 Forge gate uses `tartci-m1-stackbench-jit-gh`, whose deployed wrapper
+reads the host's mode-0600 stackbench credential at runtime. Keep normal
+`TARTCI_GH_CLI=ghapp` unchanged and deploy the wrapper before activating a
+profile that names it.
+
 If GitHub rejects JIT registration with 401, 403, or 404, the macOS provider
 records a keyed admission-denial receipt under its state directory. The key
 binds repo, runner group, labels, and selected JIT CLI. The loop then refuses

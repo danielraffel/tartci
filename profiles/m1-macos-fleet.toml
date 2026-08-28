@@ -33,6 +33,10 @@ priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
 workflows = ["protected macOS build"]
+# This command is a host-local, secret-free wrapper. It reads the M1 stackbench
+# credential only for GitHub's runner generate-jitconfig endpoint; normal fleet
+# control-plane traffic remains on the Shipyard App wrapper (ghapp).
+jit_github_cli = "tartci-m1-stackbench-jit-gh"
 replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
 
 [[lane]]
