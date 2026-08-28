@@ -244,6 +244,22 @@ The same setting also governs `tartci doctor --reap` runner reads and cleanup,
 so the fleet health surface cannot silently fall back to an exhausted ambient
 token while the providers themselves use the App.
 
+**JIT credential exception and denial fuse (`TARTCI_JIT_GH_CLI`).** Keep
+`TARTCI_GH_CLI=ghapp` as the default for queue scans, reads, cleanup, and all
+ordinary control-plane calls. A host that has a separately governed classic
+credential solely for the GitHub runner-registration edge may set
+`TARTCI_JIT_GH_CLI` to its secret-free wrapper command; only
+`generate-jitconfig` uses that override. Never put a token in a plist and never
+silently fall back from `ghapp` to ambient `gh`.
+
+If GitHub rejects JIT registration with 401, 403, or 404, the macOS provider
+records a keyed admission-denial receipt under its state directory. The key
+binds repo, runner group, labels, and selected JIT CLI. The loop then refuses
+to boot another VM for that same contract, so a bad credential cannot consume
+the fleet in a retry loop. Repair the named auth route (or intentionally change
+the route, which changes the key) before clearing the receipt and dispatching
+another gate.
+
 If a Shipyard deployment also runs an external organization runner-group policy
 verifier, the App installation needs **Self-hosted runners: Read-only** at the
 organization level. Repository `Actions` access does not grant this. The Mac

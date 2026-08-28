@@ -100,6 +100,14 @@ class GhCliKnobWiring(unittest.TestCase):
             self.assertNotIn('["gh", "api"', body,
                              f"{p.name} still has a bare gh call in python")
 
+    def test_macos_jit_override_is_explicit_and_denial_blocks_reboot(self) -> None:
+        body = MACOS.read_text(encoding="utf-8")
+        self.assertIn('JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"', body)
+        self.assertIn('generate-jitconfig', body)
+        self.assertIn('"$JIT_GH_CLI" api -X POST', body)
+        self.assertIn('jit_admission_denied', body)
+        self.assertIn('JIT admission remains blocked', body)
+
     def test_unattended_linux_and_reap_agents_pin_app_wrapper(self) -> None:
         templates = (
             ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-macos.plist.template",

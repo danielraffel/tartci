@@ -62,6 +62,10 @@ export TART_HOME="${TART_HOME:-$HOME/VMs}"
 # python pollers below inherit it.
 export TARTCI_GH_CLI="${TARTCI_GH_CLI:-gh}"
 GH_CLI="$TARTCI_GH_CLI"
+# JIT registration is the only provider write that may need a narrowly-scoped
+# host credential. Keep all polling and ordinary control-plane calls on GH_CLI
+# (normally ghapp); an explicit JIT override is never an implicit PAT fallback.
+JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
@@ -116,6 +120,7 @@ JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
+JIT_DENIAL_FILE=""
 EVENT_LOG="${TARTCI_EVENT_LOG:-$STATE_DIR/events.jsonl}"
 EVENT_LOG_EXPLICIT=0
 [ -n "${TARTCI_EVENT_LOG:-}" ] && EVENT_LOG_EXPLICIT=1
@@ -310,7 +315,19 @@ if [ -n "${TARTCI_LAUNCHD_LABEL:-}" ]; then
 fi
 command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
+command -v "$JIT_GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$JIT_GH_CLI' (TARTCI_JIT_GH_CLI) not installed / authed"
 mkdir -p "$STATE_DIR"
+JIT_DENIAL_KEY="$(printf '%s' "$REPO|$RUNNER_GROUP_ID|$LABELS|$JIT_GH_CLI" | shasum -a 256 | awk '{print $1}')"
+JIT_DENIAL_FILE="$STATE_DIR/jit-admission-denied.$JIT_DENIAL_KEY"
+
+jit_admission_denied(){ [ -f "$JIT_DENIAL_FILE" ]; }
+record_jit_admission_denied(){
+  local detail="$1"
+  umask 077
+  printf 'repo=%s\nrunner_group_id=%s\nlabels=%s\ngh_cli=%s\ndetail=%s\n' \
+    "$REPO" "$RUNNER_GROUP_ID" "$LABELS" "$JIT_GH_CLI" "$detail" >"$JIT_DENIAL_FILE"
+}
+clear_jit_admission_denied(){ rm -f "$JIT_DENIAL_FILE"; }
 
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
 event(){
@@ -967,14 +984,22 @@ run_one(){
   CURRENT_REGISTERED_RUNNER="$vm"
   IFS=',' read -r -a labels_split <<< "$selected_labels"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
-  jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
+  local jit_error="$STATE_DIR/$vm.jit-error"
+  jit="$("$JIT_GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
-        --jq '.encoded_jit_config')" || {
+        --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
+    if grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$jit_error"; then
+      record_jit_admission_denied "GitHub rejected JIT registration; inspect $jit_error and change the explicit JIT auth route before retrying"
+      event jit_admission_denied "repo=$REPO group=$RUNNER_GROUP_ID gh_cli=$JIT_GH_CLI"
+      note "[$i] JIT admission denied — blocking this exact auth/runner contract before another VM boots"
+    fi
     note "[$i] JIT config mint failed — discarding VM"
     cleanup
     return 1
   }
+  rm -f "$jit_error"
+  clear_jit_admission_denied
   if [ -z "$jit" ]; then
     tartci_pool_lock_release
     note "[$i] empty JIT config — discarding VM"
@@ -1069,6 +1094,12 @@ if [ "$LOOP" = 1 ]; then
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   heartbeat loop
   while true; do
+    if jit_admission_denied; then
+      note "JIT admission remains blocked for this exact auth/runner contract — no VM will boot; repair the explicit auth route then change it or clear $JIT_DENIAL_FILE"
+      heartbeat jit-admission-denied
+      sleep "$POLL"
+      continue
+    fi
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
@@ -1134,6 +1165,7 @@ if [ "$LOOP" = 1 ]; then
   done
 else
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
+  jit_admission_denied && die "JIT admission is blocked for this exact auth/runner contract; repair auth before --once"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"
