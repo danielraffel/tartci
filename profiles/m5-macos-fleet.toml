@@ -33,7 +33,9 @@ golden = "pulp-build-runner:latest"
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]
-workflows = ["protected macOS build"]
+# PR runs are surfaced as the trigger workflow; protected-main proofs may invoke
+# the reusable callee directly. Watch both names on the same runner contract.
+workflows = ["build", "protected macOS build"]
 replaces_launchd_labels = []
 
 [[lane]]
