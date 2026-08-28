@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# M1-only GitHub CLI route for TartCI's Forge runner JIT registration.
+#
+# This deliberately is not a general GitHub wrapper. Fleet scans, cleanup, and
+# every other control-plane operation stay on the Shipyard App wrapper (ghapp).
+set -euo pipefail
+
+token_file="$HOME/.config/pulp/secrets/ghcr-stackbench-token"
+
+[ -f "$token_file" ] && [ -r "$token_file" ] || {
+  echo "TartCI M1 JIT credential is unavailable: $token_file" >&2
+  exit 78
+}
+
+mode="$(stat -f '%Lp' "$token_file")"
+[ "$mode" = "600" ] || {
+  echo "TartCI M1 JIT credential must be mode 0600: $token_file" >&2
+  exit 78
+}
+
+token="$(<"$token_file")"
+[ -n "$token" ] || {
+  echo "TartCI M1 JIT credential is empty: $token_file" >&2
+  exit 78
+}
+
+exec env GH_TOKEN="$token" /opt/homebrew/bin/gh "$@"
