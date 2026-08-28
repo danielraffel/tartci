@@ -260,6 +260,11 @@ reads the host's mode-0600 stackbench credential at runtime. Keep normal
 `TARTCI_GH_CLI=ghapp` unchanged and deploy the wrapper before activating a
 profile that names it.
 
+On M1, deploy the versioned wrapper as
+`~/.local/bin/tartci-m1-stackbench-jit-gh` with executable mode. The wrapper is
+`scripts/tartci-m1-stackbench-jit-gh`; it refuses a missing, empty, or
+non-0600 credential and never prints its contents.
+
 If GitHub rejects JIT registration with 401, 403, or 404, the macOS provider
 records a keyed admission-denial receipt under its state directory. The key
 binds repo, runner group, labels, and selected JIT CLI. The loop then refuses
