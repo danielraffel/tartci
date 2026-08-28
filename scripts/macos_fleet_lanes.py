@@ -27,6 +27,7 @@ HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
+    "jit_github_cli",
 }
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -114,6 +115,13 @@ def load(path: Path) -> dict:
         priority = lane.get("priority", "gate")
         if not isinstance(priority, str) or priority not in LEASE_PRIORITIES:
             fail(f"lane {lane_id}: unsupported lease priority")
+        jit_github_cli = lane.get("jit_github_cli")
+        if jit_github_cli is not None and (
+                not isinstance(jit_github_cli, str)
+                or not SAFE_ID.fullmatch(jit_github_cli)):
+            fail(
+                f"lane {lane_id}: jit_github_cli must be a secret-free executable name"
+            )
         workflows = lane.get("workflows") or []
         tiers = lane.get("tier") or []
         if workflows and (not isinstance(workflows, list)
@@ -279,6 +287,8 @@ def lane_plist(data: dict, lane: dict) -> dict:
         )
     else:
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
+    if "jit_github_cli" in lane:
+        env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
     return {
         "Label": label,
         "ProgramArguments": [
