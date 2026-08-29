@@ -134,6 +134,7 @@ PRINT_IDENTITY=0
 PRINT_QUEUE=0
 PRINT_SELECTION=0
 PRINT_RUNNER_API_ROOT=0
+PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
 PRINT_HIGHER_PRIORITY=""
@@ -232,6 +233,8 @@ source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 # shellcheck source=providers/tart-macos/assignment-v2.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
+# shellcheck source=providers/tart-macos/chrome-mount.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -296,6 +299,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
+  --print-chrome-mount) PRINT_CHROME_MOUNT=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
@@ -304,6 +308,12 @@ esac; done
 
 configure_runner_api_root
 [ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
+configure_chrome_mount
+[ "$PRINT_CHROME_MOUNT" = 1 ] && {
+  [ -n "$CHROME_MOUNT_ARG" ] || die "TARTCI_RUNNER_CHROME_APP_DIR is not configured"
+  printf '%s\n' "$CHROME_MOUNT_ARG"
+  exit 0
+}
 
 case "$RUNNER_VERSION" in
   ''|*[!0-9.]*) die "invalid Actions Runner version: $RUNNER_VERSION";;
@@ -899,9 +909,12 @@ run_one(){
     return 1
   fi
   boot_log="$(mktemp -t "tart-run-$vm")"
-  tartci_vm_lease_guard_exec tart run --no-graphics \
-    --dir="ccache:$CACHE_ROOT/ccache" \
-    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro" \
+  local tart_dirs=(
+    --dir="ccache:$CACHE_ROOT/ccache"
+    --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
+  )
+  [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
+  tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   heartbeat booting
@@ -980,6 +993,18 @@ run_one(){
     discard_current_vm
     tartci_release_vm_lease
     return 1
+  fi
+
+  if [ -n "$CHROME_MOUNT_ARG" ]; then
+    heartbeat chrome-preflight
+    if ! install_and_preflight_chrome "$ip"; then
+      note "[$i] governed read-only Google Chrome mount failed preflight — discarding unregistered VM"
+      event chrome_preflight_failed "unregistered=true"
+      runtime_emit_complete fail chrome_preflight_failed 1 "" "$logdir"
+      discard_current_vm
+      tartci_release_vm_lease
+      return 1
+    fi
   fi
 
   heartbeat minting-jit

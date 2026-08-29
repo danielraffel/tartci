@@ -32,7 +32,7 @@ STACKED_IMAGE_KEYS = {
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli",
+    "jit_github_cli", "chrome_app_dir",
 }
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -164,6 +164,18 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: jit_github_cli must be a secret-free executable name"
             )
+        chrome_app_dir = lane.get("chrome_app_dir")
+        if chrome_app_dir is not None:
+            if lane["repo"] != "Generous-Corp/forge":
+                fail(f"lane {lane_id}: chrome_app_dir is restricted to the Forge lane")
+            if not isinstance(chrome_app_dir, str):
+                fail(f"lane {lane_id}: chrome_app_dir must be an absolute Google Chrome.app path")
+            normalized_chrome = PurePosixPath(posixpath.normpath(chrome_app_dir))
+            if (not normalized_chrome.is_absolute()
+                    or normalized_chrome.as_posix() != chrome_app_dir
+                    or normalized_chrome.name != "Google Chrome.app"
+                    or any(char in chrome_app_dir for char in ":\r\n")):
+                fail(f"lane {lane_id}: chrome_app_dir must be an absolute Google Chrome.app path")
         workflows = lane.get("workflows") or []
         tiers = lane.get("tier") or []
         if workflows and (not isinstance(workflows, list)
@@ -331,6 +343,8 @@ def lane_plist(data: dict, lane: dict) -> dict:
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
     if "jit_github_cli" in lane:
         env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
+    if "chrome_app_dir" in lane:
+        env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
     return {
         "Label": label,
         "ProgramArguments": [
