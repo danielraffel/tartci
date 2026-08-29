@@ -38,6 +38,7 @@ id = "forge-gate"
 repo = "Generous-Corp/forge"
 runner_group_id = 11
 golden = "pulp-build-runner:latest"
+chrome_app_dir = "/Applications/Google Chrome.app"
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "forge-gate-fast"]

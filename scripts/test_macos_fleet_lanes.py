@@ -60,6 +60,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     ["build", "protected macOS build"],
                 )
                 self.assertEqual(
+                    next(lane for lane in data["lane"] if lane["id"] == "forge-gate")["chrome_app_dir"],
+                    "/Applications/Google Chrome.app",
+                )
+                self.assertEqual(
                     data["stacked_images"],
                     {
                         "enabled": False,
@@ -101,6 +105,19 @@ class MacosFleetLaneTests(unittest.TestCase):
                         )
                         for value in values
                     ))
+                    chrome_routes = {
+                        value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
+                        value["EnvironmentVariables"].get("TARTCI_RUNNER_CHROME_APP_DIR")
+                        for value in values
+                    }
+                    self.assertEqual(
+                        chrome_routes,
+                        {
+                            "Generous-Corp/pulp": None,
+                            "Generous-Corp/forge": "/Applications/Google Chrome.app",
+                            "Generous-Corp/vellum": None,
+                        },
+                    )
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
         m3 = tomllib.loads(HOST_CONFIGS["studio"].read_text())
@@ -169,6 +186,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "forge-gate")["replaces_launchd_labels"],
             )
             forge = next(value for value in values if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"].endswith("/forge"))
+            self.assertEqual(
+                forge["EnvironmentVariables"]["TARTCI_RUNNER_CHROME_APP_DIR"],
+                "/Applications/Google Chrome.app",
+            )
             self.assertNotIn("TARTCI_JIT_GH_CLI", forge["EnvironmentVariables"])
             self.assertNotIn("TARTCI_JIT_GH_CLI", pulp["EnvironmentVariables"])
             self.assertEqual(
@@ -230,6 +251,37 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("absolute path", result.stderr)
+
+    def test_chrome_mount_is_forge_only_and_path_normalized(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "relative": base.replace(
+                'chrome_app_dir = "/Applications/Google Chrome.app"',
+                'chrome_app_dir = "Google Chrome.app"',
+                1,
+            ),
+            "wrong-app": base.replace(
+                'chrome_app_dir = "/Applications/Google Chrome.app"',
+                'chrome_app_dir = "/Applications/Chromium.app"',
+                1,
+            ),
+            "non-forge": base.replace(
+                'golden = "pulp-build-runner:latest"\npriority = "vm"',
+                'golden = "pulp-build-runner:latest"\nchrome_app_dir = "/Applications/Google Chrome.app"\npriority = "vm"',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("chrome_app_dir", result.stderr)
 
     def test_stacked_images_cannot_activate_before_graduation(self) -> None:
         body = CONFIG.read_text().replace("enabled = false", "enabled = true", 1)
