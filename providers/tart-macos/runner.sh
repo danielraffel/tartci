@@ -1038,7 +1038,8 @@ run_one(){
   IFS=',' read -r -a labels_split <<< "$selected_labels"
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   local jit_error="$STATE_DIR/$vm.jit-error"
-  jit="$("$JIT_GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
+  jit="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+        "$JIT_GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
         -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release

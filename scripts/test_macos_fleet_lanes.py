@@ -28,8 +28,8 @@ class MacosFleetLaneTests(unittest.TestCase):
     def test_all_host_profiles_validate_with_exact_paths_and_routing(self) -> None:
         expected = {
             "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
-            "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", True),
-            "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", True),
+            "studio": ("/Volumes/Workshop/VMs", "vellum-host-m3", False),
+            "m5": ("/Users/danielraffel/VMs", "vellum-host-m5", False),
         }
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(host=host_id):
@@ -50,7 +50,19 @@ class MacosFleetLaneTests(unittest.TestCase):
                 pulp_labels = next(
                     lane for lane in data["lane"] if lane["id"] == "pulp-gate"
                 )["labels"]
+                pulp_lane = next(
+                    lane for lane in data["lane"] if lane["id"] == "pulp-gate"
+                )
                 self.assertEqual("pulp-gate-fast" in pulp_labels, expected[host_id][2])
+                self.assertEqual(
+                    [tier["label"] for tier in pulp_lane["tier"]],
+                    ["pulp-build-merge-group", "pulp-build-pr-head"],
+                )
+                self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
+                self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
+                self.assertEqual(
+                    pulp_lane["supervisors"], 2
+                )
                 self.assertEqual(
                     {lane["repo"]: lane["runner_group_id"] for lane in data["lane"]},
                     RUNNER_GROUP_IDS,
@@ -118,6 +130,34 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "Generous-Corp/vellum": None,
                         },
                     )
+                    pulp_plists = [
+                        value for value in values
+                        if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]
+                        == "Generous-Corp/pulp"
+                    ]
+                    self.assertEqual(len(pulp_plists), 2)
+                    identities = {
+                        (
+                            value["Label"],
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_SLOT"],
+                            value["EnvironmentVariables"]["TARTCI_STATE_DIR"],
+                            value["EnvironmentVariables"]["TARTCI_EVENT_LOG"],
+                            value["EnvironmentVariables"]["TARTCI_MACOS_LOGS"],
+                            value["EnvironmentVariables"]["TARTCI_QUEUE_LANE_ID"],
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_NAME_PREFIX"],
+                        )
+                        for value in pulp_plists
+                    }
+                    self.assertEqual(len(identities), len(pulp_plists))
+                    for value in pulp_plists:
+                        env = value["EnvironmentVariables"]
+                        self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
+                        self.assertEqual(env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"], "pulp-gate-fast")
+                        self.assertEqual(env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"], "pulp-gate-fast")
+                        self.assertEqual(
+                            env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
+                            "pulp-build-merge-group,pulp-build-pr-head",
+                        )
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
         m3 = tomllib.loads(HOST_CONFIGS["studio"].read_text())
@@ -153,7 +193,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(rendered.returncode, 0, rendered.stderr)
             files = sorted(Path(td).glob("*.plist"))
-            self.assertEqual(len(files), 3)
+            self.assertEqual(len(files), 4)
             values = [plistlib.loads(path.read_bytes()) for path in files]
             self.assertTrue(all(value["RunAtLoad"] for value in values))
             self.assertTrue(all(".tart-runner-" in value["Label"] for value in values))
@@ -176,7 +216,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_VM_LEASE_PRIORITY"], "vm")
             self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
-            self.assertNotIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
+            self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
+            self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
                 ["com.danielraffel.pulp.tart-runner-macos-gate"],
                 next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "pulp-gate")["replaces_launchd_labels"],
@@ -251,6 +292,19 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("absolute path", result.stderr)
+
+    def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
+        body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "bad-supervisors.toml"
+            bad.write_text(body)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("supervisors must be 1 or 2", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_chrome_mount_is_forge_only_and_path_normalized(self) -> None:
         base = CONFIG.read_text()

@@ -104,6 +104,7 @@ class GhCliKnobWiring(unittest.TestCase):
         body = MACOS.read_text(encoding="utf-8")
         self.assertIn('JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"', body)
         self.assertIn('generate-jitconfig', body)
+        self.assertIn('SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO"', body)
         self.assertIn('"$JIT_GH_CLI" api -X POST', body)
         self.assertIn('jit_admission_denied', body)
         self.assertIn('JIT admission remains blocked', body)

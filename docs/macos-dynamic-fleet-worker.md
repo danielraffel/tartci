@@ -114,21 +114,29 @@ changing durable participation. `pool off` continues to discover and stop all
 runner agents; the receipt narrows installation authority, not emergency-stop
 coverage.
 
-Each host's Pulp lane exposes only the merge-group event tier. A lower PR tier is intentionally
-absent until the provider can recheck higher-priority demand after the bounded
-Shipyard admission wait; otherwise a PR could consume a slot for a merge-group
-that arrived during admission. Forge and Vellum use their
+Each host's Pulp lane exposes ordered merge-group and PR-head event tiers under
+`event-class-v2`. The provider rechecks higher-priority merge-group demand
+immediately before minting, so a PR cannot consume a slot for a merge-group
+that arrived during admission. Each host renders two independently identified
+Pulp supervisors; host leases and the two-guest hard cap remain admission
+authority, so an idle supervisor does not reserve a VM slot. Forge and Vellum use their
 current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
 
-M1 deliberately does not advertise Pulp's `pulp-gate-fast` label. Existing
+No V2 Pulp runner advertises the legacy `pulp-gate-fast` label. Existing
 measurements put it materially behind M3/M5, and the settled placement contract
-keeps it on generic rollback/non-required work with a ten-minute queue-age
-delay. Making M1 a second required merge-group worker requires fresh comparative
-timings and a separately reviewed contract/workflow change; this host profile
-does not silently reverse that incident-bought decision. M3 and M5 retain the
-required `pulp-gate-fast` capability their live gate controllers already carry.
+keeps M1 at `vm` lease priority with a ten-minute queue-age delay. M1 still
+renders both governed supervisor identities so temporary free capacity is not
+lost to a static one-slot declaration; the governor decides whether either can
+admit a complete guest. M3 and M5 retain gate lease priority without leaking the
+legacy selector into JIT registration or idle capability reporting.
+
+The GitHub App wrapper requires explicit repository authority even when the API
+endpoint is organization-scoped for a protected runner group. JIT minting
+therefore supplies both `SHIPYARD_GH_APP_REPO` and `GH_REPO` from the validated
+lane repository. Omitting that context causes deterministic VM boot/discard
+churn even though queue discovery succeeded.
 
 ## Rejoin and offline behavior
 

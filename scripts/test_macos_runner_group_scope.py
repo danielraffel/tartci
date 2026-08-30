@@ -77,6 +77,10 @@ class MacOSRunnerGroupScopeTests(unittest.TestCase):
             'api -X POST "$RUNNER_API_ROOT/generate-jitconfig"',
             body,
         )
+        self.assertIn(
+            'SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO"',
+            body,
+        )
 
 
 if __name__ == "__main__":
