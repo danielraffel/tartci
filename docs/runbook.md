@@ -612,6 +612,20 @@ providers/proxmox-linux/bake-pulp-golden.sh \
 > heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
 > as a follow-up; until then the Windows lane builds native ARM64.
 
+### 3.10 macOS render-golden readiness is fail-closed
+
+`manifests/pulp.macos.toml` records the exact m153 source/provider generation,
+but the current generic macOS list/resize/tag helper cannot prove an existing
+golden contains it. The manifest therefore says `golden_readiness.status =
+"unready"`. This is deliberate: inventory operations and a rolling `:latest`
+alias are not provider evidence.
+
+Run `providers/tart-macos/provision.sh pulp-readiness` for the exact preparation
+report. It prints the required Pulp, Skia, and V8 identities and exits nonzero.
+A future implementation may turn this green only after it binds a deep render
+receipt to the exact golden being promoted; changing the manifest status alone
+fails closed.
+
 ---
 
 ## 4. Windows lane (QEMU) — the hard-won recipe

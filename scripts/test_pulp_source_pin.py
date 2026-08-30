@@ -54,6 +54,22 @@ manifest = "tools/deps/manifest.json"
         self.assertEqual(repository, "https://github.com/Generous-Corp/pulp")
         self.assertRegex(commit, r"^[0-9a-f]{40}$")
 
+    def test_alternate_dependency_manifest_path_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            manifest = Path(temp) / "alternate.toml"
+            manifest.write_text(
+                """
+[source]
+repository = "https://github.com/Generous-Corp/pulp"
+commit = "1111111111111111111111111111111111111111"
+manifest = "vendor/manifest.json"
+"""
+            )
+            with self.assertRaisesRegex(
+                ValueError, "canonical tools/deps/manifest.json"
+            ):
+                source_pin.resolve(manifest)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

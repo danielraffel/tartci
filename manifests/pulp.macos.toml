@@ -64,6 +64,13 @@ path    = "/Users/admin/pulp-skia-build"
 disposition = "baked-provider-only"
 variant     = "darwin-arm64"
 
+[golden_readiness]
+# TartCI does not yet have a receipt-backed consumer that can prove an existing
+# macOS golden contains this exact source/provider generation. Keep this
+# explicitly unready: list/resize/tag are inventory operations, not m153 proof.
+status = "unready"
+reason = "requires receipt-backed exact-golden verification before promotion"
+
 [caches]
 # Pulp's current macOS full build is cache-dominated. Five GiB churned the
 # shared cache close to its ceiling during ordinary merge-group traffic and

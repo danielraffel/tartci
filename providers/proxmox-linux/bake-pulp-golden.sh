@@ -12,6 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 RENDER_VERIFIER="$ROOT/providers/common/pulp-render-generation.py"
 SOURCE_PIN_RESOLVER="$ROOT/providers/common/pulp-source-pin.py"
+BINDING_COMMAND="$ROOT/providers/common/pulp-vmid-binding-command.py"
 QM_BIN="${TARTCI_QM_BIN:-qm}"
 PVESH_BIN="${TARTCI_PVESH_BIN:-pvesh}"
 SSH_BIN="${TARTCI_SSH_BIN:-ssh}"
@@ -68,7 +69,7 @@ done
 NAME="${NAME:-pulp-linux-golden-m153-$NEW_VMID}"
 [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--name contains unsupported characters"
 
-for path in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
+for path in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$BINDING_COMMAND" "$RENDER_VERIFIER"; do
   [ -f "$path" ] || die "required versioned input missing: $path"
 done
 command -v "$QM_BIN" >/dev/null 2>&1 || die "qm not found: $QM_BIN"
@@ -150,6 +151,9 @@ print(secrets.token_hex(32))
 PY
 )"
 binding_path="/run/tartci-pulp-golden-$NEW_VMID.binding"
+binding_command="$(python3 "$BINDING_COMMAND" \
+  --user "$GUEST_USER" --path "$binding_path" --nonce "$binding_nonce")" \
+  || die "could not render safe VMID binding payload"
 
 if [ -n "$SSH_KEY" ]; then
   SSH_OPTS+=(-i "$SSH_KEY")
@@ -164,7 +168,7 @@ done
 binding_placed=0
 for _ in $(seq 1 30); do
   if "$QM_BIN" guest exec "$NEW_VMID" -- /bin/sh -c \
-    "set -eu; uid=\$(id -u '$GUEST_USER'); gid=\$(id -g '$GUEST_USER'); tmp='$binding_path.tmp'; umask 077; printf '%s' '$binding_nonce' > \"\$tmp\"; chown \"\$uid:\$gid\" \"\$tmp\"; chmod 0400 \"\$tmp\"; mv \"\$tmp\" '$binding_path'" \
+    "$binding_command" \
     >/dev/null 2>&1; then
     binding_placed=1
     break

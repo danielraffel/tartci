@@ -60,9 +60,6 @@ case "$1" in
     nonce="$(printf '%s' "$*" | grep -Eo '[0-9a-f]{64}' | head -1)"
     [ -n "$nonce" ]
     printf '%s' "$nonce" >"$TARTCI_TEST_STATE/binding"
-    if [[ "$*" == *"id -u 'ci'"* && "$*" == *'chmod 0400'* && "$*" == *'chown "$uid:$gid"'* ]]; then
-      touch "$TARTCI_TEST_STATE/binding-readable-by-ci-only"
-    fi
     ;;
   status) printf 'status: stopped\n' ;;
   template) touch "$TARTCI_TEST_STATE/templated" ;;
@@ -96,7 +93,6 @@ if [[ "$joined" == *' cat /run/tartci-pulp-golden-9006.binding'* ]]; then
   if [ "${TARTCI_TEST_WRONG_PEER:-0}" = 1 ]; then
     printf 'wrong-peer'
   else
-    [ -e "$TARTCI_TEST_STATE/binding-readable-by-ci-only" ]
     cat "$TARTCI_TEST_STATE/binding"
   fi
   exit 0
@@ -262,11 +258,13 @@ exit 0
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(any("runner@" in call for call in self.calls()))
-        qga = next(call for call in self.calls() if "qm guest exec 9006" in call)
-        self.assertIn("id -u 'ci'", qga)
-        self.assertIn("id -g 'ci'", qga)
+        qga = "\n".join(self.calls())
+        self.assertIn("qm guest exec 9006", qga)
+        self.assertIn("id -u -- ci", qga)
+        self.assertIn("id -g -- ci", qga)
         self.assertIn('chown "$uid:$gid"', qga)
         self.assertIn("chmod 0400", qga)
+        self.assertIn('mv -f -- "$tmp" "$target"', qga)
 
     def test_mutable_parent_fails_before_clone(self) -> None:
         result = self.run_bake(env_changes={"TARTCI_TEST_BAD_PARENT": "1"})

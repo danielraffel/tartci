@@ -32,13 +32,11 @@ def resolve(
         raise ValueError("source.repository must be one non-empty line")
     if not isinstance(commit, str) or HEX40.fullmatch(commit) is None:
         raise ValueError("source.commit must be immutable lowercase 40-hex")
-    if (
-        not isinstance(dependency_manifest, str)
-        or not dependency_manifest
-        or Path(dependency_manifest).is_absolute()
-        or ".." in Path(dependency_manifest).parts
-    ):
-        raise ValueError("source.manifest must be a safe checkout-relative path")
+    if dependency_manifest != "tools/deps/manifest.json":
+        raise ValueError(
+            "source.manifest must be canonical tools/deps/manifest.json; "
+            "alternate dependency-manifest paths are not implemented"
+        )
     if required_skia_release is not None:
         if manifest.get("skia", {}).get("release") != required_skia_release:
             raise ValueError(
