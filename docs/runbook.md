@@ -1248,6 +1248,30 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
   diagnosis.
 
+  Managed macOS fleet lanes also set one host-level
+  `TARTCI_DISK_DENIAL_RECEIPT_DIR` and their configured stable
+  `TARTCI_RECEIPT_HOST_ID` (`m1`, `studio`, or `m5`). After every lease attempt,
+  TartCI atomically overwrites one receipt named for the exact stable runner
+  identity. A denied receipt distinguishes
+  `disk_capacity_insufficient`, `disk_probe_failed`, and
+  `disk_floor_misconfigured` and
+  carries one authoritative frame of `free_bytes`, `reserved_bytes`,
+  `requested_growth_bytes`, `floor_bytes`, `required_bytes`,
+  `available_after_reservations_bytes`, and
+  `required_after_reservations_bytes`, plus probe path and device identity.
+  `available_after_reservations_bytes` is clamped at zero when reservations
+  exceed current free bytes; `required_after_reservations_bytes` is
+  `floor_bytes + requested_growth_bytes`, while `required_bytes` is
+  `floor_bytes + reserved_bytes + requested_growth_bytes`.
+  A later success or non-disk denial overwrites it as `resolved`; observers must never
+  infer disk pressure from exit 75, which is shared by several admission and
+  supervisor outcomes. Receipt publication is best-effort telemetry only: a
+  write or decode failure cannot change the lease decision or its exit status.
+  Observer input is capped at 1 MiB and publication has a two-second wall-clock
+  deadline; atomic replacement leaves either the preceding complete receipt or
+  the new complete receipt if that deadline fires.
+  TartCI does not delete user work in response to this receipt.
+
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full

@@ -369,6 +369,8 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         "TARTCI_VM_LEASE_PRIORITY": lane.get("priority", "gate"),
         "TARTCI_CI_CACHE": host["cache_root"],
         "TARTCI_STATE_DIR": state,
+        "TARTCI_DISK_DENIAL_RECEIPT_DIR": f"{host['home']}/.tartci/state/disk-admission",
+        "TARTCI_RECEIPT_HOST_ID": host["id"],
         "TARTCI_EVENT_LOG": f"{state}/events.jsonl",
         "TARTCI_MACOS_LOGS": f"{host['log_root']}/macos-fleet-jobs/{identity}",
         "TARTCI_QUEUE_LANE_ID": f"{host['id']}-{identity}",

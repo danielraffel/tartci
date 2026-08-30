@@ -23,6 +23,93 @@ tartci_vm_lease_note(){
   fi
 }
 
+tartci_observe_disk_admission(){
+  local attempt_json="$1" provider="$2" lane="$3" runner="$4"
+  [ -n "${TARTCI_DISK_DENIAL_RECEIPT_DIR:-}" ] || return 0
+  printf '%s' "$attempt_json" | python3 "$TARTCI_ROOT/scripts/disk_denial_receipt.py" \
+    --receipt-dir "$TARTCI_DISK_DENIAL_RECEIPT_DIR" \
+    --host "${TARTCI_RECEIPT_HOST_ID:-}" \
+    --provider "$provider" --lane "$lane" --runner "$runner" >/dev/null 2>&1 || {
+      tartci_vm_lease_note "disk admission receipt observer failed (ignored) provider=$provider lane=$lane runner=$runner"
+      return 0
+    }
+}
+
+tartci_prepare_disk_root_observed(){
+  local path="$1" expected_mount="$2" expected_device="$3" provider="$4" lane="$5" runner="$6"
+  tartci_prepare_disk_root "$path" "$expected_mount" "$expected_device" && return 0
+  [ -n "${TARTCI_DISK_DENIAL_RECEIPT_DIR:-}" ] && python3 "$TARTCI_ROOT/scripts/disk_denial_receipt.py" \
+    --receipt-dir "$TARTCI_DISK_DENIAL_RECEIPT_DIR" --host "${TARTCI_RECEIPT_HOST_ID:-}" \
+    --provider "$provider" --lane "$lane" --runner "$runner" \
+    --reason disk_probe_failed --disk-path "$path" >/dev/null 2>&1 || true
+  return 75
+}
+
+tartci_check_disk_floor_observed(){
+  local path="$1" provider="$2" lane="$3" runner="$4" floor_gb avail_kb floor_kb reason
+  local probe_path="" device_id="" attempt_json=""
+  if ! floor_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_FREE_FLOOR_GB "${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}" 25)"; then
+    [ -n "${TARTCI_DISK_DENIAL_RECEIPT_DIR:-}" ] && python3 "$TARTCI_ROOT/scripts/disk_denial_receipt.py" \
+      --receipt-dir "$TARTCI_DISK_DENIAL_RECEIPT_DIR" --host "${TARTCI_RECEIPT_HOST_ID:-}" \
+      --provider "$provider" --lane "$lane" --runner "$runner" \
+      --reason disk_floor_misconfigured --disk-path "$path" >/dev/null 2>&1 || true
+    return 75
+  fi
+  if [ ! -d "$path" ]; then
+    reason=disk_probe_failed
+  elif [ "$floor_gb" -eq 0 ]; then
+    return 0
+  else
+    IFS=$'\t' read -r probe_path device_id < <(python3 - "$path" <<'PY'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1]).expanduser().resolve(strict=True)
+print(f"{p}\t{p.stat().st_dev}")
+PY
+    ) || true
+    if [ -z "$probe_path" ] || [ -z "$device_id" ]; then
+      reason=disk_probe_failed
+      avail_kb=""
+    else
+      avail_kb="$(df -Pk "$probe_path" 2>/dev/null | awk 'NR==2 {print $4}')"
+    fi
+    case "$avail_kb" in
+      ''|*[!0-9]*) reason=disk_probe_failed ;;
+      *)
+        floor_kb=$((floor_gb * 1024 * 1024))
+        [ "$avail_kb" -lt "$floor_kb" ] || return 0
+        reason=disk_capacity_insufficient
+        ;;
+    esac
+  fi
+  if [ "$reason" = disk_capacity_insufficient ]; then
+    attempt_json="$(python3 - "$probe_path" "$device_id" "$((avail_kb * 1024))" "$((floor_gb * 1024 * 1024 * 1024))" <<'PY'
+import json, sys
+path, device, free, floor = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4])
+print(json.dumps({
+    "ok": False, "reason": "disk_capacity_exceeded",
+    "exceeded_axis": {"cores": False, "memory": False, "disk": True},
+    "disk": {"probe_path": path, "reservation_path": path,
+             "device_id": device, "free_bytes": free, "reserved_bytes": 0,
+             "requested_bytes": 0, "floor_bytes": floor,
+             "required_bytes": floor, "available_after_reservations_bytes": free},
+}, separators=(",", ":")))
+PY
+    )"
+    tartci_observe_disk_admission "$attempt_json" "$provider" "$lane" "$runner"
+    return 75
+  fi
+  [ -n "${TARTCI_DISK_DENIAL_RECEIPT_DIR:-}" ] && python3 "$TARTCI_ROOT/scripts/disk_denial_receipt.py" \
+    --receipt-dir "$TARTCI_DISK_DENIAL_RECEIPT_DIR" --host "${TARTCI_RECEIPT_HOST_ID:-}" \
+    --provider "$provider" --lane "$lane" --runner "$runner" \
+    --reason "$reason" --disk-path "$path" >/dev/null 2>&1 || true
+  return 75
+}
+
+tartci_prepare_and_check_disk_root_observed(){
+  tartci_prepare_disk_root_observed "$@" || return $?
+  tartci_check_disk_floor_observed "$1" "$4" "$5" "$6"
+}
+
 tartci_vm_leases_enabled(){
   case "${TARTCI_VM_LEASES:-1}" in
     0|false|FALSE|off|OFF|no|NO) return 1 ;;
@@ -215,9 +302,11 @@ tartci_stop_vm_lease_heartbeat(){
 }
 
 tartci_acquire_vm_lease(){
-  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}" lease_id rc=0 out
+  local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
+  local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
   tartci_positive_int_or_empty "$cores" || cores=1
   if [ -n "${TARTCI_ACTIVE_VM_LEASE_ID:-}" ]; then
+    tartci_observe_disk_admission '{"ok":false,"reason":"active_lease_exists"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
     tartci_vm_lease_note "refusing to acquire $kind lease for $vm_name while ${TARTCI_ACTIVE_VM_LEASE_ID} is active"
     return 75
   fi
@@ -230,6 +319,7 @@ tartci_acquire_vm_lease(){
     # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
     TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
     _tartci_vm_lease_bypass_state=(authorized)
+    tartci_observe_disk_admission '{"ok":true,"reason":"leases_disabled"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
     return 0
   fi
   # Clamp a NON-GATE VM lane to the host's non-gate core budget
@@ -264,12 +354,16 @@ tartci_acquire_vm_lease(){
     esac
     if [ "$disk_provider" = unknown ]; then
       if ! disk_growth_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_GROWTH_GB "${TARTCI_VM_DISK_GROWTH_GB:-24}" 24)"; then
+        tartci_observe_disk_admission '{"ok":false,"reason":"disk_growth_misconfigured"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
         return 75
       fi
     elif ! disk_growth_gb="$(tartci_vm_lease_disk_growth_gb "$disk_provider")"; then
+      tartci_observe_disk_admission '{"ok":false,"reason":"disk_growth_misconfigured"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
       return 75
     fi
     if ! disk_floor_gb="$(tartci_disk_gb_or_zero TARTCI_VM_DISK_FREE_FLOOR_GB "${TARTCI_VM_DISK_FREE_FLOOR_GB:-25}" 25)"; then
+      out="{\"ok\":false,\"reason\":\"disk_floor_misconfigured\",\"disk_path\":$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$disk_path") }"
+      tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
       return 75
     fi
     disk_expected_device_id="$(tartci_vm_lease_disk_expected_device_id "$disk_provider")"
@@ -297,9 +391,11 @@ tartci_acquire_vm_lease(){
     --vm-name "$vm_name" \
     --json 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
+    tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
     return "$rc"
   fi
+  tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES="$cores"

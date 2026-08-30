@@ -97,6 +97,21 @@ class MacosFleetLaneTests(unittest.TestCase):
                         plistlib.loads(path.read_bytes())
                         for path in Path(td).glob("*.plist")
                     ]
+                    receipt_dirs = {
+                        value["EnvironmentVariables"]["TARTCI_DISK_DENIAL_RECEIPT_DIR"]
+                        for value in values
+                    }
+                    self.assertEqual(
+                        receipt_dirs,
+                        {f"{data['host']['home']}/.tartci/state/disk-admission"},
+                    )
+                    self.assertEqual(
+                        {
+                            value["EnvironmentVariables"]["TARTCI_RECEIPT_HOST_ID"]
+                            for value in values
+                        },
+                        {host_id},
+                    )
                     self.assertEqual(
                         {
                             value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
