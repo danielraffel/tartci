@@ -86,19 +86,27 @@ class RunnerGroupRepositoryAccessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         receipt = json.loads(result.stdout)
         self.assertEqual(receipt["verdict"], "deny")
-        self.assertIn("not accessible", receipt["reason"])
+        self.assertIn("must select only", receipt["reason"])
 
-    def test_selected_org_group_follows_pagination_and_preserves_repo_context(self) -> None:
+    def test_selected_org_group_rejects_cross_repository_assignment_scope(self) -> None:
         result = self.run_check(
             3,
             {"pages": [["Generous-Corp/forge"], ["Generous-Corp/pulp"]]},
         )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["verdict"], "admit")
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(json.loads(result.stdout)["verdict"], "deny")
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         self.assertEqual(len(calls), 3)
         self.assertTrue(all(call["repo"] == "Generous-Corp/pulp" for call in calls))
         self.assertTrue(all(call["gh_repo"] == "Generous-Corp/pulp" for call in calls))
+
+    def test_selected_org_group_admits_only_exact_single_repository(self) -> None:
+        result = self.run_check(3, {"pages": [["Generous-Corp/pulp"]]})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            json.loads(result.stdout)["registration_scope"],
+            "organization-single-repository",
+        )
 
     def test_unknown_policy_and_api_denial_fail_closed(self) -> None:
         for state in ({"visibility": "mystery"}, {"api_error": True}):

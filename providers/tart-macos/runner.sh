@@ -152,6 +152,15 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CURRENT_WORKFLOW_NAME=""
+CURRENT_JOB_CAPTURE_STATUS="not-attempted"
+CURRENT_JOB_RECEIPT=""
+CURRENT_JOB_SCAN_SPENT=0
+CURRENT_JOB_SCAN_FAILURES=0
+CURRENT_JOB_SCAN_NEXT_AT=0
+CURRENT_CANCEL_SCAN_SPENT=0
+CURRENT_ASSIGNMENT_QUARANTINE="none"
+CURRENT_SCAN_PID=""
+CURRENT_SCAN_TMP=""
 CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
@@ -464,7 +473,7 @@ heartbeat(){
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -709,6 +718,10 @@ discard_current_vm(){
 cleanup(){
   tartci_pool_lock_release
   [ "$CLEANED_UP" = 1 ] && return 0
+  [ -z "$CURRENT_SCAN_PID" ] || kill "$CURRENT_SCAN_PID" 2>/dev/null || true
+  [ -z "$CURRENT_SCAN_TMP" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
+  CURRENT_SCAN_PID=""
+  CURRENT_SCAN_TMP=""
   discard_current_vm
   tartci_release_vm_lease
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
@@ -721,46 +734,200 @@ cleanup(){
   heartbeat stopped
 }
 
-capture_current_job(){
-  local run_id run_workflow job_id runner_registration
-  CURRENT_RUN_ID=""
-  CURRENT_JOB_ID=""
-  CURRENT_WORKFLOW_NAME=""
-  runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
-  while IFS=$'\t' read -r run_id run_workflow; do
-    [ -n "$run_id" ] || continue
-    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" 2>/dev/null \
-      | TARTCI_CAPTURE_RUNNER="$runner_registration" python3 -c '
-import json, os, sys
-runner = os.environ["TARTCI_CAPTURE_RUNNER"]
-for job in json.load(sys.stdin).get("jobs", []):
-    if job.get("runner_name") == runner and job.get("status") == "in_progress":
-        print(job.get("id", ""))
-        break
-' 2>/dev/null | head -n1 || true)"
-    if [ -n "$job_id" ]; then
-      CURRENT_RUN_ID="$run_id"
-      CURRENT_JOB_ID="$job_id"
-      CURRENT_WORKFLOW_NAME="$run_workflow"
-      return 0
+handle_supervisor_signal(){
+  if [ -n "$CURRENT_RUN_ID" ] || [ -n "$CURRENT_SCAN_PID" ] || [ "${assigned:-0}" = 1 ]; then
+    CURRENT_ASSIGNMENT_QUARANTINE="signal_teardown_unknown"
+    CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
+    CURRENT_JOB_RECEIPT='{"kind":"terminal_unknown","detail":"supervisor_signal"}'
+  fi
+  event supervisor_signal "INT/TERM quarantine=$CURRENT_ASSIGNMENT_QUARANTINE"
+  cleanup
+  trap - EXIT
+  exit 143
+}
+
+record_terminal_job_receipt(){
+  local runner_rc="$1"
+  if [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal ]; then
+    CURRENT_ASSIGNMENT_QUARANTINE="none"
+    event job_terminal_receipt "runner_rc=$runner_rc observation=terminal rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+  else
+    if [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal_pending_run ]; then
+      CURRENT_ASSIGNMENT_QUARANTINE="listener_exited_workflow_active"
+    else
+      CURRENT_ASSIGNMENT_QUARANTINE="listener_exit_terminal_unknown"
     fi
-  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" 2>/dev/null \
-    | TARTCI_CAPTURE_WORKFLOWS="$WORKFLOW_CONFIG" python3 -c '
-import json, os, sys
-workflows = set(os.environ["TARTCI_CAPTURE_WORKFLOWS"].splitlines())
-for run in json.load(sys.stdin).get("workflow_runs", []):
-    if run.get("name") in workflows and isinstance(run.get("id"), int):
-        print("{}\t{}".format(run["id"], run["name"]))
-' 2>/dev/null || true)
-  return 1
+    event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+  fi
+}
+
+finalize_listener_receipt(){
+  local runner_rc="$1" listener_assigned="$2"
+  [ "$listener_assigned" = 1 ] || return 0
+  if [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ]; then
+    capture_current_job revalidate || true
+  fi
+  record_terminal_job_receipt "$runner_rc"
+}
+
+capture_current_job(){
+  local mode="${1:-discover}" scan_mode result runner_registration rc previous_status
+  local now started elapsed budget remaining attempt_timeout kind backoff scan_spent
+  runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
+  scan_mode="$mode"
+  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
+    budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS:-30}"
+    scan_spent="$CURRENT_CANCEL_SCAN_SPENT"
+    [ "$mode" = cancel_discover ] && scan_mode=discover
+  else
+    budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS:-30}"
+    scan_spent="$CURRENT_JOB_SCAN_SPENT"
+  fi
+  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS:-8}"
+  case "$budget:$attempt_timeout" in
+    *[!0-9:]*|0:*|*:0)
+      CURRENT_JOB_CAPTURE_STATUS="invalid_budget"
+      CURRENT_JOB_RECEIPT='{"kind":"invalid_budget"}'
+      return 2 ;;
+  esac
+  now="$(date +%s)"
+  remaining=$((budget - scan_spent))
+  [ "$remaining" -gt 0 ] || {
+    CURRENT_JOB_CAPTURE_STATUS="budget_exhausted"
+    CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+    return 2
+  }
+  [ "$mode" != discover ] || [ "$now" -ge "$CURRENT_JOB_SCAN_NEXT_AT" ] || return 1
+  [ "$attempt_timeout" -le "$remaining" ] || attempt_timeout="$remaining"
+  local args=(
+    "$TARTCI_ROOT/scripts/current_job_scan.py"
+    --repo "$REPO"
+    --runner "$runner_registration"
+    --gh-cli "$GH_CLI"
+    --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
+    --mode "$scan_mode"
+    --gh-timeout "${TARTCI_CAPTURE_CURRENT_JOB_GH_TIMEOUT_SECS:-4}"
+    --scan-timeout "$attempt_timeout"
+    --result-cap "${TARTCI_CAPTURE_CURRENT_JOB_RESULT_CAP:-300}"
+    --max-api-calls "${TARTCI_CAPTURE_CURRENT_JOB_MAX_API_CALLS:-310}"
+  )
+  if [ "$scan_mode" = revalidate ]; then
+    [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ] || return 1
+    args+=(--run-id "$CURRENT_RUN_ID" --job-id "$CURRENT_JOB_ID")
+  fi
+  while IFS= read -r workflow; do
+    [ -n "$workflow" ] && args+=(--workflow "$workflow")
+  done <<<"$WORKFLOW_CONFIG"
+  previous_status="$CURRENT_JOB_CAPTURE_STATUS"
+  if ! CURRENT_SCAN_TMP="$(mktemp "$STATE_DIR/current-job-scan.XXXXXX")"; then
+    CURRENT_JOB_CAPTURE_STATUS="setup_error"
+    CURRENT_JOB_RECEIPT='{"kind":"setup_error","detail":"mktemp_failed"}'
+    CURRENT_ASSIGNMENT_QUARANTINE="observation_setup_error"
+    event job_observation_error "kind=setup_error stage=mktemp"
+    return 2
+  fi
+  started="$(date +%s)"
+  python3 "${args[@]}" >"$CURRENT_SCAN_TMP" 2>>"$EVENT_LOG" & CURRENT_SCAN_PID=$!
+  while kill -0 "$CURRENT_SCAN_PID" 2>/dev/null; do
+    heartbeat job-running
+    sleep 1
+  done
+  wait "$CURRENT_SCAN_PID" || rc=$?
+  rc="${rc:-0}"
+  elapsed=$(( $(date +%s) - started ))
+  [ "$elapsed" -gt 0 ] || elapsed=1
+  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
+    CURRENT_CANCEL_SCAN_SPENT=$((CURRENT_CANCEL_SCAN_SPENT + elapsed))
+  else
+    CURRENT_JOB_SCAN_SPENT=$((CURRENT_JOB_SCAN_SPENT + elapsed))
+  fi
+  result="$(tr -d '\n' <"$CURRENT_SCAN_TMP")"
+  rm -f "$CURRENT_SCAN_TMP"
+  CURRENT_SCAN_PID=""
+  CURRENT_SCAN_TMP=""
+  CURRENT_JOB_RECEIPT="$result"
+  kind="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("kind", "invalid_receipt"))' 2>/dev/null || printf invalid_receipt)"
+  CURRENT_JOB_CAPTURE_STATUS="$kind"
+  case "$kind" in
+    active)
+      CURRENT_RUN_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')"
+      CURRENT_JOB_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')"
+      CURRENT_WORKFLOW_NAME="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workflow_name"])')"
+      CURRENT_JOB_SCAN_FAILURES=0
+      return 0 ;;
+    no_assignment|terminal|terminal_pending_run|assignment_changed) return 1 ;;
+    unexpected_assignment|ambiguous_assignment)
+      [ "$previous_status" = "$kind" ] || event job_assignment_violation "receipt=$result"
+      return 2 ;;
+    *)
+      CURRENT_JOB_SCAN_FAILURES=$((CURRENT_JOB_SCAN_FAILURES + 1))
+      backoff=$((1 << (CURRENT_JOB_SCAN_FAILURES - 1)))
+      [ "$backoff" -le 30 ] || backoff=30
+      CURRENT_JOB_SCAN_NEXT_AT=$(( $(date +%s) + backoff ))
+      [ "$previous_status" = "$kind" ] || event job_observation_error "scanner_rc=$rc kind=$kind mode=$mode spent=$((scan_spent + elapsed))s budget=${budget}s"
+      return 2 ;;
+  esac
 }
 
 cancel_current_run(){
-  [ -n "$CURRENT_RUN_ID" ] || capture_current_job || true
-  if [ -n "$CURRENT_RUN_ID" ]; then
-    event run_cancel "run_id=$CURRENT_RUN_ID job_id=${CURRENT_JOB_ID:-} reason=timeout"
-    "$GH_CLI" api -X POST "repos/$REPO/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1 || true
+  local receipt rc=0 deadline kind terminal_timeout run_conclusion
+  if [ -z "$CURRENT_RUN_ID" ] || [ -z "$CURRENT_JOB_ID" ]; then
+    if ! capture_current_job cancel_discover; then
+      CURRENT_ASSIGNMENT_QUARANTINE="pre_cancel_discovery_${CURRENT_JOB_CAPTURE_STATUS}"
+      event run_cancel_suppressed "run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} observation=$CURRENT_JOB_CAPTURE_STATUS scanner_rc=discovery rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+      return 1
+    fi
   fi
+  capture_current_job revalidate || rc=$?
+  receipt="$CURRENT_JOB_RECEIPT"
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || {
+    CURRENT_ASSIGNMENT_QUARANTINE="pre_cancel_${CURRENT_JOB_CAPTURE_STATUS}"
+    event run_cancel_suppressed "run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} observation=$CURRENT_JOB_CAPTURE_STATUS scanner_rc=$rc rerun_eligible=false receipt=$receipt"
+    return 1
+  }
+  if ! "$GH_CLI" api -X POST "repos/$REPO/actions/runs/$CURRENT_RUN_ID/cancel" >/dev/null 2>&1; then
+    event run_cancel_failed "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=false"
+    CURRENT_ASSIGNMENT_QUARANTINE="cancel_post_failed"
+    return 1
+  fi
+  event run_cancel_requested "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=pending-terminal"
+  terminal_timeout="${TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS:-30}"
+  case "$terminal_timeout" in ''|*[!0-9]*|0) terminal_timeout=30;; esac
+  deadline=$(( $(date +%s) + terminal_timeout ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    rc=0
+    capture_current_job revalidate || rc=$?
+    receipt="$CURRENT_JOB_RECEIPT"
+    kind="$CURRENT_JOB_CAPTURE_STATUS"
+    if [ "$kind" = terminal ]; then
+      CURRENT_ASSIGNMENT_QUARANTINE="none"
+      run_conclusion="$(printf '%s' "$receipt" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("run_conclusion") or "")' 2>/dev/null || true)"
+      if [ "$run_conclusion" = cancelled ]; then
+        event run_cancel_terminal "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=true receipt=$receipt"
+        return 0
+      fi
+      event run_terminal_without_cancel "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID conclusion=$run_conclusion rerun_eligible=false receipt=$receipt"
+      return 1
+    fi
+    case "$kind" in
+      active|terminal_pending_run) ;;
+      assignment_changed)
+        CURRENT_ASSIGNMENT_QUARANTINE="orphaned_assignment"
+        event run_cancel_orphaned "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=false receipt=$receipt"
+        return 1 ;;
+      *)
+        CURRENT_ASSIGNMENT_QUARANTINE="cancel_terminal_unknown"
+        event run_cancel_unknown "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID observation=$kind scanner_rc=$rc rerun_eligible=false receipt=$receipt"
+        return 1 ;;
+    esac
+    heartbeat cancel-pending-terminal
+    sleep 2
+  done
+  CURRENT_ASSIGNMENT_QUARANTINE="cancel_terminal_timeout"
+  CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
+  CURRENT_JOB_RECEIPT='{"kind":"terminal_unknown","detail":"cancel_poll_timeout"}'
+  event run_cancel_unknown "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID observation=terminal_unknown rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+  return 1
 }
 
 ensure_runner_version(){
@@ -894,8 +1061,8 @@ run_runner_until_done(){
         event job_warn "elapsed=${job_elapsed}s"
       fi
       if [ "$job_elapsed" -ge "$JOB_TIMEOUT" ]; then
-        event job_timeout "elapsed=${job_elapsed}s run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} rerun_eligible=true"
-        cancel_current_run
+        event job_timeout "elapsed=${job_elapsed}s run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} rerun_eligible=pending-revalidation observation=$CURRENT_JOB_CAPTURE_STATUS"
+        cancel_current_run || true
         for _ in $(seq 1 30); do
           kill -0 "$ssh_pid" 2>/dev/null || break
           sleep 2
@@ -910,6 +1077,7 @@ run_runner_until_done(){
     sleep 5
   done
   wait "$ssh_pid" || rc=$?
+  finalize_listener_receipt "$rc" "$assigned"
   sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
 }
@@ -963,6 +1131,13 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
+  CURRENT_JOB_CAPTURE_STATUS="not-attempted"
+  CURRENT_JOB_RECEIPT=""
+  CURRENT_JOB_SCAN_SPENT=0
+  CURRENT_JOB_SCAN_FAILURES=0
+  CURRENT_JOB_SCAN_NEXT_AT=0
+  CURRENT_CANCEL_SCAN_SPENT=0
+  CURRENT_ASSIGNMENT_QUARANTINE="none"
   CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm" "$selected_runner_api_root"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
@@ -1252,7 +1427,7 @@ i=0
 }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
-trap 'event supervisor_signal "INT/TERM"; cleanup; trap - EXIT; exit 143' INT TERM
+trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"

@@ -65,21 +65,17 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
     group = api(gh_cli, group_path, repo, timeout)
     visibility = group.get("visibility")
     if visibility == "all":
-        return {
-            "schema": 1,
-            "verdict": "admit",
-            "repo": repo,
-            "runner_group_id": runner_group_id,
-            "registration_scope": "organization",
-            "visibility": visibility,
-            "reason": "runner group is visible to all organization repositories",
-        }
+        raise RepositoryInaccessible(
+            f"runner group {runner_group_id} is visible to multiple repositories; "
+            "tartci assignment observation is repository-scoped"
+        )
     if visibility != "selected":
         raise AccessError(
             f"runner group {runner_group_id} has unsupported visibility {visibility!r}"
         )
 
     seen = 0
+    selected: list[str] = []
     for page in range(1, MAX_PAGES + 1):
         path = (
             f"{group_path}/repositories?per_page={PER_PAGE}&page={page}"
@@ -93,16 +89,7 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
             if not isinstance(item, dict) or not isinstance(item.get("full_name"), str):
                 raise AccessError("runner-group repository response has malformed entries")
             seen += 1
-            if item["full_name"].lower() == repo.lower():
-                return {
-                    "schema": 1,
-                    "verdict": "admit",
-                    "repo": repo,
-                    "runner_group_id": runner_group_id,
-                    "registration_scope": "organization",
-                    "visibility": visibility,
-                    "reason": "repository is selected for the runner group",
-                }
+            selected.append(item["full_name"])
         if seen >= total:
             break
         if not repositories:
@@ -110,9 +97,24 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
     else:
         raise AccessError("runner-group repository pagination exceeded the safety bound")
 
-    raise RepositoryInaccessible(
-        f"runner group {runner_group_id} is not accessible to {repo}"
-    )
+    if seen != total:
+        raise AccessError(
+            f"runner-group repository pagination count mismatch ({seen} != {total})"
+        )
+    if len(selected) != 1 or selected[0].lower() != repo.lower():
+        raise RepositoryInaccessible(
+            f"runner group {runner_group_id} must select only {repo}; "
+            f"observed {len(selected)} selected repositories"
+        )
+    return {
+        "schema": 1,
+        "verdict": "admit",
+        "repo": repo,
+        "runner_group_id": runner_group_id,
+        "registration_scope": "organization-single-repository",
+        "visibility": visibility,
+        "reason": "runner group is exclusively visible to this repository",
+    }
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
