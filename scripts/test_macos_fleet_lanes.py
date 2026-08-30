@@ -123,6 +123,14 @@ class MacosFleetLaneTests(unittest.TestCase):
                             for repo, group_id in RUNNER_GROUP_IDS.items()
                         },
                     )
+                    self.assertEqual(
+                        {
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
+                            value["EnvironmentVariables"]["SHIPYARD_GH_APP_REPO"]
+                            for value in values
+                        },
+                        {repo: repo for repo in RUNNER_GROUP_IDS},
+                    )
                     self.assertTrue(all(
                         not any(
                             key.startswith("TARTCI_STACKED_")
@@ -214,6 +222,11 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(all(".tart-runner-" in value["Label"] for value in values))
             self.assertTrue(all("--name" not in value["ProgramArguments"] for value in values))
             self.assertTrue(all(value["EnvironmentVariables"]["TARTCI_GH_CLI"] == "ghapp" for value in values))
+            self.assertTrue(all(
+                value["EnvironmentVariables"]["SHIPYARD_GH_APP_REPO"]
+                == value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]
+                for value in values
+            ))
             self.assertTrue(all(value["EnvironmentVariables"]["TARTCI_ADMISSION_CLEAN_MODE"] == "required" for value in values))
             self.assertTrue(all(value["EnvironmentVariables"]["TART_HOME"] == "/Users/danielraffel/VMs" for value in values))
             self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/danielraffel/Library/Logs/tartci") for value in values))

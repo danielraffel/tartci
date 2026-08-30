@@ -361,6 +361,11 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         "TART_HOME": host["tart_home"],
         "TARTCI_HOME": f"{host['home']}/.tartci",
         "TARTCI_GH_CLI": "ghapp",
+        # launchd starts from the host home rather than a repository checkout.
+        # Bind the App wrapper to the same exact repository as this lane so
+        # every API call, including generate-jitconfig, has unambiguous
+        # authority without relying on cwd discovery.
+        "SHIPYARD_GH_APP_REPO": lane["repo"],
         "TARTCI_LAUNCHD_LABEL": label,
         "TARTCI_RUNNER_REPO": lane["repo"],
         "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),

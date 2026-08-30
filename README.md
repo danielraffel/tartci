@@ -244,6 +244,13 @@ The same setting also governs `tartci doctor --reap` runner reads and cleanup,
 so the fleet health surface cannot silently fall back to an exhausted ambient
 token while the providers themselves use the App.
 
+The generated macOS fleet LaunchAgents also set `SHIPYARD_GH_APP_REPO` to the
+lane's exact `OWNER/REPO`. LaunchAgents run with `WorkingDirectory=$HOME`, so
+the App wrapper cannot infer repository authority from a checkout. Keeping this
+value identical to `TARTCI_RUNNER_REPO` gives queue reads, runner cleanup, and
+JIT registration the same explicit per-lane authority on multi-repository
+hosts.
+
 **JIT credential exception and denial fuse (`TARTCI_JIT_GH_CLI`).** Keep
 `TARTCI_GH_CLI=ghapp` as the default for queue scans, reads, cleanup, and all
 ordinary control-plane calls. A host that has a separately governed classic

@@ -109,6 +109,11 @@ class InstallMacosFleetTests(unittest.TestCase):
             ["TARTCI_RUNNER_GROUP_ID"],
             "11",
         )
+        installed_env = plistlib.loads(installed[0].read_bytes())[
+            "EnvironmentVariables"
+        ]
+        self.assertEqual(installed_env["TARTCI_RUNNER_REPO"], "Generous-Corp/forge")
+        self.assertEqual(installed_env["SHIPYARD_GH_APP_REPO"], "Generous-Corp/forge")
         self.assertFalse(self.legacy.exists())
         self.assertFalse(stale.exists())
         retired = list((self.agents / ".tartci-retired").rglob("*.retired"))
