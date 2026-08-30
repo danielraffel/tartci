@@ -6,5 +6,7 @@ schema_version = 1
 enabled = true
 relay_hosts = ["macmini", "m1"]
 github_cli = "ghapp"
+# Required for enabled profiles. This is both the repository probe target and
+# the explicit ghapp authority exported as SHIPYARD_GH_APP_REPO / GH_REPO.
 github_probe_repo = "Generous-Corp/pulp"
 probe_timeout_seconds = 15
