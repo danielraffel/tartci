@@ -39,6 +39,7 @@ RELAY_LABEL = "com.danielraffel.network.http-connect-ssh-relay"
 RELAY_TEMPLATE = ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
 HOST_PROXY = "http://127.0.0.1:49125"
 GUEST_PROXY = "http://192.168.64.1:49125"
+GITHUB_REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 PROXY_ENV = {
     "HTTP_PROXY": HOST_PROXY,
     "HTTPS_PROXY": HOST_PROXY,
@@ -55,7 +56,7 @@ class RelayProfile:
     enabled: bool
     relay_hosts: tuple[str, str] = ("", "")
     github_cli: str = "ghapp"
-    github_probe_repo: str = "Generous-Corp/pulp"
+    github_probe_repo: str = ""
     probe_timeout_seconds: int = 15
 
 
@@ -124,12 +125,12 @@ def load_profile(path: Path) -> RelayProfile:
     ):
         raise ValueError("enabled relay requires exactly two non-empty relay_hosts")
     github_cli = relay.get("github_cli", "ghapp")
-    probe_repo = relay.get("github_probe_repo", "Generous-Corp/pulp")
+    probe_repo = relay.get("github_probe_repo")
     timeout = relay.get("probe_timeout_seconds", 15)
     if not isinstance(github_cli, str) or not github_cli:
         raise ValueError("github_cli must be a command name or absolute path")
-    if not isinstance(probe_repo, str) or probe_repo.count("/") != 1:
-        raise ValueError("github_probe_repo must be OWNER/REPO")
+    if not isinstance(probe_repo, str) or not GITHUB_REPO.fullmatch(probe_repo):
+        raise ValueError("enabled relay requires github_probe_repo = OWNER/REPO")
     if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 60:
         raise ValueError("probe_timeout_seconds must be an integer from 1 through 60")
     return RelayProfile(True, (hosts[0], hosts[1]), github_cli, probe_repo, timeout)
@@ -410,6 +411,11 @@ def authenticated_probe(profile: RelayProfile) -> tuple[bool, str]:
         "https_proxy": HOST_PROXY,
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "no_proxy": "127.0.0.1,localhost,::1",
+        # ghapp requires explicit repository authority even for installation-
+        # scoped endpoints such as rate_limit. Bind both probes to the same
+        # profile-declared repository instead of ambient shell state.
+        "SHIPYARD_GH_APP_REPO": profile.github_probe_repo,
+        "GH_REPO": profile.github_probe_repo,
     })
     try:
         rate = subprocess.run(

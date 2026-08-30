@@ -489,6 +489,8 @@ class NetworkProfileTests(unittest.TestCase):
         for _, env in calls:
             self.assertEqual(env["HTTPS_PROXY"], network.HOST_PROXY)
             self.assertNotIn("api.github.com", env["NO_PROXY"])
+            self.assertEqual(env["SHIPYARD_GH_APP_REPO"], "Generous-Corp/pulp")
+            self.assertEqual(env["GH_REPO"], "Generous-Corp/pulp")
 
         with mock.patch.object(network.shutil, "which", return_value="/usr/local/bin/ghapp"), mock.patch.object(
             network.subprocess,
@@ -498,6 +500,43 @@ class NetworkProfileTests(unittest.TestCase):
             ok, reason = network.authenticated_probe(profile)
         self.assertFalse(ok)
         self.assertIn("anonymous", reason)
+
+    def test_authenticated_probe_overrides_ambient_repo_with_profile_authority(self) -> None:
+        profile = network.RelayProfile(True, ("a", "b"), "ghapp", "Generous-Corp/forge", 9)
+        seen: list[dict[str, str]] = []
+
+        def run(args: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            env = kwargs["env"]  # type: ignore[index]
+            seen.append(env)
+            stdout = "5000\n" if "rate_limit" in args else "Generous-Corp/forge\n"
+            return subprocess.CompletedProcess(args, 0, stdout, "")
+
+        with mock.patch.dict(os.environ, {
+            "SHIPYARD_GH_APP_REPO": "wrong/ambient",
+            "GH_REPO": "wrong/ambient",
+        }), mock.patch.object(network.shutil, "which", return_value="/usr/local/bin/ghapp"), mock.patch.object(
+            network.subprocess, "run", side_effect=run,
+        ):
+            ok, _ = network.authenticated_probe(profile)
+        self.assertTrue(ok)
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(env["SHIPYARD_GH_APP_REPO"] == "Generous-Corp/forge" for env in seen))
+        self.assertTrue(all(env["GH_REPO"] == "Generous-Corp/forge" for env in seen))
+
+    def test_enabled_profile_requires_explicit_probe_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td) / "network-profile.toml"
+            profile.write_text(
+                """schema_version = 1
+[http_connect_relay]
+enabled = true
+relay_hosts = ["relay-a", "relay-b"]
+github_cli = "ghapp"
+""",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "requires github_probe_repo"):
+                network.load_profile(profile)
 
     def test_pool_on_converges_before_opening_participation(self) -> None:
         body = (ROOT / "tartci").read_text(encoding="utf-8")
