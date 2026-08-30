@@ -147,10 +147,17 @@ def load(path: Path) -> dict:
         if not isinstance(lane.get("repo"), str) or not REPO.fullmatch(lane["repo"]):
             fail(f"lane {lane_id}: repo must be OWNER/REPO")
         runner_group_id = lane.get("runner_group_id")
-        if type(runner_group_id) is not int or runner_group_id <= 1:
+        pulp_repository_v2 = (
+            lane.get("repo") == "Generous-Corp/pulp"
+            and lane.get("assignment_mode") == "event-class-v2"
+            and runner_group_id == 1
+        )
+        if (type(runner_group_id) is not int or runner_group_id < 1
+                or (runner_group_id == 1 and not pulp_repository_v2)):
             fail(
                 f"lane {lane_id}: runner_group_id must be an explicit "
-                "non-Default GitHub runner group integer"
+                "non-Default GitHub runner group integer, except the exact "
+                "repository-scoped Pulp event-class-v2 lane"
             )
         labels = lane.get("labels") or []
         if (not isinstance(labels, list) or not labels
@@ -261,10 +268,10 @@ def load(path: Path) -> dict:
                 )
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
-            if tier_groups != [runner_group_id, 1]:
+            if tier_groups != [1, 1]:
                 fail(
-                    f"lane {lane_id}: event-class-v2 requires protected merge-group "
-                    "registration followed by repository-scoped PR-head registration"
+                    f"lane {lane_id}: event-class-v2 requires repository-scoped "
+                    "merge-group and PR-head registration"
                 )
     return data
 
