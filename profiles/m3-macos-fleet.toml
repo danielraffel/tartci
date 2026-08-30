@@ -21,7 +21,7 @@ flat_rollback = "pulp-build-runner:latest"
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
-runner_group_id = 3
+runner_group_id = 1
 golden = "pulp-build-runner:latest"
 priority = "gate"
 min_queued_age_seconds = 0
@@ -37,7 +37,7 @@ replaces_launchd_labels = [
 [[lane.tier]]
 label = "pulp-build-merge-group"
 workflow = "Build and Test"
-runner_group_id = 3
+runner_group_id = 1
 
 [[lane.tier]]
 label = "pulp-build-pr-head"

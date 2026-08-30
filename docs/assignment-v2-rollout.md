@@ -23,21 +23,21 @@ before JIT minting it freshly rescans every higher class and the selected class.
 If higher demand arrived or selected demand was cancelled, the unregistered VM
 is discarded and its lease is released.
 
-Registration authority is class-specific as well as label-specific. The
-versioned fleet profiles map merge-group to protected organization group `3`
-and PR-head to repository group `1`:
+Registration authority is class-specific as well as label-specific. Both Pulp
+event classes use repository group `1`; the exclusive class label still keeps
+merge-group and PR-head jobs separate:
 
 ```text
-TARTCI_RUNNER_WORKFLOW_TIER_GROUPS=pulp-build-merge-group|3
+TARTCI_RUNNER_WORKFLOW_TIER_GROUPS=pulp-build-merge-group|1
                                      pulp-build-pr-head|1
 ```
 
 The actual value is newline-delimited. The provider rejects a missing,
-misordered, or malformed mapping. Organization-scoped tiers must freshly prove
-that their runner group includes the target repository; PR-head uses the
-repository JIT endpoint, so an org-only online/idle runner cannot masquerade as
-Pulp capacity. Required Shipyard admission-clean runs at this same final JIT
-boundary.
+misordered, or malformed mapping. GitHub evaluates a merge-group workflow under
+its `gh-readonly-queue/...` ref, so an organization group restricted to
+`build.yml@refs/heads/main` leaves an exact-label runner online and idle while
+the job remains queued. Repository JIT avoids that false capacity for both
+classes. Required Shipyard admission-clean runs at this same final JIT boundary.
 
 ## Modes and staged migration
 
@@ -72,7 +72,7 @@ LaunchAgent environment (or set the same env explicitly):
 ```bash
 TARTCI_RUNNER_ASSIGNMENT_MODE=observe \
 TARTCI_RUNNER_WORKFLOW_TIERS=$'pulp-build-merge-group|Build and Test\npulp-build-pr-head|Build and Test' \
-TARTCI_RUNNER_WORKFLOW_TIER_GROUPS=$'pulp-build-merge-group|3\npulp-build-pr-head|1' \
+TARTCI_RUNNER_WORKFLOW_TIER_GROUPS=$'pulp-build-merge-group|1\npulp-build-pr-head|1' \
 tartci serve macos --print-assignment-parity
 ```
 

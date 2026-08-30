@@ -47,7 +47,7 @@ repository runner view and could not claim the queued job:
 
 | Lane/class | Group ID | Registration scope | Access contract |
 |---|---:|---|---|
-| Pulp merge-group | 3 | organization | `pulp-trusted-build`, freshly verified selected to Pulp before JIT mint |
+| Pulp merge-group | 1 | repository | repository JIT endpoint plus exact `pulp-build-merge-group` class |
 | Pulp PR-head | 1 | repository | repository JIT endpoint plus exact `pulp-build-pr-head` class |
 | Forge | 11 | organization | `forge-pr-safe-build`, freshly verified selected to Forge before JIT mint |
 | Vellum | 8 | organization | `vellum-macos-build`, freshly verified selected to Vellum before JIT mint |
@@ -133,9 +133,11 @@ current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
 
-The same rendered Pulp contract fixes registration scope per selected class:
-merge-group uses protected organization group 3, while PR-head uses repository
-group 1. Both advertise exactly one event class, omit `pulp-gate-fast`, and set
+The same rendered Pulp contract fixes both selected classes to repository group
+1. GitHub evaluates a merge-group workflow under its `gh-readonly-queue/...`
+ref, which cannot satisfy organization group 3's
+`build.yml@refs/heads/main` restriction. Both advertise exactly one event class,
+omit `pulp-gate-fast`, and set
 `TARTCI_ADMISSION_CLEAN_MODE=required`. Shipyard's typed admission-clean verdict
 runs after guest preflight and immediately before repository-access verification,
 the pool lock, final assignment/admission rechecks, and JIT minting.

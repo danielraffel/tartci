@@ -18,7 +18,7 @@ HOST_CONFIGS = {
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
 }
 RUNNER_GROUP_IDS = {
-    "Generous-Corp/pulp": 3,
+    "Generous-Corp/pulp": 1,
     "Generous-Corp/forge": 11,
     "Generous-Corp/vellum": 8,
 }
@@ -60,7 +60,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     [tier["runner_group_id"] for tier in pulp_lane["tier"]],
-                    [3, 1],
+                    [1, 1],
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
                 self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
@@ -188,7 +188,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         )
                         self.assertEqual(
                             env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
-                            "pulp-build-merge-group|3\npulp-build-pr-head|1",
+                            "pulp-build-merge-group|1\npulp-build-pr-head|1",
                         )
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
@@ -257,7 +257,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
                 pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
-                "pulp-build-merge-group|3\npulp-build-pr-head|1",
+                "pulp-build-merge-group|1\npulp-build-pr-head|1",
             )
             self.assertEqual(
                 ["com.danielraffel.pulp.tart-runner-macos-gate"],
@@ -496,9 +496,9 @@ workflows=["Build"]
                 'label = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 3',
                 1,
             ),
-            "unprotected-merge-group": base.replace(
-                'label = "pulp-build-merge-group"\nworkflow = "Build and Test"\nrunner_group_id = 3',
+            "org-scoped-merge-group": base.replace(
                 'label = "pulp-build-merge-group"\nworkflow = "Build and Test"\nrunner_group_id = 1',
+                'label = "pulp-build-merge-group"\nworkflow = "Build and Test"\nrunner_group_id = 3',
                 1,
             ),
         }

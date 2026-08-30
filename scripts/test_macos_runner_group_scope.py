@@ -29,13 +29,13 @@ def tier_contract(tier: int) -> subprocess.CompletedProcess[str]:
     env.update(
         {
             "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
-            "TARTCI_RUNNER_GROUP_ID": "3",
+            "TARTCI_RUNNER_GROUP_ID": "1",
             "TARTCI_RUNNER_WORKFLOW_TIERS": (
                 "pulp-build-merge-group|Build and Test\n"
                 "pulp-build-pr-head|Build and Test"
             ),
             "TARTCI_RUNNER_WORKFLOW_TIER_GROUPS": (
-                "pulp-build-merge-group|3\npulp-build-pr-head|1"
+                "pulp-build-merge-group|1\npulp-build-pr-head|1"
             ),
             "TARTCI_RUNNER_ASSIGNMENT_MODE": "event-class-v2",
         }
@@ -72,14 +72,14 @@ class MacOSRunnerGroupScopeTests(unittest.TestCase):
                     "orgs/Generous-Corp/actions/runners",
                 )
 
-    def test_pulp_event_classes_select_distinct_registration_scopes(self) -> None:
+    def test_pulp_event_classes_use_repository_registration_scope(self) -> None:
         merge_group = tier_contract(0)
         pr_head = tier_contract(1)
         self.assertEqual(merge_group.returncode, 0, merge_group.stderr)
         self.assertEqual(pr_head.returncode, 0, pr_head.stderr)
         self.assertEqual(
             merge_group.stdout.strip(),
-            "3\torgs/Generous-Corp/actions/runners",
+            "1\trepos/Generous-Corp/pulp/actions/runners",
         )
         self.assertEqual(
             pr_head.stdout.strip(),
