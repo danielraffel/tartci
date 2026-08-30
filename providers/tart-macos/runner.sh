@@ -772,34 +772,53 @@ finalize_listener_receipt(){
   record_terminal_job_receipt "$runner_rc"
 }
 
+tartci_is_canonical_positive_decimal(){
+  case "$1" in
+    ''|0|0*|*[!0-9]*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
 capture_current_job(){
   local mode="${1:-discover}" scan_mode result runner_registration rc previous_status
-  local now started elapsed budget remaining attempt_timeout kind backoff scan_spent
+  local now started elapsed budget remaining attempt_timeout kind backoff scan_spent invalid_parameter
+  local budget_parameter
   runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
   scan_mode="$mode"
   case "$mode" in
     cancel_discover)
       scan_mode=discover
-      budget="${TARTCI_CANCEL_DISCOVERY_BUDGET_SECS:-30}"
-      scan_spent="$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" ;;
+      budget="${TARTCI_CANCEL_DISCOVERY_BUDGET_SECS-30}"
+      scan_spent="$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT"
+      budget_parameter="cancel_discovery_budget" ;;
     revalidate)
-      budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS:-30}"
-      scan_spent="$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" ;;
+      budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS-30}"
+      scan_spent="$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT"
+      budget_parameter="cancel_revalidation_budget" ;;
     terminal_revalidate)
       scan_mode=revalidate
-      budget="${TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS:-30}"
-      scan_spent="$CURRENT_CANCEL_TERMINAL_SCAN_SPENT" ;;
+      budget="${TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS-30}"
+      scan_spent="$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"
+      budget_parameter="cancel_terminal_observation_budget" ;;
     *)
-      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS:-30}"
-      scan_spent="$CURRENT_JOB_SCAN_SPENT" ;;
+      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-30}"
+      scan_spent="$CURRENT_JOB_SCAN_SPENT"
+      budget_parameter="lifecycle_budget" ;;
   esac
-  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS:-8}"
-  case "$budget:$attempt_timeout" in
-    *[!0-9:]*|0:*|*:0)
-      CURRENT_JOB_CAPTURE_STATUS="invalid_budget"
-      CURRENT_JOB_RECEIPT='{"kind":"invalid_budget"}'
-      return 2 ;;
-  esac
+  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-8}"
+  invalid_parameter=""
+  tartci_is_canonical_positive_decimal "$budget" || invalid_parameter="$budget_parameter"
+  if [ -z "$invalid_parameter" ]; then
+    tartci_is_canonical_positive_decimal "$attempt_timeout" \
+      || invalid_parameter="attempt_timeout"
+  fi
+  if [ -n "$invalid_parameter" ]; then
+    CURRENT_JOB_CAPTURE_STATUS="invalid_budget"
+    CURRENT_JOB_RECEIPT="{\"kind\":\"invalid_budget\",\"detail\":\"$invalid_parameter\"}"
+    CURRENT_ASSIGNMENT_QUARANTINE="observation_invalid_budget"
+    event job_observation_error "kind=invalid_budget mode=$mode parameter=$invalid_parameter"
+    return 2
+  fi
   now="$(date +%s)"
   remaining=$((budget - scan_spent))
   [ "$remaining" -gt 0 ] || {
@@ -886,6 +905,14 @@ capture_current_job(){
 
 cancel_current_run(){
   local receipt rc=0 deadline kind terminal_timeout run_conclusion
+  terminal_timeout="${TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS-30}"
+  if ! tartci_is_canonical_positive_decimal "$terminal_timeout"; then
+    CURRENT_JOB_CAPTURE_STATUS="invalid_budget"
+    CURRENT_JOB_RECEIPT='{"kind":"invalid_budget","detail":"cancel_terminal_timeout"}'
+    CURRENT_ASSIGNMENT_QUARANTINE="pre_cancel_invalid_budget"
+    event run_cancel_suppressed "run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} observation=invalid_budget scanner_rc=config rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 1
+  fi
   if [ -z "$CURRENT_RUN_ID" ] || [ -z "$CURRENT_JOB_ID" ]; then
     if ! capture_current_job cancel_discover; then
       CURRENT_ASSIGNMENT_QUARANTINE="pre_cancel_discovery_${CURRENT_JOB_CAPTURE_STATUS}"
@@ -906,8 +933,6 @@ cancel_current_run(){
     return 1
   fi
   event run_cancel_requested "run_id=$CURRENT_RUN_ID job_id=$CURRENT_JOB_ID rerun_eligible=pending-terminal"
-  terminal_timeout="${TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS:-30}"
-  case "$terminal_timeout" in ''|*[!0-9]*|0) terminal_timeout=30;; esac
   deadline=$(( $(date +%s) + terminal_timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     rc=0
