@@ -1158,6 +1158,38 @@ macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."
 
+### Classify a Pulp Actions wait before touching TartCI
+
+First inspect the run's jobs endpoint. A workflow run with **zero jobs** has not
+reached `runs-on`, a persistent preamble runner, TartCI, a host lease, or a VM;
+changing fleet labels or restarting supervisors cannot repair it. A queued job
+requesting `pulp-preamble` is also outside TartCI: verify the persistent runner
+registration, launchd-owned process, exact labels, and a real assigned job. Only
+a queued job with TartCI lane labels should lead to runner-group, exact-label,
+admission, lease, disk, and VM-slot diagnosis.
+
+If required Shipyard admission is repeatedly rejecting a managed M3 Pulp lane,
+contain only that lane while preserving the preamble and other repositories:
+
+```bash
+uid=$(id -u)
+for label in \
+  com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate \
+  com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate.slot2
+do
+  launchctl disable "gui/$uid/$label"
+  launchctl bootout "gui/$uid/$label" 2>/dev/null || true
+done
+```
+
+The disabled state is required because booting out a KeepAlive service alone
+does not prevent resurrection. Re-enable only after the installed Shipyard
+command passes and a one-job physical canary reaches assignment; an online JIT
+registration without assignment is insufficient. Before any deploy or reload,
+also prove each existing job terminal, JIT registration gone or appropriately
+idle, lease released, and VM absent. Never preempt a live lease merely to make
+the installed profile match `main` sooner.
+
 Do not set a fixed `TARTCI_VM_LEASE_PRIORITY` on a managed Pulp event-class-V2
 lane. Its exact selected label derives merge-group priority `110` or PR-head
 priority `100`; fleet validation rejects an explicit priority that would flatten
