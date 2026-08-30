@@ -157,7 +157,9 @@ CURRENT_JOB_RECEIPT=""
 CURRENT_JOB_SCAN_SPENT=0
 CURRENT_JOB_SCAN_FAILURES=0
 CURRENT_JOB_SCAN_NEXT_AT=0
-CURRENT_CANCEL_SCAN_SPENT=0
+CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0
+CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
+CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0
 CURRENT_ASSIGNMENT_QUARANTINE="none"
 CURRENT_SCAN_PID=""
 CURRENT_SCAN_TMP=""
@@ -775,14 +777,22 @@ capture_current_job(){
   local now started elapsed budget remaining attempt_timeout kind backoff scan_spent
   runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
   scan_mode="$mode"
-  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
-    budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS:-30}"
-    scan_spent="$CURRENT_CANCEL_SCAN_SPENT"
-    [ "$mode" = cancel_discover ] && scan_mode=discover
-  else
-    budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS:-30}"
-    scan_spent="$CURRENT_JOB_SCAN_SPENT"
-  fi
+  case "$mode" in
+    cancel_discover)
+      scan_mode=discover
+      budget="${TARTCI_CANCEL_DISCOVERY_BUDGET_SECS:-30}"
+      scan_spent="$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" ;;
+    revalidate)
+      budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS:-30}"
+      scan_spent="$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" ;;
+    terminal_revalidate)
+      scan_mode=revalidate
+      budget="${TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS:-30}"
+      scan_spent="$CURRENT_CANCEL_TERMINAL_SCAN_SPENT" ;;
+    *)
+      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS:-30}"
+      scan_spent="$CURRENT_JOB_SCAN_SPENT" ;;
+  esac
   attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS:-8}"
   case "$budget:$attempt_timeout" in
     *[!0-9:]*|0:*|*:0)
@@ -836,11 +846,16 @@ capture_current_job(){
   rc="${rc:-0}"
   elapsed=$(( $(date +%s) - started ))
   [ "$elapsed" -gt 0 ] || elapsed=1
-  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
-    CURRENT_CANCEL_SCAN_SPENT=$((CURRENT_CANCEL_SCAN_SPENT + elapsed))
-  else
-    CURRENT_JOB_SCAN_SPENT=$((CURRENT_JOB_SCAN_SPENT + elapsed))
-  fi
+  case "$mode" in
+    cancel_discover)
+      CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=$((CURRENT_CANCEL_DISCOVERY_SCAN_SPENT + elapsed)) ;;
+    revalidate)
+      CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=$((CURRENT_CANCEL_REVALIDATION_SCAN_SPENT + elapsed)) ;;
+    terminal_revalidate)
+      CURRENT_CANCEL_TERMINAL_SCAN_SPENT=$((CURRENT_CANCEL_TERMINAL_SCAN_SPENT + elapsed)) ;;
+    *)
+      CURRENT_JOB_SCAN_SPENT=$((CURRENT_JOB_SCAN_SPENT + elapsed)) ;;
+  esac
   result="$(tr -d '\n' <"$CURRENT_SCAN_TMP")"
   rm -f "$CURRENT_SCAN_TMP"
   CURRENT_SCAN_PID=""
@@ -896,7 +911,7 @@ cancel_current_run(){
   deadline=$(( $(date +%s) + terminal_timeout ))
   while [ "$(date +%s)" -lt "$deadline" ]; do
     rc=0
-    capture_current_job revalidate || rc=$?
+    capture_current_job terminal_revalidate || rc=$?
     receipt="$CURRENT_JOB_RECEIPT"
     kind="$CURRENT_JOB_CAPTURE_STATUS"
     if [ "$kind" = terminal ]; then
@@ -1136,7 +1151,9 @@ run_one(){
   CURRENT_JOB_SCAN_SPENT=0
   CURRENT_JOB_SCAN_FAILURES=0
   CURRENT_JOB_SCAN_NEXT_AT=0
-  CURRENT_CANCEL_SCAN_SPENT=0
+  CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0
+  CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
+  CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0
   CURRENT_ASSIGNMENT_QUARANTINE="none"
   CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm" "$selected_runner_api_root"
