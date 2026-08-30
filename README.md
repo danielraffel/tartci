@@ -441,6 +441,13 @@ the primary gate runner and existing lanes are byte-for-byte unchanged):
 - `TARTCI_YIELD_TO_LABELS` — the priority lane's labels
   (e.g. `self-hosted,macOS,ARM64,pulp-build,pulp-build-vm`).
 
+For an event-class-v2 secondary lane sharing a required-gate host, append both
+`pulp-build-merge-group` and `pulp-build-pr-head`. The yield hook controls only
+admission and cannot preempt an advisory VM, so yielding to both preserves a
+slot when merge-group work arrives during PR validation. Using only the base
+labels matches neither class because each v2 job requests its additional
+mutually exclusive class label.
+
 When set, the loop boots only when (1) this lane has queued work, (2) a VM slot
 is free, and (3) the priority lane has **no** queued or in-progress work whose
 requested labels are a subset of `TARTCI_YIELD_TO_LABELS`. Keep the secondary
