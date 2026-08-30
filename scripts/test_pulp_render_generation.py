@@ -208,6 +208,21 @@ class PulpRenderGenerationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "probe architecture mismatch"):
             self.verify()
 
+    def test_emulated_probe_cannot_claim_native_capability(self) -> None:
+        self.write_capability(
+            probes=[
+                {
+                    "architecture": "x86_64",
+                    "compile": "pass",
+                    "link": "pass",
+                    "run": "pass",
+                    "run_mode": "emulated",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "probe run mode mismatch"):
+            self.verify()
+
     def test_mismatched_v8_pair_is_rejected(self) -> None:
         self.manifest["dependencies"][1]["determinism"]["paired_dawn"] = "9" * 40
         (self.repo / "tools/deps/manifest.json").write_text(json.dumps(self.manifest))

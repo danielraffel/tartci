@@ -152,7 +152,7 @@ exit 0
                     "SkLogHandler.GetInstance.SetInstance.compile-link-run",
                     "Graphite.ContextOptions.fExecutor.compile-link-run",
                 ],
-                "probe_count": 2,
+                "probe_count": 1,
             },
             "v8": {
                 "disposition": "baked-provider-only",

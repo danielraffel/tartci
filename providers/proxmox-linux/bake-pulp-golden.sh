@@ -272,7 +272,7 @@ checks = {
         "SkLogHandler.GetInstance.SetInstance.compile-link-run",
         "Graphite.ContextOptions.fExecutor.compile-link-run",
     ],
-    "probe_count": isinstance(skia.get("probe_count"), int) and skia["probe_count"] >= 1,
+    "probe_count": skia.get("probe_count") == 1,
     "v8_disposition": v8.get("disposition") == "baked-provider-only",
     "v8_version": isinstance(v8.get("version"), str) and "m153" in v8["version"],
     "v8_platform": v8.get("platform") == "linux-x64",
