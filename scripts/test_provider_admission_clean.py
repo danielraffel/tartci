@@ -261,8 +261,16 @@ class ProviderIntegrationTests(unittest.TestCase):
                     repository_access = body.index(
                         "runner_group_repository_access.py", body.index("run_one")
                     )
-                    self.assertLess(gate, final_assignment)
-                    self.assertLess(final_assignment, repository_access)
+                    pool_lock = body.index(
+                        "tartci_pool_lock_acquire", body.index("run_one")
+                    )
+                    final_pool_gate = body.rindex(
+                        "tartci_pool_admission_open", body.index("run_one"), mint
+                    )
+                    self.assertLess(gate, repository_access)
+                    self.assertLess(repository_access, pool_lock)
+                    self.assertLess(pool_lock, final_assignment)
+                    self.assertLess(final_assignment, final_pool_gate)
                     self.assertLess(repository_access, mint)
                 if "tart-linux" in str(provider):
                     cache_setup = body.index("write_state cache-setup", body.index("run_one"))

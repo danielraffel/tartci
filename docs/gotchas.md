@@ -359,8 +359,8 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   3. Before every organization-scoped JIT mint, TartCI freshly checks group
   visibility and the complete selected-repository list. Unknown/inaccessible
   policy records a contract-keyed denial and boots no further VM for that class.
-  The final order is required Shipyard admission-clean → pool lock and assignment
-  recheck → repository-access proof → JIT mint. Do not use an online org row or
+  The final order is required Shipyard admission-clean → repository-access proof
+  → pool lock and assignment/admission rechecks → JIT mint. Do not use an online org row or
   `busy=false` as repository capacity evidence.
 
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**

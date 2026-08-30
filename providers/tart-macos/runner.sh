@@ -1101,16 +1101,36 @@ run_one(){
     fi
   fi
 
+  access_error="$STATE_DIR/$vm.repository-access-error"
+  access_rc=0
+  if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+      --repo "$REPO" --runner-group-id "$selected_group_id" \
+      --gh-cli "$JIT_GH_CLI" 2>"$access_error")"; then
+    access_rc=0
+  else
+    access_rc=$?
+  fi
+  [ -z "$access_json" ] \
+    || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
+  if [ "$access_rc" -ne 0 ]; then
+    if [ "$access_rc" -eq 3 ] \
+       || grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$access_error"; then
+      record_jit_admission_denied "$selected_group_id" "$selected_labels" \
+        "repository access denied before JIT registration; inspect $access_error"
+      event jit_repository_access_denied \
+        "repo=$REPO group=$selected_group_id labels=$selected_labels"
+    fi
+    note "[$i] runner group cannot prove repository access — refusing JIT registration and discarding VM"
+    discard_current_vm
+    tartci_release_vm_lease
+    return "$access_rc"
+  fi
+  rm -f "$access_error"
+
   heartbeat minting-jit
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
-    discard_current_vm
-    tartci_release_vm_lease
-    return 75
-  fi
-  if ! tartci_pool_admission_open; then
-    tartci_pool_lock_release
-    note "[$i] pool $(tartci_pool_read_state) before JIT mint — discarding unassigned VM"
     discard_current_vm
     tartci_release_vm_lease
     return 75
@@ -1125,33 +1145,14 @@ run_one(){
     tartci_release_vm_lease
     return 75
   fi
-  access_error="$STATE_DIR/$vm.repository-access-error"
-  access_rc=0
-  if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
-      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
-      --repo "$REPO" --runner-group-id "$selected_group_id" \
-      --gh-cli "$JIT_GH_CLI" 2>"$access_error")"; then
-    access_rc=0
-  else
-    access_rc=$?
-  fi
-  [ -z "$access_json" ] \
-    || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
-  if [ "$access_rc" -ne 0 ]; then
+  # Re-check emergency admission at the last possible boundary.
+  if ! tartci_pool_admission_open; then
     tartci_pool_lock_release
-    if [ "$access_rc" -eq 3 ] \
-       || grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$access_error"; then
-      record_jit_admission_denied "$selected_group_id" "$selected_labels" \
-        "repository access denied before JIT registration; inspect $access_error"
-      event jit_repository_access_denied \
-        "repo=$REPO group=$selected_group_id labels=$selected_labels"
-    fi
-    note "[$i] runner group cannot prove repository access — refusing JIT registration and discarding VM"
+    note "[$i] pool $(tartci_pool_read_state) after repository-access proof — discarding unassigned VM"
     discard_current_vm
     tartci_release_vm_lease
-    return "$access_rc"
+    return 75
   fi
-  rm -f "$access_error"
   event mint_jit "labels=$selected_labels tier=$selected_tier"
   # Claim the exact per-boot registration name before minting. Cleanup can then
   # reclaim it even when a signal lands immediately after GitHub creates it.

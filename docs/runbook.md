@@ -1114,8 +1114,8 @@ mode fails closed: a typed `admit` is the only path to JIT registration.
 releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`. Keep the
 mode `disabled` only during the staged TartCI-before-Shipyard rollout.
 The managed macOS fleet profiles always render `required`; for event-class V2,
-the gate runs after guest preflight and immediately before the pool lock, live
-assignment recheck, repository-access verification, and JIT minting.
+the gate runs after guest preflight and immediately before repository-access
+verification, the pool lock, live assignment/admission rechecks, and JIT minting.
 Linux and Windows scan queued and in-progress workflow runs for queued jobs and
 add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and

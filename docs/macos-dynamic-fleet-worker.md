@@ -137,8 +137,8 @@ The same rendered Pulp contract fixes registration scope per selected class:
 merge-group uses protected organization group 3, while PR-head uses repository
 group 1. Both advertise exactly one event class, omit `pulp-gate-fast`, and set
 `TARTCI_ADMISSION_CLEAN_MODE=required`. Shipyard's typed admission-clean verdict
-runs after guest preflight and immediately before the pool lock, final assignment
-recheck, repository-access verification, and JIT minting.
+runs after guest preflight and immediately before repository-access verification,
+the pool lock, final assignment/admission rechecks, and JIT minting.
 
 No V2 Pulp runner advertises the legacy `pulp-gate-fast` label. Existing
 measurements put it materially behind M3/M5, and the settled placement contract
