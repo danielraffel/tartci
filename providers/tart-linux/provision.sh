@@ -11,8 +11,8 @@
 # Usage:
 #   providers/tart-linux/provision.sh \
 #     [--base ghcr.io/cirruslabs/ubuntu:24.04@sha256:<pin>] \
-#     [--name pulp-linux-build] [--src-repo https://github.com/Generous-Corp/pulp] \
-#     [--disk 80] [--memory 16384] [--cpu 8] [--skia-arch linux-arm64]
+#     [--name pulp-linux-build] [--disk 80] [--memory 16384] [--cpu 8] \
+#     [--skia-platform linux-arm64]
 #     [--rosetta|--no-rosetta]
 set -euo pipefail
 
@@ -21,8 +21,12 @@ VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
 NAME="pulp-linux-build"
-SRC_REPO="https://github.com/Generous-Corp/pulp"
-DISK=80; MEMORY=16384; CPU=8; SKIA_ARCH="linux-arm64"; ENABLE_ROSETTA=1
+DISK=80; MEMORY=16384; CPU=8; SKIA_PLATFORM="linux-arm64"; ENABLE_ROSETTA=1
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MANIFEST="$ROOT/manifests/pulp.linux.toml"
+COMMON="$ROOT/providers/common"
+SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
+RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -32,16 +36,25 @@ command -v tart >/dev/null 2>&1 || die "tart not installed"
 while [ $# -gt 0 ]; do case "$1" in
   --base) BASE="$2"; shift 2;;
   --name) NAME="$2"; shift 2;;
-  --src-repo) SRC_REPO="$2"; shift 2;;
   --disk) DISK="$2"; shift 2;;
   --memory) MEMORY="$2"; shift 2;;
   --cpu) CPU="$2"; shift 2;;
-  --skia-arch) SKIA_ARCH="$2"; shift 2;;
+  --skia-platform|--skia-arch) SKIA_PLATFORM="$2"; shift 2;;
   --rosetta) ENABLE_ROSETTA=1; shift;;
   --no-rosetta) ENABLE_ROSETTA=0; shift;;
   -h|--help) sed -n '2,16p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+for required in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
+  [ -f "$required" ] || die "versioned golden input missing: $required"
+done
+source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+  --require-skia-release chrome/m153 \
+  --require-v8-disposition baked-provider-only)" \
+  || die "could not resolve immutable Pulp source from $MANIFEST"
+SRC_REPO="${source_identity%%$'\n'*}"
+PULP_SHA="${source_identity#*$'\n'}"
 
 case "$BASE" in *@sha256:*) ;; *) note "WARNING: --base is not digest-pinned; :tag drifts glibc/sysroot under the golden (runbook §3.1)";; esac
 
@@ -76,13 +89,28 @@ note "vm up at $IP via $GUEST_TRANSPORT — provisioning deps + Skia in-guest"
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
     ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
-      "SRC_REPO='$SRC_REPO' SKIA_ARCH='$SKIA_ARCH' ENABLE_ROSETTA='$ENABLE_ROSETTA' bash -s"
+      "SRC_REPO='$SRC_REPO' PULP_SHA='$PULP_SHA' SKIA_PLATFORM='$SKIA_PLATFORM' ENABLE_ROSETTA='$ENABLE_ROSETTA' PARENT_IDENTITY='$BASE' bash -s"
   else
     tart exec -i "$NAME" env \
-      "SRC_REPO=$SRC_REPO" "SKIA_ARCH=$SKIA_ARCH" "ENABLE_ROSETTA=$ENABLE_ROSETTA" \
+      "SRC_REPO=$SRC_REPO" "PULP_SHA=$PULP_SHA" "SKIA_PLATFORM=$SKIA_PLATFORM" \
+      "ENABLE_ROSETTA=$ENABLE_ROSETTA" "PARENT_IDENTITY=$BASE" \
       bash -s
   fi
 }
+
+install_render_verifier(){
+  if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+      'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
+      <"$RENDER_VERIFIER"
+  else
+    tart exec -i "$NAME" bash -c \
+      'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
+      <"$RENDER_VERIFIER"
+  fi
+}
+
+install_render_verifier
 
 run_guest_script <<'GUEST'
 set -euo pipefail
@@ -231,18 +259,52 @@ if [ "${ENABLE_ROSETTA:-1}" = 1 ]; then
   echo "• Rosetta x86_64 dynamic runtime verified"
 fi
 
-# Clone the project (the golden carries a ~/pulp checkout that run.sh updates to
-# the ref under test).
+# Clone the project, then detach at the immutable render-toolchain source. A
+# branch tip is never an acceptable golden input.
 if [ ! -d "$HOME/pulp/.git" ]; then
   git clone "$SRC_REPO" "$HOME/pulp"
 fi
+git -C "$HOME/pulp" remote set-url origin "$SRC_REPO"
+git -C "$HOME/pulp" fetch --no-tags origin "$PULP_SHA"
+git -C "$HOME/pulp" cat-file -e "$PULP_SHA^{commit}"
+git -C "$HOME/pulp" checkout --detach "$PULP_SHA"
+git -C "$HOME/pulp" reset --hard "$PULP_SHA"
+git -C "$HOME/pulp" clean -ffd
+[ "$(git -C "$HOME/pulp" rev-parse HEAD)" = "$PULP_SHA" ] || {
+  echo "Pulp checkout did not land on immutable SHA $PULP_SHA" >&2
+  exit 1
+}
 
 # §3.6 — bake prebuilt Skia into the in-checkout external/skia-build so each CoW
 # clone gets it free. FindSkia auto-discovers it (no SKIA_DIR needed).
 cd "$HOME/pulp"
-python3 tools/deps/fetch_skia_for_release.py --arch "$SKIA_ARCH"
+python3 tools/scripts/fetch_skia_for_release.py "$SKIA_PLATFORM"
 ls external/skia-build/build/*-gpu/lib/Release/libskia.a >/dev/null 2>&1 \
-  && echo "• Skia baked OK ($SKIA_ARCH)" || { echo "✗ Skia bake missing libskia.a"; exit 1; }
+  && echo "• Skia baked OK ($SKIA_PLATFORM)" || { echo "✗ Skia bake missing libskia.a"; exit 1; }
+
+# Prove the receipt-bound provider links both SkLogHandler symbols, executes the
+# non-global GetInstance/Graphite paths, and records why SetInstance is not run.
+# Then retain matched V8 bytes without changing Pulp's QuickJS-default policy.
+mkdir -p "$HOME/.config/tartci"
+python3 tools/scripts/verify_skia_m153_capabilities.py \
+  --platform "$SKIA_PLATFORM" \
+  --skia-dir external/skia-build \
+  --result "$HOME/.config/tartci/pulp-skia-capabilities.json"
+python3 tools/scripts/fetch_v8_for_release.py "$SKIA_PLATFORM"
+
+parent_digest="$(printf '%s' "$PARENT_IDENTITY" | sha256sum | awk '{print $1}')"
+python3 "$HOME/.local/lib/tartci/pulp-render-generation.py" \
+  --repo "$HOME/pulp" \
+  --pulp-sha "$PULP_SHA" \
+  --pulp-repository "$SRC_REPO" \
+  --platform "$SKIA_PLATFORM" \
+  --capability-result "$HOME/.config/tartci/pulp-skia-capabilities.json" \
+  --v8-disposition baked-provider-only \
+  --parent-kind tart-base-reference \
+  --parent-identity "$PARENT_IDENTITY" \
+  --parent-digest "$parent_digest" \
+  --output "$HOME/.config/tartci/pulp-render-generation.json"
+test -s "$HOME/.config/tartci/pulp-render-generation.json"
 GUEST
 
 note "§stop $NAME — golden ready. Tag it: tart stop $NAME (then keep as :latest, or"

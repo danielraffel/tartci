@@ -581,10 +581,50 @@ also verify the real workload toolchain with
 x64 (GitHub). SIMD/Highway dispatch, futex/signal semantics, and RT-audio timing
 are all unreliable emulated. GitHub-hosted x64 stays authoritative.
 
+### 3.9 Native Linux x64 Proxmox golden refresh
+
+The Mac Pro's native x64 pool is not a Tart provider, but its golden refresh is
+versioned here so it inherits the same Pulp render identity contract. Use
+`providers/proxmox-linux/bake-pulp-golden.sh`; the complete host topology,
+drain/canary procedure, and rollback boundary live in
+[`proxmox-macpro.md`](proxmox-macpro.md#refreshing-the-render-toolchain-golden-m153).
+
+The short contract is: preserve template `9005`; choose a new unused VMID; clone
+additively; bind the supplied SSH peer to that exact VMID with a guest-agent
+nonce; detach at `manifests/pulp.linux.toml`'s exact Pulp SHA; derive m153
+Skia/Dawn/V8 identity from that checkout's exact manifest; deep-validate provider
+receipts; compile/link both m153 Skia capabilities, execute the non-global
+`GetInstance`/Graphite paths, and record that process-global `SetInstance` is
+link-proven but intentionally not executed; warm the local Release
+build; publish and independently validate the host receipt; scrub clone identity;
+stop; then and only then template the new VMID. A failed candidate is retained,
+not automatically destroyed. This repository step creates tooling only—running
+it is a separately governed host operation.
+
+```bash
+providers/proxmox-linux/bake-pulp-golden.sh \
+  --new-vmid <unused-vmid-at-or-above-9006> \
+  --guest-host <candidate-ip>
+```
+
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under
 > Prism, but the cross-build toolchain story there (MSVC x64 cross + x64 deps) is
 > heavier and not yet wired — `--target-arch` is Linux/Rosetta today. Tracked
 > as a follow-up; until then the Windows lane builds native ARM64.
+
+### 3.10 macOS render-golden readiness is fail-closed
+
+`manifests/pulp.macos.toml` records the exact m153 source/provider generation,
+but the current generic macOS list/resize/tag helper cannot prove an existing
+golden contains it. The manifest therefore says `golden_readiness.status =
+"unready"`. This is deliberate: inventory operations and a rolling `:latest`
+alias are not provider evidence.
+
+Run `providers/tart-macos/provision.sh pulp-readiness` for the exact preparation
+report. It prints the required Pulp, Skia, and V8 identities and exits nonzero.
+A future implementation may turn this green only after it binds a deep render
+receipt to the exact golden being promoted; changing the manifest status alone
+fails closed.
 
 ---
 

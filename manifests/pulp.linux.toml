@@ -15,6 +15,11 @@ cross       = true
 base    = "ghcr.io/cirruslabs/ubuntu:24.04"   # pinned 24.04; bump deliberately
 disk_gb = 90
 
+[source]
+repository = "https://github.com/Generous-Corp/pulp"
+commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
+manifest   = "tools/deps/manifest.json"
+
 [toolchain]
 cmake  = "system"     # apt cmake/ninja are current enough on 24.04
 ninja  = "system"
@@ -40,8 +45,12 @@ packages = [
 ]
 
 [skia]
-release = "chrome/m149"
+release = "chrome/m153"
 variant = "linux-arm64-gpu"   # baked into the golden so configure is offline
+
+[v8]
+disposition = "baked-provider-only"
+variant     = "linux-arm64"
 
 [emulation]
 # x86_64 reached via cross-compile + Rosetta-for-Linux. SMOKE only;
