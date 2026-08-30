@@ -192,7 +192,7 @@ means a golden that *looks* warm and is not.
 | ccache | per-build | yes — warm by building before templating |
 | GitHub CLI (`gh`) | Ubuntu package | yes — preamble/alias jobs call it with their injected `GITHUB_TOKEN` |
 | QuickJS | vendored via CHOC, in-tree | no |
-| V8 | `FindV8.cmake`, opt-in engine backend | only if enabled |
+| V8 | matched prebuilt provider archive; runtime selection is opt-in | cache the provider during an m153 refresh; the warm build still uses QuickJS |
 
 **Bake the golden with the flags CI actually uses.** Pulp's matrix build leaves
 `PULP_ENABLE_GPU` and `PULP_BUILD_TESTS` at their defaults on `pull_request` /
@@ -272,6 +272,12 @@ providers/proxmox-linux/bake-pulp-golden.sh \
   --guest-host <candidate-ip> \
   --guest-user runner
 ```
+
+The supplied SSH address is not trusted by itself. Before any provider or build
+proof is accepted, the script places a one-use nonce into the exact new VMID via
+the Proxmox guest agent and requires the SSH peer to return it. A stale address
+therefore fails before baking or templating; the nonce is removed with the
+candidate's other clone-specific identity.
 
 `9006` is an example, not a reusable constant. If it exists—or if its immutable
 host receipt already exists—pick another new VMID. Before scrubbing clone

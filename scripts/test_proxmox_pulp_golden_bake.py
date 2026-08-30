@@ -56,6 +56,11 @@ case "$1" in
     ;;
   clone) touch "$TARTCI_TEST_STATE/exists" ;;
   start) touch "$TARTCI_TEST_STATE/running" ;;
+  guest)
+    nonce="$(printf '%s' "$*" | grep -Eo '[0-9a-f]{64}' | head -1)"
+    [ -n "$nonce" ]
+    printf '%s' "$nonce" >"$TARTCI_TEST_STATE/binding"
+    ;;
   status) printf 'status: stopped\n' ;;
   template) touch "$TARTCI_TEST_STATE/templated" ;;
   *) exit 3 ;;
@@ -68,6 +73,14 @@ esac
 set -euo pipefail
 printf 'ssh %s\n' "$*" >>"$TARTCI_TEST_LOG"
 joined="$*"
+if [[ "$joined" == *' cat /run/tartci-pulp-golden-9006.binding'* ]]; then
+  if [ "${TARTCI_TEST_WRONG_PEER:-0}" = 1 ]; then
+    printf 'wrong-peer'
+  else
+    cat "$TARTCI_TEST_STATE/binding"
+  fi
+  exit 0
+fi
 if [[ "$joined" == *'cat "$HOME/.config/tartci/pulp-render-generation.json"'* ]]; then
   cat "$TARTCI_TEST_GUEST_RECEIPT"
   exit 0
@@ -117,12 +130,37 @@ exit 0
         receipt: dict[str, object] = {
             "schema": 1,
             "status": "pass",
-            "pulp": {"commit": PULP_SHA},
-            "parent": {"identity": "9005", "digest_sha256": self.parent_digest},
-            "skia_dawn": {"release": "chrome/m153"},
+            "pulp": {
+                "repository": "https://github.com/Generous-Corp/pulp",
+                "commit": PULP_SHA,
+                "manifest_sha256": "0" * 64,
+            },
+            "parent": {
+                "kind": "proxmox-template",
+                "identity": "9005",
+                "digest_sha256": self.parent_digest,
+            },
+            "skia_dawn": {
+                "release": "chrome/m153",
+                "skia_commit": "1" * 40,
+                "built_dawn": "2" * 40,
+                "platform": "linux-x64",
+                "asset_sha256": "3" * 64,
+                "generation_receipt_sha256": "4" * 64,
+                "capability_result_sha256": "5" * 64,
+                "capabilities": [
+                    "SkLogHandler.GetInstance.SetInstance.compile-link-run",
+                    "Graphite.ContextOptions.fExecutor.compile-link-run",
+                ],
+                "probe_count": 2,
+            },
             "v8": {
                 "disposition": "baked-provider-only",
+                "version": "v8-m153-test",
+                "platform": "linux-x64",
+                "asset_sha256": "7" * 64,
                 "generation_receipt_sha256": "6" * 64,
+                "runtime_policy": "provider-cached; Pulp defaults to QuickJS",
             },
         }
         receipt.update(changes)
@@ -154,6 +192,7 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls()
         clone = next(i for i, call in enumerate(calls) if "qm clone 9005 9006" in call)
+        binding = next(i for i, call in enumerate(calls) if "qm guest exec 9006" in call)
         bake = next(i for i, call in enumerate(calls) if "PULP_REPOSITORY=" in call)
         receipt = next(
             i for i, call in enumerate(calls) if "pulp-render-generation.json" in call and "cat >" not in call
@@ -161,6 +200,8 @@ exit 0
         cleanup = max(i for i, call in enumerate(calls) if call.startswith("ssh ") and "bash -s" in call)
         template = next(i for i, call in enumerate(calls) if "qm template 9006" in call)
         self.assertLess(clone, bake)
+        self.assertLess(clone, binding)
+        self.assertLess(binding, bake)
         self.assertLess(bake, receipt)
         self.assertLess(receipt, cleanup)
         self.assertLess(cleanup, template)
@@ -192,12 +233,39 @@ exit 0
         self.assertIn("retained as a non-template", result.stderr)
         self.assertFalse((self.receipts / "pulp-linux-template-9006.json").exists())
 
+    def test_wrong_ssh_peer_fails_before_bake_or_templating(self) -> None:
+        result = self.run_bake(env_changes={"TARTCI_TEST_WRONG_PEER": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match candidate VMID 9006", result.stderr)
+        calls = "\n".join(self.calls())
+        self.assertNotIn("PULP_REPOSITORY=", calls)
+        self.assertNotIn("qm template 9006", calls)
+        self.assertIn("retained as a non-template", result.stderr)
+
     def test_wrong_receipt_fails_before_templating(self) -> None:
         self.write_guest_receipt(skia_dawn={"release": "chrome/m149"})
         result = self.run_bake()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("golden receipt validation failed: skia", result.stderr)
+        self.assertIn("golden receipt validation failed: skia_release", result.stderr)
         self.assertFalse(any("qm template 9006" in call for call in self.calls()))
+
+    def test_incomplete_receipt_fails_before_templating(self) -> None:
+        self.write_guest_receipt(pulp={"commit": PULP_SHA})
+        result = self.run_bake()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pulp_repository", result.stderr)
+        self.assertIn("pulp_manifest", result.stderr)
+        self.assertFalse(any("qm template 9006" in call for call in self.calls()))
+
+    def test_warm_build_matches_protected_cache_and_example_policy(self) -> None:
+        source = SCRIPT.read_text()
+        for expected in (
+            "export CCACHE_COMPILERCHECK=content",
+            "export CCACHE_NODEPEND=true",
+            "export CCACHE_SLOPPINESS=time_macros",
+            "-DPULP_BUILD_EXAMPLES=OFF",
+        ):
+            self.assertIn(expected, source)
 
     def test_identity_scrub_failure_leaves_only_candidate_receipt(self) -> None:
         result = self.run_bake(env_changes={"TARTCI_TEST_CLEANUP_FAIL": "1"})

@@ -143,6 +143,17 @@ note "full-cloning retained template $PARENT_VMID to unused candidate $NEW_VMID"
 candidate_created=1
 "$QM_BIN" start "$NEW_VMID"
 
+# Bind the operator-supplied SSH address to the exact Proxmox candidate before
+# trusting any proof returned over SSH.  The nonce enters only through the
+# guest agent for NEW_VMID, so a stale or mistyped address cannot validate a
+# different machine and leave the actual clone unverified.
+binding_nonce="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+binding_path="/run/tartci-pulp-golden-$NEW_VMID.binding"
+
 if [ -n "$SSH_KEY" ]; then
   SSH_OPTS+=(-i "$SSH_KEY")
 fi
@@ -153,6 +164,20 @@ for _ in $(seq 1 90); do
   sleep 2
 done
 [ "$reachable" -eq 1 ] || die "candidate $NEW_VMID did not become reachable at $GUEST_HOST"
+binding_placed=0
+for _ in $(seq 1 30); do
+  if "$QM_BIN" guest exec "$NEW_VMID" -- /bin/sh -c \
+    "umask 077; printf '%s' '$binding_nonce' > '$binding_path'" >/dev/null 2>&1; then
+    binding_placed=1
+    break
+  fi
+  sleep 2
+done
+[ "$binding_placed" -eq 1 ] \
+  || die "could not place VMID binding nonce through the guest agent"
+ssh_binding="$("${guest[@]}" cat "$binding_path" 2>/dev/null || true)"
+[ "$ssh_binding" = "$binding_nonce" ] \
+  || die "SSH peer $GUEST_HOST does not match candidate VMID $NEW_VMID"
 
 "${guest[@]}" 'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
   <"$RENDER_VERIFIER"
@@ -180,6 +205,9 @@ git -C "$repo" clean -ffd
 
 cd "$repo"
 export PULP_SHARED_FETCHCONTENT_SOURCE_DIR="$HOME/.cache/pulp/fetchcontent-src"
+export CCACHE_COMPILERCHECK=content
+export CCACHE_NODEPEND=true
+export CCACHE_SLOPPINESS=time_macros
 mkdir -p "$PULP_SHARED_FETCHCONTENT_SOURCE_DIR" "$HOME/.config/tartci"
 python3 tools/scripts/fetch_skia_for_release.py linux-x64
 python3 tools/scripts/verify_skia_m153_capabilities.py \
@@ -194,6 +222,7 @@ python3 tools/scripts/fetch_v8_for_release.py linux-x64
 cmake -S . -B build-golden-m153 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DPULP_BUILD_TESTS=ON \
+  -DPULP_BUILD_EXAMPLES=OFF \
   -DPULP_ENABLE_GPU=ON
 cmake --build build-golden-m153 --parallel "${PULP_GOLDEN_BUILD_JOBS:-4}"
 
@@ -212,19 +241,44 @@ GUEST
 
 receipt_tmp="$candidate_receipt.tmp"
 "${guest[@]}" 'cat "$HOME/.config/tartci/pulp-render-generation.json"' >"$receipt_tmp"
-python3 - "$receipt_tmp" "$PULP_SHA" "$PARENT_VMID" "$parent_digest" <<'PY'
-import json, sys
-path, pulp_sha, parent_vmid, parent_digest = sys.argv[1:]
+python3 - "$receipt_tmp" "$PULP_REPOSITORY" "$PULP_SHA" "$PARENT_VMID" "$parent_digest" <<'PY'
+import json, re, sys
+path, pulp_repository, pulp_sha, parent_vmid, parent_digest = sys.argv[1:]
 with open(path, encoding="utf-8") as handle:
     receipt = json.load(handle)
+hex40 = re.compile(r"[0-9a-f]{40}")
+hex64 = re.compile(r"[0-9a-f]{64}")
+pulp = receipt.get("pulp", {})
+parent = receipt.get("parent", {})
+skia = receipt.get("skia_dawn", {})
+v8 = receipt.get("v8", {})
 checks = {
+    "schema": receipt.get("schema") == 1,
     "status": receipt.get("status") == "pass",
-    "pulp": receipt.get("pulp", {}).get("commit") == pulp_sha,
-    "parent": receipt.get("parent", {}).get("identity") == parent_vmid,
-    "parent_digest": receipt.get("parent", {}).get("digest_sha256") == parent_digest,
-    "skia": receipt.get("skia_dawn", {}).get("release") == "chrome/m153",
-    "v8": receipt.get("v8", {}).get("disposition") == "baked-provider-only",
-    "v8_receipt": bool(receipt.get("v8", {}).get("generation_receipt_sha256")),
+    "pulp_repository": pulp.get("repository") == pulp_repository,
+    "pulp_commit": pulp.get("commit") == pulp_sha,
+    "pulp_manifest": bool(hex64.fullmatch(str(pulp.get("manifest_sha256", "")))),
+    "parent_kind": parent.get("kind") == "proxmox-template",
+    "parent_identity": parent.get("identity") == parent_vmid,
+    "parent_digest": parent.get("digest_sha256") == parent_digest,
+    "skia_release": skia.get("release") == "chrome/m153",
+    "skia_commit": bool(hex40.fullmatch(str(skia.get("skia_commit", "")))),
+    "dawn_commit": bool(hex40.fullmatch(str(skia.get("built_dawn", "")))),
+    "skia_platform": skia.get("platform") == "linux-x64",
+    "skia_asset": bool(hex64.fullmatch(str(skia.get("asset_sha256", "")))),
+    "skia_receipt": bool(hex64.fullmatch(str(skia.get("generation_receipt_sha256", "")))),
+    "capability_result": bool(hex64.fullmatch(str(skia.get("capability_result_sha256", "")))),
+    "capabilities": skia.get("capabilities") == [
+        "SkLogHandler.GetInstance.SetInstance.compile-link-run",
+        "Graphite.ContextOptions.fExecutor.compile-link-run",
+    ],
+    "probe_count": isinstance(skia.get("probe_count"), int) and skia["probe_count"] >= 1,
+    "v8_disposition": v8.get("disposition") == "baked-provider-only",
+    "v8_version": isinstance(v8.get("version"), str) and "m153" in v8["version"],
+    "v8_platform": v8.get("platform") == "linux-x64",
+    "v8_asset": bool(hex64.fullmatch(str(v8.get("asset_sha256", "")))),
+    "v8_receipt": bool(hex64.fullmatch(str(v8.get("generation_receipt_sha256", "")))),
+    "v8_runtime_policy": v8.get("runtime_policy") == "provider-cached; Pulp defaults to QuickJS",
 }
 failed = [name for name, ok in checks.items() if not ok]
 if failed:
@@ -237,7 +291,7 @@ note "host candidate receipt validated at $candidate_receipt"
 # Remove clone-specific identity only after the durable host receipt exists.
 # No credential is ever copied into the guest, and no runner registration may
 # survive templating.
-"${guest[@]}" bash -s <<'GUEST'
+"${guest[@]}" env "PULP_GOLDEN_BINDING_PATH=$binding_path" bash -s <<'GUEST'
 set -euo pipefail
 if [ -e "$HOME/.config/gh/hosts.yml" ]; then
   echo "refusing to template a guest containing GitHub CLI credentials" >&2
@@ -248,6 +302,7 @@ if find "$HOME" -maxdepth 4 \( -name .runner -o -name .credentials -o -name .cre
   exit 1
 fi
 sudo truncate -s 0 /etc/machine-id
+sudo rm -f "$PULP_GOLDEN_BINDING_PATH"
 sudo rm -f /var/lib/dbus/machine-id /etc/ssh/ssh_host_*
 sudo shutdown -h now
 GUEST

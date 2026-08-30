@@ -590,7 +590,8 @@ drain/canary procedure, and rollback boundary live in
 [`proxmox-macpro.md`](proxmox-macpro.md#refreshing-the-render-toolchain-golden-m153).
 
 The short contract is: preserve template `9005`; choose a new unused VMID; clone
-additively; detach at `manifests/pulp.linux.toml`'s exact Pulp SHA; derive m153
+additively; bind the supplied SSH peer to that exact VMID with a guest-agent
+nonce; detach at `manifests/pulp.linux.toml`'s exact Pulp SHA; derive m153
 Skia/Dawn/V8 identity from that checkout's exact manifest; deep-validate provider
 receipts; compile/link/run both m153 Skia capabilities; warm the local Release
 build; publish and independently validate the host receipt; scrub clone identity;

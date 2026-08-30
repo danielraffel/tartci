@@ -49,6 +49,7 @@ class PulpRenderGenerationTests(unittest.TestCase):
         self.skia_receipt.write_text('{"deep":"skia"}\n')
         self.v8_receipt.write_text('{"deep":"v8"}\n')
         self.capability = Path(self.temp.name) / "capability.json"
+        self.probe_source = "int main() { return 0; }\n"
         self.manifest = {
             "dependencies": [
                 {
@@ -109,7 +110,18 @@ class PulpRenderGenerationTests(unittest.TestCase):
             "platform": "linux-x64",
             "asset_sha256": "3" * 64,
             "generation_receipt_sha256": digest(self.skia_receipt),
-            "probes": [{"compile": "pass", "link": "pass", "run": "pass"}],
+            "probe_source_sha256": hashlib.sha256(
+                self.probe_source.encode()
+            ).hexdigest(),
+            "probes": [
+                {
+                    "architecture": "x86_64",
+                    "compile": "pass",
+                    "link": "pass",
+                    "run": "pass",
+                    "run_mode": "native",
+                }
+            ],
         }
         result.update(changes)
         self.capability.write_text(json.dumps(result))
@@ -119,11 +131,12 @@ class PulpRenderGenerationTests(unittest.TestCase):
             GENERATION_RECEIPT=".skia-generation-manifest.json",
             cache_generation_valid=lambda *_: skia_valid,
         )
+        capability = types.SimpleNamespace(PROBE_SOURCE=self.probe_source)
         v8 = types.SimpleNamespace(
             GENERATION_RECEIPT=".v8-generation-manifest.json",
             generation_valid=lambda *_: v8_valid,
         )
-        return [skia, v8]
+        return [skia, capability, v8]
 
     def verify(self, **module_validity: bool):
         with mock.patch.object(
@@ -172,7 +185,27 @@ class PulpRenderGenerationTests(unittest.TestCase):
 
     def test_header_only_capability_claim_is_rejected(self) -> None:
         self.write_capability(probes=[])
-        with self.assertRaisesRegex(ValueError, "no compile/link/run probes"):
+        with self.assertRaisesRegex(ValueError, "probe count mismatch"):
+            self.verify()
+
+    def test_different_probe_source_cannot_claim_m153_capabilities(self) -> None:
+        self.write_capability(probe_source_sha256="9" * 64)
+        with self.assertRaisesRegex(ValueError, "probe_source_sha256 mismatch"):
+            self.verify()
+
+    def test_wrong_probe_architecture_cannot_claim_native_capability(self) -> None:
+        self.write_capability(
+            probes=[
+                {
+                    "architecture": "aarch64",
+                    "compile": "pass",
+                    "link": "pass",
+                    "run": "pass",
+                    "run_mode": "native",
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "probe architecture mismatch"):
             self.verify()
 
     def test_mismatched_v8_pair_is_rejected(self) -> None:

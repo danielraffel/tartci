@@ -29,6 +29,13 @@ PLATFORM_KEYS = {
     "linux-arm64": "linux-arm64",
     "linux-x64": "linux-x64",
 }
+EXPECTED_PROBES = {
+    "darwin-arm64": [("arm64", "native")],
+    "darwin-x64": [("x86_64", "native")],
+    "darwin-universal": [("arm64", "native"), ("x86_64", "rosetta-x86_64")],
+    "linux-arm64": [("aarch64", "native")],
+    "linux-x64": [("x86_64", "native")],
+}
 
 
 def fail(message: str) -> None:
@@ -77,7 +84,11 @@ def require_hex(value: object, length: int, label: str) -> str:
 
 
 def verify_capability_result(
-    path: Path, platform: str, asset_sha: str, receipt_sha: str
+    path: Path,
+    platform: str,
+    asset_sha: str,
+    receipt_sha: str,
+    probe_source_sha: str,
 ) -> dict[str, Any]:
     try:
         result = json.loads(path.read_text(encoding="utf-8"))
@@ -89,6 +100,7 @@ def verify_capability_result(
         "platform": platform,
         "asset_sha256": asset_sha,
         "generation_receipt_sha256": receipt_sha,
+        "probe_source_sha256": probe_source_sha,
     }
     for field, value in expected.items():
         if result.get(field) != value:
@@ -97,13 +109,22 @@ def verify_capability_result(
                 f"actual={result.get(field)!r}, expected={value!r}"
             )
     probes = result.get("probes")
-    if not isinstance(probes, list) or not probes:
-        fail("capability result has no compile/link/run probes")
-    for probe in probes:
+    expected_probes = EXPECTED_PROBES[platform]
+    if not isinstance(probes, list) or len(probes) != len(expected_probes):
+        fail(
+            "capability result probe count mismatch: "
+            f"actual={len(probes) if isinstance(probes, list) else 'invalid'}, "
+            f"expected={len(expected_probes)}"
+        )
+    for probe, (architecture, run_mode) in zip(probes, expected_probes):
         if not isinstance(probe, dict) or any(
             probe.get(field) != "pass" for field in ("compile", "link", "run")
         ):
             fail("capability result contains a non-passing probe")
+        if probe.get("architecture") != architecture:
+            fail("capability result probe architecture mismatch")
+        if probe.get("run_mode") != run_mode:
+            fail("capability result probe run mode mismatch")
     return result
 
 
@@ -149,11 +170,20 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
         fail("Skia/Dawn extracted generation failed Pulp's deep receipt validator")
     skia_receipt = skia_root / skia_fetch.GENERATION_RECEIPT
     skia_receipt_sha = sha256_file(skia_receipt)
+    capability_verifier = load_module(
+        repo / "tools/scripts/verify_skia_m153_capabilities.py",
+        "pulp_verify_skia_m153_capabilities",
+    )
+    probe_source = getattr(capability_verifier, "PROBE_SOURCE", None)
+    if not isinstance(probe_source, str) or not probe_source:
+        fail("exact Pulp capability verifier has no PROBE_SOURCE")
+    probe_source_sha = hashlib.sha256(probe_source.encode()).hexdigest()
     capability = verify_capability_result(
         args.capability_result,
         args.platform,
         skia_asset_sha,
         skia_receipt_sha,
+        probe_source_sha,
     )
 
     v8 = dependency(manifest, "V8")
@@ -221,7 +251,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "platform": args.platform,
             "asset_sha256": v8_asset_sha,
             "generation_receipt_sha256": v8_receipt_sha,
-            "runtime_policy": "not-installed-by-golden; Pulp defaults to QuickJS",
+            "runtime_policy": "provider-cached; Pulp defaults to QuickJS",
         },
     }
     return receipt
