@@ -157,6 +157,16 @@ class PulpRenderGenerationTests(unittest.TestCase):
             digest(self.skia_receipt),
         )
         self.assertEqual(receipt["v8"]["disposition"], "baked-provider-only")
+        self.assertIn(
+            "SkLogHandler.SetInstance.compile-link-only",
+            receipt["skia_dawn"]["capabilities"],
+        )
+        self.assertFalse(
+            any(
+                "SetInstance" in capability and "run" in capability
+                for capability in receipt["skia_dawn"]["capabilities"]
+            )
+        )
         self.assertEqual(
             receipt["v8"]["generation_receipt_sha256"], digest(self.v8_receipt)
         )
@@ -240,6 +250,17 @@ class PulpRenderGenerationTests(unittest.TestCase):
     def test_invalid_v8_generation_fails_closed(self) -> None:
         with self.assertRaisesRegex(ValueError, "V8 extracted generation"):
             self.verify(v8_valid=False)
+
+    def test_exact_checkout_imports_work_when_verifier_is_copied_elsewhere(self) -> None:
+        helper = self.repo / "tools/scripts/import_helper.py"
+        helper.write_text("VALUE = 'exact-checkout'\n")
+        importer = self.repo / "tools/scripts/import_probe.py"
+        importer.write_text(
+            "from tools.scripts.import_helper import VALUE\n"
+            "RESULT = VALUE\n"
+        )
+        loaded = generation.load_module(importer, "pulp_import_probe", self.repo)
+        self.assertEqual(loaded.RESULT, "exact-checkout")
 
 
 class PulpRenderManifestTests(unittest.TestCase):

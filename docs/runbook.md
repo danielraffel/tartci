@@ -593,7 +593,9 @@ The short contract is: preserve template `9005`; choose a new unused VMID; clone
 additively; bind the supplied SSH peer to that exact VMID with a guest-agent
 nonce; detach at `manifests/pulp.linux.toml`'s exact Pulp SHA; derive m153
 Skia/Dawn/V8 identity from that checkout's exact manifest; deep-validate provider
-receipts; compile/link/run both m153 Skia capabilities; warm the local Release
+receipts; compile/link both m153 Skia capabilities, execute the non-global
+`GetInstance`/Graphite paths, and record that process-global `SetInstance` is
+link-proven but intentionally not executed; warm the local Release
 build; publish and independently validate the host receipt; scrub clone identity;
 stop; then and only then template the new VMID. A failed candidate is retained,
 not automatically destroyed. This repository step creates tooling only—running
@@ -602,8 +604,7 @@ it is a separately governed host operation.
 ```bash
 providers/proxmox-linux/bake-pulp-golden.sh \
   --new-vmid <unused-vmid-at-or-above-9006> \
-  --guest-host <candidate-ip> \
-  --guest-user runner
+  --guest-host <candidate-ip>
 ```
 
 > **Windows x86_64 (Prism).** The Windows-on-ARM analog runs x64 binaries under

@@ -60,11 +60,30 @@ case "$1" in
     nonce="$(printf '%s' "$*" | grep -Eo '[0-9a-f]{64}' | head -1)"
     [ -n "$nonce" ]
     printf '%s' "$nonce" >"$TARTCI_TEST_STATE/binding"
+    if [[ "$*" == *"id -u 'ci'"* && "$*" == *'chmod 0400'* && "$*" == *'chown "$uid:$gid"'* ]]; then
+      touch "$TARTCI_TEST_STATE/binding-readable-by-ci-only"
+    fi
     ;;
   status) printf 'status: stopped\n' ;;
   template) touch "$TARTCI_TEST_STATE/templated" ;;
   *) exit 3 ;;
 esac
+''',
+        )
+        self.write_stub(
+            "pvesh",
+            r'''#!/bin/bash
+set -euo pipefail
+printf 'pvesh %s\n' "$*" >>"$TARTCI_TEST_LOG"
+if [ "${TARTCI_TEST_VMID_QUERY_FAIL:-0}" = 1 ]; then
+  printf 'permission or cluster failure\n' >&2
+  exit 1
+fi
+if [ "${TARTCI_TEST_EXISTING:-0}" = 1 ]; then
+  printf 'VM 9006 already exists\n' >&2
+  exit 2
+fi
+printf '"%s"\n' "${TARTCI_TEST_NEXTID:-9006}"
 ''',
         )
         self.write_stub(
@@ -77,6 +96,7 @@ if [[ "$joined" == *' cat /run/tartci-pulp-golden-9006.binding'* ]]; then
   if [ "${TARTCI_TEST_WRONG_PEER:-0}" = 1 ]; then
     printf 'wrong-peer'
   else
+    [ -e "$TARTCI_TEST_STATE/binding-readable-by-ci-only" ]
     cat "$TARTCI_TEST_STATE/binding"
   fi
   exit 0
@@ -107,6 +127,7 @@ exit 0
             {
                 "PATH": f"{self.bin}:{self.env['PATH']}",
                 "TARTCI_QM_BIN": str(self.bin / "qm"),
+                "TARTCI_PVESH_BIN": str(self.bin / "pvesh"),
                 "TARTCI_SSH_BIN": str(self.bin / "ssh"),
                 "TARTCI_TEST_LOG": str(self.log),
                 "TARTCI_TEST_STATE": str(self.state),
@@ -149,8 +170,12 @@ exit 0
                 "generation_receipt_sha256": "4" * 64,
                 "capability_result_sha256": "5" * 64,
                 "capabilities": [
-                    "SkLogHandler.GetInstance.SetInstance.compile-link-run",
-                    "Graphite.ContextOptions.fExecutor.compile-link-run",
+                    "SkLogHandler.GetInstance.execute",
+                    "SkLogHandler.SetInstance.compile-link-only",
+                    "Graphite.ContextOptions.fExecutor.execute",
+                ],
+                "limitations": [
+                    "SkLogHandler.SetInstance is not executed because it installs process-global first-install-wins state",
                 ],
                 "probe_count": 1,
             },
@@ -205,6 +230,8 @@ exit 0
         self.assertLess(bake, receipt)
         self.assertLess(receipt, cleanup)
         self.assertLess(cleanup, template)
+        self.assertTrue(any("ci@192.0.2.6" in call for call in calls))
+        self.assertFalse(any("runner@" in call for call in calls))
         self.assertNotIn("destroy", "\n".join(calls))
         self.assertNotIn("qm template 9005", "\n".join(calls))
         output = self.receipts / "pulp-linux-template-9006.json"
@@ -214,8 +241,32 @@ exit 0
     def test_existing_vmid_fails_before_clone(self) -> None:
         result = self.run_bake(env_changes={"TARTCI_TEST_EXISTING": "1"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already exists", result.stderr)
+        self.assertIn("could not authoritatively prove", result.stderr)
         self.assertFalse(any("qm clone" in call for call in self.calls()))
+
+    def test_vmid_permission_or_transient_failure_is_not_absence(self) -> None:
+        result = self.run_bake(env_changes={"TARTCI_TEST_VMID_QUERY_FAIL": "1"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not authoritatively prove", result.stderr)
+        self.assertFalse(any("qm clone" in call for call in self.calls()))
+
+    def test_allocator_must_confirm_the_exact_requested_vmid(self) -> None:
+        result = self.run_bake(env_changes={"TARTCI_TEST_NEXTID": "9007"})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("did not confirm exact unused VMID 9006", result.stderr)
+        self.assertFalse(any("qm clone" in call for call in self.calls()))
+
+    def test_qga_binding_is_owned_for_canonical_nonroot_consumer(self) -> None:
+        result = self.run_bake(
+            env_changes={"PULP_GOLDEN_GUEST_USER": "runner"}
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(any("runner@" in call for call in self.calls()))
+        qga = next(call for call in self.calls() if "qm guest exec 9006" in call)
+        self.assertIn("id -u 'ci'", qga)
+        self.assertIn("id -g 'ci'", qga)
+        self.assertIn('chown "$uid:$gid"', qga)
+        self.assertIn("chmod 0400", qga)
 
     def test_mutable_parent_fails_before_clone(self) -> None:
         result = self.run_bake(env_changes={"TARTCI_TEST_BAD_PARENT": "1"})

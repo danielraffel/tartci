@@ -11,12 +11,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 RENDER_VERIFIER="$ROOT/providers/common/pulp-render-generation.py"
+SOURCE_PIN_RESOLVER="$ROOT/providers/common/pulp-source-pin.py"
 QM_BIN="${TARTCI_QM_BIN:-qm}"
+PVESH_BIN="${TARTCI_PVESH_BIN:-pvesh}"
 SSH_BIN="${TARTCI_SSH_BIN:-ssh}"
 PARENT_VMID=9005
 NEW_VMID=""
 GUEST_HOST=""
-GUEST_USER="${PULP_GOLDEN_GUEST_USER:-runner}"
+# Pulp's pinned protected Proxmox supervisor connects as ci; baking into a
+# different home would warm and scrub state the protected consumer never uses.
+GUEST_USER="ci"
 SSH_KEY="${PULP_GOLDEN_SSH_KEY:-}"
 NAME=""
 RECEIPT_DIR="${PULP_GOLDEN_RECEIPT_DIR:-/var/lib/tartci/golden-receipts}"
@@ -35,7 +39,6 @@ Required:
   --guest-host HOST     SSH address of the newly cloned candidate
 
 Options:
-  --guest-user USER     candidate SSH user (default: runner)
   --ssh-key PATH        private key for candidate SSH
   --name NAME           new template name (default: pulp-linux-golden-m153-VMID)
   --receipt-dir PATH    host-side immutable receipt directory
@@ -49,7 +52,6 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --new-vmid) NEW_VMID="${2:-}"; shift 2 ;;
     --guest-host) GUEST_HOST="${2:-}"; shift 2 ;;
-    --guest-user) GUEST_USER="${2:-}"; shift 2 ;;
     --ssh-key) SSH_KEY="${2:-}"; shift 2 ;;
     --name) NAME="${2:-}"; shift 2 ;;
     --receipt-dir) RECEIPT_DIR="${2:-}"; shift 2 ;;
@@ -63,37 +65,22 @@ done
 [ "$NEW_VMID" -le 999999 ] || die "--new-vmid exceeds Proxmox's supported range"
 [ "$NEW_VMID" != "$PARENT_VMID" ] || die "new VMID cannot equal retained parent 9005"
 [ -n "$GUEST_HOST" ] || die "--guest-host is required"
-[ -n "$GUEST_USER" ] || die "--guest-user cannot be empty"
 NAME="${NAME:-pulp-linux-golden-m153-$NEW_VMID}"
 [[ "$NAME" =~ ^[A-Za-z0-9._-]+$ ]] || die "--name contains unsupported characters"
 
-for path in "$MANIFEST" "$RENDER_VERIFIER"; do
+for path in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
   [ -f "$path" ] || die "required versioned input missing: $path"
 done
 command -v "$QM_BIN" >/dev/null 2>&1 || die "qm not found: $QM_BIN"
+command -v "$PVESH_BIN" >/dev/null 2>&1 || die "pvesh not found: $PVESH_BIN"
 command -v "$SSH_BIN" >/dev/null 2>&1 || die "ssh not found: $SSH_BIN"
 command -v python3 >/dev/null 2>&1 || die "python3 is required"
 command -v flock >/dev/null 2>&1 || die "flock is required"
 
-source_identity="$(python3 - "$MANIFEST" <<'PY'
-import re, sys, tomllib
-with open(sys.argv[1], "rb") as handle:
-    manifest = tomllib.load(handle)
-source = manifest.get("source", {})
-skia = manifest.get("skia", {})
-v8 = manifest.get("v8", {})
-repo = source.get("repository", "")
-commit = source.get("commit", "")
-if not re.fullmatch(r"[0-9a-f]{40}", commit):
-    raise SystemExit("pulp.linux.toml source.commit is not immutable 40-hex")
-if skia.get("release") != "chrome/m153":
-    raise SystemExit("pulp.linux.toml is not pinned to chrome/m153")
-if v8.get("disposition") != "baked-provider-only":
-    raise SystemExit("pulp.linux.toml does not require the matched V8 provider")
-print(repo)
-print(commit)
-PY
-)"
+source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+  --require-skia-release chrome/m153 \
+  --require-v8-disposition baked-provider-only)" \
+  || die "could not resolve immutable Pulp source from $MANIFEST"
 PULP_REPOSITORY="${source_identity%%$'\n'*}"
 PULP_SHA="${source_identity#*$'\n'}"
 [ -n "$PULP_REPOSITORY" ] && [[ "$PULP_SHA" =~ ^[0-9a-f]{40}$ ]] \
@@ -117,11 +104,21 @@ printf '%s\n' "$parent_config" | grep -Eq '^template:[[:space:]]*1$' \
   || die "retained parent VMID $PARENT_VMID is not an immutable template"
 parent_digest="$(printf '%s\n' "$parent_config" | sha256sum | awk '{print $1}')"
 
-# VMID availability and clone happen under one lock. Never infer availability
-# from `qm list` and then release the lock: two refreshes could claim the same ID.
-if "$QM_BIN" config "$NEW_VMID" >/dev/null 2>&1; then
-  die "new VMID $NEW_VMID already exists; choose a different unused VMID"
+# Ask the cluster allocator whether this exact VMID is free. A failed `qm
+# config` is ambiguous (missing VM, denied permission, quorum/API failure), so
+# it is never accepted as absence. The cluster query and clone remain under the
+# refresh lock; Proxmox's clone allocation is the final atomic race guard.
+if ! available_vmid="$($PVESH_BIN get /cluster/nextid \
+  --vmid "$NEW_VMID" --output-format json 2>&1)"; then
+  die "could not authoritatively prove new VMID $NEW_VMID is unused: $available_vmid"
 fi
+python3 - "$available_vmid" "$NEW_VMID" <<'PY' \
+  || die "cluster allocator did not confirm exact unused VMID $NEW_VMID"
+import json, sys
+actual = json.loads(sys.argv[1])
+if str(actual) != sys.argv[2]:
+    raise SystemExit(1)
+PY
 
 candidate_created=0
 template_requested=0
@@ -167,7 +164,8 @@ done
 binding_placed=0
 for _ in $(seq 1 30); do
   if "$QM_BIN" guest exec "$NEW_VMID" -- /bin/sh -c \
-    "umask 077; printf '%s' '$binding_nonce' > '$binding_path'" >/dev/null 2>&1; then
+    "set -eu; uid=\$(id -u '$GUEST_USER'); gid=\$(id -g '$GUEST_USER'); tmp='$binding_path.tmp'; umask 077; printf '%s' '$binding_nonce' > \"\$tmp\"; chown \"\$uid:\$gid\" \"\$tmp\"; chmod 0400 \"\$tmp\"; mv \"\$tmp\" '$binding_path'" \
+    >/dev/null 2>&1; then
     binding_placed=1
     break
   fi
@@ -269,8 +267,12 @@ checks = {
     "skia_receipt": bool(hex64.fullmatch(str(skia.get("generation_receipt_sha256", "")))),
     "capability_result": bool(hex64.fullmatch(str(skia.get("capability_result_sha256", "")))),
     "capabilities": skia.get("capabilities") == [
-        "SkLogHandler.GetInstance.SetInstance.compile-link-run",
-        "Graphite.ContextOptions.fExecutor.compile-link-run",
+        "SkLogHandler.GetInstance.execute",
+        "SkLogHandler.SetInstance.compile-link-only",
+        "Graphite.ContextOptions.fExecutor.execute",
+    ],
+    "capability_limitations": skia.get("limitations") == [
+        "SkLogHandler.SetInstance is not executed because it installs process-global first-install-wins state",
     ],
     "probe_count": skia.get("probe_count") == 1,
     "v8_disposition": v8.get("disposition") == "baked-provider-only",

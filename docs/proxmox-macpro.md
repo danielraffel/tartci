@@ -252,9 +252,12 @@ The versioned refresh entrypoint is
   Skia, bundled Dawn, and matched V8 identities are then derived from that
   commit's own `tools/deps/manifest.json`, not copied into an operator command.
 - Pulp's own fetch validators deep-check every receipt-bound extracted byte.
-  `verify_skia_m153_capabilities.py` must additionally compile, link, and run
-  `SkLogHandler::{GetInstance,SetInstance}` and Graphite
+  `verify_skia_m153_capabilities.py` must additionally compile and link both
+  `SkLogHandler` symbols, execute `GetInstance`, and execute Graphite
   `ContextOptions::fExecutor` against those exact Linux x64 archives.
+  `SetInstance` is deliberately link-proven but not called because doing so
+  installs process-global, first-install-wins state; the receipt records that
+  limitation explicitly.
 - The matched V8 provider is baked and deeply receipted, but this does not
   change Pulp's runtime policy: QuickJS remains the default. The receipt calls
   this `baked-provider-only`, so cache availability cannot be mistaken for V8
@@ -269,15 +272,15 @@ candidate, then run from a current TartCI checkout on `macpro`:
 qm list
 providers/proxmox-linux/bake-pulp-golden.sh \
   --new-vmid 9006 \
-  --guest-host <candidate-ip> \
-  --guest-user runner
+  --guest-host <candidate-ip>
 ```
 
 The supplied SSH address is not trusted by itself. Before any provider or build
 proof is accepted, the script places a one-use nonce into the exact new VMID via
-the Proxmox guest agent and requires the SSH peer to return it. A stale address
-therefore fails before baking or templating; the nonce is removed with the
-candidate's other clone-specific identity.
+the Proxmox guest agent, assigns it mode `0400` to the canonical protected-lane
+consumer `ci`, and requires that `ci` SSH peer to return it. A stale address or
+wrong consumer therefore fails before baking or templating; the nonce is
+removed with the candidate's other clone-specific identity.
 
 `9006` is an example, not a reusable constant. If it exists—or if its immutable
 host receipt already exists—pick another new VMID. Before scrubbing clone
@@ -288,7 +291,8 @@ after `qm template` and the immutable template marker pass. That receipt binds:
 
 - exact Pulp commit and dependency-manifest digest;
 - Skia release/commit, bundled Dawn commit, Linux x64 asset digest, deep
-  generation-receipt digest, and executable capability-result digest;
+  generation-receipt digest, executable capability-result digest, and the
+  explicit `SetInstance` execution limitation;
 - the retained parent VMID and parent-config digest;
 - exact matched V8 release/asset and deep generation-receipt digest plus its
   provider-only disposition.

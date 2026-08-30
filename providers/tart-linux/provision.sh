@@ -11,8 +11,7 @@
 # Usage:
 #   providers/tart-linux/provision.sh \
 #     [--base ghcr.io/cirruslabs/ubuntu:24.04@sha256:<pin>] \
-#     [--name pulp-linux-build] [--src-repo https://github.com/Generous-Corp/pulp] \
-#     [--pulp-sha 40-hex] [--disk 80] [--memory 16384] [--cpu 8] \
+#     [--name pulp-linux-build] [--disk 80] [--memory 16384] [--cpu 8] \
 #     [--skia-platform linux-arm64]
 #     [--rosetta|--no-rosetta]
 set -euo pipefail
@@ -22,10 +21,12 @@ VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
 NAME="pulp-linux-build"
-SRC_REPO="https://github.com/Generous-Corp/pulp"
-PULP_SHA="21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 DISK=80; MEMORY=16384; CPU=8; SKIA_PLATFORM="linux-arm64"; ENABLE_ROSETTA=1
-RENDER_VERIFIER="$(cd "$(dirname "${BASH_SOURCE[0]}")/../common" && pwd)/pulp-render-generation.py"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+MANIFEST="$ROOT/manifests/pulp.linux.toml"
+COMMON="$ROOT/providers/common"
+SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
+RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -35,8 +36,6 @@ command -v tart >/dev/null 2>&1 || die "tart not installed"
 while [ $# -gt 0 ]; do case "$1" in
   --base) BASE="$2"; shift 2;;
   --name) NAME="$2"; shift 2;;
-  --src-repo) SRC_REPO="$2"; shift 2;;
-  --pulp-sha) PULP_SHA="$2"; shift 2;;
   --disk) DISK="$2"; shift 2;;
   --memory) MEMORY="$2"; shift 2;;
   --cpu) CPU="$2"; shift 2;;
@@ -47,9 +46,15 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 
-[[ "$PULP_SHA" =~ ^[0-9a-f]{40}$ ]] \
-  || die "--pulp-sha must be an immutable lowercase 40-hex commit"
-[ -f "$RENDER_VERIFIER" ] || die "render generation verifier missing: $RENDER_VERIFIER"
+for required in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
+  [ -f "$required" ] || die "versioned golden input missing: $required"
+done
+source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+  --require-skia-release chrome/m153 \
+  --require-v8-disposition baked-provider-only)" \
+  || die "could not resolve immutable Pulp source from $MANIFEST"
+SRC_REPO="${source_identity%%$'\n'*}"
+PULP_SHA="${source_identity#*$'\n'}"
 
 case "$BASE" in *@sha256:*) ;; *) note "WARNING: --base is not digest-pinned; :tag drifts glibc/sysroot under the golden (runbook §3.1)";; esac
 
@@ -277,9 +282,9 @@ python3 tools/scripts/fetch_skia_for_release.py "$SKIA_PLATFORM"
 ls external/skia-build/build/*-gpu/lib/Release/libskia.a >/dev/null 2>&1 \
   && echo "• Skia baked OK ($SKIA_PLATFORM)" || { echo "✗ Skia bake missing libskia.a"; exit 1; }
 
-# Prove the receipt-bound provider exports executable SkLogHandler and Graphite
-# executor support, then retain the matched V8 provider bytes without changing
-# Pulp's QuickJS-default runtime policy.
+# Prove the receipt-bound provider links both SkLogHandler symbols, executes the
+# non-global GetInstance/Graphite paths, and records why SetInstance is not run.
+# Then retain matched V8 bytes without changing Pulp's QuickJS-default policy.
 mkdir -p "$HOME/.config/tartci"
 python3 tools/scripts/verify_skia_m153_capabilities.py \
   --platform "$SKIA_PLATFORM" \

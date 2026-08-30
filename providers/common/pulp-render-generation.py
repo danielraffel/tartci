@@ -50,12 +50,18 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def load_module(path: Path, name: str):
+def load_module(path: Path, name: str, checkout_root: Path | None = None):
     spec = importlib.util.spec_from_file_location(name, path)
     if spec is None or spec.loader is None:
         fail(f"cannot load verifier module {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    original_path = list(sys.path)
+    try:
+        if checkout_root is not None:
+            sys.path.insert(0, str(checkout_root.resolve()))
+        spec.loader.exec_module(module)
+    finally:
+        sys.path[:] = original_path
     return module
 
 
@@ -162,7 +168,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
 
     skia_root = repo / "external/skia-build"
     skia_fetch = load_module(
-        repo / "tools/scripts/fetch_skia_for_release.py", "pulp_fetch_skia"
+        repo / "tools/scripts/fetch_skia_for_release.py", "pulp_fetch_skia", repo
     )
     if not skia_fetch.cache_generation_valid(
         skia_root, args.platform, skia_asset_sha
@@ -173,6 +179,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     capability_verifier = load_module(
         repo / "tools/scripts/verify_skia_m153_capabilities.py",
         "pulp_verify_skia_m153_capabilities",
+        repo,
     )
     probe_source = getattr(capability_verifier, "PROBE_SOURCE", None)
     if not isinstance(probe_source, str) or not probe_source:
@@ -208,7 +215,7 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
     v8_receipt_sha: str | None = None
     if args.v8_disposition == "baked-provider-only":
         v8_fetch = load_module(
-            repo / "tools/scripts/fetch_v8_for_release.py", "pulp_fetch_v8"
+            repo / "tools/scripts/fetch_v8_for_release.py", "pulp_fetch_v8", repo
         )
         v8_root = repo / "external/v8-build" / platform_key
         if not v8_fetch.generation_valid(
@@ -240,8 +247,12 @@ def verify(args: argparse.Namespace) -> dict[str, Any]:
             "generation_receipt_sha256": skia_receipt_sha,
             "capability_result_sha256": sha256_file(args.capability_result),
             "capabilities": [
-                "SkLogHandler.GetInstance.SetInstance.compile-link-run",
-                "Graphite.ContextOptions.fExecutor.compile-link-run",
+                "SkLogHandler.GetInstance.execute",
+                "SkLogHandler.SetInstance.compile-link-only",
+                "Graphite.ContextOptions.fExecutor.execute",
+            ],
+            "limitations": [
+                "SkLogHandler.SetInstance is not executed because it installs process-global first-install-wins state",
             ],
             "probe_count": len(capability["probes"]),
         },
