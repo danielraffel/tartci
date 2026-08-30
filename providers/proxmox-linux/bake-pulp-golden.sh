@@ -124,11 +124,16 @@ if "$QM_BIN" config "$NEW_VMID" >/dev/null 2>&1; then
 fi
 
 candidate_created=0
+template_requested=0
 templated=0
 on_exit(){
   rc=$?
   if [ "$rc" -ne 0 ] && [ "$candidate_created" -eq 1 ] && [ "$templated" -eq 0 ]; then
-    note "candidate VMID $NEW_VMID retained as a non-template for inspection; no VM was deleted"
+    if [ "$template_requested" -eq 0 ]; then
+      note "candidate VMID $NEW_VMID retained as a non-template for inspection; no VM was deleted"
+    else
+      note "template request for VMID $NEW_VMID did not reach a verified terminal state; inspect it before any next action; no VM was deleted"
+    fi
   fi
 }
 trap on_exit EXIT
@@ -259,11 +264,12 @@ done
 [ "$stopped" -eq 1 ] || die "candidate did not stop; refusing to template"
 
 note "all source/provider/build/receipt gates passed; templating new VMID $NEW_VMID"
+template_requested=1
 "$QM_BIN" template "$NEW_VMID"
 final_config="$($QM_BIN config "$NEW_VMID")"
 printf '%s\n' "$final_config" | grep -Eq '^template:[[:space:]]*1$' \
   || die "qm template returned without an immutable template marker"
-mv "$candidate_receipt" "$receipt"
 templated=1
+mv "$candidate_receipt" "$receipt"
 trap - EXIT
 note "created new template $NEW_VMID ($NAME); retained parent 9005 unchanged"
