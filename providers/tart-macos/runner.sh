@@ -14,7 +14,10 @@
 # TARTCI_RUNNER_WORKFLOW_NAMES. The plural setting replaces the legacy singular
 # TARTCI_RUNNER_WORKFLOW_NAME; the singular setting remains the default.
 # Ordered workflow tiers (opt-in): TARTCI_RUNNER_WORKFLOW_TIERS contains one
-# `class-label|exact workflow name` entry per line. First-seen labels are
+# `class-label|exact workflow name` entry per line. A matching optional
+# TARTCI_RUNNER_WORKFLOW_TIER_GROUPS map contains `class-label|runner-group-id`
+# entries, allowing protected merge-group jobs to use an organization group
+# while PR-head jobs register at repository scope. First-seen labels are
 # the priority order; workflows sharing a class label share one FIFO
 # class. The runner scans each class in order and registers its JIT runner with
 # only the selected class labels, so GitHub cannot assign lower-priority work to
@@ -91,6 +94,7 @@ fi
 WORKFLOW_NAME="${TARTCI_RUNNER_WORKFLOW_NAME:-Build and Test}"
 WORKFLOW_NAMES="${TARTCI_RUNNER_WORKFLOW_NAMES:-}"
 WORKFLOW_TIERS="${TARTCI_RUNNER_WORKFLOW_TIERS:-}"
+WORKFLOW_TIER_GROUPS="${TARTCI_RUNNER_WORKFLOW_TIER_GROUPS:-}"
 ASSIGNMENT_MODE="${TARTCI_RUNNER_ASSIGNMENT_MODE:-legacy}"
 # shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
 ASSIGNMENT_V2_OMIT_LABELS="${TARTCI_ASSIGNMENT_V2_OMIT_LABELS:-pulp-gate-fast}"
@@ -107,6 +111,7 @@ WORKFLOW_ARGS=()
 WORKFLOW_DISPLAY=""
 WORKFLOW_CONFIG=""
 TIER_LABELS_CONFIG=""
+TIER_GROUP_IDS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
@@ -134,6 +139,7 @@ PRINT_IDENTITY=0
 PRINT_QUEUE=0
 PRINT_SELECTION=0
 PRINT_RUNNER_API_ROOT=0
+PRINT_RUNNER_CONTRACT=""
 PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
@@ -149,6 +155,7 @@ CURRENT_WORKFLOW_NAME=""
 CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
+CURRENT_RUNNER_API_ROOT=""
 CURRENT_AQUA_LABEL=""
 CLEANED_UP=0
 SUPERVISOR_PID="$$"
@@ -223,6 +230,57 @@ $workflow"
   fi
 }
 
+configure_workflow_tier_groups(){
+  local entry tier_label group_id expected_labels="" configured_labels=""
+  [ -n "$WORKFLOW_TIER_GROUPS" ] || return 0
+  [ -n "$WORKFLOW_TIERS" ] \
+    || die "TARTCI_RUNNER_WORKFLOW_TIER_GROUPS requires TARTCI_RUNNER_WORKFLOW_TIERS"
+  while IFS= read -r entry; do
+    entry="${entry%$'\r'}"
+    [ -n "$entry" ] || continue
+    case "$entry" in
+      *'|'*) ;;
+      *) die "invalid TARTCI_RUNNER_WORKFLOW_TIER_GROUPS entry (expected class-label|runner-group-id): $entry" ;;
+    esac
+    tier_label="${entry%%|*}"
+    group_id="${entry#*|}"
+    case "$group_id" in
+      ''|0*|*[!0-9]*) die "invalid workflow-tier runner group for $tier_label: expected a positive integer" ;;
+    esac
+    [ -n "$tier_label" ] \
+      || die "invalid TARTCI_RUNNER_WORKFLOW_TIER_GROUPS entry (empty class label): $entry"
+    if [ -n "$configured_labels" ]; then
+      configured_labels="$configured_labels
+$tier_label"
+      TIER_GROUP_IDS_CONFIG="$TIER_GROUP_IDS_CONFIG
+$group_id"
+    else
+      configured_labels="$tier_label"
+      TIER_GROUP_IDS_CONFIG="$group_id"
+    fi
+  done <<< "$WORKFLOW_TIER_GROUPS"
+  expected_labels="$TIER_LABELS_CONFIG"
+  [ -n "$configured_labels" ] && [ "$configured_labels" = "$expected_labels" ] \
+    || die "workflow-tier runner groups must exactly match workflow tiers in priority order"
+}
+
+runner_group_id_for_tier(){
+  local selected_tier="$1" group_id tier=0
+  if [ -z "$TIER_GROUP_IDS_CONFIG" ]; then
+    printf '%s\n' "$RUNNER_GROUP_ID"
+    return 0
+  fi
+  while IFS= read -r group_id; do
+    [ -n "$group_id" ] || continue
+    if [ "$tier" -eq "$selected_tier" ]; then
+      printf '%s\n' "$group_id"
+      return 0
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_GROUP_IDS_CONFIG"
+  return 1
+}
+
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
 # shellcheck source=providers/common/vm-state.lib.sh
@@ -252,27 +310,31 @@ usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 # the top-level shell's PID); $1 is the monotonic per-boot index.
 ephemeral_boot_name(){ printf '%s-%s-%s' "$RUNNER_NAME" "$$" "$1"; }
 
-configure_runner_api_root(){
-  local runner_org runner_repo
-  case "$RUNNER_GROUP_ID" in
+runner_api_root_for_group(){
+  local runner_group_id="$1" runner_org runner_repo
+  case "$runner_group_id" in
     ''|0*|*[!0-9]*) die "invalid TARTCI_RUNNER_GROUP_ID: expected a positive integer";;
   esac
   case "$REPO" in
-    ''|/*|*/|*/*/*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+    ''|/*|*/|*/*/*) die "invalid runner repository for group $runner_group_id: expected OWNER/REPO";;
     */*) runner_org="${REPO%%/*}"; runner_repo="${REPO#*/}";;
-    *) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+    *) die "invalid runner repository for group $runner_group_id: expected OWNER/REPO";;
   esac
   case "$runner_org" in
-    -*|*-|*[!A-Za-z0-9-]*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+    -*|*-|*[!A-Za-z0-9-]*) die "invalid runner repository for group $runner_group_id: expected OWNER/REPO";;
   esac
   case "$runner_repo" in
-    *[!A-Za-z0-9_.-]*) die "invalid runner repository for group $RUNNER_GROUP_ID: expected OWNER/REPO";;
+    *[!A-Za-z0-9_.-]*) die "invalid runner repository for group $runner_group_id: expected OWNER/REPO";;
   esac
-  if [ "$RUNNER_GROUP_ID" = 1 ]; then
-    RUNNER_API_ROOT="repos/$REPO/actions/runners"
+  if [ "$runner_group_id" = 1 ]; then
+    printf 'repos/%s/actions/runners\n' "$REPO"
     return
   fi
-  RUNNER_API_ROOT="orgs/$runner_org/actions/runners"
+  printf 'orgs/%s/actions/runners\n' "$runner_org"
+}
+
+configure_runner_api_root(){
+  RUNNER_API_ROOT="$(runner_api_root_for_group "$RUNNER_GROUP_ID")"
 }
 
 while [ $# -gt 0 ]; do case "$1" in
@@ -299,6 +361,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
+  --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
   --print-chrome-mount) PRINT_CHROME_MOUNT=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
@@ -307,6 +370,7 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 configure_runner_api_root
+CURRENT_RUNNER_API_ROOT="$RUNNER_API_ROOT"
 [ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
 configure_chrome_mount
 [ "$PRINT_CHROME_MOUNT" = 1 ] && {
@@ -325,8 +389,15 @@ esac
 [ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_RUNNER_SHA256 must contain 64 hexadecimal characters"
 
 configure_workflows
+configure_workflow_tier_groups
 tartci_assignment_v2_configure
 CURRENT_LABELS="$LABELS"
+[ -z "$PRINT_RUNNER_CONTRACT" ] || {
+  contract_group="$(runner_group_id_for_tier "$PRINT_RUNNER_CONTRACT")" \
+    || die "no workflow-tier registration contract at index $PRINT_RUNNER_CONTRACT"
+  printf '%s\t%s\n' "$contract_group" "$(runner_api_root_for_group "$contract_group")"
+  exit 0
+}
 
 IDENTITY_JSON="$(python3 "$TARTCI_ROOT/scripts/macos_runner_identity.py" \
   --name "$RUNNER_NAME" \
@@ -355,17 +426,28 @@ command -v tart >/dev/null 2>&1 || die "tart not installed"
 command -v "$GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$GH_CLI' (TARTCI_GH_CLI) not installed / authed (need repo admin to mint JIT config)"
 command -v "$JIT_GH_CLI" >/dev/null 2>&1 || die "GitHub CLI '$JIT_GH_CLI' (TARTCI_JIT_GH_CLI) not installed / authed"
 mkdir -p "$STATE_DIR"
-JIT_DENIAL_KEY="$(printf '%s' "$REPO|$RUNNER_GROUP_ID|$LABELS|$JIT_GH_CLI" | shasum -a 256 | awk '{print $1}')"
-JIT_DENIAL_FILE="$STATE_DIR/jit-admission-denied.$JIT_DENIAL_KEY"
 
-jit_admission_denied(){ [ -f "$JIT_DENIAL_FILE" ]; }
+jit_denial_file_for(){
+  local runner_group_id="$1" labels="$2" key
+  key="$(printf '%s' "$REPO|$runner_group_id|$labels|$JIT_GH_CLI" | shasum -a 256 | awk '{print $1}')"
+  printf '%s/jit-admission-denied.%s\n' "$STATE_DIR" "$key"
+}
+jit_admission_denied(){
+  local runner_group_id="$1" labels="$2"
+  JIT_DENIAL_FILE="$(jit_denial_file_for "$runner_group_id" "$labels")"
+  [ -f "$JIT_DENIAL_FILE" ]
+}
 record_jit_admission_denied(){
-  local detail="$1"
+  local runner_group_id="$1" labels="$2" detail="$3"
+  JIT_DENIAL_FILE="$(jit_denial_file_for "$runner_group_id" "$labels")"
   umask 077
   printf 'repo=%s\nrunner_group_id=%s\nlabels=%s\ngh_cli=%s\ndetail=%s\n' \
-    "$REPO" "$RUNNER_GROUP_ID" "$LABELS" "$JIT_GH_CLI" "$detail" >"$JIT_DENIAL_FILE"
+    "$REPO" "$runner_group_id" "$labels" "$JIT_GH_CLI" "$detail" >"$JIT_DENIAL_FILE"
 }
-clear_jit_admission_denied(){ rm -f "$JIT_DENIAL_FILE"; }
+clear_jit_admission_denied(){
+  local runner_group_id="$1" labels="$2"
+  rm -f "$(jit_denial_file_for "$runner_group_id" "$labels")"
+}
 
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
 event(){
@@ -591,13 +673,13 @@ priority_demand(){
 }
 
 reclaim_runner_name(){
-  local name="$1" id attempt
+  local name="$1" runner_api_root="${2:-$RUNNER_API_ROOT}" id attempt
   for attempt in $(seq 1 18); do
-    id="$("$GH_CLI" api "$RUNNER_API_ROOT" --paginate \
+    id="$("$GH_CLI" api "$runner_api_root" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    "$GH_CLI" api -X DELETE "$RUNNER_API_ROOT/$id" >/dev/null 2>&1 && break
+    "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1 && break
     sleep 10
   done
   tart delete "$name" >/dev/null 2>&1 || true
@@ -631,10 +713,10 @@ cleanup(){
   tartci_release_vm_lease
   [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
   if [ -n "$CURRENT_REGISTERED_RUNNER" ]; then
-    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" 2>/dev/null || true
+    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" "$CURRENT_RUNNER_API_ROOT" 2>/dev/null || true
     CURRENT_REGISTERED_RUNNER=""
   fi
-  reclaim_runner_name "$RUNNER_NAME" 2>/dev/null || true
+  reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 2>/dev/null || true
   CLEANED_UP=1
   heartbeat stopped
 }
@@ -855,9 +937,18 @@ run_one(){
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
+  local selected_group_id selected_runner_api_root access_json access_rc access_error
   local lease_cores lease_priority
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
+  selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
+    || { note "[$i] no runner-group contract for workflow tier $selected_tier"; return 1; }
+  selected_runner_api_root="$(runner_api_root_for_group "$selected_group_id")"
+  CURRENT_RUNNER_API_ROOT="$selected_runner_api_root"
+  if jit_admission_denied "$selected_group_id" "$selected_labels"; then
+    note "[$i] JIT admission remains blocked for this exact repository/group/class contract — no VM will boot; inspect $JIT_DENIAL_FILE"
+    return 75
+  fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
     tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \
@@ -873,7 +964,7 @@ run_one(){
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_LABELS="$selected_labels"
-  reclaim_runner_name "$vm"
+  reclaim_runner_name "$vm" "$selected_runner_api_root"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
@@ -955,28 +1046,6 @@ run_one(){
     CURRENT_LABELS="$LABELS"
     return 75
   fi
-  if tartci_admission_clean_enabled; then
-    local admission_json="" admission_rc=0
-    heartbeat admission-check
-    event admission_check "repo=$REPO labels=$selected_labels"
-    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
-      admission_rc=0
-    else
-      admission_rc=$?
-    fi
-    [ -z "$admission_json" ] \
-      || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
-    if [ "$admission_rc" -ne 0 ]; then
-      heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
-      event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
-        "rc=$admission_rc unregistered=true"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
-      discard_current_vm
-      tartci_release_vm_lease
-      return "$admission_rc"
-    fi
-  fi
-
   heartbeat ensuring-runner
   event runner_version "required=$RUNNER_VERSION"
   if ! ensure_runner_version "$ip"; then
@@ -1010,6 +1079,28 @@ run_one(){
     fi
   fi
 
+  if tartci_admission_clean_enabled; then
+    local admission_json="" admission_rc=0
+    heartbeat admission-check
+    event admission_check "repo=$REPO labels=$selected_labels"
+    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+      admission_rc=0
+    else
+      admission_rc=$?
+    fi
+    [ -z "$admission_json" ] \
+      || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
+    if [ "$admission_rc" -ne 0 ]; then
+      heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
+      event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
+        "rc=$admission_rc unregistered=true"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off"
+      discard_current_vm
+      tartci_release_vm_lease
+      return "$admission_rc"
+    fi
+  fi
+
   heartbeat minting-jit
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
@@ -1034,6 +1125,33 @@ run_one(){
     tartci_release_vm_lease
     return 75
   fi
+  access_error="$STATE_DIR/$vm.repository-access-error"
+  access_rc=0
+  if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+      --repo "$REPO" --runner-group-id "$selected_group_id" \
+      --gh-cli "$JIT_GH_CLI" 2>"$access_error")"; then
+    access_rc=0
+  else
+    access_rc=$?
+  fi
+  [ -z "$access_json" ] \
+    || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
+  if [ "$access_rc" -ne 0 ]; then
+    tartci_pool_lock_release
+    if [ "$access_rc" -eq 3 ] \
+       || grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$access_error"; then
+      record_jit_admission_denied "$selected_group_id" "$selected_labels" \
+        "repository access denied before JIT registration; inspect $access_error"
+      event jit_repository_access_denied \
+        "repo=$REPO group=$selected_group_id labels=$selected_labels"
+    fi
+    note "[$i] runner group cannot prove repository access — refusing JIT registration and discarding VM"
+    discard_current_vm
+    tartci_release_vm_lease
+    return "$access_rc"
+  fi
+  rm -f "$access_error"
   event mint_jit "labels=$selected_labels tier=$selected_tier"
   # Claim the exact per-boot registration name before minting. Cleanup can then
   # reclaim it even when a signal lands immediately after GitHub creates it.
@@ -1042,13 +1160,14 @@ run_one(){
   for l in "${labels_split[@]}"; do label_args+=(-f "labels[]=$l"); done
   local jit_error="$STATE_DIR/$vm.jit-error"
   jit="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
-        "$JIT_GH_CLI" api -X POST "$RUNNER_API_ROOT/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        "$JIT_GH_CLI" api -X POST "$selected_runner_api_root/generate-jitconfig" \
+        -f "name=$vm" -F "runner_group_id=$selected_group_id" "${label_args[@]}" \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
     if grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$jit_error"; then
-      record_jit_admission_denied "GitHub rejected JIT registration; inspect $jit_error and change the explicit JIT auth route before retrying"
-      event jit_admission_denied "repo=$REPO group=$RUNNER_GROUP_ID gh_cli=$JIT_GH_CLI"
+      record_jit_admission_denied "$selected_group_id" "$selected_labels" \
+        "GitHub rejected JIT registration; inspect $jit_error and change the explicit JIT auth route before retrying"
+      event jit_admission_denied "repo=$REPO group=$selected_group_id gh_cli=$JIT_GH_CLI"
       note "[$i] JIT admission denied — blocking this exact auth/runner contract before another VM boots"
     fi
     note "[$i] JIT config mint failed — discarding VM"
@@ -1056,7 +1175,7 @@ run_one(){
     return 1
   }
   rm -f "$jit_error"
-  clear_jit_admission_denied
+  clear_jit_admission_denied "$selected_group_id" "$selected_labels"
   if [ -z "$jit" ]; then
     tartci_pool_lock_release
     note "[$i] empty JIT config — discarding VM"
@@ -1105,8 +1224,9 @@ run_one(){
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   CURRENT_LABELS="$LABELS"
-  reclaim_runner_name "$vm"
+  reclaim_runner_name "$vm" "$selected_runner_api_root"
   CURRENT_REGISTERED_RUNNER=""
+  CURRENT_RUNNER_API_ROOT="$RUNNER_API_ROOT"
   heartbeat stopped
   CLEANED_UP=1
   return 0
@@ -1151,12 +1271,6 @@ if [ "$LOOP" = 1 ]; then
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
   heartbeat loop
   while true; do
-    if jit_admission_denied; then
-      note "JIT admission remains blocked for this exact auth/runner contract — no VM will boot; repair the explicit auth route then change it or clear $JIT_DENIAL_FILE"
-      heartbeat jit-admission-denied
-      sleep "$POLL"
-      continue
-    fi
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
@@ -1165,6 +1279,17 @@ if [ "$LOOP" = 1 ]; then
     fi
     selection="$(select_work)"
     IFS='|' read -r q selected_labels selected_tier <<< "$selection"
+    if printf '%s' "$q" | grep -qxE '[1-9][0-9]*'; then
+      selected_group_id="$(runner_group_id_for_tier "$selected_tier")" || selected_group_id=""
+      if [ -z "$selected_group_id" ]; then
+        q=ERR
+      elif jit_admission_denied "$selected_group_id" "$selected_labels"; then
+        note "JIT admission remains blocked for repository=$REPO group=$selected_group_id class=$selected_labels — no VM will boot; inspect $JIT_DENIAL_FILE"
+        heartbeat jit-admission-denied
+        sleep "$POLL"
+        continue
+      fi
+    fi
     cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
     # Blind-aware: a non-numeric `q` (ERR) means the gh queue scan FAILED — do NOT treat it as an
     # empty queue. Count consecutive blind polls; after a sustained window, self-restart for fresh
@@ -1222,7 +1347,6 @@ if [ "$LOOP" = 1 ]; then
   done
 else
   tartci_pool_admission_open || die "pool $(tartci_pool_read_state): refusing one-shot admission"
-  jit_admission_denied && die "JIT admission is blocked for this exact auth/runner contract; repair auth before --once"
   selected_labels="$LABELS"; selected_tier=0
   if [ -n "$WORKFLOW_TIERS" ]; then
     selection="$(select_work)"
@@ -1230,6 +1354,10 @@ else
     printf '%s' "$q" | grep -qxE '[1-9][0-9]*' \
       || die "no queued workflow-tier work to select for --once"
   fi
+  selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
+    || die "no runner-group contract for workflow tier $selected_tier"
+  jit_admission_denied "$selected_group_id" "$selected_labels" \
+    && die "JIT admission is blocked for this exact repository/group/class contract; inspect $JIT_DENIAL_FILE"
   note "ephemeral macOS runner ONCE; golden=$GOLDEN labels=$selected_labels workflow_tier=$selected_tier"
   run_one 1 "$selected_labels" "$selected_tier"
 fi

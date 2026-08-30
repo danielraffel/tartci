@@ -254,6 +254,16 @@ class ProviderIntegrationTests(unittest.TestCase):
                     boot = body.index("t_booted=", body.index("run_one"))
                 self.assertLess(boot, gate)
                 self.assertLess(gate, mint)
+                if "tart-macos" in str(provider):
+                    final_assignment = body.index(
+                        "tartci_assignment_v2_pre_mint_admit", body.index("run_one")
+                    )
+                    repository_access = body.index(
+                        "runner_group_repository_access.py", body.index("run_one")
+                    )
+                    self.assertLess(gate, final_assignment)
+                    self.assertLess(final_assignment, repository_access)
+                    self.assertLess(repository_access, mint)
                 if "tart-linux" in str(provider):
                     cache_setup = body.index("write_state cache-setup", body.index("run_one"))
                     self.assertLess(cache_setup, gate)
