@@ -649,16 +649,18 @@ PY
             set -euo pipefail
             TARTCI_ROOT={ROOT}
             export TARTCI_ROOT
+            export TARTCI_MACOS_VM_CORES=12
             export TARTCI_LINUX_VM_CORES=5
             export TARTCI_WIN_VM_CORES=bogus
             source {HELPER}
+            printf '%s\\n' "$(tartci_vm_lease_cores tart-macos)"
             printf '%s\\n' "$(tartci_vm_lease_cores tart-linux)"
             printf '%s\\n' "$(tartci_vm_lease_cores qemu-windows 6)"
             """
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip().splitlines(), ["5", "6"])
+        self.assertEqual(proc.stdout.strip().splitlines(), ["12", "5", "6"])
 
     def test_is_non_gate_priority_helper(self) -> None:
         script = textwrap.dedent(

@@ -64,6 +64,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
                 self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
+                self.assertNotIn("priority", pulp_lane)
+                self.assertEqual(
+                    pulp_lane.get("vm_cores"),
+                    12 if host_id == "studio" else None,
+                )
                 self.assertEqual(
                     pulp_lane["supervisors"], 2
                 )
@@ -144,6 +149,30 @@ class MacosFleetLaneTests(unittest.TestCase):
                         )
                         for value in values
                     ))
+                    self.assertEqual(
+                        {
+                            value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
+                            value["EnvironmentVariables"].get("TARTCI_VM_LEASE_PRIORITY")
+                            for value in values
+                        },
+                        {
+                            "Generous-Corp/pulp": None,
+                            "Generous-Corp/forge": "gate",
+                            "Generous-Corp/vellum": "gate",
+                        },
+                    )
+                    for value in values:
+                        env = value["EnvironmentVariables"]
+                        expected_vm_cores = (
+                            "12"
+                            if host_id == "studio"
+                            and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                            else None
+                        )
+                        self.assertEqual(
+                            env.get("TARTCI_MACOS_VM_CORES"),
+                            expected_vm_cores,
+                        )
                     chrome_routes = {
                         value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
                         value["EnvironmentVariables"].get("TARTCI_RUNNER_CHROME_APP_DIR")
@@ -178,6 +207,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(len(identities), len(pulp_plists))
                     for value in pulp_plists:
                         env = value["EnvironmentVariables"]
+                        self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", env)
                         self.assertEqual(env["TARTCI_ADMISSION_CLEAN_MODE"], "required")
                         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"], "pulp-gate-fast")
@@ -251,7 +281,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             pulp = next(value for value in values if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"].endswith("/pulp"))
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
-            self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_VM_LEASE_PRIORITY"], "vm")
+            self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", pulp["EnvironmentVariables"])
+            self.assertNotIn("TARTCI_MACOS_VM_CORES", pulp["EnvironmentVariables"])
             self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
@@ -361,14 +392,15 @@ class MacosFleetLaneTests(unittest.TestCase):
                 1,
             ),
             "non-forge": base.replace(
-                'golden = "pulp-build-runner:latest"\npriority = "vm"',
-                'golden = "pulp-build-runner:latest"\nchrome_app_dir = "/Applications/Google Chrome.app"\npriority = "vm"',
+                'golden = "pulp-build-runner:latest"',
+                'golden = "pulp-build-runner:latest"\nchrome_app_dir = "/Applications/Google Chrome.app"',
                 1,
             ),
         }
         with tempfile.TemporaryDirectory() as td:
             for name, body in fixtures.items():
                 with self.subTest(name=name):
+                    self.assertNotEqual(body, base)
                     path = Path(td) / f"{name}.toml"
                     path.write_text(body)
                     result = subprocess.run(
@@ -515,6 +547,82 @@ workflows=["Build"]
                     )
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertIn("event-class-v2", result.stderr)
+
+    def test_event_class_v2_rejects_explicit_lease_priority(self) -> None:
+        base = CONFIG.read_text()
+        body = base.replace(
+            'golden = "pulp-build-runner:latest"',
+            'golden = "pulp-build-runner:latest"\npriority = "gate"',
+            1,
+        )
+        self.assertNotEqual(body, base)
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / "v2-explicit-priority.toml"
+            bad.write_text(body)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("event-class-v2 must derive lease priority", result.stderr)
+
+    def test_unconfigured_non_v2_priority_delegates_to_provider_labels(self) -> None:
+        base = CONFIG.read_text()
+        body = base.replace(
+            'chrome_app_dir = "/Applications/Google Chrome.app"\npriority = "gate"',
+            'chrome_app_dir = "/Applications/Google Chrome.app"',
+            1,
+        )
+        self.assertNotEqual(body, base)
+        with tempfile.TemporaryDirectory() as td:
+            config = Path(td) / "non-v2-derived-priority.toml"
+            config.write_text(body)
+            rendered = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "render", str(config),
+                 "--output", td],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            forge = next(
+                plistlib.loads(path.read_bytes())
+                for path in Path(td).glob("*.plist")
+                if "forge-gate" in path.name
+            )
+        self.assertNotIn(
+            "TARTCI_VM_LEASE_PRIORITY", forge["EnvironmentVariables"]
+        )
+
+    def test_vm_cores_must_be_a_positive_integer(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "zero": "0",
+            "negative": "-1",
+            "boolean": "true",
+            "string": '"12"',
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, value in fixtures.items():
+                with self.subTest(name=name):
+                    body = base.replace(
+                        'golden = "pulp-build-runner:latest"',
+                        f'golden = "pulp-build-runner:latest"\nvm_cores = {value}',
+                        1,
+                    )
+                    self.assertNotEqual(body, base)
+                    bad = Path(td) / f"vm-cores-{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn("vm_cores must be a positive integer", result.stderr)
 
     def test_scalar_types_fail_closed_without_traceback(self) -> None:
         fixtures = [

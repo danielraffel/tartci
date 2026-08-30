@@ -187,6 +187,9 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   and non-required use but cannot win the serial required gate. The fast
   supervisors also set `TARTCI_VM_LEASE_PRIORITY=gate`; that reserves host-core
   leases but does **not** influence GitHub placement by itself.
+  The managed event-class-V2 successor deliberately omits that fixed priority:
+  merge-group derives `110`, PR-head derives `100`, and M1 yields through its
+  queue-age delay instead of being forced into the non-gate budget.
   → *Before acting, re-measure:* group gate runtimes by host with the ephemeral
   suffix stripped (`pulp-vm-m1-01-67089-59` -> `pulp-vm-m1-01`). Per-runner-instance
   numbers look like n=1 noise and hide the pattern entirely.
@@ -202,9 +205,9 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   scanner can legitimately report `queued=0` for its current window, or GitHub
   can assign an optional job that shares the required job's labels.
   → *Fix:* inspect `shipyard runner fleet-status --repo OWNER/REPO --json`,
-  configure M1/M3/M5 gate supervisors with
-  `TARTCI_VM_LEASE_PRIORITY=gate`, and separate required-gate labels from
-  advisory labels.
+  confirm managed Pulp V2 supervisors omit a fixed lease priority and publish
+  exactly one derived event class, and separate required-gate labels from
+  advisory labels. A fixed `gate` priority remains valid for non-V2 required lanes.
 
 - **macOS runners sit `busy=false` while merge-group jobs stay `queued` for
   hours.** Observed on `Generous-Corp/pulp` 2026-07-28: nine merge-group runs
@@ -354,9 +357,11 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   group. Treating the org runner list as capacity produced exactly this phantom
   on M5: group 3 was online/idle while Pulp's repository runner endpoint could
   not see or assign it.
-  → *Fix:* Pulp PR-head registers through repository group 1 with the exact
-  `pulp-build-pr-head` class. Protected merge-group stays in organization group
-  3. Before every organization-scoped JIT mint, TartCI freshly checks group
+  → *Fix:* both Pulp event classes register through repository group 1 with the
+  exact `pulp-build-pr-head` or `pulp-build-merge-group` class. Organization
+  group 3's `build.yml@refs/heads/main` restriction cannot admit a merge-group
+  workflow evaluated under `gh-readonly-queue/...`. Before every remaining
+  organization-scoped JIT mint, TartCI freshly checks group
   visibility and the complete selected-repository list. Unknown/inaccessible
   policy records a contract-keyed denial and boots no further VM for that class.
   The final order is required Shipyard admission-clean → repository-access proof

@@ -21,7 +21,6 @@ id = "pulp-gate"
 repo = "Generous-Corp/pulp"
 runner_group_id = 1
 golden = "pulp-build-runner:latest"
-priority = "gate"
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]
