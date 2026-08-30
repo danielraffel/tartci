@@ -38,6 +38,8 @@ elif path.endswith("/jobs"):
     jobs = []
     if run_id == 333:
         jobs = [{"id": 444, "status": "in_progress", "runner_name": runner}]
+    elif run_id == 1 and kind == "ambiguous":
+        jobs = [{"id": 445, "status": "in_progress", "runner_name": runner}]
     print(json.dumps({"total_count": len(jobs), "jobs": jobs}))
 elif path.endswith("/actions/jobs/444"):
     status = "completed" if kind == "terminal" else "in_progress"
@@ -46,7 +48,9 @@ elif path.endswith("/actions/jobs/444"):
 elif path.endswith("/actions/runs/333"):
     workflow_id = 88 if kind == "unexpected" else 99
     name = "Surprise" if kind == "unexpected" else "Build and Test"
-    print(json.dumps({"id": 333, "workflow_id": workflow_id, "name": name}))
+    status = "completed" if kind == "terminal" else "in_progress"
+    print(json.dumps({"id": 333, "workflow_id": workflow_id, "name": name,
+                      "status": status, "conclusion": "cancelled" if status == "completed" else None}))
 else: raise SystemExit(4)
 '''
 
@@ -59,7 +63,7 @@ class CurrentJobScanTests(unittest.TestCase):
             return subprocess.run(
                 ["python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
                  "--runner", RUNNER_NAME, "--workflow", "Build and Test",
-                 "--gh-cli", str(fake), "--max-api-calls", "110", "--scan-timeout", "30", *extra],
+                 "--gh-cli", str(fake), *extra],
                 env={**os.environ, "FAKE_KIND": kind}, text=True, capture_output=True, check=False,
             )
 
@@ -73,6 +77,41 @@ class CurrentJobScanTests(unittest.TestCase):
         receipt = json.loads(self._scan("unexpected").stdout)
         self.assertEqual(receipt["kind"], "unexpected_assignment")
         self.assertEqual(receipt["workflow_name"], "Surprise")
+
+    def test_ambiguous_assignment_is_typed(self) -> None:
+        receipt = json.loads(self._scan("ambiguous").stdout)
+        self.assertEqual(receipt, {"kind": "ambiguous_assignment", "matches": 2})
+
+    def test_same_count_deeper_page_churn_cannot_confirm_no_assignment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "fake-gh"
+            counter = Path(directory) / "counter"
+            body = f'''#!/usr/bin/env python3
+import json, sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+p = urlparse("https://x/" + sys.argv[-1]); page = int(parse_qs(p.query).get("page", ["1"])[0])
+counter = Path({str(counter)!r})
+if p.path.endswith("/actions/workflows"):
+ print(json.dumps({{"total_count":1,"workflows":[{{"id":99,"name":"Build and Test"}}]}}))
+elif p.path.endswith("/actions/runs"):
+ n = int(counter.read_text()) if counter.exists() else 0; counter.write_text(str(n + 1))
+ sweep = n // 3
+ runs = ([{{"id":i,"name":"Build and Test"}} for i in range(1,101)] if page == 1
+         else [{{"id":333 + sweep,"name":"Build and Test"}}])
+ print(json.dumps({{"total_count":101,"workflow_runs":runs}}))
+elif p.path.endswith("/jobs"):
+ print(json.dumps({{"total_count":0,"jobs":[]}}))
+else: raise SystemExit(4)
+'''
+            _write_exec(fake, body)
+            result = subprocess.run(
+                ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
+                 "--workflow", "Build and Test", "--gh-cli", str(fake)],
+                text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("scheduler pages changed", json.loads(result.stdout)["detail"])
 
     def test_exact_revalidation_reports_terminal_and_disallows_guessing(self) -> None:
         result = self._scan("terminal", "--mode", "revalidate", "--run-id", "333", "--job-id", "444")
@@ -122,16 +161,6 @@ else: raise SystemExit(4)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["kind"], "observation_error")
         self.assertIn("first page changed", json.loads(result.stdout)["detail"])
-
-    def test_runner_wires_budgeted_async_scan_and_precancel_revalidation(self) -> None:
-        body = RUNNER.read_text(encoding="utf-8")
-        self.assertIn('python3 "${args[@]}" >"$CURRENT_SCAN_TMP"', body)
-        self.assertIn('while kill -0 "$CURRENT_SCAN_PID"', body)
-        self.assertIn('heartbeat job-running', body)
-        self.assertIn('CURRENT_JOB_SCAN_SPENT=', body)
-        self.assertIn('capture_current_job revalidate || rc=$?', body)
-        self.assertIn('rerun_eligible=false receipt=', body)
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

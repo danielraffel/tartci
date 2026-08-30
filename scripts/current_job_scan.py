@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -32,11 +34,14 @@ class CurrentJobScanner:
         self.configured_names = tuple(dict.fromkeys(args.workflow))
         self.deadline = time.monotonic() + args.scan_timeout
         self.api_calls = 0
+        self.api_lock = threading.Lock()
+        self.page_fingerprints: dict[str, tuple[tuple[int, ...], ...]] = {}
 
     def _gh(self, path: str) -> dict[str, Any]:
-        if self.api_calls >= self.args.max_api_calls:
-            raise ScanError(f"API budget exhausted ({self.args.max_api_calls})")
-        self.api_calls += 1
+        with self.api_lock:
+            if self.api_calls >= self.args.max_api_calls:
+                raise ScanError(f"API budget exhausted ({self.args.max_api_calls})")
+            self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ScanError("scan exceeded its overall deadline")
@@ -62,6 +67,7 @@ class CurrentJobScanner:
         seen: set[int] = set()
         expected_total: int | None = None
         first_ids: tuple[int, ...] = ()
+        page_ids: list[tuple[int, ...]] = []
         separator = "&" if "?" in prefix else "?"
         for page in range(1, self.args.max_pages + 1):
             path = f"{prefix}{separator}per_page={PER_PAGE}&page={page}"
@@ -88,6 +94,7 @@ class CurrentJobScanner:
                 result.append(item)
             if page == 1:
                 first_ids = tuple(ids)
+            page_ids.append(tuple(ids))
             if len(result) == total:
                 if page > 1:
                     verify_path = f"{prefix}{separator}per_page={PER_PAGE}&page=1"
@@ -95,6 +102,7 @@ class CurrentJobScanner:
                     verify_ids = tuple(item.get("id") for item in _objects(verify, key, verify_path))
                     if verify.get("total_count") != expected_total or verify_ids != first_ids:
                         raise ScanError(f"first page changed during pagination for {prefix}")
+                self.page_fingerprints[prefix] = tuple(page_ids)
                 return result
             if len(result) > total or len(items) < PER_PAGE:
                 raise ScanError(f"pagination inconsistent for {prefix} ({len(result)} of {total})")
@@ -129,12 +137,16 @@ class CurrentJobScanner:
         runner = job.get("runner_name")
         workflow_id = run.get("workflow_id")
         workflow_name = run.get("name")
+        run_status = str(run.get("status") or "").lower()
         base = {"run_id": run_id, "job_id": job_id, "workflow_id": workflow_id,
                 "workflow_name": workflow_name, "runner_name": runner,
-                "job_status": status}
+                "job_status": status, "run_status": run_status,
+                "run_conclusion": run.get("conclusion")}
         if runner != self.args.runner:
             return self._receipt("assignment_changed", **base)
         if status == "completed":
+            if run_status != "completed":
+                return self._receipt("terminal_pending_run", conclusion=job.get("conclusion"), **base)
             return self._receipt("terminal", conclusion=job.get("conclusion"), **base)
         if status != "in_progress":
             return self._receipt("assignment_changed", **base)
@@ -149,25 +161,49 @@ class CurrentJobScanner:
         runs = self._pages(
             f"repos/{self.args.repo}/actions/runs?status=in_progress", "workflow_runs"
         )
-        matches: list[tuple[int, int]] = []
-        for run in runs:
-            run_id = run.get("id")
-            if not isinstance(run_id, int):
-                raise ScanError("in-progress run lacks integer id")
-            jobs = self._pages(
-                f"repos/{self.args.repo}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
+        matches = self._matches(runs)
+        if not matches:
+            # A same-count insertion/removal can preserve page 1 while moving an
+            # assignment across a deeper boundary. A negative verdict therefore
+            # requires a second complete, identical scheduler snapshot.
+            first = dict(self.page_fingerprints)
+            runs = self._pages(
+                f"repos/{self.args.repo}/actions/runs?status=in_progress", "workflow_runs"
             )
-            for job in jobs:
-                if job.get("runner_name") == self.args.runner and str(job.get("status", "")).lower() == "in_progress":
-                    job_id = job.get("id")
-                    if not isinstance(job_id, int):
-                        raise ScanError(f"matching job in run {run_id} lacks integer id")
-                    matches.append((run_id, job_id))
+            matches = self._matches(runs)
+            if not matches and self.page_fingerprints != first:
+                raise ScanError("scheduler pages changed while confirming no assignment")
         if len(matches) > 1:
             return self._receipt("ambiguous_assignment", matches=len(matches))
         if not matches:
             return self._receipt("no_assignment")
         return self._confirm(*matches[0], contract)
+
+    def _matches(self, runs: list[dict[str, Any]]) -> list[tuple[int, int]]:
+        run_ids: list[int] = []
+        for run in runs:
+            run_id = run.get("id")
+            if not isinstance(run_id, int):
+                raise ScanError("in-progress run lacks integer id")
+            run_ids.append(run_id)
+
+        def fetch(run_id: int) -> tuple[int, list[dict[str, Any]]]:
+            return run_id, self._pages(
+                f"repos/{self.args.repo}/actions/runs/{run_id}/jobs?filter=latest", "jobs"
+            )
+
+        matches: list[tuple[int, int]] = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.args.parallelism) as pool:
+            futures = [pool.submit(fetch, run_id) for run_id in run_ids]
+            for future in concurrent.futures.as_completed(futures):
+                run_id, jobs = future.result()
+                for job in jobs:
+                    if job.get("runner_name") == self.args.runner and str(job.get("status", "")).lower() == "in_progress":
+                        job_id = job.get("id")
+                        if not isinstance(job_id, int):
+                            raise ScanError(f"matching job in run {run_id} lacks integer id")
+                        matches.append((run_id, job_id))
+        return matches
 
     def revalidate(self) -> dict[str, Any]:
         return self._confirm(self.args.run_id, self.args.job_id, self._workflow_contract())
@@ -186,9 +222,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=3)
     parser.add_argument("--scan-timeout", type=float, default=10)
     parser.add_argument("--result-cap", type=int, default=300)
-    parser.add_argument("--max-api-calls", type=int, default=64)
+    parser.add_argument("--max-api-calls", type=int, default=310)
+    parser.add_argument("--parallelism", type=int, default=12)
     args = parser.parse_args()
-    for field in ("gh_timeout", "max_pages", "scan_timeout", "result_cap", "max_api_calls"):
+    for field in ("gh_timeout", "max_pages", "scan_timeout", "result_cap", "max_api_calls", "parallelism"):
         if getattr(args, field) <= 0:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.mode == "revalidate" and (not args.run_id or not args.job_id):
