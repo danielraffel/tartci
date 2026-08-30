@@ -32,7 +32,8 @@ STACKED_IMAGE_KEYS = {
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "labels", "workflows", "tier",
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli", "chrome_app_dir",
+    "jit_github_cli", "chrome_app_dir", "assignment_mode",
+    "assignment_omit_labels", "supervisors",
 }
 TIER_KEYS = {"label", "workflow"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -116,10 +117,19 @@ def load(path: Path) -> dict:
             fail("stacked_images.flat_rollback must name the retained flat golden")
     if not lanes:
         fail("at least one [[lane]] is required")
-    generated_labels = {
-        f"com.danielraffel.tartci.tart-runner-macos-fleet.{host['id']}.{lane.get('id', '')}"
-        for lane in lanes if isinstance(lane, dict)
-    }
+    generated_labels: set[str] = set()
+    for lane in lanes:
+        if not isinstance(lane, dict):
+            fail("each lane must be a table")
+        supervisors = lane.get("supervisors", 1)
+        if type(supervisors) is not int or supervisors not in (1, 2):
+            fail(f"lane {lane.get('id', '')}: supervisors must be 1 or 2")
+        for slot in range(1, supervisors + 1):
+            generated_labels.add(
+                f"com.danielraffel.tartci.tart-runner-macos-fleet."
+                f"{host['id']}.{lane.get('id', '')}"
+                f"{'' if slot == 1 else f'.slot{slot}'}"
+            )
     seen: set[str] = set()
     replaced: set[str] = set()
     for lane in lanes:
@@ -157,6 +167,18 @@ def load(path: Path) -> dict:
         priority = lane.get("priority", "gate")
         if not isinstance(priority, str) or priority not in LEASE_PRIORITIES:
             fail(f"lane {lane_id}: unsupported lease priority")
+        supervisors = lane.get("supervisors", 1)
+        if type(supervisors) is not int or supervisors not in (1, 2):
+            fail(f"lane {lane_id}: supervisors must be 1 or 2")
+        assignment_mode = lane.get("assignment_mode")
+        if assignment_mode is not None and assignment_mode != "event-class-v2":
+            fail(f"lane {lane_id}: unsupported assignment_mode")
+        omit_labels = lane.get("assignment_omit_labels", [])
+        if (not isinstance(omit_labels, list)
+                or not all(isinstance(value, str) and LABEL.fullmatch(value)
+                           for value in omit_labels)
+                or len(omit_labels) != len(set(omit_labels))):
+            fail(f"lane {lane_id}: assignment_omit_labels must contain unique labels")
         jit_github_cli = lane.get("jit_github_cli")
         if jit_github_cli is not None and (
                 not isinstance(jit_github_cli, str)
@@ -219,6 +241,14 @@ def load(path: Path) -> dict:
                 fail(f"lane {lane_id}: invalid workflow tier")
             if label in labels:
                 fail(f"lane {lane_id}: tier label must be exclusive, not a base label")
+        if assignment_mode == "event-class-v2":
+            class_labels = [tier["label"] for tier in tiers]
+            if class_labels != ["pulp-build-merge-group", "pulp-build-pr-head"]:
+                fail(
+                    f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
+                )
+            if "pulp-gate-fast" not in omit_labels:
+                fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
     return data
 
 
@@ -226,8 +256,15 @@ def rendered_plists(data: dict) -> dict[str, bytes]:
     host_id = data["host"]["id"]
     result: dict[str, bytes] = {}
     for lane in data["lane"]:
-        name = f"com.danielraffel.tartci.tart-runner-macos-fleet.{host_id}.{lane['id']}.plist"
-        result[name] = plistlib.dumps(lane_plist(data, lane), sort_keys=False)
+        for slot in range(1, lane.get("supervisors", 1) + 1):
+            suffix = "" if slot == 1 else f".slot{slot}"
+            name = (
+                f"com.danielraffel.tartci.tart-runner-macos-fleet."
+                f"{host_id}.{lane['id']}{suffix}.plist"
+            )
+            result[name] = plistlib.dumps(
+                lane_plist(data, lane, slot=slot), sort_keys=False
+            )
     return result
 
 
@@ -308,11 +345,16 @@ def verify_receipt(path: Path, config: Path, agents_dir: Path) -> None:
             fail(f"declared legacy LaunchAgent became installable again: {label}")
 
 
-def lane_plist(data: dict, lane: dict) -> dict:
+def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
     host = data["host"]
     lane_id = lane["id"]
-    label = f"com.danielraffel.tartci.tart-runner-macos-fleet.{host['id']}.{lane_id}"
-    state = f"{host['home']}/.tartci/state/macos-fleet/{lane_id}"
+    suffix = "" if slot == 1 else f".slot{slot}"
+    identity = lane_id if slot == 1 else f"{lane_id}-slot{slot}"
+    label = (
+        f"com.danielraffel.tartci.tart-runner-macos-fleet."
+        f"{host['id']}.{lane_id}{suffix}"
+    )
+    state = f"{host['home']}/.tartci/state/macos-fleet/{identity}"
     env = {
         "HOME": host["home"],
         "PATH": f"/opt/homebrew/bin:/usr/local/bin:{host['home']}/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -328,10 +370,11 @@ def lane_plist(data: dict, lane: dict) -> dict:
         "TARTCI_CI_CACHE": host["cache_root"],
         "TARTCI_STATE_DIR": state,
         "TARTCI_EVENT_LOG": f"{state}/events.jsonl",
-        "TARTCI_MACOS_LOGS": f"{host['log_root']}/macos-fleet-jobs/{lane_id}",
-        "TARTCI_QUEUE_LANE_ID": f"{host['id']}-{lane_id}",
+        "TARTCI_MACOS_LOGS": f"{host['log_root']}/macos-fleet-jobs/{identity}",
+        "TARTCI_QUEUE_LANE_ID": f"{host['id']}-{identity}",
         "TARTCI_SHARED_QUEUE_CACHE": f"{host['home']}/.tartci/state/queue-discovery.json",
-        "TARTCI_RUNNER_NAME_PREFIX": f"{host['id']}-{lane_id}",
+        "TARTCI_RUNNER_NAME_PREFIX": f"{host['id']}-{identity}",
+        "TARTCI_RUNNER_SLOT": str(slot),
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
@@ -345,6 +388,13 @@ def lane_plist(data: dict, lane: dict) -> dict:
         env["TARTCI_JIT_GH_CLI"] = lane["jit_github_cli"]
     if "chrome_app_dir" in lane:
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
+    if "assignment_mode" in lane:
+        omit = ",".join(lane.get("assignment_omit_labels", []))
+        class_labels = ",".join(row["label"] for row in lane["tier"])
+        env["TARTCI_RUNNER_ASSIGNMENT_MODE"] = lane["assignment_mode"]
+        env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"] = omit
+        env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"] = omit
+        env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"] = class_labels
     return {
         "Label": label,
         "ProgramArguments": [
@@ -353,8 +403,8 @@ def lane_plist(data: dict, lane: dict) -> dict:
         "WorkingDirectory": host["home"],
         "RunAtLoad": True,
         "KeepAlive": True,
-        "StandardOutPath": f"{host['log_root']}/macos-fleet-{lane_id}.log",
-        "StandardErrorPath": f"{host['log_root']}/macos-fleet-{lane_id}.log",
+        "StandardOutPath": f"{host['log_root']}/macos-fleet-{identity}.log",
+        "StandardErrorPath": f"{host['log_root']}/macos-fleet-{identity}.log",
         "ProcessType": "Background",
         "EnvironmentVariables": env,
     }

@@ -25,11 +25,18 @@ runner_group_id = 3
 golden = "pulp-build-runner:latest"
 priority = "vm"
 min_queued_age_seconds = 600
+assignment_mode = "event-class-v2"
+assignment_omit_labels = ["pulp-gate-fast"]
+supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
+workflow = "Build and Test"
+
+[[lane.tier]]
+label = "pulp-build-pr-head"
 workflow = "Build and Test"
 
 [[lane]]
