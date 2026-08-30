@@ -19,6 +19,8 @@ path = args[-1]
 if os.environ.get("LIFECYCLE_HANG") == "1":
     time.sleep(20)
 if "-X" in args and "POST" in args:
+    with open(os.environ["LIFECYCLE_POST_LOG"], "a", encoding="utf-8") as stream:
+        stream.write("POST\n")
     open(state, "w", encoding="utf-8").write("cancelled")
     print("{}")
 elif path.endswith("/actions/workflows?per_page=100&page=1"):
@@ -47,8 +49,10 @@ export TARTCI_ROOT="$ROOT" STATE_DIR="$TMP/state" REPO="Generous-Corp/pulp"
 export GH_CLI="$TMP/fake-gh" WORKFLOW_CONFIG="Build and Test"
 export CURRENT_REGISTERED_RUNNER="runner-1" RUNNER_NAME="lane-1"
 export LIFECYCLE_STATE="$TMP/api-state" LIFECYCLE_HANG=0
+export LIFECYCLE_POST_LOG="$TMP/posts"
 mkdir -p "$STATE_DIR"
 printf active >"$LIFECYCLE_STATE"
+: >"$LIFECYCLE_POST_LOG"
 EVENTS="$TMP/events"
 : >"$EVENTS"
 export EVENT_LOG="$EVENTS"
@@ -71,7 +75,62 @@ reset_state(){
   CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
   CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0 CURRENT_ASSIGNMENT_QUARANTINE=none
   CURRENT_SCAN_PID="" CURRENT_SCAN_TMP=""
+  : >"$EVENTS"
 }
+
+post_count(){
+  wc -l <"$LIFECYCLE_POST_LOG" | tr -d '[:space:]'
+}
+
+assert_pre_cancel_invalid(){
+  local variable="$1" value="$2" detail="$3" quarantine="$4" clear_ids="$5"
+  local posts_before
+  reset_state
+  if [ "$clear_ids" = 1 ]; then
+    CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+  fi
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "$variable=$value"
+  if cancel_current_run; then
+    unset "$variable"
+    exit 1
+  fi
+  unset "$variable"
+  [ "$(post_count)" = "$posts_before" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = "{\"kind\":\"invalid_budget\",\"detail\":\"$detail\"}" ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = "$quarantine" ]
+  grep -q '^run_cancel_suppressed|.*rerun_eligible=false' "$EVENTS"
+}
+
+assert_post_cancel_invalid(){
+  local value="$1" posts_before
+  reset_state
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=$value"
+  if cancel_current_run; then
+    unset TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS
+    exit 1
+  fi
+  unset TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS
+  [ "$(post_count)" = "$((posts_before + 1))" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = '{"kind":"invalid_budget","detail":"cancel_terminal_observation_budget"}' ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = cancel_terminal_unknown ]
+  grep -q '^run_cancel_requested|.*rerun_eligible=pending-terminal' "$EVENTS"
+  grep -q '^run_cancel_unknown|.*observation=invalid_budget.*rerun_eligible=false' "$EVENTS"
+  if grep -q '^run_cancel_terminal|' "$EVENTS"; then exit 1; fi
+}
+
+# Every timeout that reaches shell arithmetic is a canonical positive decimal.
+for value in 1 8 10 300; do
+  tartci_is_canonical_positive_decimal "$value" || exit 1
+done
+for value in "" 0 00 09 +1 -1 " 1" "1 " 1:2 1a; do
+  if tartci_is_canonical_positive_decimal "$value"; then exit 1; fi
+done
 
 # Discovery exhaustion must not consume mandatory pre-cancel authority.
 reset_state
@@ -88,6 +147,7 @@ CURRENT_RUN_ID="" CURRENT_JOB_ID=""
 CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
 CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
 printf active >"$LIFECYCLE_STATE"
+posts_before="$(post_count)"
 TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
 TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=1 \
 TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=1 \
@@ -98,7 +158,24 @@ TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
 [ "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" = 1 ]
 [ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" = 1 ]
 [ "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT" = 1 ]
+[ "$(post_count)" = "$((posts_before + 1))" ]
 grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
+
+# Every malformed class reaches each actual configuration path. Discovery,
+# mandatory revalidation, per-attempt, and terminal-deadline failures precede
+# POST; terminal-observation failure follows exactly one POST and stays
+# non-rerunnable.
+for malformed in 0 +1 -1 " 1" "1 " 1:2 09 ""; do
+  assert_pre_cancel_invalid TARTCI_CANCEL_DISCOVERY_BUDGET_SECS \
+    "$malformed" cancel_discovery_budget pre_cancel_discovery_invalid_budget 1
+  assert_pre_cancel_invalid TARTCI_CANCEL_REVALIDATION_BUDGET_SECS \
+    "$malformed" cancel_revalidation_budget pre_cancel_invalid_budget 0
+  assert_pre_cancel_invalid TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS \
+    "$malformed" attempt_timeout pre_cancel_invalid_budget 0
+  assert_pre_cancel_invalid TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS \
+    "$malformed" cancel_terminal_timeout pre_cancel_invalid_budget 0
+  assert_post_cancel_invalid "$malformed"
+done
 
 # A setup failure overwrites a stale active receipt and fails closed.
 reset_state
@@ -114,8 +191,10 @@ unset -f mktemp
 # timed-out workflow rerun-eligible.
 reset_state
 printf active >"$LIFECYCLE_STATE"
+posts_before="$(post_count)"
 TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
 TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
+[ "$(post_count)" = "$((posts_before + 1))" ]
 grep -q '^run_cancel_requested|.*rerun_eligible=pending-terminal' "$EVENTS"
 grep -q '^run_cancel_terminal|.*rerun_eligible=true.*"run_conclusion":"cancelled"' "$EVENTS"
 [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal ]
