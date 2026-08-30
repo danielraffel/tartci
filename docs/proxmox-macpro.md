@@ -23,7 +23,7 @@ macOS launchd provider.
 | **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
 | **Serves** | Pulp protected `Linux (x64)` merge-group/main builds · Windows x64 later |
 | **Model** | golden template → linked clone → one job → destroy |
-| **Templates** | `9005` `pulp-linux-golden-warm4` (current) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
+| **Templates** | `9005` `pulp-linux-golden-warm4` (current and retained parent) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
 | **Pool** | Trusted `pulp-ephemeral-pool@{1,2}.service`; PR-safe services must use a separate unit namespace and capability label |
 | **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
 | **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
@@ -237,6 +237,64 @@ to one that inherited it. The only honest check is `journalctl -u
 a VM came from, plus its age — a 70-second-old clone holding 1.8 GB cannot have
 downloaded it. A check that cannot distinguish the two will report success on the
 wrong evidence.
+
+### Refreshing the render-toolchain golden (m153)
+
+The versioned refresh entrypoint is
+`providers/proxmox-linux/bake-pulp-golden.sh`. It is intentionally additive:
+
+- `9005` is the retained parent and rollback template. The script never runs
+  `qm destroy`, never converts `9005` again, and never edits an existing target.
+- The target must be a new, unused VMID at or above `9006`. Availability is
+  checked under the refresh lock immediately before the full clone; a clone
+  race fails without cleanup that could delete another owner's VM.
+- Pulp is detached at the immutable commit in `manifests/pulp.linux.toml`.
+  Skia, bundled Dawn, and matched V8 identities are then derived from that
+  commit's own `tools/deps/manifest.json`, not copied into an operator command.
+- Pulp's own fetch validators deep-check every receipt-bound extracted byte.
+  `verify_skia_m153_capabilities.py` must additionally compile, link, and run
+  `SkLogHandler::{GetInstance,SetInstance}` and Graphite
+  `ContextOptions::fExecutor` against those exact Linux x64 archives.
+- The matched V8 provider is baked and deeply receipted, but this does not
+  change Pulp's runtime policy: QuickJS remains the default. The receipt calls
+  this `baked-provider-only`, so cache availability cannot be mistaken for V8
+  adoption or Vellum policy.
+- A full local Release build warms the actual protected-Linux source/object
+  graph. No GitHub-hosted consumer build is involved.
+
+Choose a VMID that is absent from `qm list` and an SSH address for the new
+candidate, then run from a current TartCI checkout on `macpro`:
+
+```sh
+qm list
+providers/proxmox-linux/bake-pulp-golden.sh \
+  --new-vmid 9006 \
+  --guest-host <candidate-ip> \
+  --guest-user runner
+```
+
+`9006` is an example, not a reusable constant. If it exists—or if its immutable
+host receipt already exists—pick another new VMID. Before scrubbing clone
+identity, the script writes and validates
+`/var/lib/tartci/golden-receipts/pulp-linux-template-<vmid>.candidate.json`.
+It promotes those unchanged, read-only bytes to the final `.json` name only
+after `qm template` and the immutable template marker pass. That receipt binds:
+
+- exact Pulp commit and dependency-manifest digest;
+- Skia release/commit, bundled Dawn commit, Linux x64 asset digest, deep
+  generation-receipt digest, and executable capability-result digest;
+- the retained parent VMID and parent-config digest;
+- exact matched V8 release/asset and deep generation-receipt digest plus its
+  provider-only disposition.
+
+Only after the guest proof and an independent host-side receipt check pass does
+the script call `qm template` on the **new** VMID. Any earlier failure leaves the
+candidate as a mutable non-template for inspection and prints that disposition;
+it never guesses that deletion is safe. After success, update the host pool's
+golden VMID only through its normal drained rollout, run one exact-template
+canary, and retain `9005` until that canary and restart/rejoin proof are recorded.
+Do not edit the deployed `/usr/local/sbin` copy by hand: deploy the versioned
+script so future m154+ refreshes inherit the same exact-source and receipt gates.
 
 ---
 
