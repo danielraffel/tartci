@@ -124,6 +124,25 @@ assert_post_cancel_invalid(){
   if grep -q '^run_cancel_terminal|' "$EVENTS"; then exit 1; fi
 }
 
+assert_lifecycle_invalid(){
+  local value="$1" posts_before
+  reset_state
+  CURRENT_JOB_SCAN_SPENT=0
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=$value"
+  if capture_current_job discover; then
+    unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+    exit 1
+  fi
+  unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+  [ "$(post_count)" = "$posts_before" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = '{"kind":"invalid_budget","detail":"lifecycle_budget"}' ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = observation_invalid_budget ]
+  grep -qx 'job_observation_error|kind=invalid_budget mode=discover parameter=lifecycle_budget' "$EVENTS"
+}
+
 # Every timeout that reaches shell arithmetic is a canonical positive decimal.
 for value in 1 8 10 300; do
   tartci_is_canonical_positive_decimal "$value" || exit 1
@@ -161,11 +180,14 @@ TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
 [ "$(post_count)" = "$((posts_before + 1))" ]
 grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
 
-# Every malformed class reaches each actual configuration path. Discovery,
-# mandatory revalidation, per-attempt, and terminal-deadline failures precede
-# POST; terminal-observation failure follows exactly one POST and stays
-# non-rerunnable.
-for malformed in 0 +1 -1 " 1" "1 " 1:2 09 ""; do
+# Every malformed class reaches each actual configuration path. Ordinary
+# lifecycle observation, protected cancellation discovery, mandatory
+# revalidation, per-attempt, and terminal-deadline failures precede POST;
+# terminal-observation failure follows exactly one POST and stays
+# non-rerunnable. Explicit empty is load-bearing: it detects a mutation from
+# `${VAR-30}` to `${VAR:-30}` on the ordinary lifecycle path.
+for malformed in 0 00 09 +1 -1 " 1" "1 " 1:2 1a ""; do
+  assert_lifecycle_invalid "$malformed"
   assert_pre_cancel_invalid TARTCI_CANCEL_DISCOVERY_BUDGET_SECS \
     "$malformed" cancel_discovery_budget pre_cancel_discovery_invalid_budget 1
   assert_pre_cancel_invalid TARTCI_CANCEL_REVALIDATION_BUDGET_SECS \
