@@ -28,6 +28,12 @@ cross       = true                   # true when target_arch != arch.
 base    = "ghcr.io/cirruslabs/ubuntu:24.04"   # tart: OCI base image ref.
 disk_gb = 90
 
+[source]
+# Bake from an immutable project commit. A branch or tag is not a golden input.
+repository = "https://github.com/example/example"
+commit     = "0000000000000000000000000000000000000000"
+manifest   = "tools/deps/manifest.json"
+
 [toolchain]
 # Free-form per-OS toolchain pins. Examples:
 #   cmake = "3.29"   ninja = "1.12"   python = "3.12"
@@ -40,7 +46,7 @@ packages = []    # [choco] for Windows. Only the table matching `os` is applied.
 # Prebuilt Skia pin (danielraffel/skia-builder). linux-x64/linux-arm64/mac-*/
 # ios-* exist; WINDOWS HAS NO PREBUILT — Windows builds GPU-off until a
 # windows-* Skia archive exists. Match the archive arch to `arch`.
-release = "chrome/m149"
+release = "chrome/m153"
 variant = "linux-arm64-gpu"
 
 [emulation]
