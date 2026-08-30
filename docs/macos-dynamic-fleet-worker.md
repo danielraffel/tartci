@@ -33,22 +33,31 @@ boundaries, and a flat rollback canary. The enabling change must update the
 validator/provider and the reviewed host profile together; editing a live plist
 or setting an ambient environment variable is not a supported shortcut.
 
-Every managed lane also declares its exact non-Default GitHub runner group.
-The renderer exports that value as `TARTCI_RUNNER_GROUP_ID`; omitting it would
+Every managed lane also declares its exact GitHub runner registration contract.
+The renderer exports the protected/default group as `TARTCI_RUNNER_GROUP_ID`;
+Pulp's event-class tiers additionally export
+`TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`. Omitting either contract would
 silently register disposable runners in Default even when a workflow requests
 a protected group, leaving the job queued while VMs repeatedly start and exit.
-The checked-in IDs were verified against the live organization runner-group
-API and workflow routing on 2026-08-27:
+The checked-in protected IDs were verified against the live organization
+runner-group API and workflow routing on 2026-08-27. PR-head registration was
+changed to repository scope after the 2026-08-30 incident where an M5 JIT
+runner registered online/idle at organization scope but was absent from Pulp's
+repository runner view and could not claim the queued job:
 
-| Lane | Group ID | GitHub runner group | Live access evidence |
+| Lane/class | Group ID | Registration scope | Access contract |
 |---|---:|---|---|
-| Pulp | 3 | `pulp-trusted-build` | Selected to Pulp and restricted to protected `pulp/.github/workflows/build.yml@refs/heads/main` |
-| Forge | 11 | `forge-pr-safe-build` | Selected to Forge and restricted to protected `forge/.github/workflows/build.yml@refs/heads/main` |
-| Vellum | 8 | `vellum-macos-build` | Selected to Vellum; its GPU and README macOS workflows use `VELLUM_MACOS_RUNS_ON_JSON` |
+| Pulp merge-group | 3 | organization | `pulp-trusted-build`, freshly verified selected to Pulp before JIT mint |
+| Pulp PR-head | 1 | repository | repository JIT endpoint plus exact `pulp-build-pr-head` class |
+| Forge | 11 | organization | `forge-pr-safe-build`, freshly verified selected to Forge before JIT mint |
+| Vellum | 8 | organization | `vellum-macos-build`, freshly verified selected to Vellum before JIT mint |
 
 Runner-group IDs are organization state, not values to infer from repository
-names. Re-verify the live group name, selected repository, and protected
-workflow access before changing any checked-in ID.
+names. For every organization-scoped mint, TartCI now re-reads the group's
+visibility and exhaustively checks its selected repositories at the final JIT
+boundary. An absent repository, unknown policy, pagination uncertainty, or API
+denial fails closed before `generate-jitconfig`. Re-verify the live group name,
+selected repository, and protected workflow access before changing any checked-in ID.
 
 ## Stage without activation
 
@@ -123,6 +132,13 @@ authority, so an idle supervisor does not reserve a VM slot. Forge and Vellum us
 current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
+
+The same rendered Pulp contract fixes registration scope per selected class:
+merge-group uses protected organization group 3, while PR-head uses repository
+group 1. Both advertise exactly one event class, omit `pulp-gate-fast`, and set
+`TARTCI_ADMISSION_CLEAN_MODE=required`. Shipyard's typed admission-clean verdict
+runs after guest preflight and immediately before repository-access verification,
+the pool lock, final assignment/admission rechecks, and JIT minting.
 
 No V2 Pulp runner advertises the legacy `pulp-gate-fast` label. Existing
 measurements put it materially behind M3/M5, and the settled placement contract

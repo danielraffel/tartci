@@ -35,7 +35,7 @@ LANE_KEYS = {
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
 }
-TIER_KEYS = {"label", "workflow"}
+TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
 REPLACED_AGENT = re.compile(
     r"^com[.]danielraffel[.](?:pulp[.]tart-runner|"
@@ -241,6 +241,18 @@ def load(path: Path) -> dict:
                 fail(f"lane {lane_id}: invalid workflow tier")
             if label in labels:
                 fail(f"lane {lane_id}: tier label must be exclusive, not a base label")
+            tier_group_id = tier.get("runner_group_id")
+            if tier_group_id is not None and (
+                    type(tier_group_id) is not int or tier_group_id < 1):
+                fail(
+                    f"lane {lane_id}: tier runner_group_id must be a positive integer"
+                )
+        tier_groups = [tier.get("runner_group_id") for tier in tiers]
+        if any(group_id is not None for group_id in tier_groups) and any(
+                group_id is None for group_id in tier_groups):
+            fail(
+                f"lane {lane_id}: every tier must declare runner_group_id when any tier does"
+            )
         if assignment_mode == "event-class-v2":
             class_labels = [tier["label"] for tier in tiers]
             if class_labels != ["pulp-build-merge-group", "pulp-build-pr-head"]:
@@ -249,6 +261,11 @@ def load(path: Path) -> dict:
                 )
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
+            if tier_groups != [runner_group_id, 1]:
+                fail(
+                    f"lane {lane_id}: event-class-v2 requires protected merge-group "
+                    "registration followed by repository-scoped PR-head registration"
+                )
     return data
 
 
@@ -389,6 +406,11 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]
         )
+        tier_groups = [row.get("runner_group_id") for row in lane["tier"]]
+        if any(group_id is not None for group_id in tier_groups):
+            env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"] = "\n".join(
+                f"{row['label']}|{row['runner_group_id']}" for row in lane["tier"]
+            )
     else:
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])
     if "jit_github_cli" in lane:

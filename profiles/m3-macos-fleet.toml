@@ -37,10 +37,12 @@ replaces_launchd_labels = [
 [[lane.tier]]
 label = "pulp-build-merge-group"
 workflow = "Build and Test"
+runner_group_id = 3
 
 [[lane.tier]]
 label = "pulp-build-pr-head"
 workflow = "Build and Test"
+runner_group_id = 1
 
 [[lane]]
 id = "forge-gate"

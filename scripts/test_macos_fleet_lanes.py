@@ -58,6 +58,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     [tier["label"] for tier in pulp_lane["tier"]],
                     ["pulp-build-merge-group", "pulp-build-pr-head"],
                 )
+                self.assertEqual(
+                    [tier["runner_group_id"] for tier in pulp_lane["tier"]],
+                    [3, 1],
+                )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
                 self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
                 self.assertEqual(
@@ -174,12 +178,17 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(len(identities), len(pulp_plists))
                     for value in pulp_plists:
                         env = value["EnvironmentVariables"]
+                        self.assertEqual(env["TARTCI_ADMISSION_CLEAN_MODE"], "required")
                         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"], "pulp-gate-fast")
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"], "pulp-gate-fast")
                         self.assertEqual(
                             env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
                             "pulp-build-merge-group,pulp-build-pr-head",
+                        )
+                        self.assertEqual(
+                            env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
+                            "pulp-build-merge-group|3\npulp-build-pr-head|1",
                         )
 
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
@@ -246,6 +255,10 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
+            self.assertEqual(
+                pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
+                "pulp-build-merge-group|3\npulp-build-pr-head|1",
+            )
             self.assertEqual(
                 ["com.danielraffel.pulp.tart-runner-macos-gate"],
                 next(lane for lane in tomllib.loads(CONFIG.read_text())["lane"] if lane["id"] == "pulp-gate")["replaces_launchd_labels"],
@@ -469,6 +482,39 @@ workflows=["Build"]
                     )
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertIn("runner_group_id", result.stderr)
+
+    def test_pulp_pr_head_contract_cannot_omit_class_or_repository_scope(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "missing-pr-head": base.replace(
+                '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n',
+                "",
+                1,
+            ),
+            "org-scoped-pr-head": base.replace(
+                'label = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1',
+                'label = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 3',
+                1,
+            ),
+            "unprotected-merge-group": base.replace(
+                'label = "pulp-build-merge-group"\nworkflow = "Build and Test"\nrunner_group_id = 3',
+                'label = "pulp-build-merge-group"\nworkflow = "Build and Test"\nrunner_group_id = 1',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    bad = Path(td) / f"{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn("event-class-v2", result.stderr)
 
     def test_scalar_types_fail_closed_without_traceback(self) -> None:
         fixtures = [

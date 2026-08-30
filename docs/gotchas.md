@@ -347,6 +347,22 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   required check at `pulp-build-studio` — that routes the gate to persistent
   bare-metal runners with warm build dirs (the ODR class).
 
+- **An organization runner is online/idle, but the repository runner list is
+  empty and a PR-head job never assigns.**
+  → *Cause:* organization-level JIT creation proves only that GitHub accepted
+  the runner group ID. It does not prove the selected repository can see that
+  group. Treating the org runner list as capacity produced exactly this phantom
+  on M5: group 3 was online/idle while Pulp's repository runner endpoint could
+  not see or assign it.
+  → *Fix:* Pulp PR-head registers through repository group 1 with the exact
+  `pulp-build-pr-head` class. Protected merge-group stays in organization group
+  3. Before every organization-scoped JIT mint, TartCI freshly checks group
+  visibility and the complete selected-repository list. Unknown/inaccessible
+  policy records a contract-keyed denial and boots no further VM for that class.
+  The final order is required Shipyard admission-clean → repository-access proof
+  → pool lock and assignment/admission rechecks → JIT mint. Do not use an online org row or
+  `busy=false` as repository capacity evidence.
+
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
   A run that ends `legacy label remains loaded; refusing replacement startup` →
   `migration failed; restoring prior LaunchAgent configuration` →

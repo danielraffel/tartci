@@ -1071,7 +1071,11 @@ newline-delimited name in `TARTCI_RUNNER_WORKFLOW_NAMES`, default
 runner's extra labels; a lower tier is rechecked against all higher tiers after
 VM boot and before JIT minting. Mutually exclusive job labels make priority
 enforceable at GitHub's assignment boundary while preserving GitHub FIFO inside
-each tier. Discovery is intentionally bounded and rotated to keep GitHub
+each tier. `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS` optionally maps those same class
+labels, in the same order, to exact runner-group IDs. Group `1` uses the
+repository JIT endpoint; a non-default ID uses the organization endpoint only
+after a fresh, paginated proof that the target repository can access the group.
+Discovery is intentionally bounded and rotated to keep GitHub
 API use stable. Consequently, `--print-queue` returning `0` means no match in
 that scan window, not that every workflow in the repository was inspected. Use
 `shipyard runner fleet-status --repo OWNER/REPO --json` to diagnose the
@@ -1109,6 +1113,9 @@ mode fails closed: a typed `admit` is the only path to JIT registration.
 `defer` or any operational/contract error tears down the still-unregistered VM,
 releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`. Keep the
 mode `disabled` only during the staged TartCI-before-Shipyard rollout.
+The managed macOS fleet profiles always render `required`; for event-class V2,
+the gate runs after guest preflight and immediately before repository-access
+verification, the pool lock, live assignment/admission rechecks, and JIT minting.
 Linux and Windows scan queued and in-progress workflow runs for queued jobs and
 add two more default guards: they ignore queued jobs older than
 `TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS` (default six hours), and
@@ -1165,7 +1172,8 @@ Everything is env-driven for genericity: `TARTCI_RUNNER_REPO`,
 `TARTCI_RUNNER_LABELS`, `TARTCI_RUNNER_GROUP_ID`,
 `TARTCI_RUNNER_WORKFLOW_NAME`, `TARTCI_RUNNER_WORKFLOW_NAMES` (macOS
 equal-priority multi-workflow lane), `TARTCI_RUNNER_WORKFLOW_TIERS` (macOS
-ordered exclusive workflow classes), `TARTCI_RUNNER_VERSION` (macOS and Windows agent),
+ordered exclusive workflow classes), `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`
+(matching per-class JIT runner-group IDs), `TARTCI_RUNNER_VERSION` (macOS and Windows agent),
 `TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
