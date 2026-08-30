@@ -152,6 +152,7 @@ CURRENT_RPID=""
 CURRENT_RUN_ID=""
 CURRENT_JOB_ID=""
 CURRENT_WORKFLOW_NAME=""
+CURRENT_JOB_CAPTURE_STATUS="not-attempted"
 CURRENT_LABELS="$LABELS"
 CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
@@ -464,7 +465,7 @@ heartbeat(){
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -722,37 +723,39 @@ cleanup(){
 }
 
 capture_current_job(){
-  local run_id run_workflow job_id runner_registration
+  local result runner_registration rc previous_status
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
   runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
-  while IFS=$'\t' read -r run_id run_workflow; do
-    [ -n "$run_id" ] || continue
-    job_id="$("$GH_CLI" api "repos/$REPO/actions/runs/$run_id/jobs" 2>/dev/null \
-      | TARTCI_CAPTURE_RUNNER="$runner_registration" python3 -c '
-import json, os, sys
-runner = os.environ["TARTCI_CAPTURE_RUNNER"]
-for job in json.load(sys.stdin).get("jobs", []):
-    if job.get("runner_name") == runner and job.get("status") == "in_progress":
-        print(job.get("id", ""))
-        break
-' 2>/dev/null | head -n1 || true)"
-    if [ -n "$job_id" ]; then
-      CURRENT_RUN_ID="$run_id"
-      CURRENT_JOB_ID="$job_id"
-      CURRENT_WORKFLOW_NAME="$run_workflow"
-      return 0
+  local args=(
+    "$TARTCI_ROOT/scripts/current_job_scan.py"
+    --repo "$REPO"
+    --runner "$runner_registration"
+    --gh-cli "$GH_CLI"
+    --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
+    --scan-timeout "${TARTCI_CAPTURE_CURRENT_JOB_TIMEOUT_SECS:-60}"
+    --result-cap "${TARTCI_CAPTURE_CURRENT_JOB_RESULT_CAP:-300}"
+    --max-api-calls "${TARTCI_CAPTURE_CURRENT_JOB_MAX_API_CALLS:-310}"
+  )
+  while IFS= read -r workflow; do
+    [ -n "$workflow" ] && args+=(--workflow "$workflow")
+  done <<<"$WORKFLOW_CONFIG"
+  previous_status="$CURRENT_JOB_CAPTURE_STATUS"
+  if result="$(python3 "${args[@]}")"; then
+    CURRENT_JOB_CAPTURE_STATUS="matched"
+  else
+    rc=$?
+    if [ "$rc" = 1 ]; then
+      CURRENT_JOB_CAPTURE_STATUS="no-match"
+    else
+      CURRENT_JOB_CAPTURE_STATUS="error"
+      [ "$previous_status" = error ] || event job_observation_error "scanner_rc=$rc"
     fi
-  done < <("$GH_CLI" api "repos/$REPO/actions/runs?per_page=100" 2>/dev/null \
-    | TARTCI_CAPTURE_WORKFLOWS="$WORKFLOW_CONFIG" python3 -c '
-import json, os, sys
-workflows = set(os.environ["TARTCI_CAPTURE_WORKFLOWS"].splitlines())
-for run in json.load(sys.stdin).get("workflow_runs", []):
-    if run.get("name") in workflows and isinstance(run.get("id"), int):
-        print("{}\t{}".format(run["id"], run["name"]))
-' 2>/dev/null || true)
-  return 1
+    return "$rc"
+  fi
+  IFS=$'\t' read -r CURRENT_RUN_ID CURRENT_JOB_ID CURRENT_WORKFLOW_NAME <<<"$result"
+  [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ] && [ -n "$CURRENT_WORKFLOW_NAME" ]
 }
 
 cancel_current_run(){
@@ -963,6 +966,7 @@ run_one(){
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
+  CURRENT_JOB_CAPTURE_STATUS="not-attempted"
   CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm" "$selected_runner_api_root"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
