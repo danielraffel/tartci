@@ -860,11 +860,13 @@ run_one(){
   t_start="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
-    tartci_prepare_disk_root "$logdir" || return $?
+    tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \
+      "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   fi
-  tartci_check_disk_floor "$TART_HOME" || return $?
-  tartci_prepare_disk_root "$CACHE_ROOT" || return $?
-  tartci_check_disk_floor "$CACHE_ROOT" || return $?
+  tartci_check_disk_floor_observed "$TART_HOME" tart-macos \
+    "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
+  tartci_prepare_and_check_disk_root_observed "$CACHE_ROOT" "" "" tart-macos \
+    "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   CLEANED_UP=0
   CURRENT_REGISTERED_RUNNER=""
   CURRENT_RUN_ID=""
@@ -875,7 +877,8 @@ run_one(){
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" || return $?
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" \
+    tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"

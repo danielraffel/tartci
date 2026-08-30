@@ -528,6 +528,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "ok": False,
                     "reason": "disk_root_unavailable",
                     "id": lease_id,
+                    "disk_path": args.disk_path,
                     "error": str(exc),
                     "reaped": reaped_summary(reaped),
                     "problems": problem_summary(problems),

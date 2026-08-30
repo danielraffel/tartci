@@ -311,13 +311,14 @@ run_one(){ # $1=iteration index
   local t_start t_booted t_preflight t_runner_done t_done
   local state_dir qemu_started="" prepare_rc=0
   t_start="$(now_epoch)"
-  tartci_prepare_disk_root "$WORKROOT" \
+  tartci_prepare_and_check_disk_root_observed "$WORKROOT" \
     "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
-    "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" || return $?
-  tartci_prepare_disk_root "$LOGROOT" || return $?
-  tartci_prepare_disk_root "$WORKROOT/port-locks" || return $?
-  tartci_check_disk_floor "$WORKROOT" || return $?
-  tartci_check_disk_floor "$LOGROOT" || return $?
+    "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" qemu-windows \
+    "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
+  tartci_prepare_and_check_disk_root_observed "$LOGROOT" "" "" qemu-windows \
+    "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
+  tartci_prepare_and_check_disk_root_observed "$WORKROOT/port-locks" "" "" qemu-windows \
+    "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
 
   local port port_lock port_lock_device port_lock_inode jobdir logdir overlay efivars qpid
   read -r port port_lock port_lock_device port_lock_inode < <(allocate_ssh_port)
@@ -374,7 +375,8 @@ run_one(){ # $1=iteration index
   # Claim release responsibility before the foreground acquisition so a signal
   # delivered immediately after success cannot strand the new lease.
   CURRENT_WIN_LEASE_ID_EXPECTED="vm-qemu-windows-vm-$job"
-  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" "$WORKROOT" || {
+  tartci_acquire_vm_lease "$job" "$lease_cores" "qemu-windows-vm" "$lease_priority" "$LABELS" "$lease_mem" "$WORKROOT" \
+    qemu-windows "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || {
     local lease_rc=$?
     cleanup_active_windows_job
     return "$lease_rc"

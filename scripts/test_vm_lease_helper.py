@@ -37,6 +37,117 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_observed_preflight_floor_denial_emits_authoritative_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            receipts = tmp / "receipts"
+            script = textwrap.dedent(
+                f"""
+                set -u
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=999999
+                export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipts}
+                export TARTCI_RECEIPT_HOST_ID=studio
+                note() {{ :; }}
+                source {HELPER}
+                source {STATE_HELPER}
+                tartci_check_disk_floor_observed {tmp} tart-macos studio-pulp-gate runner
+                rc=$?
+                python3 - "$rc" {receipts / "runner.disk-admission.json"} <<'PY'
+import json, sys
+d = json.load(open(sys.argv[2]))
+assert d["free_bytes"] < d["required_bytes"]
+assert d["available_after_reservations_bytes"] < d["required_after_reservations_bytes"]
+print(f'rc={{sys.argv[1]}} reason={{d["reason"]}}')
+PY
+                exit 0
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc=75 reason=disk_capacity_insufficient")
+
+    def test_observed_preflight_missing_root_is_probe_denial(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            missing = tmp / "missing"
+            receipts = tmp / "receipts"
+            script = textwrap.dedent(
+                f"""
+                set -u
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipts}
+                export TARTCI_RECEIPT_HOST_ID=studio
+                note() {{ :; }}
+                source {HELPER}
+                source {STATE_HELPER}
+                tartci_check_disk_floor_observed {missing} tart-macos lane runner
+                rc=$?
+                python3 - "$rc" {receipts / "runner.disk-admission.json"} <<'PY'
+import json, sys
+d = json.load(open(sys.argv[2]))
+print(f'rc={{sys.argv[1]}} status={{d["status"]}} reason={{d["reason"]}}')
+PY
+                exit 0
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc=75 status=denied reason=disk_probe_failed")
+
+    def test_receipt_observer_failure_preserves_disk_denial_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            not_directory = tmp / "not-a-directory"
+            not_directory.write_text("do-not-replace\n", encoding="utf-8")
+            script = textwrap.dedent(
+                f"""
+                set -u
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={tmp / "leases"}
+                export TARTCI_HOST_CORES=8
+                export TARTCI_HOST_MEM_MB=65536
+                export TARTCI_ROLE=light
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=999999
+                export TARTCI_DISK_DENIAL_RECEIPT_DIR={not_directory}
+                export TARTCI_RECEIPT_HOST_ID=studio
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease unit-vm 1 tart-macos-vm gate labels 1024 {tmp} tart-macos lane runner
+                rc=$?
+                printf 'rc=%s content=%s\n' "$rc" "$(< {not_directory})"
+                exit 0
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc=75 content=do-not-replace")
+
+    def test_misconfigured_floor_writes_typed_receipt_and_preserves_status(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            receipts = tmp / "receipts"
+            script = textwrap.dedent(
+                f"""
+                set -u
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=invalid
+                export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipts}
+                export TARTCI_RECEIPT_HOST_ID=studio
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease unit-vm 1 tart-macos-vm gate labels 1024 {tmp} tart-macos lane runner
+                rc=$?
+                receipt_state="$(python3 -c 'import json; d=json.load(open("{receipts / "runner.disk-admission.json"}")); print("status=%s reason=%s" % (d["status"], d["reason"]))')"
+                printf 'rc=%s %s\n' "$rc" "$receipt_state"
+                exit 0
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "rc=75 status=denied reason=disk_floor_misconfigured")
+
     def test_acquire_and_release_records_vm_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             script = textwrap.dedent(
@@ -482,14 +593,14 @@ class VmLeaseHelperTests(unittest.TestCase):
 
     def test_all_vm_providers_prepare_cold_auxiliary_roots(self) -> None:
         expected = {
-            MACOS_RUNNER: ('tartci_prepare_disk_root "$CACHE_ROOT"',),
+            MACOS_RUNNER: ('tartci_prepare_and_check_disk_root_observed "$CACHE_ROOT"',),
             LINUX_RUNNER: (
-                'tartci_prepare_disk_root "$LOGROOT"',
+                'tartci_prepare_and_check_disk_root_observed "$LOGROOT"',
                 'tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux"',
             ),
             WINDOWS_RUNNER: (
-                'tartci_prepare_disk_root "$WORKROOT"',
-                'tartci_prepare_disk_root "$LOGROOT"',
+                'tartci_prepare_and_check_disk_root_observed "$WORKROOT"',
+                'tartci_prepare_and_check_disk_root_observed "$LOGROOT"',
             ),
         }
         for runner, prepared_roots in expected.items():

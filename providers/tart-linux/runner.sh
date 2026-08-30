@@ -248,11 +248,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
-  tartci_check_disk_floor "$TART_HOME" || return $?
-  tartci_prepare_disk_root "$LOGROOT" || return $?
-  tartci_check_disk_floor "$LOGROOT" || return $?
+  tartci_check_disk_floor_observed "$TART_HOME" tart-linux \
+    "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
+  tartci_prepare_and_check_disk_root_observed "$LOGROOT" "" "" tart-linux \
+    "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   logdir="$LOGROOT/$vm"
-  tartci_prepare_disk_root "$logdir" || return $?
+  tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-linux \
+    "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   state_dir="$(tartci_provider_state_dir tart-linux)"
   write_state(){
     TARTCI_STATE_LABELS="$LABELS" \
@@ -273,7 +275,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   CURRENT_STATE_DIR="$state_dir"
   CURRENT_LEASE_ACTIVE=1
   CURRENT_CLEANED_UP=0
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" || {
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" \
+    tart-linux "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || {
     local lease_rc=$?
     discard_current_linux_vm
     return "$lease_rc"
