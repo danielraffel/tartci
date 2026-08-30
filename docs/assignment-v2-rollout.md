@@ -97,9 +97,10 @@ scheduler.
 Merge-group leases use numeric priority `110`; PR-head leases use gate priority
 `100`. Both retain the governor's reserved gate capacity, while merge-group
 demand sorts first. A runner carrying both class labels is invalid and falls
-down to ordinary `vm` priority. The existing explicit
-`TARTCI_VM_LEASE_PRIORITY` operator override retains precedence for a valid
-single-class runner.
+down to ordinary `vm` priority. Managed Pulp V2 profiles must omit
+`TARTCI_VM_LEASE_PRIORITY`; fleet validation rejects an explicit lane priority
+so a host-level default cannot flatten the class ordering or keep M1 out of the
+reserved gate budget. The runtime override remains available to non-V2 lanes.
 
 ## Rollback and offline rejoin
 

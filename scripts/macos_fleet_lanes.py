@@ -30,7 +30,7 @@ STACKED_IMAGE_KEYS = {
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
 LANE_KEYS = {
-    "id", "repo", "golden", "priority", "labels", "workflows", "tier",
+    "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
@@ -171,8 +171,12 @@ def load(path: Path) -> dict:
         age = lane.get("min_queued_age_seconds", 0)
         if type(age) is not int or age < 0:
             fail(f"lane {lane_id}: min_queued_age_seconds must be a nonnegative integer")
-        priority = lane.get("priority", "gate")
-        if not isinstance(priority, str) or priority not in LEASE_PRIORITIES:
+        vm_cores = lane.get("vm_cores")
+        if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
+            fail(f"lane {lane_id}: vm_cores must be a positive integer")
+        priority = lane.get("priority")
+        if priority is not None and (
+                not isinstance(priority, str) or priority not in LEASE_PRIORITIES):
             fail(f"lane {lane_id}: unsupported lease priority")
         supervisors = lane.get("supervisors", 1)
         if type(supervisors) is not int or supervisors not in (1, 2):
@@ -180,6 +184,11 @@ def load(path: Path) -> dict:
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
             fail(f"lane {lane_id}: unsupported assignment_mode")
+        if assignment_mode == "event-class-v2" and "priority" in lane:
+            fail(
+                f"lane {lane_id}: event-class-v2 must derive lease priority "
+                "from the selected event class"
+            )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
                 or not all(isinstance(value, str) and LABEL.fullmatch(value)
@@ -395,7 +404,6 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         "TARTCI_RUNNER_GROUP_ID": str(lane["runner_group_id"]),
         "TARTCI_RUNNER_LABELS": ",".join(lane["labels"]),
         "TARTCI_MACOS_GOLDEN": lane["golden"],
-        "TARTCI_VM_LEASE_PRIORITY": lane.get("priority", "gate"),
         "TARTCI_CI_CACHE": host["cache_root"],
         "TARTCI_STATE_DIR": state,
         "TARTCI_DISK_DENIAL_RECEIPT_DIR": f"{host['home']}/.tartci/state/disk-admission",
@@ -409,6 +417,12 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    # An omitted priority delegates to the provider's exact-label policy.
+    # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
+    if "priority" in lane:
+        env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
+    if "vm_cores" in lane:
+        env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if lane.get("tier"):
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]

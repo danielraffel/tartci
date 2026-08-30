@@ -404,8 +404,11 @@ once, and any later JIT registration that loses the claim follows normal
 bounded idle teardown. Do not use this for required checks that already have a
 pre-queue host resolver and host-specific labels.
 
-The fast gate supervisors (Pulp: M3 and M5) should advertise
-`TARTCI_VM_LEASE_PRIORITY=gate`; advisory supervisors must yield to that class.
+Pulp event-class-V2 supervisors must not advertise a fixed
+`TARTCI_VM_LEASE_PRIORITY`: merge-group derives priority `110` and PR-head
+derives `100`, so both can use reserved gate cores while merge-group sorts first.
+Other required-gate supervisors may explicitly advertise `gate`; advisory
+supervisors must yield to that class.
 Pulp's exclusive `pulp-release-tagged` class also receives a gate-priority
 lease automatically, so a queued tagged release can use the reserved capacity
 while an advisory VM holds the non-gate budget. The lower-priority
@@ -413,14 +416,14 @@ while an advisory VM holds the non-gate budget. The lower-priority
 If both mutually exclusive class labels appear, the PR-gate classification
 wins and the lease fails down to ordinary VM priority.
 This reserves host-core leases, but it does not choose a specific GitHub job
-after a runner boots. Host placement needs a label: Pulp's fast supervisors and
-required selector carry `pulp-gate-fast`, while the slower M1 keeps only the
-generic `pulp-build-vm` label for rollback/non-required use. Required and
-advisory jobs likewise must not share an indistinguishable label set: use
-separate class labels for coverage, snapshot, GPU-proof, and example-validation
-jobs. Shipyard may coalesce or cancel provably redundant workflow runs before
-boot, but Tart CI must never guess queue priority by PR number or mutate the
-merge queue.
+after a runner boots. Host placement needs a label: Pulp V2 uses the exclusive
+`pulp-build-merge-group` and `pulp-build-pr-head` labels and deliberately omits
+the legacy `pulp-gate-fast` selector; M1 yields with a queue-age delay instead.
+Required and advisory jobs likewise must not share an indistinguishable label
+set: use separate class labels for coverage, snapshot, GPU-proof, and
+example-validation jobs. Shipyard may coalesce or cancel provably redundant
+workflow runs before boot, but Tart CI must never guess queue priority by PR
+number or mutate the merge queue.
 
 ### Priority-aware idle gate (secondary macOS lanes)
 

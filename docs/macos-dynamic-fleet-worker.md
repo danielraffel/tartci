@@ -143,12 +143,17 @@ runs after guest preflight and immediately before repository-access verification
 the pool lock, final assignment/admission rechecks, and JIT minting.
 
 No V2 Pulp runner advertises the legacy `pulp-gate-fast` label. Existing
-measurements put it materially behind M3/M5, and the settled placement contract
-keeps M1 at `vm` lease priority with a ten-minute queue-age delay. M1 still
-renders both governed supervisor identities so temporary free capacity is not
-lost to a static one-slot declaration; the governor decides whether either can
-admit a complete guest. M3 and M5 retain gate lease priority without leaking the
-legacy selector into JIT registration or idle capability reporting.
+measurements put M1 materially behind M3/M5, so it retains a ten-minute queue-age
+delay. All three Pulp profiles omit an explicit lease priority: the selected V2
+class derives merge-group `110` or PR-head `100`, preserving merge ordering and
+allowing either class to use reserved gate cores. Fleet validation rejects an
+explicit priority on a V2 lane.
+
+M3 alone renders `TARTCI_MACOS_VM_CORES=12` for Pulp. Its 26-core host budget can
+therefore admit two Pulp guests (`12 + 12`) or one Pulp guest alongside a
+14-core Forge/Vellum guest (`12 + 14`). M1 and M5 retain their host-profile VM
+sizes of 3 and 6 cores. The per-lane override does not resize other repositories'
+guests, reserve a slot while idle, or change Tart's two-macOS-guest hard cap.
 
 The GitHub App wrapper requires explicit repository authority even when the API
 endpoint is organization-scoped for a protected runner group. JIT minting

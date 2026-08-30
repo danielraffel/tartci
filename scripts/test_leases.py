@@ -168,6 +168,49 @@ class LeasePriorityTests(LeaseCliTestCase):
         status = json.loads(self.run_cli("status").stdout)
         self.assertEqual([row["id"] for row in status["leases"]], ["high", "low"])
 
+    def test_m3_two_twelve_core_pulp_event_guests_fit(self) -> None:
+        self.acquire("merge-group", 12, capacity=26, reserved=14, priority="110")
+        second = self.acquire(
+            "pr-head", 12, capacity=26, reserved=14, priority="100"
+        )
+        body = json.loads(second.stdout)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["capacity"]["used_cores"], 24)
+
+    def test_m3_twelve_core_pulp_and_fourteen_core_gate_fit(self) -> None:
+        self.acquire("pulp", 12, capacity=26, reserved=14, priority="100")
+        second = self.acquire(
+            "other-gate", 14, capacity=26, reserved=14, priority="gate"
+        )
+        body = json.loads(second.stdout)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["capacity"]["used_cores"], 26)
+
+    def test_m3_two_default_fourteen_core_guests_do_not_fit(self) -> None:
+        self.acquire("first", 14, capacity=26, reserved=14, priority="gate")
+        denied = self.acquire(
+            "second", 14, capacity=26, reserved=14, priority="gate", check=False
+        )
+        self.assertEqual(denied.returncode, 75)
+        self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
+
+    def test_m1_two_three_core_pulp_event_guests_use_reserved_capacity(self) -> None:
+        self.acquire("merge-group", 3, capacity=6, reserved=3, priority="110")
+        second = self.acquire(
+            "pr-head", 3, capacity=6, reserved=3, priority="100"
+        )
+        body = json.loads(second.stdout)
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["capacity"]["used_cores"], 6)
+
+    def test_m1_vm_priority_override_cannot_use_reserved_capacity(self) -> None:
+        self.acquire("first", 3, capacity=6, reserved=3, priority="vm")
+        denied = self.acquire(
+            "second", 3, capacity=6, reserved=3, priority="vm", check=False
+        )
+        self.assertEqual(denied.returncode, 75)
+        self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
+
 
 class LeaseStoreIntegrityTests(LeaseCliTestCase):
     def test_corrupt_store_fails_closed(self) -> None:

@@ -1158,9 +1158,13 @@ macOS supervisors atomically replace their heartbeat state file; `doctor`,
 `observe`, and Shipyard fleet probes should treat an unreadable state file as a
 real health problem, not as "no active runner."
 
-Set `TARTCI_VM_LEASE_PRIORITY=gate` on the required-gate supervisors on every
-pool host (M1, M3, and M5), and make advisory supervisors yield. Keep required
-and advisory workflows on distinct class labels. Once a JIT runner is online,
+Do not set a fixed `TARTCI_VM_LEASE_PRIORITY` on a managed Pulp event-class-V2
+lane. Its exact selected label derives merge-group priority `110` or PR-head
+priority `100`; fleet validation rejects an explicit priority that would flatten
+that ordering or prevent M1 from using reserved gate cores. Other required-gate
+lanes may explicitly set `gate`; an omitted lane priority renders no override
+and delegates to the provider's exact-label policy. Advisory supervisors must
+yield. Keep required and advisory workflows on distinct class labels. Once a JIT runner is online,
 GitHub—not Tart CI—selects any queued job with a satisfiable label set, so
 identical labels let an optional snapshot, example, coverage, or GPU job consume
 capacity intended for the merge-queue front. Queue order, exact-head
@@ -1187,7 +1191,10 @@ unique `--name-prefix` in the installed plist.
 VM runners participate in the host-core lease store by default. Set
 `TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or `TARTCI_WIN_VM_CORES` when a
 host needs a provider-specific lease size; otherwise the host profile's
-`vm_pool_cores` value is used. The macOS hard cap remains a separate <=2 guest
+`vm_pool_cores` value is used. A managed macOS fleet lane may declare positive
+integer `vm_cores`, which renders the macOS override only for that lane. Pulp's
+M3 lane uses 12 so two guests fit its 26-core budget; M1 and M5 inherit 3 and 6.
+The macOS hard cap remains a separate <=2 guest
 semaphore and fails closed: if `tart list` is unavailable or malformed, the
 macOS serve loop treats the cap as already full and waits. Disable the lease
 consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
@@ -1239,7 +1246,8 @@ The `pulp-release-tagged` label maps to gate-priority host leases, allowing a
 real release to use reserved cores even when an advisory VM owns the non-gate
 budget. `pulp-release-pr-gate` intentionally stays at ordinary VM priority.
 Conflicting release class labels also fail down to ordinary VM priority.
-An explicit `TARTCI_VM_LEASE_PRIORITY` still overrides label-derived priority.
+An explicit `TARTCI_VM_LEASE_PRIORITY` still overrides label-derived priority
+for this non-V2 release lane; managed Pulp V2 profiles reject that override.
 
 Load the release VM lane only as one separate LaunchAgent with ordered
 `TARTCI_RUNNER_WORKFLOW_TIERS`: `Release CLI` and `Sign and Release` share the
