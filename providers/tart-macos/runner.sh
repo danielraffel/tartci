@@ -735,7 +735,7 @@ cleanup(){
 }
 
 handle_supervisor_signal(){
-  if [ -n "$CURRENT_RUN_ID" ]; then
+  if [ -n "$CURRENT_RUN_ID" ] || [ -n "$CURRENT_SCAN_PID" ] || [ "${assigned:-0}" = 1 ]; then
     CURRENT_ASSIGNMENT_QUARANTINE="signal_teardown_unknown"
     CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
     CURRENT_JOB_RECEIPT='{"kind":"terminal_unknown","detail":"supervisor_signal"}'
@@ -761,13 +761,24 @@ record_terminal_job_receipt(){
   fi
 }
 
+finalize_listener_receipt(){
+  local runner_rc="$1" listener_assigned="$2"
+  [ "$listener_assigned" = 1 ] || return 0
+  if [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ]; then
+    capture_current_job revalidate || true
+  fi
+  record_terminal_job_receipt "$runner_rc"
+}
+
 capture_current_job(){
-  local mode="${1:-discover}" result runner_registration rc previous_status
+  local mode="${1:-discover}" scan_mode result runner_registration rc previous_status
   local now started elapsed budget remaining attempt_timeout kind backoff scan_spent
   runner_registration="${CURRENT_REGISTERED_RUNNER:-$RUNNER_NAME}"
-  if [ "$mode" = revalidate ]; then
+  scan_mode="$mode"
+  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
     budget="${TARTCI_CANCEL_REVALIDATION_BUDGET_SECS:-30}"
     scan_spent="$CURRENT_CANCEL_SCAN_SPENT"
+    [ "$mode" = cancel_discover ] && scan_mode=discover
   else
     budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS:-30}"
     scan_spent="$CURRENT_JOB_SCAN_SPENT"
@@ -786,7 +797,7 @@ capture_current_job(){
     CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
     return 2
   }
-  [ "$mode" = revalidate ] || [ "$now" -ge "$CURRENT_JOB_SCAN_NEXT_AT" ] || return 1
+  [ "$mode" != discover ] || [ "$now" -ge "$CURRENT_JOB_SCAN_NEXT_AT" ] || return 1
   [ "$attempt_timeout" -le "$remaining" ] || attempt_timeout="$remaining"
   local args=(
     "$TARTCI_ROOT/scripts/current_job_scan.py"
@@ -794,13 +805,13 @@ capture_current_job(){
     --runner "$runner_registration"
     --gh-cli "$GH_CLI"
     --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
-    --mode "$mode"
+    --mode "$scan_mode"
     --gh-timeout "${TARTCI_CAPTURE_CURRENT_JOB_GH_TIMEOUT_SECS:-4}"
     --scan-timeout "$attempt_timeout"
     --result-cap "${TARTCI_CAPTURE_CURRENT_JOB_RESULT_CAP:-300}"
     --max-api-calls "${TARTCI_CAPTURE_CURRENT_JOB_MAX_API_CALLS:-310}"
   )
-  if [ "$mode" = revalidate ]; then
+  if [ "$scan_mode" = revalidate ]; then
     [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ] || return 1
     args+=(--run-id "$CURRENT_RUN_ID" --job-id "$CURRENT_JOB_ID")
   fi
@@ -825,7 +836,7 @@ capture_current_job(){
   rc="${rc:-0}"
   elapsed=$(( $(date +%s) - started ))
   [ "$elapsed" -gt 0 ] || elapsed=1
-  if [ "$mode" = revalidate ]; then
+  if [ "$mode" = revalidate ] || [ "$mode" = cancel_discover ]; then
     CURRENT_CANCEL_SCAN_SPENT=$((CURRENT_CANCEL_SCAN_SPENT + elapsed))
   else
     CURRENT_JOB_SCAN_SPENT=$((CURRENT_JOB_SCAN_SPENT + elapsed))
@@ -860,7 +871,13 @@ capture_current_job(){
 
 cancel_current_run(){
   local receipt rc=0 deadline kind terminal_timeout run_conclusion
-  [ -n "$CURRENT_RUN_ID" ] || capture_current_job || return 1
+  if [ -z "$CURRENT_RUN_ID" ] || [ -z "$CURRENT_JOB_ID" ]; then
+    if ! capture_current_job cancel_discover; then
+      CURRENT_ASSIGNMENT_QUARANTINE="pre_cancel_discovery_${CURRENT_JOB_CAPTURE_STATUS}"
+      event run_cancel_suppressed "run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-} observation=$CURRENT_JOB_CAPTURE_STATUS scanner_rc=discovery rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+      return 1
+    fi
+  fi
   capture_current_job revalidate || rc=$?
   receipt="$CURRENT_JOB_RECEIPT"
   [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || {
@@ -1060,10 +1077,7 @@ run_runner_until_done(){
     sleep 5
   done
   wait "$ssh_pid" || rc=$?
-  if [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ]; then
-    capture_current_job revalidate || true
-    record_terminal_job_receipt "$rc"
-  fi
+  finalize_listener_receipt "$rc" "$assigned"
   sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
 }

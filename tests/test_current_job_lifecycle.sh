@@ -33,7 +33,11 @@ elif path.endswith("/actions/runs/333"):
                       "status":"completed" if terminal else "in_progress",
                       "conclusion":"cancelled" if terminal else None}))
 elif "/actions/runs?status=in_progress" in path:
-    print(json.dumps({"total_count":0,"workflow_runs":[]}))
+    print(json.dumps({"total_count":1,"workflow_runs":[
+        {"id":333,"workflow_id":99,"name":"Build and Test","status":"in_progress"}]}))
+elif "/actions/runs/333/jobs?filter=latest" in path:
+    print(json.dumps({"total_count":1,"jobs":[
+        {"id":444,"status":"in_progress","runner_name":"runner-1"}]}))
 else:
     print(json.dumps({"total_count":0,"jobs":[]}))
 PY
@@ -75,6 +79,21 @@ TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=10 capture_current_job revalidate
 [ "$CURRENT_JOB_SCAN_SPENT" = 30 ]
 [ "$CURRENT_CANCEL_SCAN_SPENT" -gt 0 ]
 
+# Timeout cancellation gets the protected cancel budget even when ordinary
+# discovery exhausted before it learned the run and job IDs.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+printf active >"$LIFECYCLE_STATE"
+TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
+[ "$CURRENT_RUN_ID" = 333 ]
+[ "$CURRENT_JOB_ID" = 444 ]
+[ "$CURRENT_CANCEL_SCAN_SPENT" -gt 0 ]
+grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
+
 # A setup failure overwrites a stale active receipt and fails closed.
 reset_state
 CURRENT_JOB_SCAN_SPENT=0
@@ -108,15 +127,26 @@ record_terminal_job_receipt 1
 grep -q '^job_lifecycle_quarantine|.*observation=active.*listener_exited_workflow_active' "$EVENTS"
 grep -q '^job_lifecycle_quarantine|.*observation=observation_error.*listener_exit_terminal_unknown' "$EVENTS"
 
+# A listener that exits after assignment but before ID discovery is not allowed
+# to skip the terminal receipt/quarantine transaction.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=not-attempted
+CURRENT_JOB_RECEIPT='{"kind":"not-attempted"}'
+finalize_listener_receipt 1 1
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=not-attempted.*listener_exit_terminal_unknown' "$EVENTS"
+
 # A signal during a live API observation owns the scanner child/temp file and
 # leaves a typed terminal-unknown quarantine instead of stale active telemetry.
 reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
 printf active >"$LIFECYCLE_STATE"
 LIFECYCLE_HANG=1
 export LIFECYCLE_HANG
 (
   trap 'handle_supervisor_signal' TERM
-  capture_current_job revalidate
+  capture_current_job cancel_discover
 ) & signal_pid=$!
 sleep 1
 kill -TERM "$signal_pid"
