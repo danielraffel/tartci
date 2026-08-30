@@ -68,7 +68,12 @@ class IdleGateFailClosed(unittest.TestCase):
     CLIs so no gh/tart/network is needed.
     """
 
-    def _run(self, gh_stub_body: str) -> subprocess.CompletedProcess:
+    def _run(
+        self,
+        gh_stub_body: str,
+        *,
+        yield_labels: str = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+    ) -> subprocess.CompletedProcess:
         import stat
         import tempfile
         d = tempfile.mkdtemp()
@@ -89,7 +94,7 @@ class IdleGateFailClosed(unittest.TestCase):
             "TARTCI_GH_CLI": "stubgh",
             # Idle gate ON so priority_demand actually probes.
             "TARTCI_YIELD_TO_WORKFLOW_NAME": "Build and Test",
-            "TARTCI_YIELD_TO_LABELS": "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+            "TARTCI_YIELD_TO_LABELS": yield_labels,
         }
         return subprocess.run(
             ["bash", str(SCRIPT), "--print-priority-demand",
@@ -118,6 +123,55 @@ esac
         )
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "0")
+
+    def test_event_class_selector_yields_to_both_required_classes(self) -> None:
+        # Pulp's advisory sanitizer shares M1 with the event-class-v2 gate. Its
+        # selector includes both required classes. The idle gate cannot preempt
+        # an advisory VM, so PR demand must also preserve the free slot for a
+        # merge group that can arrive later.
+        stub = """#!/usr/bin/env bash
+case "$*" in
+  *actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
+  *actions/workflows/99/runs*status=queued*) printf '%s\n' '{"workflow_runs":[{"id":101,"name":"Build and Test","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z"}]}' ;;
+  *actions/workflows/99/runs*status=in_progress*) printf '%s\n' '{"workflow_runs":[]}' ;;
+  *actions/runs/101/jobs*) printf '%s\n' '${JOBS_JSON}' ;;
+  *) exit 1 ;;
+esac
+"""
+        merge_labels = (
+            "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,"
+            "pulp-build-merge-group,pulp-build-pr-head"
+        )
+        merge_job = (
+            '{"jobs":[{"id":201,"status":"queued",'
+            '"created_at":"2099-01-01T00:00:00Z","labels":['
+            '"self-hosted","macOS","ARM64","pulp-build","pulp-build-vm",'
+            '"pulp-build-merge-group"]}]}'
+        )
+        pr_job = merge_job.replace("pulp-build-merge-group", "pulp-build-pr-head")
+
+        r = self._run(
+            stub.replace("${JOBS_JSON}", merge_job), yield_labels=merge_labels
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+        r = self._run(
+            stub.replace("${JOBS_JSON}", pr_job), yield_labels=merge_labels
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+        base_labels = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm"
+        r = self._run(
+            stub.replace("${JOBS_JSON}", merge_job), yield_labels=base_labels
+        )
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            r.stdout.strip(),
+            "0",
+            "base-only selector must not claim an event-class-v2 job",
+        )
 
 
 class HostHealthYieldTests(unittest.TestCase):
