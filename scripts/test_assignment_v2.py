@@ -7,7 +7,11 @@ import os
 import stat
 import subprocess
 import tempfile
+import threading
+import time
 import unittest
+from argparse import Namespace
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 
@@ -243,6 +247,32 @@ class AssignmentV2Tests(unittest.TestCase):
 
 
 class AssignmentScannerPaginationTests(unittest.TestCase):
+    def test_run_job_scans_use_bounded_parallel_workers(self) -> None:
+        spec = spec_from_file_location("assignment_scan_under_test", SCANNER)
+        assert spec is not None and spec.loader is not None
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
+        scanner.args = Namespace(max_workers=3)
+        scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
+        lock = threading.Lock()
+        active = 0
+        peak = 0
+
+        def scan_run(_run: dict[str, int]) -> int:
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+            return 1
+
+        scanner._scan_run = scan_run
+        self.assertEqual(scanner.scan(), 6)
+        self.assertEqual(peak, 3)
+
     def test_run_and_job_pages_are_exhaustive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
