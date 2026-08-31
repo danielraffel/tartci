@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import datetime as dt
 import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from typing import Any
 
@@ -44,13 +46,15 @@ class AssignmentScanner:
             raise ScanError("required assignment-class label is absent from runner labels")
         self.deadline = time.monotonic() + args.scan_timeout
         self.api_calls = 0
+        self.api_calls_lock = threading.Lock()
 
     def _gh(self, path: str) -> dict[str, Any]:
-        if self.api_calls >= self.args.max_api_calls:
-            raise ScanError(
-                f"assignment scan API budget exhausted ({self.args.max_api_calls})"
-            )
-        self.api_calls += 1
+        with self.api_calls_lock:
+            if self.api_calls >= self.args.max_api_calls:
+                raise ScanError(
+                    f"assignment scan API budget exhausted ({self.args.max_api_calls})"
+                )
+            self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ScanError("assignment scan exceeded its overall deadline")
@@ -176,59 +180,68 @@ class AssignmentScanner:
                     found[run_id] = run
         return list(found.values())
 
-    def scan(self) -> int:
+    def _scan_run(self, run: dict[str, Any]) -> int:
         matches: set[int] = set()
-        for run in self._runs():
-            run_id = int(run["id"])
-            prefix = (
-                f"repos/{self.args.repo}/actions/runs/{run_id}"
-                "/jobs?filter=latest"
-            )
-            for job in self._pages(prefix, "jobs"):
-                if str(job.get("status", "")).lower() != "queued":
-                    continue
-                labels_raw = job.get("labels")
-                if not isinstance(labels_raw, list):
-                    raise ScanError(f"queued job in run {run_id} has invalid labels")
-                if any(
-                    not isinstance(label, str) or not label.strip()
-                    for label in labels_raw
-                ):
+        run_id = int(run["id"])
+        prefix = (
+            f"repos/{self.args.repo}/actions/runs/{run_id}"
+            "/jobs?filter=latest"
+        )
+        for job in self._pages(prefix, "jobs"):
+            if str(job.get("status", "")).lower() != "queued":
+                continue
+            labels_raw = job.get("labels")
+            if not isinstance(labels_raw, list):
+                raise ScanError(f"queued job in run {run_id} has invalid labels")
+            if any(
+                not isinstance(label, str) or not label.strip()
+                for label in labels_raw
+            ):
+                raise ScanError(
+                    f"queued job in run {run_id} has malformed label elements"
+                )
+            job_labels = {label.strip().lower() for label in labels_raw}
+            # Both predicates are load-bearing. Subset matching models
+            # GitHub assignment; explicit membership prevents a legacy
+            # generic-only job from being mistaken for event-class demand.
+            if self.required_label not in job_labels:
+                continue
+            if not job_labels.issubset(self.runner_labels):
+                continue
+            if self.args.min_age_seconds:
+                timestamp = str(
+                    job.get("created_at")
+                    or job.get("started_at")
+                    or run.get("updated_at")
+                    or run.get("created_at")
+                    or ""
+                )
+                try:
+                    queued_at = dt.datetime.fromisoformat(
+                        timestamp.replace("Z", "+00:00")
+                    )
+                except (AttributeError, ValueError) as error:
                     raise ScanError(
-                        f"queued job in run {run_id} has malformed label elements"
-                    )
-                job_labels = {label.strip().lower() for label in labels_raw}
-                # Both predicates are load-bearing. Subset matching models
-                # GitHub assignment; explicit membership prevents a legacy
-                # generic-only job from being mistaken for event-class demand.
-                if self.required_label not in job_labels:
+                        f"matching queued job in run {run_id} has no valid timestamp"
+                    ) from error
+                age = dt.datetime.now(dt.timezone.utc) - queued_at
+                if age.total_seconds() < self.args.min_age_seconds:
                     continue
-                if not job_labels.issubset(self.runner_labels):
-                    continue
-                if self.args.min_age_seconds:
-                    timestamp = str(
-                        job.get("created_at")
-                        or job.get("started_at")
-                        or run.get("updated_at")
-                        or run.get("created_at")
-                        or ""
-                    )
-                    try:
-                        queued_at = dt.datetime.fromisoformat(
-                            timestamp.replace("Z", "+00:00")
-                        )
-                    except (AttributeError, ValueError) as error:
-                        raise ScanError(
-                            f"matching queued job in run {run_id} has no valid timestamp"
-                        ) from error
-                    age = dt.datetime.now(dt.timezone.utc) - queued_at
-                    if age.total_seconds() < self.args.min_age_seconds:
-                        continue
-                job_id = job.get("id")
-                if not isinstance(job_id, int):
-                    raise ScanError(f"matching queued job in run {run_id} has no integer id")
-                matches.add(job_id)
+            job_id = job.get("id")
+            if not isinstance(job_id, int):
+                raise ScanError(f"matching queued job in run {run_id} has no integer id")
+            matches.add(job_id)
         return len(matches)
+
+    def scan(self) -> int:
+        runs = self._runs()
+        # Job pages are independent snapshots. Fetch them concurrently, but
+        # retain exhaustive pagination and fail the whole scan on any uncertain
+        # result. This bounds reaction latency without weakening admission.
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.args.max_workers
+        ) as executor:
+            return sum(executor.map(self._scan_run, runs), start=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -264,6 +277,11 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_API_CALLS", "1200")),
     )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS", "4")),
+    )
     args = parser.parse_args()
     if args.gh_timeout <= 0:
         parser.error("--gh-timeout must be positive")
@@ -275,6 +293,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--result-cap must be positive")
     if args.max_api_calls <= 0:
         parser.error("--max-api-calls must be positive")
+    if not 1 <= args.max_workers <= 16:
+        parser.error("--max-workers must be between 1 and 16")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     return args
