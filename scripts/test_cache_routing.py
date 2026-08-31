@@ -58,6 +58,14 @@ class CacheRoutingTests(unittest.TestCase):
         )
         self.assertNotIn("rm -rf ~/Library/Caches/Pulp/fetchcontent-src", body)
 
+    def test_macos_fetchcontent_hydration_retries_boundedly_and_fails_closed(self) -> None:
+        for path in (MAC_DIRECT, MAC_JIT):
+            body = path.read_text(encoding="utf-8")
+            self.assertIn("for attempt in 1 2 3", body, path)
+            self.assertIn("fetchcontent_hydrated=true", body, path)
+            self.assertIn("FetchContent seed changed during three hydration attempts", body, path)
+            self.assertNotIn("--ignore-errors", body, path)
+
     def test_jit_runners_override_preserved_env_after_policy_sanitization(self) -> None:
         linux = LINUX_JIT.read_text(encoding="utf-8")
         mac = MAC_JIT.read_text(encoding="utf-8")

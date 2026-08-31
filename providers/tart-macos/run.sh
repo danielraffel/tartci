@@ -113,7 +113,18 @@ SHARED="/Volumes/My Shared Files"
 ln -sfn "$SHARED/src" "$HOME/src"
 ln -sfn "$SHARED/ccache" "$HOME/ccache"
 mkdir -p "$HOME/Library/Caches/Pulp/fetchcontent-src"
-rsync -a "$SHARED/fetchcontent/" "$HOME/Library/Caches/Pulp/fetchcontent-src/"
+fetchcontent_hydrated=false
+for attempt in 1 2 3; do
+  if rsync -a "$SHARED/fetchcontent/" "$HOME/Library/Caches/Pulp/fetchcontent-src/"; then
+    fetchcontent_hydrated=true
+    break
+  fi
+  [ "$attempt" -eq 3 ] || sleep 1
+done
+[ "$fetchcontent_hydrated" = true ] || {
+  echo "tartci: FetchContent seed changed during three hydration attempts" >&2
+  exit 1
+}
 
 export CCACHE_DIR="$HOME/ccache"
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
