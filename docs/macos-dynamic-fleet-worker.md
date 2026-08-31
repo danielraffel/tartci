@@ -14,7 +14,7 @@ uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
 `TART_HOME`.
 
-M1 also declares the three references required by the Shipyard GitHub App
+M1 and M5 also declare the three references required by the Shipyard GitHub App
 wrapper: App ID, private-key path, and token-cache directory. The renderer
 places those references (never key or token contents) in each managed
 LaunchAgent. Before publication, the installer requires the private key to be
@@ -142,7 +142,7 @@ current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
 
-M1 gives each exhaustive assignment scan a 180-second overall deadline. A
+M1 and M5 give each exhaustive assignment scan a 180-second overall deadline. A
 single tier currently completes in roughly 20 seconds, but its two supervisors
 can overlap GitHub App traffic; the default 60-second budget proved too brittle
 and falsely reported scan blindness. The scan remains fail-closed, bounded, and

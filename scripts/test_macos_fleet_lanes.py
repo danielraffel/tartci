@@ -145,7 +145,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH",
                         "SHIPYARD_GITHUB_APP_CACHE_DIR",
                     )
-                    if host_id == "m1":
+                    if host_id in {"m1", "m5"}:
                         expected_github_app = {
                             "SHIPYARD_GITHUB_APP_ID": "3878000",
                             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH":

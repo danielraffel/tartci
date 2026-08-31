@@ -8,6 +8,13 @@ tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 
+# launchd does not inherit the interactive shell's GitHub App configuration.
+# Preserve references only; key and token contents remain private host files.
+[github_app]
+id = "3878000"
+private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
+cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27
@@ -24,6 +31,9 @@ golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 assignment_omit_labels = ["pulp-gate-fast"]
+# Two Pulp supervisors can overlap exhaustive GitHub App scans. Retain the
+# bounded M1 margin rather than treating healthy serialized traffic as blind.
+assignment_scan_timeout_seconds = 180
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = [
