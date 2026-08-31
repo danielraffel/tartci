@@ -50,6 +50,15 @@ class InstallMacosFleetTests(unittest.TestCase):
         shipyard = self.fakebin / "shipyard"
         shipyard.write_text("#!/bin/sh\necho \"${FAKE_SHIPYARD_TAG:-m1}\"\n")
         shipyard.chmod(0o755)
+        self.github_app_key = (
+            self.home / ".config/shipyard/github-apps/shipyard-local.private-key.pem"
+        )
+        self.github_app_key.parent.mkdir(parents=True)
+        self.github_app_key.write_text("fixture key reference only\n")
+        self.github_app_key.chmod(0o600)
+        self.github_app_cache = self.home / ".config/shipyard/ghapp-cache"
+        self.github_app_cache.mkdir()
+        self.github_app_cache.chmod(0o700)
         self.config = self.root / "fleet.toml"
         self.config.write_text(textwrap.dedent(f"""\
             schema = 1
@@ -60,6 +69,10 @@ class InstallMacosFleetTests(unittest.TestCase):
             tart_home = "{self.home}/VMs"
             cache_root = "{self.home}/cache"
             log_root = "{self.home}/logs"
+            [github_app]
+            id = "3878000"
+            private_key_path = "{self.github_app_key}"
+            cache_dir = "{self.github_app_cache}"
             [[lane]]
             id = "forge-gate"
             repo = "Generous-Corp/forge"
@@ -114,6 +127,15 @@ class InstallMacosFleetTests(unittest.TestCase):
         ]
         self.assertEqual(installed_env["TARTCI_RUNNER_REPO"], "Generous-Corp/forge")
         self.assertEqual(installed_env["SHIPYARD_GH_APP_REPO"], "Generous-Corp/forge")
+        self.assertEqual(installed_env["SHIPYARD_GITHUB_APP_ID"], "3878000")
+        self.assertEqual(
+            installed_env["SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH"],
+            str(self.github_app_key),
+        )
+        self.assertEqual(
+            installed_env["SHIPYARD_GITHUB_APP_CACHE_DIR"],
+            str(self.github_app_cache),
+        )
         self.assertFalse(self.legacy.exists())
         self.assertFalse(stale.exists())
         retired = list((self.agents / ".tartci-retired").rglob("*.retired"))
@@ -144,6 +166,22 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply")
         self.assertEqual(result.returncode, 1)
         self.assertIn("not readable and executable", result.stderr)
+        self.assertTrue(self.legacy.exists())
+        self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+
+    def test_apply_rejects_unsafe_github_app_key_before_mutation(self) -> None:
+        self.github_app_key.chmod(0o644)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("private key must be an owned mode-0600 regular file", result.stderr)
+        self.assertTrue(self.legacy.exists())
+        self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+
+    def test_apply_rejects_unsafe_github_app_cache_before_mutation(self) -> None:
+        self.github_app_cache.chmod(0o755)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("cache must be an owned mode-0700 directory", result.stderr)
         self.assertTrue(self.legacy.exists())
         self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
 

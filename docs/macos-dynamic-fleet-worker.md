@@ -14,6 +14,15 @@ uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
 `TART_HOME`.
 
+M1 also declares the three references required by the Shipyard GitHub App
+wrapper: App ID, private-key path, and token-cache directory. The renderer
+places those references (never key or token contents) in each managed
+LaunchAgent. Before publication, the installer requires the private key to be
+a current-user-owned, non-symlink, mode-`0600` regular file and the cache to be
+a current-user-owned, non-symlink, mode-`0700` directory. This prevents a
+regenerated M1 fleet from silently losing the authenticated cache path that
+interactive shells normally supply.
+
 Each host profile also carries a dormant `[stacked_images]` contract. It keeps
 stacked-disk adoption explicit and host-local: macOS and Tart minimum versions,
 the retained flat rollback golden, and paths to separate GHCR username/token
@@ -132,6 +141,14 @@ authority, so an idle supervisor does not reserve a VM slot. Forge and Vellum us
 current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
+
+M1 gives each exhaustive assignment scan a 180-second overall deadline. A
+single tier currently completes in roughly 20 seconds, but its two supervisors
+can overlap GitHub App traffic; the default 60-second budget proved too brittle
+and falsely reported scan blindness. The scan remains fail-closed, bounded, and
+limited by its existing per-call and API-call budgets. Scanner failures also
+emit a bounded `assignment_scan_error` event instead of discarding stderr, so a
+future timeout or API denial has host-local diagnostic evidence.
 
 The same rendered Pulp contract fixes both selected classes to repository group
 1. GitHub evaluates a merge-group workflow under its `gh-readonly-queue/...`

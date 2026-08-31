@@ -23,8 +23,9 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-TOP_KEYS = {"schema", "name", "host", "stacked_images", "lane"}
+TOP_KEYS = {"schema", "name", "host", "github_app", "stacked_images", "lane"}
 HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
+GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
     "registry_username_file", "registry_token_file", "flat_rollback",
@@ -34,6 +35,7 @@ LANE_KEYS = {
     "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
+    "assignment_scan_timeout_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -78,6 +80,33 @@ def load(path: Path) -> dict:
             fail(f"host.{key} must be an absolute path")
     if host["tart_home"] == host["home"] or host["log_root"] == host["home"]:
         fail("Tart and log roots may not be the host home directory itself")
+    github_app = data.get("github_app")
+    if github_app is not None:
+        if not isinstance(github_app, dict):
+            fail("github_app must be a table")
+        unknown = set(github_app) - GITHUB_APP_KEYS
+        if unknown:
+            fail(f"unknown github_app keys: {sorted(unknown)}")
+        if set(github_app) != GITHUB_APP_KEYS:
+            fail("github_app must declare id, private_key_path, and cache_dir together")
+        if (not isinstance(github_app["id"], str)
+                or not re.fullmatch(r"[1-9][0-9]*", github_app["id"])):
+            fail("github_app.id must be a positive decimal string")
+        home = PurePosixPath(host["home"])
+        for key, required_root in (
+                ("private_key_path", home / ".config/shipyard/github-apps"),
+                ("cache_dir", home / ".config/shipyard")):
+            value = github_app[key]
+            if not isinstance(value, str):
+                fail(f"github_app.{key} must be an absolute host-local Shipyard path")
+            normalized = PurePosixPath(posixpath.normpath(value))
+            try:
+                relative = normalized.relative_to(required_root)
+            except ValueError:
+                relative = None
+            if (not normalized.is_absolute() or normalized.as_posix() != value
+                    or relative is None or not relative.parts):
+                fail(f"github_app.{key} must be an absolute host-local Shipyard path")
     stacked = data.get("stacked_images")
     if stacked is not None and not isinstance(stacked, dict):
         fail("stacked_images must be a table")
@@ -188,6 +217,15 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: event-class-v2 must derive lease priority "
                 "from the selected event class"
+            )
+        scan_timeout = lane.get("assignment_scan_timeout_seconds")
+        if scan_timeout is not None and (
+                assignment_mode != "event-class-v2"
+                or type(scan_timeout) is not int
+                or not 60 <= scan_timeout <= 300):
+            fail(
+                f"lane {lane_id}: assignment_scan_timeout_seconds must be an "
+                "integer from 60 through 300 on an event-class-v2 lane"
             )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
@@ -417,6 +455,14 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    github_app = data.get("github_app")
+    if github_app is not None:
+        # References only: key/token contents remain in private host-local files.
+        env.update({
+            "SHIPYARD_GITHUB_APP_ID": github_app["id"],
+            "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
+            "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
+        })
     # An omitted priority delegates to the provider's exact-label policy.
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:
@@ -445,6 +491,10 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
         env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"] = omit
         env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"] = omit
         env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"] = class_labels
+    if "assignment_scan_timeout_seconds" in lane:
+        env["TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS"] = str(
+            lane["assignment_scan_timeout_seconds"]
+        )
     return {
         "Label": label,
         "ProgramArguments": [

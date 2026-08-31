@@ -212,7 +212,7 @@ if [ "${#stale_targets[@]}" -gt 0 ]; then
 fi
 
 python3 - "$render_dir" <<'PY'
-import os, plistlib, shutil, sys
+import os, plistlib, shutil, stat, sys
 from pathlib import Path
 for path in Path(sys.argv[1]).glob("*.plist"):
     value = plistlib.loads(path.read_bytes())
@@ -224,6 +224,27 @@ for path in Path(sys.argv[1]).glob("*.plist"):
     program = value["ProgramArguments"][1]
     if not os.access(program, os.R_OK | os.X_OK):
         raise SystemExit(f"rendered tartci program is not readable and executable: {program}")
+    app_id = env.get("SHIPYARD_GITHUB_APP_ID")
+    private_key = env.get("SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH")
+    cache_dir = env.get("SHIPYARD_GITHUB_APP_CACHE_DIR")
+    github_app_refs = (app_id, private_key, cache_dir)
+    if any(github_app_refs) and not all(github_app_refs):
+        raise SystemExit(f"rendered GitHub App references are incomplete: {path}")
+    if all(github_app_refs):
+        key_path = Path(private_key)
+        cache_path = Path(cache_dir)
+        if (key_path.is_symlink() or not key_path.is_file()
+                or stat.S_IMODE(key_path.stat().st_mode) != 0o600
+                or key_path.stat().st_uid != os.getuid()):
+            raise SystemExit(
+                f"rendered GitHub App private key must be an owned mode-0600 regular file: {key_path}"
+            )
+        if (cache_path.is_symlink() or not cache_path.is_dir()
+                or stat.S_IMODE(cache_path.stat().st_mode) != 0o700
+                or cache_path.stat().st_uid != os.getuid()):
+            raise SystemExit(
+                f"rendered GitHub App cache must be an owned mode-0700 directory: {cache_path}"
+            )
 PY
 
 backup_dir="$AGENTS_DIR/.tartci-retired/$(date -u +%Y%m%dT%H%M%SZ)-$$"

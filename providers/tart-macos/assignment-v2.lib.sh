@@ -56,19 +56,32 @@ tartci_assignment_v2_tier_labels(){
 # consumes every run/job page and fails on API uncertainty or truncation. Its
 # explicit require-label predicate rejects generic-only jobs.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" workflow tier_args=() selected_labels
+  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
   done < <(tier_workflow_args "$tier_label")
   [ "${#tier_args[@]}" -gt 0 ] || return 1
-  python3 "$TARTCI_ROOT/scripts/assignment_scan.py" \
+  mkdir -p "$STATE_DIR"
+  error_file="$(mktemp "$STATE_DIR/$RUNNER_NAME.assignment-scan.XXXXXX")" || return 1
+  if python3 "$TARTCI_ROOT/scripts/assignment_scan.py" \
     --repo "$REPO" \
     "${tier_args[@]}" \
     --labels "$selected_labels" \
     --require-label "$tier_label" \
     --min-age-seconds "$MIN_QUEUED_AGE" \
-    --gh-cli "$GH_CLI" 2>/dev/null
+    --gh-cli "$GH_CLI" 2>"$error_file"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    detail="$(tail -n 1 "$error_file" | cut -c1-512)"
+    event assignment_scan_error \
+      "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
+  fi
+  rm -f "$error_file"
+  return "$rc"
 }
 
 tartci_assignment_v2_select_live(){

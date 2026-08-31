@@ -188,6 +188,10 @@ class AssignmentV2Tests(unittest.TestCase):
         result = self._runner("--print-selection")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.split("\t", 1)[0], "ERR")
+        events = (self.root / "state" / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"event":"assignment_scan_error"', events)
+        self.assertIn("scanner_rc=2", events)
+        self.assertIn("GitHub API failed", events)
 
     def test_malformed_label_element_denies_selection(self) -> None:
         self._state(malformed=True)
