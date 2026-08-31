@@ -146,6 +146,13 @@ offline registrations from their own slot. Never restore a static GitHub runner
 name to make monitoring easier. A new repository is hosted-only until its
 profile, image, exact labels, fallback, and one real dispatch proof are present.
 
+For a repository-scoped JIT lane, declare both `runner_group_id = 1` and
+`registration_scope = "repository"`. Group 1 is not an organization runner
+group: the provider obtains its JIT configuration from the lane repository
+itself. The explicit scope prevents an accidental Default-group declaration
+from being mistaken for a reviewed repository registration. Organization lanes
+continue to name their non-Default runner group and omit `registration_scope`.
+
 For the current Vellum profile, the intended capability matrix is explicit:
 Mac Pro native x86_64 Linux for unprivileged PR/build work; M3, M5, and M1
 Tart macOS ARM64 for macOS build work; Mac mini native Intel macOS for a

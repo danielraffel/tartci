@@ -19,6 +19,7 @@ HOST_CONFIGS = {
 }
 RUNNER_GROUP_IDS = {
     "Generous-Corp/pulp": 1,
+    "danielraffel/spectr": 1,
     "Generous-Corp/forge": 11,
     "Generous-Corp/vellum": 8,
 }
@@ -38,7 +39,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     text=True, capture_output=True, check=False,
                 )
                 self.assertEqual(valid.returncode, 0, valid.stderr)
-                self.assertIn(f"host={host_id} lanes=3", valid.stdout)
+                self.assertIn(f"host={host_id} lanes=4", valid.stdout)
                 data = tomllib.loads(config.read_text())
                 self.assertEqual(data["host"]["id"], host_id)
                 self.assertEqual(data["host"]["home"], "/Users/danielraffel")
@@ -63,6 +64,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     [1, 1],
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
+                self.assertEqual(pulp_lane["registration_scope"], "repository")
                 self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
                 self.assertNotIn("priority", pulp_lane)
                 self.assertEqual(
@@ -75,6 +77,21 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertEqual(
                     {lane["repo"]: lane["runner_group_id"] for lane in data["lane"]},
                     RUNNER_GROUP_IDS,
+                )
+                spectr_lane = next(
+                    lane for lane in data["lane"] if lane["id"] == "spectr-gate"
+                )
+                self.assertEqual(spectr_lane["registration_scope"], "repository")
+                self.assertEqual(
+                    spectr_lane["labels"],
+                    ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"],
+                )
+                self.assertEqual(
+                    spectr_lane["workflows"], ["Spectr M5 Product Acceptance"]
+                )
+                self.assertEqual(
+                    spectr_lane["min_queued_age_seconds"],
+                    600 if host_id == "m1" else 0,
                 )
                 self.assertEqual(
                     next(lane for lane in data["lane"] if lane["id"] == "forge-gate")["workflows"],
@@ -181,6 +198,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         },
                         {
                             "Generous-Corp/pulp": None,
+                            "danielraffel/spectr": "vm" if host_id == "m1" else "gate",
                             "Generous-Corp/forge": "gate",
                             "Generous-Corp/vellum": "gate",
                         },
@@ -206,6 +224,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         chrome_routes,
                         {
                             "Generous-Corp/pulp": None,
+                            "danielraffel/spectr": None,
                             "Generous-Corp/forge": "/Applications/Google Chrome.app",
                             "Generous-Corp/vellum": None,
                         },
@@ -271,7 +290,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             text=True, capture_output=True, check=False,
         )
         self.assertEqual(valid.returncode, 0, valid.stderr)
-        self.assertIn("lanes=3", valid.stdout)
+        self.assertIn("lanes=4", valid.stdout)
         with tempfile.TemporaryDirectory() as td:
             rendered = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "render", str(CONFIG), "--output", td],
@@ -279,7 +298,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(rendered.returncode, 0, rendered.stderr)
             files = sorted(Path(td).glob("*.plist"))
-            self.assertEqual(len(files), 4)
+            self.assertEqual(len(files), 5)
             values = [plistlib.loads(path.read_bytes()) for path in files]
             self.assertTrue(all(value["RunAtLoad"] for value in values))
             self.assertTrue(all(".tart-runner-" in value["Label"] for value in values))
@@ -314,7 +333,15 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertTrue(all(value["EnvironmentVariables"]["TART_HOME"] == "/Users/danielraffel/VMs" for value in values))
             self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/danielraffel/Library/Logs/tartci") for value in values))
             repos = {value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"] for value in values}
-            self.assertEqual(repos, {"Generous-Corp/pulp", "Generous-Corp/forge", "Generous-Corp/vellum"})
+            self.assertEqual(
+                repos,
+                {
+                    "Generous-Corp/pulp",
+                    "danielraffel/spectr",
+                    "Generous-Corp/forge",
+                    "Generous-Corp/vellum",
+                },
+            )
             self.assertEqual(
                 {
                     value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
@@ -621,6 +648,51 @@ workflows=["Build"]
                     )
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertIn("runner_group_id", result.stderr)
+
+    def test_repository_scoped_lane_requires_explicit_scope(self) -> None:
+        base = '''schema=1
+[host]
+id="m5"
+home="/h"
+tart_home="/v"
+cache_root="/c"
+log_root="/l"
+[[lane]]
+id="product"
+repo="owner/product"
+runner_group_id=1
+registration_scope="repository"
+golden="g"
+labels=["self-hosted","macOS","ARM64"]
+workflows=["Product acceptance"]
+'''
+        fixtures = {
+            "missing-scope": base.replace('registration_scope="repository"\n', ""),
+            "wrong-scope": base.replace('registration_scope="repository"', 'registration_scope="organization"'),
+            "scope-on-org-group": base.replace("runner_group_id=1", "runner_group_id=11"),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            good = Path(td) / "repository-scope.toml"
+            good.write_text(base)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(good)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    bad = Path(td) / f"{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertTrue(
+                        "runner_group_id" in result.stderr
+                        or "registration_scope" in result.stderr,
+                        result.stderr,
+                    )
 
     def test_pulp_pr_head_contract_cannot_omit_class_or_repository_scope(self) -> None:
         base = CONFIG.read_text()

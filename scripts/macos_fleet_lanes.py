@@ -32,7 +32,7 @@ STACKED_IMAGE_KEYS = {
 }
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
-    "runner_group_id", "min_queued_age_seconds", "replaces_launchd_labels",
+    "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
     "assignment_scan_timeout_seconds",
@@ -176,17 +176,19 @@ def load(path: Path) -> dict:
         if not isinstance(lane.get("repo"), str) or not REPO.fullmatch(lane["repo"]):
             fail(f"lane {lane_id}: repo must be OWNER/REPO")
         runner_group_id = lane.get("runner_group_id")
-        pulp_repository_v2 = (
-            lane.get("repo") == "Generous-Corp/pulp"
-            and lane.get("assignment_mode") == "event-class-v2"
-            and runner_group_id == 1
-        )
+        registration_scope = lane.get("registration_scope")
+        if registration_scope not in (None, "repository"):
+            fail(
+                f"lane {lane_id}: registration_scope must be repository when declared"
+            )
+        repository_scoped = runner_group_id == 1 and registration_scope == "repository"
         if (type(runner_group_id) is not int or runner_group_id < 1
-                or (runner_group_id == 1 and not pulp_repository_v2)):
+                or (runner_group_id == 1 and not repository_scoped)
+                or (runner_group_id > 1 and registration_scope is not None)):
             fail(
                 f"lane {lane_id}: runner_group_id must be an explicit "
-                "non-Default GitHub runner group integer, except the exact "
-                "repository-scoped Pulp event-class-v2 lane"
+                "non-Default GitHub runner group integer, or group 1 with "
+                "registration_scope = repository"
             )
         labels = lane.get("labels") or []
         if (not isinstance(labels, list) or not labels

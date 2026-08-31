@@ -27,6 +27,7 @@ flat_rollback = "pulp-build-runner:latest"
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
 runner_group_id = 1
+registration_scope = "repository"
 golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
@@ -50,6 +51,18 @@ runner_group_id = 1
 label = "pulp-build-pr-head"
 workflow = "Build and Test"
 runner_group_id = 1
+
+[[lane]]
+id = "spectr-gate"
+repo = "danielraffel/spectr"
+runner_group_id = 1
+registration_scope = "repository"
+golden = "pulp-build-runner:latest"
+priority = "gate"
+min_queued_age_seconds = 0
+labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
+workflows = ["Spectr M5 Product Acceptance"]
+replaces_launchd_labels = []
 
 [[lane]]
 id = "forge-gate"
