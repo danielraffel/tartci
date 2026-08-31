@@ -140,6 +140,30 @@ class MacosFleetLaneTests(unittest.TestCase):
                         },
                         {repo: repo for repo in RUNNER_GROUP_IDS},
                     )
+                    github_app_keys = (
+                        "SHIPYARD_GITHUB_APP_ID",
+                        "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH",
+                        "SHIPYARD_GITHUB_APP_CACHE_DIR",
+                    )
+                    if host_id == "m1":
+                        expected_github_app = {
+                            "SHIPYARD_GITHUB_APP_ID": "3878000",
+                            "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH":
+                                "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem",
+                            "SHIPYARD_GITHUB_APP_CACHE_DIR":
+                                "/Users/danielraffel/.config/shipyard/ghapp-cache",
+                        }
+                        self.assertTrue(all(
+                            {key: value["EnvironmentVariables"][key]
+                             for key in github_app_keys} == expected_github_app
+                            for value in values
+                        ))
+                    else:
+                        self.assertTrue(all(
+                            not any(key in value["EnvironmentVariables"]
+                                    for key in github_app_keys)
+                            for value in values
+                        ))
                     self.assertTrue(all(
                         not any(
                             key.startswith("TARTCI_STACKED_")
@@ -266,7 +290,27 @@ class MacosFleetLaneTests(unittest.TestCase):
                 == value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]
                 for value in values
             ))
+            self.assertTrue(all(
+                value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_ID"] == "3878000"
+                and value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH"]
+                == "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"
+                and value["EnvironmentVariables"]["SHIPYARD_GITHUB_APP_CACHE_DIR"]
+                == "/Users/danielraffel/.config/shipyard/ghapp-cache"
+                for value in values
+            ))
             self.assertTrue(all(value["EnvironmentVariables"]["TARTCI_ADMISSION_CLEAN_MODE"] == "required" for value in values))
+            pulp_values = [
+                value for value in values
+                if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+            ]
+            self.assertTrue(all(
+                value["EnvironmentVariables"]["TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS"] == "180"
+                for value in pulp_values
+            ))
+            self.assertTrue(all(
+                "TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS" not in value["EnvironmentVariables"]
+                for value in values if value not in pulp_values
+            ))
             self.assertTrue(all(value["EnvironmentVariables"]["TART_HOME"] == "/Users/danielraffel/VMs" for value in values))
             self.assertTrue(all(Path(value["StandardOutPath"]).parent == Path("/Users/danielraffel/Library/Logs/tartci") for value in values))
             repos = {value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"] for value in values}
@@ -364,6 +408,69 @@ class MacosFleetLaneTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("absolute path", result.stderr)
+
+    def test_github_app_references_are_complete_and_host_local(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "partial": base.replace(
+                'cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"\n',
+                "",
+                1,
+            ),
+            "bad-id": base.replace('id = "3878000"', 'id = "not-an-id"', 1),
+            "key-outside-root": base.replace(
+                'private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/shipyard-local.private-key.pem"',
+                'private_key_path = "/tmp/github-app.pem"',
+                1,
+            ),
+            "cache-traversal": base.replace(
+                'cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache"',
+                'cache_dir = "/Users/danielraffel/.config/shipyard/nested/../ghapp-cache"',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("github_app", result.stderr)
+
+    def test_assignment_scan_timeout_is_bounded_and_v2_only(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "too-small": base.replace(
+                "assignment_scan_timeout_seconds = 180",
+                "assignment_scan_timeout_seconds = 59",
+                1,
+            ),
+            "wrong-type": base.replace(
+                "assignment_scan_timeout_seconds = 180",
+                'assignment_scan_timeout_seconds = "180"',
+                1,
+            ),
+            "non-v2": base.replace(
+                "min_queued_age_seconds = 0",
+                "min_queued_age_seconds = 0\nassignment_scan_timeout_seconds = 180",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("assignment_scan_timeout_seconds", result.stderr)
 
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
