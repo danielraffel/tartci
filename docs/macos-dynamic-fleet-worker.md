@@ -142,11 +142,13 @@ current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
 
-M1 and M5 give each exhaustive assignment scan a 180-second overall deadline. A
-single tier currently completes in roughly 20 seconds, but its two supervisors
-can overlap GitHub App traffic; the default 60-second budget proved too brittle
-and falsely reported scan blindness. The scan remains fail-closed, bounded, and
-limited by its existing per-call and API-call budgets. Scanner failures also
+M1, M3, and M5 give each exhaustive assignment scan a 180-second overall
+deadline and four API workers. The host-global observation lock admits only one
+scan owner, so this is a four-request host ceiling rather than four workers per
+overlapping supervisor. A one-worker canary on 2026-09-01 failed to exhaust the
+large live Pulp queue inside 180 seconds; the prior four-worker scans completed.
+The public/default profile behavior remains one worker. The scan remains
+fail-closed, bounded, and limited by its existing per-call and API-call budgets. Scanner failures also
 emit a bounded `assignment_scan_error` event instead of discarding stderr, so a
 future timeout or API denial has host-local diagnostic evidence.
 

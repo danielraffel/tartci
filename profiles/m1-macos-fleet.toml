@@ -38,6 +38,9 @@ assignment_omit_labels = ["pulp-gate-fast"]
 # supervisors may overlap. Preserve fail-closed behavior without treating
 # healthy serialized GitHub App traffic as blindness.
 assignment_scan_timeout_seconds = 180
+# The host-global observation lock admits only one scanner. Four workers keep
+# Pulp's large live queue exhaustive inside that bounded 180-second owner slot.
+assignment_scan_max_workers = 4
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]

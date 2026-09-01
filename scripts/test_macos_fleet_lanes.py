@@ -365,6 +365,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 for value in pulp_values
             ))
             self.assertTrue(all(
+                value["EnvironmentVariables"]["TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS"] == "4"
+                for value in pulp_values
+            ))
+            self.assertTrue(all(
                 "TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS" not in value["EnvironmentVariables"]
                 for value in values if value not in pulp_values
             ))
@@ -563,6 +567,42 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("assignment_scan_timeout_seconds", result.stderr)
+
+    def test_assignment_scan_workers_are_bounded_and_v2_only(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "zero": base.replace(
+                "assignment_scan_max_workers = 4",
+                "assignment_scan_max_workers = 0",
+                1,
+            ),
+            "too-many": base.replace(
+                "assignment_scan_max_workers = 4",
+                "assignment_scan_max_workers = 5",
+                1,
+            ),
+            "wrong-type": base.replace(
+                "assignment_scan_max_workers = 4",
+                'assignment_scan_max_workers = "4"',
+                1,
+            ),
+            "non-v2": base.replace(
+                "min_queued_age_seconds = 0",
+                "min_queued_age_seconds = 0\nassignment_scan_max_workers = 4",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("assignment_scan_max_workers", result.stderr)
 
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
