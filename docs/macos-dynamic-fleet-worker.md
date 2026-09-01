@@ -20,8 +20,9 @@ Its profile alone declares a stable Developer-ID app at
 support cohort and rendered M3 lane records. Its native process accepts only a
 sealed lane enum, remains resident as the macOS privacy responsible identity,
 and cannot launch a caller-selected executable or argument vector. The profile
-and install receipt bind its bundle SHA-256, identifier, Team ID, designated
-requirement, source commit, profile-policy digest, owner, and mode. Fleet
+binds its identifier, Team ID, and profile policy; the bundle and receipt bind
+the exact source commit, realized bundle SHA-256, designated requirement,
+owner, and mode. Fleet
 installation consumes an already-signed artifact; it never holds a signing
 identity. Before admission,
 `pool on` uses a temporary LaunchAgent to prove bounded write/read/delete access

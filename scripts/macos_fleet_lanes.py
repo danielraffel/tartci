@@ -46,7 +46,7 @@ STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
-LAUNCH_HELPER_KEYS = {"path", "sha256", "identifier", "team_id"}
+LAUNCH_HELPER_KEYS = {"path", "identifier", "team_id"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -182,13 +182,10 @@ def load(path: Path) -> dict:
     external_tart_home = PurePosixPath(host["tart_home"]).parts[:2] == ("/", "Volumes")
     if helper is not None:
         if not isinstance(helper, dict) or set(helper) != LAUNCH_HELPER_KEYS:
-            fail("launch_helper must declare path, sha256, identifier, and team_id")
+            fail("launch_helper must declare path, identifier, and team_id")
         expected_path = PurePosixPath(host["home"]) / ".local/libexec/TartCILauncher.app"
         if helper.get("path") != str(expected_path):
             fail("launch_helper.path must be the stable host-local TartCI launcher path")
-        if (not isinstance(helper.get("sha256"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", helper["sha256"])):
-            fail("launch_helper.sha256 must be lowercase SHA-256")
         if helper.get("identifier") != "com.danielraffel.tartci.launcher":
             fail("launch_helper.identifier must be com.danielraffel.tartci.launcher")
         if (not isinstance(helper.get("team_id"), str)
@@ -546,8 +543,9 @@ def write_receipt(
     if helper is not None:
         helper_record = macos_launcher_identity.verify(
             Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"], sha256=helper["sha256"],
+            team_id=helper["team_id"],
             profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+            source_commit=source_authority_commit,
         )
     receipt = {
         "schema": 3,
@@ -636,8 +634,9 @@ def verify_receipt(
     else:
         helper_record = macos_launcher_identity.verify(
             Path(helper["path"]), identifier=helper["identifier"],
-            team_id=helper["team_id"], sha256=helper["sha256"],
+            team_id=helper["team_id"],
             profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+            source_commit=verified_support["source_commit"],
         )
         if helper_record != receipt.get("launch_helper"):
             fail("installed launch helper does not match its receipt")

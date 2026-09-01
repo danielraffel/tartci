@@ -326,7 +326,6 @@ if [ "$launch_helper_json" != "null" ]; then
   launcher_target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
   launcher_identifier="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
   launcher_team_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["team_id"])' <<<"$launch_helper_json")"
-  launcher_sha256="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["sha256"])' <<<"$launch_helper_json")"
   launcher_profile_policy_sha256="$(python3 - "$locked_config" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
@@ -338,7 +337,6 @@ PY
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
   launcher_identity_json="$(python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256")"
   launcher_source_commit="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
   mkdir -p "$(dirname "$launcher_target")"
@@ -365,7 +363,6 @@ PY
   /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
   python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
     --source-commit "$launcher_source_commit" >/dev/null
 elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
@@ -547,6 +544,10 @@ fi
   exit 3
 }
 if [ -n "$launcher_target" ]; then
+  [ "$launcher_source_commit" = "$support_commit" ] || {
+    echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
+    exit 3
+  }
   if [ "$authority_env_json" = "{}" ]; then
     launcher_authority_commit="$(
       SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
@@ -588,7 +589,6 @@ if [ -n "$launcher_target" ]; then
   durable_tree "$launcher_target"
   python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
-    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
     --source-commit "$launcher_source_commit" >/dev/null
   maybe_test_crash launcher

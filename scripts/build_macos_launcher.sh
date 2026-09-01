@@ -1,17 +1,19 @@
 #!/bin/bash
 set -euo pipefail
-usage(){ echo "usage: $0 --output PATH.app --identity STRING --support-root PATH --rendered-config-dir PATH --profile PATH" >&2; exit 64; }
-output="" identity="" support_root="" rendered_dir="" profile=""
+usage(){ echo "usage: $0 --output PATH.app --identity STRING --support-root PATH --profile PATH" >&2; exit 64; }
+output="" identity="" support_root="" profile=""
 while [[ $# -gt 0 ]]; do case "$1" in
   --output) output="${2:-}"; shift 2;; --identity) identity="${2:-}"; shift 2;;
-  --support-root) support_root="${2:-}"; shift 2;; --rendered-config-dir) rendered_dir="${2:-}"; shift 2;;
+  --support-root) support_root="${2:-}"; shift 2;;
   --profile) profile="${2:-}"; shift 2;; *) usage;; esac; done
-[[ -n "$output" && -n "$identity" && -n "$support_root" && -n "$rendered_dir" && -n "$profile" ]] || usage
+[[ -n "$output" && -n "$identity" && -n "$support_root" && -n "$profile" ]] || usage
 [[ "$output" = /* && "$output" == *.app ]] || { echo "output must be an absolute .app path" >&2; exit 64; }
 [[ ! -e "$output" && ! -L "$output" ]] || { echo "refusing to replace existing output" >&2; exit 73; }
-root="$(cd "$(dirname "$0")/.." && pwd -P)"; support_root="$(cd "$support_root" && pwd -P)"; rendered_dir="$(cd "$rendered_dir" && pwd -P)"; profile="$(cd "$(dirname "$profile")" && pwd -P)/$(basename "$profile")"
+root="$(cd "$(dirname "$0")/.." && pwd -P)"; support_root="$(cd "$support_root" && pwd -P)"; profile="$(cd "$(dirname "$profile")" && pwd -P)/$(basename "$profile")"
 python3 "$support_root/scripts/tartci_support_manifest.py" verify "$support_root/.tartci-support-manifest.json" --root "$support_root" --immutable >/dev/null
 parent="$(dirname "$output")"; mkdir -p "$parent"; stage="$(mktemp -d "$parent/.tartci-launcher-app.XXXXXX")"; trap 'rm -rf "$stage"' EXIT
+rendered_dir="$stage/rendered"; mkdir -p "$rendered_dir"
+python3 "$support_root/scripts/macos_fleet_lanes.py" render "$profile" --output "$rendered_dir" >/dev/null
 app="$stage/TartCILauncher.app"; mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources/support"
 /usr/bin/ditto --noqtn "$support_root/" "$app/Contents/Resources/support/"
 chmod -R u+w "$app/Contents/Resources/support"

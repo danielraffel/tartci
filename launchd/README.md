@@ -78,17 +78,17 @@ scripts/build_macos_launcher.sh \
   --output /absolute/staging/TartCILauncher.app \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
-  --rendered-config-dir /absolute/rendered-m3-plists \
   --profile profiles/m3-macos-fleet.toml
 scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --identifier com.danielraffel.tartci.launcher \
   --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256>
 ```
 
-The M3 profile pins path, digest, identifier, and Team ID. The installer
-accepts the already-signed artifact with `--launch-helper-source`, atomically
-publishes it, and binds path, owner, mode, digest, designated requirement, and
-hardened-runtime status into the fleet receipt. Unsigned, ad-hoc, Apple
+The M3 profile pins path, identifier, Team ID, and the exact profile policy.
+The bundle binds the same exact TartCI source commit as the installed support
+cohort. The installer accepts it with `--launch-helper-source`, atomically
+publishes it, and binds path, owner, mode, realized bundle digest, designated
+requirement, and hardened-runtime status into the fleet receipt. Unsigned, ad-hoc, Apple
 Development, wrong-Team, wrong-identifier, symlinked, or changed binaries fail
 closed. M1, M5, and public home-backed profiles do not declare this helper and
 retain the ordinary launch path.
