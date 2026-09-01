@@ -7,7 +7,7 @@ from pathlib import Path
 SCHEMA = 1
 GIT="/usr/bin/git"; DU="/usr/bin/du"; LSOF="/usr/sbin/lsof"
 GIT_CONFIG=["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null","-c","core.pager=cat","-c","pager.status=false"]
-GIT_ENV={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_NOSYSTEM":"1","GIT_TERMINAL_PROMPT":"0","GIT_OPTIONAL_LOCKS":"0","LANG":"C"}
+GIT_ENV={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_NOSYSTEM":"1","GIT_NO_REPLACE_OBJECTS":"1","GIT_TERMINAL_PROMPT":"0","GIT_OPTIONAL_LOCKS":"0","LANG":"C"}
 ALLOWED={GIT,DU,LSOF}
 class Stop(RuntimeError): pass
 
@@ -49,6 +49,10 @@ def reject_executable_git_config(primary:Path,timeout:int):
     result=run(["git","-C",str(primary),"config","--local","--name-only","--get-regexp",r"^(core\.sshcommand|credential\..*helper|credential\.helper|filter\..*\.(process|clean|smudge)|core\.hookspath|url\..*\.insteadof|include(if)?\..*|diff\.external|diff\..*\.command|merge\..*\.driver|alias\..*|http\..*|remote\..*\.proxy)$"],timeout=timeout,check=False)
     if result.returncode not in (0,1): raise Stop("local Git config inspection failed")
     if result.stdout.strip(): raise Stop("repository local config contains executable or transport-bearing settings")
+    common=Path(run(["git","-C",str(primary),"rev-parse","--path-format=absolute","--git-common-dir"],timeout=timeout).stdout.strip()).resolve()
+    grafts=common/"info/grafts"
+    if grafts.is_symlink() or (grafts.exists() and (not grafts.is_file() or grafts.stat().st_size>0)):
+        raise Stop("repository contains legacy replacement grafts")
 
 def atomic_json(path:Path,value):
     path.parent.mkdir(parents=True,exist_ok=True); fd,name=tempfile.mkstemp(prefix=f".{path.name}.",dir=path.parent)

@@ -125,7 +125,25 @@ class Tests(unittest.TestCase):
             cleanup.run(["git","status"])
         env=invoked.call_args.kwargs["env"]
         self.assertEqual(env["GIT_CONFIG_GLOBAL"],"/dev/null"); self.assertEqual(env["GIT_CONFIG_SYSTEM"],"/dev/null")
+        self.assertEqual(env["GIT_NO_REPLACE_OBJECTS"],"1")
         self.assertEqual(env["PATH"],"/usr/bin:/bin:/usr/sbin:/sbin")
+
+    def test_replace_refs_cannot_falsify_ancestry_and_legacy_grafts_stop(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); repo=root/"repo"
+            subprocess.run(["git","init","-q",str(repo)],check=True)
+            subprocess.run(["git","-C",str(repo),"config","user.email","test@example.com"],check=True)
+            subprocess.run(["git","-C",str(repo),"config","user.name","Test"],check=True)
+            (repo/"tracked").write_text("main"); subprocess.run(["git","-C",str(repo),"add","tracked"],check=True); subprocess.run(["git","-C",str(repo),"commit","-qm","main"],check=True)
+            main=subprocess.run(["git","-C",str(repo),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip()
+            subprocess.run(["git","-C",str(repo),"checkout","--orphan","unrelated"],check=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            subprocess.run(["git","-C",str(repo),"rm","-rf","."],check=True,stdout=subprocess.DEVNULL); (repo/"other").write_text("orphan"); subprocess.run(["git","-C",str(repo),"add","other"],check=True); subprocess.run(["git","-C",str(repo),"commit","-qm","orphan"],check=True)
+            orphan=subprocess.run(["git","-C",str(repo),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip()
+            subprocess.run(["git","-C",str(repo),"replace","--graft",main,orphan],check=True)
+            self.assertEqual(subprocess.run(["git","-C",str(repo),"merge-base","--is-ancestor",orphan,main]).returncode,0)
+            self.assertNotEqual(cleanup.run(["git","-C",str(repo),"merge-base","--is-ancestor",orphan,main],check=False).returncode,0)
+            grafts=repo/".git/info/grafts"; grafts.write_text(f"{main} {orphan}\n")
+            with self.assertRaises(cleanup.Stop): cleanup.reject_executable_git_config(repo,30)
 
     def test_lsof_observation_tracks_live_cwd_after_worktree_quarantine_move(self):
         with tempfile.TemporaryDirectory() as td:
