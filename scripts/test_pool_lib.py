@@ -131,6 +131,145 @@ class AdmissionStateTests(unittest.TestCase):
 
 
 class TransitionLockHandoffTests(unittest.TestCase):
+    def test_lock_health_json_types_absent_owned_orphaned_and_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            absent = _bash(
+                f"source {LIB}; tartci_pool_lock_health_json",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(json.loads(absent.stdout)["state"], "absent")
+
+            owned = _bash(
+                f"source {LIB}; tartci_pool_lock_acquire; tartci_pool_lock_health_json; tartci_pool_lock_release",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            owned_value = json.loads(owned.stdout)
+            self.assertEqual(owned_value["state"], "owned")
+            self.assertIsInstance(owned_value["inode"], int)
+            self.assertIs(owned_value["owner_alive"], True)
+
+            lock.mkdir()
+            (lock / "pid").write_text("99999999\n")
+            orphaned = _bash(
+                f"source {LIB}; tartci_pool_lock_health_json",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(json.loads(orphaned.stdout)["state"], "orphaned")
+            (lock / "pid").write_text("not-a-pid\n")
+            invalid = _bash(
+                f"source {LIB}; tartci_pool_lock_health_json",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(json.loads(invalid.stdout)["state"], "invalid")
+
+            for malformed in ("file", "symlink"):
+                with self.subTest(malformed=malformed):
+                    for child in lock.iterdir():
+                        child.unlink()
+                    lock.rmdir()
+                    if malformed == "file":
+                        lock.write_text("not a lock directory")
+                    else:
+                        lock.symlink_to(Path(td) / "missing")
+                    result = _bash(
+                        f"source {LIB}; tartci_pool_lock_health_json",
+                        {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+                    )
+                    value = json.loads(result.stdout)
+                    self.assertIs(value["present"], True)
+                    self.assertEqual(value["state"], "invalid")
+                    lock.unlink()
+                    lock.mkdir()
+
+    def test_lock_absence_probe_refuses_files_directories_and_symlinks(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            for kind in ("file", "directory", "symlink"):
+                with self.subTest(kind=kind):
+                    if lock.is_symlink() or lock.is_file():
+                        lock.unlink()
+                    elif lock.is_dir():
+                        lock.rmdir()
+                    if kind == "file":
+                        lock.write_text("blocked")
+                    elif kind == "directory":
+                        lock.mkdir()
+                    else:
+                        lock.symlink_to(Path(td) / "missing")
+                    result = _bash(
+                        f"source {LIB}; tartci_pool_lock_absent",
+                        {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+                    )
+                    self.assertNotEqual(result.returncode, 0)
+
+    def test_runner_worker_probe_refuses_unavailable_or_active_evidence(self) -> None:
+        unavailable = _bash(f"source {LIB}; tartci_pool_zero_runner_workers", {"TARTCI_POOL_PS_BIN": "/bin/false"})
+        self.assertNotEqual(unavailable.returncode, 0)
+        with tempfile.TemporaryDirectory() as td:
+            active_probe = Path(td) / "ps-active"
+            active_probe.write_text(
+                "#!/bin/sh\nprintf '%s\\n' '/opt/actions-runner/bin/Runner.Worker --job 7'\n"
+            )
+            active_probe.chmod(0o755)
+            active = _bash(
+                f"source {LIB}; tartci_pool_zero_runner_workers",
+                {"TARTCI_POOL_PS_BIN": str(active_probe)},
+            )
+            self.assertNotEqual(active.returncode, 0)
+
+    def test_runner_worker_probe_ignores_unrelated_process_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = Path(td) / "ps-unrelated"
+            script.write_text("#!/bin/sh\nprintf '%s\\n' unrelated-daemon another-process\n")
+            script.chmod(0o755)
+            result = _bash(f"source {LIB}; tartci_pool_zero_runner_workers", {"TARTCI_POOL_PS_BIN": str(script)})
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_lock_health_is_read_only_and_reports_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            proc = _bash(
+                f"source {LIB}; tartci_pool_lock_acquire; tartci_pool_lock_health; tartci_pool_lock_release",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            fields = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+            self.assertEqual(fields["lock_present"], "true")
+            self.assertTrue(fields["lock_inode"].isdigit())
+            self.assertTrue(fields["lock_mtime"].isdigit())
+            self.assertTrue(fields["owner_pid"].isdigit())
+            self.assertEqual(fields["owner_alive"], "true")
+            self.assertTrue(fields["owner_start"])
+            self.assertTrue(fields["boot_id"])
+            self.assertFalse(lock.exists())
+
+    def test_lock_identity_fence_refuses_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            proc = _bash(
+                f"source {LIB}; tartci_pool_lock_acquire; "
+                "identity=$(tartci_pool_lock_identity \"$TARTCI_POOL_TRANSITION_LOCK\"); "
+                "pid=$(cat \"$TARTCI_POOL_TRANSITION_LOCK/pid\"); "
+                "mv \"$TARTCI_POOL_TRANSITION_LOCK\" \"$TARTCI_POOL_TRANSITION_LOCK.old\"; mkdir \"$TARTCI_POOL_TRANSITION_LOCK\"; "
+                "tartci_pool_lock_identity_matches \"$TARTCI_POOL_TRANSITION_LOCK\" \"$identity\" \"$pid\"; echo rc=$?",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
+
+    def test_lock_identity_fence_refuses_pid_start_reuse(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "transition.lock"
+            proc = _bash(
+                f"source {LIB}; tartci_pool_lock_acquire; "
+                "identity=$(tartci_pool_lock_identity \"$TARTCI_POOL_TRANSITION_LOCK\"); "
+                "pid=$(cat \"$TARTCI_POOL_TRANSITION_LOCK/pid\"); "
+                "tartci_pool_lock_identity_matches \"$TARTCI_POOL_TRANSITION_LOCK\" \"$identity\" \"$pid\" definitely-not-this-start; echo rc=$?; "
+                "tartci_pool_lock_release",
+                {"TARTCI_POOL_TRANSITION_LOCK": str(lock)},
+            )
+            self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
+
     def test_live_listener_handoff_releases_global_transition_lock(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             lock = Path(td) / "transition.lock"
@@ -645,6 +784,22 @@ class ProviderAdmissionContractTests(unittest.TestCase):
         self.assertLess(locked, snapshot_parse)
         self.assertLess(snapshot_parse, persistent_preflight)
 
+    def test_every_provider_refuses_existing_transition_lock_before_allocation(self) -> None:
+        cases = {
+            "providers/tart-macos/runner.sh": "tartci_acquire_vm_lease",
+            "providers/tart-linux/runner.sh": "tartci_acquire_vm_lease",
+            "providers/qemu-windows/runner.sh": "allocate_ssh_port",
+        }
+        for relative, allocation in cases.items():
+            with self.subTest(provider=relative):
+                source = (ROOT / relative).read_text()
+                run_one = source.index("run_one(){")
+                next_boundary = source.find("\n}\n", run_one)
+                body = source[run_one:next_boundary]
+                probe = body.index("tartci_pool_lock_absent")
+                self.assertLess(probe, body.index(allocation))
+                self.assertIn("deferring without boot", body)
+
     def test_pool_on_kickstarts_bootstrapped_services_before_admission(self) -> None:
         source = (ROOT / "tartci").read_text()
         start = source.index("    on|off)", source.index("cmd_pool()"))
@@ -740,6 +895,7 @@ class ProviderAdmissionContractTests(unittest.TestCase):
         self.assertIn('tartci_pool_read_participation)" = 0', body)
         self.assertIn('tartci_pool_read_state)" != on', body)
         self.assertIn('kill -0 "$owner"', body)
+        self.assertIn("owner pid is missing or malformed", body)
 
 
 if __name__ == "__main__":

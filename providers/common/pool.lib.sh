@@ -158,6 +158,157 @@ tartci_pool_lock_release() {
   rmdir "$lock" 2>/dev/null || true
 }
 
+tartci_pool_lock_identity() {
+  local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}"
+  python3 - "$lock" <<'PY'
+import os, stat, sys
+try:
+ s=os.lstat(sys.argv[1])
+ if not stat.S_ISDIR(s.st_mode): raise ValueError("lock is not a directory")
+ print(f"{s.st_dev}:{s.st_ino}:{s.st_mtime_ns}:{s.st_ctime_ns}")
+except Exception:
+ raise SystemExit(1)
+PY
+}
+
+# Cheap pre-allocation fence. This does not replace the serialized late mint
+# lock: a transition can still begin after this read, and the existing
+# acquire-before-JIT fence remains authoritative for that race. It prevents a
+# lock already known to exist from causing clone/boot/discard churn.
+tartci_pool_lock_absent() {
+  local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}"
+  [ ! -e "$lock" ] && [ ! -L "$lock" ]
+}
+
+# Read-only, typed lock evidence.  This deliberately never removes or rewrites
+# the lock.  Every field is emitted even when unavailable so callers can fail
+# closed instead of treating a partial probe as an idle/dead owner.
+tartci_pool_lock_health() {
+  local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}" present=false pid="" inode="" mtime="" owner_alive=unknown owner_start=unknown boot_id=unknown
+  if [ -e "$lock" ] || [ -L "$lock" ]; then
+    present=true
+  fi
+  if [ "$present" = true ] && [ -d "$lock" ] && [ ! -L "$lock" ]; then
+    local identity; identity="$(tartci_pool_lock_identity "$lock" || true)"
+    IFS=: read -r _dev inode mtime _ctime <<EOF
+$identity
+EOF
+    pid="$(cat "$lock/pid" 2>/dev/null || true)"
+    case "$pid" in
+      ''|*[!0-9]*) owner_alive=unknown ;;
+      *) if kill -0 "$pid" 2>/dev/null; then owner_alive=true; else owner_alive=false; fi
+         owner_start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//' || true)" ;;
+    esac
+    boot_id="$(sysctl -n kern.boottime 2>/dev/null || awk '/btime/ {print $2; exit}' /proc/stat 2>/dev/null || true)"
+  elif [ "$present" = false ]; then
+    owner_alive=false
+  fi
+  printf 'lock_path=%s\nlock_present=%s\nlock_inode=%s\nlock_mtime=%s\nowner_pid=%s\nowner_alive=%s\nowner_start=%s\nboot_id=%s\n' \
+    "$lock" "$present" "$inode" "$mtime" "$pid" "$owner_alive" "$owner_start" "$boot_id"
+}
+
+tartci_pool_lock_health_json() {
+  tartci_pool_lock_health "${1:-$TARTCI_POOL_TRANSITION_LOCK}" | python3 -c '
+import json, sys
+fields = {}
+for raw in sys.stdin:
+    key, separator, value = raw.rstrip("\n").partition("=")
+    if not separator:
+        raise SystemExit(1)
+    fields[key] = value
+required = {
+    "lock_path", "lock_present", "lock_inode", "lock_mtime", "owner_pid",
+    "owner_alive", "owner_start", "boot_id",
+}
+if set(fields) != required:
+    raise SystemExit(1)
+present = fields["lock_present"] == "true"
+identity_complete = bool(fields["lock_inode"] and fields["lock_mtime"])
+pid_valid = fields["owner_pid"].isdigit() and int(fields["owner_pid"]) > 0
+if not present:
+    state = "absent"
+elif not identity_complete or not pid_valid or fields["owner_alive"] == "unknown":
+    state = "invalid"
+elif fields["owner_alive"] == "true":
+    state = "owned"
+else:
+    state = "orphaned"
+print(json.dumps({
+    "state": state,
+    "present": present,
+    "path": fields["lock_path"],
+    "inode": int(fields["lock_inode"]) if fields["lock_inode"].isdigit() else None,
+    "mtime_ns": int(fields["lock_mtime"]) if fields["lock_mtime"].isdigit() else None,
+    "owner_pid": int(fields["owner_pid"]) if pid_valid else None,
+    "owner_alive": {"true": True, "false": False}.get(fields["owner_alive"]),
+    "owner_start": fields["owner_start"] or None,
+    "boot_id": fields["boot_id"] or None,
+}, separators=(",", ":"), sort_keys=True))
+'
+}
+
+# Verify an exact lock observation immediately before an explicit repair. The
+# repair command owns the pool-off, worker, and VM gates; this helper supplies
+# the final TOCTOU identity fence and refuses partial observations.
+tartci_pool_lock_identity_matches() {
+  local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}" expected_identity="$2" expected_pid="$3" expected_start="${4:-}" expected_boot="${5:-}"
+  [ -n "$expected_identity" ] || return 1
+  [ -d "$lock" ] || return 1
+  local identity pid start boot
+  identity="$(tartci_pool_lock_identity "$lock" || true)"
+  [ -n "$identity" ] || return 1
+  pid="$(cat "$lock/pid" 2>/dev/null || true)"
+  case "$pid" in
+    ''|*[!0-9]*) return 1 ;;
+    *) kill -0 "$pid" 2>/dev/null && return 1 ;;
+  esac
+  start="$(ps -p "$pid" -o lstart= 2>/dev/null | sed 's/^ *//' || true)"
+  boot="$(sysctl -n kern.boottime 2>/dev/null || awk '/btime/ {print $2; exit}' /proc/stat 2>/dev/null || true)"
+  [ "$identity" = "$expected_identity" ] && [ "$pid" = "$expected_pid" ] \
+    && { [ -z "$expected_start" ] || [ "$start" = "$expected_start" ]; } \
+    && { [ -z "$expected_boot" ] || [ "$boot" = "$expected_boot" ]; }
+}
+
+# Fail-closed transition repair gates.  Callers may provide deterministic test
+# seams; production probes the host process table and Tart inventory directly.
+tartci_pool_zero_runner_workers() {
+  local workers rc ps_bin
+  if [ -n "${TARTCI_POOL_PS_BIN:-}" ]; then
+    workers="$("$TARTCI_POOL_PS_BIN" 2>/dev/null)"; rc=$?
+    [ "$rc" = 0 ] || return 1
+    printf '%s\n' "$workers" | grep -Eq '(^|[[:space:]/])Runner[.]Worker([[:space:]]|$)' && return 1
+    return 0
+  fi
+  for ps_bin in /bin/ps /usr/bin/ps; do [ -x "$ps_bin" ] && break; done
+  [ -x "$ps_bin" ] || return 1
+  if [ "$(uname -s 2>/dev/null || true)" = Darwin ]; then
+    workers="$("$ps_bin" -axo command= 2>/dev/null)"
+  else
+    workers="$("$ps_bin" -eo command= 2>/dev/null)"
+  fi
+  rc=$?
+  [ "$rc" = 0 ] || return 1
+  printf '%s\n' "$workers" | grep -Eq '(^|[[:space:]/])Runner[.]Worker([[:space:]]|$)' && return 1
+  return 0
+}
+
+tartci_pool_zero_running_vms() {
+  local tart="${TARTCI_POOL_TART_BIN:-tart}"
+  python3 - "$tart" <<'PY'
+import json, subprocess, sys
+try:
+ result=subprocess.run([sys.argv[1], "list", "--format", "json"], check=True,
+                       capture_output=True, text=True, timeout=5)
+ rows=json.loads(result.stdout)
+ if not isinstance(rows,list): raise ValueError("inventory is not an array")
+ for row in rows:
+  if not isinstance(row,dict): raise ValueError("inventory entry is not an object")
+  state=str(row.get("State",row.get("status",row.get("state",row.get("running",""))))).lower()
+  if state.startswith("run") or state in ("booted","true","up"): raise SystemExit(1)
+except Exception: raise SystemExit(2)
+PY
+}
+
 # End the host-global mint/drain transition only after this supervisor owns a
 # live listener process. From this point through assignment or idle teardown,
 # the listener's provider state, VM lease, and cleanup trap are the durable

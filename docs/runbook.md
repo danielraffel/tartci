@@ -1526,7 +1526,10 @@ lanes change.
   plists and unreceipted legacy Tart controllers remain stopped. This is the only transition that
   reopens provider admission, so a reconnect cannot leave a half-on host.
 - `tartci pool status [--json]` — durable state + participation + each runner agent's
-  loaded/stopped state. Receipt-managed macOS fleets additionally report
+  loaded/stopped state. It also reports the host-global transition lock as
+  `absent`, `owned`, `orphaned`, `invalid`, or `unobservable`, with typed owner
+  and filesystem identity evidence in JSON. `tartci doctor` includes the same
+  classification in its human-readable output. Receipt-managed macOS fleets additionally report
   `fleet_ready`, `expected_supervisors`, `verified_running_supervisors`, and
   structured problems. Readiness requires the exact receipted launchd snapshot,
   running supervisors, fresh PID/start-bound provider heartbeats, no retired or
@@ -1538,6 +1541,11 @@ lanes change.
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an
   orphan blocks rejoin, run `pool off`, then `pool repair-lock`, then `pool on`.
+  Providers check for an already-present transition lock before allocating a
+  port or VM lease and before cloning or booting. The existing serialized check
+  immediately before JIT mint remains authoritative for a lock created after
+  that early observation; the early check only suppresses known-doomed
+  boot/discard churn and never reclaims a lock automatically.
 
 Drain is deliberately not a second scheduler. New jobs keep their existing
 shared GitHub labels, so GitHub may assign them to another eligible host (for
