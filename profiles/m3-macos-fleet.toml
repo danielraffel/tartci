@@ -18,6 +18,19 @@ approval_sha256_path = "/Users/danielraffel/.config/tartci/m3-launcher-approved.
 identifier = "com.danielraffel.tartci.launcher"
 team_id = "95CX6P84C4"
 
+[worktree_cleanup]
+provider = "merged-main-v1"
+repo = "Generous-Corp/pulp"
+primary = "/Volumes/Workshop/Code/pulp"
+prefix = "/Volumes/Workshop/Code"
+main_ref = "origin/main"
+github_cli = "ghapp"
+apply = false
+max_trees = 8
+max_gib = 512
+timeout_seconds = 300
+cooldown_seconds = 3600
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27

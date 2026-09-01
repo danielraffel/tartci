@@ -274,3 +274,11 @@ verified, and the new plists are installed while the pool remains off. Enable
 one M1 lane for one exact low-risk job, then drain it again. Do not change
 GitHub merge-queue `max_entries_to_build` until that receipt proves clone, cache,
 lease, teardown, offline/rejoin, and log behavior.
+## Optional M3 worktree recovery
+
+Only `profiles/m3-macos-fleet.toml` declares the dormant
+`[worktree_cleanup]` contract. Its rendered variables are consumed inside the
+existing VM lease admission path after a freshly measured disk-only denial;
+there is no LaunchAgent or periodic cleanup service. The provider is bounded to
+eight trees, 512 GiB, 300 seconds, and one cooldown-protected attempt followed
+by at most one full admission reprobe. `apply = false` is the shipped default.

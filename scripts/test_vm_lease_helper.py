@@ -37,6 +37,44 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_worktree_cleanup_trigger_rejects_non_disk_and_malformed_denials(self) -> None:
+        script = f'''
+          source {HELPER}
+          export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
+          export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
+          export TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+          for value in 'not-json' '{{"ok":false,"reason":"cpu_capacity_exceeded","exceeded_axis":{{"cores":true,"memory":false,"disk":false}}}}' '{{"ok":false,"reason":"disk_probe_failed"}}'; do
+            if tartci_try_worktree_cleanup "$value"; then exit 9; fi
+          done
+        '''
+        result = _run_bash(script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_worktree_cleanup_trigger_accepts_only_exact_fresh_disk_axis(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "scripts").mkdir()
+            called = root / "called"
+            _write_exec(root / "scripts/worktree_cleanup.py", f"#!/usr/bin/env python3\nimport pathlib,sys\npathlib.Path({str(called)!r}).write_text(' '.join(sys.argv[1:]))\n")
+            receipt_dir = root / "receipts"
+            attempt = '{"ok":false,"reason":"disk_capacity_exceeded","exceeded_axis":{"cores":false,"memory":false,"disk":true},"disk":{"available_after_reservations_bytes":10,"required_bytes":20}}'
+            script = f'''
+              source {HELPER}
+              export TARTCI_ROOT={root}
+              export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipt_dir}
+              export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
+              export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
+              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp
+              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code
+              export TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
+              export TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+              mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
+              tartci_try_worktree_cleanup '{attempt}'
+            '''
+            result = _run_bash(script)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("--before-free-bytes 10 --required-bytes 20", called.read_text())
+
     def test_observed_preflight_floor_denial_emits_authoritative_frame(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)

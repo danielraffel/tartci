@@ -70,6 +70,24 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_m3_worktree_cleanup_contract_is_dormant_and_rendered(self) -> None:
+        data = fleet.load(HOST_CONFIGS["studio"])
+        self.assertFalse(data["worktree_cleanup"]["apply"])
+        for body in fleet.rendered_plists(data).values():
+            env = plistlib.loads(body)["EnvironmentVariables"]
+            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_PROVIDER"], "merged-main-v1")
+            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_APPLY"], "0")
+            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_MAX_GIB"], "512")
+
+    def test_worktree_cleanup_rejected_outside_exact_m3_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.toml"
+            path.write_text(HOST_CONFIGS["studio"].read_text().replace(
+                'github_cli = "ghapp"', 'github_cli = "gh"'
+            ))
+            with self.assertRaisesRegex(ValueError, "reviewed M3"):
+                fleet.load(path)
+
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         rendered = fleet.rendered_plists(data)

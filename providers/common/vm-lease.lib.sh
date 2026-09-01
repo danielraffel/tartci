@@ -282,6 +282,67 @@ tartci_vm_lease_owner(){
   printf '%s@%s' "${USER:-unknown}" "$host"
 }
 
+# Only a freshly returned, exact disk-axis lease denial can trigger cleanup.
+tartci_try_worktree_cleanup(){
+  local attempt_json="$1" free_bytes="" required_bytes="" apply_args=()
+  [ "${TARTCI_WORKTREE_CLEANUP_PROVIDER:-}" = merged-main-v1 ] || return 1
+  [ "${TARTCI_WORKTREE_CLEANUP_REPO:-}" = Generous-Corp/pulp ] || return 1
+  [ "${TARTCI_WORKTREE_CLEANUP_GITHUB_CLI:-}" = ghapp ] || return 1
+  IFS=$'\t' read -r free_bytes required_bytes < <(printf '%s' "$attempt_json" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+disk=d.get("disk"); axis=d.get("exceeded_axis")
+if d.get("ok") is not False or d.get("reason")!="disk_capacity_exceeded" or axis!={"cores":False,"memory":False,"disk":True} or not isinstance(disk,dict): raise SystemExit(1)
+free=disk.get("available_after_reservations_bytes"); required=disk.get("required_bytes")
+if type(free) is not int or type(required) is not int: raise SystemExit(1)
+print(f"{free}\t{required}")
+') || return 1
+  case "$free_bytes:$required_bytes" in *[!0-9:]*) return 1;; esac
+  [ "${TARTCI_WORKTREE_CLEANUP_APPLY:-0}" = 1 ] && apply_args=(--apply)
+  python3 "$TARTCI_ROOT/scripts/worktree_cleanup.py" \
+    --provider "$TARTCI_WORKTREE_CLEANUP_PROVIDER" --repo "$TARTCI_WORKTREE_CLEANUP_REPO" \
+    --primary "$TARTCI_WORKTREE_CLEANUP_PRIMARY" --prefix "$TARTCI_WORKTREE_CLEANUP_PREFIX" \
+    --main-ref "$TARTCI_WORKTREE_CLEANUP_MAIN_REF" --github-cli "$TARTCI_WORKTREE_CLEANUP_GITHUB_CLI" \
+    --receipt "$TARTCI_DISK_DENIAL_RECEIPT_DIR/worktree-cleanup.json" \
+    --lock "$TARTCI_DISK_DENIAL_RECEIPT_DIR/worktree-cleanup.lock" \
+    --before-free-bytes "$free_bytes" --required-bytes "$required_bytes" \
+    --max-trees "${TARTCI_WORKTREE_CLEANUP_MAX_TREES:-8}" \
+    --max-bytes "$(( ${TARTCI_WORKTREE_CLEANUP_MAX_GIB:-512} * 1024 * 1024 * 1024 ))" \
+    --timeout "${TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS:-300}" \
+    --cooldown "${TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS:-3600}" \
+    ${apply_args[@]+"${apply_args[@]}"}
+}
+
+tartci_record_worktree_cleanup_retry(){
+  local attempt_json="$1" retry_rc="$2" receipt="$TARTCI_DISK_DENIAL_RECEIPT_DIR/worktree-cleanup.json"
+  [ -f "$receipt" ] || return 0
+  TARTCI_RETRY_ATTEMPT_JSON="$attempt_json" python3 - "$receipt" "$retry_rc" <<'PY' || true
+import hashlib, json, os, sys, tempfile
+from pathlib import Path
+path, rc = Path(sys.argv[1]), int(sys.argv[2])
+try:
+    record = json.loads(path.read_text())
+except OSError:
+    raise SystemExit(0)
+raw = os.environ["TARTCI_RETRY_ATTEMPT_JSON"]
+try:
+    attempt = json.loads(raw)
+except ValueError:
+    attempt = {"malformed": True, "raw_sha256": hashlib.sha256(raw.encode()).hexdigest()}
+record["retry"] = {"rc": rc, "ok": rc == 0, "attempt": attempt}
+fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+try:
+    with os.fdopen(fd, "w") as handle:
+        json.dump(record, handle, indent=2, sort_keys=True); handle.write("\n")
+        handle.flush(); os.fsync(handle.fileno())
+    os.replace(name, path)
+finally:
+    try: os.unlink(name)
+    except FileNotFoundError: pass
+PY
+}
+
 tartci_start_vm_lease_heartbeat(){
   local lease_id="$1"
   (
@@ -392,6 +453,18 @@ tartci_acquire_vm_lease(){
     --json 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
+    if tartci_try_worktree_cleanup "$out"; then
+      rc=0
+      out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
+        --id "$lease_id" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
+        ${disk_args[@]+"${disk_args[@]}"} --priority "$priority" --pid "$$" \
+        --kind "$kind" --owner "$(tartci_vm_lease_owner)" --label "$labels" \
+        --job-id "${GITHUB_RUN_ID:-}" --vm-name "$vm_name" --json 2>&1)" || rc=$?
+      tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
+      tartci_record_worktree_cleanup_retry "$out" "$rc"
+    fi
+  fi
+  if [ "$rc" -ne 0 ]; then
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
     return "$rc"
   fi
