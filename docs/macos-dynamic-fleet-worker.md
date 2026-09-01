@@ -277,8 +277,11 @@ lease, teardown, offline/rejoin, and log behavior.
 ## Optional M3 worktree recovery
 
 Only `profiles/m3-macos-fleet.toml` declares the dormant
-`[worktree_cleanup]` contract. Its rendered variables are consumed inside the
-existing VM lease admission path after a freshly measured disk-only denial;
+`[worktree_cleanup]` contract. With the shipped `apply = false`, no cleanup
+variables are rendered into launchd at all. A separately reviewed `apply =
+true` cohort would expose them only to the M3 Pulp supervisors, where the M3
+Tart-store preflight and VM lease admission paths consume a freshly measured
+disk-only denial;
 there is no LaunchAgent or periodic cleanup service. The provider is bounded to
 eight trees, 512 GiB, 300 seconds, and one cooldown-protected attempt followed
 by at most one full admission reprobe. `apply = false` is the shipped default.

@@ -1147,7 +1147,7 @@ def lane_plist(
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
     cleanup = data.get("worktree_cleanup")
-    if cleanup is not None and lane["repo"] == cleanup["repo"]:
+    if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"]:
         env.update({
             "TARTCI_WORKTREE_CLEANUP_PROVIDER": cleanup["provider"],
             "TARTCI_WORKTREE_CLEANUP_REPO": cleanup["repo"],

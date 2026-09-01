@@ -1,10 +1,93 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import subprocess,tempfile,unittest
+import json,subprocess,tempfile,types,unittest
 from unittest import mock
 import worktree_cleanup as cleanup
 
 class Tests(unittest.TestCase):
+    def authority_argv(self, root):
+        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Workshop/Code/pulp","--prefix","/Volumes/Workshop/Code","--main-ref","origin/main","--github-cli","ghapp","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
+
+    def test_nonblocking_lock_and_cooldown_stop_before_inspection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); lock=(root/"lock").open("a+"); import fcntl; fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            self.assertEqual(cleanup.main(self.authority_argv(root)),3); lock.close()
+            (root/"receipt.json").write_text("{}")
+            with mock.patch.object(cleanup,"fresh_main") as fresh:
+                self.assertEqual(cleanup.main(self.authority_argv(root)),4); fresh.assert_not_called()
+
+    def test_apply_cli_enters_apply_path(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); receipt=root/"receipt.json"
+            argv=[*self.authority_argv(root),"--apply"]
+            with mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected") as apply,mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=2)):
+                self.assertEqual(cleanup.main(argv),0); apply.assert_called_once()
+
+    def test_apply_cli_returns_nonzero_when_final_free_space_is_insufficient(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td); argv=[*self.authority_argv(root),"--apply"]
+            with mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected"),mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=0)):
+                self.assertEqual(cleanup.main(argv),7)
+            self.assertEqual(json.loads((root/"receipt.json").read_text())["retry_admission"],"denied")
+
+    def make_repo(self, root, names):
+        primary=root/"primary"; subprocess.run(["git","init","-q",str(primary)],check=True)
+        subprocess.run(["git","-C",str(primary),"config","user.email","test@example.com"],check=True); subprocess.run(["git","-C",str(primary),"config","user.name","Test"],check=True)
+        (primary/"tracked").write_text("ok"); subprocess.run(["git","-C",str(primary),"add","tracked"],check=True); subprocess.run(["git","-C",str(primary),"commit","-qm","base"],check=True)
+        head=subprocess.run(["git","-C",str(primary),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip(); selected=[]
+        for name in names:
+            path=root/name; subprocess.run(["git","-C",str(primary),"branch",name,head],check=True); subprocess.run(["git","-C",str(primary),"worktree","add","-q",str(path),name],check=True)
+            selected.append((path,head,f"refs/heads/{name}",1,{"path":str(path),"status":"candidate"}))
+        return primary,head,selected
+
+    def test_apply_stops_at_target_and_retains_branch_registry_proof(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,selected=self.make_repo(root,["one","two"]); receipt=root/"receipt.json"
+            args=types.SimpleNamespace(primary=primary,prefix=root,receipt=receipt,required_bytes=50,max_bytes=100,max_trees=8,timeout=30)
+            record={"removals":[],"dispositions":[item[4] for item in selected]}
+            with mock.patch.object(cleanup,"inspect",return_value=(selected,[],2)), mock.patch.object(cleanup.shutil,"disk_usage",side_effect=[types.SimpleNamespace(free=0),types.SimpleNamespace(free=100)]):
+                cleanup.apply_selected(args,selected,record,head)
+            self.assertFalse(selected[0][0].exists()); self.assertTrue(selected[1][0].exists())
+            final=json.loads(receipt.read_text()); self.assertEqual(len(final["removals"]),1); self.assertEqual(final["removals"][0]["branch_retained_at"],head)
+            self.assertEqual(subprocess.run(["git","-C",str(primary),"show-ref","--verify","--hash","refs/heads/one"],text=True,capture_output=True,check=True).stdout.strip(),head)
+
+    def test_apply_receipt_preserves_completed_removal_when_later_revalidation_stops(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,selected=self.make_repo(root,["one","two"]); receipt=root/"receipt.json"
+            args=types.SimpleNamespace(primary=primary,prefix=root,receipt=receipt,required_bytes=999,max_bytes=100,max_trees=8,timeout=30)
+            record={"removals":[],"dispositions":[item[4] for item in selected]}
+            with mock.patch.object(cleanup,"inspect",side_effect=[(selected,[],2),cleanup.Stop("changed")]), mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=0)):
+                with self.assertRaises(cleanup.Stop): cleanup.apply_selected(args,selected,record,head)
+            progress=json.loads(receipt.read_text()); self.assertEqual([row["path"] for row in progress["removals"]],[str(selected[0][0])]); self.assertNotIn("current_removal",progress)
+
+    def test_restart_reconciles_durable_pending_removal_intent(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,selected=self.make_repo(root,["one"]); path,_,branch,size,_=selected[0]; receipt=root/"receipt.json"
+            receipt.write_text(json.dumps({"current_removal":{"path":str(path),"head":head,"branch":branch,"size_bytes":size,"phase":"removal_in_progress"},"removals":[]}))
+            subprocess.run(["git","-C",str(primary),"worktree","remove",str(path)],check=True)
+            args=types.SimpleNamespace(primary=primary,prefix=root,receipt=receipt)
+            self.assertTrue(cleanup.reconcile_pending(args)); record=json.loads(receipt.read_text())
+            self.assertTrue(record["removals"][0]["reconciled_after_restart"]); self.assertNotIn("current_removal",record)
+
+    def test_git_ignores_malicious_path_and_core_fsmonitor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,_=self.make_repo(root,[]); marker=root/"executed"; hook=root/"fsmonitor"
+            hook.write_text(f"#!/bin/sh\ntouch {marker}\n"); hook.chmod(0o755); subprocess.run(["git","-C",str(primary),"config","core.fsmonitor",str(hook)],check=True)
+            hostile=root/"bin"; hostile.mkdir(); fake=hostile/"git"; fake.write_text(f"#!/bin/sh\ntouch {marker}\nexit 99\n"); fake.chmod(0o755)
+            with mock.patch.dict("os.environ",{"PATH":str(hostile)}),mock.patch.object(cleanup,"observations",return_value=""):
+                cleanup.inspect(primary,root,head,1024**3,8,30)
+            self.assertFalse(marker.exists())
+
+    def test_github_and_fetched_main_mismatch_stops(self):
+        def response(command,**_):
+            if "remote" in command: value="https://github.com/Generous-Corp/pulp.git\n"
+            elif cleanup.GHAPP in command: value="a"*40+"\n"
+            elif "rev-parse" in command: value="b"*40+"\n"
+            else: value=""
+            return subprocess.CompletedProcess(command,0,value,"")
+        with mock.patch.object(cleanup,"run",side_effect=response),self.assertRaises(cleanup.Stop):
+            cleanup.fresh_main(Path("/primary"),"Generous-Corp/pulp","origin/main",30)
+
     def test_inspect_selects_only_clean_merged_attached_branch(self):
         with tempfile.TemporaryDirectory() as td:
             prefix=Path(td).resolve(); primary=prefix/"primary"
@@ -21,6 +104,38 @@ class Tests(unittest.TestCase):
                 selected,dispositions,_=cleanup.inspect(primary,prefix,head,1024**3,8,30)
                 self.assertEqual(selected,[]); self.assertIn("dirty",[row.get("reason") for row in dispositions])
 
+    def test_inspect_excludes_detached_locked_and_active_worktrees(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,selected=self.make_repo(root,["clean","locked"])
+            detached=root/"detached"; subprocess.run(["git","-C",str(primary),"worktree","add","-q","--detach",str(detached),head],check=True)
+            subprocess.run(["git","-C",str(primary),"worktree","lock",str(root/"locked")],check=True)
+            with mock.patch.object(cleanup,"observations",return_value=str(root/"clean")):
+                chosen,dispositions,_=cleanup.inspect(primary,root,head,1024**3,8,30)
+            self.assertEqual(chosen,[]); reasons={row.get("reason") for row in dispositions}
+            self.assertTrue({"active_observation","locked","detached"}.issubset(reasons))
+
+    def test_inspect_excludes_dirty_submodule_state(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); sub=root/"sub-source"; subprocess.run(["git","init","-q",str(sub)],check=True)
+            subprocess.run(["git","-C",str(sub),"config","user.email","test@example.com"],check=True); subprocess.run(["git","-C",str(sub),"config","user.name","Test"],check=True)
+            (sub/"value").write_text("one"); subprocess.run(["git","-C",str(sub),"add","value"],check=True); subprocess.run(["git","-C",str(sub),"commit","-qm","sub"],check=True)
+            primary,_,_=self.make_repo(root,[ ]); subprocess.run(["git","-c","protocol.file.allow=always","-C",str(primary),"submodule","add","-q",str(sub),"module"],check=True); subprocess.run(["git","-C",str(primary),"commit","-qam","submodule"],check=True)
+            head=subprocess.run(["git","-C",str(primary),"rev-parse","HEAD"],text=True,capture_output=True,check=True).stdout.strip(); tree=root/"candidate"; subprocess.run(["git","-C",str(primary),"branch","with-submodule",head],check=True); subprocess.run(["git","-C",str(primary),"worktree","add","-q",str(tree),"with-submodule"],check=True)
+            subprocess.run(["git","-c","protocol.file.allow=always","-C",str(tree),"submodule","update","--init","-q"],check=True); (tree/"module/value").write_text("dirty")
+            with mock.patch.object(cleanup,"observations",return_value=""):
+                selected,dispositions,_=cleanup.inspect(primary,root,head,1024**3,8,30)
+            self.assertEqual(selected,[]); self.assertTrue(any(row.get("reason") in {"dirty","dirty_submodule"} for row in dispositions if row["path"]==str(tree)))
+
+    def test_inspect_stops_on_common_directory_mismatch(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,head,selected=self.make_repo(root,["candidate"]); tree=selected[0][0]; original=cleanup.run
+            def mismatched(command,**kwargs):
+                if command[0]=="git" and "--git-common-dir" in command and str(tree) in command:
+                    return subprocess.CompletedProcess(command,0,"/different/common\n","")
+                return original(command,**kwargs)
+            with mock.patch.object(cleanup,"observations",return_value=""),mock.patch.object(cleanup,"run",side_effect=mismatched),self.assertRaises(cleanup.Stop):
+                cleanup.inspect(primary,root,head,1024**3,8,30)
+
     def test_porcelain_z_parser(self):
         rows=cleanup.parse_worktrees(b"worktree /a\0HEAD "+b"a"*40+b"\0branch refs/heads/a\0\0worktree /b\0HEAD "+b"b"*40+b"\0detached\0")
         self.assertEqual(rows[0]["branch"],"refs/heads/a"); self.assertTrue(rows[1]["detached"])
@@ -30,6 +145,7 @@ class Tests(unittest.TestCase):
             self.assertEqual(cleanup.canonical_directory(target,prefix,target.stat().st_dev),target.resolve())
             with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(link,prefix,target.stat().st_dev)
             with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(root,prefix,target.stat().st_dev)
+            with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(target,prefix,target.stat().st_dev+1)
     def test_provider_is_fail_closed(self):
         with self.assertRaises(cleanup.Stop): cleanup.main(["--provider","other","--repo","Generous-Corp/pulp","--primary","/x","--prefix","/y","--main-ref","origin/main","--github-cli","ghapp","--receipt","/r","--lock","/l","--required-bytes","1","--before-free-bytes","0"])
 if __name__=="__main__": unittest.main()

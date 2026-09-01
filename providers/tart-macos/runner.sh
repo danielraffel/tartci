@@ -1200,7 +1200,7 @@ run_one(){
     tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \
       "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   fi
-  tartci_check_disk_floor_observed "$TART_HOME" tart-macos \
+  tartci_check_macos_disk_floor_with_cleanup_once "$TART_HOME" \
     "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   tartci_prepare_and_check_disk_root_observed "$CACHE_ROOT" "" "" tart-macos \
     "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
