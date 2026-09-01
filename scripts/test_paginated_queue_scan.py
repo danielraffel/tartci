@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fcntl
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -58,6 +60,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
             "job_statuses": "queued",
             "state_file": str(state_file),
             "shared_cache_file": str(state_file.parent / "shared-discovery.json"),
+            "observation_lock_file": str(state_file.parent / "host-observation.lock"),
+            "observation_lock_timeout": 2.0,
             "provider": provider,
             "lane_id": "test-slot-1",
             "gh_cli": "unused",
@@ -652,6 +656,8 @@ print(json.dumps(payload))
                 "tart-macos",
                 "--shared-cache-file",
                 str(shared),
+                "--observation-lock-file",
+                str(root / "host-observation.lock"),
                 "--stagger-max-seconds",
                 "0",
             ]
@@ -701,6 +707,224 @@ print(json.dumps(payload))
                 len(counter.read_text(encoding="utf-8").splitlines()),
                 10,
             )
+
+    def test_distinct_namespaces_share_one_host_observation_slot(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        active = 0
+        peak = 0
+        guard = threading.Lock()
+
+        def api(path: str) -> dict[str, Any]:
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.01)
+                return self._base_api([eligible], eligible["id"])(path)
+            finally:
+                with guard:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanners = [
+                self._scanner(
+                    "tart-macos",
+                    root / f"lane-{index}.json",
+                    api,
+                    repo=f"owner/repo-{index}",
+                    shared_cache_file=str(root / "shared-discovery.json"),
+                    observation_lock_file=str(root / "host-observation.lock"),
+                )
+                for index in range(3)
+            ]
+            barrier = threading.Barrier(len(scanners))
+
+            def scan(scanner: Any) -> int:
+                barrier.wait()
+                return scanner.scan()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                results = list(executor.map(scan, scanners))
+
+        self.assertEqual(results, [1, 1, 1])
+        self.assertEqual(peak, 1)
+
+    def test_distinct_process_namespaces_bound_actual_github_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation_lock = root / "host-observation.lock"
+            activity = root / "activity.json"
+            stub = root / "counted-gh"
+            stub.write_text(
+                """#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+activity = os.environ['ACTIVITY']
+with open(activity, 'a+', encoding='utf-8') as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0); raw = handle.read().strip()
+    state = json.loads(raw) if raw else {'active': 0, 'peak': 0}
+    state['active'] += 1; state['peak'] = max(state['peak'], state['active'])
+    handle.seek(0); handle.truncate(); json.dump(state, handle); handle.flush()
+try:
+    time.sleep(0.02)
+    path = sys.argv[-1]
+    if path.endswith('/actions/workflows?per_page=100'):
+        payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
+    elif 'status=queued' in path or 'status=in_progress' in path:
+        payload = {'workflow_runs': []}
+    else:
+        raise SystemExit(2)
+    print(json.dumps(payload))
+finally:
+    with open(activity, 'r+', encoding='utf-8') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = json.load(handle); state['active'] -= 1
+        handle.seek(0); handle.truncate(); json.dump(state, handle); handle.flush()
+""",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            env = {**os.environ, "ACTIVITY": str(activity)}
+            processes = []
+            for index in range(3):
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable, str(MODULE_PATH),
+                            "--repo", f"owner/repo-{index}",
+                            "--workflow", "Build and Test",
+                            "--labels", "self-hosted,macOS",
+                            "--provider", "tart-macos",
+                            "--lane-id", f"lane-{index}",
+                            "--state-file", str(root / f"lane-{index}.json"),
+                            "--shared-cache-file", str(root / "discovery.json"),
+                            "--observation-lock-file", str(observation_lock),
+                            "--stagger-max-seconds", "0",
+                            "--gh-cli", str(stub),
+                        ],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, env=env,
+                    )
+                )
+            results = [process.communicate(timeout=10) for process in processes]
+            self.assertEqual([process.returncode for process in processes], [0, 0, 0])
+            self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
+            self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
+
+    def test_scanner_death_keeps_host_lock_with_observation_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entered = root / "entered"
+            calls = root / "calls"
+            stub = root / "orphanable-gh"
+            stub.write_text(
+                """#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+with open(os.environ['CALLS'], 'a+', encoding='utf-8') as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX); handle.write(sys.argv[-1] + '\\n'); handle.flush()
+try:
+    fd = os.open(os.environ['ENTERED'], os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    pass
+else:
+    os.close(fd); time.sleep(1)
+path = sys.argv[-1]
+if path.endswith('/actions/workflows?per_page=100'):
+    payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
+elif 'status=queued' in path or 'status=in_progress' in path:
+    payload = {'workflow_runs': []}
+else:
+    raise SystemExit(2)
+print(json.dumps(payload))
+""",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            lock = root / "host-observation.lock"
+            env = {**os.environ, "ENTERED": str(entered), "CALLS": str(calls)}
+
+            def command(repo: str, timeout: str) -> list[str]:
+                return [
+                    sys.executable, str(MODULE_PATH), "--repo", repo,
+                    "--workflow", "Build and Test", "--labels", "self-hosted",
+                    "--provider", "tart-macos", "--state-file", str(root / f"{repo.rsplit('/', 1)[-1]}.json"),
+                    "--shared-cache-file", str(root / "discovery.json"),
+                    "--observation-lock-file", str(lock),
+                    "--observation-lock-timeout", timeout,
+                    "--stagger-max-seconds", "0", "--gh-cli", str(stub),
+                ]
+
+            owner = subprocess.Popen(
+                command("owner/first", "5"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            deadline = time.monotonic() + 3
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first observation child never started")
+            owner.kill()
+            owner.communicate(timeout=3)
+
+            denied = subprocess.run(
+                command("owner/second", "0.1"),
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(denied.returncode, 1)
+            self.assertIn("host queue observation lock timed out", denied.stderr)
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
+
+            time.sleep(1.1)
+            recovered = subprocess.run(
+                command("owner/third", "2"),
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertEqual(recovered.stdout.strip(), "0")
+
+    def test_host_observation_lock_timeout_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                lambda _path: self.fail("API must not run without the lock"),
+                observation_lock_file=str(root / "host-observation.lock"),
+                observation_lock_timeout=0.05,
+            )
+            with scanner.observation_lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                with self.assertRaisesRegex(RuntimeError, "observation lock timed out"):
+                    scanner.scan()
+
+    def test_namespace_lock_wait_shares_the_bounded_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                lambda _path: self.fail("API must not run while state is locked"),
+                observation_lock_timeout=0.05,
+            )
+            with scanner.lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                with self.assertRaisesRegex(RuntimeError, "queue state lock timed out"):
+                    scanner.scan()
+
+    def test_non_finite_observation_timeout_is_rejected(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(MODULE_PATH), "--repo", "owner/repo",
+                "--workflow", "Build and Test", "--labels", "self-hosted",
+                "--provider", "test", "--state-file", "/tmp/unused-state.json",
+                "--observation-lock-timeout", "nan",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("observation-lock-timeout must be positive", result.stderr)
 
     def test_api_calls_are_hard_capped(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)

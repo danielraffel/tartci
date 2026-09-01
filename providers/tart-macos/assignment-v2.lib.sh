@@ -124,6 +124,10 @@ tartci_assignment_v2_select(){
     esac
   fi
   cached_value="$(tartci_assignment_v2_select_live)"
+  # TTL begins when the exhaustive observation completes, not before lock
+  # contention and API pagination. Backdating this stamp can make a fresh
+  # snapshot immediately expire and recreate the scan burst it should prevent.
+  now="$(date +%s)"
   mkdir -p "$STATE_DIR"
   if tmp="$(mktemp "$cache_file.tmp.XXXXXX")"; then
     printf '%s\t%s\n' "$now" "$cached_value" > "$tmp"

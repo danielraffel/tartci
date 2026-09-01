@@ -103,6 +103,7 @@ def run_bounded(
     *,
     timeout: float,
     operation: str,
+    pass_fds: Sequence[int] = (),
 ) -> subprocess.CompletedProcess[str]:
     """Run a trusted read-only controller command with bounded capture.
 
@@ -124,6 +125,7 @@ def run_bounded(
                 stdout=stdout_file,
                 stderr=stderr_file,
                 start_new_session=True,
+                pass_fds=tuple(pass_fds),
             )
         except OSError as exc:
             raise ObservationError(operation, "spawn_failed", str(exc)) from exc

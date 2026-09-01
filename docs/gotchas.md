@@ -368,6 +368,27 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   → pool lock and assignment/admission rechecks → JIT mint. Do not use an online org row or
   `busy=false` as repository capacity evidence.
 
+- **Each queue query works alone, but several healthy lanes become scan-blind together.**
+  Observed 2026-09-01 on M1: an isolated serialized assignment scan completed,
+  while concurrent supervisors repeatedly timed out individually valid `ghapp`
+  calls. Per-namespace discovery locks did not help because Pulp, Forge, release,
+  and sanitizer lanes use distinct repository/workflow namespaces.
+  → *Invariant:* all TartCI providers on one host share the host-global queue
+  observation lock (`~/.tartci/state/queue-observation.lock` by default).
+  Namespace locks still coalesce identical scans; the host lock serializes only
+  cache-miss GitHub observation bursts across different namespaces.
+  → *Failure behavior:* lock acquisition is bounded by
+  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default). The
+  exhaustive assignment scanner's total deadline is 180 seconds by default,
+  leaving a serialized waiter time to perform its own scan after the lock opens.
+  Timeout
+  is scan-blind/fail-closed: do not report zero demand, publish partial cache
+  state, or start a lower-priority VM. The supervisor retries normally.
+  → *Do not* fix this by independently increasing every lane's worker count or
+  API timeout. That increases the concurrent burst which caused the incident.
+  Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
+  host is explicitly pointed at the same replacement path.
+
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
   A run that ends `legacy label remains loaded; refusing replacement startup` →
   `migration failed; restoring prior LaunchAgent configuration` →

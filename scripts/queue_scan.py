@@ -8,6 +8,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -16,6 +17,8 @@ import zlib
 from math import ceil
 from pathlib import Path
 from typing import Any
+
+from bounded_subprocess import run_bounded
 
 RUNS_PER_PAGE = 100
 
@@ -106,9 +109,12 @@ class QueueScanner:
         self.discovery_lock_path = self.discovery_path.with_suffix(
             f"{self.discovery_path.suffix}.lock"
         )
+        self.observation_lock_path = Path(args.observation_lock_file)
+        self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
         self.now = int(time.time())
         self.api_calls = 0
+        self.observation_lock_fd: int | None = None
 
     def _gh(self, path: str) -> dict[str, Any]:
         if self.api_calls >= self.args.max_api_calls:
@@ -116,12 +122,13 @@ class QueueScanner:
                 f"GitHub API call budget exhausted ({self.args.max_api_calls})"
             )
         self.api_calls += 1
-        result = subprocess.run(
+        result = run_bounded(
             [self.args.gh_cli, "api", path],
-            capture_output=True,
-            text=True,
             timeout=self.args.gh_timeout,
-            check=False,
+            operation="queue_scan_github_api",
+            pass_fds=(self.observation_lock_fd,)
+            if self.observation_lock_fd is not None
+            else (),
         )
         if result.returncode:
             raise GitHubApiError(path, result.returncode, result.stderr)
@@ -170,25 +177,56 @@ class QueueScanner:
         )
 
     @contextlib.contextmanager
-    def _state_lock(self) -> Any:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    def _bounded_lock(self, path: Path, kind: str) -> Any:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= self.lock_deadline:
+                        raise RuntimeError(
+                            f"{kind} lock timed out after "
+                            f"{self.args.observation_lock_timeout}s"
+                        )
+                    time.sleep(0.05)
             try:
-                self.state = self._load_state()
-                yield
+                yield handle
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @contextlib.contextmanager
+    def _state_lock(self) -> Any:
+        with self._bounded_lock(self.lock_path, "queue state"):
+            self.state = self._load_state()
+            yield
+
+    @contextlib.contextmanager
     def _discovery_lock(self) -> Any:
-        self.discovery_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.discovery_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        with self._bounded_lock(self.discovery_lock_path, "queue discovery"):
+            yield
+
+    @contextlib.contextmanager
+    def _observation_lock(self) -> Any:
+        """Bound concurrent GitHub observation across every lane on this host."""
+        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._bounded_lock(
+            self.observation_lock_path, "host queue observation"
+        ) as handle:
+            # Duplicate the locked open-file description into an inheritable
+            # descriptor so every bounded gh/ghapp tree retains the flock if
+            # this scanner is killed. The kernel then releases host authority
+            # only after the old observation tree exits.
+            self.observation_lock_fd = os.dup(handle.fileno())
+            os.set_inheritable(self.observation_lock_fd, True)
             try:
                 yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                os.close(self.observation_lock_fd)
+                self.observation_lock_fd = None
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.
@@ -389,24 +427,32 @@ class QueueScanner:
             ):
                 return cached_runs
 
-            self.api_calls = 0
-            runs = self._runs(discovery)
-            candidates, backlog_ids = self._candidate_runs(runs, discovery)
-            discovered: list[dict[str, Any]] = []
-            for run in candidates[: self.args.max_job_fetches]:
-                run_id = int(run["id"])
-                jobs = self._gh(
-                    f"repos/{self.args.repo}/actions/runs/{run_id}"
-                    "/jobs?filter=latest&per_page=100"
-                ).get("jobs", [])
-                if not isinstance(jobs, list):
-                    raise ValueError(f"jobs is not a list for run {run_id}")
-                discovered.append({**run, "_jobs": jobs})
+            # Namespace locks coalesce identical scans. This host-global lock
+            # additionally prevents distinct repos/workflows from launching
+            # simultaneous gh/ghapp bursts. On slower hosts those bursts can
+            # all exceed their subprocess deadline and make healthy lanes look
+            # scan-blind. A bounded wait fails closed instead of hanging the
+            # supervisor or publishing a partial snapshot.
+            with self._observation_lock():
+                self.now = int(time.time())
+                self.api_calls = 0
+                runs = self._runs(discovery)
+                candidates, backlog_ids = self._candidate_runs(runs, discovery)
+                discovered: list[dict[str, Any]] = []
+                for run in candidates[: self.args.max_job_fetches]:
+                    run_id = int(run["id"])
+                    jobs = self._gh(
+                        f"repos/{self.args.repo}/actions/runs/{run_id}"
+                        "/jobs?filter=latest&per_page=100"
+                    ).get("jobs", [])
+                    if not isinstance(jobs, list):
+                        raise ValueError(f"jobs is not a list for run {run_id}")
+                    discovered.append({**run, "_jobs": jobs})
 
-            discovery["fetched_at"] = self.now
-            discovery["runs"] = discovered
-            self._save_json(self.discovery_path, discovery)
-            return discovered
+                discovery["fetched_at"] = int(time.time())
+                discovery["runs"] = discovered
+                self._save_json(self.discovery_path, discovery)
+                return discovered
 
     def _scan_locked(self) -> int:
         runs = self._discover()
@@ -513,6 +559,20 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("TARTCI_SHARED_QUEUE_CACHE")
         or str(Path.home() / ".tartci/state/queue-discovery.json"),
     )
+    parser.add_argument(
+        "--observation-lock-file",
+        default=os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE")
+        or str(Path.home() / ".tartci/state/queue-observation.lock"),
+        help="host-global lock shared by all queue-observation namespaces",
+    )
+    parser.add_argument(
+        "--observation-lock-timeout",
+        type=float,
+        default=float(
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")
+        ),
+        help="seconds to wait for the host-global observation lock",
+    )
     parser.add_argument("--provider", required=True)
     parser.add_argument(
         "--lane-id",
@@ -564,6 +624,11 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.stagger_max_seconds < 0:
         parser.error("--stagger-max-seconds must be non-negative")
+    if (
+        not math.isfinite(args.observation_lock_timeout)
+        or args.observation_lock_timeout <= 0
+    ):
+        parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     statuses = {
