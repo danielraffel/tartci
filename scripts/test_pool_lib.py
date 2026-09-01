@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import os
+import json
+import plistlib
 import subprocess
 import tempfile
 import textwrap
@@ -291,13 +293,44 @@ class RunnerAgentLoadedTests(unittest.TestCase):
     def test_pool_status_uses_loaded_probe_for_both_output_modes(self) -> None:
         source = (ROOT / "tartci").read_text()
         status = source.index("    status)", source.index("cmd_pool()"))
-        end = source.index('    *) echo "usage: tartci pool', status)
+        end = source.index("\n      ;;", status)
         body = source[status:end]
         self.assertEqual(body.count('tartci_pool_agent_loaded "$label"'), 2)
         self.assertNotIn("launchctl list", body)
 
 
 class PoolCommandHelpTests(unittest.TestCase):
+    def test_managed_plist_without_receipt_is_broken_and_require_ready_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            state = home / ".config/tartci"
+            state.mkdir(parents=True)
+            (state / "pool-state").write_text("on\n")
+            (state / "native-build-participation").write_text("1\n")
+            label = "com.danielraffel.tartci.tart-runner-macos-fleet.test.gate"
+            with (agents / f"{label}.plist").open("wb") as handle:
+                plistlib.dump({"Label": label, "ProgramArguments": ["/bin/true"]}, handle)
+            env = {**os.environ, "HOME": str(home)}
+            observed = subprocess.run(
+                [str(ROOT / "tartci"), "pool", "status", "--json"],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(observed.returncode, 0, observed.stderr)
+            body = json.loads(observed.stdout)
+            self.assertTrue(body["fleet"]["managed"])
+            self.assertFalse(body["fleet"]["fleet_ready"])
+            self.assertEqual(
+                body["fleet"]["problems"][0]["code"], "receipt_mismatch"
+            )
+            required = subprocess.run(
+                [str(ROOT / "tartci"), "pool", "status", "--json", "--require-ready"],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(required.returncode, 8, required.stderr)
+
     def _run_pool(
         self, root: Path, *args: str
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
