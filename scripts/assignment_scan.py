@@ -53,6 +53,7 @@ class AssignmentScanner:
         self.observation_lock_path = Path(args.observation_lock_file)
         self.api_calls = 0
         self.api_calls_lock = threading.Lock()
+        self.observation_lock_fd: int | None = None
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
@@ -76,7 +77,13 @@ class AssignmentScanner:
                         )
                     time.sleep(0.05)
             try:
-                yield
+                self.observation_lock_fd = os.dup(handle.fileno())
+                os.set_inheritable(self.observation_lock_fd, True)
+                try:
+                    yield
+                finally:
+                    os.close(self.observation_lock_fd)
+                    self.observation_lock_fd = None
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -95,6 +102,9 @@ class AssignmentScanner:
                 [self.args.gh_cli, "api", path],
                 timeout=min(self.args.gh_timeout, remaining),
                 operation="assignment_scan_github_api",
+                pass_fds=(self.observation_lock_fd,)
+                if self.observation_lock_fd is not None
+                else (),
             )
         except (OSError, ObservationError) as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error

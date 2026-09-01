@@ -114,6 +114,7 @@ class QueueScanner:
         self.state: dict[str, Any] = {}
         self.now = int(time.time())
         self.api_calls = 0
+        self.observation_lock_fd: int | None = None
 
     def _gh(self, path: str) -> dict[str, Any]:
         if self.api_calls >= self.args.max_api_calls:
@@ -125,6 +126,9 @@ class QueueScanner:
             [self.args.gh_cli, "api", path],
             timeout=self.args.gh_timeout,
             operation="queue_scan_github_api",
+            pass_fds=(self.observation_lock_fd,)
+            if self.observation_lock_fd is not None
+            else (),
         )
         if result.returncode:
             raise GitHubApiError(path, result.returncode, result.stderr)
@@ -190,7 +194,7 @@ class QueueScanner:
                         )
                     time.sleep(0.05)
             try:
-                yield
+                yield handle
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
@@ -211,8 +215,18 @@ class QueueScanner:
         self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self._bounded_lock(
             self.observation_lock_path, "host queue observation"
-        ):
-            yield
+        ) as handle:
+            # Duplicate the locked open-file description into an inheritable
+            # descriptor so every bounded gh/ghapp tree retains the flock if
+            # this scanner is killed. The kernel then releases host authority
+            # only after the old observation tree exits.
+            self.observation_lock_fd = os.dup(handle.fileno())
+            os.set_inheritable(self.observation_lock_fd, True)
+            try:
+                yield
+            finally:
+                os.close(self.observation_lock_fd)
+                self.observation_lock_fd = None
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.

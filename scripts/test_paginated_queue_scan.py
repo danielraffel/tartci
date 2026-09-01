@@ -814,6 +814,76 @@ finally:
             self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
             self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
 
+    def test_scanner_death_keeps_host_lock_with_observation_child(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            entered = root / "entered"
+            calls = root / "calls"
+            stub = root / "orphanable-gh"
+            stub.write_text(
+                """#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+with open(os.environ['CALLS'], 'a+', encoding='utf-8') as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX); handle.write(sys.argv[-1] + '\\n'); handle.flush()
+try:
+    fd = os.open(os.environ['ENTERED'], os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+except FileExistsError:
+    pass
+else:
+    os.close(fd); time.sleep(1)
+path = sys.argv[-1]
+if path.endswith('/actions/workflows?per_page=100'):
+    payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
+elif 'status=queued' in path or 'status=in_progress' in path:
+    payload = {'workflow_runs': []}
+else:
+    raise SystemExit(2)
+print(json.dumps(payload))
+""",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            lock = root / "host-observation.lock"
+            env = {**os.environ, "ENTERED": str(entered), "CALLS": str(calls)}
+
+            def command(repo: str, timeout: str) -> list[str]:
+                return [
+                    sys.executable, str(MODULE_PATH), "--repo", repo,
+                    "--workflow", "Build and Test", "--labels", "self-hosted",
+                    "--provider", "tart-macos", "--state-file", str(root / f"{repo.rsplit('/', 1)[-1]}.json"),
+                    "--shared-cache-file", str(root / "discovery.json"),
+                    "--observation-lock-file", str(lock),
+                    "--observation-lock-timeout", timeout,
+                    "--stagger-max-seconds", "0", "--gh-cli", str(stub),
+                ]
+
+            owner = subprocess.Popen(
+                command("owner/first", "5"),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env,
+            )
+            deadline = time.monotonic() + 3
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(entered.exists(), "first observation child never started")
+            owner.kill()
+            owner.communicate(timeout=3)
+
+            denied = subprocess.run(
+                command("owner/second", "0.1"),
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(denied.returncode, 1)
+            self.assertIn("host queue observation lock timed out", denied.stderr)
+            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
+
+            time.sleep(1.1)
+            recovered = subprocess.run(
+                command("owner/third", "2"),
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(recovered.returncode, 0, recovered.stderr)
+            self.assertEqual(recovered.stdout.strip(), "0")
+
     def test_host_observation_lock_timeout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
