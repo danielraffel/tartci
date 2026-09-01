@@ -70,6 +70,14 @@ check(wd.launchctl_reports_absent(
       "launchctl not-found response must prove absence")
 check(not wd.launchctl_reports_absent(1, "permission denied"),
       "generic launchctl failure must not prove absence")
+disabled = wd.parse_disabled_services("""\
+disabled services = {\n
+\t\"com.example.retired\" => disabled\n
+\t\"com.example.live\" => enabled\n
+}\n
+""")
+check(disabled == {"com.example.retired"},
+      f"launchd disabled map must preserve only exact disabled labels: {disabled!r}")
 
 
 # ── classify ─────────────────────────────────────────────────────────────────
@@ -230,6 +238,30 @@ check(wd.is_pool_runner("com.danielraffel.forge.tart-runner-macos"),
       "Forge tart runner must be pool-controlled")
 check(not wd.is_pool_runner("com.danielraffel.tartci.orchard-worker"),
       "orchard worker must not inherit pool participation")
+
+# Per-lane launchd disablement is more specific than host participation. A
+# profile may keep the host on while an advisory/legacy lane remains disabled.
+with tempfile.TemporaryDirectory() as td:
+    plist = Path(td) / "com.danielraffel.pulp.tart-runner-linux.plist"
+    with plist.open("wb") as fh:
+        plistlib.dump({"Label": plist.stem}, fh)
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (113, "", "Could not find service")
+        health = wd.gather_health(
+            plist.stem, str(plist), STALE, vm_running=False,
+            pool_participating=True, service_enabled=False,
+        )
+        unknown = wd.gather_health(
+            plist.stem, str(plist), STALE, vm_running=False,
+            pool_participating=True, service_enabled=None,
+        )
+    finally:
+        wd._run = original_run
+    check(health.verdict == "healthy" and "explicitly disabled" in health.reason,
+          f"disabled lane must not be healed: {health}")
+    check(unknown.verdict == "unknown" and "refusing" in unknown.reason,
+          f"unknown enablement must fail closed without heal: {unknown}")
 
 with tempfile.TemporaryDirectory() as td:
     participation = os.path.join(td, "participate")
