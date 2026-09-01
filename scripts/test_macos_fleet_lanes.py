@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import plistlib
 import json
+import shutil
 import tomllib
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+
+import tartci_support_manifest as support_manifest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -23,6 +26,41 @@ RUNNER_GROUP_IDS = {
     "Generous-Corp/forge": 11,
     "Generous-Corp/vellum": 8,
 }
+
+
+def write_support_manifest(root: Path, path: Path) -> None:
+    path.write_text(json.dumps({
+        "schema": 2,
+        "repository": "https://github.com/danielraffel/tartci.git",
+        "source_commit": "a" * 40,
+        "members": [
+            support_manifest.member(root, name)
+            for name in sorted(support_manifest.filesystem_names(root))
+        ],
+    }))
+
+
+def freeze_support_cohort(root: Path, manifest: Path) -> None:
+    for name in support_manifest.filesystem_names(root):
+        target = root / name
+        target.chmod((target.stat().st_mode & 0o777) & ~0o222)
+    manifest.chmod(0o444)
+    for directory in [root, *root.rglob("*")]:
+        if directory.is_dir() and not directory.is_symlink():
+            directory.chmod(0o555)
+
+
+def thaw_support_cohort(root: Path) -> None:
+    for directory in [root, *root.rglob("*")]:
+        if directory.is_dir() and not directory.is_symlink():
+            directory.chmod(0o755)
+
+
+def copy_support_cohort(root: Path) -> None:
+    for name in sorted(support_manifest.filesystem_names(ROOT)):
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / name, target)
 
 
 class MacosFleetLaneTests(unittest.TestCase):
@@ -384,24 +422,48 @@ class MacosFleetLaneTests(unittest.TestCase):
     def test_receipt_verifies_exact_plists_and_rejects_tampering(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
+            home = root / "home"
             agents = root / "agents"
             agents.mkdir()
+            config = root / "fleet.toml"
+            config.write_text(CONFIG.read_text().replace("/Users/danielraffel", str(home)))
             render = subprocess.run(
-                [str(ROOT / "tartci"), "fleet-macos", "render", str(CONFIG), "--output", str(agents)],
+                [str(ROOT / "tartci"), "fleet-macos", "render", str(config), "--output", str(agents)],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(render.returncode, 0, render.stderr)
             receipt = root / "receipt.json"
+            support_root = root / "support"
+            copy_support_cohort(support_root)
+            manifest = support_root / support_manifest.MANIFEST_NAME
+            write_support_manifest(support_root, manifest)
+            launch = support_root / support_manifest.LAUNCH_NAME
+            launch.write_bytes(support_manifest.canonical_wrapper_bytes(support_root))
+            launch.chmod(0o555)
+            launch = launch.resolve()
+            freeze_support_cohort(support_root, manifest)
+            for plist_path in agents.glob("*.plist"):
+                value = plistlib.loads(plist_path.read_bytes())
+                value["ProgramArguments"][1] = str(launch)
+                plist_path.write_bytes(plistlib.dumps(value, sort_keys=False))
+            entrypoint = home / ".local/bin/tartci"
+            support_manifest.write_wrapper(entrypoint, support_root)
             write = subprocess.run(
-                [str(ROOT / "tartci"), "fleet-macos", "write-receipt", str(CONFIG),
-                 "--agents-dir", str(agents), "--output", str(receipt)],
+                [str(ROOT / "tartci"), "fleet-macos", "write-receipt", str(config),
+                 "--agents-dir", str(agents), "--output", str(receipt),
+                 "--support-root", str(support_root), "--support-manifest", str(manifest),
+                 "--entrypoint", str(entrypoint),
+                 "--entrypoint-source", str(entrypoint),
+                 "--launch-entrypoint", str(launch),
+                 "--source-authority-commit", "a" * 40],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(write.returncode, 0, write.stderr)
-            self.assertEqual(json.loads(receipt.read_text())["schema"], 1)
+            self.assertEqual(json.loads(receipt.read_text())["schema"], 2)
             verify = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
-                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(verify.returncode, 0, verify.stderr)
@@ -409,7 +471,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             stale.write_bytes(next(agents.glob("*.plist")).read_bytes())
             extra = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
-                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(extra.returncode, 2)
@@ -419,11 +482,13 @@ class MacosFleetLaneTests(unittest.TestCase):
             target.write_bytes(target.read_bytes() + b"\n")
             rejected = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
-                 "--config", str(CONFIG), "--agents-dir", str(agents)],
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(rejected.returncode, 2)
             self.assertIn("failed receipt verification", rejected.stderr)
+            thaw_support_cohort(support_root)
 
     def test_invalid_config_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -13,6 +13,7 @@
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
+#   tartci support-manifest <write|verify|stage-install> # bind/install runtime cohort
 #   tartci gate-slot2 <render|validate|install> # managed second Pulp macOS gate lane
 #   tartci tart-image-sync ... # resumable, checksum-verified Tart golden transfer
 #   tartci observe macos       # read-only live view of macOS VM runners/jobs
@@ -120,7 +121,7 @@ cmd_profile() {
 cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    validate|render|write-receipt|verify-installed)
+    validate|render|write-receipt|verify-installed|verify-loaded)
       exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
@@ -128,6 +129,10 @@ cmd_fleet_macos() {
       ;;
     *) echo "usage: tartci fleet-macos <validate|render|install> ..."; return 2 ;;
   esac
+}
+
+cmd_support_manifest() {
+  exec python3 "$HERE/scripts/tartci_support_manifest.py" "$@"
 }
 
 cmd_gate_slot2() {
@@ -336,19 +341,27 @@ cmd_pool() {
       else
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
         local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
-        local fleet_plists
+        local loaded_receipt="$HOME/.config/tartci/macos-fleet-loaded.json"
+        local fleet_plists activation_agents=""
         fleet_plists="$(find "$agents_dir" -maxdepth 1 \
           -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' \
           -print 2>/dev/null || true)"
         if [ -n "$fleet_plists" ] || [ -f "$fleet_receipt" ]; then
-          if [ ! -f "$fleet_receipt" ] \
-            || ! python3 "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
-              --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
-              --agents-dir "$agents_dir" >/dev/null; then
+          if [ ! -f "$fleet_receipt" ]; then
             tartci_pool_lock_release
             echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
             return 7
           fi
+          if ! activation_agents="$(python3 "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
+              --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+              --agents-dir "$agents_dir" --support-root "$HERE" \
+              --print-services)"; then
+            tartci_pool_lock_release
+            echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
+            return 7
+          fi
+        else
+          activation_agents="$(tartci_pool_runner_agents "$agents_dir")"
         fi
         # A host-local network profile is an opt-in admission prerequisite.
         # Converge and prove its relay before making participation visible or
@@ -359,13 +372,11 @@ cmd_pool() {
           return 6
         fi
         # A held-idle receipt authorizes exactly one drain era. Reopening the
-        # pool invalidates it before admission becomes visible again.
+        # pool invalidates it before any controller becomes eligible to admit.
         rm -f "$TARTCI_POOL_PERSISTENT_HOLD_FILE"
-        tartci_pool_write_state on
-        tartci_pool_write_participation 1
       fi
-      echo "state: $sub; participation: $target"
-      local label n=0 launchd_target
+      local label n=0 launchd_target load_failed=0 was_loaded
+      local -a newly_loaded=()
       while IFS= read -r label; do
         [ -n "$label" ] || continue
         launchd_target="$(tartci_pool_launchd_target "$label")"
@@ -377,18 +388,45 @@ cmd_pool() {
             echo "  (already stopped: $label)"
           fi
         else
+          was_loaded=0
+          launchctl print "$launchd_target" >/dev/null 2>&1 && was_loaded=1
           launchctl enable "$launchd_target" >/dev/null 2>&1 || true
           if launchctl print "$launchd_target" >/dev/null 2>&1 \
-            || launchctl bootstrap "gui/$(id -u)" "$agents_dir/$label.plist" >/dev/null 2>&1; then
+            || { launchctl bootstrap "gui/$(id -u)" "$agents_dir/$label.plist" >/dev/null 2>&1 \
+              && launchctl print "$launchd_target" >/dev/null 2>&1; }; then
             echo "  enabled $label"; n=$((n + 1))
+            [ "$was_loaded" = 1 ] || newly_loaded+=("$label")
           else
             echo "  (enable skipped: $label)"
+            load_failed=1
           fi
         fi
       done <<EOF
-$(tartci_pool_runner_agents "$agents_dir")
+$([ "$sub" = on ] && printf '%s\n' "$activation_agents" || tartci_pool_runner_agents "$agents_dir")
 EOF
-      [ "$sub" = off ] || tartci_pool_lock_release
+      if [ "$sub" = on ]; then
+        if [ "$load_failed" = 0 ] && [ -n "$fleet_plists" ]; then
+          python3 "$HERE/scripts/macos_fleet_lanes.py" verify-loaded "$fleet_receipt" \
+            --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+            --agents-dir "$agents_dir" --support-root "$HERE" \
+            --output "$loaded_receipt" >/dev/null || load_failed=1
+        fi
+        if [ "$load_failed" != 0 ]; then
+          rm -f "$loaded_receipt"
+          for label in "${newly_loaded[@]}"; do
+            launchd_target="$(tartci_pool_launchd_target "$label")"
+            launchctl disable "$launchd_target" >/dev/null 2>&1 || true
+            launchctl bootout "$launchd_target" >/dev/null 2>&1 || true
+          done
+          tartci_pool_lock_release
+          echo "pool on refused: loaded runner generation did not match its receipt" >&2
+          return 7
+        fi
+        tartci_pool_write_state on
+        tartci_pool_write_participation 1
+        tartci_pool_lock_release
+      fi
+      echo "state: $sub; participation: $target"
       echo "runner agents changed: $n"
       if [ "$sub" = off ]; then
         echo "opted OUT: $host agents unloaded immediately (pool off is not a drain)"
@@ -498,6 +536,7 @@ case "${1:-help}" in
   leases)  shift; cmd_leases "$@" ;;
   profile) shift; cmd_profile "$@" ;;
   fleet-macos) shift; cmd_fleet_macos "$@" ;;
+  support-manifest) shift; cmd_support_manifest "$@" ;;
   gate-slot2) shift; cmd_gate_slot2 "$@" ;;
   tart-image-sync) shift; cmd_tart_image_sync "$@" ;;
   observe) shift; cmd_observe "$@" ;;

@@ -14,9 +14,15 @@ import os
 import posixpath
 import plistlib
 import re
+import stat
+import subprocess
 import sys
+import tempfile
+import time
 import tomllib
 from pathlib import Path, PurePosixPath
+
+import tartci_support_manifest as support_manifest
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -325,7 +331,9 @@ def load(path: Path) -> dict:
     return data
 
 
-def rendered_plists(data: dict) -> dict[str, bytes]:
+def rendered_plists(
+    data: dict, *, launch_entrypoint: Path | None = None
+) -> dict[str, bytes]:
     host_id = data["host"]["id"]
     result: dict[str, bytes] = {}
     for lane in data["lane"]:
@@ -336,7 +344,10 @@ def rendered_plists(data: dict) -> dict[str, bytes]:
                 f"{host_id}.{lane['id']}{suffix}.plist"
             )
             result[name] = plistlib.dumps(
-                lane_plist(data, lane, slot=slot), sort_keys=False
+                lane_plist(
+                    data, lane, slot=slot, launch_entrypoint=launch_entrypoint
+                ),
+                sort_keys=False,
             )
     return result
 
@@ -345,9 +356,21 @@ def replacements(data: dict) -> list[str]:
     return [label for lane in data["lane"] for label in lane.get("replaces_launchd_labels", [])]
 
 
-def write_receipt(config: Path, agents_dir: Path, output: Path) -> None:
+def write_receipt(
+    config: Path,
+    agents_dir: Path,
+    output: Path,
+    support_root: Path,
+    manifest_path: Path,
+    entrypoint: Path,
+    entrypoint_source: Path,
+    launch_entrypoint: Path,
+    source_authority_commit: str,
+) -> None:
     data = load(config)
-    expected = rendered_plists(data)
+    support_root = support_root.resolve()
+    launch_entrypoint = launch_entrypoint.resolve()
+    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -364,36 +387,129 @@ def write_receipt(config: Path, agents_dir: Path, output: Path) -> None:
     for label in replacements(data):
         if (agents_dir / f"{label}.plist").exists():
             fail(f"declared legacy LaunchAgent is still installable: {label}")
+    manifest_path = manifest_path.resolve()
+    if manifest_path != support_root / support_manifest.MANIFEST_NAME:
+        fail("support manifest must be installed inside the immutable support root")
+    support = support_manifest.verify(
+        support_root, manifest_path, immutable=True
+    )
+    if source_authority_commit != support["source_commit"]:
+        fail("authenticated source authority does not match the support commit")
+    wrapper = support_manifest.staged_wrapper_record(
+        entrypoint_source, entrypoint, support_root
+    )
+    launch = support_manifest.launch_record(launch_entrypoint, support_root)
+    interpreter = Path("/usr/bin/python3")
+    interpreter_info = interpreter.lstat()
+    if interpreter.is_symlink() or not interpreter.is_file():
+        fail("fleet launch interpreter must be a regular non-symlink file")
+    interpreter_record = {
+        "path": str(interpreter),
+        "mode": stat.S_IMODE(interpreter_info.st_mode),
+        "sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "owner_uid": interpreter_info.st_uid,
+    }
     receipt = {
-        "schema": 1,
+        "schema": 2,
         "profile": data.get("name", config.stem),
         "config_path": str(config.resolve()),
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "agents_dir": str(agents_dir.resolve()),
         "plists": digests,
         "retired_launchd_labels": replacements(data),
+        "support": {
+            "root": str(support_root),
+            "manifest_path": str(manifest_path),
+            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "repository": support["repository"],
+            "source_commit": support["source_commit"],
+            "members": support["members"],
+            "entrypoint": wrapper,
+            "launch_entrypoint": launch,
+            "interpreter": interpreter_record,
+            "source_authority": {
+                "kind": "github_app_commit_read",
+                "repository": support["repository"],
+                "commit": source_authority_commit,
+            },
+        },
     }
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
-def verify_receipt(path: Path, config: Path, agents_dir: Path) -> None:
+def verify_receipt(
+    path: Path, config: Path, agents_dir: Path, support_root: Path
+) -> dict:
     try:
         receipt = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"could not read install receipt {path}: {exc}")
-    if not isinstance(receipt, dict) or receipt.get("schema") != 1:
-        fail("install receipt schema must be 1")
+    if not isinstance(receipt, dict) or receipt.get("schema") != 2:
+        fail("install receipt schema must be 2")
     config = config.resolve()
     agents_dir = agents_dir.resolve()
+    support_root = support_root.resolve()
     if (Path(receipt.get("config_path", "")).resolve() != config
             or Path(receipt.get("agents_dir", "")).resolve() != agents_dir):
         fail("install receipt paths do not match the canonical installed paths")
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
+    support = receipt.get("support")
+    if not isinstance(support, dict) or set(support) != {
+        "root", "manifest_path", "manifest_sha256", "repository", "source_commit",
+        "members", "entrypoint", "launch_entrypoint", "interpreter",
+        "source_authority",
+    }:
+        fail("install receipt support cohort is missing or malformed")
+    if Path(str(support.get("root", ""))).resolve() != support_root:
+        fail("install receipt support root does not match the active TartCI root")
+    manifest_path = Path(str(support.get("manifest_path", ""))).resolve()
+    if manifest_path != support_root / support_manifest.MANIFEST_NAME:
+        fail("install receipt manifest is outside the immutable support root")
+    verified_support = support_manifest.verify(
+        support_root, manifest_path, immutable=True
+    )
+    if (
+        hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        != support.get("manifest_sha256")
+        or verified_support.get("repository") != support.get("repository")
+        or verified_support.get("source_commit") != support.get("source_commit")
+        or verified_support.get("members") != support.get("members")
+    ):
+        fail("installed TartCI support cohort does not match its receipt")
+    if support.get("source_authority") != {
+        "kind": "github_app_commit_read",
+        "repository": verified_support["repository"],
+        "commit": verified_support["source_commit"],
+    }:
+        fail("installed TartCI source authority does not match its receipt")
+    data = load(config)
+    expected_entrypoint = Path(data["host"]["home"]) / ".local/bin/tartci"
+    verified_entrypoint = support_manifest.wrapper_record(
+        expected_entrypoint, support_root
+    )
+    if verified_entrypoint != support.get("entrypoint"):
+        fail("installed TartCI entrypoint does not match its receipt")
+    launch_entrypoint = support_root / support_manifest.LAUNCH_NAME
+    if (
+        support_manifest.launch_record(launch_entrypoint, support_root)
+        != support.get("launch_entrypoint")
+    ):
+        fail("installed TartCI launch entrypoint does not match its receipt")
+    interpreter = Path("/usr/bin/python3")
+    interpreter_info = interpreter.lstat()
+    interpreter_record = {
+        "path": str(interpreter),
+        "mode": stat.S_IMODE(interpreter_info.st_mode),
+        "sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+        "owner_uid": interpreter_info.st_uid,
+    }
+    if interpreter.is_symlink() or not interpreter.is_file() \
+            or interpreter_record != support.get("interpreter"):
+        fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
-    data = load(config)
-    expected = rendered_plists(data)
+    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -416,9 +532,124 @@ def verify_receipt(path: Path, config: Path, agents_dir: Path) -> None:
     for label in expected_retired:
         if (agents_dir / f"{label}.plist").exists():
             fail(f"declared legacy LaunchAgent became installable again: {label}")
+    return receipt
 
 
-def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
+def _loaded_has(output: str, value: str, description: str) -> None:
+    if value not in output:
+        fail(
+            f"loaded LaunchAgent {description} does not match its receipt "
+            f"(missing {value!r})"
+        )
+
+
+def verify_loaded(
+    receipt_path: Path,
+    config: Path,
+    agents_dir: Path,
+    support_root: Path,
+) -> dict:
+    receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
+    expected = rendered_plists(
+        load(config),
+        launch_entrypoint=support_root / support_manifest.LAUNCH_NAME,
+    )
+    loaded: dict[str, str] = {}
+    for name, payload in expected.items():
+        label = name.removesuffix(".plist")
+        result = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            fail(
+                f"could not read loaded LaunchAgent {label}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        output = result.stdout
+        value = plistlib.loads(payload)
+        loaded_path = re.search(r"^\tpath = (.+)$", output, re.MULTILINE)
+        if (
+            loaded_path is None
+            or Path(loaded_path.group(1)).resolve() != (agents_dir / name).resolve()
+        ):
+            fail(f"loaded LaunchAgent {label} path does not match its receipt")
+        _loaded_has(output, f"\tprogram = {value['ProgramArguments'][0]}\n", f"{label} program")
+        arguments = "\targuments = {\n" + "".join(
+            f"\t\t{argument}\n" for argument in value["ProgramArguments"]
+        ) + "\t}\n"
+        _loaded_has(output, arguments, f"{label} arguments")
+        for key, plist_key in (
+            ("working directory", "WorkingDirectory"),
+            ("stdout path", "StandardOutPath"),
+            ("stderr path", "StandardErrorPath"),
+        ):
+            _loaded_has(output, f"\t{key} = {value[plist_key]}\n", f"{label} {key}")
+        environment = value["EnvironmentVariables"]
+        for key, expected_value in environment.items():
+            _loaded_has(
+                output,
+                f"\t\t{key} => {expected_value}\n",
+                f"{label} environment {key}",
+            )
+        environment_start = output.find("\n\tenvironment = {\n")
+        environment_end = output.find("\n\t}\n", environment_start + 2)
+        if environment_start < 0 or environment_end < 0:
+            fail(f"loaded LaunchAgent {label} has no readable environment")
+        loaded_environment = output[environment_start:environment_end]
+        loaded_keys = set(re.findall(
+            r"^\t\t([A-Z][A-Z0-9_]*) =>", loaded_environment, re.MULTILINE
+        ))
+        unexpected_governed = {
+            key for key in loaded_keys - set(environment)
+            if key.startswith(("TARTCI_", "SHIPYARD_", "TART_HOME"))
+        }
+        if unexpected_governed:
+            fail(
+                f"loaded LaunchAgent {label} retains obsolete governed environment: "
+                f"{sorted(unexpected_governed)}"
+            )
+        properties = next(
+            (line for line in output.splitlines() if line.startswith("\tproperties = ")),
+            "",
+        )
+        if "keepalive" not in properties or "runatload" not in properties:
+            fail(f"loaded LaunchAgent {label} lost keepalive/runatload properties")
+        loaded[name] = hashlib.sha256(output.encode()).hexdigest()
+    return {
+        "schema": 1,
+        "verified_at_unix": int(time.time()),
+        "install_receipt_path": str(receipt_path.resolve()),
+        "install_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "support_root": str(support_root.resolve()),
+        "loaded_services": loaded,
+    }
+
+
+def atomic_write_json(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, staged_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    staged = Path(staged_name)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        staged.chmod(0o644)
+        os.replace(staged, path)
+    finally:
+        staged.unlink(missing_ok=True)
+
+
+def lane_plist(
+    data: dict,
+    lane: dict,
+    *,
+    slot: int = 1,
+    launch_entrypoint: Path | None = None,
+) -> dict:
     host = data["host"]
     lane_id = lane["id"]
     suffix = "" if slot == 1 else f".slot{slot}"
@@ -500,7 +731,9 @@ def lane_plist(data: dict, lane: dict, *, slot: int = 1) -> dict:
     return {
         "Label": label,
         "ProgramArguments": [
-            "/bin/bash", f"{host['home']}/.local/bin/tartci", "serve", "macos", "--loop"
+            "/bin/bash",
+            str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci"),
+            "serve", "macos", "--loop",
         ],
         "WorkingDirectory": host["home"],
         "RunAtLoad": True,
@@ -524,22 +757,59 @@ def main(argv: list[str] | None = None) -> int:
     receipt.add_argument("config", type=Path)
     receipt.add_argument("--agents-dir", required=True, type=Path)
     receipt.add_argument("--output", required=True, type=Path)
+    receipt.add_argument("--support-root", required=True, type=Path)
+    receipt.add_argument("--support-manifest", required=True, type=Path)
+    receipt.add_argument("--entrypoint", required=True, type=Path)
+    receipt.add_argument("--entrypoint-source", required=True, type=Path)
+    receipt.add_argument("--launch-entrypoint", required=True, type=Path)
+    receipt.add_argument("--source-authority-commit", required=True)
     verify = sub.add_parser("verify-installed")
     verify.add_argument("receipt", type=Path)
     verify.add_argument("--config", required=True, type=Path)
     verify.add_argument("--agents-dir", required=True, type=Path)
+    verify.add_argument("--support-root", required=True, type=Path)
+    verify.add_argument("--print-services", action="store_true")
+    loaded = sub.add_parser("verify-loaded")
+    loaded.add_argument("receipt", type=Path)
+    loaded.add_argument("--config", required=True, type=Path)
+    loaded.add_argument("--agents-dir", required=True, type=Path)
+    loaded.add_argument("--support-root", required=True, type=Path)
+    loaded.add_argument("--output", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
+        if args.command == "verify-loaded":
+            value = verify_loaded(
+                args.receipt, args.config, args.agents_dir, args.support_root
+            )
+            atomic_write_json(args.output, value)
+            print(f"verified loaded macOS fleet generation: {args.output}")
+            return 0
         if args.command == "verify-installed":
-            verify_receipt(args.receipt, args.config, args.agents_dir)
-            print(f"verified installed macOS fleet receipt: {args.receipt}")
+            receipt_value = verify_receipt(
+                args.receipt, args.config, args.agents_dir, args.support_root
+            )
+            if args.print_services:
+                for name in sorted(receipt_value["plists"]):
+                    print(name.removesuffix(".plist"))
+            else:
+                print(f"verified installed macOS fleet receipt: {args.receipt}")
             return 0
         data = load(args.config)
         if args.command == "validate":
             print(f"valid: host={data['host']['id']} lanes={len(data['lane'])} activation=unchanged")
             return 0
         if args.command == "write-receipt":
-            write_receipt(args.config, args.agents_dir, args.output)
+            write_receipt(
+                args.config,
+                args.agents_dir,
+                args.output,
+                args.support_root,
+                args.support_manifest,
+                args.entrypoint,
+                args.entrypoint_source,
+                args.launch_entrypoint,
+                args.source_authority_commit,
+            )
             print(args.output)
             return 0
         args.output.mkdir(parents=True, exist_ok=True)
