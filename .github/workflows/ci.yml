@@ -31,6 +31,18 @@ jobs:
       - name: Run repo lint (shellcheck + bash -n + py_compile + TOML parse)
         run: ./scripts/lint.sh
 
+      - name: Match the macOS launch-interpreter contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -L /usr/bin/python3 ]]; then
+            source_python="$(readlink -f /usr/bin/python3)"
+            sudo cp --remove-destination "$source_python" /usr/bin/python3
+          fi
+          test -f /usr/bin/python3
+          test ! -L /usr/bin/python3
+          /usr/bin/python3 --version
+
       - name: Run unit tests
         # lint.sh only py_compiles the test files; actually EXECUTE the
         # behavioral suites so a regression in e.g. the idle-gate subset
