@@ -11,9 +11,11 @@ import tempfile
 import textwrap
 import threading
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import tartci_support_manifest as support_manifest
+import network_profile as network
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -565,6 +567,57 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(1, loaded["schema"])
         self.assertEqual(set(receipt["plists"]), set(loaded["loaded_services"]))
+
+    def test_loaded_verifier_accepts_exact_receipted_network_overlay(self) -> None:
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        target = next(self.agents.glob("*macos-fleet*.plist"))
+        profile = self.home / ".config/tartci/custom/network-profile.toml"
+        profile.parent.mkdir()
+        profile.write_text(
+            "schema_version = 1\n[http_connect_relay]\n"
+            "enabled = true\nrelay_hosts = [\"relay-a\", \"relay-b\"]\n"
+            "github_cli = \"ghapp\"\n"
+            "github_probe_repo = \"Generous-Corp/pulp\"\n"
+            "probe_timeout_seconds = 15\n"
+        )
+        with (
+            mock.patch.object(network, "_loaded_path", return_value=None),
+            mock.patch.object(network, "_reload", return_value=True),
+            mock.patch.object(network, "authenticated_probe", return_value=(True, "authenticated")),
+            mock.patch.object(network, "_any_tart_vm_running", return_value=False),
+            mock.patch.object(network.Path, "home", return_value=self.home),
+            mock.patch.dict(os.environ, {
+                "TARTCI_POOL_TRANSITION_LOCK": str(self.root / "pool.lock")
+            }),
+        ):
+            reconciled = network.reconcile(
+                profile,
+                self.agents,
+                participation_path=self.home / ".config/tartci/native-build-participation",
+            )
+        self.assertTrue(reconciled["ok"], reconciled)
+        receipt_path = self.home / ".config/tartci/macos-fleet-install.json"
+        receipt = json.loads(receipt_path.read_text())
+        support_root = Path(receipt["support"]["root"])
+        subprocess.run(
+            [str(self.fakebin / "launchctl"), "bootstrap", "gui/501", str(target)],
+            text=True, capture_output=True, check=True, env=self.env,
+        )
+        loaded_path = self.home / ".config/tartci/macos-fleet-loaded.json"
+        verified = subprocess.run(
+            [sys.executable, str(support_root / "scripts/macos_fleet_lanes.py"),
+             "verify-loaded", str(receipt_path),
+             "--config", str(self.home / ".config/tartci/macos-fleet-profile.toml"),
+             "--agents-dir", str(self.agents),
+             "--support-root", str(support_root),
+             "--output", str(loaded_path)],
+            text=True, capture_output=True, check=False,
+            env={**self.env, "TARTCI_NETWORK_PROFILE": str(profile)},
+        )
+        self.assertEqual(0, verified.returncode, verified.stderr)
+        loaded = json.loads(loaded_path.read_text())
+        self.assertEqual([target.name], list(loaded["loaded_services"]))
 
     def test_pool_on_does_not_activate_unreceipted_runner_services(self) -> None:
         installed = self.run_installer("--apply")

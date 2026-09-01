@@ -23,6 +23,7 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 import tartci_support_manifest as support_manifest
+import network_profile
 
 
 SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
@@ -53,10 +54,85 @@ REPLACED_AGENT = re.compile(
     r"^com[.]danielraffel[.](?:pulp[.]tart-runner|"
     r"[a-z0-9.-]+[.]tart-runner-[a-z0-9.-]+)$"
 )
+NETWORK_PROXY_ENV = {
+    "HTTP_PROXY": "http://127.0.0.1:49125",
+    "HTTPS_PROXY": "http://127.0.0.1:49125",
+    "http_proxy": "http://127.0.0.1:49125",
+    "https_proxy": "http://127.0.0.1:49125",
+    "NO_PROXY": "127.0.0.1,localhost,::1",
+    "no_proxy": "127.0.0.1,localhost,::1",
+    "TARTCI_GUEST_HTTP_PROXY": "http://192.168.64.1:49125",
+}
 
 
 def fail(message: str) -> None:
     raise ValueError(message)
+
+
+def _verified_network_overlay(
+    installed: Path, base_body: bytes, config: Path
+) -> bytes | None:
+    """Return a receipted host-network overlay, or None when it is not exact."""
+    if installed.is_symlink() or not installed.is_file():
+        return None
+    receipt_path = network_profile.applied_receipt_path(
+        network_profile.default_profile_path()
+    )
+    try:
+        receipt = json.loads(receipt_path.read_text())
+        body = installed.read_bytes()
+        value = plistlib.loads(body)
+        base = plistlib.loads(base_body)
+    except (OSError, json.JSONDecodeError, plistlib.InvalidFileException):
+        return None
+    if not isinstance(receipt, dict) or receipt.get("schema_version") != 1:
+        return None
+    label = value.get("Label")
+    agent = (receipt.get("agents") or {}).get(label)
+    owner = ((receipt.get("ownership") or {}).get("controllers") or {}).get(label)
+    if not isinstance(agent, dict) or set(agent) != {"digest", "path", "state"}:
+        return None
+    if (
+        Path(str(agent.get("path", ""))).resolve() != installed.resolve()
+        or agent.get("state") not in {"staged", "loaded"}
+        or agent.get("digest") != hashlib.sha256(
+            plistlib.dumps(value, sort_keys=True)
+        ).hexdigest()
+    ):
+        return None
+    if not isinstance(owner, dict) or set(owner) != {"environment", "path"}:
+        return None
+    original = owner.get("environment")
+    if (
+        Path(str(owner.get("path", ""))).resolve() != installed.resolve()
+        or not isinstance(original, dict)
+    ):
+        return None
+    if set(original) != set(NETWORK_PROXY_ENV):
+        return None
+    environment = value.get("EnvironmentVariables")
+    if not isinstance(environment, dict):
+        return None
+    if any(environment.get(key) != wanted for key, wanted in NETWORK_PROXY_ENV.items()):
+        return None
+    restored = dict(environment)
+    for key, state in original.items():
+        if not isinstance(state, dict) or set(state) not in (
+            {"present"}, {"present", "value"}
+        ) or not isinstance(state.get("present"), bool):
+            return None
+        if state["present"]:
+            if set(state) != {"present", "value"} or not isinstance(state["value"], str):
+                return None
+            restored[key] = state["value"]
+        else:
+            if set(state) != {"present"}:
+                return None
+            restored.pop(key, None)
+    value["EnvironmentVariables"] = restored
+    if value != base or plistlib.dumps(value, sort_keys=False) != base_body:
+        return None
+    return body
 
 
 def load(path: Path) -> dict:
@@ -552,8 +628,12 @@ def verify_receipt(
     for name, body in expected.items():
         installed = agents_dir / name
         digest = hashlib.sha256(body).hexdigest()
-        if (recorded.get(name) != digest or installed.is_symlink()
-                or not installed.is_file() or installed.read_bytes() != body):
+        installed_body = None
+        if not installed.is_symlink() and installed.is_file():
+            installed_body = installed.read_bytes()
+        if installed_body is not None and installed_body != body:
+            installed_body = _verified_network_overlay(installed, body, config)
+        if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
     expected_retired = replacements(data)
     if receipt.get("retired_launchd_labels") != expected_retired:
@@ -579,10 +659,10 @@ def verify_loaded(
     support_root: Path,
 ) -> dict:
     receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
-    expected = rendered_plists(
-        load(config),
-        launch_entrypoint=support_root / support_manifest.LAUNCH_NAME,
-    )
+    expected = {
+        name: (agents_dir / name).read_bytes()
+        for name in receipt["plists"]
+    }
     loaded: dict[str, str] = {}
     for name, payload in expected.items():
         label = name.removesuffix(".plist")

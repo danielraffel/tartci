@@ -3,14 +3,17 @@ from __future__ import annotations
 
 import plistlib
 import json
+import os
 import shutil
 import tomllib
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import tartci_support_manifest as support_manifest
+import network_profile as network
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -492,6 +495,89 @@ class MacosFleetLaneTests(unittest.TestCase):
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(verify.returncode, 0, verify.stderr)
+            target = next(agents.glob("*.plist"))
+            base_value = plistlib.loads(target.read_bytes())
+            profile = config.parent / "custom/network-profile.toml"
+            profile.parent.mkdir()
+            profile.write_text(
+                "schema_version = 1\n[http_connect_relay]\n"
+                "enabled = true\nrelay_hosts = [\"relay-a\", \"relay-b\"]\n"
+                "github_cli = \"ghapp\"\n"
+                "github_probe_repo = \"Generous-Corp/pulp\"\n"
+                "probe_timeout_seconds = 15\n"
+            )
+            participation = config.parent / "participation"
+            participation.write_text("0\n")
+            with (
+                mock.patch.object(network, "_loaded_path", return_value=None),
+                mock.patch.object(network, "_reload", return_value=True),
+                mock.patch.object(network, "authenticated_probe", return_value=(True, "authenticated")),
+                mock.patch.object(network, "_any_tart_vm_running", return_value=False),
+                mock.patch.object(network.Path, "home", return_value=home),
+                mock.patch.dict(os.environ, {
+                    "TARTCI_POOL_TRANSITION_LOCK": str(config.parent / "pool.lock")
+                }),
+            ):
+                reconciled = network.reconcile(
+                    profile, agents, participation_path=participation
+                )
+            self.assertTrue(reconciled["ok"], reconciled)
+            overlay_value = plistlib.loads(target.read_bytes())
+            label = overlay_value["Label"]
+            network_receipt_path = network.applied_receipt_path(profile)
+            verify_env = {**os.environ, "TARTCI_NETWORK_PROFILE": str(profile)}
+            composed = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False, env=verify_env,
+            )
+            self.assertEqual(composed.returncode, 0, composed.stderr)
+            stale_default = config.parent / "network-profile.applied.json"
+            stale_default.write_bytes(network_receipt_path.read_bytes())
+            absent_profile_env = {
+                **os.environ,
+                "TARTCI_NETWORK_PROFILE": str(config.parent / "absent-profile.toml"),
+            }
+            stale_refused = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False, env=absent_profile_env,
+            )
+            self.assertEqual(stale_refused.returncode, 2)
+            self.assertIn("failed receipt verification", stale_refused.stderr)
+            symlink_target = config.parent / "overlay-target.plist"
+            symlink_target.write_bytes(target.read_bytes())
+            target.unlink()
+            target.symlink_to(symlink_target)
+            symlinked = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False, env=verify_env,
+            )
+            self.assertEqual(symlinked.returncode, 2)
+            self.assertIn("failed receipt verification", symlinked.stderr)
+            target.unlink()
+            target.write_bytes(symlink_target.read_bytes())
+            overlay_value["EnvironmentVariables"]["FOREIGN_PROXY_DRIFT"] = "1"
+            target.write_bytes(plistlib.dumps(overlay_value, sort_keys=False))
+            network_receipt = json.loads(network_receipt_path.read_text())
+            network_receipt["agents"][label]["digest"] = network._plist_digest(
+                overlay_value
+            )
+            network_receipt_path.write_text(json.dumps(network_receipt))
+            overlay_drift = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False, env=verify_env,
+            )
+            self.assertEqual(overlay_drift.returncode, 2)
+            self.assertIn("failed receipt verification", overlay_drift.stderr)
+            target.write_bytes(plistlib.dumps(base_value, sort_keys=False))
+            network_receipt_path.unlink()
             stale = agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.removed.plist"
             stale.write_bytes(next(agents.glob("*.plist")).read_bytes())
             extra = subprocess.run(
