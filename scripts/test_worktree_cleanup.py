@@ -98,12 +98,12 @@ class Tests(unittest.TestCase):
                 cleanup.inspect(primary,root,head,1024**3,8,30)
             self.assertFalse(marker.exists())
 
-    def test_executable_bearing_local_git_config_is_rejected(self):
+    def test_executable_and_transport_bearing_local_git_config_is_rejected(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td).resolve(); primary,head,_=self.make_repo(root,[]); marker=root/"executed"; hostile=root/"hostile"
             hostile.write_text(f"#!/bin/sh\ntouch {marker}\n"); hostile.chmod(0o755)
-            for key in ("core.sshCommand","filter.evil.process"):
-                subprocess.run(["git","-C",str(primary),"config",key,str(hostile)],check=True)
+            for key,value in (("core.sshCommand",str(hostile)),("filter.evil.process",str(hostile)),("http.sslVerify","false"),("http.https://github.com/.proxy","http://127.0.0.1:9"),("remote.origin.proxy","http://127.0.0.1:9")):
+                subprocess.run(["git","-C",str(primary),"config",key,value],check=True)
                 with self.assertRaises(cleanup.Stop): cleanup.inspect(primary,root,head,1024**3,8,30)
                 subprocess.run(["git","-C",str(primary),"config","--unset-all",key],check=True)
             self.assertFalse(marker.exists())

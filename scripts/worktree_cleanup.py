@@ -46,9 +46,9 @@ def registered(rows,path:Path):
     return matches[0] if matches else None
 
 def reject_executable_git_config(primary:Path,timeout:int):
-    result=run(["git","-C",str(primary),"config","--local","--name-only","--get-regexp",r"^(core\.sshcommand|credential\..*helper|credential\.helper|filter\..*\.(process|clean|smudge)|core\.hookspath|url\..*\.insteadof|include(if)?\..*|diff\.external|diff\..*\.command|merge\..*\.driver|alias\..*)$"],timeout=timeout,check=False)
+    result=run(["git","-C",str(primary),"config","--local","--name-only","--get-regexp",r"^(core\.sshcommand|credential\..*helper|credential\.helper|filter\..*\.(process|clean|smudge)|core\.hookspath|url\..*\.insteadof|include(if)?\..*|diff\.external|diff\..*\.command|merge\..*\.driver|alias\..*|http\..*|remote\..*\.proxy)$"],timeout=timeout,check=False)
     if result.returncode not in (0,1): raise Stop("local Git config inspection failed")
-    if result.stdout.strip(): raise Stop("repository local config contains executable-bearing settings")
+    if result.stdout.strip(): raise Stop("repository local config contains executable or transport-bearing settings")
 
 def atomic_json(path:Path,value):
     path.parent.mkdir(parents=True,exist_ok=True); fd,name=tempfile.mkstemp(prefix=f".{path.name}.",dir=path.parent)
