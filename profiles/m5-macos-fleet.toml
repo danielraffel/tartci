@@ -35,6 +35,7 @@ assignment_omit_labels = ["pulp-gate-fast"]
 # Two Pulp supervisors can overlap exhaustive GitHub App scans. Retain the
 # bounded M1 margin rather than treating healthy serialized traffic as blind.
 assignment_scan_timeout_seconds = 180
+assignment_scan_max_workers = 4
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = [

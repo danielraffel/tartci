@@ -391,7 +391,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   is scan-blind/fail-closed: do not report zero demand, publish partial cache
   state, or start a lower-priority VM. The supervisor retries normally.
   → *Do not* fix this by independently increasing every lane's worker count or
-  API timeout. That increases the concurrent burst which caused the incident.
+  API timeout. The profile-owned exception is a measured event-class lane:
+  after the host lock proves there is only one scan owner, it may set
+  `assignment_scan_max_workers` from 1 through 4 so a large live queue remains
+  exhaustive inside the total deadline. This bounds the whole host burst, not
+  each overlapping supervisor independently. Current-job lifecycle discovery
+  remains one worker.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
   host is explicitly pointed at the same replacement path.
 

@@ -41,7 +41,7 @@ LANE_KEYS = {
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
-    "assignment_scan_timeout_seconds",
+    "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -234,6 +234,15 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_scan_timeout_seconds must be an "
                 "integer from 60 through 300 on an event-class-v2 lane"
+            )
+        scan_workers = lane.get("assignment_scan_max_workers")
+        if scan_workers is not None and (
+                assignment_mode != "event-class-v2"
+                or type(scan_workers) is not int
+                or not 1 <= scan_workers <= 4):
+            fail(
+                f"lane {lane_id}: assignment_scan_max_workers must be an "
+                "integer from 1 through 4 on an event-class-v2 lane"
             )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
@@ -727,6 +736,10 @@ def lane_plist(
     if "assignment_scan_timeout_seconds" in lane:
         env["TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS"] = str(
             lane["assignment_scan_timeout_seconds"]
+        )
+    if "assignment_scan_max_workers" in lane:
+        env["TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS"] = str(
+            lane["assignment_scan_max_workers"]
         )
     return {
         "Label": label,
