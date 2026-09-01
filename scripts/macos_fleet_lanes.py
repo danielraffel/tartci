@@ -45,6 +45,7 @@ LANE_KEYS = {
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
+    "assignment_top_tier_receipt_max_age_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -251,6 +252,17 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_scan_max_workers must be an "
                 "integer from 1 through 4 on an event-class-v2 lane"
+            )
+        top_tier_receipt_age = lane.get(
+            "assignment_top_tier_receipt_max_age_seconds"
+        )
+        if top_tier_receipt_age is not None and (
+                assignment_mode != "event-class-v2"
+                or type(top_tier_receipt_age) is not int
+                or not 0 <= top_tier_receipt_age <= 300):
+            fail(
+                f"lane {lane_id}: assignment_top_tier_receipt_max_age_seconds "
+                "must be an integer from 0 through 300 on an event-class-v2 lane"
             )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
@@ -750,6 +762,10 @@ def lane_plist(
     if "assignment_scan_max_workers" in lane:
         env["TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS"] = str(
             lane["assignment_scan_max_workers"]
+        )
+    if "assignment_top_tier_receipt_max_age_seconds" in lane:
+        env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = str(
+            lane["assignment_top_tier_receipt_max_age_seconds"]
         )
     return {
         "Label": label,

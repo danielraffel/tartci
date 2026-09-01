@@ -188,6 +188,46 @@ class AssignmentV2Tests(unittest.TestCase):
         self.assertEqual(fields[2], "1")
         self.assertIn("pulp-build-pr-head", fields[1].split(","))
 
+    def test_top_tier_may_reuse_only_a_fresh_exact_receipt(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = "180"
+        self._state(merge=True)
+        selected = self._runner("--print-selection")
+        self.assertEqual(selected.returncode, 0, selected.stderr)
+        self.assertEqual(selected.stdout.strip().split("\t")[2], "0")
+
+        # Cancellation after observation may create one bounded idle tier-zero
+        # runner, but it cannot invert priority or authorize a different class.
+        self.state.write_text("{}", encoding="utf-8")
+        admitted = self._runner("--print-pre-mint-selection", "0")
+        self.assertEqual(admitted.stdout.strip(), "1", admitted.stderr)
+        events = (self.root / "state" / "events.jsonl").read_text(encoding="utf-8")
+        self.assertIn('"event":"assignment_v2_pre_mint_receipt"', events)
+
+        cache = next((self.root / "state").glob("*.assignment-v2-selection.cache"))
+        _stamp, value = cache.read_text(encoding="utf-8").split("\t", 1)
+        cache.write_text(f"1\t{value}", encoding="utf-8")
+        stale = self._runner("--print-pre-mint-selection", "0")
+        self.assertEqual(stale.stdout.strip(), "0", stale.stderr)
+
+    def test_top_tier_receipt_policy_is_bounded(self) -> None:
+        self._state(merge=True)
+        for value in ("-1", "301", "bad"):
+            with self.subTest(value=value):
+                self.env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = value
+                result = self._runner("--print-selection")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("TOP_TIER_RECEIPT_MAX_AGE_SECS", result.stderr)
+
+    def test_lower_tier_never_reuses_receipt_when_higher_work_arrives(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = "180"
+        self._state(pr=True)
+        selected = self._runner("--print-selection")
+        self.assertEqual(selected.stdout.strip().split("\t")[2], "1", selected.stderr)
+
+        self.state.write_text(json.dumps({"merge": True, "pr": True}), encoding="utf-8")
+        denied = self._runner("--print-pre-mint-selection", "1")
+        self.assertEqual(denied.stdout.strip(), "0", denied.stderr)
+
     def test_api_failure_denies_selection(self) -> None:
         self._state(api_fail=True)
         result = self._runner("--print-selection")

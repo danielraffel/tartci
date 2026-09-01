@@ -403,6 +403,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   it uniformly to every managed lane as `TARTCI_GH_TIMEOUT_SECS`; do not patch
   individual live plists. M1 retains 30 seconds because its pre-immutable live
   configuration and concurrent-supervisor measurements require that margin.
+  A measured event-class lane may also set
+  `assignment_top_tier_receipt_max_age_seconds` (at most 300). Only tier zero,
+  which has no higher class to preempt it, may use its supervisor's exact recent
+  exhaustive receipt across VM boot. Cancellation can then cost one bounded
+  idle JIT runner, but lower tiers still require live exhaustive pre-mint proof
+  and can never bypass newly arrived higher-priority work.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
   host is explicitly pointed at the same replacement path.
 
