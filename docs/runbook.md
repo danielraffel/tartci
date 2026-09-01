@@ -54,8 +54,9 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 
 ### B. Add one Mac to an existing pool  ← the common case
 
-1. **Install + onboard.** On the new Mac: clone tartci (or rsync your deploy to
-   `~/.local/share/tartci` and expose `~/.local/bin/tartci`), then run
+1. **Install + onboard.** On the new Mac: clone tartci, generate its clean
+   support manifest, and use the receipt-bound fleet installer to publish an
+   immutable generation plus `~/.local/bin/tartci`; then run
    **`tartci setup`** — it installs prereqs, creates stores, **auto-derives +
    persists the role**, and runs the governor verify gate. A half-provisioned
    host is surfaced rather than reported clean.
@@ -864,9 +865,44 @@ Keep the runner code on a home-backed path so launchd and non-interactive SSH do
 not depend on a mounted workspace:
 
 ```bash
-mkdir -p "$HOME/.local/share/tartci"
-rsync -a --delete --exclude .git ./ "$HOME/.local/share/tartci/"
+./tartci support-manifest write \
+  --root . --output .tartci-support-manifest.json
+./tartci fleet-macos install profiles/<host>-macos-fleet.toml \
+  --support-source . \
+  --support-manifest .tartci-support-manifest.json \
+  --apply
 ```
+
+Generate the manifest only from the exact clean source commit being deployed.
+It requires and binds the canonical `danielraffel/tartci` GitHub repository key
+and every selected provider,
+runtime helper, profile, and LaunchAgent template by path, mode, and SHA-256.
+Before mutation, `fleet-macos install --apply` also uses `ghapp` to prove that
+the exact commit exists in that repository. A profile `[github_app]` block, when
+present, supplies host-local references for the proof and rendered services;
+otherwise the proof uses `ghapp`'s installed machine-global Shipyard App
+context. It verifies the
+clean Git source, stages a
+non-writable runtime generation under
+`~/.local/share/tartci-generations`, atomically switches the canonical
+`~/.local/bin/tartci` wrapper, and records the source commit, entrypoint, and
+complete cohort in `macos-fleet-install.json`. LaunchAgents execute a
+generation-local, non-writable verification entrypoint using the receipted
+`/usr/bin/python3`; the mutable convenience wrapper is not launch authority.
+Every CLI or supervisor start verifies the cohort, so an ordinary launchd
+restart cannot execute post-install drift. Profile, plist, receipt, and wrapper
+publication is file- and directory-synced in dependency order; a power-loss
+subset either verifies as complete or keeps admission closed for a supported
+reinstall. `tartci pool on` verifies the
+installed cohort and activates only services named by that receipt, then
+compares launchd's in-memory arguments and governed environment against the
+receipt before opening admission. Unreceipted persistent or legacy runner
+services require their own explicit install/activation authority; this fleet
+transaction will not start them incidentally. The composed readback is published as
+`~/.config/tartci/macos-fleet-loaded.json`. Missing helpers, unreceipted runtime
+files, symlinks, mixed generations, stale loaded arguments, or obsolete loaded
+environment fail closed. The prior wrapper/generation remains available for
+rollback; generation cleanup is a separate explicit idle operation.
 
 One-shot proof, with the same PATH launchd will use:
 
@@ -877,7 +913,7 @@ TARTCI_RUNNER_REPO=OWNER/REPO \
 TARTCI_RUNNER_LABELS=self-hosted,Windows,ARM64,pulp-build-windows \
 TARTCI_WIN_WORK="$HOME/VMs/tmp/tartci-win-proof" \
 TARTCI_WIN_LOGS="$HOME/VMs/logs/tartci-win-proof" \
-"$HOME/.local/share/tartci/providers/qemu-windows/runner.sh" --once
+"$HOME/.local/bin/tartci" serve windows
 ```
 
 To create a matching queued job, prefer a Windows-native workflow. For Pulp,
@@ -1430,9 +1466,9 @@ installing prereqs + creating stores, it now:
    `tartci setup` reports the host is not fully onboarded instead of exiting
    clean, so a half-provisioned host is visible.
 
-After `tartci setup`, deploy the tartci snapshot to `~/.local/share/tartci`
-(rsync) and — for a CI host — register runners. Helpers:
-`providers/common/onboard.lib.sh`.
+After `tartci setup`, deploy the clean receipt-bound support generation through
+`tartci fleet-macos install` as described above and — for a CI host — register
+runners. Helpers: `providers/common/onboard.lib.sh`.
 
 ## Drain or opt a host out of the CI pool (`tartci pool`)
 
