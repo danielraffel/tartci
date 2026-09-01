@@ -106,6 +106,7 @@ class QueueScanner:
         self.discovery_lock_path = self.discovery_path.with_suffix(
             f"{self.discovery_path.suffix}.lock"
         )
+        self.observation_lock_path = Path(args.observation_lock_file)
         self.state: dict[str, Any] = {}
         self.now = int(time.time())
         self.api_calls = 0
@@ -185,6 +186,30 @@ class QueueScanner:
         self.discovery_lock_path.parent.mkdir(parents=True, exist_ok=True)
         with self.discovery_lock_path.open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def _observation_lock(self) -> Any:
+        """Bound concurrent GitHub observation across every lane on this host."""
+        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.args.observation_lock_timeout
+        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(
+                            "host queue observation lock timed out after "
+                            f"{self.args.observation_lock_timeout}s"
+                        )
+                    time.sleep(0.05)
             try:
                 yield
             finally:
@@ -389,24 +414,31 @@ class QueueScanner:
             ):
                 return cached_runs
 
-            self.api_calls = 0
-            runs = self._runs(discovery)
-            candidates, backlog_ids = self._candidate_runs(runs, discovery)
-            discovered: list[dict[str, Any]] = []
-            for run in candidates[: self.args.max_job_fetches]:
-                run_id = int(run["id"])
-                jobs = self._gh(
-                    f"repos/{self.args.repo}/actions/runs/{run_id}"
-                    "/jobs?filter=latest&per_page=100"
-                ).get("jobs", [])
-                if not isinstance(jobs, list):
-                    raise ValueError(f"jobs is not a list for run {run_id}")
-                discovered.append({**run, "_jobs": jobs})
+            # Namespace locks coalesce identical scans. This host-global lock
+            # additionally prevents distinct repos/workflows from launching
+            # simultaneous gh/ghapp bursts. On slower hosts those bursts can
+            # all exceed their subprocess deadline and make healthy lanes look
+            # scan-blind. A bounded wait fails closed instead of hanging the
+            # supervisor or publishing a partial snapshot.
+            with self._observation_lock():
+                self.api_calls = 0
+                runs = self._runs(discovery)
+                candidates, backlog_ids = self._candidate_runs(runs, discovery)
+                discovered: list[dict[str, Any]] = []
+                for run in candidates[: self.args.max_job_fetches]:
+                    run_id = int(run["id"])
+                    jobs = self._gh(
+                        f"repos/{self.args.repo}/actions/runs/{run_id}"
+                        "/jobs?filter=latest&per_page=100"
+                    ).get("jobs", [])
+                    if not isinstance(jobs, list):
+                        raise ValueError(f"jobs is not a list for run {run_id}")
+                    discovered.append({**run, "_jobs": jobs})
 
-            discovery["fetched_at"] = self.now
-            discovery["runs"] = discovered
-            self._save_json(self.discovery_path, discovery)
-            return discovered
+                discovery["fetched_at"] = self.now
+                discovery["runs"] = discovered
+                self._save_json(self.discovery_path, discovery)
+                return discovered
 
     def _scan_locked(self) -> int:
         runs = self._discover()
@@ -513,6 +545,20 @@ def parse_args() -> argparse.Namespace:
         default=os.environ.get("TARTCI_SHARED_QUEUE_CACHE")
         or str(Path.home() / ".tartci/state/queue-discovery.json"),
     )
+    parser.add_argument(
+        "--observation-lock-file",
+        default=os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE")
+        or str(Path.home() / ".tartci/state/queue-observation.lock"),
+        help="host-global lock shared by all queue-observation namespaces",
+    )
+    parser.add_argument(
+        "--observation-lock-timeout",
+        type=float,
+        default=float(
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "30")
+        ),
+        help="seconds to wait for the host-global observation lock",
+    )
     parser.add_argument("--provider", required=True)
     parser.add_argument(
         "--lane-id",
@@ -564,6 +610,8 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.stagger_max_seconds < 0:
         parser.error("--stagger-max-seconds must be non-negative")
+    if args.observation_lock_timeout <= 0:
+        parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     statuses = {

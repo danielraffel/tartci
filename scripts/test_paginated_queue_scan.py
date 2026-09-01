@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import fcntl
 import importlib.util
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from math import ceil
@@ -58,6 +60,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
             "job_statuses": "queued",
             "state_file": str(state_file),
             "shared_cache_file": str(state_file.parent / "shared-discovery.json"),
+            "observation_lock_file": str(state_file.parent / "host-observation.lock"),
+            "observation_lock_timeout": 2.0,
             "provider": provider,
             "lane_id": "test-slot-1",
             "gh_cli": "unused",
@@ -701,6 +705,65 @@ print(json.dumps(payload))
                 len(counter.read_text(encoding="utf-8").splitlines()),
                 10,
             )
+
+    def test_distinct_namespaces_share_one_host_observation_slot(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        active = 0
+        peak = 0
+        guard = threading.Lock()
+
+        def api(path: str) -> dict[str, Any]:
+            nonlocal active, peak
+            with guard:
+                active += 1
+                peak = max(peak, active)
+            try:
+                time.sleep(0.01)
+                return self._base_api([eligible], eligible["id"])(path)
+            finally:
+                with guard:
+                    active -= 1
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanners = [
+                self._scanner(
+                    "tart-macos",
+                    root / f"lane-{index}.json",
+                    api,
+                    repo=f"owner/repo-{index}",
+                    shared_cache_file=str(root / "shared-discovery.json"),
+                    observation_lock_file=str(root / "host-observation.lock"),
+                )
+                for index in range(3)
+            ]
+            barrier = threading.Barrier(len(scanners))
+
+            def scan(scanner: Any) -> int:
+                barrier.wait()
+                return scanner.scan()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                results = list(executor.map(scan, scanners))
+
+        self.assertEqual(results, [1, 1, 1])
+        self.assertEqual(peak, 1)
+
+    def test_host_observation_lock_timeout_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                lambda _path: self.fail("API must not run without the lock"),
+                observation_lock_file=str(root / "host-observation.lock"),
+                observation_lock_timeout=0.05,
+            )
+            with scanner.observation_lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                with self.assertRaisesRegex(RuntimeError, "observation lock timed out"):
+                    scanner.scan()
 
     def test_api_calls_are_hard_capped(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
