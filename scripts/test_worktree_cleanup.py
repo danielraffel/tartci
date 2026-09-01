@@ -11,22 +11,24 @@ class Tests(unittest.TestCase):
     def test_nonblocking_lock_and_cooldown_stop_before_inspection(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); lock=(root/"lock").open("a+"); import fcntl; fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            self.assertEqual(cleanup.main(self.authority_argv(root)),3); lock.close()
+            with mock.patch.object(cleanup,"validate_authority_roots"):
+                self.assertEqual(cleanup.main(self.authority_argv(root)),3)
+            lock.close()
             (root/"receipt.json").write_text("{}")
-            with mock.patch.object(cleanup,"fresh_main") as fresh:
+            with mock.patch.object(cleanup,"validate_authority_roots"),mock.patch.object(cleanup,"fresh_main") as fresh:
                 self.assertEqual(cleanup.main(self.authority_argv(root)),4); fresh.assert_not_called()
 
     def test_apply_cli_enters_apply_path(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); receipt=root/"receipt.json"
             argv=[*self.authority_argv(root),"--apply"]
-            with mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected") as apply,mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=2)):
+            with mock.patch.object(cleanup,"validate_authority_roots"),mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected") as apply,mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=2)):
                 self.assertEqual(cleanup.main(argv),0); apply.assert_called_once()
 
     def test_apply_cli_returns_nonzero_when_final_free_space_is_insufficient(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); argv=[*self.authority_argv(root),"--apply"]
-            with mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected"),mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=0)):
+            with mock.patch.object(cleanup,"validate_authority_roots"),mock.patch.object(cleanup,"fresh_main",return_value="a"*40),mock.patch.object(cleanup,"inspect",return_value=([],[],0)),mock.patch.object(cleanup,"apply_selected"),mock.patch.object(cleanup.shutil,"disk_usage",return_value=types.SimpleNamespace(free=0)):
                 self.assertEqual(cleanup.main(argv),7)
             self.assertEqual(json.loads((root/"receipt.json").read_text())["retry_admission"],"denied")
 
@@ -154,6 +156,7 @@ class Tests(unittest.TestCase):
             grafts=repo/".git/info/grafts"; grafts.write_text(f"{main} {orphan}\n")
             with self.assertRaises(cleanup.Stop): cleanup.reject_executable_git_config(repo,30)
 
+    @unittest.skipUnless(Path(cleanup.LSOF).is_file(),"requires macOS system lsof")
     def test_lsof_observation_tracks_live_cwd_after_worktree_quarantine_move(self):
         with tempfile.TemporaryDirectory() as td:
             root=Path(td).resolve(); primary,_,selected=self.make_repo(root,["one"]); path=selected[0][0]; quarantine=root/"quarantine"
