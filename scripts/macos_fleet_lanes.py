@@ -8,6 +8,7 @@ loads, enables, drains, or otherwise mutates a host runner pool.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import json
 import os
@@ -652,32 +653,10 @@ def _loaded_has(output: str, value: str, description: str) -> None:
         )
 
 
-def verify_loaded(
-    receipt_path: Path,
-    config: Path,
-    agents_dir: Path,
-    support_root: Path,
-) -> dict:
-    receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
-    expected = {
-        name: (agents_dir / name).read_bytes()
-        for name in receipt["plists"]
-    }
-    loaded: dict[str, str] = {}
-    for name, payload in expected.items():
+def _verify_loaded_output(
+    name: str, payload: bytes, output: str, agents_dir: Path
+) -> str:
         label = name.removesuffix(".plist")
-        result = subprocess.run(
-            ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        if result.returncode != 0:
-            fail(
-                f"could not read loaded LaunchAgent {label}: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
-        output = result.stdout
         value = plistlib.loads(payload)
         loaded_path = re.search(r"^\tpath = (.+)$", output, re.MULTILINE)
         if (
@@ -727,7 +706,57 @@ def verify_loaded(
         if "keepalive" not in properties or "runatload" not in properties:
             fail(f"loaded LaunchAgent {label} lost keepalive/runatload properties")
         _loaded_has(output, "\texit timeout = 30 seconds\n", f"{label} exit timeout")
-        loaded[name] = hashlib.sha256(output.encode()).hexdigest()
+        return hashlib.sha256(output.encode()).hexdigest()
+
+
+def verify_loaded_snapshot(
+    receipt_path: Path,
+    config: Path,
+    agents_dir: Path,
+    support_root: Path,
+    outputs: dict[str, str],
+) -> dict[str, str]:
+    receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
+    expected = {
+        name: (agents_dir / name).read_bytes()
+        for name in receipt["plists"]
+    }
+    if set(outputs) != {name.removesuffix(".plist") for name in expected}:
+        fail("loaded LaunchAgent snapshot does not match the receipt service set")
+    return {
+        name: _verify_loaded_output(
+            name, payload, outputs[name.removesuffix(".plist")], agents_dir
+        )
+        for name, payload in expected.items()
+    }
+
+
+def verify_loaded(
+    receipt_path: Path,
+    config: Path,
+    agents_dir: Path,
+    support_root: Path,
+) -> dict:
+    receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
+    outputs: dict[str, str] = {}
+    for name in receipt["plists"]:
+        label = name.removesuffix(".plist")
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            fail(f"timed out reading loaded LaunchAgent {label}: {exc}")
+        if result.returncode != 0:
+            fail(
+                f"could not read loaded LaunchAgent {label}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        outputs[label] = result.stdout
+    loaded = verify_loaded_snapshot(
+        receipt_path, config, agents_dir, support_root, outputs
+    )
     return {
         "schema": 1,
         "verified_at_unix": int(time.time()),
@@ -735,6 +764,218 @@ def verify_loaded(
         "install_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "support_root": str(support_root.resolve()),
         "loaded_services": loaded,
+    }
+
+
+def fleet_readiness(
+    receipt_path: Path,
+    config: Path,
+    agents_dir: Path,
+    support_root: Path,
+    participating: bool,
+    pool_state: str,
+    stale_heartbeat_seconds: int = 300,
+) -> dict:
+    """Report realized receipt-backed capacity separately from pool intent."""
+    problems: list[dict[str, str]] = []
+    try:
+        receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
+    except (OSError, ValueError) as exc:
+        return {
+            "managed": True,
+            "fleet_ready": False,
+            "verified_running_supervisors": 0,
+            "expected_supervisors": None,
+            "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
+        }
+
+    labels = sorted(name.removesuffix(".plist") for name in receipt["plists"])
+    admission_open = participating and pool_state == "on"
+    if participating != (pool_state == "on"):
+        problems.append({
+            "code": "admission_state_mismatch",
+            "detail": f"state={pool_state} participating={int(participating)}",
+        })
+    loaded_outputs: dict[str, str] = {}
+    for label in labels:
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            problems.append({"code": "launchctl_probe_timeout", "label": label})
+            continue
+        if result.returncode == 0:
+            loaded_outputs[label] = result.stdout
+            if pool_state == "off":
+                problems.append({"code": "unexpected_loaded_service", "label": label})
+        elif result.returncode == 113 and "Could not find service" in result.stderr:
+            if admission_open:
+                problems.append({"code": "unloaded_service", "label": label})
+        else:
+            problems.append({
+                "code": "launchctl_probe_error", "label": label,
+                "detail": result.stderr.strip() or f"exit={result.returncode}",
+            })
+
+    state_dirs: set[Path] = set()
+    fleet_homes: set[str] = set()
+    for label in labels:
+        plist = plistlib.loads((agents_dir / f"{label}.plist").read_bytes())
+        environment = plist.get("EnvironmentVariables") or {}
+        raw_state_dir = environment.get("TARTCI_STATE_DIR")
+        raw_home = environment.get("HOME")
+        if isinstance(raw_home, str) and raw_home:
+            fleet_homes.add(raw_home)
+        if isinstance(raw_state_dir, str) and raw_state_dir:
+            state_dirs.add(Path(raw_state_dir))
+        else:
+            problems.append({"code": "state_dir_missing", "label": label})
+    expected_pids = {
+        int(match.group(1))
+        for output in loaded_outputs.values()
+        if (match := re.search(r"^\s*pid = ([0-9]+)\s*$", output, re.MULTILINE))
+    }
+    process_starts: dict[int, str] = {}
+    managed_supervisor_pids: set[int] = set()
+    try:
+        process_table = subprocess.run(
+            ["ps", "-axo", "pid=,lstart=,command="],
+            text=True, capture_output=True, check=False, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        problems.append({"code": "process_table_probe_timeout"})
+    else:
+        if process_table.returncode != 0:
+            problems.append({"code": "process_table_probe_error"})
+        else:
+            home = next(iter(fleet_homes), "")
+            generation_prefix = f"{home}/.local/share/tartci-generations/"
+            provider_suffix = "/providers/tart-macos/runner.sh --loop"
+            for line in process_table.stdout.splitlines():
+                match = re.match(r"^\s*([0-9]+)\s+(.{24})\s+(.+)$", line)
+                if match is None:
+                    continue
+                pid = int(match.group(1))
+                process_starts[pid] = " ".join(match.group(2).split())
+                command = match.group(3)
+                if generation_prefix in command and provider_suffix in command:
+                    managed_supervisor_pids.add(pid)
+            for orphan_pid in sorted(managed_supervisor_pids - expected_pids):
+                problems.append({
+                    "code": "orphaned_supervisor", "label": str(orphan_pid),
+                    "detail": process_starts[orphan_pid],
+                })
+
+    verified_running = 0
+    if admission_open and len(loaded_outputs) == len(labels):
+        try:
+            verify_loaded_snapshot(
+                receipt_path, config, agents_dir, support_root, loaded_outputs
+            )
+        except (OSError, ValueError) as exc:
+            problems.append({"code": "loaded_receipt_mismatch", "detail": str(exc)})
+        else:
+            now = dt.datetime.now(dt.timezone.utc)
+            for label, output in loaded_outputs.items():
+                if not re.search(r"^\s*state = running\s*$", output, re.MULTILINE):
+                    problems.append({"code": "supervisor_not_running", "label": label})
+                    continue
+                pid_match = re.search(r"^\s*pid = ([0-9]+)\s*$", output, re.MULTILINE)
+                if pid_match is None:
+                    problems.append({"code": "supervisor_pid_missing", "label": label})
+                    continue
+                pid = int(pid_match.group(1))
+                plist = plistlib.loads((agents_dir / f"{label}.plist").read_bytes())
+                state_dir = Path(
+                    (plist.get("EnvironmentVariables") or {}).get("TARTCI_STATE_DIR", "")
+                )
+                matching_state = None
+                for state_path in sorted(state_dir.glob("*.state.json")):
+                    try:
+                        candidate = json.loads(state_path.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if (
+                        candidate.get("supervisor_pid") == str(pid)
+                        and " ".join(str(candidate.get(
+                            "supervisor_pid_started_at", ""
+                        )).split()) == process_starts.get(pid, "")
+                    ):
+                        matching_state = candidate
+                        break
+                if matching_state is None:
+                    problems.append({"code": "heartbeat_missing", "label": label})
+                    continue
+                try:
+                    heartbeat_at = dt.datetime.fromisoformat(
+                        str(matching_state["ts"]).replace("Z", "+00:00")
+                    )
+                except (KeyError, TypeError, ValueError):
+                    problems.append({"code": "heartbeat_invalid", "label": label})
+                    continue
+                age = (now - heartbeat_at).total_seconds()
+                if age < -30:
+                    problems.append({
+                        "code": "heartbeat_from_future", "label": label,
+                        "detail": f"skew_seconds={int(-age)}",
+                    })
+                    continue
+                age = max(0.0, age)
+                if age > stale_heartbeat_seconds:
+                    problems.append({
+                        "code": "heartbeat_stale", "label": label,
+                        "detail": f"age_seconds={int(age)}",
+                    })
+                    continue
+                verified_running += 1
+
+    try:
+        domain = subprocess.run(
+            ["launchctl", "print", f"gui/{os.getuid()}"],
+            text=True, capture_output=True, check=False, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        problems.append({"code": "launchctl_domain_probe_timeout"})
+    else:
+        if domain.returncode != 0:
+            problems.append({"code": "launchctl_domain_probe_error"})
+        else:
+            prefix = "com.danielraffel.tartci.tart-runner-macos-fleet."
+            loaded_managed = {
+                match.group(1)
+                for line in domain.stdout.splitlines()
+                if (match := re.search(
+                    rf"({re.escape(prefix)}[A-Za-z0-9_.-]+)\s*$", line
+                ))
+                and re.match(r"^\s*[0-9-]+\s+[0-9-]+\s+", line)
+            }
+            for unexpected in sorted(loaded_managed - set(labels)):
+                problems.append({
+                    "code": "unexpected_managed_service", "label": unexpected,
+                })
+
+    for retired in receipt.get("retired_launchd_labels", []):
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{retired}"],
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            problems.append({"code": "launchctl_probe_timeout", "label": retired})
+            continue
+        if result.returncode == 0:
+            problems.append({"code": "retired_service_loaded", "label": retired})
+        elif not (result.returncode == 113 and "Could not find service" in result.stderr):
+            problems.append({"code": "launchctl_probe_error", "label": retired})
+
+    return {
+        "managed": True,
+        "fleet_ready": admission_open and verified_running == len(labels) and not problems,
+        "verified_running_supervisors": verified_running,
+        "expected_supervisors": len(labels),
+        "problems": problems,
     }
 
 
@@ -899,6 +1140,14 @@ def main(argv: list[str] | None = None) -> int:
     loaded.add_argument("--agents-dir", required=True, type=Path)
     loaded.add_argument("--support-root", required=True, type=Path)
     loaded.add_argument("--output", required=True, type=Path)
+    readiness = sub.add_parser("fleet-readiness")
+    readiness.add_argument("receipt", type=Path)
+    readiness.add_argument("--config", required=True, type=Path)
+    readiness.add_argument("--agents-dir", required=True, type=Path)
+    readiness.add_argument("--support-root", required=True, type=Path)
+    readiness.add_argument("--participating", choices=("0", "1"), required=True)
+    readiness.add_argument("--pool-state", choices=("on", "off", "draining"), required=True)
+    readiness.add_argument("--stale-heartbeat-seconds", type=int, default=300)
     args = parser.parse_args(argv)
     try:
         if args.command == "verify-loaded":
@@ -907,6 +1156,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             atomic_write_json(args.output, value)
             print(f"verified loaded macOS fleet generation: {args.output}")
+            return 0
+        if args.command == "fleet-readiness":
+            print(json.dumps(fleet_readiness(
+                args.receipt, args.config, args.agents_dir, args.support_root,
+                args.participating == "1", args.pool_state,
+                args.stale_heartbeat_seconds,
+            ), sort_keys=True))
             return 0
         if args.command == "verify-installed":
             receipt_value = verify_receipt(

@@ -318,7 +318,7 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready]"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
@@ -491,11 +491,30 @@ EOF
       done
       ;;
     status)
+      local status_json=0 require_ready=0
+      for arg in "$@"; do
+        case "$arg" in
+          --json) status_json=1 ;;
+          --require-ready) require_ready=1 ;;
+          *) echo "$pool_usage" >&2; return 2 ;;
+        esac
+      done
       local part; part="$(tartci_pool_read_participation)"
       local state; state="$(tartci_pool_read_state)"
-      if [ "${1:-}" = "--json" ]; then
-        printf '{"host":"%s","state":"%s","participating":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)"
+      local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
+      local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[]}'
+      local managed_plists=""
+      managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
+      if [ -f "$fleet_receipt" ] || [ -n "$managed_plists" ]; then
+        fleet_readiness="$(python3 "$HERE/scripts/macos_fleet_lanes.py" fleet-readiness "$fleet_receipt" \
+          --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+          --agents-dir "$agents_dir" --support-root "$HERE" --participating "$part" \
+          --pool-state "$state" 2>/dev/null \
+          || printf '%s' '{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}')"
+      fi
+      if [ "$status_json" = 1 ]; then
+        printf '{"host":"%s","state":"%s","participating":%s,"fleet":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$fleet_readiness"
         local first=1 label loaded
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -510,6 +529,17 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
+        python3 - "$fleet_readiness" <<'PY'
+import json, sys
+fleet = json.loads(sys.argv[1])
+if fleet["managed"]:
+    print(f"fleet ready: {'yes' if fleet['fleet_ready'] else 'NO'}")
+    print(f"verified running supervisors: {fleet['verified_running_supervisors']}/{fleet['expected_supervisors']}")
+    for problem in fleet["problems"]:
+        print(f"  problem: {problem['code']}" + (f" ({problem['label']})" if 'label' in problem else ""))
+else:
+    print("fleet ready: unknown (legacy/unmanaged)")
+PY
         echo "runner agents:"
         local label loaded any=0
         while IFS= read -r label; do
@@ -521,8 +551,15 @@ $(tartci_pool_runner_agents "$agents_dir")
 EOF
         [ "$any" = 1 ] || echo "  (no runner agents installed on this host)"
       fi
+      if [ "$require_ready" = 1 ] && ! python3 - "$fleet_readiness" <<'PY'
+import json, sys
+raise SystemExit(0 if json.loads(sys.argv[1]).get("fleet_ready") is True else 1)
+PY
+      then
+        return 8
+      fi
       ;;
-    *) echo "usage: tartci pool <on|drain|off|status|repair-lock> [--json]"; return 2 ;;
+    *) echo "$pool_usage"; return 2 ;;
   esac
 }
 

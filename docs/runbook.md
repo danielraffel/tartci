@@ -1510,7 +1510,14 @@ lanes change.
   bootstrap the installed runner agents. This is the only transition that
   reopens provider admission, so a reconnect cannot leave a half-on host.
 - `tartci pool status [--json]` — durable state + participation + each runner agent's
-  loaded/stopped state.
+  loaded/stopped state. Receipt-managed macOS fleets additionally report
+  `fleet_ready`, `expected_supervisors`, `verified_running_supervisors`, and
+  structured problems. Readiness requires the exact receipted launchd snapshot,
+  running supervisors, fresh PID/start-bound provider heartbeats, no retired or
+  unexpected managed service, and no live supervisor from an older installed
+  generation. Supervisor counts are control-plane health, not the host's two-VM
+  physical capacity. Use `tartci pool status --require-ready` for a nonzero gate;
+  ordinary status remains observational.
 - `tartci pool repair-lock` — recover a transition lock orphaned by power loss,
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an

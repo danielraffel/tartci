@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import plistlib
 import json
+import datetime as dt
 import os
 import shutil
 import tomllib
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import tartci_support_manifest as support_manifest
 import network_profile as network
+import macos_fleet_lanes as fleet
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +69,122 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_receipt_backed_readiness_separates_intent_from_capacity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            receipt = {"plists": {"one.plist": "a", "two.plist": "b"},
+                       "retired_launchd_labels": []}
+            heartbeat_ts = dt.datetime.now(dt.timezone.utc).isoformat()
+            starts = {
+                101: "Mon Sep  1 00:00:00 2026",
+                102: "Mon Sep  1 00:00:01 2026",
+            }
+            for index, label in enumerate(("one", "two"), start=101):
+                state_dir = root / f"{label}-state"
+                state_dir.mkdir()
+                (state_dir / f"{label}.state.json").write_text(json.dumps({
+                    "ts": heartbeat_ts,
+                    "supervisor_pid": str(index),
+                    "supervisor_pid_started_at": starts[index],
+                }))
+                (agents / f"{label}.plist").write_bytes(plistlib.dumps({
+                    "EnvironmentVariables": {
+                        "HOME": str(root), "TARTCI_STATE_DIR": str(state_dir),
+                    },
+                }))
+            running_one = subprocess.CompletedProcess(
+                [], 0, "state = running\npid = 101\n", ""
+            )
+            running_two = subprocess.CompletedProcess(
+                [], 0, "state = running\npid = 102\n", ""
+            )
+            missing = subprocess.CompletedProcess(
+                [], 113, "", "Could not find service\n"
+            )
+            domain = subprocess.CompletedProcess([], 0, "", "")
+            process_table = subprocess.CompletedProcess(
+                [], 0,
+                f"101 {starts[101]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n"
+                f"102 {starts[102]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n",
+                "",
+            )
+            args = (Path("receipt"), Path("config"), agents, Path("support"))
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running_one, missing, process_table, domain],
+                 ):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertFalse(value["fleet_ready"])
+            self.assertEqual(value["verified_running_supervisors"], 0)
+            self.assertEqual(value["expected_supervisors"], 2)
+            self.assertEqual(
+                {problem["code"] for problem in value["problems"]},
+                {"unloaded_service", "orphaned_supervisor"},
+            )
+
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running_one, running_two, process_table, domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertTrue(value["fleet_ready"])
+            self.assertEqual(value["verified_running_supervisors"], 2)
+
+            orphan_table = subprocess.CompletedProcess(
+                [], 0,
+                process_table.stdout
+                + f"999 Mon Sep  1 00:00:02 2026 bash {root}/.local/share/tartci-generations/old/providers/tart-macos/runner.sh --loop\n",
+                "",
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running_one, running_two, orphan_table, domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertFalse(value["fleet_ready"])
+            self.assertIn("orphaned_supervisor", {
+                problem["code"] for problem in value["problems"]
+            })
+            unexpected_domain = subprocess.CompletedProcess(
+                [], 0,
+                "34889 143 com.danielraffel.tartci.tart-runner-macos-fleet.m3.extra\n",
+                "",
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running_one, running_two, process_table, unexpected_domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertIn("unexpected_managed_service", {
+                problem["code"] for problem in value["problems"]
+            })
+
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[
+                         missing, missing,
+                         subprocess.CompletedProcess([], 0, "", ""), domain,
+                     ],
+                 ):
+                value = fleet.fleet_readiness(*args, participating=False, pool_state="off")
+            self.assertFalse(value["fleet_ready"])
+            self.assertEqual(value["problems"], [])
+
+            with mock.patch.object(fleet, "verify_receipt", side_effect=ValueError("tampered")):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            self.assertEqual(value["verified_running_supervisors"], 0)
+            self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
+
     def test_all_host_profiles_validate_with_exact_paths_and_routing(self) -> None:
         expected = {
             "m1": ("/Users/danielraffel/VMs", "vellum-host-m1", False),
