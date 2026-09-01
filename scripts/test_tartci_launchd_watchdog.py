@@ -74,6 +74,7 @@ check(not wd.launchctl_reports_absent(1, "permission denied"),
 
 # ── classify ─────────────────────────────────────────────────────────────────
 STALE = wd.DEFAULT_STALE_LOG_S
+RESTART_GRACE = wd.DEFAULT_RESTART_GRACE_S
 
 # The incident signature: non-zero exit + a 2-week-stale log → wedged.
 v, _ = wd.classify("spawn scheduled", 126, log_age_s=14 * 24 * 3600,
@@ -87,6 +88,30 @@ check(v == "wedged", f"exit126 + missing log must be wedged, got {v}")
 # Non-zero exit but a FRESH log → a live restart, not the invisible wedge.
 v, _ = wd.classify("running", 1, log_age_s=5.0, stale_log_s=STALE)
 check(v == "healthy", f"non-zero exit + fresh log must be healthy, got {v}")
+
+# The exact M1 incident: `serve --loop` exited 75 to refresh App auth, but
+# launchd retained a loaded, not-running job instead of honoring KeepAlive.
+v, reason = wd.classify(
+    "not running", 75, log_age_s=RESTART_GRACE + 1,
+    stale_log_s=STALE, expected_loaded=True,
+)
+check(v == "wedged", f"stalled EX_TEMPFAIL restart must be wedged, got {v}: {reason}")
+
+# Preserve a bounded launchd respawn window so a normal exit/restart transition
+# is not booted out while it is still progressing.
+v, _ = wd.classify(
+    "not running", 75, log_age_s=RESTART_GRACE,
+    stale_log_s=STALE, expected_loaded=True,
+)
+check(v == "healthy", f"EX_TEMPFAIL at restart grace must remain healthy, got {v}")
+
+# Durable participation remains the authority: the watchdog must not revive an
+# intentionally disabled lane merely because its last exit was EX_TEMPFAIL.
+v, _ = wd.classify(
+    "not running", 75, log_age_s=RESTART_GRACE + 1,
+    stale_log_s=STALE, expected_loaded=False,
+)
+check(v == "healthy", f"disabled EX_TEMPFAIL lane must remain stopped, got {v}")
 
 # Never exited non-zero → healthy regardless of state.
 v, _ = wd.classify("running", None, log_age_s=None, stale_log_s=STALE)
