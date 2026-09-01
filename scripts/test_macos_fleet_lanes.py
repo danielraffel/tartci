@@ -84,12 +84,12 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_enabled_cleanup_authority_renders_only_m3_pulp_slots(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            path=Path(td)/"m3.toml"; body=HOST_CONFIGS["studio"].read_text().replace("apply = false","apply = true\nghapp_sha256 = \""+"a"*64+"\"\ncmux_sha256 = \""+"b"*64+"\"")
+            path=Path(td)/"m3.toml"; body=HOST_CONFIGS["studio"].read_text().replace("apply = false","apply = true")
             path.write_text(body); rendered=fleet.rendered_plists(fleet.load(path)); pulp_count=0
             for plist_body in rendered.values():
                 env=plistlib.loads(plist_body)["EnvironmentVariables"]; keys={key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
                 if env["TARTCI_QUEUE_LANE_ID"] in {"studio-pulp-gate","studio-pulp-gate-slot2"}:
-                    pulp_count+=1; self.assertEqual(env["TARTCI_RUNNER_REPO"],"Generous-Corp/pulp"); self.assertIn("TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256",keys); self.assertIn("TARTCI_WORKTREE_CLEANUP_CMUX_SHA256",keys)
+                    pulp_count+=1; self.assertEqual(env["TARTCI_RUNNER_REPO"],"Generous-Corp/pulp"); self.assertIn("TARTCI_WORKTREE_CLEANUP_PROVIDER",keys)
                 else: self.assertEqual(keys,set())
             self.assertEqual(pulp_count,2)
 
@@ -97,7 +97,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "bad.toml"
             path.write_text(HOST_CONFIGS["studio"].read_text().replace(
-                'github_cli = "ghapp"', 'github_cli = "gh"'
+                'provider = "merged-main-v1"', 'provider = "other"'
             ))
             with self.assertRaisesRegex(ValueError, "reviewed M3"):
                 fleet.load(path)

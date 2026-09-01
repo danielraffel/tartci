@@ -48,10 +48,9 @@ STACKED_IMAGE_KEYS = {
 }
 LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
 WORKTREE_CLEANUP_KEYS = {
-    "provider", "repo", "primary", "prefix", "main_ref", "github_cli",
+    "provider", "repo", "primary", "prefix", "main_ref",
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
-WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS = {"ghapp_sha256", "cmux_sha256"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -211,20 +210,14 @@ def load(path: Path) -> dict:
             "provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
             "primary": "/Volumes/Workshop/Code/pulp",
             "prefix": "/Volumes/Workshop/Code", "main_ref": "origin/main",
-            "github_cli": "ghapp", "apply": False, "max_trees": 8,
+            "apply": False, "max_trees": 8,
             "max_gib": 512, "timeout_seconds": 300, "cooldown_seconds": 3600,
         }
-        if not isinstance(cleanup, dict) or set(cleanup) not in (WORKTREE_CLEANUP_KEYS, WORKTREE_CLEANUP_KEYS | WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS):
+        if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
             fail("worktree_cleanup must declare the complete strict contract")
-        core={key:value for key,value in cleanup.items() if key not in WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS}
         expected["apply"]=cleanup.get("apply")
-        if core != expected or type(cleanup.get("apply")) is not bool:
+        if cleanup != expected or type(cleanup.get("apply")) is not bool:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
-        if cleanup["apply"]:
-            if set(cleanup) != WORKTREE_CLEANUP_KEYS | WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS or any(not isinstance(cleanup.get(key),str) or not re.fullmatch(r"[0-9a-f]{64}",cleanup[key]) for key in WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS):
-                fail("enabled worktree_cleanup requires sealed ghapp and cmux SHA-256 identities")
-        elif set(cleanup) != WORKTREE_CLEANUP_KEYS:
-            fail("dormant worktree_cleanup must not carry executable identity authority")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
     github_app = data.get("github_app")
@@ -1162,14 +1155,11 @@ def lane_plist(
             "TARTCI_WORKTREE_CLEANUP_PRIMARY": cleanup["primary"],
             "TARTCI_WORKTREE_CLEANUP_PREFIX": cleanup["prefix"],
             "TARTCI_WORKTREE_CLEANUP_MAIN_REF": cleanup["main_ref"],
-            "TARTCI_WORKTREE_CLEANUP_GITHUB_CLI": cleanup["github_cli"],
             "TARTCI_WORKTREE_CLEANUP_APPLY": "1" if cleanup["apply"] else "0",
             "TARTCI_WORKTREE_CLEANUP_MAX_TREES": str(cleanup["max_trees"]),
             "TARTCI_WORKTREE_CLEANUP_MAX_GIB": str(cleanup["max_gib"]),
             "TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS": str(cleanup["timeout_seconds"]),
             "TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS": str(cleanup["cooldown_seconds"]),
-            "TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256": cleanup["ghapp_sha256"],
-            "TARTCI_WORKTREE_CLEANUP_CMUX_SHA256": cleanup["cmux_sha256"],
         })
     github_app = data.get("github_app")
     if github_app is not None:

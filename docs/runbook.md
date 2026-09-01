@@ -1587,9 +1587,10 @@ attempt reports an exact disk-only capacity denial. The checked-in default is
 it requires integration review and a new signed fleet cohort. CPU, RAM, probe,
 malformed, and persisted/stale denials never trigger it.
 
-The provider takes one nonblocking lock, authenticates through `ghapp`, fetches
-the exact current `origin/main`, and requires complete `ps`, `lsof`, and cmux
-workspace observations. It retains primary, detached, locked, dirty, active,
+The provider takes one nonblocking lock, fetches the exact current `origin/main`
+from the literal canonical HTTPS remote under isolated Git configuration, and
+requires a complete fail-closed system `lsof` observation. It retains primary,
+detached, locked, dirty, active,
 unmerged, ambiguous, or branch-mismatched worktrees. Apply mode durably
 checkpoints before and after every removal and stops as soon as measured free
 space reaches the denial target. A removal uses non-forced

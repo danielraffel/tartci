@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
 """Conservative, bounded cleanup of merged Pulp Git worktrees."""
 from __future__ import annotations
-import argparse, datetime as dt, fcntl, hashlib, json, os, re, shutil, signal, stat, subprocess, tempfile, time
+import argparse, datetime as dt, fcntl, json, os, re, shutil, signal, stat, subprocess, tempfile, time
 from pathlib import Path
 
 SCHEMA = 1
-GIT="/usr/bin/git"; DU="/usr/bin/du"; PS="/bin/ps"; LSOF="/usr/sbin/lsof"
-GHAPP="/Users/danielraffel/.local/bin/ghapp"
-CMUX="/Applications/cmux.app/Contents/Resources/bin/cmux"
+GIT="/usr/bin/git"; DU="/usr/bin/du"; LSOF="/usr/sbin/lsof"
 GIT_CONFIG=["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null","-c","core.pager=cat","-c","pager.status=false"]
 GIT_ENV={"PATH":"/usr/bin:/bin:/usr/sbin:/sbin","GIT_CONFIG_GLOBAL":"/dev/null","GIT_CONFIG_SYSTEM":"/dev/null","GIT_CONFIG_NOSYSTEM":"1","GIT_TERMINAL_PROMPT":"0","GIT_OPTIONAL_LOCKS":"0","LANG":"C"}
-ALLOWED={GIT,DU,PS,LSOF,GHAPP,CMUX}
-PRIVATE_DIGESTS={}
+ALLOWED={GIT,DU,LSOF}
 class Stop(RuntimeError): pass
 
 def run(command, *, env=None, timeout=30, check=True):
     executable=command[0]
     if executable=="git": command=[GIT,*GIT_CONFIG,*command[1:]]; executable=GIT
     if executable not in ALLOWED: raise Stop(f"external executable is not allowed: {executable}")
-    identity=None
-    if executable in (GHAPP,CMUX):
-        target=Path(executable)
-        info=target.lstat()
-        if target.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode & 0o022 or not os.access(target,os.X_OK) or str(target.resolve(strict=True))!=executable: raise Stop(f"private executable identity is invalid: {executable}")
-        expected=PRIVATE_DIGESTS.get(executable)
-        if not expected or hashlib.sha256(target.read_bytes()).hexdigest()!=expected: raise Stop(f"private executable digest is not approved: {executable}")
-        identity=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns)
     controlled={**GIT_ENV,"HOME":os.environ.get("HOME","/Users/danielraffel"),"USER":os.environ.get("USER","danielraffel")}
     result=subprocess.run(command,text=True,capture_output=True,env=controlled,timeout=timeout,check=False)
-    if identity is not None:
-        info=Path(executable).lstat()
-        if identity!=(info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns): raise Stop(f"private executable changed during execution: {executable}")
     if check and result.returncode: raise Stop(f"command failed ({result.returncode}): {' '.join(command)}: {result.stderr.strip()}")
     return result
 
@@ -83,35 +69,31 @@ def canonical_directory(path:Path,prefix:Path,device:int):
     if resolved.stat().st_dev!=device: raise Stop(f"worktree is on another device: {path}")
     return resolved
 
+def validate_authority_roots(primary:Path,prefix:Path):
+    for label,path in (("primary",primary),("prefix",prefix)):
+        try: info=path.lstat(); resolved=path.resolve(strict=True)
+        except OSError as error: raise Stop(f"cleanup {label} authority is unavailable") from error
+        if path.is_symlink() or not stat.S_ISDIR(info.st_mode) or not path.is_absolute() or resolved!=path:
+            raise Stop(f"cleanup {label} authority is not an exact canonical directory")
+    if prefix not in primary.parents or primary.stat().st_dev!=prefix.stat().st_dev:
+        raise Stop("cleanup primary and prefix authorities do not share the required device hierarchy")
+
 def fresh_main(primary:Path,repo:str,ref:str,timeout:int):
     reject_executable_git_config(primary,timeout)
-    api=run([GHAPP,"api",f"repos/{repo}/git/ref/heads/{ref.removeprefix('origin/')}","--jq",".object.sha"],timeout=timeout).stdout.strip()
-    if not re.fullmatch(r"[0-9a-f]{40}",api): raise Stop("fresh GitHub main identity is malformed")
     fetched="refs/tartci-worktree-cleanup/fetched-main"
     try:
         run(["git","-C",str(primary),"fetch","--no-tags","--force",f"https://github.com/{repo}.git",f"refs/heads/{ref.removeprefix('origin/')}:"+fetched],timeout=timeout)
         sha=run(["git","-C",str(primary),"rev-parse",fetched],timeout=timeout).stdout.strip()
     finally: run(["git","-C",str(primary),"update-ref","-d",fetched],check=False)
-    if sha!=api: raise Stop("Git fetch and authenticated API main identities disagree")
+    if not re.fullmatch(r"[0-9a-f]{40}",sha): raise Stop("fresh fetched main identity is malformed")
     return sha
 
 def observations(prefix:Path,timeout:int):
-    run([PS,"-axo","pid=,command="],timeout=timeout)
     lsof_result=run([LSOF,"-Fn","+D",str(prefix)],timeout=timeout,check=False)
     if lsof_result.returncode not in (0,1) or lsof_result.stderr.strip(): raise Stop("lsof observation is incomplete")
     paths=set()
     for line in lsof_result.stdout.splitlines():
         if line.startswith("n/"): paths.add(line[1:])
-    cmux=run([CMUX,"list-workspaces","--json"],timeout=timeout).stdout
-    try: cmux_value=json.loads(cmux)
-    except json.JSONDecodeError as error: raise Stop("cmux workspace observation is malformed") from error
-    def collect(value,key=""):
-        if isinstance(value,dict):
-            for child_key,child in value.items(): collect(child,str(child_key).lower())
-        elif isinstance(value,list):
-            for child in value: collect(child,key)
-        elif isinstance(value,str) and key in {"path","cwd","root","current_directory","working_directory","workingdirectory"} and value.startswith("/"): paths.add(value)
-    collect(cmux_value)
     return paths
 
 def observation_active(paths,target:Path):
@@ -221,9 +203,9 @@ def reconcile_pending(args):
     record.setdefault("removals",[]).append(completed); record.pop("current_removal",None); record["status"]="stopped_after_reconciliation"; record["retry_admission"]="denied"
     record["after_free_bytes"]=shutil.disk_usage(args.prefix).free; record["finished_at"]=dt.datetime.now(dt.timezone.utc).isoformat(); atomic_json(args.receipt,record); return True
 def main(argv=None):
-    p=argparse.ArgumentParser(); p.add_argument("--provider",required=True); p.add_argument("--repo",required=True); p.add_argument("--primary",type=Path,required=True); p.add_argument("--prefix",type=Path,required=True); p.add_argument("--main-ref",required=True); p.add_argument("--github-cli",required=True); p.add_argument("--ghapp-sha256",required=True); p.add_argument("--cmux-sha256",required=True); p.add_argument("--receipt",type=Path,required=True); p.add_argument("--lock",type=Path,required=True); p.add_argument("--required-bytes",type=int,required=True); p.add_argument("--before-free-bytes",type=int,required=True); p.add_argument("--max-trees",type=int,default=8); p.add_argument("--max-bytes",type=int,default=512*1024**3); p.add_argument("--timeout",type=int,default=300); p.add_argument("--cooldown",type=int,default=3600); p.add_argument("--apply",action="store_true"); args=p.parse_args(argv)
-    if args.provider!="merged-main-v1" or args.repo!="Generous-Corp/pulp" or args.primary!=Path("/Volumes/Workshop/Code/pulp") or args.prefix!=Path("/Volumes/Workshop/Code") or args.main_ref!="origin/main" or args.github_cli!="ghapp" or not re.fullmatch(r"[0-9a-f]{64}",args.ghapp_sha256) or not re.fullmatch(r"[0-9a-f]{64}",args.cmux_sha256) or not 1<=args.max_trees<=8 or not 0<args.max_bytes<=512*1024**3 or not 1<=args.timeout<=300 or args.cooldown<0: raise Stop("unsupported cleanup authority")
-    PRIVATE_DIGESTS.update({GHAPP:args.ghapp_sha256,CMUX:args.cmux_sha256})
+    p=argparse.ArgumentParser(); p.add_argument("--provider",required=True); p.add_argument("--repo",required=True); p.add_argument("--primary",type=Path,required=True); p.add_argument("--prefix",type=Path,required=True); p.add_argument("--main-ref",required=True); p.add_argument("--receipt",type=Path,required=True); p.add_argument("--lock",type=Path,required=True); p.add_argument("--required-bytes",type=int,required=True); p.add_argument("--before-free-bytes",type=int,required=True); p.add_argument("--max-trees",type=int,default=8); p.add_argument("--max-bytes",type=int,default=512*1024**3); p.add_argument("--timeout",type=int,default=300); p.add_argument("--cooldown",type=int,default=3600); p.add_argument("--apply",action="store_true"); args=p.parse_args(argv)
+    if args.provider!="merged-main-v1" or args.repo!="Generous-Corp/pulp" or args.primary!=Path("/Volumes/Workshop/Code/pulp") or args.prefix!=Path("/Volumes/Workshop/Code") or args.main_ref!="origin/main" or not 1<=args.max_trees<=8 or not 0<args.max_bytes<=512*1024**3 or not 1<=args.timeout<=300 or args.cooldown<0: raise Stop("unsupported cleanup authority")
+    validate_authority_roots(args.primary,args.prefix)
     started=time.monotonic(); args.lock.parent.mkdir(parents=True,exist_ok=True)
     with args.lock.open("a+") as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)

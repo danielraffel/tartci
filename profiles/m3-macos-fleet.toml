@@ -24,7 +24,6 @@ repo = "Generous-Corp/pulp"
 primary = "/Volumes/Workshop/Code/pulp"
 prefix = "/Volumes/Workshop/Code"
 main_ref = "origin/main"
-github_cli = "ghapp"
 apply = false
 max_trees = 8
 max_gib = 512

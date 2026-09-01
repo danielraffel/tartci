@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 from pathlib import Path
-import json,subprocess,tempfile,types,unittest
+import json,subprocess,tempfile,time,types,unittest
 from unittest import mock
 import worktree_cleanup as cleanup
 
 class Tests(unittest.TestCase):
     def authority_argv(self, root):
-        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Workshop/Code/pulp","--prefix","/Volumes/Workshop/Code","--main-ref","origin/main","--github-cli","ghapp","--ghapp-sha256","a"*64,"--cmux-sha256","b"*64,"--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
+        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Workshop/Code/pulp","--prefix","/Volumes/Workshop/Code","--main-ref","origin/main","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
 
     def test_nonblocking_lock_and_cooldown_stop_before_inspection(self):
         with tempfile.TemporaryDirectory() as td:
@@ -108,17 +108,15 @@ class Tests(unittest.TestCase):
                 subprocess.run(["git","-C",str(primary),"config","--unset-all",key],check=True)
             self.assertFalse(marker.exists())
 
-    def test_github_and_fetched_main_mismatch_stops(self):
+    def test_fresh_main_uses_only_canonical_https_and_validates_sha(self):
         commands=[]
         def response(command,**_):
             commands.append(command)
-            if "remote" in command: value="https://github.com/Generous-Corp/pulp.git\n"
-            elif cleanup.GHAPP in command: value="a"*40+"\n"
-            elif "rev-parse" in command: value="b"*40+"\n"
+            if "rev-parse" in command: value="b"*40+"\n"
             else: value=""
             return subprocess.CompletedProcess(command,0,value,"")
-        with mock.patch.object(cleanup,"run",side_effect=response),self.assertRaises(cleanup.Stop):
-            cleanup.fresh_main(Path("/primary"),"Generous-Corp/pulp","origin/main",30)
+        with mock.patch.object(cleanup,"run",side_effect=response):
+            self.assertEqual(cleanup.fresh_main(Path("/primary"),"Generous-Corp/pulp","origin/main",30),"b"*40)
         fetch=next(command for command in commands if "fetch" in command)
         self.assertIn("https://github.com/Generous-Corp/pulp.git",fetch); self.assertNotIn("origin",fetch)
 
@@ -129,17 +127,16 @@ class Tests(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_GLOBAL"],"/dev/null"); self.assertEqual(env["GIT_CONFIG_SYSTEM"],"/dev/null")
         self.assertEqual(env["PATH"],"/usr/bin:/bin:/usr/sbin:/sbin")
 
-    def test_cmux_current_directory_is_an_exact_activity_observation(self):
-        target=Path("/Volumes/Workshop/Code/pulp-claimed")
-        responses=[
-            subprocess.CompletedProcess([],0,"",""),
-            subprocess.CompletedProcess([],1,"",""),
-            subprocess.CompletedProcess([],0,json.dumps({"workspaces":[{"current_directory":str(target)}]}),""),
-        ]
-        with mock.patch.object(cleanup,"run",side_effect=responses):
-            paths=cleanup.observations(Path("/Volumes/Workshop/Code"),30)
-        self.assertTrue(cleanup.observation_active(paths,target))
-        self.assertFalse(cleanup.observation_active(paths,Path(str(target)+"-backup")))
+    def test_lsof_observation_tracks_live_cwd_after_worktree_quarantine_move(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,_,selected=self.make_repo(root,["one"]); path=selected[0][0]; quarantine=root/"quarantine"
+            holder=subprocess.Popen(["/bin/sh","-c",f"cd {str(path)!r}; exec sleep 30"])
+            try:
+                time.sleep(0.2)
+                subprocess.run(["git","-C",str(primary),"worktree","move",str(path),str(quarantine)],check=True)
+                self.assertTrue(cleanup.observation_active(cleanup.observations(quarantine,30),quarantine))
+            finally:
+                holder.terminate(); holder.wait(timeout=5)
 
     def test_inspect_selects_only_clean_merged_attached_branch(self):
         with tempfile.TemporaryDirectory() as td:
@@ -217,6 +214,15 @@ class Tests(unittest.TestCase):
             with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(link,prefix,target.stat().st_dev)
             with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(root,prefix,target.stat().st_dev)
             with self.assertRaises(cleanup.Stop): cleanup.canonical_directory(target,prefix,target.stat().st_dev+1)
+
+    def test_authority_roots_reject_primary_or_prefix_symlinks(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); prefix=root/"Code"; prefix.mkdir(); primary=prefix/"pulp"; primary.mkdir()
+            cleanup.validate_authority_roots(primary,prefix)
+            primary_link=prefix/"pulp-link"; primary_link.symlink_to(primary,target_is_directory=True)
+            with self.assertRaises(cleanup.Stop): cleanup.validate_authority_roots(primary_link,prefix)
+            prefix_link=root/"Code-link"; prefix_link.symlink_to(prefix,target_is_directory=True)
+            with self.assertRaises(cleanup.Stop): cleanup.validate_authority_roots(prefix_link,prefix_link/"pulp")
     def test_provider_is_fail_closed(self):
-        with self.assertRaises(cleanup.Stop): cleanup.main(["--provider","other","--repo","Generous-Corp/pulp","--primary","/x","--prefix","/y","--main-ref","origin/main","--github-cli","ghapp","--ghapp-sha256","a"*64,"--cmux-sha256","b"*64,"--receipt","/r","--lock","/l","--required-bytes","1","--before-free-bytes","0"])
+        with self.assertRaises(cleanup.Stop): cleanup.main(["--provider","other","--repo","Generous-Corp/pulp","--primary","/x","--prefix","/y","--main-ref","origin/main","--receipt","/r","--lock","/l","--required-bytes","1","--before-free-bytes","0"])
 if __name__=="__main__": unittest.main()

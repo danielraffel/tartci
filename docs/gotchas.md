@@ -608,5 +608,5 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 The optional cleanup provider is M3/Pulp-only and accepts only a fresh,
 machine-readable disk-axis lease denial. Do not broaden it to old receipts,
 CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
-Incomplete `ps`, `lsof`, cmux, Git, branch, or main-fetch evidence is a stop,
+Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
