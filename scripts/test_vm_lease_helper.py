@@ -43,6 +43,8 @@ class VmLeaseHelperTests(unittest.TestCase):
           export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
           export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
           export TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+          export TARTCI_RUNNER_REPO=Generous-Corp/pulp
+          export TARTCI_RECEIPT_HOST_ID=studio
           for value in 'not-json' '{{"ok":false,"reason":"cpu_capacity_exceeded","exceeded_axis":{{"cores":true,"memory":false,"disk":false}}}}' '{{"ok":false,"reason":"disk_probe_failed"}}'; do
             if tartci_try_worktree_cleanup "$value"; then exit 9; fi
           done
@@ -68,12 +70,53 @@ class VmLeaseHelperTests(unittest.TestCase):
               export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code
               export TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
               export TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+              export TARTCI_RUNNER_REPO=Generous-Corp/pulp
+              export TARTCI_RECEIPT_HOST_ID=studio
               mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
               tartci_try_worktree_cleanup '{attempt}'
             '''
             result = _run_bash(script)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("--before-free-bytes 10 --required-bytes 20", called.read_text())
+
+    def test_worktree_cleanup_trigger_rejects_wrong_or_missing_lane_identity(self) -> None:
+        attempt = '{"ok":false,"reason":"disk_capacity_exceeded","exceeded_axis":{"cores":false,"memory":false,"disk":true},"disk":{"available_after_reservations_bytes":10,"required_bytes":20}}'
+        for runner_repo, host_id in (("", "studio"), ("Generous-Corp/forge", "studio"), ("Generous-Corp/pulp", ""), ("Generous-Corp/pulp", "m5")):
+            with self.subTest(runner_repo=runner_repo, host_id=host_id), tempfile.TemporaryDirectory() as td:
+                root = Path(td); (root / "scripts").mkdir(); called = root / "called"
+                _write_exec(root / "scripts/worktree_cleanup.py", f"#!/usr/bin/env python3\nimport pathlib\npathlib.Path({str(called)!r}).touch()\n")
+                result = _run_bash(f'''
+                  source {HELPER}; export TARTCI_ROOT={root}; export TARTCI_DISK_DENIAL_RECEIPT_DIR={root / "receipts"}
+                  export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+                  export TARTCI_RUNNER_REPO={runner_repo!r} TARTCI_RECEIPT_HOST_ID={host_id!r}
+                  tartci_try_worktree_cleanup '{attempt}'; test $? -eq 1
+                ''')
+                self.assertEqual(result.returncode, 0, result.stderr); self.assertFalse(called.exists())
+
+    def test_successful_cleanup_retries_lease_exactly_once_but_nonzero_does_not(self) -> None:
+        denial = '{"ok":false,"reason":"disk_capacity_exceeded","exceeded_axis":{"cores":false,"memory":false,"disk":true},"disk":{"available_after_reservations_bytes":10,"required_bytes":20}}'
+        for cleanup_rc, expected_calls in ((0, 2), (5, 1)):
+            with self.subTest(cleanup_rc=cleanup_rc), tempfile.TemporaryDirectory() as td:
+                root = Path(td); (root / "scripts").mkdir(); count = root / "count"
+                _write_exec(root / "scripts/leases.py", f'''#!/usr/bin/env python3
+import pathlib,sys
+p=pathlib.Path({str(count)!r}); n=int(p.read_text())+1 if p.exists() else 1; p.write_text(str(n))
+if n==1: print({denial!r}); raise SystemExit(75)
+print('{{"ok":true,"reason":"acquired"}}')
+''')
+                _write_exec(root / "scripts/worktree_cleanup.py", f"#!/usr/bin/env python3\nraise SystemExit({cleanup_rc})\n")
+                result = _run_bash(f'''
+                  source {HELPER}; tartci_start_vm_lease_heartbeat() {{ :; }}
+                  export TARTCI_ROOT={root} TARTCI_DISK_DENIAL_RECEIPT_DIR={root / "receipts"}
+                  export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
+                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
+                  export TARTCI_RUNNER_REPO=Generous-Corp/pulp TARTCI_RECEIPT_HOST_ID=studio
+                  mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
+                  tartci_acquire_vm_lease unit 1 test-vm gate labels '' '' provider lane runner
+                  rc=$?; test "$(cat {count})" -eq {expected_calls}
+                  test "$rc" -eq {0 if cleanup_rc == 0 else 75}
+                ''')
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_observed_preflight_floor_denial_emits_authoritative_frame(self) -> None:
         with tempfile.TemporaryDirectory() as td:

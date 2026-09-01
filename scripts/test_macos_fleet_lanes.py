@@ -73,11 +73,22 @@ class MacosFleetLaneTests(unittest.TestCase):
     def test_m3_worktree_cleanup_contract_is_dormant_and_rendered(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         self.assertFalse(data["worktree_cleanup"]["apply"])
+        enabled = 0
         for body in fleet.rendered_plists(data).values():
             env = plistlib.loads(body)["EnvironmentVariables"]
-            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_PROVIDER"], "merged-main-v1")
-            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_APPLY"], "0")
-            self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_MAX_GIB"], "512")
+            cleanup_keys = {key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
+            if env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp":
+                enabled += 1
+                self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_PROVIDER"], "merged-main-v1")
+                self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_APPLY"], "0")
+                self.assertEqual(env["TARTCI_WORKTREE_CLEANUP_MAX_GIB"], "512")
+            else:
+                self.assertEqual(cleanup_keys, set())
+        self.assertEqual(enabled, 2)
+        for profile in (HOST_CONFIGS["m1"], HOST_CONFIGS["m5"]):
+            for body in fleet.rendered_plists(fleet.load(profile)).values():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertFalse(any(key.startswith("TARTCI_WORKTREE_CLEANUP_") for key in env))
 
     def test_worktree_cleanup_rejected_outside_exact_m3_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -288,6 +288,8 @@ tartci_try_worktree_cleanup(){
   [ "${TARTCI_WORKTREE_CLEANUP_PROVIDER:-}" = merged-main-v1 ] || return 1
   [ "${TARTCI_WORKTREE_CLEANUP_REPO:-}" = Generous-Corp/pulp ] || return 1
   [ "${TARTCI_WORKTREE_CLEANUP_GITHUB_CLI:-}" = ghapp ] || return 1
+  [ "${TARTCI_RUNNER_REPO:-}" = Generous-Corp/pulp ] || return 1
+  [ "${TARTCI_RECEIPT_HOST_ID:-}" = studio ] || return 1
   IFS=$'\t' read -r free_bytes required_bytes < <(printf '%s' "$attempt_json" | python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
