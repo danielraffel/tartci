@@ -20,8 +20,9 @@ Its profile alone declares a stable Developer-ID app at
 support cohort and rendered M3 lane records. Its native process accepts only a
 sealed lane enum, remains resident as the macOS privacy responsible identity,
 and cannot launch a caller-selected executable or argument vector. The profile
-binds its identifier, Team ID, and profile policy; the bundle and receipt bind
-the exact source commit, realized bundle SHA-256, designated requirement,
+binds its identifier, Team ID, profile policy, and a host-private mode-0600
+approval-digest path produced by the signing build; the bundle and receipt bind
+the exact source commit, approved bundle SHA-256, designated requirement,
 owner, and mode. Fleet
 installation consumes an already-signed artifact; it never holds a signing
 identity. Before admission,

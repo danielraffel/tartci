@@ -46,7 +46,7 @@ STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
-LAUNCH_HELPER_KEYS = {"path", "identifier", "team_id"}
+LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -182,10 +182,13 @@ def load(path: Path) -> dict:
     external_tart_home = PurePosixPath(host["tart_home"]).parts[:2] == ("/", "Volumes")
     if helper is not None:
         if not isinstance(helper, dict) or set(helper) != LAUNCH_HELPER_KEYS:
-            fail("launch_helper must declare path, identifier, and team_id")
+            fail("launch_helper must declare path, approval_sha256_path, identifier, and team_id")
         expected_path = PurePosixPath(host["home"]) / ".local/libexec/TartCILauncher.app"
         if helper.get("path") != str(expected_path):
             fail("launch_helper.path must be the stable host-local TartCI launcher path")
+        expected_approval = PurePosixPath(host["home"]) / ".config/tartci/m3-launcher-approved.sha256"
+        if helper.get("approval_sha256_path") != str(expected_approval):
+            fail("launch_helper.approval_sha256_path must be the stable private M3 approval path")
         if helper.get("identifier") != "com.danielraffel.tartci.launcher":
             fail("launch_helper.identifier must be com.danielraffel.tartci.launcher")
         if (not isinstance(helper.get("team_id"), str)

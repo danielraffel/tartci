@@ -324,6 +324,7 @@ actual_host_id="$("$shipyard_bin" runner tag 2>/dev/null)" || {
 }
 if [ "$launch_helper_json" != "null" ]; then
   launcher_target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
+  launcher_approval_path="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
   launcher_identifier="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
   launcher_team_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["team_id"])' <<<"$launch_helper_json")"
   launcher_profile_policy_sha256="$(python3 - "$locked_config" "$ROOT" <<'PY'
@@ -334,9 +335,23 @@ import macos_launcher_identity
 print(macos_launcher_identity.profile_policy_digest(Path(sys.argv[1])))
 PY
 )"
+  launcher_sha256="$(python3 - "$launcher_approval_path" <<'PY'
+import os, re, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+info = path.lstat()
+if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+    raise SystemExit("launcher approval must be an owned mode-0600 regular file")
+value = path.read_text()
+if not re.fullmatch(r"[0-9a-f]{64}\n", value):
+    raise SystemExit("launcher approval must contain one lowercase SHA-256 line")
+print(value.strip())
+PY
+)"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
   launcher_identity_json="$(python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256")"
   launcher_source_commit="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
   mkdir -p "$(dirname "$launcher_target")"
@@ -363,6 +378,7 @@ PY
   /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
   python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
     --source-commit "$launcher_source_commit" >/dev/null
 elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
@@ -589,6 +605,7 @@ if [ -n "$launcher_target" ]; then
   durable_tree "$launcher_target"
   python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
     --source-commit "$launcher_source_commit" >/dev/null
   maybe_test_crash launcher

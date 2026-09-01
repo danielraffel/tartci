@@ -14,6 +14,7 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 # the TCC responsible process; public/home-backed profiles do not inherit it.
 [launch_helper]
 path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
+approval_sha256_path = "/Users/danielraffel/.config/tartci/m3-launcher-approved.sha256"
 identifier = "com.danielraffel.tartci.launcher"
 team_id = "95CX6P84C4"
 

@@ -76,6 +76,7 @@ installation:
 ```sh
 scripts/build_macos_launcher.sh \
   --output /absolute/staging/TartCILauncher.app \
+  --approval-output /absolute/staging/TartCILauncher.sha256 \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
   --profile profiles/m3-macos-fleet.toml
@@ -84,7 +85,8 @@ scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256>
 ```
 
-The M3 profile pins path, identifier, Team ID, and the exact profile policy.
+The M3 profile pins path, identifier, Team ID, exact profile policy, and the
+path to an owned mode-0600 approval digest produced by the signing build.
 The bundle binds the same exact TartCI source commit as the installed support
 cohort. The installer accepts it with `--launch-helper-source`, atomically
 publishes it, and binds path, owner, mode, realized bundle digest, designated
