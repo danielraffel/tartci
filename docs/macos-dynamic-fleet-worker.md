@@ -14,6 +14,21 @@ uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
 `TART_HOME`.
 
+M3's external store is not permission-equivalent to the home-backed stores.
+Its profile alone declares a stable Developer-ID app at
+`~/.local/libexec/TartCILauncher.app`. The app signature seals the exact TartCI
+support cohort and rendered M3 lane records. Its native process accepts only a
+sealed lane enum, remains resident as the macOS privacy responsible identity,
+and cannot launch a caller-selected executable or argument vector. The profile
+and install receipt bind its bundle SHA-256, identifier, Team ID, designated
+requirement, source commit, profile-policy digest, owner, and mode. Fleet
+installation consumes an already-signed artifact; it never holds a signing
+identity. Before admission,
+`pool on` uses a temporary LaunchAgent to prove bounded write/read/delete access
+to `/Volumes/Workshop/VMs`. Failure leaves participation closed and starts no
+runner. This is private host policy encoded by the M3 profile, not a default
+imposed on TartCI users.
+
 M1 and M5 also declare the three references required by the Shipyard GitHub App
 wrapper: App ID, private-key path, and token-cache directory. The renderer
 places those references (never key or token contents) in each managed
@@ -89,6 +104,23 @@ for file in "$out"/*.plist; do plutil -lint "$file"; done
 # Before any separately authorized install/bootstrap on M1:
 ssh m1-lan 'mkdir -p "$HOME/Library/Logs/tartci"'
 ```
+
+For M3, stage the exact profile-pinned signed launcher alongside the immutable
+support cohort, then install only at a terminal idle boundary:
+
+```sh
+./tartci fleet-macos install profiles/m3-macos-fleet.toml \
+  --support-source . --support-manifest .tartci-support-manifest.json \
+  --launch-helper-source /absolute/staging/TartCILauncher.app --apply
+./tartci pool on
+./tartci pool status --require-ready
+```
+
+The migration gate is zero Shipyard jobs, zero production leases, zero running
+production VMs, and zero Runner.Worker processes. Never preempt a job to obtain
+that boundary. After the first explicit Removable Volumes grant, canary a real
+JIT job and then replace the launcher once with the same identifier/Team ID to
+prove the consent identity is durable.
 
 Before a future stacked-image canary on any host, validate only metadata and
 authorization without displaying credential values:

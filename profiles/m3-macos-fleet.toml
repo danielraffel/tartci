@@ -10,6 +10,16 @@ tart_home = "/Volumes/Workshop/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 
+# Daniel-only external-volume execution. The stable Developer-ID identity is
+# the TCC responsible process; public/home-backed profiles do not inherit it.
+[launch_helper]
+path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
+# Bootstrap value for the first local commit. The immediately following
+# artifact-pin commit replaces it with the exact signed bundle digest.
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+identifier = "com.danielraffel.tartci.launcher"
+team_id = "95CX6P84C4"
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27
