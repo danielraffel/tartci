@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 
@@ -45,8 +48,35 @@ class AssignmentScanner:
         if self.required_label not in self.runner_labels:
             raise ScanError("required assignment-class label is absent from runner labels")
         self.deadline = time.monotonic() + args.scan_timeout
+        self.observation_lock_path = Path(args.observation_lock_file)
         self.api_calls = 0
         self.api_calls_lock = threading.Lock()
+
+    @contextlib.contextmanager
+    def _observation_lock(self) -> Any:
+        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_deadline = min(
+            self.deadline,
+            time.monotonic() + self.args.observation_lock_timeout,
+        )
+        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
+            while True:
+                try:
+                    fcntl.flock(
+                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                    )
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= lock_deadline:
+                        raise ScanError(
+                            "host queue observation lock timed out after "
+                            f"{self.args.observation_lock_timeout}s"
+                        )
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     def _gh(self, path: str) -> dict[str, Any]:
         with self.api_calls_lock:
@@ -234,14 +264,20 @@ class AssignmentScanner:
         return len(matches)
 
     def scan(self) -> int:
-        runs = self._runs()
-        # Job pages are independent snapshots. Fetch them concurrently, but
-        # retain exhaustive pagination and fail the whole scan on any uncertain
-        # result. This bounds reaction latency without weakening admission.
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.args.max_workers
-        ) as executor:
-            return sum(executor.map(self._scan_run, runs), start=0)
+        # Every fleet supervisor shares this host-global observation slot. The
+        # exhaustive scanner can issue many GitHub calls; overlapping scans for
+        # different lanes made individually healthy ghapp requests time out and
+        # left the host scan-blind. The bounded lock wait is part of the overall
+        # deadline and failure remains fail-closed.
+        with self._observation_lock():
+            runs = self._runs()
+            # Concurrency remains opt-in for a measured host. The reliable
+            # fleet default is one call stream; raising it multiplies pressure
+            # inside the host-global scan and must not happen accidentally.
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=self.args.max_workers
+            ) as executor:
+                return sum(executor.map(self._scan_run, runs), start=0)
 
 
 def parse_args() -> argparse.Namespace:
@@ -280,7 +316,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-workers",
         type=int,
-        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS", "4")),
+        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS", "1")),
+    )
+    parser.add_argument(
+        "--observation-lock-file",
+        default=os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE")
+        or str(Path.home() / ".tartci/state/queue-observation.lock"),
+    )
+    parser.add_argument(
+        "--observation-lock-timeout",
+        type=float,
+        default=float(
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "30")
+        ),
     )
     args = parser.parse_args()
     if args.gh_timeout <= 0:
@@ -295,6 +343,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-api-calls must be positive")
     if not 1 <= args.max_workers <= 16:
         parser.error("--max-workers must be between 1 and 16")
+    if args.observation_lock_timeout <= 0:
+        parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     return args

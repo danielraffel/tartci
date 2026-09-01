@@ -2,6 +2,7 @@
 """Behavioral coverage for exclusive V2 macOS JIT assignment classes."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import stat
@@ -254,6 +255,7 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
         scanner.args = Namespace(max_workers=3)
+        scanner._observation_lock = lambda: contextlib.nullcontext()
         scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
         lock = threading.Lock()
         active = 0
@@ -272,6 +274,46 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         scanner._scan_run = scan_run
         self.assertEqual(scanner.scan(), 6)
         self.assertEqual(peak, 3)
+
+    def test_cross_process_assignment_scans_share_host_observation_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            marker = root / "entered"
+            lock = root / "host-observation.lock"
+            fake = root / "slow-gh"
+            _write_exec(
+                fake,
+                """#!/usr/bin/env python3
+import json, os, time
+from pathlib import Path
+Path(os.environ['ENTERED']).write_text('yes', encoding='utf-8')
+time.sleep(2)
+print(json.dumps({'total_count': 0, 'workflows': []}))
+""",
+            )
+            common = [
+                "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                "--workflow", "Build and Test", "--labels", "pulp-build-merge-group",
+                "--require-label", "pulp-build-merge-group", "--gh-cli", str(fake),
+                "--observation-lock-file", str(lock), "--scan-timeout", "10",
+            ]
+            env = {**os.environ, "ENTERED": str(marker)}
+            holder = subprocess.Popen(
+                [*common, "--observation-lock-timeout", "5"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+            )
+            deadline = time.monotonic() + 3
+            while not marker.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "first scanner never entered GitHub observation")
+            denied = subprocess.run(
+                [*common, "--observation-lock-timeout", "0.05"],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(denied.returncode, 2)
+            self.assertIn("observation lock timed out", denied.stderr)
+            holder.terminate()
+            holder.communicate(timeout=5)
 
     def test_run_and_job_pages_are_exhaustive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
