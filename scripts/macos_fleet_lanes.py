@@ -726,6 +726,7 @@ def verify_loaded(
         )
         if "keepalive" not in properties or "runatload" not in properties:
             fail(f"loaded LaunchAgent {label} lost keepalive/runatload properties")
+        _loaded_has(output, "\texit timeout = 30 seconds\n", f"{label} exit timeout")
         loaded[name] = hashlib.sha256(output.encode()).hexdigest()
     return {
         "schema": 1,
@@ -860,6 +861,10 @@ def lane_plist(
         "StandardOutPath": f"{host['log_root']}/macos-fleet-{identity}.log",
         "StandardErrorPath": f"{host['log_root']}/macos-fleet-{identity}.log",
         "ProcessType": "Background",
+        # Give the supervisor's TERM trap a deterministic cleanup window and
+        # retain launchd ownership of ordinary provider descendants.
+        "ExitTimeOut": 30,
+        "AbandonProcessGroup": False,
         "EnvironmentVariables": env,
     }
 

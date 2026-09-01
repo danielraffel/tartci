@@ -363,6 +363,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertEqual(len(files), 5)
             values = [plistlib.loads(path.read_bytes()) for path in files]
             self.assertTrue(all(value["RunAtLoad"] for value in values))
+            self.assertTrue(all(value["ExitTimeOut"] == 30 for value in values))
+            self.assertTrue(all(value["AbandonProcessGroup"] is False for value in values))
             self.assertTrue(all(".tart-runner-" in value["Label"] for value in values))
             self.assertTrue(all("--name" not in value["ProgramArguments"] for value in values))
             self.assertTrue(all(value["EnvironmentVariables"]["TARTCI_GH_CLI"] == "ghapp" for value in values))

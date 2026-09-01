@@ -104,6 +104,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             print(f"\\tworking directory = {{value['WorkingDirectory']}}\\n")
             print(f"\\tstdout path = {{value['StandardOutPath']}}")
             print(f"\\tstderr path = {{value['StandardErrorPath']}}\\n")
+            print(f"\\texit timeout = {{value['ExitTimeOut']}} seconds\\n")
             print("\\tenvironment = {{")
             for key, item in value["EnvironmentVariables"].items():
                 print(f"\\t\\t{{key}} => {{item}}")
