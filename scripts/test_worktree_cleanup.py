@@ -129,6 +129,18 @@ class Tests(unittest.TestCase):
         self.assertEqual(env["GIT_CONFIG_GLOBAL"],"/dev/null"); self.assertEqual(env["GIT_CONFIG_SYSTEM"],"/dev/null")
         self.assertEqual(env["PATH"],"/usr/bin:/bin:/usr/sbin:/sbin")
 
+    def test_cmux_current_directory_is_an_exact_activity_observation(self):
+        target=Path("/Volumes/Workshop/Code/pulp-claimed")
+        responses=[
+            subprocess.CompletedProcess([],0,"",""),
+            subprocess.CompletedProcess([],1,"",""),
+            subprocess.CompletedProcess([],0,json.dumps({"workspaces":[{"current_directory":str(target)}]}),""),
+        ]
+        with mock.patch.object(cleanup,"run",side_effect=responses):
+            paths=cleanup.observations(Path("/Volumes/Workshop/Code"),30)
+        self.assertTrue(cleanup.observation_active(paths,target))
+        self.assertFalse(cleanup.observation_active(paths,Path(str(target)+"-backup")))
+
     def test_inspect_selects_only_clean_merged_attached_branch(self):
         with tempfile.TemporaryDirectory() as td:
             prefix=Path(td).resolve(); primary=prefix/"primary"

@@ -85,6 +85,7 @@ class VmLeaseHelperTests(unittest.TestCase):
               export TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256={'a'*64} TARTCI_WORKTREE_CLEANUP_CMUX_SHA256={'b'*64}
               export TARTCI_RUNNER_REPO=Generous-Corp/pulp
               export TARTCI_RECEIPT_HOST_ID=studio
+              export TARTCI_QUEUE_LANE_ID=studio-pulp-gate
               mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
               tartci_try_worktree_cleanup '{attempt}'
             '''
@@ -94,8 +95,8 @@ class VmLeaseHelperTests(unittest.TestCase):
 
     def test_worktree_cleanup_trigger_rejects_wrong_or_missing_lane_identity(self) -> None:
         attempt = '{"ok":false,"reason":"disk_capacity_exceeded","exceeded_axis":{"cores":false,"memory":false,"disk":true},"disk":{"free_bytes":10,"available_after_reservations_bytes":9,"required_bytes":20}}'
-        for runner_repo, host_id in (("", "studio"), ("Generous-Corp/forge", "studio"), ("Generous-Corp/pulp", ""), ("Generous-Corp/pulp", "m5")):
-            with self.subTest(runner_repo=runner_repo, host_id=host_id), tempfile.TemporaryDirectory() as td:
+        for runner_repo, host_id, queue_lane in (("", "studio", "studio-pulp-gate"), ("Generous-Corp/forge", "studio", "studio-pulp-gate"), ("Generous-Corp/pulp", "", "studio-pulp-gate"), ("Generous-Corp/pulp", "m5", "studio-pulp-gate"), ("Generous-Corp/pulp", "studio", "studio-forge-gate"), ("Generous-Corp/pulp", "studio", "")):
+            with self.subTest(runner_repo=runner_repo, host_id=host_id, queue_lane=queue_lane), tempfile.TemporaryDirectory() as td:
                 root = Path(td); (root / "scripts").mkdir(); called = root / "called"
                 _write_exec(root / "scripts/worktree_cleanup.py", f"#!/usr/bin/env python3\nimport pathlib\npathlib.Path({str(called)!r}).touch()\n")
                 result = _run_bash(f'''
@@ -103,7 +104,7 @@ class VmLeaseHelperTests(unittest.TestCase):
                   export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp TARTCI_WORKTREE_CLEANUP_GITHUB_CLI=ghapp
                   export TARTCI_WORKTREE_CLEANUP_APPLY=1
                   export TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256={'a'*64} TARTCI_WORKTREE_CLEANUP_CMUX_SHA256={'b'*64}
-                  export TARTCI_RUNNER_REPO={runner_repo!r} TARTCI_RECEIPT_HOST_ID={host_id!r}
+                  export TARTCI_RUNNER_REPO={runner_repo!r} TARTCI_RECEIPT_HOST_ID={host_id!r} TARTCI_QUEUE_LANE_ID={queue_lane!r}
                   tartci_try_worktree_cleanup '{attempt}'; test $? -eq 1
                 ''')
                 self.assertEqual(result.returncode, 0, result.stderr); self.assertFalse(called.exists())
@@ -139,6 +140,7 @@ print('{{"ok":true,"reason":"acquired"}}')
                   export TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256={'a'*64} TARTCI_WORKTREE_CLEANUP_CMUX_SHA256={'b'*64}
                   export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
                   export TARTCI_RUNNER_REPO=Generous-Corp/pulp TARTCI_RECEIPT_HOST_ID=studio
+                  export TARTCI_QUEUE_LANE_ID=studio-pulp-gate
                   mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
                   tartci_acquire_vm_lease unit 1 test-vm gate labels '' '' provider lane runner
                   rc=$?; test "$(cat {count})" -eq {expected_calls}

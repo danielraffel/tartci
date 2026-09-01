@@ -110,7 +110,7 @@ def observations(prefix:Path,timeout:int):
             for child_key,child in value.items(): collect(child,str(child_key).lower())
         elif isinstance(value,list):
             for child in value: collect(child,key)
-        elif isinstance(value,str) and key in {"path","cwd","root","working_directory","workingdirectory"} and value.startswith("/"): paths.add(value)
+        elif isinstance(value,str) and key in {"path","cwd","root","current_directory","working_directory","workingdirectory"} and value.startswith("/"): paths.add(value)
     collect(cmux_value)
     return paths
 

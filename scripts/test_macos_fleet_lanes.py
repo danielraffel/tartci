@@ -88,8 +88,8 @@ class MacosFleetLaneTests(unittest.TestCase):
             path.write_text(body); rendered=fleet.rendered_plists(fleet.load(path)); pulp_count=0
             for plist_body in rendered.values():
                 env=plistlib.loads(plist_body)["EnvironmentVariables"]; keys={key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
-                if env["TARTCI_RUNNER_REPO"]=="Generous-Corp/pulp":
-                    pulp_count+=1; self.assertIn("TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256",keys); self.assertIn("TARTCI_WORKTREE_CLEANUP_CMUX_SHA256",keys)
+                if env["TARTCI_QUEUE_LANE_ID"] in {"studio-pulp-gate","studio-pulp-gate-slot2"}:
+                    pulp_count+=1; self.assertEqual(env["TARTCI_RUNNER_REPO"],"Generous-Corp/pulp"); self.assertIn("TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256",keys); self.assertIn("TARTCI_WORKTREE_CLEANUP_CMUX_SHA256",keys)
                 else: self.assertEqual(keys,set())
             self.assertEqual(pulp_count,2)
 

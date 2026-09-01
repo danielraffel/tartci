@@ -304,6 +304,10 @@ tartci_try_worktree_cleanup(){
   [ "${TARTCI_WORKTREE_CLEANUP_GITHUB_CLI:-}" = ghapp ] || return 1
   [ "${TARTCI_RUNNER_REPO:-}" = Generous-Corp/pulp ] || return 1
   [ "${TARTCI_RECEIPT_HOST_ID:-}" = studio ] || return 1
+  case "${TARTCI_QUEUE_LANE_ID:-}" in
+    studio-pulp-gate|studio-pulp-gate-slot2) ;;
+    *) return 1 ;;
+  esac
   [ "${#ghapp_sha}" -eq 64 ] || return 1
   [ "${#cmux_sha}" -eq 64 ] || return 1
   case "$ghapp_sha$cmux_sha" in *[!0-9a-f]*) return 1;; esac
