@@ -8,6 +8,7 @@ import os
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Sequence
 
@@ -15,6 +16,14 @@ from collections.abc import Sequence
 TIMEOUT_EXIT_CODE = 124
 DESCENDANT_LEAK_EXIT_CODE = 125
 TERMINATE_GRACE_SECONDS = 0.25
+
+
+class _ParentSignal(BaseException):
+    """Interrupt a wait so its private observation group can be reaped."""
+
+    def __init__(self, signum: int) -> None:
+        super().__init__(signum)
+        self.signum = signum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,13 +139,46 @@ def run_bounded(
         except OSError as exc:
             raise ObservationError(operation, "spawn_failed", str(exc)) from exc
 
+        old_handlers: dict[int, signal.Handlers] = {}
+        if threading.current_thread() is threading.main_thread():
+            for signum in (signal.SIGTERM, signal.SIGINT):
+                previous = signal.getsignal(signum)
+                if previous is signal.SIG_IGN:
+                    continue
+                old_handlers[signum] = previous
+
+                def interrupt_parent(
+                    received: int,
+                    _frame: object,
+                ) -> None:
+                    raise _ParentSignal(received)
+
+                signal.signal(signum, interrupt_parent)
+
         timed_out = False
+        parent_signal: int | None = None
         try:
-            returncode = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            timed_out = True
-            _terminate_group(proc)
-            returncode = TIMEOUT_EXIT_CODE
+            try:
+                returncode = proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+                _terminate_group(proc)
+                returncode = TIMEOUT_EXIT_CODE
+            except _ParentSignal as exc:
+                parent_signal = exc.signum
+                _terminate_group(proc)
+                returncode = 128 + exc.signum
+        finally:
+            for signum, previous in old_handlers.items():
+                signal.signal(signum, previous)
+
+        if parent_signal is not None:
+            # Re-deliver only after the private group is terminal and the
+            # caller's signal disposition is restored. With the normal default
+            # disposition this preserves the supervisor's signal exit status;
+            # a caller-installed handler receives the original signal once.
+            os.kill(os.getpid(), parent_signal)
+            raise RuntimeError("parent signal unexpectedly returned")
 
         leaked_descendant = False
         if not timed_out and _group_exists(proc.pid):
