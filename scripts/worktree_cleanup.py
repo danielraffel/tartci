@@ -46,9 +46,16 @@ def registered(rows,path:Path):
     return matches[0] if matches else None
 
 def reject_executable_git_config(primary:Path,timeout:int):
-    result=run(["git","-C",str(primary),"config","--local","--name-only","--get-regexp",r"^(core\.sshcommand|credential\..*helper|credential\.helper|filter\..*\.(process|clean|smudge)|core\.hookspath|url\..*\.insteadof|include(if)?\..*|diff\.external|diff\..*\.command|merge\..*\.driver|alias\..*|http\..*|remote\..*\.proxy)$"],timeout=timeout,check=False)
-    if result.returncode not in (0,1): raise Stop("local Git config inspection failed")
-    if result.stdout.strip(): raise Stop("repository local config contains executable or transport-bearing settings")
+    blocked=r"^(core\.sshcommand|credential\..*helper|credential\.helper|filter\..*\.(process|clean|smudge)|core\.hookspath|url\..*\.insteadof|include(if)?\..*|diff\.external|diff\..*\.command|merge\..*\.driver|alias\..*|http\..*|remote\..*\.proxy)$"
+    local=run(["git","-C",str(primary),"config","--local","--name-only","--get-regexp",blocked],timeout=timeout,check=False)
+    if local.returncode not in (0,1): raise Stop("local Git config inspection failed")
+    if local.stdout.strip(): raise Stop("repository local config contains executable or transport-bearing settings")
+    worktree_enabled=run(["git","-C",str(primary),"config","--local","--bool","extensions.worktreeConfig"],timeout=timeout,check=False)
+    if worktree_enabled.returncode not in (0,1) or (worktree_enabled.returncode==0 and worktree_enabled.stdout.strip().lower() not in ("true","false")): raise Stop("worktree Git config mode is ambiguous")
+    if worktree_enabled.returncode==0 and worktree_enabled.stdout.strip().lower()=="true":
+        worktree=run(["git","-C",str(primary),"config","--worktree","--name-only","--get-regexp",blocked],timeout=timeout,check=False)
+        if worktree.returncode not in (0,1): raise Stop("per-worktree Git config inspection failed")
+        if worktree.stdout.strip(): raise Stop("per-worktree Git config contains executable or transport-bearing settings")
     common=Path(run(["git","-C",str(primary),"rev-parse","--path-format=absolute","--git-common-dir"],timeout=timeout).stdout.strip()).resolve()
     grafts=common/"info/grafts"
     if grafts.is_symlink() or (grafts.exists() and (not grafts.is_file() or grafts.stat().st_size>0)):
@@ -123,6 +130,7 @@ def inspect(primary:Path,prefix:Path,main_sha:str,limit_bytes:int,max_trees:int,
         elif not isinstance(row.get("branch"),str): reason="ambiguous_branch"
         if reason: disposition.update(status="excluded",reason=reason); dispositions.append(disposition); continue
         if observation_active(observed,resolved): disposition.update(status="excluded",reason="active_observation"); dispositions.append(disposition); continue
+        reject_executable_git_config(resolved,timeout)
         candidate_common=Path(run(["git","-C",str(resolved),"rev-parse","--path-format=absolute","--git-common-dir"]).stdout.strip()).resolve()
         if candidate_common!=common: raise Stop(f"worktree common-dir mismatch: {resolved}")
         head=run(["git","-C",str(resolved),"rev-parse","HEAD"]).stdout.strip(); branch=str(row["branch"])

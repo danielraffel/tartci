@@ -108,6 +108,15 @@ class Tests(unittest.TestCase):
                 subprocess.run(["git","-C",str(primary),"config","--unset-all",key],check=True)
             self.assertFalse(marker.exists())
 
+    def test_per_worktree_transport_config_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            root=Path(td).resolve(); primary,_,selected=self.make_repo(root,["one"]); candidate=selected[0][0]
+            subprocess.run(["git","-C",str(primary),"config","extensions.worktreeConfig","true"],check=True)
+            subprocess.run(["git","-C",str(candidate),"config","--worktree","http.sslVerify","false"],check=True)
+            local=subprocess.run(["git","-C",str(candidate),"config","--local","--name-only","--get-regexp",r"^http\..*"],capture_output=True)
+            self.assertEqual(local.returncode,1)
+            with self.assertRaises(cleanup.Stop): cleanup.reject_executable_git_config(candidate,30)
+
     def test_fresh_main_uses_only_canonical_https_and_validates_sha(self):
         commands=[]
         def response(command,**_):
@@ -115,7 +124,7 @@ class Tests(unittest.TestCase):
             if "rev-parse" in command: value="b"*40+"\n"
             else: value=""
             return subprocess.CompletedProcess(command,0,value,"")
-        with mock.patch.object(cleanup,"run",side_effect=response):
+        with mock.patch.object(cleanup,"run",side_effect=response),mock.patch.object(cleanup,"reject_executable_git_config"):
             self.assertEqual(cleanup.fresh_main(Path("/primary"),"Generous-Corp/pulp","origin/main",30),"b"*40)
         fetch=next(command for command in commands if "fetch" in command)
         self.assertIn("https://github.com/Generous-Corp/pulp.git",fetch); self.assertNotIn("origin",fetch)
