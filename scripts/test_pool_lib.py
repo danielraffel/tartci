@@ -586,6 +586,18 @@ class PersistentRunnerDrainTests(unittest.TestCase):
 
 
 class ProviderAdmissionContractTests(unittest.TestCase):
+    def test_pool_on_kickstarts_bootstrapped_services_before_admission(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        start = source.index("    on|off)", source.index("cmd_pool()"))
+        end = source.index("    repair-lock)", start)
+        body = source[start:end]
+        bootstrap = body.index('launchctl bootstrap "gui/$(id -u)"')
+        kickstart = body.index('launchctl kickstart "$launchd_target"', bootstrap)
+        state_on = body.index("tartci_pool_write_state on", kickstart)
+        self.assertLess(bootstrap, kickstart)
+        self.assertLess(kickstart, state_on)
+        self.assertNotIn('kickstart -k "$launchd_target"', body)
+
     def test_every_provider_gates_immediately_before_jit_mint(self) -> None:
         for relative in (
             "providers/tart-macos/runner.sh",
