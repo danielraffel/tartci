@@ -35,7 +35,7 @@ REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
-    "launch_helper", "lane",
+    "launch_helper", "worktree_cleanup", "lane",
 }
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
@@ -47,6 +47,10 @@ STACKED_IMAGE_KEYS = {
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
 LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
+WORKTREE_CLEANUP_KEYS = {
+    "provider", "repo", "primary", "prefix", "main_ref",
+    "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
+}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -200,6 +204,22 @@ def load(path: Path) -> dict:
         fail("an external-volume Tart home requires a verified signed launch_helper")
     if helper is not None and not external_tart_home:
         fail("launch_helper is reserved for an external-volume Tart home")
+    cleanup = data.get("worktree_cleanup")
+    if cleanup is not None:
+        expected = {
+            "provider": "merged-main-v1", "repo": "Generous-Corp/pulp",
+            "primary": "/Volumes/Workshop/Code/pulp",
+            "prefix": "/Volumes/Workshop/Code", "main_ref": "origin/main",
+            "apply": False, "max_trees": 8,
+            "max_gib": 512, "timeout_seconds": 300, "cooldown_seconds": 3600,
+        }
+        if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
+            fail("worktree_cleanup must declare the complete strict contract")
+        expected["apply"]=cleanup.get("apply")
+        if cleanup != expected or type(cleanup.get("apply")) is not bool:
+            fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
+        if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
+            fail("worktree_cleanup is restricted to the private M3 profile")
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):
@@ -1127,6 +1147,20 @@ def lane_plist(
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    cleanup = data.get("worktree_cleanup")
+    if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
+        env.update({
+            "TARTCI_WORKTREE_CLEANUP_PROVIDER": cleanup["provider"],
+            "TARTCI_WORKTREE_CLEANUP_REPO": cleanup["repo"],
+            "TARTCI_WORKTREE_CLEANUP_PRIMARY": cleanup["primary"],
+            "TARTCI_WORKTREE_CLEANUP_PREFIX": cleanup["prefix"],
+            "TARTCI_WORKTREE_CLEANUP_MAIN_REF": cleanup["main_ref"],
+            "TARTCI_WORKTREE_CLEANUP_APPLY": "1" if cleanup["apply"] else "0",
+            "TARTCI_WORKTREE_CLEANUP_MAX_TREES": str(cleanup["max_trees"]),
+            "TARTCI_WORKTREE_CLEANUP_MAX_GIB": str(cleanup["max_gib"]),
+            "TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS": str(cleanup["timeout_seconds"]),
+            "TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS": str(cleanup["cooldown_seconds"]),
+        })
     github_app = data.get("github_app")
     if github_app is not None:
         # References only: key/token contents remain in private host-local files.

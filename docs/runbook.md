@@ -1578,3 +1578,24 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+## M3 disk-denial worktree recovery
+
+The private M3 profile may declare the strict `merged-main-v1` worktree-cleanup
+provider. It runs only after the M3 Tart-store preflight or current lease
+attempt reports an exact disk-only capacity denial. The checked-in default is
+`apply = false`; changing
+it requires integration review and a new signed fleet cohort. CPU, RAM, probe,
+malformed, and persisted/stale denials never trigger it.
+
+The provider takes one nonblocking lock, fetches the exact current `origin/main`
+from the literal canonical HTTPS remote under isolated Git configuration, and
+requires a complete fail-closed system `lsof` observation. It retains primary,
+detached, locked, dirty, active,
+unmerged, ambiguous, or branch-mismatched worktrees. Apply mode durably
+checkpoints before and after every removal and stops as soon as measured free
+space reaches the denial target. A removal uses non-forced
+`git worktree remove`, retains the branch at the same HEAD, and is immediately
+verified. Any ambiguity stops the batch; admission remains denied. The atomic
+receipt under the disk-admission state directory records bounds, before/after
+capacity, fetched main SHA, dispositions, removals, branch proofs, and whether
+one exact admission retry is eligible.

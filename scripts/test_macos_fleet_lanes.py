@@ -70,6 +70,38 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_m3_worktree_cleanup_contract_is_dormant_and_rendered(self) -> None:
+        data = fleet.load(HOST_CONFIGS["studio"])
+        self.assertFalse(data["worktree_cleanup"]["apply"])
+        for body in fleet.rendered_plists(data).values():
+            env = plistlib.loads(body)["EnvironmentVariables"]
+            cleanup_keys = {key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
+            self.assertEqual(cleanup_keys, set())
+        for profile in (HOST_CONFIGS["m1"], HOST_CONFIGS["m5"]):
+            for body in fleet.rendered_plists(fleet.load(profile)).values():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertFalse(any(key.startswith("TARTCI_WORKTREE_CLEANUP_") for key in env))
+
+    def test_enabled_cleanup_authority_renders_only_m3_pulp_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"m3.toml"; body=HOST_CONFIGS["studio"].read_text().replace("apply = false","apply = true")
+            path.write_text(body); rendered=fleet.rendered_plists(fleet.load(path)); pulp_count=0
+            for plist_body in rendered.values():
+                env=plistlib.loads(plist_body)["EnvironmentVariables"]; keys={key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
+                if env["TARTCI_QUEUE_LANE_ID"] in {"studio-pulp-gate","studio-pulp-gate-slot2"}:
+                    pulp_count+=1; self.assertEqual(env["TARTCI_RUNNER_REPO"],"Generous-Corp/pulp"); self.assertIn("TARTCI_WORKTREE_CLEANUP_PROVIDER",keys)
+                else: self.assertEqual(keys,set())
+            self.assertEqual(pulp_count,2)
+
+    def test_worktree_cleanup_rejected_outside_exact_m3_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.toml"
+            path.write_text(HOST_CONFIGS["studio"].read_text().replace(
+                'provider = "merged-main-v1"', 'provider = "other"'
+            ))
+            with self.assertRaisesRegex(ValueError, "reviewed M3"):
+                fleet.load(path)
+
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         rendered = fleet.rendered_plists(data)

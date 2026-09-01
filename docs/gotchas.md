@@ -603,3 +603,10 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   resolved `pipelines*.actions.githubusercontent.com` endpoint and
   `broker.actions.githubusercontent.com` over HTTPS from the guest, record
   both in the proof, and keep hosted fallback enabled until they pass.
+## Worktree cleanup is not a generic low-disk hook
+
+The optional cleanup provider is M3/Pulp-only and accepts only a fresh,
+machine-readable disk-axis lease denial. Do not broaden it to old receipts,
+CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
+Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
+not permission to force-remove a worktree.
