@@ -14,9 +14,7 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 # the TCC responsible process; public/home-backed profiles do not inherit it.
 [launch_helper]
 path = "/Users/danielraffel/.local/libexec/TartCILauncher.app"
-# Bootstrap value for the first local commit. The immediately following
-# artifact-pin commit replaces it with the exact signed bundle digest.
-sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+sha256 = "a1ecb0e7de558da59c18412725945160100333a065ed1f9d6024841c9f929fe6"
 identifier = "com.danielraffel.tartci.launcher"
 team_id = "95CX6P84C4"
 
