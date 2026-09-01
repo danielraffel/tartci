@@ -656,6 +656,8 @@ print(json.dumps(payload))
                 "tart-macos",
                 "--shared-cache-file",
                 str(shared),
+                "--observation-lock-file",
+                str(root / "host-observation.lock"),
                 "--stagger-max-seconds",
                 "0",
             ]
@@ -749,6 +751,68 @@ print(json.dumps(payload))
 
         self.assertEqual(results, [1, 1, 1])
         self.assertEqual(peak, 1)
+
+    def test_distinct_process_namespaces_bound_actual_github_children(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            observation_lock = root / "host-observation.lock"
+            activity = root / "activity.json"
+            stub = root / "counted-gh"
+            stub.write_text(
+                """#!/usr/bin/env python3
+import fcntl, json, os, sys, time
+activity = os.environ['ACTIVITY']
+with open(activity, 'a+', encoding='utf-8') as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    handle.seek(0); raw = handle.read().strip()
+    state = json.loads(raw) if raw else {'active': 0, 'peak': 0}
+    state['active'] += 1; state['peak'] = max(state['peak'], state['active'])
+    handle.seek(0); handle.truncate(); json.dump(state, handle); handle.flush()
+try:
+    time.sleep(0.02)
+    path = sys.argv[-1]
+    if path.endswith('/actions/workflows?per_page=100'):
+        payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
+    elif 'status=queued' in path or 'status=in_progress' in path:
+        payload = {'workflow_runs': []}
+    else:
+        raise SystemExit(2)
+    print(json.dumps(payload))
+finally:
+    with open(activity, 'r+', encoding='utf-8') as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        state = json.load(handle); state['active'] -= 1
+        handle.seek(0); handle.truncate(); json.dump(state, handle); handle.flush()
+""",
+                encoding="utf-8",
+            )
+            stub.chmod(0o755)
+            env = {**os.environ, "ACTIVITY": str(activity)}
+            processes = []
+            for index in range(3):
+                processes.append(
+                    subprocess.Popen(
+                        [
+                            sys.executable, str(MODULE_PATH),
+                            "--repo", f"owner/repo-{index}",
+                            "--workflow", "Build and Test",
+                            "--labels", "self-hosted,macOS",
+                            "--provider", "tart-macos",
+                            "--lane-id", f"lane-{index}",
+                            "--state-file", str(root / f"lane-{index}.json"),
+                            "--shared-cache-file", str(root / "discovery.json"),
+                            "--observation-lock-file", str(observation_lock),
+                            "--stagger-max-seconds", "0",
+                            "--gh-cli", str(stub),
+                        ],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, env=env,
+                    )
+                )
+            results = [process.communicate(timeout=10) for process in processes]
+            self.assertEqual([process.returncode for process in processes], [0, 0, 0])
+            self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
+            self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
 
     def test_host_observation_lock_timeout_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
