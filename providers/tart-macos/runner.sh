@@ -122,6 +122,12 @@ LOOP=0
 CAP="${TARTCI_MACOS_VM_CAP:-${PULP_VM_CAP:-2}}"
 POLL="${TARTCI_VM_POLL:-${PULP_VM_POLL:-20}}"; case "$POLL" in ''|*[!0-9]*|0) POLL=20;; esac  # positive int only (self-heal arithmetic)
 JOB_TIMEOUT="${TARTCI_JOB_TIMEOUT_SECS:-7200}"
+TEARDOWN_STEP_TIMEOUT="${TARTCI_TEARDOWN_STEP_TIMEOUT_SECS:-5}"
+case "$TEARDOWN_STEP_TIMEOUT" in
+  ''|*[!0-9]*|0) printf 'invalid TARTCI_TEARDOWN_STEP_TIMEOUT_SECS: expected 1-20\n' >&2; exit 1 ;;
+esac
+[ "$TEARDOWN_STEP_TIMEOUT" -le 20 ] \
+  || { printf 'invalid TARTCI_TEARDOWN_STEP_TIMEOUT_SECS: expected 1-20\n' >&2; exit 1; }
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
@@ -684,8 +690,8 @@ priority_demand(){
 }
 
 reclaim_runner_name(){
-  local name="$1" runner_api_root="${2:-$RUNNER_API_ROOT}" id attempt
-  for attempt in $(seq 1 18); do
+  local name="$1" runner_api_root="${2:-$RUNNER_API_ROOT}" max_attempts="${3:-18}" id attempt
+  for attempt in $(seq 1 "$max_attempts"); do
     id="$("$GH_CLI" api "$runner_api_root" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
@@ -698,21 +704,47 @@ reclaim_runner_name(){
 
 stop_current_aqua_runner(){
   if [ -n "$CURRENT_IP" ] && [ -n "$CURRENT_AQUA_LABEL" ]; then
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
+    bounded_teardown_command aqua-stop \
+      ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$CURRENT_IP" \
       "\$HOME/.tartci/bin/guest-aqua-runner.sh stop '$CURRENT_AQUA_LABEL'" \
       >/dev/null 2>&1 || true
   fi
+}
+
+bounded_teardown_command(){
+  local operation="$1"; shift
+  python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
+    --timeout "$TEARDOWN_STEP_TIMEOUT" --operation "$operation" -- "$@"
+}
+
+terminate_current_guardian(){
+  local pid="${CURRENT_RPID:-}"
+  [ -n "$pid" ] || return 0
+  case "$pid" in *[!0-9]*) return 1 ;; esac
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  ! kill -0 "$pid" 2>/dev/null
 }
 
 discard_current_vm(){
   [ -n "$CURRENT_VM" ] || return 0
   note "stopping — tearing down in-flight VM $CURRENT_VM"
   stop_current_aqua_runner
-  [ -n "$CURRENT_RPID" ] && kill -9 "$CURRENT_RPID" 2>/dev/null || true
-  tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  tart delete "$CURRENT_VM" >/dev/null 2>&1 || true
-  CURRENT_VM=""
+  if ! terminate_current_guardian; then
+    note "teardown incomplete — exact tart guardian $CURRENT_RPID remains live; preserving capacity ownership"
+    event teardown_incomplete "vm=$CURRENT_VM reason=guardian_live pid=$CURRENT_RPID"
+    return 1
+  fi
   CURRENT_RPID=""
+  bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
+  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1; then
+    note "teardown incomplete — guardian is terminal but VM deletion was not proved"
+    event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved"
+    return 1
+  fi
+  CURRENT_VM=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""
 }
@@ -724,14 +756,18 @@ cleanup(){
   [ -z "$CURRENT_SCAN_TMP" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
   CURRENT_SCAN_PID=""
   CURRENT_SCAN_TMP=""
-  discard_current_vm
-  tartci_release_vm_lease
-  [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+  local teardown_terminal=1
+  discard_current_vm || teardown_terminal=0
+  if [ "$teardown_terminal" = 1 ]; then
+    tartci_release_vm_lease
+    [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+    CURRENT_RESV=""
+  fi
   if [ -n "$CURRENT_REGISTERED_RUNNER" ]; then
-    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" "$CURRENT_RUNNER_API_ROOT" 2>/dev/null || true
+    reclaim_runner_name "$CURRENT_REGISTERED_RUNNER" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
     CURRENT_REGISTERED_RUNNER=""
   fi
-  reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 2>/dev/null || true
+  reclaim_runner_name "$RUNNER_NAME" "$CURRENT_RUNNER_API_ROOT" 1 2>/dev/null || true
   CLEANED_UP=1
   heartbeat stopped
 }
@@ -1413,11 +1449,10 @@ run_one(){
 
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
-  stop_current_aqua_runner
-  tart stop "$vm" >/dev/null 2>&1 || true
-  kill "$rpid" 2>/dev/null || true
-  sleep 2
-  tart delete "$vm" >/dev/null 2>&1 || true
+  if ! discard_current_vm; then
+    note "[$i] teardown ownership could not be proved — supervisor will exit fail-closed"
+    return 75
+  fi
   tartci_release_vm_lease
   t_done="$(now_epoch)"
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
@@ -1436,10 +1471,6 @@ run_one(){
       runtime_emit_complete fail source_failure "$rc" "$logdir/timing.tsv" "$logdir"
     fi
   fi
-  CURRENT_VM=""
-  CURRENT_RPID=""
-  CURRENT_IP=""
-  CURRENT_AQUA_LABEL=""
   CURRENT_RUN_ID=""
   CURRENT_JOB_ID=""
   CURRENT_WORKFLOW_NAME=""
@@ -1546,7 +1577,14 @@ if [ "$LOOP" = 1 ]; then
     if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
-      run_one "$i" "$selected_labels" "$selected_tier" || sleep "$POLL"
+      run_rc=0
+      run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      if [ -n "$CURRENT_VM" ]; then
+        note "teardown remained nonterminal — exiting for launchd process-group cleanup"
+        event teardown_restart "vm=$CURRENT_VM rc=$run_rc"
+        exit 75
+      fi
+      [ "$run_rc" = 0 ] || sleep "$POLL"
       CURRENT_LABELS="$LABELS"
       rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
