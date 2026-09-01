@@ -14,7 +14,10 @@
   healthy between-jobs serve loop (fresh "waiting" log), a mid-build supervisor (a
   VM is running), and a deliberately-stopped agent (not loaded) are all left alone.
   It also reconciles durable pool intent: missing runner jobs are reloaded when
-  participation is ON and remain stopped when participation is OFF.
+  participation is ON and remain stopped when participation is OFF. A loaded,
+  pool-enabled supervisor that exits EX_TEMPFAIL for its documented App-auth
+  refresh but does not respawn is healed after a short bounded grace rather than
+  waiting for the generic stale-log threshold.
 
   Install shape:
 

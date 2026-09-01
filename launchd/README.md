@@ -292,6 +292,15 @@ job is bootstrapped through the normal rate-limited heal path. When the flag is
 resurrected. This closes the gap where a host retained an ON flag while its
 runner jobs had disappeared from launchd.
 
+The watchdog also recognizes the supervisor's explicit GitHub-auth refresh
+contract. A pool-enabled `serve --loop` process exits `EX_TEMPFAIL` (75) after
+sustained queue-scan blindness and expects launchd to respawn it. If the loaded
+job remains `not running` or `spawn scheduled` beyond the bounded restart grace
+(default 60 seconds), the watchdog reloads it on its next five-minute pass
+instead of waiting for the generic 30-minute stale-log threshold. Participation
+OFF remains authoritative, and other nonzero exit classes retain the conservative
+stale-log rule.
+
 ```
 mkdir -p "$HOME/Library/Logs/tartci"
 sed -e "s|\$HOME|$HOME|g" \

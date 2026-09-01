@@ -78,6 +78,11 @@ SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 # old. During a legit build the log DOES go this stale (run_one is quiet until the job
 # ends), which is why the alive-but-frozen signature also requires no running VM.
 DEFAULT_STALE_LOG_S = 1800  # 30 min
+# `serve ... --loop` deliberately exits EX_TEMPFAIL after sustained GitHub
+# observation blindness so launchd can give it a fresh App-auth environment.
+# If launchd does not respawn it, that explicit restart contract has failed; do
+# not make a known-idle lane wait for the generic 30-minute crash-loop bound.
+DEFAULT_RESTART_GRACE_S = 60
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
 DEFAULT_HEAL_WINDOW_S = 3600  # 1 hour
@@ -139,6 +144,7 @@ def classify(
     stale_log_s: int,
     vm_running: bool = True,
     expected_loaded: bool = False,
+    restart_grace_s: int = DEFAULT_RESTART_GRACE_S,
 ) -> tuple[str, str]:
     """Decide healthy / wedged / unknown from parsed signals. Pure.
 
@@ -157,6 +163,18 @@ def classify(
        quietly for up to hours, so we only call it frozen when NO VM is running."""
     if state is None and expected_loaded:
         return "wedged", "not loaded while pool participation is enabled"
+    if (
+        expected_loaded
+        and last_exit_code == 75
+        and state in {"not running", "spawn scheduled"}
+        and log_age_s is not None
+        and log_age_s > restart_grace_s
+    ):
+        return (
+            "wedged",
+            f"EX_TEMPFAIL self-restart did not respawn within {restart_grace_s}s "
+            f"(state={state}, log age {int(log_age_s)}s)",
+        )
     if last_exit_code is None or last_exit_code == 0:
         # Alive / cleanly-restarting. The alive-but-frozen signature applies ONLY when the process is
         # genuinely UP: state == "running". A frozen run_one still reports "running" (the process is
@@ -257,7 +275,8 @@ def any_tart_vm_running() -> bool:
 
 def gather_health(label: str, plist_path: str, stale_log_s: int,
                   vm_running: bool = True,
-                  pool_participating: bool = False) -> AgentHealth:
+                  pool_participating: bool = False,
+                  restart_grace_s: int = DEFAULT_RESTART_GRACE_S) -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
     log_path = _log_path_from_plist(plist_path)
@@ -288,7 +307,8 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         )
     expected_loaded = pool_participating and is_pool_runner(label)
     verdict, reason = classify(
-        state, last_exit, log_age, stale_log_s, vm_running, expected_loaded
+        state, last_exit, log_age, stale_log_s, vm_running, expected_loaded,
+        restart_grace_s
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
@@ -418,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="report what heal would do; take no action")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--stale-log-seconds", type=int, default=DEFAULT_STALE_LOG_S)
+    ap.add_argument("--restart-grace-seconds", type=int,
+                    default=DEFAULT_RESTART_GRACE_S)
     ap.add_argument("--max-heals", type=int, default=DEFAULT_MAX_HEALS)
     ap.add_argument("--heal-window-seconds", type=int,
                     default=DEFAULT_HEAL_WINDOW_S)
@@ -448,7 +470,8 @@ def main(argv: list[str] | None = None) -> int:
     vm_running = any_tart_vm_running()
     participating = pool_participating(args.participation_file)
     health = [
-        gather_health(lbl, p, args.stale_log_seconds, vm_running, participating)
+        gather_health(lbl, p, args.stale_log_seconds, vm_running, participating,
+                      args.restart_grace_seconds)
         for lbl, p in agents
     ]
 
