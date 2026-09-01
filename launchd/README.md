@@ -50,11 +50,58 @@ used `WorkingDirectory=$HOME`, a wrapper under `$HOME/.local/bin`, and
 Use `com.danielraffel.pulp.tart-runner-macos.plist.template` as the replacement
 shape: install tartci into `$HOME/.local/share/tartci`, expose a small
 `$HOME/.local/bin/tartci` wrapper, and keep macOS goldens under `$HOME/VMs`.
-Only use `/Volumes` for macOS launchd after introducing a signed Full Disk
-Access helper.
+Only use `/Volumes` for macOS launchd through the opt-in, receipt-bound native
+launcher described below. Do not grant broad access to Bash, Node, Python, or
+`env`: those interpreter identities are shared by unrelated tools and produce
+repeated privacy prompts.
 Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
 wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
 capacity and supervisor health will be read from different Tart homes.
+
+### External-volume responsible process (Daniel's M3 profile only)
+
+`profiles/m3-macos-fleet.toml` deliberately keeps its 4 TiB Tart store at
+`/Volumes/Workshop/VMs`. Its managed LaunchAgents therefore start the stable
+Developer-ID-signed `TartCILauncher.app` at
+`~/.local/libexec/TartCILauncher.app`. Its signature seals the exact TartCI
+support cohort and five rendered M3 lane environments. The resident launcher
+accepts only `--lane <sealed-enum>` or the fixed `--probe-store`, spawns no
+caller-selected executable or arguments, owns the child process group, and
+bounds TERM-to-KILL cleanup inside launchd's 30-second exit window. It contains
+no scheduler, queue, GitHub, listener, or capacity policy.
+
+Build/sign the artifact on a controlled signing surface, never during fleet
+installation:
+
+```sh
+scripts/build_macos_launcher.sh \
+  --output /absolute/staging/TartCILauncher.app \
+  --approval-output /absolute/staging/TartCILauncher.sha256 \
+  --identity '<Developer ID Application identity>' \
+  --support-root /absolute/immutable/tartci-generation \
+  --profile profiles/m3-macos-fleet.toml
+scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
+  --identifier com.danielraffel.tartci.launcher \
+  --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256>
+```
+
+The M3 profile pins path, identifier, Team ID, exact profile policy, and the
+path to an owned mode-0600 approval digest produced by the signing build.
+The bundle binds the same exact TartCI source commit as the installed support
+cohort. The installer accepts it with `--launch-helper-source`, atomically
+publishes it, and binds path, owner, mode, realized bundle digest, designated
+requirement, and hardened-runtime status into the fleet receipt. Unsigned, ad-hoc, Apple
+Development, wrong-Team, wrong-identifier, symlinked, or changed binaries fail
+closed. M1, M5, and public home-backed profiles do not declare this helper and
+retain the ordinary launch path.
+
+`tartci pool on` runs a one-shot LaunchAgent probe through this same identity
+before loading any fleet supervisor or opening participation. The probe must
+write, read back, and delete a temporary file in the declared Tart store. Its
+first M3 run may require one explicit Removable Volumes consent; TartCI never
+edits TCC databases or invokes `tccutil`. Denial, timeout, signature drift, or
+digest drift leaves the pool off. `$HOME/VMs` is the safe rollback while the
+external-volume identity is unavailable.
 
 The bare `com.danielraffel.pulp.tart-runner` label is retired. Never load it
 beside the replacement: both can resolve to the same runner name and state

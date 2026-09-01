@@ -18,6 +18,32 @@ difference cannot masquerade as missing TartCI.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## M3 external-volume privacy attribution (2026-09-01)
+
+- **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
+  M3 runner LaunchAgents fail or leave `/Volumes/Workshop/VMs` idle.**
+  → *Cause:* launchd started `/bin/bash` directly. macOS attributed external-
+  volume access to mutable/shared interpreter identities rather than to TartCI;
+  static runner labels and free VM slots could then look healthy while the
+  responsible process was denied. Live TCC records named `/bin/bash` and
+  `/usr/bin/env`, while interactive Tart runs were attributed to the signed
+  terminal app. This is SYSTEMIC: every regenerated Bash supervisor can repeat
+  it. → *Fix:* M3 alone uses the stable Developer-ID
+  `com.danielraffel.tartci.launcher` app, whose signature seals the exact
+  support cohort and lane environments and whose interface accepts no arbitrary
+  executable, argument vector, or store path. Its exact identity is profile-
+  and receipt-bound. `pool on` proves launchd-context write/read/delete access
+  before admission. Never grant broad interpreter access, edit
+  TCC state, or fall back to Bash plus `/Volumes`; use `$HOME/VMs` until the
+  signed path passes. The mechanism is falsifiable: wrong signature/digest,
+  denied access, timeout, or failed child cleanup keeps the pool off.
+
+  **Resolution:** implemented by the signed-launcher change; rollout remains
+  incomplete until its PR lands and M3 passes the naturally idle two-slot JIT
+  canary without another interpreter prompt. Confidence is HIGH for the
+  diagnosis and pre-admission detector (live attribution plus focused tests),
+  MEDIUM for final TCC durability until that replacement-build canary runs.
+
 ## Cross-cutting (AVF / QEMU media)
 
 - **"Invalid disk image. The disk image format is not recognized."**

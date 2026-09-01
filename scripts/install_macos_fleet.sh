@@ -6,6 +6,8 @@ APPLY=0
 CONFIG=""
 SUPPORT_MANIFEST=""
 SUPPORT_SOURCE=""
+LAUNCH_HELPER_SOURCE=""
+USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--apply]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
@@ -19,12 +21,17 @@ while [ "$#" -gt 0 ]; do
       [ "$#" -gt 0 ] || { echo "--support-source requires a path" >&2; exit 2; }
       SUPPORT_SOURCE="$1"
       ;;
-    -*) echo "usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--apply]" >&2; exit 2 ;;
-    *) [ -z "$CONFIG" ] || { echo "usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--apply]" >&2; exit 2; }; CONFIG="$1" ;;
+    --launch-helper-source)
+      shift
+      [ "$#" -gt 0 ] || { echo "--launch-helper-source requires a path" >&2; exit 2; }
+      LAUNCH_HELPER_SOURCE="$1"
+      ;;
+    -*) echo "$USAGE" >&2; exit 2 ;;
+    *) [ -z "$CONFIG" ] || { echo "$USAGE" >&2; exit 2; }; CONFIG="$1" ;;
   esac
   shift
 done
-[ -n "$CONFIG" ] || { echo "usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--apply]" >&2; exit 2; }
+[ -n "$CONFIG" ] || { echo "$USAGE" >&2; exit 2; }
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 [ -n "$SUPPORT_SOURCE" ] || SUPPORT_SOURCE="$ROOT"
@@ -101,6 +108,7 @@ echo "  installed_profile=$PROFILE_SNAPSHOT"
 echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
+[ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 echo "  activation=deferred to tartci pool on"
 [ "$APPLY" = 1 ] || { echo "  action=dry-run (pass --apply only while the pool is terminally off)"; exit 0; }
 
@@ -120,6 +128,10 @@ profile_backup=""
 profile_touched=0
 wrapper_backup=""
 wrapper_touched=0
+launcher_target=""
+launcher_candidate=""
+launcher_backup=""
+launcher_touched=0
 support_root=""
 installed_support_manifest=""
 launch_entrypoint=""
@@ -131,6 +143,12 @@ retired_backups=()
 
 rollback() {
   local i target backup
+  if [ "$launcher_touched" = 1 ]; then
+    rm -rf -- "$launcher_target"
+    if [ -n "$launcher_backup" ] && { [ -e "$launcher_backup" ] || [ -L "$launcher_backup" ]; }; then
+      mv -f "$launcher_backup" "$launcher_target" || true
+    fi
+  fi
   if [ "$wrapper_touched" = 1 ]; then
     rm -f "$ENTRYPOINT"
     if [ -n "$wrapper_backup" ] && { [ -e "$wrapper_backup" ] || [ -L "$wrapper_backup" ]; }; then
@@ -174,6 +192,7 @@ cleanup() {
   [ -n "$stage_dir" ] && rm -rf "$stage_dir"
   [ -n "$receipt_tmp" ] && rm -f "$receipt_tmp"
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"
+  [ -z "$launcher_candidate" ] || rm -rf -- "$launcher_candidate"
   if [ "$lock_owned" = 1 ]; then tartci_pool_lock_release || true; fi
   rm -rf "$plan_dir"
   exit "$rc"
@@ -205,6 +224,28 @@ try:
     os.fsync(descriptor)
 finally:
     os.close(descriptor)
+PY
+}
+
+durable_tree() {
+  /usr/bin/python3 - "$1" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+root = Path(sys.argv[1])
+for path in sorted(root.rglob("*")):
+    if path.is_symlink():
+        raise SystemExit(f"durability tree contains a symlink: {path}")
+    if path.is_file():
+        with path.open("rb") as handle:
+            os.fsync(handle.fileno())
+for path in sorted([root, *[p for p in root.rglob("*") if p.is_dir()]], reverse=True):
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
 PY
 }
 
@@ -258,6 +299,15 @@ import macos_fleet_lanes as fleet
 print(fleet.load(Path(sys.argv[1]))["host"]["home"])
 PY
 )"
+launch_helper_json="$(python3 - "$locked_config" "$ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+print(json.dumps(fleet.load(Path(sys.argv[1])).get("launch_helper")))
+PY
+)"
 [ "$(cd "$HOME" && pwd -P)" = "$(cd "$profile_home" && pwd -P)" ] || {
   echo "fleet profile home mismatch: profile=$profile_home runtime=$HOME" >&2
   exit 3
@@ -272,6 +322,69 @@ actual_host_id="$("$shipyard_bin" runner tag 2>/dev/null)" || {
   echo "fleet profile host mismatch: profile=$profile_host_id shipyard=$actual_host_id" >&2
   exit 3
 }
+if [ "$launch_helper_json" != "null" ]; then
+  launcher_target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
+  launcher_approval_path="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
+  launcher_identifier="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
+  launcher_team_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["team_id"])' <<<"$launch_helper_json")"
+  launcher_profile_policy_sha256="$(python3 - "$locked_config" "$ROOT" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_launcher_identity
+print(macos_launcher_identity.profile_policy_digest(Path(sys.argv[1])))
+PY
+)"
+  launcher_sha256="$(python3 - "$launcher_approval_path" <<'PY'
+import os, re, stat, sys
+from pathlib import Path
+path = Path(sys.argv[1])
+info = path.lstat()
+if path.is_symlink() or not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o600:
+    raise SystemExit("launcher approval must be an owned mode-0600 regular file")
+value = path.read_text()
+if not re.fullmatch(r"[0-9a-f]{64}\n", value):
+    raise SystemExit("launcher approval must contain one lowercase SHA-256 line")
+print(value.strip())
+PY
+)"
+  [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
+  launcher_identity_json="$(python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
+    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
+    --profile-policy-sha256 "$launcher_profile_policy_sha256")"
+  launcher_source_commit="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
+  mkdir -p "$(dirname "$launcher_target")"
+  python3 - "$profile_home" "$launcher_target" <<'PY' || {
+import os
+import sys
+from pathlib import Path
+home = Path(sys.argv[1])
+target = Path(sys.argv[2])
+try:
+    relative = target.relative_to(home)
+except ValueError:
+    raise SystemExit(1)
+current = home
+for component in relative.parts[:-1]:
+    current /= component
+    if current.is_symlink() or not current.is_dir() or current.stat().st_uid != os.getuid():
+        raise SystemExit(1)
+PY
+    echo "launch helper parent chain must be owned, home-relative, and non-symlinked" >&2
+    exit 3
+  }
+  launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
+  /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
+  python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
+    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
+    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+    --source-commit "$launcher_source_commit" >/dev/null
+elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
+  echo "--launch-helper-source is invalid for a profile without launch_helper" >&2
+  exit 2
+fi
 python3 "$PY" render "$locked_config" --output "$render_dir" >/dev/null
 replacements=()
 while IFS= read -r label; do replacements+=("$label"); done < <(python3 - "$locked_config" "$ROOT" <<'PY'
@@ -333,7 +446,8 @@ wrapper_candidate="$(mktemp "$(dirname "$ENTRYPOINT")/.tartci-wrapper.XXXXXX")"
 python3 "$ROOT/scripts/tartci_support_manifest.py" wrapper-write "$wrapper_candidate" \
   --support-root "$support_root" >/dev/null
 
-python3 - "$render_dir" "$launch_entrypoint" <<'PY'
+if [ -z "$launcher_target" ]; then
+  python3 - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'
 import os
 import plistlib
 import sys
@@ -341,13 +455,20 @@ from pathlib import Path
 
 root = Path(sys.argv[1])
 launch = Path(sys.argv[2])
+old_launch = Path(sys.argv[3])
 if launch.is_symlink() or not launch.is_file() or not os.access(launch, os.R_OK | os.X_OK):
     raise SystemExit(f"immutable TartCI launch entrypoint is unavailable: {launch}")
 for path in root.glob("*.plist"):
     value = plistlib.loads(path.read_bytes())
-    value["ProgramArguments"][1] = str(launch)
+    arguments = value["ProgramArguments"]
+    matches = [index for index, argument in enumerate(arguments)
+               if argument == str(old_launch)]
+    if len(matches) != 1:
+        raise SystemExit(f"rendered fleet service has no unique launch entrypoint: {path}")
+    arguments[matches[0]] = str(launch)
     path.write_bytes(plistlib.dumps(value, sort_keys=False))
 PY
+fi
 
 ghapp_path="$(python3 - "$render_dir" <<'PY'
 import os, plistlib, shutil, stat, sys
@@ -438,6 +559,57 @@ fi
   echo "fleet install source authority returned a mismatched commit" >&2
   exit 3
 }
+if [ -n "$launcher_target" ]; then
+  [ "$launcher_source_commit" = "$support_commit" ] || {
+    echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
+    exit 3
+  }
+  if [ "$authority_env_json" = "{}" ]; then
+    launcher_authority_commit="$(
+      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
+        "$ghapp_path" api \
+          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
+    )" || launcher_authority_commit=""
+  else
+    launcher_authority_commit="$(
+      SHIPYARD_GITHUB_APP_ID="$app_id" \
+      SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
+      SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
+      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
+        "$ghapp_path" api \
+          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
+    )" || launcher_authority_commit=""
+  fi
+  [ "$launcher_authority_commit" = "$launcher_source_commit" ] || {
+    echo "fleet install could not authenticate the launcher's exact TartCI source commit" >&2
+    exit 3
+  }
+fi
+
+if [ -n "$launcher_target" ]; then
+  if { [ -e "$launcher_target" ] || [ -L "$launcher_target" ]; } \
+      && { [ -L "$launcher_target" ] || [ ! -d "$launcher_target" ]; }; then
+    echo "fleet install requires a regular app directory at the launch helper path: $launcher_target" >&2
+    exit 3
+  fi
+  if [ -e "$launcher_target" ] || [ -L "$launcher_target" ]; then
+    launcher_backup="$backup_dir/TartCILauncher.previous.app"
+    mv "$launcher_target" "$launcher_backup"
+    durable_directory "$(dirname "$launcher_target")"
+    durable_directory "$backup_dir"
+  fi
+  launcher_touched=1
+  durable_tree "$launcher_candidate"
+  mv "$launcher_candidate" "$launcher_target"
+  launcher_candidate=""
+  durable_tree "$launcher_target"
+  python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
+    --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
+    --sha256 "$launcher_sha256" \
+    --profile-policy-sha256 "$launcher_profile_policy_sha256" \
+    --source-commit "$launcher_source_commit" >/dev/null
+  maybe_test_crash launcher
+fi
 
 for candidate in "${candidates[@]}"; do
   target="$AGENTS_DIR/$(basename "$candidate")"

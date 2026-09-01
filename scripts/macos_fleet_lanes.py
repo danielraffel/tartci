@@ -24,6 +24,8 @@ import tomllib
 from pathlib import Path, PurePosixPath
 
 import tartci_support_manifest as support_manifest
+import macos_launcher_identity
+import macos_launcher_probe
 import network_profile
 
 
@@ -31,7 +33,10 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
-TOP_KEYS = {"schema", "name", "host", "github_app", "stacked_images", "lane"}
+TOP_KEYS = {
+    "schema", "name", "host", "github_app", "stacked_images",
+    "launch_helper", "lane",
+}
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
     "github_api_timeout_seconds",
@@ -41,6 +46,7 @@ STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
+LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -172,6 +178,28 @@ def load(path: Path) -> dict:
         fail("host.github_api_timeout_seconds must be an integer from 5 through 60")
     if host["tart_home"] == host["home"] or host["log_root"] == host["home"]:
         fail("Tart and log roots may not be the host home directory itself")
+    helper = data.get("launch_helper")
+    external_tart_home = PurePosixPath(host["tart_home"]).parts[:2] == ("/", "Volumes")
+    if helper is not None:
+        if not isinstance(helper, dict) or set(helper) != LAUNCH_HELPER_KEYS:
+            fail("launch_helper must declare path, approval_sha256_path, identifier, and team_id")
+        expected_path = PurePosixPath(host["home"]) / ".local/libexec/TartCILauncher.app"
+        if helper.get("path") != str(expected_path):
+            fail("launch_helper.path must be the stable host-local TartCI launcher path")
+        expected_approval = PurePosixPath(host["home"]) / ".config/tartci/m3-launcher-approved.sha256"
+        if helper.get("approval_sha256_path") != str(expected_approval):
+            fail("launch_helper.approval_sha256_path must be the stable private M3 approval path")
+        if helper.get("identifier") != "com.danielraffel.tartci.launcher":
+            fail("launch_helper.identifier must be com.danielraffel.tartci.launcher")
+        if (not isinstance(helper.get("team_id"), str)
+                or not re.fullmatch(r"[A-Z0-9]{10}", helper["team_id"])):
+            fail("launch_helper.team_id must be a ten-character Apple Team ID")
+        if host["tart_home"] != "/Volumes/Workshop/VMs":
+            fail("launch_helper is restricted to the private M3 /Volumes/Workshop/VMs store")
+    if external_tart_home and helper is None:
+        fail("an external-volume Tart home requires a verified signed launch_helper")
+    if helper is not None and not external_tart_home:
+        fail("launch_helper is reserved for an external-volume Tart home")
     github_app = data.get("github_app")
     if github_app is not None:
         if not isinstance(github_app, dict):
@@ -515,14 +543,24 @@ def write_receipt(
         "sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
         "owner_uid": interpreter_info.st_uid,
     }
+    helper = data.get("launch_helper")
+    helper_record = None
+    if helper is not None:
+        helper_record = macos_launcher_identity.verify(
+            Path(helper["path"]), identifier=helper["identifier"],
+            team_id=helper["team_id"],
+            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+            source_commit=source_authority_commit,
+        )
     receipt = {
-        "schema": 2,
+        "schema": 3,
         "profile": data.get("name", config.stem),
         "config_path": str(config.resolve()),
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "agents_dir": str(agents_dir.resolve()),
         "plists": digests,
         "retired_launchd_labels": replacements(data),
+        "launch_helper": helper_record,
         "support": {
             "root": str(support_root),
             "manifest_path": str(manifest_path),
@@ -550,8 +588,14 @@ def verify_receipt(
         receipt = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         fail(f"could not read install receipt {path}: {exc}")
-    if not isinstance(receipt, dict) or receipt.get("schema") != 2:
-        fail("install receipt schema must be 2")
+    if not isinstance(receipt, dict):
+        fail("install receipt must be an object")
+    data = load(config)
+    helper = data.get("launch_helper")
+    supported_schemas = {3} if helper is not None else {2, 3}
+    if receipt.get("schema") not in supported_schemas:
+        expected = "3" if helper is not None else "2 or 3"
+        fail(f"install receipt schema must be {expected} for this profile")
     config = config.resolve()
     agents_dir = agents_dir.resolve()
     support_root = support_root.resolve()
@@ -589,7 +633,18 @@ def verify_receipt(
         "commit": verified_support["source_commit"],
     }:
         fail("installed TartCI source authority does not match its receipt")
-    data = load(config)
+    if helper is None:
+        if receipt.get("launch_helper") is not None:
+            fail("install receipt unexpectedly records a launch helper")
+    else:
+        helper_record = macos_launcher_identity.verify(
+            Path(helper["path"]), identifier=helper["identifier"],
+            team_id=helper["team_id"],
+            profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
+            source_commit=verified_support["source_commit"],
+        )
+        if helper_record != receipt.get("launch_helper"):
+            fail("installed launch helper does not match its receipt")
     expected_entrypoint = Path(data["host"]["home"]) / ".local/bin/tartci"
     verified_entrypoint = support_manifest.wrapper_record(
         expected_entrypoint, support_root
@@ -776,6 +831,21 @@ def verify_loaded(
         "support_root": str(support_root.resolve()),
         "loaded_services": loaded,
     }
+
+
+def probe_launch_helper(
+    receipt_path: Path,
+    config: Path,
+    agents_dir: Path,
+    support_root: Path,
+    timeout_seconds: float = 10.0,
+) -> dict:
+    """Prove external-volume access with the receipted launchd identity."""
+    receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
+    helper = receipt.get("launch_helper")
+    if helper is None:
+        return {"schema": 1, "required": False, "passed": True}
+    return macos_launcher_probe.run(helper, load(config), timeout_seconds)
 
 
 def fleet_readiness(
@@ -1107,13 +1177,17 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = str(
             lane["assignment_top_tier_receipt_max_age_seconds"]
         )
+    launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")
+    helper = data.get("launch_helper")
+    program_arguments = (
+        [f"{helper['path']}/Contents/MacOS/tartci-launcher", "--lane",
+         env["TARTCI_QUEUE_LANE_ID"]]
+        if helper is not None else
+        ["/bin/bash", launch, "serve", "macos", "--loop"]
+    )
     return {
         "Label": label,
-        "ProgramArguments": [
-            "/bin/bash",
-            str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci"),
-            "serve", "macos", "--loop",
-        ],
+        "ProgramArguments": program_arguments,
         "WorkingDirectory": host["home"],
         "RunAtLoad": True,
         "KeepAlive": True,
@@ -1158,6 +1232,12 @@ def main(argv: list[str] | None = None) -> int:
     loaded.add_argument("--agents-dir", required=True, type=Path)
     loaded.add_argument("--support-root", required=True, type=Path)
     loaded.add_argument("--output", required=True, type=Path)
+    probe = sub.add_parser("probe-launch-helper")
+    probe.add_argument("receipt", type=Path)
+    probe.add_argument("--config", required=True, type=Path)
+    probe.add_argument("--agents-dir", required=True, type=Path)
+    probe.add_argument("--support-root", required=True, type=Path)
+    probe.add_argument("--output", type=Path)
     readiness = sub.add_parser("fleet-readiness")
     readiness.add_argument("receipt", type=Path)
     readiness.add_argument("--config", required=True, type=Path)
@@ -1168,6 +1248,14 @@ def main(argv: list[str] | None = None) -> int:
     readiness.add_argument("--stale-heartbeat-seconds", type=int, default=300)
     args = parser.parse_args(argv)
     try:
+        if args.command == "probe-launch-helper":
+            value = probe_launch_helper(
+                args.receipt, args.config, args.agents_dir, args.support_root,
+            )
+            if args.output is not None:
+                atomic_write_json(args.output, value)
+            print(json.dumps(value, sort_keys=True))
+            return 0
         if args.command == "verify-loaded":
             value = verify_loaded(
                 args.receipt, args.config, args.agents_dir, args.support_root

@@ -16,6 +16,7 @@ from pathlib import Path
 import tartci_support_manifest as support_manifest
 import network_profile as network
 import macos_fleet_lanes as fleet
+import macos_launcher_probe
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -69,6 +70,104 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
+        data = fleet.load(HOST_CONFIGS["studio"])
+        rendered = fleet.rendered_plists(data)
+        for body in rendered.values():
+            value = plistlib.loads(body)
+            arguments = value["ProgramArguments"]
+            self.assertEqual(
+                arguments,
+                [
+                    "/Users/danielraffel/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher",
+                    "--lane",
+                    value["EnvironmentVariables"]["TARTCI_QUEUE_LANE_ID"],
+                ],
+            )
+
+    def test_external_volume_profile_fails_closed_without_launch_helper(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            body = HOST_CONFIGS["studio"].read_text()
+            start = body.index("[launch_helper]\n")
+            end = body.index("[stacked_images]\n", start)
+            path.write_text(body[:start] + body[end:])
+            with self.assertRaisesRegex(ValueError, "external-volume"):
+                fleet.load(path)
+
+    def test_private_launcher_rejects_another_external_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            path.write_text(HOST_CONFIGS["studio"].read_text().replace(
+                "/Volumes/Workshop/VMs", "/Volumes/Another/VMs"
+            ))
+            with self.assertRaisesRegex(ValueError, "private M3"):
+                fleet.load(path)
+
+    def test_launchd_context_probe_is_bounded_and_cleans_up(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            config = root / "m3.toml"
+            config.write_text(
+                HOST_CONFIGS["studio"].read_text()
+                .replace("/Users/danielraffel", str(home))
+            )
+            helper = {
+                "path": str(home / ".local/libexec/tartci-launcher"),
+                "sha256": "a" * 64,
+                "designated_requirement_sha256": "b" * 64,
+            }
+            missing = subprocess.CompletedProcess(
+                [], 113, "", "Could not find service\n"
+            )
+            ok = subprocess.CompletedProcess([], 0, "", "")
+            terminal = subprocess.CompletedProcess(
+                [], 0, "state = exited\nlast exit code = 0\n", ""
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value={
+                "launch_helper": helper,
+            }), mock.patch.object(
+                macos_launcher_probe.subprocess, "run",
+                side_effect=[missing, ok, terminal, ok],
+            ) as run:
+                result = fleet.probe_launch_helper(
+                    Path("receipt"), config, root / "agents", root / "support"
+                )
+            self.assertTrue(result["passed"])
+            self.assertEqual(result["path"], "/Volumes/Workshop/VMs")
+            self.assertEqual(run.call_args_list[-1].args[0][1], "bootout")
+
+            cleanup_failed = subprocess.CompletedProcess(
+                [], 5, "", "bootout failed\n"
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value={
+                "launch_helper": helper,
+            }), mock.patch.object(
+                macos_launcher_probe.subprocess, "run",
+                side_effect=[missing, ok, terminal, cleanup_failed],
+            ):
+                with self.assertRaisesRegex(ValueError, "could not remove"):
+                    fleet.probe_launch_helper(
+                        Path("receipt"), config, root / "agents", root / "support"
+                    )
+
+            probe_failed = subprocess.CompletedProcess(
+                [], 0, "state = exited\nlast exit code = 74\n", ""
+            )
+            with mock.patch.object(fleet, "verify_receipt", return_value={
+                "launch_helper": helper,
+            }), mock.patch.object(
+                macos_launcher_probe.subprocess, "run",
+                side_effect=[missing, ok, probe_failed, cleanup_failed],
+            ):
+                with self.assertRaisesRegex(
+                    ValueError, "exited 74; .*could not remove"
+                ):
+                    fleet.probe_launch_helper(
+                        Path("receipt"), config, root / "agents", root / "support"
+                    )
+
     def test_exit_timeout_accepts_live_macos26_and_macos27_renderings(self) -> None:
         self.assertTrue(fleet._loaded_exit_timeout_matches(
             "\texit timeout = 30 seconds\n", 30
@@ -619,7 +718,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(write.returncode, 0, write.stderr)
-            self.assertEqual(json.loads(receipt.read_text())["schema"], 2)
+            self.assertEqual(json.loads(receipt.read_text())["schema"], 3)
             verify = subprocess.run(
                 [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
                  "--config", str(config), "--agents-dir", str(agents),
@@ -627,6 +726,30 @@ class MacosFleetLaneTests(unittest.TestCase):
                 text=True, capture_output=True, check=False,
             )
             self.assertEqual(verify.returncode, 0, verify.stderr)
+            legacy_receipt = json.loads(receipt.read_text())
+            legacy_receipt["schema"] = 2
+            legacy_receipt.pop("launch_helper", None)
+            receipt.write_text(json.dumps(legacy_receipt))
+            verify_legacy = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(verify_legacy.returncode, 0, verify_legacy.stderr)
+            legacy_receipt["schema"] = 1
+            receipt.write_text(json.dumps(legacy_receipt))
+            verify_obsolete = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "verify-installed", str(receipt),
+                 "--config", str(config), "--agents-dir", str(agents),
+                 "--support-root", str(support_root)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertNotEqual(verify_obsolete.returncode, 0)
+            self.assertIn("schema must be 2 or 3", verify_obsolete.stderr)
+            legacy_receipt["schema"] = 3
+            legacy_receipt["launch_helper"] = None
+            receipt.write_text(json.dumps(legacy_receipt))
             target = next(agents.glob("*.plist"))
             base_value = plistlib.loads(target.read_bytes())
             profile = config.parent / "custom/network-profile.toml"
