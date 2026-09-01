@@ -301,6 +301,13 @@ instead of waiting for the generic 30-minute stale-log threshold. Participation
 OFF remains authoritative, and other nonzero exit classes retain the conservative
 stale-log rule.
 
+Per-lane launchd enablement is also authoritative. A host may participate while
+legacy, release, sanitizer, Linux, or Windows plists remain explicitly disabled.
+The watchdog reads `launchctl print-disabled` once per pass and never reloads an
+exact disabled label. If that enablement map cannot be read, automatic recovery
+fails closed for pool-controlled lanes instead of guessing that every discovered
+plist should be active.
+
 ```
 mkdir -p "$HOME/Library/Logs/tartci"
 sed -e "s|\$HOME|$HOME|g" \

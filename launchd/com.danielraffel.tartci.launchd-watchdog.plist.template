@@ -17,7 +17,8 @@
   participation is ON and remain stopped when participation is OFF. A loaded,
   pool-enabled supervisor that exits EX_TEMPFAIL for its documented App-auth
   refresh but does not respawn is healed after a short bounded grace rather than
-  waiting for the generic stale-log threshold.
+  waiting for the generic stale-log threshold. Exact labels reported disabled by
+  launchd are never healed; an unreadable enablement map fails closed.
 
   Install shape:
 

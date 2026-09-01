@@ -212,6 +212,25 @@ def _domain() -> str:
     return f"gui/{os.getuid()}"
 
 
+def parse_disabled_services(text: str) -> set[str]:
+    """Return exact labels launchd reports as durably disabled."""
+    disabled: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.endswith("=> disabled") or not line.startswith('"'):
+            continue
+        end = line.find('"', 1)
+        if end > 1:
+            disabled.add(line[1:end])
+    return disabled
+
+
+def disabled_services() -> set[str] | None:
+    """Read launchd's enablement authority once; unknown fails closed to no heal."""
+    rc, out, _ = _run(["launchctl", "print-disabled", _domain()])
+    return parse_disabled_services(out) if rc == 0 else None
+
+
 def discover_agents(launch_agents_dir: str) -> list[tuple[str, str]]:
     """Return every tartci or persistent Actions runner LaunchAgent plist."""
     out: list[tuple[str, str]] = []
@@ -276,7 +295,8 @@ def any_tart_vm_running() -> bool:
 def gather_health(label: str, plist_path: str, stale_log_s: int,
                   vm_running: bool = True,
                   pool_participating: bool = False,
-                  restart_grace_s: int = DEFAULT_RESTART_GRACE_S) -> AgentHealth:
+                  restart_grace_s: int = DEFAULT_RESTART_GRACE_S,
+                  service_enabled: bool | None = True) -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
     log_path = _log_path_from_plist(plist_path)
@@ -305,7 +325,18 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             label, plist_path, log_path, state, last_exit, log_age, "healthy",
             "declared runner executable exists; runtime health is owned by Shipyard",
         )
-    expected_loaded = pool_participating and is_pool_runner(label)
+    pool_runner = is_pool_runner(label)
+    if pool_runner and service_enabled is False:
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "healthy",
+            "explicitly disabled in launchd; durable lane authority preserved",
+        )
+    if pool_runner and service_enabled is None:
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "unknown",
+            "launchd enablement state unavailable; refusing automatic recovery",
+        )
+    expected_loaded = pool_participating and pool_runner
     verdict, reason = classify(
         state, last_exit, log_age, stale_log_s, vm_running, expected_loaded,
         restart_grace_s
@@ -469,9 +500,11 @@ def main(argv: list[str] | None = None) -> int:
     # fires when nothing is building, so a legit long build is never healed.
     vm_running = any_tart_vm_running()
     participating = pool_participating(args.participation_file)
+    disabled = disabled_services()
     health = [
         gather_health(lbl, p, args.stale_log_seconds, vm_running, participating,
-                      args.restart_grace_seconds)
+                      args.restart_grace_seconds,
+                      None if disabled is None else lbl not in disabled)
         for lbl, p in agents
     ]
 
