@@ -69,7 +69,7 @@ chmod -R a-w "$app/Contents/Resources/support"
 cat >"$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?><!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd"><plist version="1.0"><dict><key>CFBundleExecutable</key><string>tartci-launcher</string><key>CFBundleIdentifier</key><string>com.danielraffel.tartci.launcher</string><key>CFBundleName</key><string>TartCI Launcher</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleVersion</key><string>1</string><key>LSBackgroundOnly</key><true/><key>NSRemovableVolumesUsageDescription</key><string>TartCI uses the Workshop volume for isolated local CI virtual machines.</string></dict></plist>
 PLIST
-xcrun swiftc -O -whole-module-optimization -target arm64-apple-macos13 -framework Security "$root/native/macos/tartci-launcher/main.swift" -o "$app/Contents/MacOS/tartci-launcher"
+xcrun swiftc -O -whole-module-optimization -target arm64-apple-macos13 -framework Security "$support_root/native/macos/tartci-launcher/main.swift" -o "$app/Contents/MacOS/tartci-launcher"
 /usr/bin/codesign --force --timestamp --options runtime --sign "$identity" --identifier com.danielraffel.tartci.launcher "$app"
 /usr/bin/codesign --verify --strict --deep --verbose=2 "$app"; mv "$app" "$output"
 python3 - "$root" "$output" "$approval_output" <<'PY'

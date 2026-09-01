@@ -24,7 +24,7 @@ GITHUB_REPOSITORY = re.compile(
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$"
 )
 ROOT_FILES = {"tartci"}
-ROOT_DIRS = {"launchd", "profiles", "providers", "scripts"}
+ROOT_DIRS = {"launchd", "native", "profiles", "providers", "scripts"}
 MANIFEST_NAME = ".tartci-support-manifest.json"
 LAUNCH_NAME = ".tartci-launch"
 TRUSTED_REPOSITORY = "https://github.com/danielraffel/tartci.git"
@@ -107,7 +107,7 @@ def build(root: Path) -> dict[str, object]:
     tree_modes: dict[str, int] = {}
     tree = _git(
         root, "ls-tree", "-r", "-z", "HEAD", "--",
-        "tartci", "launchd", "profiles", "providers", "scripts",
+        "tartci", "launchd", "native", "profiles", "providers", "scripts",
     )
     for record in tree.split("\0"):
         if not record:
