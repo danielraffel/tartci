@@ -95,6 +95,15 @@ class MacosFleetLaneTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "external-volume"):
                 fleet.load(path)
 
+    def test_private_launcher_rejects_another_external_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m3.toml"
+            path.write_text(HOST_CONFIGS["studio"].read_text().replace(
+                "/Volumes/Workshop/VMs", "/Volumes/Another/VMs"
+            ))
+            with self.assertRaisesRegex(ValueError, "private M3"):
+                fleet.load(path)
+
     def test_launchd_context_probe_is_bounded_and_cleans_up(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

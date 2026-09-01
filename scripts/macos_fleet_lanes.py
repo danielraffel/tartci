@@ -191,6 +191,8 @@ def load(path: Path) -> dict:
         if (not isinstance(helper.get("team_id"), str)
                 or not re.fullmatch(r"[A-Z0-9]{10}", helper["team_id"])):
             fail("launch_helper.team_id must be a ten-character Apple Team ID")
+        if host["tart_home"] != "/Volumes/Workshop/VMs":
+            fail("launch_helper is restricted to the private M3 /Volumes/Workshop/VMs store")
     if external_tart_home and helper is None:
         fail("an external-volume Tart home requires a verified signed launch_helper")
     if helper is not None and not external_tart_home:
