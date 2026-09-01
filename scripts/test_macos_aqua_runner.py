@@ -308,7 +308,10 @@ class AquaRunnerTest(unittest.TestCase):
         self.assertNotIn("./run.sh --jitconfig", supervisor)
         self.assertNotIn("printf '%s' '$jit'", supervisor)
         discard = supervisor[supervisor.index("discard_current_vm(){") : supervisor.index("cleanup(){")]
-        self.assertLess(discard.index("stop_current_aqua_runner"), discard.index('kill -9 "$CURRENT_RPID"'))
+        self.assertLess(discard.index("stop_current_aqua_runner"), discard.index("terminate_current_guardian"))
+        guardian = supervisor[supervisor.index("terminate_current_guardian(){") : supervisor.index("discard_current_vm(){")]
+        self.assertLess(guardian.index('kill -9 "$pid"'), guardian.index('wait "$pid"'))
+        self.assertIn('! kill -0 "$pid"', guardian)
         stream = supervisor[supervisor.index("run_runner_until_done(){") : supervisor.index("install_and_preflight_aqua_runner(){")]
         self.assertLess(stream.index('CURRENT_AQUA_LABEL="$aqua_label"'), stream.index("printf '%s' \"$jit\" | ssh"))
         self.assertIn("failed to stream JIT config", stream)
