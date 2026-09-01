@@ -51,6 +51,7 @@ WORKTREE_CLEANUP_KEYS = {
     "provider", "repo", "primary", "prefix", "main_ref", "github_cli",
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
+WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS = {"ghapp_sha256", "cmux_sha256"}
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
@@ -213,10 +214,17 @@ def load(path: Path) -> dict:
             "github_cli": "ghapp", "apply": False, "max_trees": 8,
             "max_gib": 512, "timeout_seconds": 300, "cooldown_seconds": 3600,
         }
-        if not isinstance(cleanup, dict) or set(cleanup) != WORKTREE_CLEANUP_KEYS:
+        if not isinstance(cleanup, dict) or set(cleanup) not in (WORKTREE_CLEANUP_KEYS, WORKTREE_CLEANUP_KEYS | WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS):
             fail("worktree_cleanup must declare the complete strict contract")
-        if cleanup != expected:
+        core={key:value for key,value in cleanup.items() if key not in WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS}
+        expected["apply"]=cleanup.get("apply")
+        if core != expected or type(cleanup.get("apply")) is not bool:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
+        if cleanup["apply"]:
+            if set(cleanup) != WORKTREE_CLEANUP_KEYS | WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS or any(not isinstance(cleanup.get(key),str) or not re.fullmatch(r"[0-9a-f]{64}",cleanup[key]) for key in WORKTREE_CLEANUP_SIGNED_IDENTITY_KEYS):
+                fail("enabled worktree_cleanup requires sealed ghapp and cmux SHA-256 identities")
+        elif set(cleanup) != WORKTREE_CLEANUP_KEYS:
+            fail("dormant worktree_cleanup must not carry executable identity authority")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
     github_app = data.get("github_app")
@@ -1160,6 +1168,8 @@ def lane_plist(
             "TARTCI_WORKTREE_CLEANUP_MAX_GIB": str(cleanup["max_gib"]),
             "TARTCI_WORKTREE_CLEANUP_TIMEOUT_SECS": str(cleanup["timeout_seconds"]),
             "TARTCI_WORKTREE_CLEANUP_COOLDOWN_SECS": str(cleanup["cooldown_seconds"]),
+            "TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256": cleanup["ghapp_sha256"],
+            "TARTCI_WORKTREE_CLEANUP_CMUX_SHA256": cleanup["cmux_sha256"],
         })
     github_app = data.get("github_app")
     if github_app is not None:

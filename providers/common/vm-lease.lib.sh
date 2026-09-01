@@ -297,13 +297,16 @@ tartci_vm_lease_owner(){
 
 # Only a freshly returned, exact disk-axis lease denial can trigger cleanup.
 tartci_try_worktree_cleanup(){
-  local attempt_json="$1" free_bytes="" required_bytes="" apply_args=()
+  local attempt_json="$1" free_bytes="" required_bytes="" apply_args=() ghapp_sha="${TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256:-}" cmux_sha="${TARTCI_WORKTREE_CLEANUP_CMUX_SHA256:-}"
   [ "${TARTCI_WORKTREE_CLEANUP_APPLY:-0}" = 1 ] || return 1
   [ "${TARTCI_WORKTREE_CLEANUP_PROVIDER:-}" = merged-main-v1 ] || return 1
   [ "${TARTCI_WORKTREE_CLEANUP_REPO:-}" = Generous-Corp/pulp ] || return 1
   [ "${TARTCI_WORKTREE_CLEANUP_GITHUB_CLI:-}" = ghapp ] || return 1
   [ "${TARTCI_RUNNER_REPO:-}" = Generous-Corp/pulp ] || return 1
   [ "${TARTCI_RECEIPT_HOST_ID:-}" = studio ] || return 1
+  [ "${#ghapp_sha}" -eq 64 ] || return 1
+  [ "${#cmux_sha}" -eq 64 ] || return 1
+  case "$ghapp_sha$cmux_sha" in *[!0-9a-f]*) return 1;; esac
   IFS=$'\t' read -r free_bytes required_bytes < <(printf '%s' "$attempt_json" | /usr/bin/python3 -c '
 import json,sys
 try: d=json.load(sys.stdin)
@@ -320,6 +323,7 @@ print(f"{free}\t{required}")
     --provider "$TARTCI_WORKTREE_CLEANUP_PROVIDER" --repo "$TARTCI_WORKTREE_CLEANUP_REPO" \
     --primary "$TARTCI_WORKTREE_CLEANUP_PRIMARY" --prefix "$TARTCI_WORKTREE_CLEANUP_PREFIX" \
     --main-ref "$TARTCI_WORKTREE_CLEANUP_MAIN_REF" --github-cli "$TARTCI_WORKTREE_CLEANUP_GITHUB_CLI" \
+    --ghapp-sha256 "$TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256" --cmux-sha256 "$TARTCI_WORKTREE_CLEANUP_CMUX_SHA256" \
     --receipt "$TARTCI_DISK_DENIAL_RECEIPT_DIR/worktree-cleanup.json" \
     --lock "$TARTCI_DISK_DENIAL_RECEIPT_DIR/worktree-cleanup.lock" \
     --before-free-bytes "$free_bytes" --required-bytes "$required_bytes" \

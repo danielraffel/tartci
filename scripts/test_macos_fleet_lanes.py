@@ -82,6 +82,17 @@ class MacosFleetLaneTests(unittest.TestCase):
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 self.assertFalse(any(key.startswith("TARTCI_WORKTREE_CLEANUP_") for key in env))
 
+    def test_enabled_cleanup_authority_renders_only_m3_pulp_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path=Path(td)/"m3.toml"; body=HOST_CONFIGS["studio"].read_text().replace("apply = false","apply = true\nghapp_sha256 = \""+"a"*64+"\"\ncmux_sha256 = \""+"b"*64+"\"")
+            path.write_text(body); rendered=fleet.rendered_plists(fleet.load(path)); pulp_count=0
+            for plist_body in rendered.values():
+                env=plistlib.loads(plist_body)["EnvironmentVariables"]; keys={key for key in env if key.startswith("TARTCI_WORKTREE_CLEANUP_")}
+                if env["TARTCI_RUNNER_REPO"]=="Generous-Corp/pulp":
+                    pulp_count+=1; self.assertIn("TARTCI_WORKTREE_CLEANUP_GHAPP_SHA256",keys); self.assertIn("TARTCI_WORKTREE_CLEANUP_CMUX_SHA256",keys)
+                else: self.assertEqual(keys,set())
+            self.assertEqual(pulp_count,2)
+
     def test_worktree_cleanup_rejected_outside_exact_m3_contract(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "bad.toml"
