@@ -181,6 +181,91 @@ exit 0
             )
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_domain_services_are_filtered_before_detail_queries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            calls = root / "calls"
+            launchctl = root / "launchctl"
+            launchctl.write_text(
+                f"""#!/bin/sh
+printf '%s\\n' "$2" >> '{calls}'
+case "$2" in
+  gui/*) printf 'services = {{\\n  "com.apple.textcontextd" => {{\\n  }}\\n  "com.example.menu-helper" => {{\\n  }}\\n}}\\n' ;;
+  */com.apple.textcontextd|*/com.example.menu-helper) exit 77 ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-studio-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(
+                calls.read_text(encoding="utf-8").splitlines(),
+                [f"gui/{os.getuid()}"],
+            )
+
+    def test_plausible_service_launchctl_timeout_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            launchctl = root / "launchctl"
+            launchctl.write_text(
+                """#!/bin/sh
+case "$2" in
+  gui/*/local.tart-macos-runner) sleep 1 ;;
+  gui/*) printf 'services = {\n  "local.tart-macos-runner" => {\n  }\n}\n' ;;
+esac
+exit 0
+""",
+                encoding="utf-8",
+            )
+            launchctl.chmod(0o755)
+            env = os.environ.copy()
+            env["TARTCI_LAUNCHCTL"] = str(launchctl)
+            result = subprocess.run(
+                [
+                    str(SCRIPT),
+                    "--current-label",
+                    "com.danielraffel.pulp.tart-runner-macos-gate",
+                    "--runner-name",
+                    "pulp-studio-01",
+                    "--state-dir",
+                    str(root / "state"),
+                    "--agents-dir",
+                    str(agents),
+                    "--launchctl-timeout-seconds",
+                    "0.05",
+                ],
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("launchctl print timed out", result.stderr)
+
     def test_loaded_linux_provider_is_positively_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

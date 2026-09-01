@@ -100,6 +100,23 @@ def _service_labels(text: str) -> set[str]:
     return labels
 
 
+def _launchctl_print(
+    launchctl: str, target: str, *, timeout_seconds: float
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [launchctl, "print", target],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"launchctl print timed out after {timeout_seconds:g}s for {target}"
+        ) from error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--current-label", required=True)
@@ -107,20 +124,38 @@ def main() -> int:
     parser.add_argument("--state-dir", required=True)
     parser.add_argument("--agents-dir", default=str(Path.home() / "Library/LaunchAgents"))
     parser.add_argument("--hostname", default=os.uname().nodename.split(".")[0])
+    parser.add_argument(
+        "--launchctl-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("TARTCI_IDENTITY_GUARD_LAUNCHCTL_TIMEOUT_SECS", "5")),
+    )
     args = parser.parse_args()
+    if args.launchctl_timeout_seconds <= 0:
+        parser.error("--launchctl-timeout-seconds must be positive")
     launchctl = os.environ.get("TARTCI_LAUNCHCTL", "launchctl")
     domain = f"gui/{os.getuid()}"
     expected = (
         args.runner_name,
         os.path.join(os.path.abspath(os.path.expanduser(args.state_dir)), f"{args.runner_name}.state.json"),
     )
-    domain_print = subprocess.run(
-        [launchctl, "print", domain], capture_output=True, text=True, check=False
-    )
+    try:
+        domain_print = _launchctl_print(
+            launchctl, domain, timeout_seconds=args.launchctl_timeout_seconds
+        )
+    except RuntimeError as error:
+        print(f"identity guard cannot enumerate loaded services: {error}", file=sys.stderr)
+        return 2
     if domain_print.returncode != 0:
         print(f"identity guard cannot enumerate loaded services in {domain}", file=sys.stderr)
         return 2
-    loaded_labels = _service_labels(domain_print.stdout)
+    # The GUI domain contains hundreds of unrelated Apple/application services.
+    # Inspecting every one made concurrent lane startup take minutes. Disk-backed
+    # candidates are added below; only plausible runner labels from the domain
+    # need a per-service launchctl query.
+    loaded_labels = {
+        label for label in _service_labels(domain_print.stdout)
+        if _plausible_runner_label(label)
+    }
     disk_specs: dict[str, dict] = {}
     for path in sorted(Path(args.agents_dir).glob("*.plist")):
         try:
@@ -135,14 +170,28 @@ def main() -> int:
         if not isinstance(label, str):
             continue
         disk_specs[label] = plist
-        loaded = subprocess.run([launchctl, "print", f"{domain}/{label}"], capture_output=True, text=True, check=False)
+        try:
+            loaded = _launchctl_print(
+                launchctl,
+                f"{domain}/{label}",
+                timeout_seconds=args.launchctl_timeout_seconds,
+            )
+        except RuntimeError as error:
+            print(f"identity guard cannot inspect candidate {label}: {error}", file=sys.stderr)
+            return 2
         if loaded.returncode == 0:
             loaded_labels.add(label)
     conflicts: list[tuple[str, tuple[str, str]]] = []
     for label in sorted(loaded_labels - {args.current_label}):
-        detail = subprocess.run(
-            [launchctl, "print", f"{domain}/{label}"], capture_output=True, text=True, check=False
-        )
+        try:
+            detail = _launchctl_print(
+                launchctl,
+                f"{domain}/{label}",
+                timeout_seconds=args.launchctl_timeout_seconds,
+            )
+        except RuntimeError as error:
+            print(f"identity guard cannot inspect loaded service {label}: {error}", file=sys.stderr)
+            return 2
         if detail.returncode != 0:
             continue
         cached = _cached_spec(detail.stdout)
