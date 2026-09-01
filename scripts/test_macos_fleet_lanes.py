@@ -69,6 +69,17 @@ def copy_support_cohort(root: Path) -> None:
 
 
 class MacosFleetLaneTests(unittest.TestCase):
+    def test_exit_timeout_accepts_live_macos26_and_macos27_renderings(self) -> None:
+        self.assertTrue(fleet._loaded_exit_timeout_matches(
+            "\texit timeout = 30 seconds\n", 30
+        ))
+        self.assertTrue(fleet._loaded_exit_timeout_matches(
+            "\texit timeout = 30\n", 30
+        ))
+        self.assertFalse(fleet._loaded_exit_timeout_matches(
+            "\texit timeout = 31\n", 30
+        ))
+
     def test_receipt_backed_readiness_separates_intent_from_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

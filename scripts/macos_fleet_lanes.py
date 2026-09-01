@@ -653,6 +653,13 @@ def _loaded_has(output: str, value: str, description: str) -> None:
         )
 
 
+def _loaded_exit_timeout_matches(output: str, seconds: int) -> bool:
+    """Accept launchd's macOS 26 (`seconds`) and macOS 27 (bare) renderings."""
+    return re.search(
+        rf"^\texit timeout = {seconds}(?: seconds)?$", output, re.MULTILINE
+    ) is not None
+
+
 def _verify_loaded_output(
     name: str, payload: bytes, output: str, agents_dir: Path
 ) -> str:
@@ -705,7 +712,11 @@ def _verify_loaded_output(
         )
         if "keepalive" not in properties or "runatload" not in properties:
             fail(f"loaded LaunchAgent {label} lost keepalive/runatload properties")
-        _loaded_has(output, "\texit timeout = 30 seconds\n", f"{label} exit timeout")
+        if not _loaded_exit_timeout_matches(output, 30):
+            fail(
+                f"loaded LaunchAgent {label} exit timeout does not match its receipt "
+                "(expected 30 seconds)"
+            )
         return hashlib.sha256(output.encode()).hexdigest()
 
 
