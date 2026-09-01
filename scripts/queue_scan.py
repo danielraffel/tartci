@@ -18,6 +18,8 @@ from math import ceil
 from pathlib import Path
 from typing import Any
 
+from bounded_subprocess import run_bounded
+
 RUNS_PER_PAGE = 100
 
 
@@ -119,12 +121,10 @@ class QueueScanner:
                 f"GitHub API call budget exhausted ({self.args.max_api_calls})"
             )
         self.api_calls += 1
-        result = subprocess.run(
+        result = run_bounded(
             [self.args.gh_cli, "api", path],
-            capture_output=True,
-            text=True,
             timeout=self.args.gh_timeout,
-            check=False,
+            operation="queue_scan_github_api",
         )
         if result.returncode:
             raise GitHubApiError(path, result.returncode, result.stderr)

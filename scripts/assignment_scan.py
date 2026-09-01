@@ -10,12 +10,13 @@ import fcntl
 import json
 import math
 import os
-import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any
+
+from bounded_subprocess import ObservationError, run_bounded
 
 
 PER_PAGE = 100
@@ -90,14 +91,12 @@ class AssignmentScanner:
         if remaining <= 0:
             raise ScanError("assignment scan exceeded its overall deadline")
         try:
-            result = subprocess.run(
+            result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                capture_output=True,
-                text=True,
                 timeout=min(self.args.gh_timeout, remaining),
-                check=False,
+                operation="assignment_scan_github_api",
             )
-        except (OSError, subprocess.TimeoutExpired) as error:
+        except (OSError, ObservationError) as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
         if result.returncode:
             raise ScanError(
