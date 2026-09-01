@@ -112,7 +112,6 @@ class MacosFleetLaneTests(unittest.TestCase):
             config.write_text(
                 HOST_CONFIGS["studio"].read_text()
                 .replace("/Users/danielraffel", str(home))
-                .replace("/Volumes/Workshop/VMs", "/Volumes/Test/VMs")
             )
             helper = {
                 "path": str(home / ".local/libexec/tartci-launcher"),
@@ -136,7 +135,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     Path("receipt"), config, root / "agents", root / "support"
                 )
             self.assertTrue(result["passed"])
-            self.assertEqual(result["path"], "/Volumes/Test/VMs")
+            self.assertEqual(result["path"], "/Volumes/Workshop/VMs")
             self.assertEqual(run.call_args_list[-1].args[0][1], "bootout")
 
             cleanup_failed = subprocess.CompletedProcess(
