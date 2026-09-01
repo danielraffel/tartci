@@ -83,6 +83,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertEqual(data["host"]["home"], "/Users/danielraffel")
                 self.assertEqual(data["host"]["tart_home"], expected[host_id][0])
                 self.assertEqual(
+                    data["host"].get("github_api_timeout_seconds"),
+                    30 if host_id == "m1" else None,
+                )
+                self.assertEqual(
                     next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")["labels"][-1],
                     expected[host_id][1],
                 )
@@ -176,6 +180,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                         },
                         {host_id},
                     )
+                    self.assertTrue(all(
+                        value["EnvironmentVariables"].get("TARTCI_GH_TIMEOUT_SECS")
+                        == ("30" if host_id == "m1" else None)
+                        for value in values
+                    ))
                     self.assertEqual(
                         {
                             value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
@@ -567,6 +576,37 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("assignment_scan_timeout_seconds", result.stderr)
+
+    def test_host_github_api_timeout_is_bounded(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "too-small": base.replace(
+                "github_api_timeout_seconds = 30",
+                "github_api_timeout_seconds = 4",
+                1,
+            ),
+            "too-large": base.replace(
+                "github_api_timeout_seconds = 30",
+                "github_api_timeout_seconds = 61",
+                1,
+            ),
+            "wrong-type": base.replace(
+                "github_api_timeout_seconds = 30",
+                'github_api_timeout_seconds = "30"',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("host.github_api_timeout_seconds", result.stderr)
 
     def test_assignment_scan_workers_are_bounded_and_v2_only(self) -> None:
         base = CONFIG.read_text()

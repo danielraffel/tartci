@@ -397,6 +397,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   exhaustive inside the total deadline. This bounds the whole host burst, not
   each overlapping supervisor independently. Current-job lifecycle discovery
   remains one worker.
+  A host whose production traces prove individual GitHub App calls can exceed
+  the generic 15-second subprocess limit may declare the bounded
+  `host.github_api_timeout_seconds` value (5 through 60). The renderer applies
+  it uniformly to every managed lane as `TARTCI_GH_TIMEOUT_SECS`; do not patch
+  individual live plists. M1 retains 30 seconds because its pre-immutable live
+  configuration and concurrent-supervisor measurements require that margin.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
   host is explicitly pointed at the same replacement path.
 
