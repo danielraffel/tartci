@@ -8,6 +8,7 @@ import contextlib
 import datetime as dt
 import fcntl
 import json
+import math
 import os
 import subprocess
 import sys
@@ -301,7 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scan-timeout",
         type=int,
-        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS", "60")),
+        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS", "180")),
     )
     parser.add_argument(
         "--result-cap",
@@ -327,7 +328,7 @@ def parse_args() -> argparse.Namespace:
         "--observation-lock-timeout",
         type=float,
         default=float(
-            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "30")
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")
         ),
     )
     args = parser.parse_args()
@@ -343,7 +344,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-api-calls must be positive")
     if not 1 <= args.max_workers <= 16:
         parser.error("--max-workers must be between 1 and 16")
-    if args.observation_lock_timeout <= 0:
+    if (
+        not math.isfinite(args.observation_lock_timeout)
+        or args.observation_lock_timeout <= 0
+    ):
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")

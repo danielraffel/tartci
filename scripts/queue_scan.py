@@ -8,6 +8,7 @@ import datetime as dt
 import fcntl
 import hashlib
 import json
+import math
 import os
 import subprocess
 import tempfile
@@ -555,7 +556,7 @@ def parse_args() -> argparse.Namespace:
         "--observation-lock-timeout",
         type=float,
         default=float(
-            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "30")
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")
         ),
         help="seconds to wait for the host-global observation lock",
     )
@@ -610,7 +611,10 @@ def parse_args() -> argparse.Namespace:
             parser.error(f"--{field.replace('_', '-')} must be positive")
     if args.stagger_max_seconds < 0:
         parser.error("--stagger-max-seconds must be non-negative")
-    if args.observation_lock_timeout <= 0:
+    if (
+        not math.isfinite(args.observation_lock_timeout)
+        or args.observation_lock_timeout <= 0
+    ):
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")

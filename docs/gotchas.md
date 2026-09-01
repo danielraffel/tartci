@@ -378,7 +378,10 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
   → *Failure behavior:* lock acquisition is bounded by
-  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (30 seconds by default). Timeout
+  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default). The
+  exhaustive assignment scanner's total deadline is 180 seconds by default,
+  leaving a serialized waiter time to perform its own scan after the lock opens.
+  Timeout
   is scan-blind/fail-closed: do not report zero demand, publish partial cache
   state, or start a lower-priority VM. The supervisor retries normally.
   → *Do not* fix this by independently increasing every lane's worker count or
