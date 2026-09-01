@@ -30,7 +30,10 @@ REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
 TOP_KEYS = {"schema", "name", "host", "github_app", "stacked_images", "lane"}
-HOST_KEYS = {"id", "home", "tart_home", "cache_root", "log_root"}
+HOST_KEYS = {
+    "id", "home", "tart_home", "cache_root", "log_root",
+    "github_api_timeout_seconds",
+}
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
@@ -84,6 +87,11 @@ def load(path: Path) -> dict:
             fail(f"host.{key} must be a string")
         if not value.startswith("/"):
             fail(f"host.{key} must be an absolute path")
+    github_api_timeout = host.get("github_api_timeout_seconds")
+    if github_api_timeout is not None and (
+            type(github_api_timeout) is not int
+            or not 5 <= github_api_timeout <= 60):
+        fail("host.github_api_timeout_seconds must be an integer from 5 through 60")
     if host["tart_home"] == host["home"] or host["log_root"] == host["home"]:
         fail("Tart and log roots may not be the host home directory itself")
     github_app = data.get("github_app")
@@ -705,6 +713,8 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
+    if "github_api_timeout_seconds" in host:
+        env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
     # An omitted priority delegates to the provider's exact-label policy.
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:

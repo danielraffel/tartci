@@ -9,6 +9,10 @@ home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
+# M1's concurrent production supervisors have measured transient GitHub App
+# calls above the generic 15-second default even though isolated calls finish
+# quickly. Preserve the prior live-host margin across immutable generations.
+github_api_timeout_seconds = 30
 
 # launchd does not inherit the interactive shell's GitHub App configuration.
 # Preserve references only; key and token contents remain private host files.

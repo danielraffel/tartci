@@ -43,6 +43,12 @@ validator/provider and the reviewed host profile together; editing a live plist
 or setting an ambient environment variable is not a supported shortcut.
 
 Every managed lane also declares its exact GitHub runner registration contract.
+Host profiles may also declare a bounded GitHub API subprocess timeout when
+live measurements require more than the generic 15 seconds. This renders the
+same `TARTCI_GH_TIMEOUT_SECS` into every lane on that host; it is not a per-lane
+throughput knob. M1 records 30 seconds to preserve its measured production
+margin across immutable installs, while M3 and M5 retain the default.
+
 The renderer exports the protected/default group as `TARTCI_RUNNER_GROUP_ID`;
 Pulp's event-class tiers additionally export
 `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`. Omitting either contract would
