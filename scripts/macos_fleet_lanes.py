@@ -852,7 +852,7 @@ def fleet_readiness(
     managed_supervisor_pids: set[int] = set()
     try:
         process_table = subprocess.run(
-            ["ps", "-axo", "pid=,lstart=,command="],
+            ["ps", "-axo", "pid=,ppid=,lstart=,command="],
             text=True, capture_output=True, check=False, timeout=5,
         )
     except subprocess.TimeoutExpired:
@@ -865,13 +865,20 @@ def fleet_readiness(
             generation_prefix = f"{home}/.local/share/tartci-generations/"
             provider_suffix = "/providers/tart-macos/runner.sh --loop"
             for line in process_table.stdout.splitlines():
-                match = re.match(r"^\s*([0-9]+)\s+(.{24})\s+(.+)$", line)
+                match = re.match(
+                    r"^\s*([0-9]+)\s+([0-9]+)\s+(.{24})\s+(.+)$", line
+                )
                 if match is None:
                     continue
                 pid = int(match.group(1))
-                process_starts[pid] = " ".join(match.group(2).split())
-                command = match.group(3)
-                if generation_prefix in command and provider_suffix in command:
+                ppid = int(match.group(2))
+                process_starts[pid] = " ".join(match.group(3).split())
+                command = match.group(4)
+                if (
+                    ppid == 1
+                    and generation_prefix in command
+                    and provider_suffix in command
+                ):
                     managed_supervisor_pids.add(pid)
             for orphan_pid in sorted(managed_supervisor_pids - expected_pids):
                 problems.append({

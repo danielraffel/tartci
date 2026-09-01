@@ -117,8 +117,9 @@ class MacosFleetLaneTests(unittest.TestCase):
             domain = subprocess.CompletedProcess([], 0, "", "")
             process_table = subprocess.CompletedProcess(
                 [], 0,
-                f"101 {starts[101]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n"
-                f"102 {starts[102]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n",
+                f"101 1 {starts[101]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n"
+                f"102 1 {starts[102]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n"
+                f"555 101 {starts[101]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n",
                 "",
             )
             args = (Path("receipt"), Path("config"), agents, Path("support"))
@@ -149,7 +150,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             orphan_table = subprocess.CompletedProcess(
                 [], 0,
                 process_table.stdout
-                + f"999 Mon Sep  1 00:00:02 2026 bash {root}/.local/share/tartci-generations/old/providers/tart-macos/runner.sh --loop\n",
+                + f"999 1 Mon Sep  1 00:00:02 2026 bash {root}/.local/share/tartci-generations/old/providers/tart-macos/runner.sh --loop\n",
                 "",
             )
             with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \

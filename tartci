@@ -394,8 +394,13 @@ cmd_pool() {
           if launchctl print "$launchd_target" >/dev/null 2>&1 \
             || { launchctl bootstrap "gui/$(id -u)" "$agents_dir/$label.plist" >/dev/null 2>&1 \
               && launchctl print "$launchd_target" >/dev/null 2>&1; }; then
-            echo "  enabled $label"; n=$((n + 1))
-            [ "$was_loaded" = 1 ] || newly_loaded+=("$label")
+            if launchctl kickstart "$launchd_target" >/dev/null 2>&1; then
+              echo "  enabled $label"; n=$((n + 1))
+              [ "$was_loaded" = 1 ] || newly_loaded+=("$label")
+            else
+              echo "  (kickstart failed: $label)"
+              load_failed=1
+            fi
           else
             echo "  (enable skipped: $label)"
             load_failed=1
