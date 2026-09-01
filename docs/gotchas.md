@@ -375,6 +375,12 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   and sanitizer lanes use distinct repository/workflow namespaces.
   → *Invariant:* all TartCI providers on one host share the host-global queue
   observation lock (`~/.tartci/state/queue-observation.lock` by default).
+  Assignment lifecycle discovery for a running JIT VM uses that same lock and
+  permits only one API worker. Otherwise a single current-job scan can fan out
+  across every in-progress run and starve the admission scanners it is meant
+  to complement. Lock contention and deadline exhaustion remain typed,
+  fail-closed observations; they never become proof that the queue is empty or
+  that a job is terminal.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
   → *Failure behavior:* lock acquisition is bounded by

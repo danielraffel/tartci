@@ -2,6 +2,7 @@
 """Behavioral regressions for bounded assignment receipt discovery."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
@@ -63,7 +64,9 @@ class CurrentJobScanTests(unittest.TestCase):
             return subprocess.run(
                 ["python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
                  "--runner", RUNNER_NAME, "--workflow", "Build and Test",
-                 "--gh-cli", str(fake), *extra],
+                 "--gh-cli", str(fake),
+                 "--observation-lock-file", str(Path(directory) / "observation.lock"),
+                 *extra],
                 env={**os.environ, "FAKE_KIND": kind}, text=True, capture_output=True, check=False,
             )
 
@@ -107,7 +110,9 @@ else: raise SystemExit(4)
             _write_exec(fake, body)
             result = subprocess.run(
                 ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
-                 "--workflow", "Build and Test", "--gh-cli", str(fake)],
+                 "--workflow", "Build and Test", "--gh-cli", str(fake),
+                 "--scan-timeout", "60",
+                 "--observation-lock-file", str(Path(directory) / "observation.lock")],
                 text=True, capture_output=True, check=False,
             )
         self.assertEqual(result.returncode, 2)
@@ -125,7 +130,8 @@ else: raise SystemExit(4)
             _write_exec(fake, "#!/usr/bin/env bash\nexit 9\n")
             result = subprocess.run(
                 ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
-                 "--workflow", "w", "--gh-cli", str(fake)], text=True,
+                 "--workflow", "w", "--gh-cli", str(fake),
+                 "--observation-lock-file", str(Path(directory) / "observation.lock")], text=True,
                 capture_output=True, check=False,
             )
         self.assertEqual(result.returncode, 2)
@@ -156,11 +162,37 @@ else: raise SystemExit(4)
             result = subprocess.run(
                 ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
                  "--workflow", "Build and Test", "--gh-cli", str(fake),
-                 "--scan-timeout", "20"], text=True, capture_output=True, check=False,
+                 "--scan-timeout", "60",
+                 "--observation-lock-file", str(Path(directory) / "observation.lock")],
+                text=True, capture_output=True, check=False,
             )
         self.assertEqual(result.returncode, 2)
         self.assertEqual(json.loads(result.stdout)["kind"], "observation_error")
         self.assertIn("first page changed", json.loads(result.stdout)["detail"])
+
+    def test_parallel_api_fanout_is_rejected(self) -> None:
+        result = self._scan("active", "--parallelism", "2")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--parallelism must be 1", result.stderr)
+
+    def test_host_lock_timeout_fails_closed_before_api_call(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "observation.lock"
+            marker = Path(directory) / "called"
+            fake = Path(directory) / "fake-gh"
+            _write_exec(fake, f"#!/usr/bin/env bash\ntouch {str(marker)!r}\nexit 9\n")
+            with lock.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                result = subprocess.run(
+                    ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
+                     "--workflow", "w", "--gh-cli", str(fake),
+                     "--observation-lock-file", str(lock),
+                     "--observation-lock-timeout", "0.1"],
+                    text=True, capture_output=True, check=False,
+                )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("host queue observation lock timed out", result.stdout)
+        self.assertFalse(marker.exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
