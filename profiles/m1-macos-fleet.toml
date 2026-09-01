@@ -45,6 +45,10 @@ assignment_scan_timeout_seconds = 180
 # The host-global observation lock admits only one scanner. Four workers keep
 # Pulp's large live queue exhaustive inside that bounded 180-second owner slot.
 assignment_scan_max_workers = 4
+# Tier zero has no higher class to preempt it. Reuse only this supervisor's
+# recent exhaustive receipt across VM boot instead of repeating the full Pulp
+# backlog scan while holding an unregistered VM.
+assignment_top_tier_receipt_max_age_seconds = 180
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]

@@ -48,6 +48,9 @@ live measurements require more than the generic 15 seconds. This renders the
 same `TARTCI_GH_TIMEOUT_SECS` into every lane on that host; it is not a per-lane
 throughput knob. M1 records 30 seconds to preserve its measured production
 margin across immutable installs, while M3 and M5 retain the default.
+M1's Pulp lane also retains a bounded 180-second tier-zero receipt across VM
+boot. This avoids a second exhaustive backlog scan only for merge-group work;
+PR-head and every lower class still revalidate live so priority cannot invert.
 
 The renderer exports the protected/default group as `TARTCI_RUNNER_GROUP_ID`;
 Pulp's event-class tiers additionally export

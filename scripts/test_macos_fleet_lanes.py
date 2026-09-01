@@ -106,6 +106,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     [1, 1],
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
+                self.assertEqual(
+                    pulp_lane.get("assignment_top_tier_receipt_max_age_seconds"),
+                    180 if host_id == "m1" else None,
+                )
                 self.assertEqual(pulp_lane["registration_scope"], "repository")
                 self.assertEqual(pulp_lane["assignment_omit_labels"], ["pulp-gate-fast"])
                 self.assertNotIn("priority", pulp_lane)
@@ -184,6 +188,14 @@ class MacosFleetLaneTests(unittest.TestCase):
                         value["EnvironmentVariables"].get("TARTCI_GH_TIMEOUT_SECS")
                         == ("30" if host_id == "m1" else None)
                         for value in values
+                    ))
+                    self.assertTrue(all(
+                        value["EnvironmentVariables"].get(
+                            "TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"
+                        ) == ("180" if host_id == "m1" else None)
+                        for value in values
+                        if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]
+                        == "Generous-Corp/pulp"
                     ))
                     self.assertEqual(
                         {
@@ -643,6 +655,31 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("assignment_scan_max_workers", result.stderr)
+
+    def test_top_tier_receipt_age_is_bounded_and_v2_only(self) -> None:
+        base = CONFIG.read_text()
+        key = "assignment_top_tier_receipt_max_age_seconds"
+        fixtures = {
+            "negative": base.replace(f"{key} = 180", f"{key} = -1", 1),
+            "too-large": base.replace(f"{key} = 180", f"{key} = 301", 1),
+            "wrong-type": base.replace(f"{key} = 180", f'{key} = "180"', 1),
+            "non-v2": base.replace(
+                "min_queued_age_seconds = 0",
+                f"min_queued_age_seconds = 0\n{key} = 180",
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(key, result.stderr)
 
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)

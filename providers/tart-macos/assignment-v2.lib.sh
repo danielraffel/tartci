@@ -17,6 +17,11 @@ tartci_assignment_v2_configure(){
     *) [ "${TARTCI_ASSIGNMENT_V2_OBSERVE_INTERVAL_SECS:-900}" -ge 300 ] \
       || die "TARTCI_ASSIGNMENT_V2_OBSERVE_INTERVAL_SECS must be at least 300" ;;
   esac
+  case "${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}" in
+    ''|*[!0-9]*) die "invalid TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS" ;;
+    *) [ "${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}" -le 300 ] \
+      || die "TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS must be at most 300" ;;
+  esac
   [ -n "$WORKFLOW_TIERS" ] \
     || die "$ASSIGNMENT_MODE assignment mode requires TARTCI_RUNNER_WORKFLOW_TIERS"
   ASSIGNMENT_V2_BASE_LABELS="$(python3 - "$LABELS" "$ASSIGNMENT_V2_OMIT_LABELS" "$ASSIGNMENT_V2_CLASS_LABELS" <<'PY'
@@ -106,22 +111,28 @@ tartci_assignment_v2_select_live(){
   printf '0|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
 }
 
-tartci_assignment_v2_select(){
-  local force_refresh="${1:-0}" ttl now cache_file cached_at cached_value tmp
-  ttl="${TARTCI_ASSIGNMENT_V2_CACHE_TTL_SECS:-120}"
+tartci_assignment_v2_read_fresh_selection(){
+  local max_age="$1" now cache_file cached_at cached_value age
+  [ "$max_age" -gt 0 ] || return 1
   now="$(date +%s)"
   cache_file="$STATE_DIR/$RUNNER_NAME.assignment-v2-selection.cache"
-  if [ "$force_refresh" != 1 ] && [ -r "$cache_file" ]; then
-    IFS=$'\t' read -r cached_at cached_value < "$cache_file" || true
-    case "$cached_at" in
-      ''|*[!0-9]*) ;;
-      *)
-        if [ $((now - cached_at)) -lt "$ttl" ] && [ -n "$cached_value" ]; then
-          printf '%s\n' "$cached_value"
-          return 0
-        fi
-        ;;
-    esac
+  [ -r "$cache_file" ] || return 1
+  IFS=$'\t' read -r cached_at cached_value < "$cache_file" || return 1
+  case "$cached_at" in ''|*[!0-9]*) return 1;; esac
+  age=$((now - cached_at))
+  [ "$age" -ge 0 ] && [ "$age" -lt "$max_age" ] && [ -n "$cached_value" ] \
+    || return 1
+  printf '%s\n' "$cached_value"
+}
+
+tartci_assignment_v2_select(){
+  local force_refresh="${1:-0}" ttl now cache_file cached_value tmp
+  ttl="${TARTCI_ASSIGNMENT_V2_CACHE_TTL_SECS:-120}"
+  cache_file="$STATE_DIR/$RUNNER_NAME.assignment-v2-selection.cache"
+  if [ "$force_refresh" != 1 ] \
+     && cached_value="$(tartci_assignment_v2_read_fresh_selection "$ttl")"; then
+    printf '%s\n' "$cached_value"
+    return 0
   fi
   cached_value="$(tartci_assignment_v2_select_live)"
   # TTL begins when the exhaustive observation completes, not before lock
@@ -182,10 +193,29 @@ tartci_assignment_v2_parity(){
 }
 
 # Succeed only while the selected class still has demand and every higher class
-# is empty. Every invocation is exhaustive and live; cancellation, class-label
-# drift, API failure, or truncation denies JIT minting.
+# is empty. Lower tiers always re-observe exhaustively and live. A profile may
+# let tier zero reuse its own bounded, exact-class exhaustive receipt because no
+# higher class can arrive above it; a stale/malformed receipt falls back to the
+# live fail-closed scan.
 tartci_assignment_v2_pre_mint_valid(){
-  local selected_tier="$1" tier_label q tier=0
+  local selected_tier="$1" tier_label q tier=0 cached cached_q cached_labels
+  local cached_tier cached_extra top_label expected_labels max_age
+  max_age="${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}"
+  if [ "$selected_tier" = 0 ] && [ "$max_age" -gt 0 ]; then
+    cached="$(tartci_assignment_v2_read_fresh_selection "$max_age")" || cached=""
+    IFS='|' read -r cached_q cached_labels cached_tier cached_extra <<< "$cached"
+    top_label="${TIER_LABELS_CONFIG%%$'\n'*}"
+    expected_labels="$(tartci_assignment_v2_tier_labels "$top_label")"
+    case "$cached_q" in ''|*[!0-9]*) cached_q=0;; esac
+    if [ "$cached_q" -gt 0 ] \
+       && [ "$cached_labels" = "$expected_labels" ] \
+       && [ "$cached_tier" = 0 ] \
+       && [ -z "$cached_extra" ]; then
+      event assignment_v2_pre_mint_receipt \
+        "selected_tier=0 max_age_seconds=$max_age"
+      return 0
+    fi
+  fi
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
     [ "$tier" -le "$selected_tier" ] || break
