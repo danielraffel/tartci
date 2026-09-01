@@ -765,6 +765,33 @@ print(json.dumps(payload))
                 with self.assertRaisesRegex(RuntimeError, "observation lock timed out"):
                     scanner.scan()
 
+    def test_namespace_lock_wait_shares_the_bounded_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                lambda _path: self.fail("API must not run while state is locked"),
+                observation_lock_timeout=0.05,
+            )
+            with scanner.lock_path.open("a+", encoding="utf-8") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                with self.assertRaisesRegex(RuntimeError, "queue state lock timed out"):
+                    scanner.scan()
+
+    def test_non_finite_observation_timeout_is_rejected(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(MODULE_PATH), "--repo", "owner/repo",
+                "--workflow", "Build and Test", "--labels", "self-hosted",
+                "--provider", "test", "--state-file", "/tmp/unused-state.json",
+                "--observation-lock-timeout", "nan",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("observation-lock-timeout must be positive", result.stderr)
+
     def test_api_calls_are_hard_capped(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
         runs = [_run(index, origin + timedelta(minutes=index)) for index in range(100)]

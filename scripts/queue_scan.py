@@ -108,6 +108,7 @@ class QueueScanner:
             f"{self.discovery_path.suffix}.lock"
         )
         self.observation_lock_path = Path(args.observation_lock_file)
+        self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
         self.now = int(time.time())
         self.api_calls = 0
@@ -172,32 +173,9 @@ class QueueScanner:
         )
 
     @contextlib.contextmanager
-    def _state_lock(self) -> Any:
-        self.lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                self.state = self._load_state()
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    @contextlib.contextmanager
-    def _discovery_lock(self) -> Any:
-        self.discovery_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.discovery_lock_path.open("a+", encoding="utf-8") as handle:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-
-    @contextlib.contextmanager
-    def _observation_lock(self) -> Any:
-        """Bound concurrent GitHub observation across every lane on this host."""
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        deadline = time.monotonic() + self.args.observation_lock_timeout
-        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
+    def _bounded_lock(self, path: Path, kind: str) -> Any:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a+", encoding="utf-8") as handle:
             while True:
                 try:
                     fcntl.flock(
@@ -205,9 +183,9 @@ class QueueScanner:
                     )
                     break
                 except BlockingIOError:
-                    if time.monotonic() >= deadline:
+                    if time.monotonic() >= self.lock_deadline:
                         raise RuntimeError(
-                            "host queue observation lock timed out after "
+                            f"{kind} lock timed out after "
                             f"{self.args.observation_lock_timeout}s"
                         )
                     time.sleep(0.05)
@@ -215,6 +193,26 @@ class QueueScanner:
                 yield
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def _state_lock(self) -> Any:
+        with self._bounded_lock(self.lock_path, "queue state"):
+            self.state = self._load_state()
+            yield
+
+    @contextlib.contextmanager
+    def _discovery_lock(self) -> Any:
+        with self._bounded_lock(self.discovery_lock_path, "queue discovery"):
+            yield
+
+    @contextlib.contextmanager
+    def _observation_lock(self) -> Any:
+        """Bound concurrent GitHub observation across every lane on this host."""
+        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._bounded_lock(
+            self.observation_lock_path, "host queue observation"
+        ):
+            yield
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.
@@ -422,6 +420,7 @@ class QueueScanner:
             # scan-blind. A bounded wait fails closed instead of hanging the
             # supervisor or publishing a partial snapshot.
             with self._observation_lock():
+                self.now = int(time.time())
                 self.api_calls = 0
                 runs = self._runs(discovery)
                 candidates, backlog_ids = self._candidate_runs(runs, discovery)
@@ -436,7 +435,7 @@ class QueueScanner:
                         raise ValueError(f"jobs is not a list for run {run_id}")
                     discovered.append({**run, "_jobs": jobs})
 
-                discovery["fetched_at"] = self.now
+                discovery["fetched_at"] = int(time.time())
                 discovery["runs"] = discovered
                 self._save_json(self.discovery_path, discovery)
                 return discovered

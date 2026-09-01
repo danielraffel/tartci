@@ -315,6 +315,19 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
             holder.terminate()
             holder.communicate(timeout=5)
 
+    def test_non_finite_observation_timeout_is_rejected(self) -> None:
+        result = subprocess.run(
+            [
+                "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                "--workflow", "Build and Test", "--labels", "pulp-build-pr-head",
+                "--require-label", "pulp-build-pr-head",
+                "--observation-lock-timeout", "inf",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("observation-lock-timeout must be positive", result.stderr)
+
     def test_run_and_job_pages_are_exhaustive(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
