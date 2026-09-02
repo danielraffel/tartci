@@ -505,6 +505,24 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   follow-up: the final classification must clear the warning only when the
   same runner identity is busy and its current lease/PID ownership is fresh.
 
+- **Hosts report `SCAN BLIND` and restart for credentials, while real
+  pull-request work sits queued.**
+  → *Cause:* two independent defects. `tartci_assignment_v2_select_live` walked
+  assignment tiers highest-first and returned `ERR` on the FIRST tier whose scan
+  failed, so one tier's transient API error made every lower tier unobservable;
+  the supervisor's remedy for sustained blindness is `exit 75`, which refreshes
+  `gh` auth that was never the problem. Separately, demand was counted from a
+  run's reported status alone, and a `merge_group` run can report `queued`
+  forever with its queue entry dequeued, its queue branch deleted, `jobs: []`,
+  cancel saying "already completed", force-cancel saying "not queued", and
+  delete returning 403 to both the App and a maintainer.
+  → *Fix:* an unobserved tier is skipped rather than fatal (`ERR` only when
+  nothing was found AND a tier went unobserved), and a selection made without an
+  exhaustive walk is never cached. A `merge_group` run whose queue branch is
+  confirmed absent, or which is confirmed to carry no queued job, is quarantined
+  and not counted — on POSITIVE determination only, so a timeout still counts
+  the run. Full account: `docs/stale-merge-group-demand.md`.
+
 ## Windows (QEMU)
 
 - **Install media won't boot — BCD `0xc000000d` (\EFI\Microsoft\Boot\BCD).**

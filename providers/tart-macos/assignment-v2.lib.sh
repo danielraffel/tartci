@@ -61,7 +61,7 @@ tartci_assignment_v2_tier_labels(){
 # consumes every run/job page and fails on API uncertainty or truncation. Its
 # explicit require-label predicate rejects generic-only jobs.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc
+  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
@@ -85,29 +85,71 @@ tartci_assignment_v2_tier_demand(){
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
   fi
+  # The scanner's stderr is captured so it cannot pollute the demand count on
+  # stdout, and then deleted. Evidence written there is therefore invisible
+  # unless it is lifted out here: on the SUCCESS path the file is discarded
+  # entirely, which is exactly the path a stale run is detected on. Promote each
+  # stale-demand line to a typed event before the file goes away.
+  while IFS= read -r evidence; do
+    [ -n "$evidence" ] || continue
+    event assignment_stale_demand \
+      "tier=$tier_label detail=$(printf '%s' "$evidence" | cut -c1-512)"
+  done < <(grep '^stale-demand: ' "$error_file" 2>/dev/null | sed 's/^stale-demand: //')
   rm -f "$error_file"
   return "$rc"
 }
 
+# An unobservable tier must not make every lower tier unobservable with it.
+#
+# Tiers are walked highest-priority first, and a tier whose scan fails says
+# nothing about the tiers beneath it. Aborting the whole walk on the first
+# failure therefore converts one tier's transient error into total blindness:
+# the host reports SCAN BLIND, restarts for fresh credentials it did not need,
+# and never learns that a lower tier had work waiting the entire time.
+#
+# So an unobserved tier is skipped, not fatal. Selecting a lower tier on
+# incomplete information is safe because assignment classes are exclusive — a
+# VM minted for a lower class cannot claim higher-class work — and because the
+# pre-mint re-check denies the mint outright if the higher tier turns out to
+# have demand after all. What is NOT safe is caching that selection, so the
+# incomplete walk is signalled to the caller through a state file — this
+# function is always called inside a command substitution, so an exported
+# variable would be set in a subshell and silently lost.
+#
+# Fail-closed is preserved where it matters: if nothing was found and any tier
+# went unobserved, the result is still ERR. Only a walk that observed every
+# tier may report an empty queue.
 tartci_assignment_v2_select_live(){
-  local tier_label q tier=0
+  local tier_label q tier=0 unobserved=0 first_unobserved=0 partial_file
+  partial_file="$STATE_DIR/$RUNNER_NAME.assignment-v2-partial.flag"
+  mkdir -p "$STATE_DIR"
+  rm -f "$partial_file"
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
-    if ! q="$(tartci_assignment_v2_tier_demand "$tier_label")"; then
-      printf 'ERR|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
-      return 0
+    if ! q="$(tartci_assignment_v2_tier_demand "$tier_label")" \
+       || ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      if [ "$unobserved" -eq 0 ]; then
+        first_unobserved="$tier"
+      fi
+      unobserved=$((unobserved + 1))
+      event assignment_tier_unobserved \
+        "tier=$tier_label tier_index=$tier action=continue_to_lower_tier"
+      tier=$((tier + 1))
+      continue
     fi
-    printf '%s' "$q" | grep -qxE '[0-9]+' || {
-      printf 'ERR|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
-      return 0
-    }
     if [ "$q" -gt 0 ]; then
+      [ "$unobserved" -eq 0 ] || : > "$partial_file"
       printf '%s|%s|%s\n' \
         "$q" "$(tartci_assignment_v2_tier_labels "$tier_label")" "$tier"
       return 0
     fi
     tier=$((tier + 1))
   done <<< "$TIER_LABELS_CONFIG"
+  if [ "$unobserved" -gt 0 ]; then
+    : > "$partial_file"
+    printf 'ERR|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$first_unobserved"
+    return 0
+  fi
   printf '0|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
 }
 
@@ -135,6 +177,15 @@ tartci_assignment_v2_select(){
     return 0
   fi
   cached_value="$(tartci_assignment_v2_select_live)"
+  # A selection reached while some tier could not be observed is correct to act
+  # on once and wrong to remember: caching it would hold the fleet on a
+  # lower-tier verdict for the whole TTL on the strength of a scan that never
+  # saw the higher tier. Serve it, do not store it.
+  if [ -e "$STATE_DIR/$RUNNER_NAME.assignment-v2-partial.flag" ]; then
+    rm -f "$cache_file" "$STATE_DIR/$RUNNER_NAME.assignment-v2-partial.flag"
+    printf '%s\n' "$cached_value"
+    return 0
+  fi
   # TTL begins when the exhaustive observation completes, not before lock
   # contention and API pagination. Backdating this stamp can make a fresh
   # snapshot immediately expire and recreate the scan burst it should prevent.

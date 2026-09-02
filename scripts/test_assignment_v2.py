@@ -44,6 +44,42 @@ query = parse_qs(parsed.query)
 page = int(query.get("page", ["1"])[0])
 status = query.get("status", [""])[0]
 
+# Every request, in order. Lets a test assert what was NOT asked for, which is
+# the only way to observe a fetch that was correctly skipped.
+if os.environ.get("ASSIGNMENT_CALLS"):
+    with open(os.environ["ASSIGNMENT_CALLS"], "a", encoding="utf-8") as fh:
+        fh.write(parsed.path + "\n")
+
+# A per-TIER failure channel. `api_fail` fails every tier at once and so cannot
+# express the case that matters: a high tier that cannot be observed while a
+# lower tier is perfectly healthy. Each tier scan opens with the workflow
+# listing, so counting those gives each tier a number.
+session = 0
+if os.environ.get("ASSIGNMENT_SESSION"):
+    counter = os.environ["ASSIGNMENT_SESSION"]
+    try:
+        session = int(open(counter, encoding="utf-8").read().strip() or 0)
+    except (OSError, ValueError):
+        session = 0
+    if parsed.path.endswith("/actions/workflows"):
+        session += 1
+        with open(counter, "w", encoding="utf-8") as fh:
+            fh.write(str(session))
+if session and session in [int(n) for n in state.get("fail_tier_sessions", [])]:
+    if parsed.path.endswith("/runs"):
+        raise SystemExit(9)
+
+if parsed.path.startswith("/repos/") and "/git/ref/" in parsed.path:
+    mode = state.get("ghost_ref", "absent")
+    if mode == "present":
+        print(json.dumps({"ref": parsed.path.split("/git/ref/", 1)[1]}))
+        raise SystemExit(0)
+    if mode == "error":
+        print("gh: server error (HTTP 502)", file=sys.stderr)
+        raise SystemExit(1)
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    raise SystemExit(1)
+
 jobs = []
 if state.get("merge"):
     jobs.append({"id": 201, "status": "queued", "labels": %s + ["pulp-build-merge-group"]})
@@ -62,15 +98,33 @@ elif "/actions/workflows/99/runs" in parsed.path or parsed.path.endswith("/actio
     runs = ([{"id": 101, "name": "Build and Test", "status": status,
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
+    # The ghost: a merge_group run whose queue entry is long gone. Nothing in
+    # its own status says so. It reports queued forever, and its head_branch
+    # names a queue branch that no longer exists.
+    if state.get("ghost") and status == "queued":
+        runs.append({"id": 102, "name": "Build and Test", "status": status,
+                     "event": "merge_group",
+                     "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
+                     "created_at": "2026-08-18T00:00:00Z",
+                     "updated_at": "2026-08-18T00:00:00Z"})
     print(json.dumps({"total_count": len(runs), "workflow_runs": runs if page == 1 else []}))
 elif "/actions/runs/101/jobs" in parsed.path:
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
+elif "/actions/runs/102/jobs" in parsed.path:
+    ghost_jobs = []
+    if state.get("ghost_job"):
+        ghost_jobs.append({"id": 302, "status": "queued",
+                           "labels": %s + ["pulp-build-merge-group"]})
+    print(json.dumps({"total_count": len(ghost_jobs),
+                      "jobs": ghost_jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
-''' % (repr(BASE), repr(BASE), repr(BASE), repr(BASE))
+''' % (repr(BASE), repr(BASE), repr(BASE), repr(BASE), repr(BASE))
 
 
-class AssignmentV2Tests(unittest.TestCase):
+class RunnerFixture:
+    """Shared runner fixture. Not a TestCase, so it is never collected."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -110,6 +164,8 @@ class AssignmentV2Tests(unittest.TestCase):
             env=self.env,
         )
 
+
+class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
     def test_eligibility_matrix_and_v2_registration_labels(self) -> None:
         cases = (
             ({"merge": True}, "1", "pulp-build-merge-group"),
@@ -295,6 +351,19 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
         scanner.args = Namespace(max_workers=3)
+        # This test hand-builds the object to observe executor concurrency, so
+        # it has to supply the collaborators scan() uses. The classifier is
+        # switched off here: what is under test is the worker bound, not
+        # staleness.
+        scanner.stale_demand = module.StaleDemandClassifier(
+            scanner,
+            Namespace(
+                stale_demand_classifier=False,
+                stale_demand_ttl_seconds=1,
+                stale_demand_min_age_seconds=0,
+                stale_demand_quarantine_file=os.devnull,
+            ),
+        )
         scanner._observation_lock = lambda: contextlib.nullcontext()
         scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
         lock = threading.Lock()
@@ -500,6 +569,124 @@ else:
             )
         self.assertEqual(result.returncode, 2)
         self.assertIn("duplicate id", result.stderr)
+
+
+class StaleDemandTests(RunnerFixture, unittest.TestCase):
+    """The two halves of the ordering defect, and the contradiction behind it.
+
+    A merge queue entry that has been dequeued can leave its workflow run
+    reporting `queued` forever: the queue branch is deleted, the run carries no
+    jobs, a normal cancel says the run already completed, a force-cancel says it
+    is not queued, and deleting it is forbidden. The run's own status is
+    therefore not evidence about whether it can still run, and demand counted
+    from that status never drains.
+
+    Because tiers are walked highest-first, an undrainable top tier is not a
+    local problem: it either outranks every lower tier forever, or — when its
+    scan fails outright — it aborts the walk and makes every lower tier
+    unobservable too.
+    """
+
+    def _events(self) -> str:
+        return "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(self.root.rglob("events.jsonl"))
+        )
+
+    def _quarantine(self) -> dict:
+        path = self.root / ".tartci" / "state" / "stale-demand-quarantine.json"
+        if not path.is_file():
+            return {}
+        # The file is versioned under a "runs" key. Reading the top level
+        # instead would make every "not quarantined" assertion below pass
+        # vacuously, which is exactly how a control disarms itself.
+        return json.loads(path.read_text(encoding="utf-8")).get("runs", {})
+
+    def _caches(self) -> list:
+        return sorted((self.root / "state").glob("*.assignment-v2-selection.cache"))
+
+    def test_unobserved_tier_does_not_hide_lower_tier_demand(self) -> None:
+        # Tier 0 cannot be scanned; tier 1 has real work. Aborting the walk on
+        # the first failure reports SCAN BLIND and strands that work, which is
+        # the live starvation this fix exists to end.
+        self.env["ASSIGNMENT_SESSION"] = str(self.root / "session")
+        self._state(pr=True, fail_tier_sessions=[1])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", result.stdout)
+        self.assertIn("pulp-build-pr-head", fields[1].split(","))
+        # CONTROL. The assertion above would also pass if the injected failure
+        # never landed and tier 0 simply had no demand. The event proves tier 0
+        # was genuinely unobservable.
+        self.assertIn("assignment_tier_unobserved", self._events())
+
+    def test_selection_made_without_seeing_every_tier_is_not_cached(self) -> None:
+        # Acting on an incomplete walk once is correct. Remembering it is not:
+        # the cache would hold the fleet on a lower-tier verdict for the whole
+        # TTL on the strength of a scan that never saw the higher tier.
+        self.env["ASSIGNMENT_SESSION"] = str(self.root / "session")
+        self._state(pr=True, fail_tier_sessions=[1])
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        self.assertEqual(self._caches(), [])
+        # CONTROL. A fully observed walk must still cache, or this test would
+        # pass against a build that simply never caches anything.
+        self.env.pop("ASSIGNMENT_SESSION")
+        self._state(pr=True)
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        self.assertNotEqual(self._caches(), [])
+
+    def test_ghost_merge_group_run_is_quarantined_not_counted(self) -> None:
+        self._state(ghost=True, ghost_ref="absent")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().split("\t")[0], "0", result.stdout)
+        entry = self._quarantine().get("102")
+        self.assertIsNotNone(entry, self._quarantine())
+        self.assertEqual(entry["reason"], "queue_branch_absent_and_no_queued_job")
+        self.assertIn("assignment_stale_demand", self._events())
+
+    def test_live_merge_group_run_is_counted_and_never_quarantined(self) -> None:
+        # THE CONTROL for every exclusion above. A classifier that quarantined
+        # everything would satisfy the ghost tests perfectly and silently
+        # strand all real merge-group work.
+        self._state(ghost=True, ghost_job=True, ghost_ref="present")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", result.stdout)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+        self.assertNotIn("102", self._quarantine())
+
+    def test_indeterminate_branch_probe_counts_the_run(self) -> None:
+        # Positive determination only. An API error is not evidence of
+        # staleness, and treating it as evidence would rebuild the demand
+        # suppressor this guard exists to prevent.
+        self._state(ghost=True, ghost_job=True, ghost_ref="error")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().split("\t")[0], "1", result.stdout)
+        self.assertNotIn("102", self._quarantine())
+
+    def test_quarantined_run_is_not_fetched_again(self) -> None:
+        # The ghost's real cost is not a phantom count. It is one extra job
+        # fetch on every pass of every lane, permanently — and that added call
+        # is what pushes an otherwise healthy scan past its API timeout.
+        calls = self.root / "calls"
+        self.env["ASSIGNMENT_CALLS"] = str(calls)
+        self._state(ghost=True, ghost_ref="absent")
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        # CONTROL. The first pass must have fetched it, or the second pass
+        # skipping it proves nothing.
+        self.assertIn("/actions/runs/102/jobs", calls.read_text(encoding="utf-8"))
+        calls.unlink()
+        self._state(ghost=True, ghost_ref="absent")
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        second = calls.read_text(encoding="utf-8")
+        self.assertNotIn("/actions/runs/102/jobs", second)
+        # ...and the pass still happened, rather than being short-circuited
+        # somewhere that would make the absence meaningless.
+        self.assertIn("/actions/workflows", second)
 
 
 if __name__ == "__main__":
