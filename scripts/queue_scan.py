@@ -284,7 +284,11 @@ class QueueScanner:
             page_sweeps_raw = discovery.get("run_page_sweeps")
             page_sweeps = page_sweeps_raw if isinstance(page_sweeps_raw, dict) else {}
             try:
-                for status in ("queued", "in_progress"):
+                # GitHub can report a workflow run as `pending` while its
+                # self-hosted job is already `queued`. Include that parent-run
+                # state or a demand-driven runner can never observe the job it
+                # must register to serve.
+                for status in ("pending", "queued", "in_progress"):
                     sweep = int(page_sweeps.get(status, 0))
                     completed_sweep = False
                     pages = [1]
@@ -585,9 +589,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-run-pages", type=int, default=int(os.environ.get("TARTCI_QUEUE_RUN_PAGES", "2")))
     parser.add_argument("--max-job-fetches", type=int, default=int(os.environ.get("TARTCI_QUEUE_JOB_FETCHES", "5")))
     parser.add_argument("--newest-quota", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEWEST_QUOTA", "2")))
-    parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "12")))
+    parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "14")))
     parser.add_argument("--workflow-cache-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_WORKFLOW_CACHE_TTL_SECS", "86400")))
-    parser.add_argument("--discovery-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_DISCOVERY_TTL_SECS", "120")))
+    parser.add_argument("--discovery-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_DISCOVERY_TTL_SECS", "160")))
     parser.add_argument(
         "--force-refresh",
         action="store_true",
@@ -640,9 +644,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--job-statuses must contain queued and/or in_progress")
     if args.newest_quota >= args.max_job_fetches:
         parser.error("--newest-quota must be less than --max-job-fetches")
-    # One workflow lookup, two status page windows, job fetches, plus one
-    # bounded stale-workflow-ID 404 recovery call.
-    maximum_calls = 2 + (2 * args.max_run_pages) + args.max_job_fetches
+    # One workflow lookup, three status page windows, and job fetches. Reserve
+    # two more calls for the bounded stale-workflow-ID recovery: the failed
+    # status request plus the replacement workflow lookup.
+    maximum_calls = 3 + (3 * args.max_run_pages) + args.max_job_fetches
     if maximum_calls > args.max_api_calls:
         parser.error(
             "--max-api-calls must cover workflow lookup, run pages, and job fetches "

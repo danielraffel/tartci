@@ -54,7 +54,7 @@ if path.endswith("/actions/workflows?per_page=100"):
     print(json.dumps({"workflows": [{"id": 99, "name": "Build and Test"}]}))
 elif "/actions/workflows/99/runs?status=queued" in path:
     print(open(os.environ["RUNS_PAYLOAD"], encoding="utf-8").read())
-elif "/actions/workflows/99/runs?status=in_progress" in path:
+elif "/actions/workflows/99/runs?status=pending" in path or "/actions/workflows/99/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif f"/actions/runs/{eligible_id}/jobs" in path:
     print(json.dumps({"jobs": [{

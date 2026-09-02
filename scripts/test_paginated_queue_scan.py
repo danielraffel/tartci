@@ -69,9 +69,9 @@ class PaginatedQueueScanTests(unittest.TestCase):
             "max_run_pages": 2,
             "max_job_fetches": 5,
             "newest_quota": 2,
-            "max_api_calls": 12,
+            "max_api_calls": 14,
             "workflow_cache_ttl": 86400,
-            "discovery_ttl": 120,
+            "discovery_ttl": 160,
             "force_refresh": False,
             "expected_fleet_hosts": 3,
             "expected_discovery_namespaces": 4,
@@ -95,7 +95,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
                 return {"workflow_runs": runs}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": []}
             if f"/actions/runs/{eligible_id}/jobs?" in path:
                 return {
@@ -130,6 +130,56 @@ class PaginatedQueueScanTests(unittest.TestCase):
                     self._base_api(runs, eligible["id"]),
                 )
                 self.assertEqual(scanner.scan(), 1)
+
+    def test_pending_parent_exposes_queued_exact_head_job_once(self) -> None:
+        origin = datetime(2026, 9, 2, tzinfo=timezone.utc)
+        pending = {
+            **_run(33610980203, origin),
+            "status": "pending",
+            "head_sha": "fa78155208823daf1c1de04d5e84e28709b744fe",
+        }
+        job_fetches = 0
+
+        def api(path: str) -> dict[str, Any]:
+            nonlocal job_fetches
+            if path.endswith("/actions/workflows?per_page=100"):
+                return {"workflows": [{"id": 99, "name": "Build and Test"}]}
+            if "status=pending" in path or "status=queued" in path:
+                # A repeated run ID across status snapshots must remain one
+                # exact-head candidate rather than double-counting its job.
+                return {"workflow_runs": [pending]}
+            if "status=in_progress" in path:
+                return {"workflow_runs": []}
+            if "/actions/runs/33610980203/jobs?" in path:
+                job_fetches += 1
+                return {
+                    "jobs": [{
+                        "id": 100185793286,
+                        "status": "queued",
+                        "head_sha": pending["head_sha"],
+                        "labels": [
+                            "self-hosted",
+                            "macOS",
+                            "ARM64",
+                            "pulp-build-vm",
+                        ],
+                    }]
+                }
+            raise AssertionError(f"unexpected API path: {path}")
+
+        with tempfile.TemporaryDirectory() as directory:
+            scanner = self._scanner(
+                "tart-macos",
+                Path(directory) / "state.json",
+                api,
+            )
+            discovered = scanner._discover()
+            self.assertEqual(len(discovered), 1)
+            self.assertEqual(discovered[0]["id"], 33610980203)
+            self.assertEqual(discovered[0]["head_sha"], pending["head_sha"])
+            self.assertEqual(scanner.scan(), 1)
+
+        self.assertEqual(job_fetches, 1)
 
     def test_minimum_queue_age_delays_then_admits_the_same_job(self) -> None:
         created = datetime.now(timezone.utc) - timedelta(seconds=30)
@@ -192,7 +242,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
             if "status=queued" in path:
                 page = int(path.rsplit("&page=", 1)[1])
                 return {"workflow_runs": [eligible] if page == 7 else pages.get(page, [])}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": []}
             if f"/actions/runs/{eligible['id']}/jobs?filter=latest&per_page=100" in path:
                 return {
@@ -241,7 +291,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
         def api(path: str) -> dict[str, Any]:
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": []}
             if "status=queued" in path:
                 page = int(path.rsplit("&page=", 1)[1])
@@ -308,7 +358,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
         def api(path: str) -> dict[str, Any]:
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": []}
             if "status=queued" in path:
                 page = int(path.rsplit("&page=", 1)[1])
@@ -399,7 +449,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
             calls.append(path)
             if "/actions/runs?status=queued" in path:
                 return {"workflow_runs": runs}
-            if "/actions/runs?status=in_progress" in path:
+            if "/actions/runs?status=pending" in path or "/actions/runs?status=in_progress" in path:
                 return {"workflow_runs": []}
             if "/jobs?" in path:
                 run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -510,7 +560,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
                 return {"workflow_runs": []}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": [run]}
             if "/jobs?" in path:
                 return {
@@ -570,7 +620,7 @@ class PaginatedQueueScanTests(unittest.TestCase):
 
         self.assertEqual(results, [1] * 9)
         self.assertLessEqual(len(calls), 11)
-        fleet_hourly_upper_bound = ceil(3600 / 120) * 11 * 3
+        fleet_hourly_upper_bound = ceil(3600 / 160) * 14 * 3
         ghapp_installation_core_limit = 12_500
         reserved_for_other_traffic = 8_500
         discovery_budget = (
@@ -580,12 +630,12 @@ class PaginatedQueueScanTests(unittest.TestCase):
         # plus Forge Build. Not every host currently serves every namespace, but
         # the enforced default budgets all four on all three hosts.
         fleet_hourly_upper_bound *= 4
-        self.assertEqual(fleet_hourly_upper_bound, 3960)
+        self.assertEqual(fleet_hourly_upper_bound, 3864)
         self.assertEqual(discovery_budget, 4000)
         self.assertLessEqual(fleet_hourly_upper_bound, discovery_budget)
         self.assertEqual(
             ghapp_installation_core_limit - fleet_hourly_upper_bound,
-            8_540,
+            8_636,
         )
 
     def test_cross_process_cache_lock_recovers_and_only_publishes_atomic_json(
@@ -607,7 +657,7 @@ if path.endswith("/actions/workflows?per_page=100"):
     payload = {"workflows": [{"id": 99, "name": "Build and Test"}]}
 elif "status=queued" in path:
     payload = {"workflow_runs": [{"id": 999, "name": "Build and Test", "status": "queued", "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"}]}
-elif "status=in_progress" in path:
+elif "status=pending" in path or "status=in_progress" in path:
     payload = {"workflow_runs": []}
 elif "/jobs?" in path:
     payload = {"jobs": [{"status": "queued", "labels": ["self-hosted", "macOS", "ARM64", "pulp-build-vm"]}]}
@@ -773,7 +823,7 @@ try:
     path = sys.argv[-1]
     if path.endswith('/actions/workflows?per_page=100'):
         payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
-    elif 'status=queued' in path or 'status=in_progress' in path:
+    elif 'status=pending' in path or 'status=queued' in path or 'status=in_progress' in path:
         payload = {'workflow_runs': []}
     else:
         raise SystemExit(2)
@@ -834,7 +884,7 @@ else:
 path = sys.argv[-1]
 if path.endswith('/actions/workflows?per_page=100'):
     payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
-elif 'status=queued' in path or 'status=in_progress' in path:
+elif 'status=pending' in path or 'status=queued' in path or 'status=in_progress' in path:
     payload = {'workflow_runs': []}
 else:
     raise SystemExit(2)
@@ -942,7 +992,7 @@ print(json.dumps(payload))
                 api,
             )
             self.assertEqual(scanner.scan(), 0)
-        self.assertLessEqual(len(calls), 12)
+        self.assertLessEqual(len(calls), 14)
 
     def test_newest_quota_must_leave_backlog_fetch_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -964,7 +1014,7 @@ print(json.dumps(payload))
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
                 return {"workflow_runs": runs}
-            if "status=in_progress" in path:
+            if "status=pending" in path or "status=in_progress" in path:
                 return {"workflow_runs": []}
             if "/jobs?" in path:
                 raise subprocess.CalledProcessError(1, ["gh", "api", path])

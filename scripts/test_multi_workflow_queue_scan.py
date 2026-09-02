@@ -89,7 +89,7 @@ if "/actions/runs?status=queued" in path:
          "updated_at": f"2026-01-01T00:0{index}:00Z"}
         for index, name in enumerate(names)
     ]}))
-elif "/actions/runs?status=in_progress" in path:
+elif "/actions/runs?status=pending" in path or "/actions/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif "/jobs?" in path:
     run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -226,7 +226,7 @@ elif "/actions/workflows/99/runs?status=queued" in path:
         "created_at": "2026-01-01T00:00:00Z",
         "updated_at": "2026-01-01T00:00:00Z"
     }]}))
-elif "/actions/workflows/99/runs?status=in_progress" in path:
+elif "/actions/workflows/99/runs?status=pending" in path or "/actions/workflows/99/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif "/actions/runs/1/jobs?" in path:
     print(json.dumps({"jobs": [{
@@ -284,7 +284,7 @@ runs = [
 ]
 if "/actions/runs?status=queued" in path:
     print(json.dumps({"workflow_runs": runs}))
-elif "/actions/runs?status=in_progress" in path:
+elif "/actions/runs?status=pending" in path or "/actions/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif "/jobs?" in path:
     run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
@@ -373,7 +373,7 @@ elif "/actions/workflows/99/runs?status=queued" in path:
         "id": 1, "name": "Release-path PR gate", "status": "queued",
         "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"
     }]}))
-elif "/actions/workflows/99/runs?status=in_progress" in path:
+elif "/actions/workflows/99/runs?status=pending" in path or "/actions/workflows/99/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif "/actions/runs?status=queued" in path:
     runs = [{
@@ -386,7 +386,7 @@ elif "/actions/runs?status=queued" in path:
             "created_at": "2026-01-01T00:05:00Z", "updated_at": "2026-01-01T00:05:00Z"
         })
     print(json.dumps({"workflow_runs": runs}))
-elif "/actions/runs?status=in_progress" in path:
+elif "/actions/runs?status=pending" in path or "/actions/runs?status=in_progress" in path:
     print(json.dumps({"workflow_runs": []}))
 elif "/jobs?" in path:
     run_id = int(path.split("/actions/runs/", 1)[1].split("/", 1)[0])
