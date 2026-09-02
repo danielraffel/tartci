@@ -213,7 +213,15 @@ ownership receipt only after convergence.
 `tartci pool on` runs that reconciliation before reopening admission. The
 launchd watchdog does the same on every heal pass, covering reboot and offline
 rejoin. If the relay or authenticated probe is unhealthy, both paths fail
-closed instead of loading a scan-blind controller. Do not put relay hostnames,
+closed instead of loading a scan-blind controller. Pool admission preserves the
+network-profile tool's exact refusal cause; it does not replace an unavailable
+Tart inventory with the false claim that a VM is running. Tart inventory is
+tri-state (`running`, `idle`, or `unavailable`) and resolves
+`TARTCI_TART_CLI`, PATH, then the canonical Homebrew locations. It preserves an
+explicit `TART_HOME` or derives `[host].tart_home` from the installed fleet
+profile; it never treats Tart's unrelated default store as authoritative. The
+watchdog still refuses alive-but-frozen recovery when inventory is unavailable,
+so this diagnostic distinction does not weaken the long-build guard. Do not put relay hostnames,
 GitHub tokens, or proxy variables in shell startup files; the profile records
 only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
 While pool participation is off, reconciliation loads and proves only the

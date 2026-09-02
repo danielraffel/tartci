@@ -16,6 +16,7 @@ import plistlib
 import sys
 import tempfile
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
@@ -141,6 +142,16 @@ check(v == "wedged", f"alive + stale log + no VM must be wedged, got {v}")
 v, _ = wd.classify("running", None, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=True)
 check(v == "healthy", f"alive + stale log but VM building must be healthy, got {v}")
 
+# Inventory failure is neither idle nor busy. It suppresses unsafe healing while
+# retaining the cause for callers that must explain why admission was refused.
+v, reason = wd.classify(
+    "running", None, log_age_s=STALE + 1, stale_log_s=STALE,
+    vm_running=None, vm_probe_reason="Tart executable unavailable",
+)
+check(v == "unknown", f"unavailable VM inventory must be unknown, got {v}")
+check("Tart executable unavailable" in reason,
+      f"unavailable inventory cause must survive classification: {reason}")
+
 # Alive + FRESH log + no VM → healthy (a healthy idle loop writes every poll).
 v, _ = wd.classify("running", None, log_age_s=5.0, stale_log_s=STALE, vm_running=False)
 check(v == "healthy", f"alive + fresh log must be healthy, got {v}")
@@ -157,6 +168,98 @@ check(v == "healthy", f"unloaded agent (state None) must be healthy, not resurre
 # Same for a stopped agent that last exited 0 while unloaded.
 v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
 check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
+
+
+# ── Tart executable + inventory probe ───────────────────────────────────────
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nprintf '[]\\n'\n")
+    fake_tart.chmod(0o755)
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_TART_CLI": str(fake_tart),
+            "TART_HOME": str(tart_home),
+        },
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is False, f"explicit Tart under minimal PATH must prove idle: {probe}")
+    check(probe.executable == str(fake_tart),
+          f"probe must report the explicit executable it ran: {probe}")
+    check(probe.tart_home == str(tart_home),
+          f"probe must report the exact Tart store it inspected: {probe}")
+
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "custom-store"
+    tart_home.mkdir()
+    observed_home = Path(td) / "observed-home"
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text(
+        f"#!/bin/sh\nprintf '%s' \"$TART_HOME\" > '{observed_home}'\nprintf '[null]\\n'\n"
+    )
+    fake_tart.chmod(0o755)
+    profile = Path(td) / "macos-fleet-profile.toml"
+    profile.write_text(f'[host]\ntart_home = "{tart_home}"\n')
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_TART_CLI": str(fake_tart),
+            "TART_HOME": "",
+            "TARTCI_MACOS_FLEET_PROFILE": str(profile),
+        },
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(observed_home.read_text() == str(tart_home),
+          "inventory command must receive the installed profile's custom Tart store")
+    check(probe.running is None,
+          f"malformed inventory entries must be unavailable, not idle: {probe}")
+    check("non-object entry" in probe.reason,
+          f"malformed inventory cause must survive the probe: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nexit 99\n")
+    fake_tart.chmod(0o755)
+    profile = Path(td) / "macos-fleet-profile.toml"
+    profile.write_text('host = "malformed"\n')
+    with mock.patch.dict(
+        os.environ,
+        {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_TART_CLI": str(fake_tart),
+            "TART_HOME": "",
+            "TARTCI_MACOS_FLEET_PROFILE": str(profile),
+        },
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None,
+          f"malformed profile shape must be unavailable, not crash or idle: {probe}")
+    check("Tart store unavailable" in probe.reason,
+          f"malformed profile must preserve a typed store cause: {probe.reason}")
+
+with (
+    mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
+    mock.patch.object(wd.shutil, "which", return_value=None),
+    mock.patch.object(wd.os.path, "isfile", return_value=False),
+):
+    probe = wd.probe_tart_vm_running()
+check(probe.running is None, f"missing Tart must be unavailable, not busy: {probe}")
+check("set TARTCI_TART_CLI" in probe.reason,
+      f"unavailable Tart probe must explain the explicit override: {probe.reason}")
+
+with (
+    mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
+    mock.patch.object(wd.shutil, "which", return_value=None),
+    mock.patch.object(wd.os.path, "isfile", side_effect=lambda p: p == "/opt/homebrew/bin/tart"),
+    mock.patch.object(wd.os, "access", side_effect=lambda p, _: p == "/opt/homebrew/bin/tart"),
+):
+    resolved, reason = wd.resolve_tart_cli()
+check(resolved == "/opt/homebrew/bin/tart",
+      f"minimal PATH must fall back to canonical Apple Silicon Tart: {resolved}, {reason}")
 
 
 # ── persistent Actions runner installation drift ──────────────────────────

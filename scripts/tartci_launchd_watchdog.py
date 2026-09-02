@@ -56,10 +56,16 @@ import glob
 import json
 import os
 import plistlib
+import shutil
 import subprocess
 import sys
 import time
 from typing import Any, NamedTuple
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - exercised only by macOS system Python < 3.11
+    tomllib = None  # type: ignore[assignment]
 
 # A LaunchAgent is considered tartci-owned if its Label starts with any of these.
 TARTCI_LABEL_PREFIXES = (
@@ -103,6 +109,13 @@ class AgentHealth(NamedTuple):
     reason: str
 
 
+class TartVMProbe(NamedTuple):
+    running: bool | None       # None means inventory unavailable, not busy or idle
+    reason: str
+    executable: str | None
+    tart_home: str | None
+
+
 def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
     """Extract (state, last_exit_code) from `launchctl print` output.
 
@@ -142,9 +155,10 @@ def classify(
     last_exit_code: int | None,
     log_age_s: float | None,
     stale_log_s: int,
-    vm_running: bool = True,
+    vm_running: bool | None = True,
     expected_loaded: bool = False,
     restart_grace_s: int = DEFAULT_RESTART_GRACE_S,
+    vm_probe_reason: str = "Tart VM inventory unavailable",
 ) -> tuple[str, str]:
     """Decide healthy / wedged / unknown from parsed signals. Pure.
 
@@ -182,11 +196,16 @@ def classify(
         # loaded — deliberately stopped (pool-off) or a staged-but-unloaded plist — and must never be
         # resurrected; `launchctl print` returns rc!=0 for those, which gather_health maps to
         # state=None. So `state == "running"` is the load-bearing guard against reviving a stopped host.
-        if (state == "running" and not vm_running
-                and log_age_s is not None and log_age_s > stale_log_s):
-            return ("wedged",
-                    f"alive but frozen: log stale {int(log_age_s)}s (> {stale_log_s}s) "
-                    "and no VM building")
+        if (state == "running" and log_age_s is not None and log_age_s > stale_log_s):
+            if vm_running is None:
+                return (
+                    "unknown",
+                    f"{vm_probe_reason}; refusing alive-but-frozen recovery",
+                )
+            if not vm_running:
+                return ("wedged",
+                        f"alive but frozen: log stale {int(log_age_s)}s (> {stale_log_s}s) "
+                        "and no VM building")
         if last_exit_code is None:
             return "healthy", "no non-zero exit recorded"
         return "healthy", "clean last exit"
@@ -277,26 +296,151 @@ def _program_path_from_plist(plist_path: str) -> str | None:
     return None
 
 
-def any_tart_vm_running() -> bool:
-    """True if any Tart VM is running on this host — a conservative guard for the alive-but-frozen
-    signature so the watchdog never heals a supervisor that is quietly blocked on a legitimate long
-    build. FAILS SAFE: on any error reading `tart list`, returns True (assume a build is running →
-    do not heal on staleness). Host-wide (not per-lane) on purpose: simpler and strictly safer."""
+def resolve_tart_cli() -> tuple[str | None, str]:
+    """Resolve Tart without assuming an interactive shell has Homebrew on PATH."""
+    configured = os.environ.get("TARTCI_TART_CLI", "").strip()
+    if configured:
+        resolved = configured if os.path.isabs(configured) else shutil.which(configured)
+        if resolved and os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+            return resolved, f"resolved from TARTCI_TART_CLI={configured}"
+        return None, f"TARTCI_TART_CLI is not an executable: {configured}"
+
+    resolved = shutil.which("tart")
+    if resolved and os.path.isfile(resolved) and os.access(resolved, os.X_OK):
+        return resolved, f"resolved from PATH: {resolved}"
+    for candidate in ("/opt/homebrew/bin/tart", "/usr/local/bin/tart"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate, f"resolved from canonical install path: {candidate}"
+    return None, (
+        "Tart executable unavailable from PATH or canonical install paths; "
+        "set TARTCI_TART_CLI to its absolute path"
+    )
+
+
+def _profile_tart_home(profile_path: str) -> str | None:
+    """Read the installed fleet profile without requiring interactive shell state."""
+    # Do not implement a partial TOML parser on Apple's older system Python. A
+    # launchd service already carries explicit TART_HOME; an interactive caller
+    # without tomllib must supply it too. Partial parsing could accept a torn or
+    # otherwise malformed profile and turn corruption into a false idle result.
+    if tomllib is None:
+        return None
     try:
-        rc, out, _ = _run(["tart", "list", "--format", "json"])
+        with open(profile_path, "rb") as fh:
+            parsed = tomllib.load(fh)
+            host = parsed.get("host")
+            if not isinstance(host, dict):
+                return None
+            value = host.get("tart_home")
+            return value.strip() if isinstance(value, str) and value.strip() else None
+    except (OSError, ValueError):
+        return None
+
+
+def resolve_tart_home() -> tuple[str | None, str]:
+    """Resolve the declared Tart store; never silently inspect Tart's default store."""
+    configured = os.environ.get("TART_HOME", "").strip()
+    if configured:
+        expanded = os.path.abspath(os.path.expanduser(configured))
+        if os.path.isabs(configured) and os.path.isdir(expanded):
+            return expanded, f"resolved from TART_HOME={configured}"
+        return None, f"TART_HOME is not an existing absolute directory: {configured}"
+
+    profile_path = os.environ.get(
+        "TARTCI_MACOS_FLEET_PROFILE",
+        os.path.expanduser("~/.config/tartci/macos-fleet-profile.toml"),
+    )
+    profile_home = _profile_tart_home(profile_path)
+    if profile_home:
+        expanded = os.path.abspath(os.path.expanduser(profile_home))
+        if os.path.isabs(profile_home) and os.path.isdir(expanded):
+            return expanded, f"resolved from installed fleet profile: {profile_path}"
+        return None, (
+            f"installed fleet profile declares unavailable Tart store: {profile_home} "
+            f"({profile_path})"
+        )
+    return None, (
+        "Tart store unavailable: set TART_HOME or install a fleet profile with "
+        "[host].tart_home"
+    )
+
+
+def _run_tart_inventory(tart_cli: str, tart_home: str) -> tuple[int, str, str]:
+    env = dict(os.environ)
+    env["TART_HOME"] = tart_home
+    process = subprocess.run(
+        [tart_cli, "list", "--format", "json"],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    return process.returncode, process.stdout, process.stderr
+
+
+def probe_tart_vm_running() -> TartVMProbe:
+    """Return running/idle/unavailable without conflating probe failure with load."""
+    tart_cli, resolution = resolve_tart_cli()
+    if tart_cli is None:
+        return TartVMProbe(None, resolution, None, None)
+    tart_home, home_resolution = resolve_tart_home()
+    if tart_home is None:
+        return TartVMProbe(None, home_resolution, tart_cli, None)
+    try:
+        rc, out, err = _run_tart_inventory(tart_cli, tart_home)
         if rc != 0:
-            return True
-        return any(str(vm.get("State", vm.get("state", ""))).lower().startswith("run")
-                   for vm in (json.loads(out) or []))
-    except Exception:
-        return True
+            detail = err.strip() or f"exit {rc}"
+            return TartVMProbe(
+                None,
+                f"Tart VM inventory failed via {tart_cli} in {tart_home}: {detail}",
+                tart_cli,
+                tart_home,
+            )
+        inventory = json.loads(out)
+        if not isinstance(inventory, list):
+            return TartVMProbe(
+                None,
+                f"Tart VM inventory was not a JSON list via {tart_cli} in {tart_home}",
+                tart_cli,
+                tart_home,
+            )
+        if not all(isinstance(vm, dict) for vm in inventory):
+            return TartVMProbe(
+                None,
+                f"Tart VM inventory contained a non-object entry via {tart_cli} in {tart_home}",
+                tart_cli,
+                tart_home,
+            )
+        running = any(
+            str(vm.get("State", vm.get("state", ""))).lower().startswith("run")
+            for vm in inventory
+        )
+        return TartVMProbe(
+            running,
+            f"Tart VM inventory {'has a running VM' if running else 'is idle'}; "
+            f"{resolution}; {home_resolution}",
+            tart_cli,
+            tart_home,
+        )
+    except (OSError, json.JSONDecodeError) as exc:
+        return TartVMProbe(
+            None,
+            f"Tart VM inventory unavailable via {tart_cli} in {tart_home}: {exc}",
+            tart_cli,
+            tart_home,
+        )
+
+
+def any_tart_vm_running() -> bool | None:
+    """Compatibility projection: True=busy, False=idle, None=probe unavailable."""
+    return probe_tart_vm_running().running
 
 
 def gather_health(label: str, plist_path: str, stale_log_s: int,
-                  vm_running: bool = True,
+                  vm_running: bool | None = True,
                   pool_participating: bool = False,
                   restart_grace_s: int = DEFAULT_RESTART_GRACE_S,
-                  service_enabled: bool | None = True) -> AgentHealth:
+                  service_enabled: bool | None = True,
+                  vm_probe_reason: str = "Tart VM inventory unavailable") -> AgentHealth:
     rc, out, _ = _run(["launchctl", "print", f"{_domain()}/{label}"])
     state, last_exit = parse_launchctl_print(out) if rc == 0 else (None, None)
     log_path = _log_path_from_plist(plist_path)
@@ -339,7 +483,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     expected_loaded = pool_participating and pool_runner
     verdict, reason = classify(
         state, last_exit, log_age, stale_log_s, vm_running, expected_loaded,
-        restart_grace_s
+        restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
@@ -498,13 +642,14 @@ def main(argv: list[str] | None = None) -> int:
     agents = discover_agents(args.launch_agents_dir)
     # Compute the VM-running guard ONCE per pass (host-wide) — the alive-but-frozen signature only
     # fires when nothing is building, so a legit long build is never healed.
-    vm_running = any_tart_vm_running()
+    vm_probe = probe_tart_vm_running()
     participating = pool_participating(args.participation_file)
     disabled = disabled_services()
     health = [
-        gather_health(lbl, p, args.stale_log_seconds, vm_running, participating,
+        gather_health(lbl, p, args.stale_log_seconds, vm_probe.running, participating,
                       args.restart_grace_seconds,
-                      None if disabled is None else lbl not in disabled)
+                      None if disabled is None else lbl not in disabled,
+                      vm_probe.reason)
         for lbl, p in agents
     ]
 
@@ -545,7 +690,19 @@ def main(argv: list[str] | None = None) -> int:
 
     unhealthy = [r for r in results if r["verdict"] in {"wedged", "broken"}]
     if args.json:
-        print(json.dumps({"ts": _iso(now), "agents": results}, indent=2))
+        print(json.dumps({
+            "ts": _iso(now),
+            "tart_vm_probe": {
+                "state": (
+                    "unavailable" if vm_probe.running is None
+                    else "running" if vm_probe.running else "idle"
+                ),
+                "reason": vm_probe.reason,
+                "executable": vm_probe.executable,
+                "tart_home": vm_probe.tart_home,
+            },
+            "agents": results,
+        }, indent=2))
     else:
         if not results:
             print("launchd-watchdog: no managed runner LaunchAgents found")

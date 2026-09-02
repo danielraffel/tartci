@@ -433,6 +433,18 @@ class PoolCommandHelpTests(unittest.TestCase):
                 self.assertFalse(launchctl_log.exists(), f"launchctl called for {subcommand}")
                 self.assertFalse(nohup_log.exists(), f"watcher launched for {subcommand}")
 
+    def test_pool_on_preserves_network_profile_failure_cause(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            profile = root / "home" / ".config" / "tartci" / "network-profile.toml"
+            profile.parent.mkdir(parents=True)
+            profile.write_text("schema_version = 2\n", encoding="utf-8")
+            proc, launchctl_log, _ = self._run_pool(root, "on")
+            self.assertEqual(proc.returncode, 6, proc.stderr)
+            self.assertIn("network profile requires schema_version = 1", proc.stderr)
+            self.assertNotIn("opt-in network profile did not converge", proc.stderr)
+            self.assertFalse(launchctl_log.exists(), "failed admission must not load a controller")
+
 
 class PersistentRunnerDrainTests(unittest.TestCase):
     def _fake_path(self, td: str) -> tuple[Path, Path]:

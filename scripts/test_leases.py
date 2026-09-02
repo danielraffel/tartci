@@ -574,9 +574,15 @@ class LeaseDiskAxisTests(LeaseCliTestCase):
 
             supervisor.terminate()
             supervisor.wait(timeout=5)
+            refreshed = json.loads(
+                self.run_cli("heartbeat", "--id", "kept-failed-vm").stdout
+            )
+            self.assertTrue(refreshed["ok"])
+            self.assertEqual(refreshed["capacity"]["used_cores"], 1)
             held = json.loads(self.run_cli("status").stdout)
             self.assertEqual([row["id"] for row in held["leases"]], ["kept-failed-vm"])
             self.assertEqual(held["leases"][0]["guardian_pid"], guardian.pid)
+            self.assertEqual(held["disk_volumes"][0]["reservation_count"], 1)
 
             guardian.terminate()
             guardian.communicate(timeout=5)

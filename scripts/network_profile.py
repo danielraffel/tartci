@@ -49,6 +49,7 @@ PROXY_ENV = {
     "no_proxy": "127.0.0.1,localhost,::1",
     "TARTCI_GUEST_HTTP_PROXY": GUEST_PROXY,
 }
+_LAST_TART_VM_PROBE_REASON = "Tart VM inventory unavailable"
 
 
 @dataclass(frozen=True)
@@ -391,11 +392,20 @@ def _unload(label: str, dry_run: bool = False) -> bool:
     return watchdog.wait_until_unloaded(label, timeout_s=timeout + 5.0)
 
 
-def _any_tart_vm_running() -> bool:
+def _any_tart_vm_running() -> bool | None:
+    """Compatibility seam retained for existing callers and focused tests."""
+    global _LAST_TART_VM_PROBE_REASON
     sys.path.insert(0, str(ROOT / "scripts"))
     import tartci_launchd_watchdog as watchdog  # pylint: disable=import-outside-toplevel
 
-    return watchdog.any_tart_vm_running()
+    probe = watchdog.probe_tart_vm_running()
+    _LAST_TART_VM_PROBE_REASON = probe.reason
+    return probe.running
+
+
+def _tart_vm_probe_reason() -> str:
+    """Return the typed inventory cause when the compatibility seam is unavailable."""
+    return _LAST_TART_VM_PROBE_REASON
 
 
 def authenticated_probe(profile: RelayProfile) -> tuple[bool, str]:
@@ -506,7 +516,11 @@ def _rollback_unlocked(profile_path: Path, agents_dir: Path, participation_path:
     if pool_participating(participation_path):
         result.update(ok=False, reason="rollback requires tartci pool off")
         return result
-    if _any_tart_vm_running():
+    vm_running = _any_tart_vm_running()
+    if vm_running is None:
+        result.update(ok=False, reason=f"rollback Tart VM probe unavailable: {_tart_vm_probe_reason()}")
+        return result
+    if vm_running:
         result.update(ok=False, reason="rollback refused while a Tart VM is running")
         return result
     receipt = _load_receipt(receipt_path)
@@ -639,9 +653,17 @@ def _reconcile_unlocked(profile_path: Path, agents_dir: Path, *, dry_run: bool =
                 "action": "write-and-stage" if stage_only else "write-and-full-reload",
             })
 
-    if plans and not dry_run and _any_tart_vm_running():
-        result.update(ok=False, reason="network-profile reload deferred while a Tart VM is running")
-        return result
+    if plans and not dry_run:
+        vm_running = _any_tart_vm_running()
+        if vm_running is None:
+            result.update(
+                ok=False,
+                reason=f"Tart VM probe unavailable before network-profile reload: {_tart_vm_probe_reason()}",
+            )
+            return result
+        if vm_running:
+            result.update(ok=False, reason="network-profile reload deferred while a Tart VM is running")
+            return result
 
     unexpectedly_loaded = [
         label for label, _, _, _, _, stage_only, loaded_path in plans

@@ -54,7 +54,17 @@ class NetworkProfileTests(unittest.TestCase):
         self.addCleanup(self._pool_lock_dir.cleanup)
         self._pool_lock_env = mock.patch.dict(
             os.environ,
-            {"TARTCI_POOL_TRANSITION_LOCK": str(Path(self._pool_lock_dir.name) / "pool-transition.lock")},
+            {
+                "TARTCI_POOL_TRANSITION_LOCK": str(
+                    Path(self._pool_lock_dir.name) / "pool-transition.lock"
+                ),
+                # Tests that do not pass an explicit participation path model a
+                # legacy/default-on host, never the developer machine's live
+                # pool state.
+                "TARTCI_POOL_PARTICIPATION_FILE": str(
+                    Path(self._pool_lock_dir.name) / "absent-participation"
+                ),
+            },
         )
         self._pool_lock_env.start()
         self.addCleanup(self._pool_lock_env.stop)
@@ -181,6 +191,31 @@ class NetworkProfileTests(unittest.TestCase):
             self.assertIn("deferred", result["reason"])
             self.assertEqual(mac.read_bytes(), before)
 
+    def test_unavailable_inventory_is_not_reported_as_a_running_vm(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            profile = root / "profile.toml"
+            write_profile(profile)
+            controller = agents / "mac.plist"
+            write_controller(controller, "com.danielraffel.pulp.tart-runner-macos-gate")
+            with (
+                mock.patch.object(network, "_loaded_path", return_value=None),
+                mock.patch.object(network, "_any_tart_vm_running", return_value=None),
+                mock.patch.object(
+                    network,
+                    "_tart_vm_probe_reason",
+                    return_value="Tart executable unavailable; set TARTCI_TART_CLI",
+                ),
+                mock.patch.object(network.Path, "home", return_value=Path("/Users/tester")),
+            ):
+                result = network.reconcile(profile, agents)
+            self.assertFalse(result["ok"])
+            self.assertIn("Tart VM probe unavailable", result["reason"])
+            self.assertIn("TARTCI_TART_CLI", result["reason"])
+            self.assertNotIn("while a Tart VM is running", result["reason"])
+
     def test_removed_applied_profile_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -263,6 +298,62 @@ class NetworkProfileTests(unittest.TestCase):
             receipt = network._load_receipt(network.applied_receipt_path(profile))
             self.assertEqual(receipt["agents"][label]["state"], "staged")
             self.assertEqual(network._read_plist(controller)["EnvironmentVariables"]["HTTP_PROXY"], network.HOST_PROXY)
+
+    def test_closed_pool_stages_then_on_promotes_exact_loaded_controller(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            profile = root / "network-profile.toml"
+            participation = root / "participation"
+            participation.write_text("0\n")
+            write_profile(profile)
+            controller = agents / "mac.plist"
+            label = "com.danielraffel.pulp.tart-runner-macos-gate"
+            write_controller(controller, label)
+            relay = agents / f"{network.RELAY_LABEL}.plist"
+            reloads: list[str] = []
+            with (
+                mock.patch.object(network, "_loaded_path", return_value=None),
+                mock.patch.object(
+                    network,
+                    "_reload",
+                    side_effect=lambda item, path, dry: reloads.append(item) or True,
+                ),
+                mock.patch.object(network, "_any_tart_vm_running", return_value=False),
+                mock.patch.object(network, "authenticated_probe", return_value=(True, "authenticated")),
+                mock.patch.object(network.Path, "home", return_value=Path("/Users/tester")),
+            ):
+                staged = network.reconcile(profile, agents, participation_path=participation)
+            self.assertTrue(staged["ok"], staged)
+            receipt_path = network.applied_receipt_path(profile)
+            self.assertEqual(network._load_receipt(receipt_path)["agents"][label]["state"], "staged")
+            self.assertEqual(reloads, [network.RELAY_LABEL])
+
+            # Drain/off share the closed participation boundary. Pool-on loads
+            # the exact staged controller; reconcile must promote that receipt
+            # without bootout/bootstrap churn before admission opens.
+            participation.write_text("1\n")
+            reloads.clear()
+            with (
+                mock.patch.object(
+                    network,
+                    "_loaded_path",
+                    side_effect=lambda item: relay if item == network.RELAY_LABEL else controller,
+                ),
+                mock.patch.object(
+                    network,
+                    "_reload",
+                    side_effect=lambda item, path, dry: reloads.append(item) or True,
+                ),
+                mock.patch.object(network, "_any_tart_vm_running", return_value=False),
+                mock.patch.object(network, "authenticated_probe", return_value=(True, "authenticated")),
+                mock.patch.object(network.Path, "home", return_value=Path("/Users/tester")),
+            ):
+                promoted = network.reconcile(profile, agents, participation_path=participation)
+            self.assertTrue(promoted["ok"], promoted)
+            self.assertEqual(network._load_receipt(receipt_path)["agents"][label]["state"], "loaded")
+            self.assertEqual(reloads, [])
 
     def test_emergency_pool_off_during_reconcile_never_reloads_controller(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -540,7 +631,7 @@ github_cli = "ghapp"
 
     def test_pool_on_converges_before_opening_participation(self) -> None:
         body = (ROOT / "tartci").read_text(encoding="utf-8")
-        reconcile = body.index('network_profile.py" reconcile --quiet --pool-lock-held')
+        reconcile = body.index('network_profile.py" reconcile --pool-lock-held')
         state_on = body.index("tartci_pool_write_state on", reconcile)
         participation_on = body.index("tartci_pool_write_participation 1", state_on)
         self.assertLess(reconcile, state_on)
