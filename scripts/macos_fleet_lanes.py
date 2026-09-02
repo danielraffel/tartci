@@ -1443,8 +1443,14 @@ def lane_plist(
         )
         tier_groups = [row.get("runner_group_id") for row in lane["tier"]]
         if any(group_id is not None for group_id in tier_groups):
+            tier_group_by_label = {}
+            for row in lane["tier"]:
+                tier_group_by_label.setdefault(
+                    row["label"], row["runner_group_id"]
+                )
             env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"] = "\n".join(
-                f"{row['label']}|{row['runner_group_id']}" for row in lane["tier"]
+                f"{label}|{group_id}"
+                for label, group_id in tier_group_by_label.items()
             )
     else:
         env["TARTCI_RUNNER_WORKFLOW_NAMES"] = "\n".join(lane["workflows"])

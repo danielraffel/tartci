@@ -832,9 +832,52 @@ class MacosFleetLaneTests(unittest.TestCase):
         )
         self.assertEqual(
             env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
+            "pulp-release-tagged|1\npulp-release-pr-gate|1",
+        )
+        provider_env = os.environ.copy()
+        provider_env.update(env)
+        for tier_index in (0, 1):
+            with self.subTest(tier_index=tier_index):
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(ROOT / "providers" / "tart-macos" / "runner.sh"),
+                        "--print-runner-contract",
+                        str(tier_index),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=provider_env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.strip(),
+                    "1\trepos/Generous-Corp/pulp/actions/runners",
+                )
+
+        duplicate_env = provider_env.copy()
+        duplicate_env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"] = (
             "pulp-release-tagged|1\n"
             "pulp-release-tagged|1\n"
-            "pulp-release-pr-gate|1",
+            "pulp-release-pr-gate|1"
+        )
+        duplicate = subprocess.run(
+            [
+                "/bin/bash",
+                str(ROOT / "providers" / "tart-macos" / "runner.sh"),
+                "--print-runner-contract",
+                "0",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=duplicate_env,
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn(
+            "workflow-tier runner groups must exactly match workflow tiers in priority order",
+            duplicate.stderr,
         )
         self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", env)
         self.assertNotIn("TARTCI_RUNNER_ASSIGNMENT_MODE", env)
