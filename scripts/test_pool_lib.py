@@ -249,9 +249,16 @@ class RunnerAgentLoadedTests(unittest.TestCase):
                 "printf '%s\\n' \"$1\"\n"
             )
             fake.chmod(0o755)
+            for versioned in ("python3.11", "python3.12"):
+                unavailable = bindir / versioned
+                unavailable.write_text("#!/bin/sh\nexit 1\n")
+                unavailable.chmod(0o755)
             proc = _bash(
                 f"source {shlex.quote(str(ROOT / 'tartci'))} >/dev/null; "
                 "tartci_toml_python selected-marker",
+                # Shadow host-provided versioned interpreters so this fixture
+                # proves the unversioned-python3 branch rather than depending
+                # on the runner image.
                 {"PATH": f"{bindir}:/bin:/usr/bin", "TARTCI_PYTHON": ""},
             )
             self.assertEqual(proc.stdout.strip(), "selected-marker", proc.stderr)
