@@ -1520,7 +1520,10 @@ lanes change.
   agent. It deliberately bypasses a provider's cooperative JIT-start lock, so
   it can terminate active work; use drain for normal roaming.
 - `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
-  bootstrap the installed runner agents. This is the only transition that
+  bootstrap the installed runner agents. On a receipt-managed macOS fleet, both
+  dynamic controllers and persistent `actions.runner.*` services must be named
+  and digest-bound by the exact verified profile receipt; arbitrary persistent
+  plists and unreceipted legacy Tart controllers remain stopped. This is the only transition that
   reopens provider admission, so a reconnect cannot leave a half-on host.
 - `tartci pool status [--json]` — durable state + participation + each runner agent's
   loaded/stopped state. Receipt-managed macOS fleets additionally report

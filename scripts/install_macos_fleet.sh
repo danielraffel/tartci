@@ -106,6 +106,21 @@ for label in fleet.replacements(fleet.load(Path(sys.argv[1]))):
     print(label)
 PY
 )
+persistent_labels=()
+persistent_output="$(
+  "$PYTHON_BIN" - "$CONFIG" "$ROOT" "$AGENTS_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+data = fleet.load(Path(sys.argv[1]))
+for name in fleet.persistent_plist_records(data, Path(sys.argv[3])):
+    print(name.removesuffix(".plist"))
+PY
+)" || exit 3
+while IFS= read -r label; do
+  [ -n "$label" ] && persistent_labels+=("$label")
+done <<<"$persistent_output"
 candidates=()
 while IFS= read -r candidate; do candidates+=("$candidate"); done < <(find "$plan_dir" -maxdepth 1 -type f -name '*.plist' -print | sort)
 [ "${#candidates[@]}" -gt 0 ] || { echo "fleet profile rendered no LaunchAgents" >&2; exit 2; }
@@ -425,6 +440,23 @@ for label in fleet.replacements(fleet.load(Path(sys.argv[1]))):
     print(label)
 PY
 )
+# Re-derive persistent authority from the immutable in-transaction profile.
+# The pre-lock parse is only for dry-run validation and cannot authorize apply.
+persistent_labels=()
+persistent_output="$(
+  "$PYTHON_BIN" - "$locked_config" "$ROOT" "$AGENTS_DIR" <<'PY'
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+data = fleet.load(Path(sys.argv[1]))
+for name in fleet.persistent_plist_records(data, Path(sys.argv[3])):
+    print(name.removesuffix(".plist"))
+PY
+)" || exit 3
+while IFS= read -r label; do
+  [ -n "$label" ] && persistent_labels+=("$label")
+done <<<"$persistent_output"
 candidates=()
 while IFS= read -r candidate; do candidates+=("$candidate"); done < <(find "$render_dir" -maxdepth 1 -type f -name '*.plist' -print | sort)
 stale_targets=()
@@ -437,6 +469,11 @@ for candidate in "${candidates[@]}"; do
   label="$(basename "$candidate" .plist)"
   assert_agent_unloaded "$label" target || exit 3
 done
+if [ "${#persistent_labels[@]}" -gt 0 ]; then
+  for label in "${persistent_labels[@]}"; do
+    assert_agent_unloaded "$label" "declared persistent" || exit 3
+  done
+fi
 if [ "${#replacements[@]}" -gt 0 ]; then
   for label in "${replacements[@]}"; do
     assert_agent_unloaded "$label" replaced || exit 3

@@ -211,6 +211,182 @@ class MacosFleetLaneTests(unittest.TestCase):
             "\texit timeout = 31\n", 30
         ))
 
+    def test_persistent_plist_records_require_safe_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            label = "actions.runner.owner.repo.preamble"
+            path = root / f"{label}.plist"
+            path.write_bytes(plistlib.dumps({"Label": label}))
+            path.chmod(0o644)
+            data = {"host": {"persistent_runner_labels": [label]}}
+            self.assertEqual(
+                0o644,
+                fleet.persistent_plist_records(data, root)[path.name]["mode"],
+            )
+            path.chmod(0o600)
+            self.assertEqual(
+                0o600,
+                fleet.persistent_plist_records(data, root)[path.name]["mode"],
+            )
+            path.chmod(0o666)
+            with self.assertRaisesRegex(ValueError, "group/world-writable"):
+                fleet.persistent_plist_records(data, root)
+            path.chmod(0o644)
+            with mock.patch.object(fleet.os, "getuid", return_value=os.getuid() + 1):
+                with self.assertRaisesRegex(ValueError, "owned by the caller"):
+                    fleet.persistent_plist_records(data, root)
+            path.unlink()
+            target = root / "target.plist"
+            target.write_bytes(plistlib.dumps({"Label": label}))
+            path.symlink_to(target)
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                fleet.persistent_plist_records(data, root)
+
+    def test_persistent_loaded_verifier_binds_keepalive_and_exact_environment(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            agents = Path(td)
+            name = "actions.runner.owner.repo.preamble.plist"
+            label = name.removesuffix(".plist")
+            value = {
+                "Label": label,
+                "ProgramArguments": ["/usr/bin/true", "--serve"],
+                "WorkingDirectory": "/tmp/work",
+                "StandardOutPath": "/tmp/out",
+                "StandardErrorPath": "/tmp/err",
+                "EnvironmentVariables": {"RUNNER_ALLOW_RUNASROOT": "0"},
+                "ProcessType": "Interactive",
+                "SessionCreate": True,
+                "RunAtLoad": True,
+            }
+            payload = plistlib.dumps(value)
+            output = (
+                "\tstate = running\n"
+                "\tpid = 4242\n"
+                f"\tpath = {agents / name}\n"
+                "\tprogram = /usr/bin/true\n"
+                "\targuments = {\n\t\t/usr/bin/true\n\t\t--serve\n\t}\n"
+                "\tworking directory = /tmp/work\n"
+                "\tstdout path = /tmp/out\n"
+                "\tstderr path = /tmp/err\n"
+                "\texit timeout = 5 seconds\n"
+                "\tenvironment = {\n"
+                "\t\tRUNNER_ALLOW_RUNASROOT => 0\n"
+                "\t\tOSLogRateLimit => 64\n"
+                f"\t\tXPC_SERVICE_NAME => {label}\n"
+                "\t}\n"
+                "\tspawn type = interactive (4)\n"
+                "\tproperties = runatload | creates session | inferred program\n"
+            )
+            fleet._verify_persistent_loaded_output(name, payload, output, agents)
+            with self.assertRaisesRegex(ValueError, "is not running"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace("state = running", "state = exited"),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "no numeric pid"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace("\tpid = 4242\n", ""),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "keepalive does not match"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace(
+                        "properties = runatload",
+                        "properties = keepalive | runatload",
+                    ),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "session creation does not match"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace(" | creates session", ""),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "process type does not match"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace("spawn type = interactive (4)", "spawn type = background (3)"),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "exit timeout does not match"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace("exit timeout = 5", "exit timeout = 6"),
+                    agents,
+                )
+            with self.assertRaisesRegex(ValueError, "environment does not match"):
+                fleet._verify_persistent_loaded_output(
+                    name,
+                    payload,
+                    output.replace(
+                        "\t}\n\tspawn type",
+                        "\t\tTARTCI_UNRECEIPTED => 1\n\t}\n\tspawn type",
+                    ),
+                    agents,
+                )
+
+    def test_readiness_requires_receipted_persistent_runner_loaded(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            dynamic = "dynamic"
+            persistent = "actions.runner.owner.repo.preamble"
+            state_dir = root / "state"
+            state_dir.mkdir()
+            start = "Mon Sep  1 00:00:00 2026"
+            (state_dir / "dynamic.state.json").write_text(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "supervisor_pid": "101",
+                "supervisor_pid_started_at": start,
+            }))
+            (agents / f"{dynamic}.plist").write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {
+                    "HOME": str(root), "TARTCI_STATE_DIR": str(state_dir),
+                },
+            }))
+            (agents / f"{persistent}.plist").write_text("persistent")
+            receipt = {
+                "plists": {f"{dynamic}.plist": "a"},
+                "persistent_plists": {f"{persistent}.plist": {}},
+                "retired_launchd_labels": [],
+            }
+            running = subprocess.CompletedProcess(
+                [], 0, "state = running\npid = 101\n", ""
+            )
+            missing = subprocess.CompletedProcess(
+                [], 113, "", "Could not find service\n"
+            )
+            process_table = subprocess.CompletedProcess(
+                [], 0,
+                f"101 1 {start} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n",
+                "",
+            )
+            domain = subprocess.CompletedProcess([], 0, "", "")
+            args = (Path("receipt"), Path("config"), agents, Path("support"))
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running, missing, process_table, domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(
+                    *args, participating=True, pool_state="on"
+                )
+            self.assertFalse(value["fleet_ready"])
+            self.assertIn(
+                "unloaded_service", {item["code"] for item in value["problems"]}
+            )
+
     def test_receipt_backed_readiness_separates_intent_from_capacity(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -349,6 +525,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertEqual(
                     data["host"].get("github_api_timeout_seconds"),
                     30 if host_id == "m1" else None,
+                )
+                self.assertEqual(
+                    data["host"].get("persistent_runner_labels", []),
+                    ["actions.runner.danielraffel-pulp.pulp-preamble-m5"]
+                    if host_id == "m5" else [],
                 )
                 self.assertEqual(
                     next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")["labels"][-1],

@@ -39,7 +39,7 @@ TOP_KEYS = {
 }
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
-    "github_api_timeout_seconds",
+    "github_api_timeout_seconds", "persistent_runner_labels",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -65,6 +65,7 @@ REPLACED_AGENT = re.compile(
     r"^com[.]danielraffel[.](?:pulp[.]tart-runner|"
     r"[a-z0-9.-]+[.]tart-runner-[a-z0-9.-]+)$"
 )
+PERSISTENT_AGENT = re.compile(r"^actions[.]runner[.][A-Za-z0-9_.-]+$")
 NETWORK_PROXY_ENV = {
     "HTTP_PROXY": "http://127.0.0.1:49125",
     "HTTPS_PROXY": "http://127.0.0.1:49125",
@@ -180,6 +181,18 @@ def load(path: Path) -> dict:
             type(github_api_timeout) is not int
             or not 5 <= github_api_timeout <= 60):
         fail("host.github_api_timeout_seconds must be an integer from 5 through 60")
+    persistent_labels = host.get("persistent_runner_labels", [])
+    if (
+        not isinstance(persistent_labels, list)
+        or not all(
+            isinstance(label, str) and PERSISTENT_AGENT.fullmatch(label)
+            for label in persistent_labels
+        )
+        or len(persistent_labels) != len(set(persistent_labels))
+    ):
+        fail(
+            "host.persistent_runner_labels must contain unique actions.runner.* labels"
+        )
     if host["tart_home"] == host["home"] or host["log_root"] == host["home"]:
         fail("Tart and log roots may not be the host home directory itself")
     helper = data.get("launch_helper")
@@ -510,6 +523,39 @@ def replacements(data: dict) -> list[str]:
     return [label for lane in data["lane"] for label in lane.get("replaces_launchd_labels", [])]
 
 
+def persistent_plist_records(data: dict, agents_dir: Path) -> dict[str, dict]:
+    records: dict[str, dict] = {}
+    for label in data["host"].get("persistent_runner_labels", []):
+        name = f"{label}.plist"
+        installed = agents_dir / name
+        if installed.is_symlink() or not installed.is_file():
+            fail(f"declared persistent runner plist is unavailable: {installed}")
+        try:
+            value = plistlib.loads(installed.read_bytes())
+        except plistlib.InvalidFileException as exc:
+            fail(f"declared persistent runner plist is malformed: {installed}: {exc}")
+        if value.get("Label") != label:
+            fail(f"declared persistent runner plist label does not match: {installed}")
+        info = installed.stat()
+        mode = stat.S_IMODE(info.st_mode)
+        if not stat.S_ISREG(info.st_mode):
+            fail(f"declared persistent runner plist is not a regular file: {installed}")
+        if info.st_uid != os.getuid():
+            fail(f"declared persistent runner plist is not owned by the caller: {installed}")
+        if not (mode & stat.S_IRUSR) or mode & (stat.S_IWGRP | stat.S_IWOTH):
+            fail(
+                f"declared persistent runner plist must be owner-readable and "
+                f"not group/world-writable: "
+                f"{installed} has {mode:04o}"
+            )
+        records[name] = {
+            "sha256": hashlib.sha256(installed.read_bytes()).hexdigest(),
+            "mode": mode,
+            "owner_uid": info.st_uid,
+        }
+    return records
+
+
 def write_receipt(
     config: Path,
     agents_dir: Path,
@@ -572,13 +618,15 @@ def write_receipt(
             profile_policy_sha256=macos_launcher_identity.profile_policy_digest(config),
             source_commit=source_authority_commit,
         )
+    persistent_records = persistent_plist_records(data, agents_dir)
     receipt = {
-        "schema": 3,
+        "schema": 4 if persistent_records else 3,
         "profile": data.get("name", config.stem),
         "config_path": str(config.resolve()),
         "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
         "agents_dir": str(agents_dir.resolve()),
         "plists": digests,
+        "persistent_plists": persistent_records,
         "retired_launchd_labels": replacements(data),
         "launch_helper": helper_record,
         "support": {
@@ -612,9 +660,10 @@ def verify_receipt(
         fail("install receipt must be an object")
     data = load(config)
     helper = data.get("launch_helper")
-    supported_schemas = {3} if helper is not None else {2, 3}
+    persistent_expected = bool(data["host"].get("persistent_runner_labels"))
+    supported_schemas = ({4} if persistent_expected else ({3} if helper is not None else {2, 3}))
     if receipt.get("schema") not in supported_schemas:
-        expected = "3" if helper is not None else "2 or 3"
+        expected = "4" if persistent_expected else ("3" if helper is not None else "2 or 3")
         fail(f"install receipt schema must be {expected} for this profile")
     config = config.resolve()
     agents_dir = agents_dir.resolve()
@@ -690,6 +739,10 @@ def verify_receipt(
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
+    expected_persistent = persistent_plist_records(data, agents_dir)
+    recorded_persistent = receipt.get("persistent_plists", {})
+    if recorded_persistent != expected_persistent:
+        fail("installed persistent runner plist set does not match the profile receipt")
     expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
@@ -795,6 +848,92 @@ def _verify_loaded_output(
         return hashlib.sha256(output.encode()).hexdigest()
 
 
+def _verify_persistent_loaded_output(
+    name: str, payload: bytes, output: str, agents_dir: Path
+) -> str:
+    label = name.removesuffix(".plist")
+    value = plistlib.loads(payload)
+    if not re.search(r"^\s*state = running\s*$", output, re.MULTILINE):
+        fail(f"loaded persistent LaunchAgent {label} is not running")
+    if not re.search(r"^\s*pid = [0-9]+\s*$", output, re.MULTILINE):
+        fail(f"loaded persistent LaunchAgent {label} has no numeric pid")
+    loaded_path = re.search(r"^\tpath = (.+)$", output, re.MULTILINE)
+    if (
+        loaded_path is None
+        or Path(loaded_path.group(1)).resolve() != (agents_dir / name).resolve()
+    ):
+        fail(f"loaded persistent LaunchAgent {label} path does not match its receipt")
+    arguments = value.get("ProgramArguments")
+    if (
+        not isinstance(arguments, list)
+        or not arguments
+        or not all(isinstance(argument, str) and argument for argument in arguments)
+    ):
+        fail(f"persistent LaunchAgent {label} has invalid ProgramArguments")
+    _loaded_has(output, f"\tprogram = {arguments[0]}\n", f"{label} program")
+    rendered_arguments = "\targuments = {\n" + "".join(
+        f"\t\t{argument}\n" for argument in arguments
+    ) + "\t}\n"
+    _loaded_has(output, rendered_arguments, f"{label} arguments")
+    for key, plist_key in (
+        ("working directory", "WorkingDirectory"),
+        ("stdout path", "StandardOutPath"),
+        ("stderr path", "StandardErrorPath"),
+    ):
+        expected = value.get(plist_key)
+        if not isinstance(expected, str) or not expected:
+            fail(f"persistent LaunchAgent {label} has invalid {plist_key}")
+        _loaded_has(output, f"\t{key} = {expected}\n", f"{label} {key}")
+    environment = value.get("EnvironmentVariables", {})
+    if not isinstance(environment, dict) or not all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in environment.items()
+    ):
+        fail(f"persistent LaunchAgent {label} has invalid EnvironmentVariables")
+    environment_start = output.find("\n\tenvironment = {\n")
+    environment_end = output.find("\n\t}\n", environment_start + 2)
+    if environment_start < 0 or environment_end < 0:
+        fail(f"loaded persistent LaunchAgent {label} has no readable environment")
+    loaded_environment = output[environment_start:environment_end]
+    loaded_keys = set(re.findall(
+        r"^\t\t([^\s=]+) =>", loaded_environment, re.MULTILINE
+    ))
+    allowed_launchd_environment = {"OSLogRateLimit", "XPC_SERVICE_NAME"}
+    unexpected_loaded = loaded_keys - set(environment) - allowed_launchd_environment
+    missing_loaded = set(environment) - loaded_keys
+    if unexpected_loaded or missing_loaded:
+        fail(
+            f"loaded persistent LaunchAgent {label} environment does not match "
+            f"its receipt: missing={sorted(missing_loaded)} "
+            f"unexpected={sorted(unexpected_loaded)}"
+        )
+    for key, expected in environment.items():
+        _loaded_has(output, f"\t\t{key} => {expected}\n", f"{label} environment {key}")
+    properties = next(
+        (line for line in output.splitlines() if line.startswith("\tproperties = ")),
+        "",
+    )
+    if value.get("RunAtLoad") is not True or "runatload" not in properties:
+        fail(f"loaded persistent LaunchAgent {label} lost runatload")
+    keep_alive = value.get("KeepAlive", False)
+    if type(keep_alive) is not bool or ("keepalive" in properties) != keep_alive:
+        fail(f"loaded persistent LaunchAgent {label} keepalive does not match")
+    session_create = value.get("SessionCreate", False)
+    if type(session_create) is not bool or (
+        "creates session" in properties
+    ) != session_create:
+        fail(f"loaded persistent LaunchAgent {label} session creation does not match")
+    process_type = value.get("ProcessType")
+    if process_type != "Interactive" or not re.search(
+        r"^\tspawn type = interactive(?: \([0-9]+\))?$", output, re.MULTILINE
+    ):
+        fail(f"loaded persistent LaunchAgent {label} process type does not match")
+    exit_timeout = value.get("ExitTimeOut", 5)
+    if type(exit_timeout) is not int or not _loaded_exit_timeout_matches(output, exit_timeout):
+        fail(f"loaded persistent LaunchAgent {label} exit timeout does not match")
+    return hashlib.sha256(output.encode()).hexdigest()
+
+
 def verify_loaded_snapshot(
     receipt_path: Path,
     config: Path,
@@ -843,13 +982,31 @@ def verify_loaded(
     loaded = verify_loaded_snapshot(
         receipt_path, config, agents_dir, support_root, outputs
     )
+    persistent_loaded: dict[str, str] = {}
+    for name in receipt.get("persistent_plists", {}):
+        label = name.removesuffix(".plist")
+        try:
+            result = subprocess.run(
+                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                text=True, capture_output=True, check=False, timeout=5,
+            )
+        except subprocess.TimeoutExpired as exc:
+            fail(f"timed out reading loaded persistent LaunchAgent {label}: {exc}")
+        if result.returncode != 0:
+            fail(
+                f"could not read loaded persistent LaunchAgent {label}: "
+                f"{result.stderr.strip() or result.stdout.strip()}"
+            )
+        persistent_loaded[name] = _verify_persistent_loaded_output(
+            name, (agents_dir / name).read_bytes(), result.stdout, agents_dir
+        )
     return {
         "schema": 1,
         "verified_at_unix": int(time.time()),
         "install_receipt_path": str(receipt_path.resolve()),
         "install_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
         "support_root": str(support_root.resolve()),
-        "loaded_services": loaded,
+        "loaded_services": {**loaded, **persistent_loaded},
     }
 
 
@@ -891,6 +1048,11 @@ def fleet_readiness(
         }
 
     labels = sorted(name.removesuffix(".plist") for name in receipt["plists"])
+    persistent_labels = sorted(
+        name.removesuffix(".plist")
+        for name in receipt.get("persistent_plists", {})
+    )
+    required_labels = labels + persistent_labels
     admission_open = participating and pool_state == "on"
     if participating != (pool_state == "on"):
         problems.append({
@@ -898,7 +1060,8 @@ def fleet_readiness(
             "detail": f"state={pool_state} participating={int(participating)}",
         })
     loaded_outputs: dict[str, str] = {}
-    for label in labels:
+    persistent_loaded_outputs: dict[str, str] = {}
+    for label in required_labels:
         try:
             result = subprocess.run(
                 ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
@@ -908,7 +1071,10 @@ def fleet_readiness(
             problems.append({"code": "launchctl_probe_timeout", "label": label})
             continue
         if result.returncode == 0:
-            loaded_outputs[label] = result.stdout
+            if label in persistent_labels:
+                persistent_loaded_outputs[label] = result.stdout
+            else:
+                loaded_outputs[label] = result.stdout
             if pool_state == "off":
                 problems.append({"code": "unexpected_loaded_service", "label": label})
         elif result.returncode == 113 and "Could not find service" in result.stderr:
@@ -977,6 +1143,7 @@ def fleet_readiness(
                 })
 
     verified_running = 0
+    persistent_verified = 0
     if admission_open and len(loaded_outputs) == len(labels):
         try:
             verify_loaded_snapshot(
@@ -1039,6 +1206,22 @@ def fleet_readiness(
                     continue
                 verified_running += 1
 
+    if admission_open and len(persistent_loaded_outputs) == len(persistent_labels):
+        for label, output in persistent_loaded_outputs.items():
+            name = f"{label}.plist"
+            try:
+                _verify_persistent_loaded_output(
+                    name, (agents_dir / name).read_bytes(), output, agents_dir
+                )
+            except (OSError, ValueError) as exc:
+                problems.append({
+                    "code": "persistent_loaded_receipt_mismatch",
+                    "label": label,
+                    "detail": str(exc),
+                })
+            else:
+                persistent_verified += 1
+
     try:
         domain = subprocess.run(
             ["launchctl", "print", f"gui/{os.getuid()}"],
@@ -1080,7 +1263,12 @@ def fleet_readiness(
 
     return {
         "managed": True,
-        "fleet_ready": admission_open and verified_running == len(labels) and not problems,
+        "fleet_ready": (
+            admission_open
+            and verified_running == len(labels)
+            and persistent_verified == len(persistent_labels)
+            and not problems
+        ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),
         "problems": problems,
@@ -1310,6 +1498,8 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.print_services:
                 for name in sorted(receipt_value["plists"]):
+                    print(name.removesuffix(".plist"))
+                for name in sorted(receipt_value.get("persistent_plists", {})):
                     print(name.removesuffix(".plist"))
             else:
                 print(f"verified installed macOS fleet receipt: {args.receipt}")
