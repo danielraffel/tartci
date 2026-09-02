@@ -34,6 +34,8 @@ REASONS = {
     "stale_compatible_runs",
     "mutation_authority_required",
     "cancellation_pending",
+    "observation_in_progress",
+    "stewardship_in_progress",
     "invalid_labels",
     "observation_failed",
     "authority_failed",
@@ -46,6 +48,8 @@ VERDICT_REASONS = {
         "stale_compatible_runs",
         "mutation_authority_required",
         "cancellation_pending",
+        "observation_in_progress",
+        "stewardship_in_progress",
     },
     "error": {
         "invalid_labels",
