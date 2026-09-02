@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import json
 import plistlib
+import shlex
 import subprocess
 import tempfile
 import textwrap
@@ -237,6 +238,33 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
 
 
 class RunnerAgentLoadedTests(unittest.TestCase):
+    def test_toml_selector_uses_capable_unversioned_python3(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            bindir = Path(td) / "bin"
+            bindir.mkdir()
+            fake = bindir / "python3"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = -c ]; then exit 0; fi\n"
+                "printf '%s\\n' \"$1\"\n"
+            )
+            fake.chmod(0o755)
+            proc = _bash(
+                f"source {shlex.quote(str(ROOT / 'tartci'))} >/dev/null; "
+                "tartci_toml_python selected-marker",
+                {"PATH": f"{bindir}:/bin:/usr/bin", "TARTCI_PYTHON": ""},
+            )
+            self.assertEqual(proc.stdout.strip(), "selected-marker", proc.stderr)
+
+    def test_toml_helpers_use_supported_python_selection(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        self.assertIn("tartci_toml_python()", source)
+        self.assertIn("TARTCI_PYTHON", source)
+        self.assertIn("/opt/homebrew/bin/python3.11", source)
+        self.assertNotIn(
+            'exec python3 "$HERE/scripts/macos_fleet_lanes.py"', source
+        )
+
     def _fake_launchctl(self, td: str) -> Path:
         bindir = Path(td) / "bin"
         bindir.mkdir()

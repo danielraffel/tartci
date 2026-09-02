@@ -193,6 +193,15 @@ class InstallMacosFleetTests(unittest.TestCase):
             text=True, capture_output=True, check=False, env=effective,
         )
 
+    def test_explicit_toml_python_path_with_spaces_is_used(self) -> None:
+        interpreter_dir = self.root / "Python Tools"
+        interpreter_dir.mkdir()
+        interpreter = interpreter_dir / "python3"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_dry_run_does_not_install_or_retire(self) -> None:
         result = self.run_installer()
         self.assertEqual(result.returncode, 0, result.stderr)

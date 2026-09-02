@@ -41,6 +41,35 @@ if [ -z "$SUPPORT_MANIFEST" ]; then
 fi
 PY="$ROOT/scripts/macos_fleet_lanes.py"
 POOL_LIB="$ROOT/providers/common/pool.lib.sh"
+# macOS's system Python can be 3.9; all TOML-aware installer helpers require
+# Python 3.11+ and its stdlib tomllib module.
+PYTHON_BIN=""
+if [ -n "${TARTCI_PYTHON:-}" ]; then
+  PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)"
+else
+  for candidate in python3 python3.12 python3.11; do
+    candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+  for candidate in \
+    /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3.12 /usr/local/bin/python3.11 \
+    /usr/local/bin/python3; do
+    if [ -z "$PYTHON_BIN" ] && [ -x "$candidate" ] \
+        && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      PYTHON_BIN="$candidate"
+      break
+    fi
+  done
+fi
+[ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  exit 127
+}
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 RECEIPT="$HOME/.config/tartci/macos-fleet-install.json"
 PROFILE_SNAPSHOT="$HOME/.config/tartci/macos-fleet-profile.toml"
@@ -48,7 +77,7 @@ LOADED_RECEIPT="$HOME/.config/tartci/macos-fleet-loaded.json"
 SUPPORT_GENERATIONS="$HOME/.local/share/tartci-generations"
 ENTRYPOINT="$HOME/.local/bin/tartci"
 DOMAIN="gui/$(id -u)"
-CONFIG="$(python3 - "$CONFIG" <<'PY'
+CONFIG="$("$PYTHON_BIN" - "$CONFIG" <<'PY'
 from pathlib import Path
 import sys
 print(Path(sys.argv[1]).resolve())
@@ -62,13 +91,13 @@ cleanup_plan() {
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"
 }
 trap cleanup_plan EXIT
-python3 "$PY" validate "$CONFIG"
-python3 "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
-python3 "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
+"$PYTHON_BIN" "$PY" validate "$CONFIG"
+"$PYTHON_BIN" "$PY" render "$CONFIG" --output "$plan_dir" >/dev/null
+"$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" verify "$SUPPORT_MANIFEST" \
   --root "$SUPPORT_SOURCE" >/dev/null
 
 replacements=()
-while IFS= read -r label; do replacements+=("$label"); done < <(python3 - "$CONFIG" "$ROOT" <<'PY'
+while IFS= read -r label; do replacements+=("$label"); done < <("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -282,8 +311,8 @@ stage_dir="$(mktemp -d "$AGENTS_DIR/.macos-fleet-install.XXXXXX")"
 locked_config="$stage_dir/profile.toml"
 render_dir="$stage_dir/rendered"
 cp "$CONFIG" "$locked_config"
-python3 "$PY" validate "$locked_config" >/dev/null
-profile_host_id="$(python3 - "$locked_config" "$ROOT" <<'PY'
+"$PYTHON_BIN" "$PY" validate "$locked_config" >/dev/null
+profile_host_id="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -291,7 +320,7 @@ import macos_fleet_lanes as fleet
 print(fleet.load(Path(sys.argv[1]))["host"]["id"])
 PY
 )"
-profile_home="$(python3 - "$locked_config" "$ROOT" <<'PY'
+profile_home="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -299,7 +328,7 @@ import macos_fleet_lanes as fleet
 print(fleet.load(Path(sys.argv[1]))["host"]["home"])
 PY
 )"
-launch_helper_json="$(python3 - "$locked_config" "$ROOT" <<'PY'
+launch_helper_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -323,11 +352,11 @@ actual_host_id="$("$shipyard_bin" runner tag 2>/dev/null)" || {
   exit 3
 }
 if [ "$launch_helper_json" != "null" ]; then
-  launcher_target="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
-  launcher_approval_path="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
-  launcher_identifier="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
-  launcher_team_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["team_id"])' <<<"$launch_helper_json")"
-  launcher_profile_policy_sha256="$(python3 - "$locked_config" "$ROOT" <<'PY'
+  launcher_target="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["path"])' <<<"$launch_helper_json")"
+  launcher_approval_path="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["approval_sha256_path"])' <<<"$launch_helper_json")"
+  launcher_identifier="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["identifier"])' <<<"$launch_helper_json")"
+  launcher_team_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["team_id"])' <<<"$launch_helper_json")"
+  launcher_profile_policy_sha256="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -335,7 +364,7 @@ import macos_launcher_identity
 print(macos_launcher_identity.profile_policy_digest(Path(sys.argv[1])))
 PY
 )"
-  launcher_sha256="$(python3 - "$launcher_approval_path" <<'PY'
+  launcher_sha256="$("$PYTHON_BIN" - "$launcher_approval_path" <<'PY'
 import os, re, stat, sys
 from pathlib import Path
 path = Path(sys.argv[1])
@@ -349,13 +378,13 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
-  launcher_identity_json="$(python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
+  launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256")"
-  launcher_source_commit="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
+  launcher_source_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["source_commit"])' <<<"$launcher_identity_json")"
   mkdir -p "$(dirname "$launcher_target")"
-  python3 - "$profile_home" "$launcher_target" <<'PY' || {
+  "$PYTHON_BIN" - "$profile_home" "$launcher_target" <<'PY' || {
 import os
 import sys
 from pathlib import Path
@@ -376,7 +405,7 @@ PY
   }
   launcher_candidate="$(mktemp -d "$(dirname "$launcher_target")/.TartCILauncher.app.XXXXXX")"
   /usr/bin/ditto --noqtn "$LAUNCH_HELPER_SOURCE/" "$launcher_candidate/"
-  python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
+  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_candidate" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
@@ -385,9 +414,9 @@ elif [ -n "$LAUNCH_HELPER_SOURCE" ]; then
   echo "--launch-helper-source is invalid for a profile without launch_helper" >&2
   exit 2
 fi
-python3 "$PY" render "$locked_config" --output "$render_dir" >/dev/null
+"$PYTHON_BIN" "$PY" render "$locked_config" --output "$render_dir" >/dev/null
 replacements=()
-while IFS= read -r label; do replacements+=("$label"); done < <(python3 - "$locked_config" "$ROOT" <<'PY'
+while IFS= read -r label; do replacements+=("$label"); done < <("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -423,15 +452,15 @@ fi
 backup_dir="$AGENTS_DIR/.tartci-retired/$(date -u +%Y%m%dT%H%M%SZ)-$$"
 mkdir -p "$backup_dir"
 durable_directory "$(dirname "$backup_dir")"
-stage_result="$(python3 "$ROOT/scripts/tartci_support_manifest.py" stage-install \
+stage_result="$("$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" stage-install \
   "$SUPPORT_MANIFEST" --source-root "$SUPPORT_SOURCE" \
   --generations-root "$SUPPORT_GENERATIONS")"
-support_root="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<<"$stage_result")"
-installed_support_manifest="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["manifest"])' <<<"$stage_result")"
-launch_entrypoint="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["launch_entrypoint"])' <<<"$stage_result")"
+support_root="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<<"$stage_result")"
+installed_support_manifest="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["manifest"])' <<<"$stage_result")"
+launch_entrypoint="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["launch_entrypoint"])' <<<"$stage_result")"
 
 mkdir -p "$(dirname "$ENTRYPOINT")"
-python3 - "$(dirname "$ENTRYPOINT")" <<'PY' || {
+"$PYTHON_BIN" - "$(dirname "$ENTRYPOINT")" <<'PY' || {
 import os
 import sys
 from pathlib import Path
@@ -443,11 +472,11 @@ PY
     exit 3
 }
 wrapper_candidate="$(mktemp "$(dirname "$ENTRYPOINT")/.tartci-wrapper.XXXXXX")"
-python3 "$ROOT/scripts/tartci_support_manifest.py" wrapper-write "$wrapper_candidate" \
+"$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" wrapper-write "$wrapper_candidate" \
   --support-root "$support_root" >/dev/null
 
 if [ -z "$launcher_target" ]; then
-  python3 - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'
+  "$PYTHON_BIN" - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'
 import os
 import plistlib
 import sys
@@ -470,7 +499,7 @@ for path in root.glob("*.plist"):
 PY
 fi
 
-ghapp_path="$(python3 - "$render_dir" <<'PY'
+ghapp_path="$("$PYTHON_BIN" - "$render_dir" <<'PY'
 import os, plistlib, shutil, stat, sys
 from pathlib import Path
 ghapp_paths = set()
@@ -513,9 +542,9 @@ print(next(iter(ghapp_paths)))
 PY
 )"
 
-support_repository="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
-support_commit="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$installed_support_manifest")"
-authority_env_json="$(python3 - "$locked_config" "$ROOT" <<'PY'
+support_repository="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
+support_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$installed_support_manifest")"
+authority_env_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -539,9 +568,9 @@ if [ "$authority_env_json" = "{}" ]; then
         "repos/danielraffel/tartci/commits/$support_commit" --jq .sha
   )" || source_authority_commit=""
 else
-  app_id="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
-  app_key="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
-  app_cache="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
+  app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+  app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+  app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
   source_authority_commit="$(
     SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
@@ -603,7 +632,7 @@ if [ -n "$launcher_target" ]; then
   mv "$launcher_candidate" "$launcher_target"
   launcher_candidate=""
   durable_tree "$launcher_target"
-  python3 "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
+  "$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$launcher_target" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \
     --profile-policy-sha256 "$launcher_profile_policy_sha256" \
@@ -659,7 +688,7 @@ mv "$locked_config" "$PROFILE_SNAPSHOT"
 durable_file "$PROFILE_SNAPSHOT"
 
 receipt_tmp="$(mktemp "$(dirname "$RECEIPT")/.macos-fleet-install.json.XXXXXX")"
-python3 "$PY" write-receipt "$PROFILE_SNAPSHOT" --agents-dir "$AGENTS_DIR" \
+"$PYTHON_BIN" "$PY" write-receipt "$PROFILE_SNAPSHOT" --agents-dir "$AGENTS_DIR" \
   --support-root "$support_root" --support-manifest "$installed_support_manifest" \
   --entrypoint "$ENTRYPOINT" --entrypoint-source "$wrapper_candidate" \
   --launch-entrypoint "$launch_entrypoint" \
@@ -700,7 +729,7 @@ mv -f "$wrapper_candidate" "$ENTRYPOINT"
 wrapper_candidate=""
 durable_file "$ENTRYPOINT"
 maybe_test_crash wrapper
-python3 "$PY" verify-installed "$RECEIPT" \
+"$PYTHON_BIN" "$PY" verify-installed "$RECEIPT" \
   --config "$PROFILE_SNAPSHOT" --agents-dir "$AGENTS_DIR" \
   --support-root "$support_root" >/dev/null
 
