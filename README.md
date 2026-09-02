@@ -37,7 +37,9 @@ idle receipt before tartci will boot it out; without that receipt drain remains
 pending and exits nonzero. The current supported Shipyard CLI does not produce
 this receipt; do not create it by hand. Persistent-runner drains therefore stay
 fail-closed until an authoritative producer is deployed. `pool off` remains
-immediate and may terminate work.
+immediate and may terminate work. A later `pool on` restores only the exact
+dynamic and persistent services named by the verified fleet profile receipt;
+it does not revive arbitrary `actions.runner.*` plists or legacy Tart controllers.
 See the runbook.
 
 On a host whose governed budget supports two full macOS guests, use

@@ -236,7 +236,6 @@ class RunnerAgentEnumerationTests(unittest.TestCase):
         self.assertIn("rc=0", proc.stdout)
         self.assertEqual([l for l in proc.stdout.splitlines() if l != "rc=0"], [])
 
-
 class RunnerAgentLoadedTests(unittest.TestCase):
     def test_toml_selector_uses_capable_unversioned_python3(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -633,6 +632,19 @@ class PersistentRunnerDrainTests(unittest.TestCase):
 
 
 class ProviderAdmissionContractTests(unittest.TestCase):
+    def test_installer_rederives_persistent_authority_from_locked_profile(self) -> None:
+        source = (ROOT / "scripts/install_macos_fleet.sh").read_text()
+        locked = source.index('locked_config="$stage_dir/profile.toml"')
+        snapshot_parse = source.index(
+            'fleet.persistent_plist_records(data, Path(sys.argv[3]))', locked
+        )
+        persistent_preflight = source.index(
+            'assert_agent_unloaded "$label" "declared persistent"',
+            snapshot_parse,
+        )
+        self.assertLess(locked, snapshot_parse)
+        self.assertLess(snapshot_parse, persistent_preflight)
+
     def test_pool_on_kickstarts_bootstrapped_services_before_admission(self) -> None:
         source = (ROOT / "tartci").read_text()
         start = source.index("    on|off)", source.index("cmd_pool()"))

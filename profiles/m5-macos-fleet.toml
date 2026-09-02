@@ -7,6 +7,9 @@ home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
+persistent_runner_labels = [
+  "actions.runner.danielraffel-pulp.pulp-preamble-m5",
+]
 
 # launchd does not inherit the interactive shell's GitHub App configuration.
 # Preserve references only; key and token contents remain private host files.

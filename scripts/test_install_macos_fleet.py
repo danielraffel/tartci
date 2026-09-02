@@ -53,6 +53,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         ghapp.chmod(0o755)
         self.calls = self.root / "launchctl.calls"
         self.launchctl_state = self.root / "launchctl-state.json"
+        self.launchctl_disabled = self.root / "launchctl-disabled.json"
         launchctl = self.fakebin / "launchctl"
         launchctl.write_text(textwrap.dedent(f"""\
             #!{sys.executable}
@@ -61,19 +62,47 @@ class InstallMacosFleetTests(unittest.TestCase):
 
             calls = Path({str(self.calls)!r})
             state_path = Path({str(self.launchctl_state)!r})
+            disabled_path = Path({str(self.launchctl_disabled)!r})
             calls.write_text((calls.read_text() if calls.exists() else "") + " ".join(sys.argv[1:]) + "\\n")
             state = json.loads(state_path.read_text()) if state_path.exists() else {{}}
+            disabled = set(json.loads(disabled_path.read_text())) if disabled_path.exists() else set()
             command = sys.argv[1] if len(sys.argv) > 1 else ""
             target = sys.argv[2] if len(sys.argv) > 2 else ""
             label = target.rsplit("/", 1)[-1]
             if command == "bootstrap":
                 plist_path = Path(sys.argv[3])
+                if os.environ.get("FAKE_FAIL_BOOTSTRAP_LABEL") == plist_path.stem:
+                    raise SystemExit(70)
                 state[plist_path.stem] = str(plist_path)
                 state_path.write_text(json.dumps(state))
                 raise SystemExit(0)
+            if command == "enable":
+                if os.environ.get("FAKE_FAIL_ENABLE_LABEL") == label:
+                    raise SystemExit(70)
+                disabled.discard(label)
+                disabled_path.write_text(json.dumps(sorted(disabled)))
+                raise SystemExit(0)
+            if command == "disable":
+                if os.environ.get("FAKE_FAIL_DISABLE_LABEL") == label:
+                    raise SystemExit(70)
+                disabled.add(label)
+                disabled_path.write_text(json.dumps(sorted(disabled)))
+                raise SystemExit(0)
+            if command == "print-disabled":
+                print("disabled services = {{")
+                for item in sorted(disabled):
+                    print(f'\t"{{item}}" => disabled')
+                print("}}")
+                raise SystemExit(0)
             if command == "bootout":
+                if os.environ.get("FAKE_FAIL_BOOTOUT_LABEL") == label:
+                    raise SystemExit(70)
                 state.pop(label, None)
                 state_path.write_text(json.dumps(state))
+                raise SystemExit(0)
+            if command == "kickstart":
+                if os.environ.get("FAKE_FAIL_KICKSTART_LABEL") == label:
+                    raise SystemExit(70)
                 raise SystemExit(0)
             if command != "print":
                 raise SystemExit(0)
@@ -92,7 +121,8 @@ class InstallMacosFleetTests(unittest.TestCase):
             print("gui/501/" + label + " = {{")
             print(f"\\tpath = {{path}}")
             print("\\ttype = LaunchAgent")
-            print("\\tstate = running\\n")
+            print("\\tstate = running")
+            print("\\tpid = 4242\\n")
             print(f"\\tprogram = {{value['ProgramArguments'][0]}}")
             print("\\targuments = {{")
             arguments = list(value["ProgramArguments"])
@@ -104,15 +134,27 @@ class InstallMacosFleetTests(unittest.TestCase):
             print(f"\\tworking directory = {{value['WorkingDirectory']}}\\n")
             print(f"\\tstdout path = {{value['StandardOutPath']}}")
             print(f"\\tstderr path = {{value['StandardErrorPath']}}\\n")
-            print(f"\\texit timeout = {{value['ExitTimeOut']}} seconds\\n")
+            print(f"\\texit timeout = {{value.get('ExitTimeOut', 5)}} seconds\\n")
             print("\\tenvironment = {{")
             for key, item in value["EnvironmentVariables"].items():
                 print(f"\\t\\t{{key}} => {{item}}")
+            print("\\t\\tOSLogRateLimit => 64")
+            print(f"\\t\\tXPC_SERVICE_NAME => {{label}}")
             extra = os.environ.get("FAKE_OBSOLETE_ENV")
             if extra:
                 print(f"\\t\\t{{extra}} => stale")
             print("\\t}}\\n")
-            print("\\tproperties = keepalive | runatload | inferred program")
+            if value.get("ProcessType") == "Interactive":
+                print("\\tspawn type = interactive (4)")
+            properties = []
+            if value.get("KeepAlive") and not os.environ.get("FAKE_OMIT_KEEPALIVE"):
+                properties.append("keepalive")
+            if value.get("RunAtLoad"):
+                properties.append("runatload")
+            if value.get("SessionCreate"):
+                properties.append("creates session")
+            properties.append("inferred program")
+            print(f"\\tproperties = {{' | '.join(properties)}}")
             print("}}")
         """))
         launchctl.chmod(0o755)
@@ -192,6 +234,30 @@ class InstallMacosFleetTests(unittest.TestCase):
              "--support-manifest", str(self.support_manifest), *args],
             text=True, capture_output=True, check=False, env=effective,
         )
+
+    def configure_persistent_runner(self) -> tuple[str, Path]:
+        label = "actions.runner.Generous-Corp-pulp.pulp-preamble-test"
+        self.config.write_text(
+            self.config.read_text().replace(
+                f'log_root = "{self.home}/logs"\n',
+                f'log_root = "{self.home}/logs"\n'
+                f'persistent_runner_labels = ["{label}"]\n',
+            )
+        )
+        persistent = self.agents / f"{label}.plist"
+        persistent.write_bytes(plistlib.dumps({
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/true"],
+            "WorkingDirectory": str(self.home),
+            "StandardOutPath": str(self.home / "persistent.log"),
+            "StandardErrorPath": str(self.home / "persistent.err"),
+            "EnvironmentVariables": {"ACTIONS_RUNNER_SVC": "1"},
+            "ProcessType": "Interactive",
+            "SessionCreate": True,
+            "RunAtLoad": True,
+        }, sort_keys=False))
+        persistent.chmod(0o644)
+        return label, persistent
 
     def test_explicit_toml_python_path_with_spaces_is_used(self) -> None:
         interpreter_dir = self.root / "Python Tools"
@@ -647,6 +713,226 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("tart-runner-macos-fleet.m1.forge-gate", calls)
         self.assertNotIn("unreceipted", calls)
 
+    def test_pool_on_restores_only_profile_receipted_persistent_runner(self) -> None:
+        label = "actions.runner.Generous-Corp-pulp.pulp-preamble-test"
+        self.config.write_text(
+            self.config.read_text().replace(
+                f'log_root = "{self.home}/logs"\n',
+                f'log_root = "{self.home}/logs"\n'
+                f'persistent_runner_labels = ["{label}"]\n',
+            )
+        )
+        persistent = self.agents / f"{label}.plist"
+        persistent.write_bytes(plistlib.dumps({
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/true"],
+            "WorkingDirectory": str(self.home),
+            "StandardOutPath": str(self.home / "persistent.log"),
+            "StandardErrorPath": str(self.home / "persistent.err"),
+            "EnvironmentVariables": {"ACTIONS_RUNNER_SVC": "1"},
+            "ProcessType": "Interactive",
+            "SessionCreate": True,
+            "RunAtLoad": True,
+        }, sort_keys=False))
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        receipt = json.loads(
+            (self.home / ".config/tartci/macos-fleet-install.json").read_text()
+        )
+        self.assertEqual(4, receipt["schema"])
+        self.assertEqual([persistent.name], list(receipt["persistent_plists"]))
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"bootstrap gui/501 {persistent}", calls)
+        self.assertIn(f"kickstart gui/501/{label}", calls)
+        loaded = json.loads(
+            (self.home / ".config/tartci/macos-fleet-loaded.json").read_text()
+        )
+        self.assertIn(persistent.name, loaded["loaded_services"])
+
+    def test_installer_refuses_loaded_declared_persistent_runner(self) -> None:
+        label, _ = self.configure_persistent_runner()
+        result = self.run_installer(
+            "--apply", FAKE_LOADED_LABEL=label,
+        )
+        self.assertEqual(3, result.returncode, result.stderr)
+        self.assertIn("declared persistent LaunchAgent is loaded", result.stderr)
+        self.assertFalse(
+            (self.home / ".config/tartci/macos-fleet-install.json").exists()
+        )
+        self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+
+    def test_installer_refuses_unsafe_persistent_runner_mode(self) -> None:
+        _, persistent = self.configure_persistent_runner()
+        persistent.chmod(0o666)
+        result = self.run_installer("--apply")
+        self.assertEqual(3, result.returncode, result.stderr)
+        self.assertIn("not group/world-writable", result.stderr)
+        self.assertFalse(
+            (self.home / ".config/tartci/macos-fleet-install.json").exists()
+        )
+
+    def test_pool_on_kickstart_failure_rolls_back_persistent_runner(self) -> None:
+        label, persistent = self.configure_persistent_runner()
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**self.env, "FAKE_FAIL_KICKSTART_LABEL": label},
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"bootstrap gui/501 {persistent}", calls)
+        self.assertIn(f"kickstart gui/501/{label}", calls)
+        self.assertIn(f"disable gui/501/{label}", calls)
+        self.assertIn(f"bootout gui/501/{label}", calls)
+        state = json.loads(self.launchctl_state.read_text())
+        self.assertNotIn(label, state)
+        self.assertEqual(
+            "off\n", (self.home / ".config/tartci/pool-state").read_text()
+        )
+        self.assertEqual(
+            "0\n",
+            (self.home / ".config/tartci/native-build-participation").read_text(),
+        )
+
+    def test_pool_on_bootstrap_failure_stays_fail_closed(self) -> None:
+        label, _ = self.configure_persistent_runner()
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**self.env, "FAKE_FAIL_BOOTSTRAP_LABEL": label},
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        calls = self.calls.read_text()
+        self.assertIn(f"bootstrap gui/501 {self.agents / (label + '.plist')}", calls)
+        self.assertIn(f"disable gui/501/{label}", calls)
+        self.assertIn(f"bootout gui/501/{label}", calls)
+        self.assertNotIn(label, json.loads(self.launchctl_state.read_text()))
+
+    def test_pool_on_rejects_extra_persistent_environment_and_rolls_back(self) -> None:
+        label, _ = self.configure_persistent_runner()
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**self.env, "FAKE_OBSOLETE_ENV": "UNRECEIPTED_EXTRA"},
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        self.assertIn(f"bootout gui/501/{label}", self.calls.read_text())
+
+    def test_pool_on_reports_unproven_rollback_and_closes_admission(self) -> None:
+        label, _ = self.configure_persistent_runner()
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={
+                **self.env,
+                "FAKE_FAIL_KICKSTART_LABEL": label,
+                "FAKE_FAIL_BOOTOUT_LABEL": label,
+            },
+        )
+        self.assertEqual(10, result.returncode, result.stderr)
+        self.assertIn("rollback could not prove", result.stderr)
+        self.assertIn(label, json.loads(self.launchctl_state.read_text()))
+        self.assertEqual(
+            "off\n", (self.home / ".config/tartci/pool-state").read_text()
+        )
+        self.assertEqual(
+            "0\n",
+            (self.home / ".config/tartci/native-build-participation").read_text(),
+        )
+
+    def test_pool_on_refuses_preloaded_runner_when_enable_cannot_be_proven(self) -> None:
+        label, persistent = self.configure_persistent_runner()
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        subprocess.run(
+            [str(self.fakebin / "launchctl"), "bootstrap", "gui/501", str(persistent)],
+            text=True, capture_output=True, check=True, env=self.env,
+        )
+        subprocess.run(
+            [str(self.fakebin / "launchctl"), "disable", f"gui/501/{label}"],
+            text=True, capture_output=True, check=True, env=self.env,
+        )
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env={**self.env, "FAKE_FAIL_ENABLE_LABEL": label},
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        calls = self.calls.read_text()
+        self.assertNotIn(f"kickstart gui/501/{label}", calls)
+        self.assertIn(f"bootout gui/501/{label}", calls)
+        self.assertNotIn(label, json.loads(self.launchctl_state.read_text()))
+
+    def test_pool_on_refuses_drifted_profile_receipted_persistent_runner(self) -> None:
+        label = "actions.runner.Generous-Corp-pulp.pulp-preamble-test"
+        self.config.write_text(
+            self.config.read_text().replace(
+                f'log_root = "{self.home}/logs"\n',
+                f'log_root = "{self.home}/logs"\n'
+                f'persistent_runner_labels = ["{label}"]\n',
+            )
+        )
+        persistent = self.agents / f"{label}.plist"
+        persistent.write_bytes(plistlib.dumps({
+            "Label": label,
+            "ProgramArguments": ["/usr/bin/true"],
+            "WorkingDirectory": str(self.home),
+            "StandardOutPath": str(self.home / "persistent.log"),
+            "StandardErrorPath": str(self.home / "persistent.err"),
+            "EnvironmentVariables": {"ACTIONS_RUNNER_SVC": "1"},
+            "ProcessType": "Interactive",
+            "SessionCreate": True,
+            "RunAtLoad": True,
+        }, sort_keys=False))
+        installed = self.run_installer("--apply")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        value = plistlib.loads(persistent.read_bytes())
+        value["ProgramArguments"].append("--drift")
+        persistent.write_bytes(plistlib.dumps(value, sort_keys=False))
+        self.calls.write_text("")
+        result = subprocess.run(
+            [str(self.bin / "tartci"), "pool", "on"],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=self.env,
+        )
+        self.assertEqual(7, result.returncode, result.stderr)
+        self.assertIn("no valid receipt", result.stderr)
+        self.assertNotIn("bootstrap", self.calls.read_text())
+
     def test_pool_on_refuses_obsolete_loaded_governed_environment(self) -> None:
         installed = self.run_installer("--apply")
         self.assertEqual(installed.returncode, 0, installed.stderr)
@@ -681,6 +967,8 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("bootstrap", calls)
         self.assertIn("bootout", calls)
         self.assertEqual({}, json.loads(self.launchctl_state.read_text()))
+        self.assertEqual("off\n", (state / "pool-state").read_text())
+        self.assertEqual("0\n", (state / "native-build-participation").read_text())
 
     def test_pool_on_refuses_tampered_entrypoint_before_loading_services(self) -> None:
         installed = self.run_installer("--apply")

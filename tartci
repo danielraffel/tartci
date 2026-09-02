@@ -449,8 +449,8 @@ cmd_pool() {
         # pool invalidates it before any controller becomes eligible to admit.
         rm -f "$TARTCI_POOL_PERSISTENT_HOLD_FILE"
       fi
-      local label n=0 launchd_target load_failed=0 was_loaded
-      local -a newly_loaded=()
+      local label n=0 launchd_target load_failed=0 activation_enabled disabled_line disabled_output
+      local -a activation_attempted=()
       while IFS= read -r label; do
         [ -n "$label" ] || continue
         launchd_target="$(tartci_pool_launchd_target "$label")"
@@ -462,15 +462,33 @@ cmd_pool() {
             echo "  (already stopped: $label)"
           fi
         else
-          was_loaded=0
-          launchctl print "$launchd_target" >/dev/null 2>&1 && was_loaded=1
-          launchctl enable "$launchd_target" >/dev/null 2>&1 || true
-          if launchctl print "$launchd_target" >/dev/null 2>&1 \
+          activation_attempted+=("$label")
+          activation_enabled=1
+          launchctl enable "$launchd_target" >/dev/null 2>&1 \
+            || launchctl enable "$launchd_target" >/dev/null 2>&1 \
+            || activation_enabled=0
+          if [ "$activation_enabled" = 1 ] \
+              && disabled_output="$(launchctl print-disabled "gui/$(id -u)" 2>&1)"; then
+            disabled_line="$(
+              printf '%s\n' "$disabled_output" \
+                | grep -F "\"$label\" =>" \
+                | head -1 \
+                || true
+            )"
+            case "$disabled_line" in
+              *"=> disabled"|*"=> true") activation_enabled=0 ;;
+              ""|*"=> enabled"|*"=> false") ;;
+              *) activation_enabled=0 ;;
+            esac
+          else
+            activation_enabled=0
+          fi
+          if [ "$activation_enabled" = 1 ] \
+            && { launchctl print "$launchd_target" >/dev/null 2>&1 \
             || { launchctl bootstrap "gui/$(id -u)" "$agents_dir/$label.plist" >/dev/null 2>&1 \
-              && launchctl print "$launchd_target" >/dev/null 2>&1; }; then
+              && launchctl print "$launchd_target" >/dev/null 2>&1; }; }; then
             if launchctl kickstart "$launchd_target" >/dev/null 2>&1; then
               echo "  enabled $label"; n=$((n + 1))
-              [ "$was_loaded" = 1 ] || newly_loaded+=("$label")
             else
               echo "  (kickstart failed: $label)"
               load_failed=1
@@ -492,12 +510,54 @@ EOF
         fi
         if [ "$load_failed" != 0 ]; then
           rm -f "$loaded_receipt"
-          for label in "${newly_loaded[@]}"; do
+          local rollback_failed=0
+          _tartci_pool_rollback_service_absent() {
+            local probe_output
+            if probe_output="$(launchctl print "$1" 2>&1)"; then
+              return 1
+            fi
+            case "$probe_output" in
+              *"Could not find service"*|*"service not found"*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+          # Any failed bootstrap, kickstart, or loaded-spec verification closes
+          # admission, attempts to stop every receipted activation agent, and
+          # proves the disabled/absent postcondition before claiming rollback.
+          for label in "${activation_attempted[@]}"; do
             launchd_target="$(tartci_pool_launchd_target "$label")"
-            launchctl disable "$launchd_target" >/dev/null 2>&1 || true
+            launchctl disable "$launchd_target" >/dev/null 2>&1 \
+              || launchctl disable "$launchd_target" >/dev/null 2>&1 \
+              || rollback_failed=1
+            if disabled_output="$(launchctl print-disabled "gui/$(id -u)" 2>&1)"; then
+              disabled_line="$(
+                printf '%s\n' "$disabled_output" \
+                  | grep -F "\"$label\" =>" \
+                  | head -1 \
+                  || true
+              )"
+              case "$disabled_line" in
+                *"=> disabled"|*"=> true") ;;
+                *) rollback_failed=1 ;;
+              esac
+            else
+              rollback_failed=1
+            fi
             launchctl bootout "$launchd_target" >/dev/null 2>&1 || true
+            if ! _tartci_pool_rollback_service_absent "$launchd_target"; then
+              launchctl bootout "$launchd_target" >/dev/null 2>&1 || true
+              _tartci_pool_rollback_service_absent "$launchd_target" \
+                || rollback_failed=1
+            fi
           done
+          unset -f _tartci_pool_rollback_service_absent
+          tartci_pool_write_participation 0
+          tartci_pool_write_state off
           tartci_pool_lock_release
+          if [ "$rollback_failed" != 0 ]; then
+            echo "pool on failed and rollback could not prove every runner disabled and stopped" >&2
+            return 10
+          fi
           echo "pool on refused: loaded runner generation did not match its receipt" >&2
           return 7
         fi
