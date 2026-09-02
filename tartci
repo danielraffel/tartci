@@ -48,6 +48,52 @@ c_ok()   { printf '  \033[32m✓\033[0m %s\n' "$1"; }
 c_miss() { printf '  \033[31m✗\033[0m %s\n' "$1"; }
 c_warn() { printf '  \033[33m•\033[0m %s\n' "$1"; }
 
+# macOS still ships Python 3.9, but fleet profile/readiness helpers use the
+# stdlib tomllib module added in Python 3.11. Resolve a supported interpreter
+# explicitly so launchd cannot turn a real readiness result into the generic
+# readiness_probe_failed fallback. TARTCI_PYTHON may name an absolute path or
+# a PATH command; otherwise prefer common Homebrew 3.11/3.12 installations.
+tartci_toml_python() {
+  local candidate configured="${TARTCI_PYTHON:-}"
+  if [ -n "$configured" ]; then
+    candidate="$(command -v "$configured" 2>/dev/null || true)"
+    [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1 || {
+      echo "tartci: TARTCI_PYTHON must name a Python 3.11+ interpreter with tomllib: $configured" >&2
+      return 127
+    }
+    "$candidate" "$@"
+    return
+  fi
+
+  for candidate in python3.12 python3.11; do
+    candidate="$(command -v "$candidate" 2>/dev/null || true)"
+    if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      "$candidate" "$@"
+      return
+    fi
+  done
+
+  candidate="$(command -v python3 2>/dev/null || true)"
+  if [ -n "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+    "$candidate" "$@"
+    return
+  fi
+
+  for candidate in \
+    /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 \
+    /opt/homebrew/bin/python3 \
+    /usr/local/bin/python3.12 /usr/local/bin/python3.11 \
+    /usr/local/bin/python3; do
+    if [ -x "$candidate" ] && "$candidate" -c 'import tomllib' >/dev/null 2>&1; then
+      "$candidate" "$@"
+      return
+    fi
+  done
+
+  echo "tartci: no Python 3.11+ interpreter with tomllib is available; set TARTCI_PYTHON" >&2
+  return 127
+}
+
 # check_shipyard_auth — non-fatal onboarding check (see runbook §1).
 # Shipyard's GitHub auth must point at the GitHub-App installation token (the
 # `[github.auth]` source="command" helper in its config.toml). A host that never
@@ -122,7 +168,7 @@ cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
     validate|render|write-receipt|verify-installed|verify-loaded)
-      exec python3 "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
+      tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
@@ -353,26 +399,42 @@ cmd_pool() {
             echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
             return 7
           fi
-          if ! activation_agents="$(python3 "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
+          if activation_agents="$(tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
               --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
               --agents-dir "$agents_dir" --support-root "$HERE" \
               --print-services)"; then
+            :
+          else
+            local fleet_verify_rc=$?
             tartci_pool_lock_release
-            echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
+            if [ "$fleet_verify_rc" = 127 ]; then
+              echo "pool on refused: fleet readiness requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+            else
+              echo "pool on refused: installed macOS fleet profile has no valid receipt" >&2
+            fi
             return 7
           fi
         else
           activation_agents="$(tartci_pool_runner_agents "$agents_dir")"
         fi
-        if [ -n "$fleet_plists" ] && ! python3 "$HERE/scripts/macos_fleet_lanes.py" \
-            probe-launch-helper "$fleet_receipt" \
-            --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
-            --agents-dir "$agents_dir" --support-root "$HERE" \
-            --output "$launch_helper_probe_receipt" >/dev/null; then
-          rm -f "$launch_helper_probe_receipt"
-          tartci_pool_lock_release
-          echo "pool on refused: signed launch helper could not prove external-volume access" >&2
-          return 9
+        if [ -n "$fleet_plists" ]; then
+          if tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" \
+              probe-launch-helper "$fleet_receipt" \
+              --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+              --agents-dir "$agents_dir" --support-root "$HERE" \
+              --output "$launch_helper_probe_receipt" >/dev/null; then
+            :
+          else
+            local launch_helper_rc=$?
+            rm -f "$launch_helper_probe_receipt"
+            tartci_pool_lock_release
+            if [ "$launch_helper_rc" = 127 ]; then
+              echo "pool on refused: fleet readiness requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+            else
+              echo "pool on refused: signed launch helper could not prove external-volume access" >&2
+            fi
+            return 9
+          fi
         fi
         # A host-local network profile is an opt-in admission prerequisite.
         # Converge and prove its relay before making participation visible or
@@ -422,7 +484,7 @@ $([ "$sub" = on ] && printf '%s\n' "$activation_agents" || tartci_pool_runner_ag
 EOF
       if [ "$sub" = on ]; then
         if [ "$load_failed" = 0 ] && [ -n "$fleet_plists" ]; then
-          python3 "$HERE/scripts/macos_fleet_lanes.py" verify-loaded "$fleet_receipt" \
+          tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" verify-loaded "$fleet_receipt" \
             --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
             --agents-dir "$agents_dir" --support-root "$HERE" \
             --output "$loaded_receipt" >/dev/null || load_failed=1
@@ -522,11 +584,19 @@ EOF
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
       if [ -f "$fleet_receipt" ] || [ -n "$managed_plists" ]; then
-        fleet_readiness="$(python3 "$HERE/scripts/macos_fleet_lanes.py" fleet-readiness "$fleet_receipt" \
+        if fleet_readiness="$(tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" fleet-readiness "$fleet_receipt" \
           --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
           --agents-dir "$agents_dir" --support-root "$HERE" --participating "$part" \
-          --pool-state "$state" 2>/dev/null \
-          || printf '%s' '{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}')"
+          --pool-state "$state" 2>/dev/null)"; then
+          :
+        else
+          local readiness_rc=$?
+          if [ "$readiness_rc" = 127 ]; then
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
+          else
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}'
+          fi
+        fi
       fi
       if [ "$status_json" = 1 ]; then
         printf '{"host":"%s","state":"%s","participating":%s,"fleet":%s,"runners":[' \
@@ -545,6 +615,8 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
+# The readiness payload is already computed above; JSON formatting does not
+# require tomllib, so legacy/unmanaged hosts can still report their status.
         python3 - "$fleet_readiness" <<'PY'
 import json, sys
 fleet = json.loads(sys.argv[1])

@@ -78,8 +78,11 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   config file that appears installed and does nothing. Seen with Pulp's `daw-smoke`
   opt-in, which reported `enabled: False` no matter what the file said. Install a
   modern Python (`uv python install 3.12` needs no sudo) and put it ahead of
-  `/usr/bin` on the runner's PATH. Verify by *parsing the config*, not by checking
-  the file exists.
+  `/usr/bin` on the runner's PATH. Fleet profile/readiness commands also resolve
+  a TOML-capable interpreter explicitly; set `TARTCI_PYTHON` to an absolute
+  Python 3.11+ path in the host's launchd environment when the default
+  Homebrew locations do not apply. Verify by *parsing the config*, not by
+  checking the file exists.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
