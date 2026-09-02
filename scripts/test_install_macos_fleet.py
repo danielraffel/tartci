@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class InstallMacosFleetTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.uid = os.getuid()
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.home = self.root / "home"
@@ -108,17 +109,17 @@ class InstallMacosFleetTests(unittest.TestCase):
                 raise SystemExit(0)
             forced = os.environ.get("FAKE_LOADED_LABEL", "__none__")
             if forced in target and label not in state:
-                print("gui/501/" + label + " = {{\\n\\tstate = running\\n}}")
+                print("gui/{self.uid}/" + label + " = {{\\n\\tstate = running\\n}}")
                 raise SystemExit(0)
             if os.environ.get("FAKE_LAUNCHCTL_ERROR") == "1":
                 print("launchctl IPC unavailable", file=sys.stderr)
                 raise SystemExit(64)
             if label not in state:
-                print(f'Bad request. Could not find service "{{target}}" in domain for user gui: 501', file=sys.stderr)
+                print(f'Bad request. Could not find service "{{target}}" in domain for user gui: {self.uid}', file=sys.stderr)
                 raise SystemExit(1)
             path = Path(state[label])
             value = plistlib.loads(path.read_bytes())
-            print("gui/501/" + label + " = {{")
+            print("gui/{self.uid}/" + label + " = {{")
             print(f"\\tpath = {{path}}")
             print("\\ttype = LaunchAgent")
             print("\\tstate = running")
@@ -677,7 +678,7 @@ class InstallMacosFleetTests(unittest.TestCase):
         receipt = json.loads(receipt_path.read_text())
         support_root = Path(receipt["support"]["root"])
         subprocess.run(
-            [str(self.fakebin / "launchctl"), "bootstrap", "gui/501", str(target)],
+            [str(self.fakebin / "launchctl"), "bootstrap", f"gui/{self.uid}", str(target)],
             text=True, capture_output=True, check=True, env=self.env,
         )
         loaded_path = self.home / ".config/tartci/macos-fleet-loaded.json"
@@ -751,8 +752,8 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(0, result.returncode, result.stderr)
         calls = self.calls.read_text()
-        self.assertIn(f"bootstrap gui/501 {persistent}", calls)
-        self.assertIn(f"kickstart gui/501/{label}", calls)
+        self.assertIn(f"bootstrap gui/{self.uid} {persistent}", calls)
+        self.assertIn(f"kickstart gui/{self.uid}/{label}", calls)
         loaded = json.loads(
             (self.home / ".config/tartci/macos-fleet-loaded.json").read_text()
         )
@@ -794,10 +795,10 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(7, result.returncode, result.stderr)
         calls = self.calls.read_text()
-        self.assertIn(f"bootstrap gui/501 {persistent}", calls)
-        self.assertIn(f"kickstart gui/501/{label}", calls)
-        self.assertIn(f"disable gui/501/{label}", calls)
-        self.assertIn(f"bootout gui/501/{label}", calls)
+        self.assertIn(f"bootstrap gui/{self.uid} {persistent}", calls)
+        self.assertIn(f"kickstart gui/{self.uid}/{label}", calls)
+        self.assertIn(f"disable gui/{self.uid}/{label}", calls)
+        self.assertIn(f"bootout gui/{self.uid}/{label}", calls)
         state = json.loads(self.launchctl_state.read_text())
         self.assertNotIn(label, state)
         self.assertEqual(
@@ -822,9 +823,9 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(7, result.returncode, result.stderr)
         calls = self.calls.read_text()
-        self.assertIn(f"bootstrap gui/501 {self.agents / (label + '.plist')}", calls)
-        self.assertIn(f"disable gui/501/{label}", calls)
-        self.assertIn(f"bootout gui/501/{label}", calls)
+        self.assertIn(f"bootstrap gui/{self.uid} {self.agents / (label + '.plist')}", calls)
+        self.assertIn(f"disable gui/{self.uid}/{label}", calls)
+        self.assertIn(f"bootout gui/{self.uid}/{label}", calls)
         self.assertNotIn(label, json.loads(self.launchctl_state.read_text()))
 
     def test_pool_on_rejects_extra_persistent_environment_and_rolls_back(self) -> None:
@@ -840,7 +841,7 @@ class InstallMacosFleetTests(unittest.TestCase):
             env={**self.env, "FAKE_OBSOLETE_ENV": "UNRECEIPTED_EXTRA"},
         )
         self.assertEqual(7, result.returncode, result.stderr)
-        self.assertIn(f"bootout gui/501/{label}", self.calls.read_text())
+        self.assertIn(f"bootout gui/{self.uid}/{label}", self.calls.read_text())
 
     def test_pool_on_reports_unproven_rollback_and_closes_admission(self) -> None:
         label, _ = self.configure_persistent_runner()
@@ -874,11 +875,11 @@ class InstallMacosFleetTests(unittest.TestCase):
         installed = self.run_installer("--apply")
         self.assertEqual(installed.returncode, 0, installed.stderr)
         subprocess.run(
-            [str(self.fakebin / "launchctl"), "bootstrap", "gui/501", str(persistent)],
+            [str(self.fakebin / "launchctl"), "bootstrap", f"gui/{self.uid}", str(persistent)],
             text=True, capture_output=True, check=True, env=self.env,
         )
         subprocess.run(
-            [str(self.fakebin / "launchctl"), "disable", f"gui/501/{label}"],
+            [str(self.fakebin / "launchctl"), "disable", f"gui/{self.uid}/{label}"],
             text=True, capture_output=True, check=True, env=self.env,
         )
         self.calls.write_text("")
@@ -891,8 +892,8 @@ class InstallMacosFleetTests(unittest.TestCase):
         )
         self.assertEqual(7, result.returncode, result.stderr)
         calls = self.calls.read_text()
-        self.assertNotIn(f"kickstart gui/501/{label}", calls)
-        self.assertIn(f"bootout gui/501/{label}", calls)
+        self.assertNotIn(f"kickstart gui/{self.uid}/{label}", calls)
+        self.assertIn(f"bootout gui/{self.uid}/{label}", calls)
         self.assertNotIn(label, json.loads(self.launchctl_state.read_text()))
 
     def test_pool_on_refuses_drifted_profile_receipted_persistent_runner(self) -> None:
