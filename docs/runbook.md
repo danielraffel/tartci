@@ -219,6 +219,19 @@ tart_home = "/Users/<you>/VMs" # absolute path; no shell/tilde expansion
 labels = ["self-hosted", "macos", "arm64", "<repo>-build-secondary"]
 ```
 
+For TartCI's host-local watchdog and network-profile inventory probe, set
+`TARTCI_TART_CLI=/opt/homebrew/bin/tart` when Tart is installed somewhere other
+than the canonical Apple Silicon or Intel Homebrew locations. The built-in
+resolver covers those canonical paths even under a minimal noninteractive SSH
+PATH. The probe preserves an explicit `TART_HOME`; otherwise it resolves
+`[host].tart_home` from the installed fleet profile. It fails closed instead of
+inspecting Tart's default store when neither authority exists. An unavailable
+executable/store or malformed inventory remains a typed `unavailable` result:
+it blocks controller mutation without being mislabeled as a running VM.
+Profile resolution requires Python 3.11+'s complete TOML parser; an older
+system Python must receive explicit `TART_HOME` rather than partially parsing a
+possibly torn profile.
+
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
 uses `TART_HOME`, capacity and cleanup will disagree.

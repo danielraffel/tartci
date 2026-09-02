@@ -86,11 +86,18 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
-  → *Fix:* configure fleet tools with the absolute Tart path, usually
-  `/opt/homebrew/bin/tart`, and pass the intended store explicitly as
-  `TART_HOME=/Users/<you>/VMs` (or the host's absolute Tart store path). Treat
+  → *Fix:* TartCI's watchdog/network-profile inventory probe resolves
+  `TARTCI_TART_CLI` first, then PATH, then the canonical
+  `/opt/homebrew/bin/tart` and `/usr/local/bin/tart` locations. Set
+  `TARTCI_TART_CLI` to an absolute path for a nonstandard install, and pass the
+  intended store explicitly as `TART_HOME=/Users/<you>/VMs` (or the host's
+  absolute Tart store path). When `TART_HOME` is absent, the probe reads
+  `[host].tart_home` from the installed macOS fleet profile; it never silently
+  inspects Tart's unrelated default store. Treat
   `installed but unreachable from this launch environment` as a distinct
-  status from `absent`; never infer absence from ambient `command -v` alone.
+  status from `running`, `idle`, or `absent`; never infer any of those from
+  ambient `command -v` alone. `tartci launchd status --json` reports the
+  resolved executable and a typed `running|idle|unavailable` probe state.
 
 - **`tartci setup` still finds `cirruslabs/cli/tart`.**
   → *Cause:* Tart moved to `openai/tart`, and Homebrew will not install the

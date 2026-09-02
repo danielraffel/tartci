@@ -439,9 +439,10 @@ cmd_pool() {
         # A host-local network profile is an opt-in admission prerequisite.
         # Converge and prove its relay before making participation visible or
         # loading controllers; absent/disabled profiles are a strict no-op.
-        if ! python3 "$HERE/scripts/network_profile.py" reconcile --quiet --pool-lock-held; then
+        local network_profile_output
+        if ! network_profile_output="$(python3 "$HERE/scripts/network_profile.py" reconcile --pool-lock-held 2>&1)"; then
           tartci_pool_lock_release
-          echo "pool on refused: opt-in network profile did not converge" >&2
+          printf 'pool on refused: %s\n' "${network_profile_output:-network-profile reconcile failed without a typed cause}" >&2
           return 6
         fi
         # A held-idle receipt authorizes exactly one drain era. Reopening the
