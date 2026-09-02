@@ -188,7 +188,9 @@ tartci_pool_lock_health() {
   if [ -e "$lock" ] || [ -L "$lock" ]; then
     present=true
   fi
-  if [ "$present" = true ] && [ -d "$lock" ] && [ ! -L "$lock" ]; then
+  if [ "$present" = true ] && [ -d "$lock" ] && { [ ! -r "$lock" ] || [ ! -x "$lock" ]; }; then
+    owner_alive=unobservable
+  elif [ "$present" = true ] && [ -d "$lock" ] && [ ! -L "$lock" ]; then
     local identity; identity="$(tartci_pool_lock_identity "$lock" || true)"
     IFS=: read -r _dev inode mtime _ctime <<EOF
 $identity
@@ -227,6 +229,8 @@ identity_complete = bool(fields["lock_inode"] and fields["lock_mtime"])
 pid_valid = fields["owner_pid"].isdigit() and int(fields["owner_pid"]) > 0
 if not present:
     state = "absent"
+elif fields["owner_alive"] == "unobservable":
+    state = "unobservable"
 elif not identity_complete or not pid_valid or fields["owner_alive"] == "unknown":
     state = "invalid"
 elif fields["owner_alive"] == "true":
@@ -294,6 +298,17 @@ tartci_pool_zero_runner_workers() {
 
 tartci_pool_zero_running_vms() {
   local tart="${TARTCI_POOL_TART_BIN:-tart}"
+  if [ -z "${TARTCI_POOL_TART_BIN:-}" ] && ! command -v "$tart" >/dev/null 2>&1; then
+    local ps_bin
+    for ps_bin in /bin/ps /usr/bin/ps; do [ -x "$ps_bin" ] && break; done
+    [ -x "$ps_bin" ] || return 1
+    # QEMU-only hosts have no Tart inventory; a live QEMU process is the
+    # equivalent provider VM evidence.  Unknown process output refuses.
+    local qemu_processes
+    qemu_processes="$($ps_bin -eo command= 2>/dev/null)" || return 1
+    printf '%s\n' "$qemu_processes" | grep -Eq '(^|[[:space:]/])qemu-system-' && return 1
+    return 0
+  fi
   python3 - "$tart" <<'PY'
 import json, subprocess, sys
 try:
@@ -303,7 +318,15 @@ try:
  if not isinstance(rows,list): raise ValueError("inventory is not an array")
  for row in rows:
   if not isinstance(row,dict): raise ValueError("inventory entry is not an object")
-  state=str(row.get("State",row.get("status",row.get("state",row.get("running",""))))).lower()
+  state=str(row.get("State",row.get("status",row.get("state","")))).lower()
+  has_running="Running" in row or "running" in row
+  running=row.get("Running",row.get("running"))
+  if has_running and not isinstance(running, bool):
+   raise ValueError("inventory Running value is not boolean")
+  if isinstance(running, bool):
+   if running or state.startswith("run") or state in ("booted","up"): raise SystemExit(1)
+   if state in ("stopped","off","false",""): continue
+   raise ValueError("inventory state disagrees with Running")
   if state.startswith("run") or state in ("booted","true","up"): raise SystemExit(1)
 except Exception: raise SystemExit(2)
 PY
