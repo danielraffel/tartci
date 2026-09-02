@@ -57,6 +57,46 @@ workflow = "Build and Test"
 runner_group_id = 1
 
 [[lane]]
+id = "pulp-release"
+repo = "Generous-Corp/pulp"
+runner_group_id = 1
+registration_scope = "repository"
+golden = "pulp-build-runner:latest"
+min_queued_age_seconds = 0
+supervisors = 1
+runner_idle_timeout_seconds = 60
+labels = ["self-hosted", "macOS", "ARM64", "pulp-build-vm-release"]
+yield_to_workflow = "Build and Test"
+yield_to_labels = [
+  "self-hosted",
+  "macOS",
+  "ARM64",
+  "pulp-build",
+  "pulp-build-vm",
+  "pulp-gate-fast",
+  "pulp-build-pr-head",
+  "pulp-build-merge-group",
+]
+replaces_launchd_labels = [
+  "com.danielraffel.pulp.tart-runner-macos-release",
+]
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Release CLI"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Sign and Release"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-pr-gate"
+workflow = "Release-path PR gate"
+runner_group_id = 1
+
+[[lane]]
 id = "spectr-gate"
 repo = "danielraffel/spectr"
 runner_group_id = 1

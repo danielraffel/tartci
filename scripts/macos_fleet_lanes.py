@@ -58,6 +58,7 @@ LANE_KEYS = {
     "assignment_omit_labels", "supervisors",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds",
+    "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -402,6 +403,36 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: assignment_top_tier_receipt_max_age_seconds "
                 "must be an integer from 0 through 300 on an event-class-v2 lane"
             )
+        idle_timeout = lane.get("runner_idle_timeout_seconds")
+        if idle_timeout is not None and (
+                type(idle_timeout) is not int or not 1 <= idle_timeout <= 3600):
+            fail(
+                f"lane {lane_id}: runner_idle_timeout_seconds must be an "
+                "integer from 1 through 3600"
+            )
+        yield_workflow = lane.get("yield_to_workflow")
+        yield_labels = lane.get("yield_to_labels")
+        if (yield_workflow is None) != (yield_labels is None):
+            fail(
+                f"lane {lane_id}: yield_to_workflow and yield_to_labels must "
+                "be declared together"
+            )
+        if yield_workflow is not None and (
+                not isinstance(yield_workflow, str)
+                or not yield_workflow.strip()
+                or any(char in yield_workflow for char in "\r\n|")):
+            fail(f"lane {lane_id}: yield_to_workflow must be one workflow name")
+        if yield_labels is not None and (
+                not isinstance(yield_labels, list)
+                or not yield_labels
+                or not all(isinstance(value, str) and LABEL.fullmatch(value)
+                           for value in yield_labels)
+                or len(yield_labels) != len(set(yield_labels))
+                or not REQUIRED_BASE_LABELS.issubset(yield_labels)):
+            fail(
+                f"lane {lane_id}: yield_to_labels must be unique and include "
+                f"{sorted(REQUIRED_BASE_LABELS)}"
+            )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
                 or not all(isinstance(value, str) and LABEL.fullmatch(value)
@@ -495,6 +526,47 @@ def load(path: Path) -> dict:
                     f"lane {lane_id}: event-class-v2 requires repository-scoped "
                     "merge-group and PR-head registration"
                 )
+        release_tiers = [
+            (tier["label"], tier["workflow"], tier.get("runner_group_id"))
+            for tier in tiers
+            if tier["label"].startswith("pulp-release-")
+        ]
+        if lane_id == "pulp-release":
+            expected_release_tiers = [
+                ("pulp-release-tagged", "Release CLI", 1),
+                ("pulp-release-tagged", "Sign and Release", 1),
+                ("pulp-release-pr-gate", "Release-path PR gate", 1),
+            ]
+            expected_yield_labels = [
+                "self-hosted", "macOS", "ARM64", "pulp-build",
+                "pulp-build-vm", "pulp-gate-fast", "pulp-build-pr-head",
+                "pulp-build-merge-group",
+            ]
+            if (
+                lane["repo"] != "Generous-Corp/pulp"
+                or runner_group_id != 1
+                or registration_scope != "repository"
+                or lane["labels"] != [
+                    "self-hosted", "macOS", "ARM64", "pulp-build-vm-release"
+                ]
+                or release_tiers != expected_release_tiers
+                or len(release_tiers) != len(tiers)
+                or supervisors != 1
+                or idle_timeout != 60
+                or yield_workflow != "Build and Test"
+                or yield_labels != expected_yield_labels
+                or priority is not None
+                or assignment_mode is not None
+                or replacements != [
+                    "com.danielraffel.pulp.tart-runner-macos-release"
+                ]
+            ):
+                fail(
+                    "lane pulp-release must preserve the repository-scoped "
+                    "group-1 M5 release controller contract"
+                )
+        elif release_tiers:
+            fail("pulp release workflow tiers are reserved for lane pulp-release")
     return data
 
 
@@ -1399,6 +1471,13 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = str(
             lane["assignment_top_tier_receipt_max_age_seconds"]
         )
+    if "runner_idle_timeout_seconds" in lane:
+        env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
+            lane["runner_idle_timeout_seconds"]
+        )
+    if "yield_to_workflow" in lane:
+        env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = lane["yield_to_workflow"]
+        env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
     launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")
     helper = data.get("launch_helper")
     program_arguments = (

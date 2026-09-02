@@ -420,10 +420,19 @@ claiming tagged-release capacity. It still boots through one supervisor and the
 same host-wide VM cap. Existing single-name and plural-name
 agents need no migration.
 
-To migrate an installed release agent, render the current template over its
-plist (preserving that host's `TART_HOME` substitution), then drain/reload the
-single `com.danielraffel.pulp.tart-runner-macos-release` LaunchAgent. Do not load
-one release agent per workflow.
+The M5 host obtains this lane from `profiles/m5-macos-fleet.toml`, rendered as
+`com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release`. The generated
+agent preserves the contract above while bringing the controller under the
+fleet receipt, readiness, and pool-lifecycle gates. Its replacement list names
+only the legacy `com.danielraffel.pulp.tart-runner-macos-release` label; retire
+that label through the normal generated installer only after this source change
+has merged. Do not manually load either controller during source preparation.
+
+On a host not managed by a generated fleet profile, migrate an installed
+release agent by rendering the current template over its plist (preserving that
+host's `TART_HOME` substitution), then drain/reload the single
+`com.danielraffel.pulp.tart-runner-macos-release` LaunchAgent. Do not load one
+release agent per workflow.
 
 ## Windows QEMU launchd rule
 
