@@ -202,6 +202,16 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.legacy.write_text("legacy\n")
         self.env = os.environ.copy()
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}:{os.environ['PATH']}")
+        # The fixture has no governed Runner.Worker; make that evidence
+        # explicit rather than inheriting unrelated host processes.
+        ps = self.fakebin / "ps-empty"
+        ps.write_text("#!/bin/sh\nexit 0\n")
+        ps.chmod(0o755)
+        self.env["TARTCI_POOL_PS_BIN"] = str(ps)
+        inventory = self.fakebin / "tart-inventory"
+        inventory.write_text("#!/bin/sh\nprintf '%s\\n' '[]'\n")
+        inventory.chmod(0o755)
+        self.env["TARTCI_POOL_TART_BIN"] = str(inventory)
         self.support_source = self.root / "support-source"
         for name in sorted(support_manifest.filesystem_names(ROOT)):
             source = ROOT / name

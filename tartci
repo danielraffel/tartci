@@ -142,6 +142,21 @@ cmd_doctor() {
     echo "goldens: $n"; find "$TARTCI_GOLDENS" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sed 's/^/  - /'
   fi
   check_shipyard_auth
+  # shellcheck source=providers/common/pool.lib.sh
+  . "$HERE/providers/common/pool.lib.sh"
+  echo "pool transition lock:"
+  tartci_pool_lock_health_json | python3 -c '
+import json, sys
+value = json.load(sys.stdin)
+print("  state: {}".format(value["state"]))
+if value["present"]:
+    print("  owner pid: {}".format(
+        value["owner_pid"] if value["owner_pid"] is not None else "unknown"
+    ))
+    print("  identity: inode={} mtime_ns={}".format(
+        value["inode"], value["mtime_ns"]
+    ))
+'
 }
 
 cmd_status() {
@@ -574,16 +589,25 @@ EOF
       fi
       ;;
     repair-lock)
-      local owner=""
+      local owner="" lock_identity="" owner_start="" boot_id=""
       [ "$(tartci_pool_read_participation)" = 0 ] \
         && [ "$(tartci_pool_read_state)" != on ] \
         || { echo "refusing lock repair while admission is open; run pool off first" >&2; return 5; }
       owner="$(cat "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true)"
+      lock_identity="$(tartci_pool_lock_identity "$TARTCI_POOL_TRANSITION_LOCK" || true)"
+      owner_start="$(ps -p "$owner" -o lstart= 2>/dev/null | sed 's/^ *//' || true)"
+      boot_id="$(sysctl -n kern.boottime 2>/dev/null || awk '/btime/ {print $2; exit}' /proc/stat 2>/dev/null || true)"
       case "$owner" in
-        ''|*[!0-9]*) ;;
+        ''|*[!0-9]*) echo "refusing lock repair: owner pid is missing or malformed" >&2; return 5 ;;
         *) kill -0 "$owner" 2>/dev/null \
           && { echo "refusing lock repair: owner pid $owner is alive" >&2; return 5; } ;;
       esac
+      tartci_pool_zero_runner_workers \
+        || { echo "refusing lock repair: Runner.Worker evidence is active or unavailable" >&2; return 5; }
+      tartci_pool_zero_running_vms \
+        || { echo "refusing lock repair: running Tart VM evidence is active or unavailable" >&2; return 5; }
+      tartci_pool_lock_identity_matches "$TARTCI_POOL_TRANSITION_LOCK" "$lock_identity" "$owner" "$owner_start" "$boot_id" \
+        || { echo "refusing lock repair: lock identity changed or could not be observed" >&2; return 5; }
       rm -f "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true
       rmdir "$TARTCI_POOL_TRANSITION_LOCK" 2>/dev/null || true
       [ ! -d "$TARTCI_POOL_TRANSITION_LOCK" ] \
@@ -640,6 +664,9 @@ EOF
       done
       local part; part="$(tartci_pool_read_participation)"
       local state; state="$(tartci_pool_read_state)"
+      local lock_health_json
+      lock_health_json="$(tartci_pool_lock_health_json)" \
+        || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
       local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[]}'
       local managed_plists=""
@@ -660,8 +687,8 @@ EOF
         fi
       fi
       if [ "$status_json" = 1 ]; then
-        printf '{"host":"%s","state":"%s","participating":%s,"fleet":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$fleet_readiness"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness"
         local first=1 label loaded
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -676,8 +703,16 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
-# The readiness payload is already computed above; JSON formatting does not
-# require tomllib, so legacy/unmanaged hosts can still report their status.
+        # The readiness payload is already computed above; JSON formatting does
+        # not require tomllib, so legacy/unmanaged hosts can still report status.
+        python3 - "$lock_health_json" <<'PY'
+import json, sys
+value = json.loads(sys.argv[1])
+print(f"pool transition lock: {value['state']}")
+if value.get("present"):
+    print(f"  owner pid: {value.get('owner_pid') or 'unknown'}")
+    print(f"  identity: inode={value.get('inode')} mtime_ns={value.get('mtime_ns')}")
+PY
         python3 - "$fleet_readiness" <<'PY'
 import json, sys
 fleet = json.loads(sys.argv[1])

@@ -311,6 +311,10 @@ run_one(){ # $1=iteration index
   local t_start t_booted t_preflight t_runner_done t_done
   local state_dir qemu_started="" prepare_rc=0
   t_start="$(now_epoch)"
+  if ! tartci_pool_lock_absent; then
+    note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
   tartci_prepare_and_check_disk_root_observed "$WORKROOT" \
     "$(tartci_vm_lease_disk_expected_mount_path qemu-windows "$WORKROOT")" \
     "$(tartci_vm_lease_disk_expected_device_id qemu-windows)" qemu-windows \

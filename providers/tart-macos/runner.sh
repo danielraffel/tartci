@@ -1195,6 +1195,10 @@ run_one(){
     note "[$i] JIT admission remains blocked for this exact repository/group/class contract — no VM will boot; inspect $JIT_DENIAL_FILE"
     return 75
   fi
+  if ! tartci_pool_lock_absent; then
+    note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
     tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \

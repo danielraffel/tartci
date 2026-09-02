@@ -248,6 +248,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
   t_start="$(now_epoch)"
+  if ! tartci_pool_lock_absent; then
+    note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
   tartci_check_disk_floor_observed "$TART_HOME" tart-linux \
     "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || return $?
   tartci_prepare_and_check_disk_root_observed "$LOGROOT" "" "" tart-linux \
