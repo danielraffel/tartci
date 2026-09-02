@@ -78,6 +78,43 @@ class AdmissionContractTests(unittest.TestCase):
                 process_exit=0,
             )
 
+    def test_in_progress_reasons_are_defer_only_and_unknowns_stay_closed(
+        self,
+    ) -> None:
+        labels = ["self-hosted", "Linux", "ARM64", "pulp-build-linux"]
+        for reason in ("observation_in_progress", "stewardship_in_progress"):
+            with self.subTest(reason=reason, verdict="defer"):
+                value = envelope("defer", reason)
+                self.assertEqual(
+                    admission.validate_verdict(
+                        value,
+                        repo="Generous-Corp/pulp",
+                        base="main",
+                        labels=labels,
+                        process_exit=3,
+                    ),
+                    value,
+                )
+            for verdict, process_exit in (("admit", 0), ("error", 1)):
+                with self.subTest(reason=reason, verdict=verdict):
+                    with self.assertRaises(ValueError):
+                        admission.validate_verdict(
+                            envelope(verdict, reason),
+                            repo="Generous-Corp/pulp",
+                            base="main",
+                            labels=labels,
+                            process_exit=process_exit,
+                        )
+
+        with self.assertRaises(ValueError):
+            admission.validate_verdict(
+                envelope("defer", "unknown_future_reason"),
+                repo="Generous-Corp/pulp",
+                base="main",
+                labels=labels,
+                process_exit=3,
+            )
+
     def test_target_and_core_types_fail_closed(self) -> None:
         bad_values = [
             {**envelope("admit"), "schema_version": True},
