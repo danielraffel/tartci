@@ -513,6 +513,19 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: every tier must declare runner_group_id when any tier does"
             )
+        tier_group_by_label = {}
+        for tier in tiers:
+            label = tier["label"]
+            group_id = tier.get("runner_group_id")
+            if (
+                label in tier_group_by_label
+                and tier_group_by_label[label] != group_id
+            ):
+                fail(
+                    f"lane {lane_id}: workflows sharing tier class label {label} "
+                    "must use the same runner_group_id"
+                )
+            tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
             class_labels = [tier["label"] for tier in tiers]
             if class_labels != ["pulp-build-merge-group", "pulp-build-pr-head"]:

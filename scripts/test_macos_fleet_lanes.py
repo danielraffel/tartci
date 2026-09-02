@@ -882,6 +882,25 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", env)
         self.assertNotIn("TARTCI_RUNNER_ASSIGNMENT_MODE", env)
 
+    def test_workflows_sharing_a_tier_class_reject_conflicting_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "conflicting-tier-groups.toml"
+            path.write_text(HOST_CONFIGS["m5"].read_text().replace(
+                'label = "pulp-release-tagged"\n'
+                'workflow = "Sign and Release"\n'
+                'runner_group_id = 1',
+                'label = "pulp-release-tagged"\n'
+                'workflow = "Sign and Release"\n'
+                'runner_group_id = 3',
+                1,
+            ))
+            with self.assertRaisesRegex(
+                ValueError,
+                "workflows sharing tier class label pulp-release-tagged must use "
+                "the same runner_group_id",
+            ):
+                fleet.load(path)
+
     def test_m5_release_lane_rejects_org_scope_and_auxiliary_authority(self) -> None:
         base = HOST_CONFIGS["m5"].read_text()
         fixtures = {
