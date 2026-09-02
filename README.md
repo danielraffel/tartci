@@ -548,6 +548,13 @@ not Tart CI, assigns compatible queued jobs after registration. Do not create a
 separate supervisor per workflow or share the Build and Test `pulp-build-vm`
 label with release jobs.
 
+On M5, this controller is generated from the `pulp-release` lane in
+`profiles/m5-macos-fleet.toml`. It remains repository-scoped in runner group 1
+and is included in the fleet install receipt, loaded-readiness proof, and pool
+on/off lifecycle. A normal generated fleet deployment retires only the prior
+`com.danielraffel.pulp.tart-runner-macos-release` controller after the pool is
+closed; the profile does not grant authority over unrelated auxiliary agents.
+
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for tartci VM
 CI hosts. It emits capacity, supervisor heartbeat, VM/overlay, GitHub runner,

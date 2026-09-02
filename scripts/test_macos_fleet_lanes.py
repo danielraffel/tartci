@@ -517,7 +517,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     text=True, capture_output=True, check=False,
                 )
                 self.assertEqual(valid.returncode, 0, valid.stderr)
-                self.assertIn(f"host={host_id} lanes=4", valid.stdout)
+                self.assertIn(
+                    f"host={host_id} lanes={5 if host_id == 'm5' else 4}",
+                    valid.stdout,
+                )
                 data = tomllib.loads(config.read_text())
                 self.assertEqual(data["host"]["id"], host_id)
                 self.assertEqual(data["host"]["home"], "/Users/danielraffel")
@@ -737,6 +740,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                         value for value in values
                         if value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]
                         == "Generous-Corp/pulp"
+                        and value["EnvironmentVariables"].get(
+                            "TARTCI_RUNNER_ASSIGNMENT_MODE"
+                        ) == "event-class-v2"
                     ]
                     self.assertEqual(len(pulp_plists), 2)
                     identities = {
@@ -768,6 +774,170 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "pulp-build-merge-group|1\npulp-build-pr-head|1",
                         )
 
+    def test_m5_generated_release_lane_preserves_exact_contract(self) -> None:
+        data = fleet.load(HOST_CONFIGS["m5"])
+        release = next(lane for lane in data["lane"] if lane["id"] == "pulp-release")
+        self.assertEqual(release["repo"], "Generous-Corp/pulp")
+        self.assertEqual(release["runner_group_id"], 1)
+        self.assertEqual(release["registration_scope"], "repository")
+        self.assertEqual(release["supervisors"], 1)
+        self.assertEqual(release["runner_idle_timeout_seconds"], 60)
+        self.assertEqual(
+            release["labels"],
+            ["self-hosted", "macOS", "ARM64", "pulp-build-vm-release"],
+        )
+        self.assertEqual(
+            [
+                (tier["label"], tier["workflow"], tier["runner_group_id"])
+                for tier in release["tier"]
+            ],
+            [
+                ("pulp-release-tagged", "Release CLI", 1),
+                ("pulp-release-tagged", "Sign and Release", 1),
+                ("pulp-release-pr-gate", "Release-path PR gate", 1),
+            ],
+        )
+        self.assertEqual(release["yield_to_workflow"], "Build and Test")
+        self.assertEqual(
+            release["yield_to_labels"],
+            [
+                "self-hosted", "macOS", "ARM64", "pulp-build",
+                "pulp-build-vm", "pulp-gate-fast", "pulp-build-pr-head",
+                "pulp-build-merge-group",
+            ],
+        )
+        self.assertEqual(
+            release["replaces_launchd_labels"],
+            ["com.danielraffel.pulp.tart-runner-macos-release"],
+        )
+        self.assertNotIn("priority", release)
+        rendered = fleet.rendered_plists(data)
+        value = plistlib.loads(rendered[
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"
+        ])
+        env = value["EnvironmentVariables"]
+        self.assertEqual(env["TARTCI_RUNNER_GROUP_ID"], "1")
+        self.assertEqual(env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"], "60")
+        self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+        self.assertEqual(
+            env["TARTCI_YIELD_TO_LABELS"],
+            "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-gate-fast,"
+            "pulp-build-pr-head,pulp-build-merge-group",
+        )
+        self.assertEqual(
+            env["TARTCI_RUNNER_WORKFLOW_TIERS"],
+            "pulp-release-tagged|Release CLI\n"
+            "pulp-release-tagged|Sign and Release\n"
+            "pulp-release-pr-gate|Release-path PR gate",
+        )
+        self.assertEqual(
+            env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
+            "pulp-release-tagged|1\npulp-release-pr-gate|1",
+        )
+        provider_env = os.environ.copy()
+        provider_env.update(env)
+        for tier_index in (0, 1):
+            with self.subTest(tier_index=tier_index):
+                result = subprocess.run(
+                    [
+                        "/bin/bash",
+                        str(ROOT / "providers" / "tart-macos" / "runner.sh"),
+                        "--print-runner-contract",
+                        str(tier_index),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env=provider_env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(
+                    result.stdout.strip(),
+                    "1\trepos/Generous-Corp/pulp/actions/runners",
+                )
+
+        duplicate_env = provider_env.copy()
+        duplicate_env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"] = (
+            "pulp-release-tagged|1\n"
+            "pulp-release-tagged|1\n"
+            "pulp-release-pr-gate|1"
+        )
+        duplicate = subprocess.run(
+            [
+                "/bin/bash",
+                str(ROOT / "providers" / "tart-macos" / "runner.sh"),
+                "--print-runner-contract",
+                "0",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=duplicate_env,
+        )
+        self.assertNotEqual(duplicate.returncode, 0)
+        self.assertIn(
+            "workflow-tier runner groups must exactly match workflow tiers in priority order",
+            duplicate.stderr,
+        )
+        self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", env)
+        self.assertNotIn("TARTCI_RUNNER_ASSIGNMENT_MODE", env)
+
+    def test_workflows_sharing_a_tier_class_reject_conflicting_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "conflicting-tier-groups.toml"
+            path.write_text(HOST_CONFIGS["m5"].read_text().replace(
+                'label = "pulp-release-tagged"\n'
+                'workflow = "Sign and Release"\n'
+                'runner_group_id = 1',
+                'label = "pulp-release-tagged"\n'
+                'workflow = "Sign and Release"\n'
+                'runner_group_id = 3',
+                1,
+            ))
+            with self.assertRaisesRegex(
+                ValueError,
+                "workflows sharing tier class label pulp-release-tagged must use "
+                "the same runner_group_id",
+            ):
+                fleet.load(path)
+
+    def test_m5_release_lane_rejects_org_scope_and_auxiliary_authority(self) -> None:
+        base = HOST_CONFIGS["m5"].read_text()
+        fixtures = {
+            "group-3": base.replace(
+                'id = "pulp-release"\nrepo = "Generous-Corp/pulp"\nrunner_group_id = 1',
+                'id = "pulp-release"\nrepo = "Generous-Corp/pulp"\nrunner_group_id = 3',
+                1,
+            ),
+            "organization-scope": base.replace(
+                'id = "pulp-release"\nrepo = "Generous-Corp/pulp"\nrunner_group_id = 1\nregistration_scope = "repository"',
+                'id = "pulp-release"\nrepo = "Generous-Corp/pulp"\nrunner_group_id = 1\nregistration_scope = "organization"',
+                1,
+            ),
+            "tier-group-3": base.replace(
+                'label = "pulp-release-tagged"\nworkflow = "Release CLI"\nrunner_group_id = 1',
+                'label = "pulp-release-tagged"\nworkflow = "Release CLI"\nrunner_group_id = 3',
+                1,
+            ),
+            "auxiliary-retirement": base.replace(
+                '  "com.danielraffel.pulp.tart-runner-macos-release",\n]',
+                '  "com.danielraffel.pulp.tart-runner-macos-release",\n'
+                '  "com.danielraffel.pulp.tart-runner",\n]',
+                1,
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertNotIn("Traceback", result.stderr)
+
     def test_m3_and_m5_profiles_retire_the_exact_live_gate_controllers(self) -> None:
         m3 = tomllib.loads(HOST_CONFIGS["studio"].read_text())
         m5 = tomllib.loads(HOST_CONFIGS["m5"].read_text())
@@ -777,6 +947,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 "com.danielraffel.pulp.tart-runner-slot2",
             ],
             next(lane for lane in m3["lane"] if lane["id"] == "pulp-gate")
+            ["replaces_launchd_labels"],
+        )
+        self.assertEqual(
+            ["com.danielraffel.pulp.tart-runner-macos-release"],
+            next(lane for lane in m5["lane"] if lane["id"] == "pulp-release")
             ["replaces_launchd_labels"],
         )
         self.assertEqual(
