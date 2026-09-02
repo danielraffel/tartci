@@ -132,6 +132,7 @@ esac
         stub = """#!/usr/bin/env bash
 case "$*" in
   *actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
+  *actions/workflows/99/runs*status=pending*) printf '%s\n' '{"workflow_runs":[]}' ;;
   *actions/workflows/99/runs*status=queued*) printf '%s\n' '{"workflow_runs":[{"id":101,"name":"Build and Test","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z"}]}' ;;
   *actions/workflows/99/runs*status=in_progress*) printf '%s\n' '{"workflow_runs":[]}' ;;
   *actions/runs/101/jobs*) printf '%s\n' '${JOBS_JSON}' ;;
