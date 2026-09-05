@@ -660,6 +660,15 @@ higher_priority_demand(){
 # BOTH queued and in_progress because a priority run can flip to in_progress
 # (its GitHub-hosted resolver/classify job) before its self-hosted leg is queued.
 #
+# That widening has a cost, which `--exclude-assigned 1` pays back: an
+# in_progress job that ALREADY holds a runner_name is being served, and on the
+# hosted resolver leg it will never occupy a self-hosted slot at all -- yet it
+# still reserved one, for as long as it ran. A host was observed with both VM
+# slots free and a release job queued, indefinitely yielding to a priority lane
+# whose own supervisors reported nothing queued. Excluding assigned jobs keeps
+# the race guard (an unassigned in_progress job still counts) while dropping the
+# reservation that cannot be used.
+#
 # Use the same host-shared discovery cache as queued_work. Priority lanes often
 # watch a second workflow (for example Sanitizers yielding to Build and Test);
 # queue_scan budgets two shared workflows per host and serializes their refreshes.
@@ -681,6 +690,7 @@ priority_demand(){
     --labels "$YIELD_LABELS" \
     --job-statuses queued,in_progress \
     --provider tart-macos-priority \
+    --exclude-assigned 1 \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-priority" \
     --state-file "$STATE_DIR/priority-queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
