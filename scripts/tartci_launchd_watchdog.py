@@ -50,6 +50,7 @@ strings so they can be unit-tested with no launchd present
 
 from __future__ import annotations
 
+import re
 import argparse
 import datetime as dt
 import glob
@@ -126,14 +127,21 @@ def parse_launchctl_print(text: str) -> tuple[str | None, int | None]:
     for raw in text.splitlines():
         line = raw.strip()
         if line.startswith("state = "):
-            state = line[len("state = "):].strip() or None
+            # Only the JOB's state, which launchd prints first. Nested blocks
+            # (coalition, endpoints) print their own `state = active` deeper in
+            # the tree, and stripping indentation makes them indistinguishable —
+            # last-wins reported a dead job as "active".
+            if state is None:
+                state = line[len("state = "):].strip() or None
         elif line.startswith("last exit code = "):
             val = line[len("last exit code = "):].strip()
-            # launchd prints "(never exited)" for a never-failed service.
-            try:
-                last_exit = int(val)
-            except ValueError:
-                last_exit = None
+            # launchd prints "(never exited)" for a never-failed service, and a
+            # NAMED sysexits code for others: "75: EX_TEMPFAIL". A bare int()
+            # raises on the named form and yielded None, which downstream read
+            # as "no non-zero exit recorded" — so the one restart code our
+            # runners actually use was the one this could not see.
+            match = re.match(r"-?\d+", val)
+            last_exit = int(match.group()) if match else None
     return state, last_exit
 
 
