@@ -113,6 +113,10 @@ class QueueScanner:
         self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
         self.now = int(time.time())
+        # Resolved once, tolerantly: callers that build a Namespace directly
+        # (the test suites, and any in-process consumer) predate this option
+        # and must keep the historical behaviour rather than raising.
+        self.exclude_assigned = bool(getattr(args, "exclude_assigned", 0))
         self.api_calls = 0
         self.observation_lock_fd: int | None = None
 
@@ -509,6 +513,14 @@ class QueueScanner:
                     continue
                 if not _old_enough(timestamp, self.args.min_age_seconds, self.now):
                     continue
+                if (
+                    self.exclude_assigned
+                    and job.get("status") == "in_progress"
+                    and job.get("runner_name")
+                ):
+                    # Already assigned to a runner, so it is being served and
+                    # does not need another slot. Only unassigned work is demand.
+                    continue
                 job_labels = {
                     str(label).lower() for label in job.get("labels", []) if str(label)
                 }
@@ -609,6 +621,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-age-seconds", type=int, default=0)
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
+    # Off by default: changing what counts as demand is a scheduling decision,
+    # so a caller opts in per lane rather than inheriting it by upgrade.
+    parser.add_argument("--exclude-assigned", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     for field in (
         "gh_timeout",
