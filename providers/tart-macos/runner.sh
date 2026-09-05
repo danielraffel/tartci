@@ -725,7 +725,7 @@ reclaim_runner_name(){
 # labels, so a label served only by ghosts reads as served. Reap this lane's
 # own residue; the exact-shape match means another lane is never touched.
 sweep_lane_ghost_runners(){
-  local runner_api_root="$1" keep="$2" line id name
+  local runner_api_root="$1" keep="$2" id name
   "$GH_CLI" api "$runner_api_root" --paginate \
     --jq ".runners[] | select(.status == \"offline\") | select(.name | test(\"^${RUNNER_NAME}-[0-9]+-[0-9]+$\")) | \"\\(.id)\\t\\(.name)\"" 2>/dev/null \
   | while IFS="$(printf '\t')" read -r id name; do
