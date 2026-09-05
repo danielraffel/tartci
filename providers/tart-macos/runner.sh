@@ -706,10 +706,37 @@ reclaim_runner_name(){
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1 && break
+    "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1 && { id=""; break; }
     sleep 10
   done
+  # A registration we found but could not delete becomes a ghost: it stays
+  # offline while still advertising this lane's labels. It is not worth failing
+  # the boot over, but it must not vanish silently -- a ghost with no
+  # provenance is what makes "is this label served?" unanswerable later.
+  [ -z "$id" ] || note "runner registration '$name' (id=$id) could not be deleted; it will linger as a ghost"
   tart delete "$name" >/dev/null 2>&1 || true
+}
+
+# A per-boot registration name is never reused, so any OFFLINE registration
+# carrying this lane's exact per-boot shape, other than the one this boot just
+# claimed, belongs to a finished boot. Ghosts are tolerated by design -- a
+# never-reused name cannot collide, which is what keeps a SIGKILLed VM from
+# wedging the whole gate -- but an offline registration still advertises its
+# labels, so a label served only by ghosts reads as served. Reap this lane's
+# own residue; the exact-shape match means another lane is never touched.
+sweep_lane_ghost_runners(){
+  local runner_api_root="$1" keep="$2" line id name
+  "$GH_CLI" api "$runner_api_root" --paginate \
+    --jq ".runners[] | select(.status == \"offline\") | select(.name | test(\"^${RUNNER_NAME}-[0-9]+-[0-9]+$\")) | \"\\(.id)\\t\\(.name)\"" 2>/dev/null \
+  | while IFS="$(printf '\t')" read -r id name; do
+      [ -n "$id" ] && [ -n "$name" ] || continue
+      [ "$name" = "$keep" ] && continue
+      if "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1; then
+        note "swept ghost runner registration '$name' (id=$id)"
+      else
+        note "ghost runner registration '$name' (id=$id) could not be swept"
+      fi
+    done
 }
 
 stop_current_aqua_runner(){
@@ -1234,6 +1261,7 @@ run_one(){
   CURRENT_ASSIGNMENT_QUARANTINE="none"
   CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm" "$selected_runner_api_root"
+  sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
