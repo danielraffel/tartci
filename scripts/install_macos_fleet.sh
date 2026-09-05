@@ -236,7 +236,19 @@ cleanup() {
   [ -n "$stage_dir" ] && rm -rf "$stage_dir"
   [ -n "$receipt_tmp" ] && rm -f "$receipt_tmp"
   [ -z "$wrapper_candidate" ] || rm -f "$wrapper_candidate"
-  [ -z "$launcher_candidate" ] || rm -rf -- "$launcher_candidate"
+  # The staged bundle is copied by ditto from a launcher whose support tree is
+  # deliberately a-w, so it arrives read-only and `rm -rf` cannot empty it.
+  # build_macos_launcher.sh already does exactly this chmod before populating;
+  # the removal path needs the mirror of it. Without this the rm fails, and
+  # because this trap runs under `set -e` the failure aborts cleanup BEFORE the
+  # lock release below -- orphaning the pool transition lock and wedging the
+  # host on "pool transition busy" until a manual idle-proven repair.
+  if [ -n "$launcher_candidate" ] && [ -e "$launcher_candidate" ]; then
+    chmod -R u+w -- "$launcher_candidate" 2>/dev/null || true
+    rm -rf -- "$launcher_candidate" || true
+  fi
+  # Releasing the lock must not depend on any cleanup step above succeeding: a
+  # host that cannot re-enter the pool is a worse outcome than a leftover file.
   if [ "$lock_owned" = 1 ]; then tartci_pool_lock_release || true; fi
   rm -rf "$plan_dir"
   exit "$rc"
