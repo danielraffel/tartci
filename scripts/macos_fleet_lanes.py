@@ -1110,6 +1110,63 @@ def probe_launch_helper(
     return macos_launcher_probe.run(helper, load(config), timeout_seconds)
 
 
+ANCESTRY_WALK_LIMIT = 64
+
+
+def pid_is_self_or_descendant(
+    writer_pid: int, job_pid: int, parents: dict[int, int]
+) -> bool:
+    """Is writer_pid the launchd job itself, or a process it forked?
+
+    A lane whose Tart home is on an external volume runs through a signed
+    launch_helper, so launchd's job pid is the helper and the heartbeat is
+    written by a child of it. A lane on the internal disk writes from the job
+    pid directly. Both are correct, so identity is ancestry rather than
+    equality -- but it stays scoped to THIS lane's job pid, so a wedged lane
+    cannot be verified by a neighbour's writer. The walk is bounded because a
+    reparenting cycle would otherwise loop forever.
+    """
+    if writer_pid == job_pid:
+        return True
+    seen: set[int] = set()
+    current = writer_pid
+    for _ in range(ANCESTRY_WALK_LIMIT):
+        if current in seen:
+            return False
+        seen.add(current)
+        parent = parents.get(current)
+        if parent is None or parent <= 1:
+            return False
+        if parent == job_pid:
+            return True
+        current = parent
+    return False
+
+
+def launchd_managed_pids() -> set[int]:
+    """Pids launchd is currently running, under any label.
+
+    Reparenting to init is normal for a launchd job, so ppid == 1 is not
+    evidence of abandonment. Without this, every managed supervisor outside
+    the fleet lanes -- the release lane in particular -- reports as orphaned.
+    """
+    try:
+        listed = subprocess.run(
+            ["launchctl", "list"],
+            text=True, capture_output=True, check=False, timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return set()
+    if listed.returncode != 0:
+        return set()
+    managed: set[int] = set()
+    for line in listed.stdout.splitlines()[1:]:
+        field = line.split("\t", 1)[0].strip()
+        if field.isdigit():
+            managed.add(int(field))
+    return managed
+
+
 def fleet_readiness(
     receipt_path: Path,
     config: Path,
@@ -1190,6 +1247,7 @@ def fleet_readiness(
         if (match := re.search(r"^\s*pid = ([0-9]+)\s*$", output, re.MULTILINE))
     }
     process_starts: dict[int, str] = {}
+    process_parents: dict[int, int] = {}
     managed_supervisor_pids: set[int] = set()
     try:
         process_table = subprocess.run(
@@ -1214,6 +1272,7 @@ def fleet_readiness(
                 pid = int(match.group(1))
                 ppid = int(match.group(2))
                 process_starts[pid] = " ".join(match.group(3).split())
+                process_parents[pid] = ppid
                 command = match.group(4)
                 if (
                     ppid == 1
@@ -1221,7 +1280,10 @@ def fleet_readiness(
                     and provider_suffix in command
                 ):
                     managed_supervisor_pids.add(pid)
-            for orphan_pid in sorted(managed_supervisor_pids - expected_pids):
+            candidates = managed_supervisor_pids - expected_pids
+            if candidates:
+                candidates -= launchd_managed_pids()
+            for orphan_pid in sorted(candidates):
                 problems.append({
                     "code": "orphaned_supervisor", "label": str(orphan_pid),
                     "detail": process_starts[orphan_pid],
@@ -1257,11 +1319,15 @@ def fleet_readiness(
                         candidate = json.loads(state_path.read_text())
                     except (OSError, json.JSONDecodeError):
                         continue
+                    try:
+                        writer_pid = int(str(candidate.get("supervisor_pid")))
+                    except (TypeError, ValueError):
+                        continue
                     if (
-                        candidate.get("supervisor_pid") == str(pid)
+                        pid_is_self_or_descendant(writer_pid, pid, process_parents)
                         and " ".join(str(candidate.get(
                             "supervisor_pid_started_at", ""
-                        )).split()) == process_starts.get(pid, "")
+                        )).split()) == process_starts.get(writer_pid, "")
                     ):
                         matching_state = candidate
                         break

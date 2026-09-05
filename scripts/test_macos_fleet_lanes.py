@@ -422,6 +422,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                 [], 113, "", "Could not find service\n"
             )
             domain = subprocess.CompletedProcess([], 0, "", "")
+            unmanaged_list = subprocess.CompletedProcess(
+                [], 0, "PID\tStatus\tLabel\n-\t0\tcom.example.idle\n", ""
+            )
             process_table = subprocess.CompletedProcess(
                 [], 0,
                 f"101 1 {starts[101]} bash {root}/.local/share/tartci-generations/current/providers/tart-macos/runner.sh --loop\n"
@@ -433,7 +436,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
                  mock.patch.object(
                      fleet.subprocess, "run",
-                     side_effect=[running_one, missing, process_table, domain],
+                     side_effect=[running_one, missing, process_table, unmanaged_list, domain],
                  ):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
             self.assertFalse(value["fleet_ready"])
@@ -463,7 +466,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
                  mock.patch.object(
                      fleet.subprocess, "run",
-                     side_effect=[running_one, running_two, orphan_table, domain],
+                     side_effect=[running_one, running_two, orphan_table, unmanaged_list, domain],
                  ), \
                  mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
@@ -503,6 +506,116 @@ class MacosFleetLaneTests(unittest.TestCase):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
             self.assertEqual(value["verified_running_supervisors"], 0)
             self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
+
+    def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
+        """A lane on an external volume runs through a signed launch_helper, so
+        launchd's job pid is the helper and the heartbeat is written by its
+        child. A lane on the internal disk writes from the job pid itself. Both
+        are healthy, so identity is ancestry rather than pid equality -- but it
+        stays scoped to the lane, and the recorded start time is still compared
+        against the writer, which is what guards against pid reuse.
+        """
+        wrapper_start = "Mon Sep  1 00:00:00 2026"
+        direct_start = "Mon Sep  1 00:00:01 2026"
+        child_start = "Mon Sep  1 00:00:02 2026"
+        heartbeat_ts = dt.datetime.now(dt.timezone.utc).isoformat()
+
+        def scenario(one_writer: int, one_writer_start: str,
+                     release_managed: bool | None = None):
+            td = tempfile.TemporaryDirectory()
+            root = Path(td.name)
+            agents = root / "agents"
+            agents.mkdir()
+            receipt = {"plists": {"one.plist": "a", "two.plist": "b"},
+                       "retired_launchd_labels": []}
+            writers = {"one": (one_writer, one_writer_start),
+                       "two": (102, direct_start)}
+            for label, (writer, started) in writers.items():
+                state_dir = root / f"{label}-state"
+                state_dir.mkdir()
+                (state_dir / f"{label}.state.json").write_text(json.dumps({
+                    "ts": heartbeat_ts,
+                    "supervisor_pid": str(writer),
+                    "supervisor_pid_started_at": started,
+                }))
+                (agents / f"{label}.plist").write_bytes(plistlib.dumps({
+                    "EnvironmentVariables": {
+                        "HOME": str(root), "TARTCI_STATE_DIR": str(state_dir),
+                    },
+                }))
+            gen = f"{root}/.local/share/tartci-generations/current"
+            table = (
+                f"101 1 {wrapper_start} bash {gen}/providers/tart-macos/runner.sh --loop\n"
+                f"102 1 {direct_start} bash {gen}/providers/tart-macos/runner.sh --loop\n"
+                f"201 101 {child_start} bash {gen}/providers/tart-macos/runner.sh --loop\n"
+                f"202 102 {child_start} bash {gen}/providers/tart-macos/runner.sh --loop\n"
+            )
+            if release_managed is not None:
+                # Same generations path and ppid 1 as a real release-lane
+                # supervisor, rooted at THIS scenario's home so the orphan
+                # predicate actually sees it.
+                table += (
+                    f"999 1 Mon Sep  1 00:00:03 2026 bash "
+                    f"{gen}/providers/tart-macos/runner.sh --loop\n"
+                )
+            calls = [
+                subprocess.CompletedProcess([], 0, "state = running\npid = 101\n", ""),
+                subprocess.CompletedProcess([], 0, "state = running\npid = 102\n", ""),
+                subprocess.CompletedProcess([], 0, table, ""),
+            ]
+            if release_managed is not None:
+                listing = "PID\tStatus\tLabel\n"
+                if release_managed:
+                    listing += "999\t0\tcom.danielraffel.pulp.tart-runner-macos-release\n"
+                calls.append(subprocess.CompletedProcess([], 0, listing, ""))
+            calls.append(subprocess.CompletedProcess([], 0, "", ""))
+            args = (Path("receipt"), Path("config"), agents, Path("support"))
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(fleet.subprocess, "run", side_effect=calls), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
+            td.cleanup()
+            return value
+
+        # 201 is a child of lane one's job pid 101; lane two writes from 102 itself.
+        value = scenario(201, child_start)
+        self.assertTrue(value["fleet_ready"])
+        self.assertEqual(value["verified_running_supervisors"], 2)
+        self.assertEqual(value["problems"], [])
+
+        # NEGATIVE CONTROL: 202 is live and on the generations path, but it
+        # descends from the OTHER lane's job. One lane must not be verified by
+        # its neighbour's writer.
+        value = scenario(202, child_start)
+        self.assertFalse(value["fleet_ready"])
+        self.assertIn("heartbeat_missing", {
+            problem["code"] for problem in value["problems"]
+        })
+
+        # NEGATIVE CONTROL: the writer pid is a correct descendant, but the
+        # recorded start time is not that writer's. This is the pid-reuse guard,
+        # and it must compare against the writer rather than the job.
+        value = scenario(201, "Mon Sep  1 09:09:09 2026")
+        self.assertFalse(value["fleet_ready"])
+        self.assertIn("heartbeat_missing", {
+            problem["code"] for problem in value["problems"]
+        })
+
+        # POSITIVE CONTROL for the assertion below: with launchd reporting
+        # nothing, the same process IS reported as an orphan. Without this the
+        # next assertion could pass by never seeing the process at all.
+        value = scenario(201, child_start, release_managed=False)
+        self.assertIn("orphaned_supervisor", {
+            problem["code"] for problem in value["problems"]
+        })
+
+        # A managed supervisor outside the fleet lanes -- the release lane lives
+        # on the same host -- is not an orphan, whatever its ppid.
+        value = scenario(201, child_start, release_managed=True)
+        self.assertNotIn("orphaned_supervisor", {
+            problem["code"] for problem in value["problems"]
+        })
+        self.assertTrue(value["fleet_ready"])
 
     def test_all_host_profiles_validate_with_exact_paths_and_routing(self) -> None:
         expected = {
