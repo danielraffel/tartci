@@ -681,6 +681,7 @@ priority_demand(){
     --labels "$YIELD_LABELS" \
     --job-statuses queued,in_progress \
     --provider tart-macos-priority \
+    --exclude-assigned 1 \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-priority" \
     --state-file "$STATE_DIR/priority-queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \

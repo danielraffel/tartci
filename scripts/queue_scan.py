@@ -509,6 +509,12 @@ class QueueScanner:
                     continue
                 if not _old_enough(timestamp, self.args.min_age_seconds, self.now):
                     continue
+                if (
+                    self.args.exclude_assigned
+                    and str(job.get("status", "")).lower() == "in_progress"
+                    and job.get("runner_name")
+                ):
+                    continue
                 job_labels = {
                     str(label).lower() for label in job.get("labels", []) if str(label)
                 }
@@ -609,6 +615,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-age-seconds", type=int, default=0)
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
+    # Priority lanes count queued+in_progress to avoid a race where a priority
+    # run's hosted resolver leg flips to in_progress before its self-hosted leg
+    # is queued. But an in_progress job that ALREADY has a runner is being
+    # served: it needs no further slot, and counting it makes every other host
+    # in the fleet yield capacity to work that is already under way. Opt in per
+    # caller so ordinary queue scans are unchanged.
+    parser.add_argument("--exclude-assigned", type=int, choices=(0, 1), default=0)
     args = parser.parse_args()
     for field in (
         "gh_timeout",
