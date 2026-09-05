@@ -510,7 +510,7 @@ class QueueScanner:
                 if not _old_enough(timestamp, self.args.min_age_seconds, self.now):
                     continue
                 if (
-                    self.args.exclude_assigned
+                    getattr(self.args, "exclude_assigned", 0)
                     and str(job.get("status", "")).lower() == "in_progress"
                     and job.get("runner_name")
                 ):
