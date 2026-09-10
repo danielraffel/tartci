@@ -135,14 +135,23 @@ tartci_assignment_v2_select(){
     return 0
   fi
   cached_value="$(tartci_assignment_v2_select_live)"
+  # Publish only a real observation. A blind selection (`ERR`) is the ABSENCE of
+  # an observation, never an observation of absence, so it must not enter the
+  # cache: a cached blind verdict is replayed for the whole TTL, during which the
+  # lane makes no GitHub call at all and therefore cannot recover on the next
+  # poll, and a supervisor that restarts for fresh credentials re-reads the same
+  # stale verdict from disk. Leaving the cache untouched keeps the fail-closed
+  # answer for this poll while letting the next one re-observe.
   # TTL begins when the exhaustive observation completes, not before lock
   # contention and API pagination. Backdating this stamp can make a fresh
   # snapshot immediately expire and recreate the scan burst it should prevent.
-  now="$(date +%s)"
-  mkdir -p "$STATE_DIR"
-  if tmp="$(mktemp "$cache_file.tmp.XXXXXX")"; then
-    printf '%s\t%s\n' "$now" "$cached_value" > "$tmp"
-    mv -f "$tmp" "$cache_file"
+  if printf '%s' "${cached_value%%|*}" | grep -qxE '[0-9]+'; then
+    now="$(date +%s)"
+    mkdir -p "$STATE_DIR"
+    if tmp="$(mktemp "$cache_file.tmp.XXXXXX")"; then
+      printf '%s\t%s\n' "$now" "$cached_value" > "$tmp"
+      mv -f "$tmp" "$cache_file"
+    fi
   fi
   printf '%s\n' "$cached_value"
 }
