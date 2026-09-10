@@ -554,6 +554,11 @@ it would remove:
 TARTCI_RECLAIM_ROOTS="$HOME/Code" "$HOME/.local/bin/tartci" reclaim
 ```
 
+A dry run reports the bytes a `--fix` pass would free, both in the summary line
+("would reclaim N GiB") and in the JSON `reclaimed_bytes`, so the report-only
+step tells you what the rollout is actually worth on that host. Under `--fix`
+the same figure is what was freed.
+
 `TARTCI_RECLAIM_ROOTS` is colon-separated, so a host that keeps code on an
 external volume declares it there. Logs land in
 `~/Library/Logs/tartci/tartci-reclaim.log`. The agent runs hourly rather than

@@ -304,7 +304,11 @@ def main(argv: list[str] | None = None) -> int:
                 record["error"] = str(exc)
                 kept.append(record)
                 continue
-            reclaimed += size
+        # Counted in both modes: under --fix this is what was freed, in a dry
+        # run it is what a --fix pass would free. Accumulating only under --fix
+        # made every dry run report 0.0 GiB, which defeats the report-only
+        # first step every rollout starts with.
+        reclaimed += size
         deleted.append(record)
 
     free_after = free_bytes(roots[0]) if args.fix else free_before
@@ -326,12 +330,13 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         verb = "removed" if args.fix else "would remove"
+        freed_verb = "reclaimed" if args.fix else "would reclaim"
         for record in deleted:
             print(f"  {verb} {record['size_bytes'] / GIB:6.1f} GiB  {record['path']}")
         free_text = "unknown" if free_after is None else f"{free_after / GIB:.1f} GiB"
         print(f"disk_reclaim: {len(candidates)} candidate(s) under "
               f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
-              f"{reclaimed / GIB:.1f} GiB reclaimed; "
+              f"{freed_verb} {reclaimed / GIB:.1f} GiB; "
               f"free {free_text} "
               f"(pressure={'yes' if pressure else 'no'}, age gate {min_age:g}d)")
         if active is None:

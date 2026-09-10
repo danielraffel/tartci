@@ -253,6 +253,41 @@ class MainTests(unittest.TestCase):
         self.assertEqual(report["candidates"], 1)
         self.assertEqual(len(report["deleted"]), 1)
 
+    def test_dry_run_reports_the_bytes_a_fix_pass_would_free(self):
+        """A dry run that totals 0.0 GiB defeats the report-only first step.
+
+        The accumulator used to sit inside the --fix branch, so every dry run
+        listed real per-directory sizes under a zero total.
+        """
+        make_build_tree(self.root / "wt" / "build", age_days=400)
+        code, dry = self.run_json("--min-age-days", "7",
+                                  "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        per_record = sum(d["size_bytes"] for d in dry["deleted"])
+        self.assertGreater(per_record, 0, "control: the tree must have a size")
+        self.assertEqual(dry["reclaimed_bytes"], per_record)
+
+        # Control: the same tree under --fix reports the same total, so the
+        # dry-run figure is the fix figure rather than an independent guess.
+        code, fixed = self.run_json("--fix", "--min-age-days", "7",
+                                    "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertEqual(fixed["reclaimed_bytes"], per_record)
+
+    def test_summary_line_says_would_reclaim_in_a_dry_run(self):
+        make_build_tree(self.root / "wt" / "build", age_days=400)
+        code, out = self.run_main("--min-age-days", "7",
+                                  "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertIn("would reclaim", out)
+        # Control: the same phrase must NOT survive a --fix pass, which
+        # reports what it actually freed.
+        code, out = self.run_main("--fix", "--min-age-days", "7",
+                                  "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertNotIn("would reclaim", out)
+        self.assertIn("reclaimed", out)
+
 
 class FailClosedTests(unittest.TestCase):
     """The janitor must treat "could not measure" as a reason to do less.
