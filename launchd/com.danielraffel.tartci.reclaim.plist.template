@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci per-host disk reclaimer.
+
+  Why this agent exists: a tartci host admits work by lease, and the lease has
+  a disk axis. When the data volume fills, EVERY lease is denied
+  `disk_capacity_exceeded` and the host stops serving entirely. It is not a
+  slow host at that point, it is a dead one, and its share of the load moves
+  elsewhere without anyone being told. Build directories are what fills it:
+  large, regenerable, and until this agent nothing removed them. m5 reached
+  14 GiB free on a 3.6 TiB volume with 488 build dirs totalling 1.32 TB, and
+  refused 276 leases before anyone noticed.
+
+  Deletion is conservative in the same shape as the reap agent: a directory
+  goes only when its name is a build-directory name AND it carries a generated
+  -tree marker AND it carries no source marker AND no live build process
+  references it AND nothing inside it changed inside the age gate.
+
+  Install shape:
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.reclaim.plist.template \
+      --set "HOME=$HOME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist"
+
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist"
+    launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.reclaim"
+
+  Tune per host by editing the TARTCI_RECLAIM_* values below before rendering.
+  TARTCI_RECLAIM_ROOTS is a colon-separated list, so a host that keeps code on
+  an external volume declares it here (m3: /Volumes/Workshop/Code plus its
+  agent-worktrees root). TARTCI_RECLAIM_FAIL_BELOW_GB is the escalation half:
+  a host still under the floor after a pass exits non-zero, so launchd records
+  a failing janitor instead of the fleet only seeing refused leases.
+
+  Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
+  and sizes candidates, and disk fills over days rather than seconds.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.reclaim</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>reclaim</string>
+        <string>--json</string>
+        <string>--fix</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>3600</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-reclaim.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-reclaim.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_RECLAIM_ROOTS</key>
+        <string>$HOME/Code</string>
+        <key>TARTCI_RECLAIM_MAXDEPTH</key>
+        <string>3</string>
+        <key>TARTCI_RECLAIM_MIN_AGE_DAYS</key>
+        <string>30</string>
+        <key>TARTCI_RECLAIM_PRESSURE_FREE_GB</key>
+        <string>200</string>
+        <key>TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS</key>
+        <string>7</string>
+        <key>TARTCI_RECLAIM_FAIL_BELOW_GB</key>
+        <string>60</string>
+    </dict>
+</dict>
+</plist>

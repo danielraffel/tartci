@@ -1,0 +1,365 @@
+#!/usr/bin/env python3
+"""Reclaim regenerable build directories so a CI host cannot fill its disk.
+
+Why this exists: tartci admits work by lease, and the lease has a disk axis.
+When a host's data volume fills, every lease is denied `disk_capacity_exceeded`
+and the host stops serving. That is not a slow host, it is a dead one, and the
+load silently moves to whatever host is left. Build directories are the thing
+that fills it: they are large, regenerable, and nothing has ever removed them.
+
+The janitor is conservative in the same shape as vm_reap.py. A directory is
+deleted only when EVERY positive check passes:
+
+  * its basename is a build-directory name (`build`, `build-<key>`,
+    `build-cov*`, `build-coverage*`),
+  * it carries a generated-tree marker (`CMakeCache.txt`, `build.ninja`, or
+    `CMakeFiles/`), so a source directory that merely has the name is skipped,
+  * it carries no source marker (`.git`, `CMakeLists.txt`) of its own,
+  * no live build process references its path,
+  * nothing inside it has been modified inside the age gate.
+
+Two age tiers. `--min-age-days` always applies. Under disk pressure (free space
+below `--pressure-free-gb`) the shorter `--pressure-min-age-days` applies too,
+so an idle host keeps recent build dirs warm and a full host reclaims harder.
+
+`--fail-below-gb` closes the escalation half: a host still below the floor after
+a reclaim pass exits non-zero, so launchd records it and a supervisor can see a
+full disk instead of only seeing refused leases.
+
+Exit codes:
+
+  0  the pass ran and the host is above its floor,
+  2  no scan roots resolved, so nothing was examined,
+  3  the pass ran and the host is STILL below `--fail-below-gb`; the reclaim
+     could not free enough and a human needs to look,
+  4  a measurement the decision depends on could not be taken (the process
+     table or the free-space figure). Nothing was deleted. This is distinct
+     from 3 on purpose: 3 means the host is full, 4 means we do not know.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any, Iterable
+
+BUILD_DIR_PREFIXES = ("build-",)
+BUILD_DIR_EXACT = ("build",)
+
+# Positive proof the directory is generator output rather than a source tree
+# that happens to be called "build".
+GENERATED_MARKERS = ("CMakeCache.txt", "build.ninja", "CMakeFiles")
+
+# Presence of any of these means a human's tree, never a reclaim candidate.
+SOURCE_MARKERS = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
+
+# Command names whose live command lines are scanned for candidate paths.
+BUILD_PROCESS_PATTERN = r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
+
+GIB = 1024**3
+
+
+def is_build_dir_name(name: str) -> bool:
+    """True when `name` is a build-directory name we are willing to consider."""
+    if name in BUILD_DIR_EXACT:
+        return True
+    return any(name.startswith(prefix) and len(name) > len(prefix)
+               for prefix in BUILD_DIR_PREFIXES)
+
+
+def has_marker(path: pathlib.Path, markers: Iterable[str]) -> str | None:
+    """Return the first marker present directly inside `path`, else None."""
+    for marker in markers:
+        if (path / marker).exists():
+            return marker
+    return None
+
+
+def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Path]:
+    """Directories under `roots` whose name looks like a build directory.
+
+    Does not descend into a candidate (a nested `build/` inside a build tree is
+    reclaimed with its parent), does not follow symlinks, and never returns a
+    root itself.
+    """
+    found: list[pathlib.Path] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        stack: list[tuple[pathlib.Path, int]] = [(root, 0)]
+        while stack:
+            current, depth = stack.pop()
+            if depth >= maxdepth:
+                continue
+            try:
+                entries = list(os.scandir(current))
+            except OSError:
+                continue
+            for entry in entries:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+                child = pathlib.Path(entry.path)
+                if is_build_dir_name(entry.name):
+                    found.append(child)
+                    continue
+                stack.append((child, depth + 1))
+    return sorted(found)
+
+
+def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float:
+    """Newest mtime at or shallowly below `path`.
+
+    A build tree that ran recently has a fresh `CMakeCache.txt`, `.ninja_log`,
+    or a fresh top-level subdirectory, so a bounded scan is enough and a full
+    recursive walk of a 100 GB tree is not paid on every pass.
+    """
+    newest = 0.0
+    stack: list[tuple[pathlib.Path, int]] = [(path, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            newest = max(newest, current.stat().st_mtime)
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+            except OSError:
+                continue
+            if depth + 1 < maxdepth and entry.is_dir(follow_symlinks=False):
+                stack.append((pathlib.Path(entry.path), depth + 1))
+    return newest
+
+
+def active_command_lines(pattern: str = BUILD_PROCESS_PATTERN) -> str | None:
+    """Live build command lines, or None when the process table cannot be read.
+
+    The distinction matters more than it looks. An empty result means "pgrep
+    ran and no build is in flight", which licenses deletion. A failed scan
+    means we do not know, and reading that as an idle host would delete a
+    live build. So the two cases must never collapse to the same value.
+    `pgrep` exits 1 with empty output when nothing matches; anything above
+    that is an error, not an answer.
+    """
+    try:
+        proc = subprocess.run(
+            ["pgrep", "-fl", pattern],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+    if proc.returncode > 1:
+        return None
+    return proc.stdout or ""
+
+
+def dir_size_bytes(path: pathlib.Path) -> int:
+    """Size of `path`, preferring `du` and falling back to a python walk."""
+    try:
+        proc = subprocess.run(
+            ["du", "-sk", str(path)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return int(proc.stdout.split()[0]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    total = 0
+    for current, _dirs, files in os.walk(path, onerror=lambda _e: None):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(current, name)).st_size
+            except OSError:
+                continue
+    return total
+
+
+def free_bytes(path: pathlib.Path) -> int | None:
+    """Free bytes on `path`'s volume, or None when it cannot be read.
+
+    Returning 0 here would be read as a full disk, which selects the SHORTER
+    pressure age gate. An unreadable volume would then reclaim harder than a
+    healthy one, so the unknown case has to stay distinct from zero.
+    """
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def classify(
+    path: pathlib.Path,
+    *,
+    now: float,
+    min_age_days: float,
+    active: str | None,
+) -> tuple[bool, str, float]:
+    """Decide one candidate. Returns (delete, reason, age_days).
+
+    `active` is the live build command lines, or None when that scan failed.
+    None blocks every deletion: without a process table we cannot prove a
+    build is not running, and the whole contract is that deletion requires
+    positive proof rather than absence of evidence.
+    """
+    age_days = max(0.0, (now - newest_mtime(path)) / 86400.0)
+
+    if has_marker(path, SOURCE_MARKERS):
+        return False, "source_tree", age_days
+    marker = has_marker(path, GENERATED_MARKERS)
+    if marker is None:
+        return False, "not_a_build_tree", age_days
+    if active is None:
+        return False, "process_scan_unavailable", age_days
+    if active and str(path) in active:
+        return False, "active_build", age_days
+    if age_days < min_age_days:
+        return False, "too_recent", age_days
+    return True, f"reclaimable ({marker}, idle {age_days:.1f}d)", age_days
+
+
+def parse_roots(raw: str | None) -> list[pathlib.Path]:
+    home = pathlib.Path(os.path.expanduser("~"))
+    if not raw:
+        return [home / "Code"]
+    return [pathlib.Path(os.path.expanduser(part)).resolve()
+            for part in raw.split(":") if part]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Reclaim regenerable build directories on a CI host.")
+    parser.add_argument(
+        "--roots",
+        default=os.environ.get("TARTCI_RECLAIM_ROOTS"),
+        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS or ~/Code)")
+    parser.add_argument("--maxdepth", type=int,
+                        default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "3")),
+                        help="directory depth below each root to scan (default 3)")
+    parser.add_argument("--min-age-days", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_MIN_AGE_DAYS", "30")),
+                        help="always reclaim a build dir idle at least this long (default 30)")
+    parser.add_argument("--pressure-free-gb", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_FREE_GB", "200")),
+                        help="free space below which the shorter age gate applies (default 200)")
+    parser.add_argument("--pressure-min-age-days", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS", "7")),
+                        help="age gate used under disk pressure (default 7)")
+    parser.add_argument("--fail-below-gb", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_FAIL_BELOW_GB", "0")),
+                        help="exit 3 when free space is still below this after the pass (0 disables)")
+    parser.add_argument("--fix", action="store_true",
+                        help="actually delete; without it the pass is a dry run")
+    parser.add_argument("--json", action="store_true", help="emit a JSON report")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    roots = parse_roots(args.roots)
+    if not roots:
+        print("disk_reclaim: no scan roots", file=sys.stderr)
+        return 2
+
+    now = time.time()
+    free_before = free_bytes(roots[0])
+    # An unknown free figure selects the LONGER gate. Guessing "full" here
+    # would make an unreadable volume delete more aggressively than a healthy
+    # one, which is exactly backwards.
+    pressure = free_before is not None and free_before < args.pressure_free_gb * GIB
+    min_age = min(args.min_age_days, args.pressure_min_age_days) if pressure \
+        else args.min_age_days
+
+    active = active_command_lines()
+    candidates = find_candidates(roots, args.maxdepth)
+
+    deleted: list[dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
+    reclaimed = 0
+
+    for path in candidates:
+        delete, reason, age_days = classify(
+            path, now=now, min_age_days=min_age, active=active)
+        if not delete:
+            kept.append({"path": str(path), "reason": reason,
+                         "age_days": round(age_days, 1)})
+            continue
+        size = dir_size_bytes(path)
+        record = {"path": str(path), "reason": reason,
+                  "age_days": round(age_days, 1), "size_bytes": size}
+        if args.fix:
+            try:
+                shutil.rmtree(path)
+            except OSError as exc:
+                record["error"] = str(exc)
+                kept.append(record)
+                continue
+            reclaimed += size
+        deleted.append(record)
+
+    free_after = free_bytes(roots[0]) if args.fix else free_before
+    report = {
+        "process_scan_ok": active is not None,
+        "roots": [str(root) for root in roots],
+        "mode": "fix" if args.fix else "dry-run",
+        "pressure": pressure,
+        "min_age_days": min_age,
+        "candidates": len(candidates),
+        "deleted": deleted,
+        "kept": kept,
+        "reclaimed_bytes": reclaimed,
+        "free_bytes_before": free_before,
+        "free_bytes_after": free_after,
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        verb = "removed" if args.fix else "would remove"
+        for record in deleted:
+            print(f"  {verb} {record['size_bytes'] / GIB:6.1f} GiB  {record['path']}")
+        free_text = "unknown" if free_after is None else f"{free_after / GIB:.1f} GiB"
+        print(f"disk_reclaim: {len(candidates)} candidate(s) under "
+              f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
+              f"{reclaimed / GIB:.1f} GiB reclaimed; "
+              f"free {free_text} "
+              f"(pressure={'yes' if pressure else 'no'}, age gate {min_age:g}d)")
+        if active is None:
+            print("disk_reclaim: process scan unavailable, so nothing was "
+                  "eligible for deletion this pass.", file=sys.stderr)
+        if not args.fix:
+            print("disk_reclaim: re-run with --fix to delete.")
+
+    if active is None:
+        print("disk_reclaim: could not read the process table (pgrep), so no "
+              "build directory could be proven idle. Deleted nothing.",
+              file=sys.stderr)
+        return 4
+
+    if args.fail_below_gb > 0 and free_after is None:
+        print("disk_reclaim: could not read free space, so the "
+              f"{args.fail_below_gb:g} GiB floor could not be checked.",
+              file=sys.stderr)
+        return 4
+
+    if args.fail_below_gb > 0 and free_after < args.fail_below_gb * GIB:
+        print(f"disk_reclaim: FREE SPACE STILL LOW after reclaim: "
+              f"{free_after / GIB:.1f} GiB < {args.fail_below_gb:g} GiB floor. "
+              f"This host will refuse leases (disk_capacity_exceeded).",
+              file=sys.stderr)
+        return 3
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
