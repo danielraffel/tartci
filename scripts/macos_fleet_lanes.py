@@ -1175,6 +1175,7 @@ def fleet_readiness(
     participating: bool,
     pool_state: str,
     stale_heartbeat_seconds: int = 300,
+    blocked_serving_seconds: int = 5400,
 ) -> dict:
     """Report realized receipt-backed capacity separately from pool intent."""
     problems: list[dict[str, str]] = []
@@ -1359,6 +1360,33 @@ def fleet_readiness(
                         "detail": f"age_seconds={int(age)}",
                     })
                     continue
+                # A fresh heartbeat proves the supervisor is alive, not that it
+                # is serving. One that keeps winning a host reservation and then
+                # losing the VM lease heartbeats normally forever, so age alone
+                # cannot see it. Absent field = a generation that predates it;
+                # treat that as "not measurable" rather than "not blocked".
+                blocked_since = str(matching_state.get("serving_blocked_since", "") or "")
+                if blocked_since:
+                    try:
+                        blocked_at = dt.datetime.fromisoformat(
+                            blocked_since.replace("Z", "+00:00")
+                        )
+                    except (TypeError, ValueError):
+                        problems.append({
+                            "code": "serving_blocked_invalid", "label": label,
+                            "detail": blocked_since,
+                        })
+                        continue
+                    blocked_for = (now - blocked_at).total_seconds()
+                    if blocked_for > blocked_serving_seconds:
+                        problems.append({
+                            "code": "serving_blocked", "label": label,
+                            "detail": (
+                                f"blocked_seconds={int(blocked_for)} "
+                                "(alive, repeatedly denied a VM lease)"
+                            ),
+                        })
+                        continue
                 verified_running += 1
 
     if admission_open and len(persistent_loaded_outputs) == len(persistent_labels):
@@ -1636,6 +1664,7 @@ def main(argv: list[str] | None = None) -> int:
     readiness.add_argument("--participating", choices=("0", "1"), required=True)
     readiness.add_argument("--pool-state", choices=("on", "off", "draining"), required=True)
     readiness.add_argument("--stale-heartbeat-seconds", type=int, default=300)
+    readiness.add_argument("--blocked-serving-seconds", type=int, default=5400)
     args = parser.parse_args(argv)
     try:
         if args.command == "probe-launch-helper":
@@ -1658,6 +1687,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.receipt, args.config, args.agents_dir, args.support_root,
                 args.participating == "1", args.pool_state,
                 args.stale_heartbeat_seconds,
+                args.blocked_serving_seconds,
             ), sort_keys=True))
             return 0
         if args.command == "verify-installed":
