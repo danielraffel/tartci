@@ -46,6 +46,7 @@ import json
 import os
 import pathlib
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -442,6 +443,58 @@ def tightest_volume_root(volumes: list[dict[str, Any]]) -> str | None:
     return min(known, key=lambda v: v["free_bytes"])["root"]
 
 
+def rotate_log(path: pathlib.Path, max_bytes: int, generations: int,
+               stream: Any = None) -> bool:
+    """Rename an oversized log aside at startup, keeping `generations` of it.
+
+    The reclaim log lives on the volume the reclaim exists to protect, and
+    launchd appends every hourly pass to it forever. Nothing has ever bounded
+    it: m3 was carrying 368M of tartci logs when this was written. A janitor
+    whose own receipt fills the disk is the failure it was built to prevent.
+
+    Rename rather than truncate, because launchd opens `StandardOutPath`
+    fresh on every spawn of a `StartInterval` job. That was measured on a
+    throwaway job, not assumed, and it has a visible consequence: the fd this
+    process inherited still points at the renamed inode, so THIS pass's output
+    lands in generation 1 and the next spawn creates the new file. The bound
+    is therefore generations x (max_bytes + one pass's output), never
+    generations x max_bytes exactly.
+
+    Returns True when a rotation happened, and never raises. A log that cannot
+    be rotated is a far smaller problem than a reclaim pass that refuses to
+    run because of it.
+    """
+    if max_bytes <= 0 or generations <= 0:
+        return False
+    stream = sys.stderr if stream is None else stream
+    try:
+        metadata = path.lstat()
+    except OSError:
+        return False  # absent or unreadable: there is nothing to rotate yet
+    try:
+        # lstat, so a symlink is judged as a symlink. Following one would let
+        # anything that can write this directory choose the file we rename.
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            print(f"disk_reclaim: refusing to rotate {path}: "
+                  "not a user-owned regular file", file=stream)
+            return False
+        if metadata.st_size < max_bytes:
+            return False
+        oldest = pathlib.Path(f"{path}.{generations}")
+        oldest.unlink(missing_ok=True)
+        for index in range(generations - 1, 0, -1):
+            source = pathlib.Path(f"{path}.{index}")
+            if source.exists():
+                os.replace(source, pathlib.Path(f"{path}.{index + 1}"))
+        os.replace(path, pathlib.Path(f"{path}.1"))
+        descriptor = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        os.close(descriptor)
+    except OSError as error:
+        print(f"disk_reclaim: could not rotate {path}: {error}", file=stream)
+        return False
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Reclaim regenerable build directories on a CI host.")
@@ -464,6 +517,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-below-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_FAIL_BELOW_GB", "0")),
                         help="exit 3 when free space is still below this after the pass (0 disables)")
+    parser.add_argument("--log-path",
+                        default=os.environ.get("TARTCI_RECLAIM_LOG"),
+                        help="log file to rotate aside at startup once it reaches --log-max-bytes (default: $TARTCI_RECLAIM_LOG; unset disables rotation)")
+    parser.add_argument("--log-max-bytes", type=int,
+                        default=int(os.environ.get("TARTCI_RECLAIM_LOG_MAX_BYTES", str(8 * 1024 * 1024))),
+                        help="rotate the log once it reaches this size (default 8 MiB)")
+    parser.add_argument("--log-generations", type=int,
+                        default=int(os.environ.get("TARTCI_RECLAIM_LOG_GENERATIONS", "5")),
+                        help="how many rotated generations to keep (default 5)")
     parser.add_argument("--fix", action="store_true",
                         help="actually delete; without it the pass is a dry run")
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
@@ -472,6 +534,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Before anything is printed: this pass appends to that file, and an
+    # unbounded receipt on the volume we are protecting is the problem.
+    if args.log_path:
+        rotate_log(pathlib.Path(args.log_path).expanduser(),
+                   args.log_max_bytes, args.log_generations)
     roots = parse_roots(args.roots)
     if not roots:
         print("disk_reclaim: no scan roots", file=sys.stderr)

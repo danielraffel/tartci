@@ -988,5 +988,151 @@ class RootDiscoveryTests(unittest.TestCase):
         self.assertEqual(code_ctl, 0)
 
 
+class RotateLogTests(unittest.TestCase):
+    """The janitor's own receipt must not be the thing that fills the disk.
+
+    launchd appends every hourly pass to `StandardOutPath` and nothing has
+    ever bounded it, so these cover the rotation that does. Every negative
+    assertion here is paired with a control that MUST rotate, because a
+    rotation that silently does nothing passes a "the file survived" test
+    exactly as happily as one that correctly refused.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.dir = pathlib.Path(self.tmp.name).resolve()
+        self.log = self.dir / "tartci-reclaim.log"
+        self.addCleanup(self.tmp.cleanup)
+
+    def write_log(self, size: int, content: str = "a") -> None:
+        self.log.write_text(content * size)
+
+    def test_an_oversized_log_is_renamed_aside_and_a_fresh_one_takes_over(self):
+        self.write_log(64, "o")
+        self.assertTrue(dr.rotate_log(self.log, max_bytes=64, generations=3))
+        # Renamed, not truncated: launchd's inherited fd still points at the
+        # old inode, so this pass's own output has to keep landing somewhere.
+        self.assertEqual((self.dir / "tartci-reclaim.log.1").read_text(),
+                         "o" * 64)
+        self.assertTrue(self.log.exists())
+        self.assertEqual(self.log.read_text(), "")
+
+    def test_a_log_under_the_bound_is_left_alone(self):
+        self.write_log(63, "o")
+        self.assertFalse(dr.rotate_log(self.log, max_bytes=64, generations=3))
+        self.assertEqual(self.log.read_text(), "o" * 63)
+        self.assertFalse((self.dir / "tartci-reclaim.log.1").exists())
+        # Control: one more byte on the SAME instrument must rotate, so a
+        # rotation that can never fire cannot pass the assertions above.
+        self.write_log(64, "o")
+        self.assertTrue(dr.rotate_log(self.log, max_bytes=64, generations=3))
+        self.assertTrue((self.dir / "tartci-reclaim.log.1").exists())
+
+    def test_generations_shuffle_down_and_the_oldest_is_dropped(self):
+        for index in (1, 2):
+            (self.dir / f"tartci-reclaim.log.{index}").write_text(f"gen{index}")
+        self.write_log(64, "n")
+        self.assertTrue(dr.rotate_log(self.log, max_bytes=64, generations=2))
+        self.assertEqual((self.dir / "tartci-reclaim.log.1").read_text(),
+                         "n" * 64)
+        self.assertEqual((self.dir / "tartci-reclaim.log.2").read_text(), "gen1")
+        # gen2's content is gone: what proves the drop is generation 2 now
+        # carrying gen1, not the absence below. The ceiling assertion is a
+        # guard against a future refactor, and it is deliberately not the
+        # evidence -- removing either the unlink or the shuffle's upper bound
+        # leaves it green, because the two enforce the ceiling jointly.
+        self.assertFalse((self.dir / "tartci-reclaim.log.3").exists())
+
+    def test_a_symlink_is_refused_rather_than_followed(self):
+        target = self.dir / "elsewhere.log"
+        target.write_text("t" * 64)
+        link = self.dir / "linked.log"
+        link.symlink_to(target)
+        stream = io.StringIO()
+        self.assertFalse(dr.rotate_log(link, max_bytes=64, generations=3,
+                                       stream=stream))
+        self.assertIn("not a user-owned regular file", stream.getvalue())
+        # Neither the link nor what it points at was renamed: following it
+        # would let anything that can write this directory pick the victim.
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(target.read_text(), "t" * 64)
+        self.assertFalse((self.dir / "linked.log.1").exists())
+        # Control: the identical size through a real file does rotate.
+        self.write_log(64, "t")
+        self.assertTrue(dr.rotate_log(self.log, max_bytes=64, generations=3))
+
+    def test_an_absent_log_is_not_an_error(self):
+        self.assertFalse(dr.rotate_log(self.dir / "never-written.log",
+                                       max_bytes=64, generations=3))
+        self.assertFalse((self.dir / "never-written.log").exists())
+
+    def test_a_zero_bound_disables_rotation(self):
+        self.write_log(64, "z")
+        self.assertFalse(dr.rotate_log(self.log, max_bytes=0, generations=3))
+        self.assertFalse((self.dir / "tartci-reclaim.log.1").exists())
+        # Control: the same file with a real bound rotates.
+        self.assertTrue(dr.rotate_log(self.log, max_bytes=64, generations=3))
+        self.assertTrue((self.dir / "tartci-reclaim.log.1").exists())
+
+
+class LogRotationWiringTests(unittest.TestCase):
+    """A rotation nothing calls bounds nothing.
+
+    This is the half that actually ships: `rotate_log` passing its own unit
+    tests while `main` never reaches it would leave the log growing exactly
+    as it does today, and every test above would still be green.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.scan = self.root / "code"
+        self.scan.mkdir()
+        self.log = self.root / "tartci-reclaim.log"
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_main(self, *argv):
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            return dr.main(["--roots", str(self.scan), *argv])
+
+    def test_a_pass_rotates_an_oversized_log_before_it_writes(self):
+        self.log.write_text("o" * 64)
+        code = self.run_main("--json", "--log-path", str(self.log),
+                             "--log-max-bytes", "64", "--log-generations", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual((self.root / "tartci-reclaim.log.1").read_text(),
+                         "o" * 64)
+
+    def test_a_pass_leaves_a_log_under_the_bound_alone(self):
+        self.log.write_text("o" * 63)
+        code = self.run_main("--json", "--log-path", str(self.log),
+                             "--log-max-bytes", "64", "--log-generations", "3")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.log.read_text(), "o" * 63)
+        self.assertFalse((self.root / "tartci-reclaim.log.1").exists())
+
+    def test_without_a_log_path_a_pass_rotates_nothing(self):
+        self.log.write_text("o" * 64)
+        code = self.run_main("--json", "--log-max-bytes", "64")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.log.read_text(), "o" * 64)
+        self.assertFalse((self.root / "tartci-reclaim.log.1").exists())
+
+    def test_the_env_var_supplies_the_log_path_launchd_will_set(self):
+        # The plist sets TARTCI_RECLAIM_LOG; the flag is for a human. Parsing
+        # the env happens at parser construction, so this has to be patched
+        # around the call rather than set once in setUp.
+        self.log.write_text("o" * 64)
+        with unittest.mock.patch.dict(
+                os.environ,
+                {"TARTCI_RECLAIM_LOG": str(self.log),
+                 "TARTCI_RECLAIM_LOG_MAX_BYTES": "64",
+                 "TARTCI_RECLAIM_LOG_GENERATIONS": "3"}):
+            code = self.run_main("--json")
+        self.assertEqual(code, 0)
+        self.assertEqual((self.root / "tartci-reclaim.log.1").read_text(),
+                         "o" * 64)
+
+
 if __name__ == "__main__":
     unittest.main()

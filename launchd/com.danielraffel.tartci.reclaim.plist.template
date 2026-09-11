@@ -67,6 +67,20 @@
   floor after a pass exits non-zero, so launchd records a failing janitor
   instead of the fleet only seeing refused leases.
 
+  TARTCI_RECLAIM_LOG bounds the janitor's own receipt. StandardOutPath below
+  is appended to on every pass and nothing else ever truncates it, so without
+  this the log grows without limit on the very volume the janitor exists to
+  protect. It must name the SAME path as StandardOutPath: disk_reclaim renames
+  that file aside at startup once it reaches TARTCI_RECLAIM_LOG_MAX_BYTES and
+  keeps TARTCI_RECLAIM_LOG_GENERATIONS of it, so the worst case on disk is
+  generations x (max bytes + one pass's output).
+
+  Rename rather than truncate, because launchd opens StandardOutPath fresh on
+  every spawn of a StartInterval job. The one-pass overshoot in that bound is
+  the direct consequence: the fd this pass inherited still points at the inode
+  it just renamed, so the pass that triggers a rotation writes into generation
+  1 and the new file starts collecting at the next spawn.
+
   Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
   and sizes candidates, and disk fills over days rather than seconds.
 -->
@@ -117,6 +131,12 @@
         <string>7</string>
         <key>TARTCI_RECLAIM_FAIL_BELOW_GB</key>
         <string>60</string>
+        <key>TARTCI_RECLAIM_LOG</key>
+        <string>$HOME/Library/Logs/tartci/tartci-reclaim.log</string>
+        <key>TARTCI_RECLAIM_LOG_MAX_BYTES</key>
+        <string>8388608</string>
+        <key>TARTCI_RECLAIM_LOG_GENERATIONS</key>
+        <string>5</string>
     </dict>
 </dict>
 </plist>

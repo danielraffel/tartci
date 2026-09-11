@@ -658,6 +658,22 @@ Logs land in
 the reap agent's five minutes: a pass walks the scan roots and sizes
 candidates, and a disk fills over days.
 
+That log is bounded, because it lives on the volume the janitor exists to
+protect and launchd appends every pass to it forever. Nothing used to truncate
+it: m3 was carrying 368 MiB of tartci logs when the bound was written. Each
+pass renames the log aside at startup once it reaches
+`TARTCI_RECLAIM_LOG_MAX_BYTES` (8 MiB) and keeps `TARTCI_RECLAIM_LOG_GENERATIONS`
+(5) of it. `TARTCI_RECLAIM_LOG` must name the same path as `StandardOutPath`,
+which is what the template does; leaving it unset disables rotation entirely.
+
+It renames rather than truncates, because launchd opens `StandardOutPath` fresh
+on every spawn of a `StartInterval` job. That was measured on a throwaway job
+rather than assumed, and it has a visible consequence: the descriptor a pass
+inherited still points at the inode it just renamed, so the pass that triggers a
+rotation writes into generation 1 and the new file starts collecting at the next
+spawn. The worst case on disk is therefore generations x (max bytes + one
+pass's output), roughly 40 MiB, not generations x max bytes exactly.
+
 Pulp ships its own `tools/scripts/clean_build_cov.sh`, which covers only
 `build-cov*` inside one checkout. That stays: it is the repo-local convenience
 for an external cloner who has no tartci. This agent is the fleet-wide job, and
