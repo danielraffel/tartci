@@ -674,6 +674,18 @@ rotation writes into generation 1 and the new file starts collecting at the next
 spawn. The worst case on disk is therefore generations x (max bytes + one
 pass's output), roughly 40 MiB, not generations x max bytes exactly.
 
+`tartci status` reports whether this host has the agent, whether launchd holds
+it, when it last wrote its log, and the free space on each volume the janitor
+scans. Ask it before assuming a host is protected: the failure it exists to
+catch is silent, because a host that never got the agent looks exactly like a
+host whose passes are all finding nothing. m3 was running a stale generation
+while m1 and m5 had no reap agent at all, and nothing reported that.
+
+It reads the roots from `disk_reclaim` itself rather than keeping its own list,
+so status cannot disagree with the janitor about which volumes are scanned, and
+it prints `unknown` rather than a figure when a volume cannot be read. An
+unreadable volume is not a healthy one.
+
 Pulp ships its own `tools/scripts/clean_build_cov.sh`, which covers only
 `build-cov*` inside one checkout. That stays: it is the repo-local convenience
 for an external cloner who has no tartci. This agent is the fleet-wide job, and

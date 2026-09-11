@@ -1417,7 +1417,11 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   is still below `TARTCI_RECLAIM_FAIL_BELOW_GB` afterwards so a full disk
   surfaces as a failing agent rather than only as refused leases. Preview a host
   with `tartci reclaim` (dry run) before installing it; see
-  `launchd/README.md`. This does not contradict the line above: the reclaimer
+  `launchd/README.md`. Ask `tartci status` whether this host actually has that
+  agent, whether launchd holds it, and how much room is left on each volume it
+  scans: a host that never got the agent looks exactly like a host whose passes
+  are all finding nothing, and that is how m3 ran a stale generation while m1
+  and m5 carried no reap agent at all. This does not contradict the line above: the reclaimer
   deletes generated build output that carries no source marker, never a
   checkout.
 
