@@ -606,7 +606,7 @@ Run it report-only first. Without `--fix` the pass is a dry run and prints what
 it would remove:
 
 ```sh
-TARTCI_RECLAIM_ROOTS="$HOME/Code" "$HOME/.local/bin/tartci" reclaim
+"$HOME/.local/bin/tartci" reclaim
 ```
 
 A dry run reports the bytes a `--fix` pass would free, both in the summary line
@@ -614,8 +614,22 @@ A dry run reports the bytes a `--fix` pass would free, both in the summary line
 step tells you what the rollout is actually worth on that host. Under `--fix`
 the same figure is what was freed.
 
-`TARTCI_RECLAIM_ROOTS` is colon-separated, so a host that keeps code on an
-external volume declares it there. Logs land in
+Scan roots are discovered rather than declared: the janitor keeps whichever of
+`~/Code` and `/Volumes/Workshop/Code` the host actually has, and judges free
+space, the pressure tier, and the floor on every volume those roots span.
+`TARTCI_RECLAIM_ROOTS` still overrides with a colon-separated list, but reach
+for it only for a one-off run. A declared root that exists on the wrong volume
+is the one fault nothing downstream can catch: the pass reports a clean exit 0
+forever while the volume it was installed to protect fills up, which is what
+`$HOME/Code` did on a host that keeps its code on Workshop.
+
+The scan depth of 3 is deliberate. It covers `Code/<repo>/build` and
+`Code/agent-worktrees/<worktree>/build-cov` and nothing else; the build-named
+directories below that depth are `external/skia-build/build`, cargo
+`target/debug/build`, `node_modules/*/build`, and `.git/refs/heads/build`, none
+of which may be deleted. Raising it is a hazard, not a coverage improvement.
+
+Logs land in
 `~/Library/Logs/tartci/tartci-reclaim.log`. The agent runs hourly rather than
 the reap agent's five minutes: a pass walks the scan roots and sizes
 candidates, and a disk fills over days.

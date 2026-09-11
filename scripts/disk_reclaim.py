@@ -342,12 +342,104 @@ def classify(
     return True, f"reclaimable ({marker}, idle {age_days:.1f}d)", age_days
 
 
+# Where build trees live when nothing declares TARTCI_RECLAIM_ROOTS. This is
+# a list and not a single `~/Code` because a hand-set root that EXISTS but
+# sits on the wrong volume passes every guard below and reports a clean exit 0
+# forever while the volume it was installed to protect fills up. m3 keeps its
+# code and worktrees on an external Workshop volume and still has a populated
+# `~/Code` on the boot disk, so `~/Code` alone is exactly that failure.
+# Discovery keeps whichever of these the host actually has, so a host is
+# covered without per-host tuning of the rendered plist.
+DEFAULT_ROOT_CANDIDATES = (
+    "~/Code",
+    "/Volumes/Workshop/Code",
+)
+
+
+def discover_roots() -> list[pathlib.Path]:
+    """Existing default scan roots, in candidate order, deduped by device+path.
+
+    A candidate that does not exist is skipped rather than reported, which is
+    the opposite of how an explicitly declared root is treated: declaring a
+    root that is absent is a configuration fault, while a default that does
+    not apply to this host is simply not this host's layout.
+    """
+    found: list[pathlib.Path] = []
+    seen: set[str] = set()
+    for candidate in DEFAULT_ROOT_CANDIDATES:
+        path = pathlib.Path(os.path.expanduser(candidate))
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if not resolved.is_dir() or str(resolved) in seen:
+            continue
+        seen.add(str(resolved))
+        found.append(resolved)
+    return found
+
+
 def parse_roots(raw: str | None) -> list[pathlib.Path]:
-    home = pathlib.Path(os.path.expanduser("~"))
     if not raw:
-        return [home / "Code"]
+        return discover_roots()
     return [pathlib.Path(os.path.expanduser(part)).resolve()
             for part in raw.split(":") if part]
+
+
+def device_id(path: pathlib.Path) -> int | None:
+    """The volume a path lives on, or None when it cannot be determined.
+
+    Unknown must not collapse into a shared sentinel: two unreadable roots
+    are not evidence of one volume, and folding them together would drop a
+    measurement rather than take one.
+    """
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def volumes_free_bytes(roots: list[pathlib.Path]) -> list[dict[str, Any]]:
+    """Free space for every distinct volume the scan roots span.
+
+    One entry per device, in root order. Measuring roots[0] alone is what
+    lets a two-volume host report a healthy pass: m3 scans the boot disk and
+    the Workshop volume, and only one of them is the one that fills.
+    """
+    seen: set[int] = set()
+    out: list[dict[str, Any]] = []
+    for root in roots:
+        device = device_id(root)
+        if device is not None:
+            if device in seen:
+                continue
+            seen.add(device)
+        out.append({"root": str(root), "device": device,
+                    "free_bytes": free_bytes(root)})
+    return out
+
+
+def tightest_free_bytes(volumes: list[dict[str, Any]]) -> int | None:
+    """The smallest free figure across `volumes`, or None if any is unknown.
+
+    None when ANY volume is unreadable, because the unreadable one could be
+    the full one. An unknown has to stay distinct from a healthy reading for
+    the same reason `free_bytes` never returns 0 on failure.
+    """
+    if not volumes:
+        return None
+    figures = [volume["free_bytes"] for volume in volumes]
+    if any(figure is None for figure in figures):
+        return None
+    return min(figures)
+
+
+def tightest_volume_root(volumes: list[dict[str, Any]]) -> str | None:
+    """The root naming the volume `tightest_free_bytes` reported, if known."""
+    known = [v for v in volumes if v["free_bytes"] is not None]
+    if not known or len(known) != len(volumes):
+        return None
+    return min(known, key=lambda v: v["free_bytes"])["root"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -356,7 +448,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--roots",
         default=os.environ.get("TARTCI_RECLAIM_ROOTS"),
-        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS or ~/Code)")
+        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and /Volumes/Workshop/Code exist)")
     parser.add_argument("--maxdepth", type=int,
                         default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "3")),
                         help="directory depth below each root to scan (default 3)")
@@ -401,13 +493,35 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     now = time.time()
-    free_before = free_bytes(roots[0])
+    volumes_before = volumes_free_bytes(roots)
+    free_before = tightest_free_bytes(volumes_before)
     # An unknown free figure selects the LONGER gate. Guessing "full" here
     # would make an unreadable volume delete more aggressively than a healthy
     # one, which is exactly backwards.
-    pressure = free_before is not None and free_before < args.pressure_free_gb * GIB
-    min_age = min(args.min_age_days, args.pressure_min_age_days) if pressure \
-        else args.min_age_days
+    # Pressure is per volume, and so is the gate it selects. A low boot disk
+    # is a real reason to reclaim the boot disk's build directories sooner; it
+    # is not a reason to delete week-old builds off a Workshop volume that has
+    # 1.6 TiB free, and the shorter gate is the one direction where being
+    # wrong destroys work. An unknown free figure keeps the LONGER gate, the
+    # same direction the single-volume code already took.
+    short_gate = min(args.min_age_days, args.pressure_min_age_days)
+    pressured_devices = {
+        volume["device"] for volume in volumes_before
+        if volume["device"] is not None
+        and volume["free_bytes"] is not None
+        and volume["free_bytes"] < args.pressure_free_gb * GIB
+    }
+    pressure = bool(pressured_devices)
+
+    def min_age_for(path: pathlib.Path) -> float:
+        device = device_id(path)
+        if device is None or device not in pressured_devices:
+            return args.min_age_days
+        return short_gate
+
+    # Reported as the tightest gate any candidate can meet, so the summary
+    # line still names a single number; the per-volume detail is in the JSON.
+    min_age = short_gate if pressure else args.min_age_days
 
     progress = Progress()
     progress.emit(
@@ -426,8 +540,9 @@ def main(argv: list[str] | None = None) -> int:
         progress.emit(
             f"{index}/{len(candidates)} examined, "
             f"{reclaimed / GIB:.1f} GiB so far")
+        candidate_min_age = min_age_for(path)
         delete, reason, age_days = classify(
-            path, now=now, min_age_days=min_age, active=active)
+            path, now=now, min_age_days=candidate_min_age, active=active)
         if not delete:
             kept.append({"path": str(path), "reason": reason,
                          "age_days": round(age_days, 1)})
@@ -443,7 +558,8 @@ def main(argv: list[str] | None = None) -> int:
             # it no longer clears the gate. One bounded stat walk against an
             # operation that already pays for a recursive unlink.
             recheck = newest_mtime(path)
-            if recheck is None or (time.time() - recheck) / 86400.0 < min_age:
+            if recheck is None or \
+                    (time.time() - recheck) / 86400.0 < candidate_min_age:
                 record["reason"] = "touched_during_pass"
                 kept.append(record)
                 continue
@@ -465,7 +581,8 @@ def main(argv: list[str] | None = None) -> int:
         reclaimed += size
         deleted.append(record)
 
-    free_after = free_bytes(roots[0]) if args.fix else free_before
+    volumes_after = volumes_free_bytes(roots) if args.fix else volumes_before
+    free_after = tightest_free_bytes(volumes_after)
     report = {
         "process_scan_ok": active is not None,
         "roots": [str(root) for root in roots],
@@ -478,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
         "reclaimed_bytes": reclaimed,
         "free_bytes_before": free_before,
         "free_bytes_after": free_after,
+        "free_bytes_by_volume_before": volumes_before,
+        "free_bytes_by_volume_after": volumes_after,
     }
 
     if args.json:
@@ -487,7 +606,11 @@ def main(argv: list[str] | None = None) -> int:
         freed_verb = "reclaimed" if args.fix else "would reclaim"
         for record in deleted:
             print(f"  {verb} {record['size_bytes'] / GIB:6.1f} GiB  {record['path']}")
-        free_text = "unknown" if free_after is None else f"{free_after / GIB:.1f} GiB"
+        tightest_root = tightest_volume_root(volumes_after)
+        free_text = "unknown" if free_after is None else (
+            f"{free_after / GIB:.1f} GiB"
+            + (f" on {tightest_root}" if tightest_root and len(volumes_after) > 1
+               else ""))
         print(f"disk_reclaim: {len(candidates)} candidate(s) under "
               f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
               f"{freed_verb} {reclaimed / GIB:.1f} GiB; "
@@ -512,8 +635,10 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     if args.fail_below_gb > 0 and free_after < args.fail_below_gb * GIB:
+        tightest_root = tightest_volume_root(volumes_after)
+        where = f" on {tightest_root}" if tightest_root else ""
         print(f"disk_reclaim: FREE SPACE STILL LOW after reclaim: "
-              f"{free_after / GIB:.1f} GiB < {args.fail_below_gb:g} GiB floor. "
+              f"{free_after / GIB:.1f} GiB{where} < {args.fail_below_gb:g} GiB floor. "
               f"This host will refuse leases (disk_capacity_exceeded).",
               file=sys.stderr)
         return 3

@@ -27,12 +27,25 @@
     launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist"
     launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.reclaim"
 
-  Tune per host by editing the TARTCI_RECLAIM_* values below before rendering.
-  TARTCI_RECLAIM_ROOTS is a colon-separated list, so a host that keeps code on
-  an external volume declares it here (m3: /Volumes/Workshop/Code plus its
-  agent-worktrees root). TARTCI_RECLAIM_FAIL_BELOW_GB is the escalation half:
-  a host still under the floor after a pass exits non-zero, so launchd records
-  a failing janitor instead of the fleet only seeing refused leases.
+  Scan roots are DISCOVERED, not declared. This template deliberately does not
+  set TARTCI_RECLAIM_ROOTS: the janitor keeps whichever of ~/Code and
+  /Volumes/Workshop/Code the host actually has. A hand-tuned root is the one
+  failure the guards cannot catch, because a root that EXISTS but sits on the
+  wrong volume passes every check and reports a clean exit 0 forever while the
+  volume it was installed to protect fills up. m3 is exactly that shape: it
+  keeps code and worktrees on Workshop and still has a populated ~/Code on the
+  boot disk. Free space, the pressure tier, and the floor are judged on every
+  volume the roots span, so the healthier disk cannot mask the full one.
+
+  Depth 3 is deliberate and should not be raised. It covers both real shapes,
+  Code/<repo>/build and Code/agent-worktrees/<worktree>/build-cov, and nothing
+  else. Every measured build-named directory below that depth on m3 belongs to
+  something that must never be deleted: external/skia-build/build, cargo
+  target/debug/build, node_modules/*/build, and .git/refs/heads/build.
+
+  TARTCI_RECLAIM_FAIL_BELOW_GB is the escalation half: a host still under the
+  floor after a pass exits non-zero, so launchd records a failing janitor
+  instead of the fleet only seeing refused leases.
 
   Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
   and sizes candidates, and disk fills over days rather than seconds.
@@ -74,8 +87,6 @@
         <string>$HOME</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-        <key>TARTCI_RECLAIM_ROOTS</key>
-        <string>$HOME/Code</string>
         <key>TARTCI_RECLAIM_MAXDEPTH</key>
         <string>3</string>
         <key>TARTCI_RECLAIM_MIN_AGE_DAYS</key>

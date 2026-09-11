@@ -603,5 +603,186 @@ class ProgressWiringTests(MainTests):
         self.assertNotIn("removing ", err_dry)
 
 
+class MultiVolumeTests(unittest.TestCase):
+    """Every volume the scan spans must be measured, not just the first.
+
+    The janitor used to read free space from roots[0] alone, so a host that
+    scans a boot disk and an external volume judged pressure and the
+    --fail-below-gb floor on whichever happened to be listed first. On m3 that
+    is the boot disk, while the volume that actually fills is Workshop.
+    """
+
+    def setUp(self):
+        self.first = tempfile.TemporaryDirectory()
+        self.second = tempfile.TemporaryDirectory()
+        self.addCleanup(self.first.cleanup)
+        self.addCleanup(self.second.cleanup)
+        self.a = pathlib.Path(self.first.name).resolve()
+        self.b = pathlib.Path(self.second.name).resolve()
+
+    def run_json(self, *argv, free=None, devices=None):
+        """Run over both roots, optionally faking per-root volume facts."""
+        stack = []
+        if devices is not None:
+            # Keyed by root, resolved by prefix: a candidate inside a root
+            # really does live on that root's volume, and main() asks for the
+            # device of every candidate, not just of the roots.
+            def device_of(path, table=devices):
+                text = str(path)
+                for root, device in table.items():
+                    if text == root or text.startswith(root + "/"):
+                        return device
+                return None
+            stack.append(unittest.mock.patch.object(
+                dr, "device_id", side_effect=device_of))
+        if free is not None:
+            stack.append(unittest.mock.patch.object(
+                dr, "free_bytes", side_effect=lambda p: free[str(p)]))
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            for patcher in stack:
+                patcher.start()
+            try:
+                code = dr.main(["--roots", f"{self.a}:{self.b}", "--json",
+                                *argv])
+            finally:
+                for patcher in reversed(stack):
+                    patcher.stop()
+        return code, json.loads(buffer.getvalue())
+
+    def separate_volumes(self):
+        return {str(self.a): 101, str(self.b): 202}
+
+    def test_a_second_volume_below_the_floor_fails_the_pass(self):
+        plenty = 900 * dr.GIB
+        starved = 3 * dr.GIB
+        code, report = self.run_json(
+            "--fail-below-gb", "60",
+            free={str(self.a): plenty, str(self.b): starved},
+            devices=self.separate_volumes())
+        self.assertEqual(code, 3)
+        self.assertEqual(report["free_bytes_after"], starved)
+        self.assertEqual(
+            [v["root"] for v in report["free_bytes_by_volume_after"]],
+            [str(self.a), str(self.b)])
+        # Control: the identical run with the second volume healthy must pass.
+        # Without it, exit 3 could just mean the floor rejects every host.
+        code_ctl, report_ctl = self.run_json(
+            "--fail-below-gb", "60",
+            free={str(self.a): plenty, str(self.b): plenty},
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 0)
+        self.assertEqual(report_ctl["free_bytes_after"], plenty)
+
+    def test_pressure_fires_when_any_volume_is_low(self):
+        make_build_tree(self.b / "wt" / "build", age_days=400)
+        argv = ("--min-age-days", "30", "--pressure-free-gb", "200",
+                "--pressure-min-age-days", "7")
+        code, report = self.run_json(
+            *argv,
+            free={str(self.a): 900 * dr.GIB, str(self.b): 10 * dr.GIB},
+            devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertTrue(report["pressure"])
+        self.assertEqual(report["min_age_days"], 7)
+        # Control: both volumes above the threshold stay on the long gate.
+        code_ctl, report_ctl = self.run_json(
+            *argv,
+            free={str(self.a): 900 * dr.GIB, str(self.b): 900 * dr.GIB},
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 0)
+        self.assertFalse(report_ctl["pressure"])
+        self.assertEqual(report_ctl["min_age_days"], 30)
+
+    def test_one_unreadable_volume_cannot_certify_the_floor(self):
+        code, _ = self.run_json(
+            "--fail-below-gb", "60",
+            free={str(self.a): 900 * dr.GIB, str(self.b): None},
+            devices=self.separate_volumes())
+        self.assertEqual(code, 4)
+        # Control: the same roots with both figures readable certify fine.
+        code_ctl, _ = self.run_json(
+            "--fail-below-gb", "60",
+            free={str(self.a): 900 * dr.GIB, str(self.b): 900 * dr.GIB},
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 0)
+
+    def test_two_roots_on_one_volume_are_measured_once(self):
+        same = {str(self.a): 101, str(self.b): 101}
+        code, report = self.run_json(
+            free={str(self.a): 900 * dr.GIB, str(self.b): 900 * dr.GIB},
+            devices=same)
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [v["root"] for v in report["free_bytes_by_volume_before"]],
+            [str(self.a)])
+        # Control: the same two roots on distinct volumes report both.
+        _, report_ctl = self.run_json(
+            free={str(self.a): 900 * dr.GIB, str(self.b): 900 * dr.GIB},
+            devices=self.separate_volumes())
+        self.assertEqual(
+            [v["root"] for v in report_ctl["free_bytes_by_volume_before"]],
+            [str(self.a), str(self.b)])
+
+
+class RootDiscoveryTests(unittest.TestCase):
+    """The default roots must not depend on per-host hand tuning.
+
+    A rendered plist that names one root which EXISTS but sits on the wrong
+    volume passes every guard in main() and reports exit 0 forever. Discovery
+    removes the tuning step that nobody performs.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.base = pathlib.Path(self.tmp.name).resolve()
+        self.present_a = self.base / "boot-code"
+        self.present_b = self.base / "workshop-code"
+        self.present_a.mkdir()
+        self.present_b.mkdir()
+        self.absent = self.base / "not-on-this-host"
+
+    def test_discovery_keeps_every_existing_candidate(self):
+        with unittest.mock.patch.object(
+                dr, "DEFAULT_ROOT_CANDIDATES",
+                (str(self.present_a), str(self.absent), str(self.present_b))):
+            self.assertEqual(dr.parse_roots(None),
+                             [self.present_a, self.present_b])
+        # Control: with no candidate present, discovery must report nothing
+        # rather than invent a root. A test that only proves the present ones
+        # survive would pass on a function that returns its input unfiltered.
+        with unittest.mock.patch.object(
+                dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
+            self.assertEqual(dr.parse_roots(None), [])
+
+    def test_an_explicitly_declared_missing_root_is_still_a_fault(self):
+        """Discovery must not soften the declared-root contract."""
+        buffer = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(buffer):
+            code = dr.main(["--roots", str(self.absent), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("unusable scan root", buffer.getvalue())
+        # Control: the same invocation against a root that exists passes.
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            code_ctl = dr.main(["--roots", str(self.present_a), "--json"])
+        self.assertEqual(code_ctl, 0)
+
+    def test_a_host_matching_no_candidate_exits_two(self):
+        with unittest.mock.patch.object(
+                dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
+            buffer = io.StringIO()
+            with redirect_stdout(io.StringIO()), redirect_stderr(buffer):
+                code = dr.main(["--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("no scan roots", buffer.getvalue())
+        # Control: one existing candidate is enough to run a pass.
+        with unittest.mock.patch.object(
+                dr, "DEFAULT_ROOT_CANDIDATES", (str(self.present_a),)):
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code_ctl = dr.main(["--json"])
+        self.assertEqual(code_ctl, 0)
+
+
 if __name__ == "__main__":
     unittest.main()
