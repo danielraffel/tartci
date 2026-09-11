@@ -755,12 +755,13 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2))
     else:
         if not results:
-            print("launchd-watchdog: no managed runner LaunchAgents found")
+            print(f"{_iso(now)} launchd-watchdog: no managed runner "
+                  f"LaunchAgents found")
         for r in results:
             mark = {"healthy": "✓", "wedged": "✗", "broken": "✗", "unknown": "?"}.get(
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
-            print(f"  {mark} {r['label']}: {r['reason']}{act}")
+            print(f"{_iso(now)}   {mark} {r['label']}: {r['reason']}{act}")
     # Status reports unresolved wedges. Healing reports failure only when a
     # reload failed its postcondition; successful recovery exits zero.
     if args.status and unhealthy:
