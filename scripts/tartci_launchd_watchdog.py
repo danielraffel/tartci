@@ -19,7 +19,11 @@ No amount of in-script logging can catch this class (the script never runs), so
 the recovery has to live OUTSIDE the wedged agent: this watchdog, on its own
 `StartInterval` LaunchAgent, detects two wedge signatures and runs the one thing
 that heals them — bootout+bootstrap:
-  1. Invisible crash-loop — exited non-zero AND its log has gone stale.
+  1. Invisible crash-loop — exited non-zero AND its log has gone stale AND no VM
+     is building. The VM condition matters as much here as in (2): a supervisor
+     exits EX_TEMPFAIL by design for its App-auth refresh and launchd reports
+     that code for the whole life of the respawn, so a quiet 30 minutes inside a
+     long build looks identical to a crash-loop on exit code and log age alone.
   2. Alive-but-frozen — the process is UP (state=running) but its log has gone
      stale AND no VM is building (a hung `tart`/frozen run_one the in-supervisor
      self-heal can't catch). Gated on state=running + no running VM so a
@@ -189,16 +193,29 @@ def classify(
     Two independent wedge signatures:
 
     1. **Invisible crash-loop** := exited non-zero AND its log has gone stale (or
-       is missing). Distinguishes the crash-loop from a healthy between-jobs idle
-       (running, fresh "waiting" log) and a momentary restart (non-zero exit,
-       log still being written).
+       is missing) AND no VM is building. The first two distinguish the
+       crash-loop from a healthy between-jobs idle (running, fresh "waiting"
+       log) and a momentary restart (non-zero exit, log still being written).
+       The third carries the same weight it does in (2), because a sticky
+       non-zero exit is not evidence of a crash: `serve --loop` exits
+       EX_TEMPFAIL deliberately and launchd reports that code for the life of
+       the respawned job, so a supervisor that logs nothing for the stale
+       threshold while a required gate job builds matches this signature
+       exactly. Healing is a bootout, which SIGTERMs that supervisor and takes
+       its guest with it.
     2. **Alive-but-frozen** := the process is up (no non-zero exit) BUT its log has
        gone stale AND no VM is building. A healthy serve loop writes a "waiting"/
        "SCAN BLIND" line every poll (~10-20s), so a stale log while alive means the
        loop stopped iterating — a hung `tart`/boot or a frozen loop the in-supervisor
        self-heal can't catch (it never gets back to the top to increment `blind`).
        The `vm_running` guard is load-bearing: a legit long build blocks the loop
-       quietly for up to hours, so we only call it frozen when NO VM is running."""
+       quietly for up to hours, so we only call it frozen when NO VM is running.
+
+    Both signatures fail safe on the probe: `vm_running is None` means the Tart
+    inventory could not be read (an unset `TART_HOME` under launchd is enough to
+    make `tart list` blind), and an unreadable inventory returns "unknown" — a
+    verdict `main` never heals — rather than the "no VM running" it superficially
+    resembles."""
     if state is None and expected_loaded:
         return "wedged", "not loaded while pool participation is enabled"
     if (
@@ -234,16 +251,39 @@ def classify(
             return "healthy", "no non-zero exit recorded"
         return "healthy", "clean last exit"
     # last_exit_code != 0 from here.
+    # Non-zero exit but the log is fresh → a live restart, give it time.
+    if log_age_s is not None and log_age_s <= stale_log_s:
+        return "healthy", f"exited {last_exit_code} but log fresh ({int(log_age_s)}s)"
+    # The `vm_running` guard is load-bearing HERE TOO, for the same reason it is
+    # in the alive-but-frozen branch above. `serve --loop` exits EX_TEMPFAIL by
+    # design so launchd hands the respawn a fresh App-auth environment, and
+    # launchd then reports that non-zero code for the whole life of the
+    # respawned supervisor. A long build blocks the loop quietly, so the log
+    # goes stale while everything is healthy — making "sticky non-zero exit +
+    # stale log" indistinguishable from a crash-loop on those two signals alone.
+    # Healing is a bootout, which SIGTERMs the supervisor under a live job and
+    # takes its guest with it, so only call it a crash-loop when NO VM is
+    # running, and refuse rather than guess when the inventory is unavailable.
+    if vm_running is None:
+        return (
+            "unknown",
+            f"{vm_probe_reason}; refusing crash-loop recovery for exit "
+            f"{last_exit_code}",
+        )
+    if vm_running:
+        age = "missing" if log_age_s is None else f"stale {int(log_age_s)}s"
+        return (
+            "healthy",
+            f"exited {last_exit_code} and log {age}, but a VM is building — "
+            "not a crash-loop",
+        )
     if log_age_s is None:
         return "wedged", f"exited {last_exit_code}, log missing"
-    if log_age_s > stale_log_s:
-        return (
-            "wedged",
-            f"exited {last_exit_code}, log stale {int(log_age_s)}s "
-            f"(> {stale_log_s}s)",
-        )
-    # Non-zero exit but the log is fresh → a live restart, give it time.
-    return "healthy", f"exited {last_exit_code} but log fresh ({int(log_age_s)}s)"
+    return (
+        "wedged",
+        f"exited {last_exit_code}, log stale {int(log_age_s)}s "
+        f"(> {stale_log_s}s)",
+    )
 
 
 def _run(cmd: list[str]) -> tuple[int, str, str]:
@@ -709,8 +749,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if ok else 1
 
     agents = discover_agents(args.launch_agents_dir)
-    # Compute the VM-running guard ONCE per pass (host-wide) — the alive-but-frozen signature only
-    # fires when nothing is building, so a legit long build is never healed.
+    # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and
+    # deliberately imprecise in the safe direction: neither wedge signature fires
+    # while anything is building, so a busy host defers a heal to its next idle
+    # window rather than risking a bootout under someone else's live job.
     vm_probe = probe_tart_vm_running()
     participating = pool_participating(args.participation_file)
     disabled = disabled_services()
@@ -775,13 +817,14 @@ def main(argv: list[str] | None = None) -> int:
         }, indent=2))
     else:
         if not results:
-            print("launchd-watchdog: no managed runner LaunchAgents found")
+            print(f"{_iso(now)} launchd-watchdog: no managed runner "
+                  f"LaunchAgents found")
         for r in results:
             mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
                     "broken": "✗", "unknown": "?"}.get(
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
-            print(f"  {mark} {r['label']}: {r['reason']}{act}")
+            print(f"{_iso(now)}   {mark} {r['label']}: {r['reason']}{act}")
     # Status reports unresolved wedges. Healing reports failure only when a
     # reload failed its postcondition; successful recovery exits zero.
     if args.status and unhealthy:
