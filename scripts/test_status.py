@@ -31,7 +31,7 @@ def write_plist(path: pathlib.Path, env: dict[str, str], **extra) -> None:
 class ReclaimAgentTests(unittest.TestCase):
     def test_missing_plist_reports_not_installed(self):
         with tempfile.TemporaryDirectory() as tmp:
-            out = status.reclaim_agent(
+            out = status.janitor_agent(
                 plist_path=pathlib.Path(tmp) / "absent.plist")
         self.assertFalse(out["installed"])
         self.assertNotIn("settings", out)
@@ -48,7 +48,7 @@ class ReclaimAgentTests(unittest.TestCase):
             write_plist(path, {})
             with mock.patch.object(status, "run", return_value={
                     "ok": False, "returncode": 127, "stdout": "", "stderr": ""}):
-                out = status.reclaim_agent(plist_path=path)
+                out = status.janitor_agent(plist_path=path)
         self.assertIsNone(out["loaded"])
 
     def test_launchd_answering_no_reports_false(self):
@@ -57,7 +57,7 @@ class ReclaimAgentTests(unittest.TestCase):
             write_plist(path, {})
             with mock.patch.object(status, "run", return_value={
                     "ok": False, "returncode": 113, "stdout": "", "stderr": ""}):
-                out = status.reclaim_agent(plist_path=path)
+                out = status.janitor_agent(plist_path=path)
         self.assertIs(out["loaded"], False)
 
     def test_reports_installed_settings_and_last_pass(self):
@@ -73,7 +73,7 @@ class ReclaimAgentTests(unittest.TestCase):
                         StandardOutPath=str(log), StartInterval=3600)
             with mock.patch.object(status, "run", return_value={
                     "ok": True, "returncode": 0, "stdout": "", "stderr": ""}):
-                out = status.reclaim_agent(plist_path=path)
+                out = status.janitor_agent(plist_path=path)
         self.assertTrue(out["installed"])
         self.assertEqual(out["start_interval_s"], 3600)
         self.assertEqual(out["last_pass_ts"], 1_700_000_000)
@@ -82,6 +82,22 @@ class ReclaimAgentTests(unittest.TestCase):
                          ["TARTCI_RECLAIM_FAIL_BELOW_GB",
                           "TARTCI_RECLAIM_MAXDEPTH"])
 
+    def test_each_janitor_reports_only_its_own_settings(self):
+        """The settings filter follows the label, not a fixed prefix.
+
+        Both janitors write their knobs into the same EnvironmentVariables
+        dict shape, so a hardcoded TARTCI_RECLAIM_ prefix would report the
+        VM janitor as having no settings at all while it has several.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "reap.plist"
+            write_plist(path, {"TARTCI_REAP_PREFIXES": "pulp-",
+                               "TARTCI_RECLAIM_ROOTS": "/nope",
+                               "PATH": "/usr/bin"})
+            out = status.janitor_agent(status.REAP_LABEL, "TARTCI_REAP_",
+                                       plist_path=path)
+        self.assertEqual(out["settings"], {"TARTCI_REAP_PREFIXES": "pulp-"})
+
     def test_absent_log_is_unknown_not_zero(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = pathlib.Path(tmp) / "job.plist"
@@ -89,7 +105,7 @@ class ReclaimAgentTests(unittest.TestCase):
                         StandardOutPath=str(pathlib.Path(tmp) / "nope.log"))
             with mock.patch.object(status, "run", return_value={
                     "ok": True, "returncode": 0, "stdout": "", "stderr": ""}):
-                out = status.reclaim_agent(plist_path=path)
+                out = status.janitor_agent(plist_path=path)
         self.assertIsNone(out["last_pass_ts"])
 
     def test_corrupt_plist_reports_error_without_raising(self):
@@ -98,7 +114,7 @@ class ReclaimAgentTests(unittest.TestCase):
             path.write_bytes(b"this is not a plist")
             with mock.patch.object(status, "run", return_value={
                     "ok": True, "returncode": 0, "stdout": "", "stderr": ""}):
-                out = status.reclaim_agent(plist_path=path)
+                out = status.janitor_agent(plist_path=path)
         self.assertTrue(out["installed"])
         self.assertIn("error", out)
 
@@ -160,17 +176,17 @@ class StatusOutputTests(unittest.TestCase):
             code = status.main(argv)
         return code, buffer.getvalue()
 
-    def test_json_carries_disk_and_reclaim(self):
+    def test_json_carries_disk_and_both_janitors(self):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"TARTCI_RECLAIM_ROOTS": tmp}), \
-                    mock.patch.object(status, "reclaim_agent",
+                    mock.patch.object(status, "janitor_agent",
                                       return_value={"installed": False,
                                                     "loaded": None}):
                 code, text = self._quiet_main(["--json"])
         self.assertEqual(code, 0)
         data = json.loads(text)
         self.assertIn("disk", data)
-        self.assertIn("reclaim", data)
+        self.assertEqual(sorted(data["janitors"]), ["reap", "reclaim"])
         self.assertEqual(data["disk"]["roots"],
                          [str(pathlib.Path(tmp).resolve())])
 
@@ -178,7 +194,7 @@ class StatusOutputTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"TARTCI_RECLAIM_ROOTS": tmp}), \
                     mock.patch.object(dr, "free_bytes", return_value=None), \
-                    mock.patch.object(status, "reclaim_agent",
+                    mock.patch.object(status, "janitor_agent",
                                       return_value={"installed": False,
                                                     "loaded": None}):
                 _, text = self._quiet_main([])
@@ -186,14 +202,32 @@ class StatusOutputTests(unittest.TestCase):
         self.assertNotIn("GiB free", text)
 
     def test_missing_agent_is_stated_loudly(self):
-        with mock.patch.object(status, "reclaim_agent",
+        with mock.patch.object(status, "janitor_agent",
                                return_value={"installed": False,
                                              "loaded": None}):
             _, text = self._quiet_main([])
         self.assertIn("NOT INSTALLED", text)
 
+    def test_a_present_vm_janitor_does_not_mask_a_missing_reclaimer(self):
+        """Each janitor is reported on its own line, from its own label.
+
+        m3 carries the VM janitor and no disk reclaimer. Reporting a single
+        "janitor" line from whichever one answered first would have read as
+        healthy on exactly that host, which is the reading this exists to stop.
+        """
+        def by_label(label=status.RECLAIM_LABEL, *_args, **_kwargs):
+            if label == status.REAP_LABEL:
+                return {"installed": True, "loaded": True,
+                        "last_pass_ts": None}
+            return {"installed": False, "loaded": False}
+
+        with mock.patch.object(status, "janitor_agent", side_effect=by_label):
+            _, text = self._quiet_main([])
+        self.assertIn("disk reclaimer: NOT INSTALLED", text)
+        self.assertIn("VM janitor: installed and loaded", text)
+
     def test_unreachable_launchd_is_not_reported_as_running(self):
-        with mock.patch.object(status, "reclaim_agent",
+        with mock.patch.object(status, "janitor_agent",
                                return_value={"installed": True,
                                              "loaded": None,
                                              "last_pass_ts": None}):

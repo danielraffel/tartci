@@ -678,8 +678,13 @@ pass's output), roughly 40 MiB, not generations x max bytes exactly.
 it, when it last wrote its log, and the free space on each volume the janitor
 scans. Ask it before assuming a host is protected: the failure it exists to
 catch is silent, because a host that never got the agent looks exactly like a
-host whose passes are all finding nothing. m3 was running a stale generation
-while m1 and m5 had no reap agent at all, and nothing reported that.
+host whose passes are all finding nothing.
+
+It reports both janitors on their own lines, the disk reclaimer above and the
+VM reaper from the Janitor section, because a host can carry either, both, or
+neither: m3 has the VM reaper and no disk reclaimer, while m1 and m5 have no VM
+reaper at all. A single collapsed line would have read as healthy on exactly
+the host that is half covered.
 
 It reads the roots from `disk_reclaim` itself rather than keeping its own list,
 so status cannot disagree with the janitor about which volumes are scanned, and
