@@ -1181,10 +1181,14 @@ def fleet_readiness(
     try:
         receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
     except (OSError, ValueError) as exc:
+        # An unverifiable receipt is a fact about the observer, not the fleet.
+        # Reporting 0 here renders identically to "no supervisors are running",
+        # which is the one reading that provokes an operator to bounce a pool.
+        # None means "not checked from here" and is rendered as unknown.
         return {
             "managed": True,
             "fleet_ready": False,
-            "verified_running_supervisors": 0,
+            "verified_running_supervisors": None,
             "expected_supervisors": None,
             "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
         }
