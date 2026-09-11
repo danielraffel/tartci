@@ -603,6 +603,40 @@ class MainTests(unittest.TestCase):
         self.assertEqual(len(report_ctl["deleted"]), 1)
         self.assertFalse(stale.exists())
 
+    def test_the_report_records_the_depth_the_scan_actually_used(self):
+        """A receipt that cannot name its own depth cannot be read.
+
+        The scan depth was wrong on the whole fleet and invisible in every
+        report it wrote: a pass that "found nothing deep" looked identical
+        whether it had walked three levels or five, so the blind spot was only
+        found by measuring by hand. Recording the depth beside the candidate
+        count it produced is what makes a later receipt answerable.
+        """
+        # Nested so the build tree sits four levels below the root: reachable
+        # at depth 5, out of reach at depth 3. That is the same shape as the
+        # agent worktree nest, <repo>/.claude/worktrees/<worktree>/build.
+        deep = make_build_tree(self.root / "repo" / "nest" / "wt" / "build",
+                               age_days=400)
+
+        code_deep, deep_report = self.run_json("--maxdepth", "5",
+                                               "--min-age-days", "7",
+                                               "--pressure-free-gb", "0")
+        self.assertEqual(code_deep, 0)
+        self.assertEqual(deep_report["maxdepth"], 5)
+        self.assertEqual(len(deep_report["deleted"]), 1,
+                         "control: depth 5 has to reach the nested tree")
+
+        code_shallow, shallow_report = self.run_json("--maxdepth", "3",
+                                                     "--min-age-days", "7",
+                                                     "--pressure-free-gb", "0")
+        self.assertEqual(code_shallow, 0)
+        # Two different values from two runs, so a hardcoded constant in place
+        # of the real argument fails here rather than reading plausibly.
+        self.assertEqual(shallow_report["maxdepth"], 3)
+        self.assertEqual(shallow_report["candidates"], 0,
+                         "control: depth 3 must not reach it")
+        self.assertTrue(deep.is_dir(), "both passes are dry runs")
+
 
 class FailClosedTests(unittest.TestCase):
     """The janitor must treat "could not measure" as a reason to do less.

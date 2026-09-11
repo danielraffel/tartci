@@ -589,6 +589,11 @@ def main(argv: list[str] | None = None) -> int:
         "mode": "fix" if args.fix else "dry-run",
         "pressure": pressure,
         "min_age_days": min_age,
+        # Recorded beside the count it produced: a receipt saying "165
+        # candidates" cannot be read without knowing how deep the scan
+        # went, and the depth that missed the worktree nest was invisible
+        # in exactly this way until someone measured it by hand.
+        "maxdepth": args.maxdepth,
         "candidates": len(candidates),
         "deleted": deleted,
         "kept": kept,
