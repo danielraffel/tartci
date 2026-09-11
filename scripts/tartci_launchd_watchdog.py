@@ -90,6 +90,19 @@ DEFAULT_STALE_LOG_S = 1800  # 30 min
 # If launchd does not respawn it, that explicit restart contract has failed; do
 # not make a known-idle lane wait for the generic 30-minute crash-loop bound.
 DEFAULT_RESTART_GRACE_S = 60
+# Exit codes with which a tartci agent reports APPLICATION state: the program
+# ran to completion and is reporting a condition a reload cannot fix. Treating
+# those as the crash-loop signature boots out a working agent every hour and
+# buries the condition it was reporting. Everything NOT listed here stays on
+# the wedge path on purpose - 126/127 (not executable, not found) and
+# signal-derived exits are exactly the no-Full-Disk-Access wedge class.
+APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
+    "com.danielraffel.tartci.reclaim": {
+        2: "unusable scan root or bad arguments",
+        3: "free space still below the floor after reclaiming",
+        4: "process table unreadable, so no build directory could be proven idle",
+    },
+}
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
 DEFAULT_HEAL_WINDOW_S = 3600  # 1 hour
@@ -106,7 +119,10 @@ class AgentHealth(NamedTuple):
     state: str | None          # "running" | "spawn scheduled" | None (not loaded)
     last_exit_code: int | None
     log_age_s: float | None    # None when the log is missing
-    verdict: str               # "healthy" | "wedged" | "broken" | "unknown"
+    # "attention" is neither: the agent ran and reported a condition of its
+    # own. It is never healed (a reload would just repeat it) but it IS
+    # reported, and --status exits non-zero on it.
+    verdict: str               # "healthy" | "attention" | "wedged" | "broken" | "unknown"
     reason: str
 
 
@@ -286,6 +302,28 @@ def _log_path_from_plist(plist_path: str) -> str | None:
     except Exception:
         return None
     return data.get("StandardOutPath") or data.get("StandardErrorPath")
+
+
+def _start_interval_from_plist(plist_path: str) -> int | None:
+    """The agent's own StartInterval in seconds, or None when it has no usable one.
+
+    An interval agent is SUPPOSED to be quiet between runs, so the shared
+    30-minute staleness bound calls an hourly agent frozen on every other pass.
+    The bound has to come from the plist rather than a second flag, because the
+    plist is what actually decides how often the log can be written.
+
+    None (not zero) for an absent, non-integer, or non-positive value: a zero
+    would collapse the staleness bound and make every agent read as wedged.
+    """
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return None
+    interval = data.get("StartInterval")
+    if isinstance(interval, bool) or not isinstance(interval, int):
+        return None
+    return interval if interval > 0 else None
 
 
 def _program_path_from_plist(plist_path: str) -> str | None:
@@ -488,9 +526,24 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             label, plist_path, log_path, state, last_exit, log_age, "unknown",
             "launchd enablement state unavailable; refusing automatic recovery",
         )
+    documented = APPLICATION_EXIT_CODES.get(label, {})
+    if last_exit is not None and last_exit in documented:
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "attention",
+            f"exited {last_exit}: {documented[last_exit]}. The agent ran and "
+            "reported this itself, so a reload would only repeat it",
+        )
+    # An interval agent is quiet by design between runs, so the shared bound
+    # would call an hourly agent frozen on every other pass. Two intervals is
+    # the smallest bound that survives one skipped run; never SHORTER than the
+    # shared bound, so a fast agent keeps the 30-minute floor.
+    interval_s = _start_interval_from_plist(plist_path)
+    effective_stale_s = stale_log_s
+    if interval_s is not None:
+        effective_stale_s = max(stale_log_s, 2 * interval_s)
     expected_loaded = pool_participating and pool_runner
     verdict, reason = classify(
-        state, last_exit, log_age, stale_log_s, vm_running, expected_loaded,
+        state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
@@ -544,6 +597,14 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
         ["launchctl", "print", f"{dom}/{label}"]
     )
     if loaded_rc == 0:
+        state, _ = parse_launchctl_print(loaded_out)
+        if state == "running" and _start_interval_from_plist(plist_path) is not None:
+            # An interval agent that is running is running its ONE job, not
+            # serving a loop that can be interrupted anywhere. The reclaimer is
+            # mid-rmtree; booting it out there leaves a half-deleted tree that
+            # no later pass can classify. Refuse loudly and let the next
+            # interval start it cleanly.
+            return False
         exit_timeout = parse_launchctl_exit_timeout(loaded_out)
         if exit_timeout is None or exit_timeout == 0:
             # Zero is infinite; a missing value is likewise not a safe bound.
@@ -696,7 +757,8 @@ def main(argv: list[str] | None = None) -> int:
     if acted:
         save_heal_log(_state_file(), heal_log)
 
-    unhealthy = [r for r in results if r["verdict"] in {"wedged", "broken"}]
+    unhealthy = [r for r in results
+                 if r["verdict"] in {"wedged", "broken", "attention"}]
     if args.json:
         print(json.dumps({
             "ts": _iso(now),
@@ -715,7 +777,8 @@ def main(argv: list[str] | None = None) -> int:
         if not results:
             print("launchd-watchdog: no managed runner LaunchAgents found")
         for r in results:
-            mark = {"healthy": "✓", "wedged": "✗", "broken": "✗", "unknown": "?"}.get(
+            mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
+                    "broken": "✗", "unknown": "?"}.get(
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
             print(f"  {mark} {r['label']}: {r['reason']}{act}")

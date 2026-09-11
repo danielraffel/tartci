@@ -40,6 +40,8 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import errno
+import functools
 import json
 import os
 import pathlib
@@ -63,6 +65,40 @@ SOURCE_MARKERS = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
 BUILD_PROCESS_PATTERN = r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
 
 GIB = 1024**3
+
+# A --fix pass can run for minutes with nothing to say, and the watchdog reads
+# this agent's liveness from the mtime of its log. A pass that is working but
+# silent is indistinguishable from one that is wedged, so emit a bounded
+# heartbeat instead of leaving the log frozen for the whole run.
+PROGRESS_INTERVAL_S = 300.0
+
+
+class Progress:
+    """Rate-limited heartbeat, written to stderr.
+
+    stderr and not stdout on purpose: under --json stdout carries one machine
+    read document, and a heartbeat interleaved into it would break every
+    parser. The launchd plist points BOTH streams at the same log file, so a
+    line written here still refreshes the mtime the watchdog reads.
+
+    Every write flushes. A buffered line does not move the file's mtime, which
+    would leave the log exactly as stale as it was before.
+    """
+
+    def __init__(self, interval_s: float = PROGRESS_INTERVAL_S,
+                 stream: Any = None) -> None:
+        self.interval_s = interval_s
+        self.stream = sys.stderr if stream is None else stream
+        self._last = time.time()
+
+    def emit(self, message: str, force: bool = False) -> bool:
+        """Write `message` unless the rate limit is still holding it back."""
+        now = time.time()
+        if not force and now - self._last < self.interval_s:
+            return False
+        self._last = now
+        print(f"disk_reclaim: {message}", file=self.stream, flush=True)
+        return True
 
 
 def is_build_dir_name(name: str) -> bool:
@@ -112,30 +148,51 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
     return sorted(found)
 
 
-def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float:
-    """Newest mtime at or shallowly below `path`.
+# Errnos that mean "this subtree exists and we were refused", which is the
+# only case where an unreadable entry makes the age unknowable. ENOENT and
+# ENOTDIR are deliberately absent: a live build tree creates and unlinks temp
+# files under the scan, so an entry vanishing mid-walk is routine AND is
+# positive evidence the tree is busy. Treating that as unmeasured would make
+# the hourly pass report unknown on every busy host.
+UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELOOP})
+
+
+def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float | None:
+    """Newest mtime at or shallowly below `path`, or None when unmeasurable.
 
     A build tree that ran recently has a fresh `CMakeCache.txt`, `.ninja_log`,
     or a fresh top-level subdirectory, so a bounded scan is enough and a full
     recursive walk of a 100 GB tree is not paid on every pass.
+
+    None is the load-bearing part. Without it an unreadable subtree reads as
+    mtime 0, which is maximally idle, so a tree written seconds ago is
+    reported as decades old and deleted. A refusal has to stay distinct from
+    an answer, exactly as it does for the process scan and for free space.
     """
     newest = 0.0
+    measured = False
     stack: list[tuple[pathlib.Path, int]] = [(path, 0)]
     while stack:
         current, depth = stack.pop()
         try:
             newest = max(newest, current.stat().st_mtime)
+            measured = True
             entries = list(os.scandir(current))
-        except OSError:
+        except OSError as exc:
+            if exc.errno in UNMEASURABLE_ERRNOS:
+                return None
             continue
         for entry in entries:
             try:
                 newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
-            except OSError:
+                measured = True
+            except OSError as exc:
+                if exc.errno in UNMEASURABLE_ERRNOS:
+                    return None
                 continue
             if depth + 1 < maxdepth and entry.is_dir(follow_symlinks=False):
                 stack.append((pathlib.Path(entry.path), depth + 1))
-    return newest
+    return newest if measured else None
 
 
 def active_command_lines(pattern: str = BUILD_PROCESS_PATTERN) -> str | None:
@@ -198,6 +255,60 @@ def free_bytes(path: pathlib.Path) -> int | None:
         return None
 
 
+def path_spellings(path: pathlib.Path) -> set[str]:
+    """Every absolute spelling of `path` a command line might carry.
+
+    On macOS `/tmp` is a symlink to `/private/tmp` and a checkout can sit
+    behind any number of symlinked parents, so a command line naming the
+    unresolved spelling does not substring-match the resolved one. Comparing
+    only one of them is a guard that silently does not fire.
+    """
+    spellings = {str(path)}
+    try:
+        spellings.add(str(path.resolve()))
+    except OSError:
+        pass
+    return spellings
+
+
+@functools.lru_cache(maxsize=8)
+def resolved_command_paths(active: str) -> frozenset[str]:
+    """Every absolute path token in `active`, plus its resolved spelling.
+
+    The substring test above resolves the CANDIDATE; this resolves the other
+    side. A command line records whichever spelling the shell handed it, so
+    without this a build launched through a symlinked checkout names a path
+    that no spelling of the candidate matches. A token that is not a path
+    resolves to itself and matches nothing, so no argv parser is needed.
+    """
+    spellings: set[str] = set()
+    for token in active.split():
+        if not token.startswith("/"):
+            continue
+        spellings.add(token)
+        try:
+            spellings.add(str(pathlib.Path(token).resolve()))
+        except OSError:
+            continue
+    return frozenset(spellings)
+
+
+def names_candidate(active: str, spellings: set[str]) -> bool:
+    """True when `active` names this candidate under either spelling.
+
+    Deliberately generous in both directions: a command line naming a file
+    INSIDE the tree protects the tree, because a compiler writing into it is
+    exactly what the guard exists to catch.
+    """
+    if any(spelling in active for spelling in spellings):
+        return True
+    for token in resolved_command_paths(active):
+        if any(token == spelling or token.startswith(spelling + os.sep)
+               for spelling in spellings):
+            return True
+    return False
+
+
 def classify(
     path: pathlib.Path,
     *,
@@ -212,7 +323,10 @@ def classify(
     build is not running, and the whole contract is that deletion requires
     positive proof rather than absence of evidence.
     """
-    age_days = max(0.0, (now - newest_mtime(path)) / 86400.0)
+    measured = newest_mtime(path)
+    if measured is None:
+        return False, "unmeasured", 0.0
+    age_days = max(0.0, (now - measured) / 86400.0)
 
     if has_marker(path, SOURCE_MARKERS):
         return False, "source_tree", age_days
@@ -221,7 +335,7 @@ def classify(
         return False, "not_a_build_tree", age_days
     if active is None:
         return False, "process_scan_unavailable", age_days
-    if active and str(path) in active:
+    if active and names_candidate(active, path_spellings(path)):
         return False, "active_build", age_days
     if age_days < min_age_days:
         return False, "too_recent", age_days
@@ -271,6 +385,21 @@ def main(argv: list[str] | None = None) -> int:
         print("disk_reclaim: no scan roots", file=sys.stderr)
         return 2
 
+    # A root that does not exist or cannot be entered is a configuration
+    # fault, not an empty host. Skipping it silently is what lets a rendered
+    # plist point at the wrong volume and report a clean exit 0 forever while
+    # the disk it was installed to protect fills up.
+    unusable = []
+    for root in roots:
+        if not root.is_dir():
+            unusable.append(f"{root} (not a directory)")
+        elif not os.access(root, os.R_OK | os.X_OK):
+            unusable.append(f"{root} (not readable)")
+    if unusable:
+        print("disk_reclaim: unusable scan root(s): " + ", ".join(unusable),
+              file=sys.stderr)
+        return 2
+
     now = time.time()
     free_before = free_bytes(roots[0])
     # An unknown free figure selects the LONGER gate. Guessing "full" here
@@ -280,14 +409,23 @@ def main(argv: list[str] | None = None) -> int:
     min_age = min(args.min_age_days, args.pressure_min_age_days) if pressure \
         else args.min_age_days
 
+    progress = Progress()
+    progress.emit(
+        f"pass starting: {len(roots)} root(s), mode "
+        f"{'fix' if args.fix else 'dry-run'}, min age {min_age}d", force=True)
+
     active = active_command_lines()
     candidates = find_candidates(roots, args.maxdepth)
+    progress.emit(f"scanned {len(candidates)} candidate(s)", force=True)
 
     deleted: list[dict[str, Any]] = []
     kept: list[dict[str, Any]] = []
     reclaimed = 0
 
-    for path in candidates:
+    for index, path in enumerate(candidates, start=1):
+        progress.emit(
+            f"{index}/{len(candidates)} examined, "
+            f"{reclaimed / GIB:.1f} GiB so far")
         delete, reason, age_days = classify(
             path, now=now, min_age_days=min_age, active=active)
         if not delete:
@@ -298,6 +436,22 @@ def main(argv: list[str] | None = None) -> int:
         record = {"path": str(path), "reason": reason,
                   "age_days": round(age_days, 1), "size_bytes": size}
         if args.fix:
+            # Liveness was sampled once, before the first `du -sk`, and this
+            # pass can run for minutes. Re-read the age immediately before the
+            # irreversible act: a build that started (or a relative command
+            # line the argv guard cannot see) has touched this tree since, so
+            # it no longer clears the gate. One bounded stat walk against an
+            # operation that already pays for a recursive unlink.
+            recheck = newest_mtime(path)
+            if recheck is None or (time.time() - recheck) / 86400.0 < min_age:
+                record["reason"] = "touched_during_pass"
+                kept.append(record)
+                continue
+            # Forced, never rate limited: an rmtree is the longest single
+            # operation in the pass AND the only one that can leave a tree no
+            # later pass can classify. If the process is killed mid-unlink,
+            # this line is the sole record of which tree was half deleted.
+            progress.emit(f"removing {path} ({size / GIB:.1f} GiB)", force=True)
             try:
                 shutil.rmtree(path)
             except OSError as exc:

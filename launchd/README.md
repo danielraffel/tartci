@@ -309,6 +309,34 @@ instead of waiting for the generic 30-minute stale-log threshold. Participation
 OFF remains authoritative, and other nonzero exit classes retain the conservative
 stale-log rule.
 
+An interval agent is quiet by design between runs, so the shared 30-minute
+stale-log threshold would call an hourly agent frozen on every other pass and
+boot out an agent that is working. The watchdog reads `StartInterval` from each
+agent's own plist and widens that agent's bound to twice its interval. The bound
+never shortens: a one-minute agent keeps the 30-minute floor, and only a slower
+agent widens past it. Two intervals is the smallest bound that survives one
+skipped run. An absent, zero, negative, or non-integer `StartInterval` yields no
+bound rather than a zero one, because a zero would collapse the threshold and
+make every agent read as wedged.
+
+A reload is also refused outright for an interval agent that is currently
+`running`. Such an agent is running its one job, not serving a loop that can be
+interrupted anywhere: the reclaimer is mid-`rmtree`, and booting it out there
+leaves a half-deleted tree no later pass can classify. The watchdog logs the
+refusal and lets the next interval start it cleanly.
+
+Not every nonzero exit is a wedge. Some agents exit with a code that reports an
+application condition: the program ran to completion and is naming something a
+reload cannot fix. The reclaimer's 2 (unusable scan root), 3 (still below the
+free-space floor), and 4 (process table unreadable, so nothing could be proven
+idle) are those. Treating them as the crash-loop signature boots out a working
+agent every hour and buries the condition it was reporting, so they get their
+own verdict, `attention`: it is reported, `--status` exits non-zero on it, and
+it is marked `!` rather than a tick, but it is never healed. Everything not
+listed stays on the wedge path on purpose. 126 and 127 (not executable, not
+found) and signal-derived exits are exactly the no-Full-Disk-Access wedge class
+this watchdog exists to recover.
+
 Per-lane launchd enablement is also authoritative. A host may participate while
 legacy, release, sanitizer, Linux, or Windows plists remain explicitly disabled.
 The watchdog reads `launchctl print-disabled` once per pass and never reloads an
@@ -517,6 +545,33 @@ carries no source marker (`.git`, `CMakeLists.txt`, `Cargo.toml`,
 `package.json`) of its own, no live build process names its path, and nothing
 inside it changed inside the age gate. A directory that merely has the name is
 skipped, and the report says which check rejected it.
+
+Be precise about what the liveness check is worth, because it is the one gate
+that sounds stronger than it is. It compares each candidate's path against the
+command lines of live build processes, both as spelled and resolved through
+realpath, so a build invoked with a relative path from inside its own tree can
+name a directory the scan cannot match. It is a cheap first filter, not a proof
+of idleness. The gate that actually carries the weight is the age re-check: the
+mtime is read a second time immediately before `shutil.rmtree`, so a tree that
+was touched between the scan and the delete is kept and reported as
+`touched_during_pass`. The window that matters is the one between deciding and
+deleting, and that is the window the re-check closes.
+
+A candidate whose age cannot be measured is never deleted. `EACCES`, `EPERM`,
+`EIO`, and `ELOOP` while walking a tree mean the janitor could not see it, and
+it is kept with the reason `unmeasured`. A vanished entry (`ENOENT`) is
+deliberately not in that set: it is a normal, constant event on a live build
+tree, and it is positive evidence the tree is busy rather than a failure to
+measure.
+
+A `--fix` pass writes a bounded heartbeat to stderr, which the plist points at
+the same log file as stdout, so the JSON document on stdout stays parseable. It
+announces the pass start and the candidate count, then at most one line every
+five minutes as it works, and one line naming each tree immediately before it
+is removed. That last line is never rate limited. Two reasons: the watchdog reads this agent's
+liveness from its log mtime, so a long working pass must not look frozen, and if
+the process is killed mid-unlink that last line is the only record of which tree
+was left half deleted.
 
 Two age tiers, so an idle host keeps recent build dirs warm and a full host
 reclaims harder: `TARTCI_RECLAIM_MIN_AGE_DAYS` (30) always applies, and the

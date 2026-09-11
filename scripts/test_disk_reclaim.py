@@ -11,16 +11,18 @@ Run:  python3 -m unittest scripts.test_disk_reclaim   (or via discover)
 
 from __future__ import annotations
 
+import errno
 import io
 import json
 import os
 import pathlib
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 import unittest.mock
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 
@@ -93,6 +95,88 @@ class FindCandidatesTests(unittest.TestCase):
 
     def test_missing_root_is_not_an_error(self):
         self.assertEqual(dr.find_candidates([self.root / "absent"], maxdepth=3), [])
+
+
+class _RefusingEntry:
+    """A scandir entry whose stat fails with a chosen errno.
+
+    Real ENOENT races need a live build running under the scan, which no unit
+    test can stage deterministically, so the errno is supplied directly. The
+    distinction under test is errno-level, not filesystem-level.
+    """
+
+    def __init__(self, path: pathlib.Path, err: int) -> None:
+        self.path = str(path)
+        self.name = path.name
+        self._err = err
+
+    def stat(self, follow_symlinks: bool = True):
+        raise OSError(self._err, os.strerror(self._err))
+
+    def is_dir(self, follow_symlinks: bool = True) -> bool:
+        return False
+
+
+class NewestMtimeTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_an_unreadable_subtree_reports_unmeasured_not_maximally_idle(self):
+        """0.0 would read as decades idle, which deletes a tree written seconds ago."""
+        tree = make_build_tree(self.root / "wt" / "build", age_days=0)
+        # Control first, on the same instrument and the same tree: while it is
+        # readable the walk returns a real, recent figure.
+        readable = dr.newest_mtime(tree)
+        self.assertIsNotNone(readable, "control: a readable tree must measure")
+        self.assertLess(time.time() - readable, 120)
+
+        os.chmod(tree, 0o300)
+        self.addCleanup(os.chmod, tree, 0o700)
+        self.assertIsNone(dr.newest_mtime(tree),
+                          "a refused subtree must be unmeasured, not idle")
+
+    def test_a_vanishing_entry_stays_benign_but_a_refused_one_does_not(self):
+        """ninja unlinks temp files under the scan; that must not read as unknown."""
+        tree = make_build_tree(self.root / "busy" / "build", age_days=0)
+        for err, expect_none in ((errno.ENOENT, False), (errno.EACCES, True)):
+            with self.subTest(errno=errno.errorcode[err]):
+                entries = [_RefusingEntry(tree / "gone.tmp", err)]
+                with unittest.mock.patch.object(dr.os, "scandir",
+                                                return_value=entries):
+                    result = dr.newest_mtime(tree)
+                if expect_none:
+                    self.assertIsNone(result)
+                else:
+                    self.assertIsNotNone(
+                        result, "a vanishing entry is evidence of a BUSY tree")
+
+
+class ActiveCommandLinesTests(unittest.TestCase):
+    """The fail-open branches, driven through the real function.
+
+    Patching `active_command_lines` itself (as the surrounding suite does for
+    classify) leaves these two `return None` lines unreachable, so replacing
+    either with `return ""` keeps the whole suite green while the guard that
+    stops the janitor deleting a live build is switched off.
+    """
+
+    def test_an_unexecutable_pgrep_is_a_refusal_not_an_idle_host(self):
+        self.assertIsInstance(dr.active_command_lines("python"), str,
+                              "control: a working pgrep returns a string")
+        with unittest.mock.patch.object(dr.subprocess, "run",
+                                        side_effect=OSError("no pgrep")):
+            self.assertIsNone(dr.active_command_lines())
+
+    def test_a_pgrep_error_exit_is_a_refusal_not_an_idle_host(self):
+        self.assertIsInstance(dr.active_command_lines("python"), str,
+                              "control: a working pgrep returns a string")
+        broken = subprocess.CompletedProcess(
+            args=["pgrep"], returncode=2, stdout="", stderr="boom")
+        with unittest.mock.patch.object(dr.subprocess, "run",
+                                        return_value=broken):
+            self.assertIsNone(dr.active_command_lines())
 
 
 class ClassifyTests(unittest.TestCase):
@@ -170,6 +254,45 @@ class ClassifyTests(unittest.TestCase):
         # Control: a pattern that must match this very test process.
         self.assertNotEqual(dr.active_command_lines("python"), "")
 
+    def test_an_unreadable_build_tree_is_never_reclaimable(self):
+        """An age we could not measure must not be spent as an old age."""
+        path = make_build_tree(self.root / "wt" / "build", age_days=40)
+        # Control first: while readable, this exact tree is reclaimable.
+        delete_ctl, reason_ctl, age_ctl = self.classify(path)
+        self.assertTrue(delete_ctl, reason_ctl)
+        self.assertGreater(age_ctl, 39)
+
+        os.chmod(path, 0o300)
+        self.addCleanup(os.chmod, path, 0o700)
+        delete, reason, age_days = self.classify(path)
+        self.assertFalse(delete)
+        self.assertEqual(reason, "unmeasured")
+        self.assertEqual(age_days, 0.0)
+
+    def test_a_command_line_naming_the_other_spelling_of_the_path_protects_it(self):
+        """A checkout behind a symlink has two absolute spellings.
+
+        `cmake --build` records whichever one the shell handed it, so a guard
+        that compares only the resolved spelling silently does not fire on the
+        unresolved one (and vice versa).
+        """
+        real = make_build_tree(self.root / "real" / "pulp" / "build", age_days=400)
+        (self.root / "link").symlink_to(self.root / "real")
+        unresolved = self.root / "link" / "pulp" / "build"
+        self.assertNotEqual(str(unresolved), str(real),
+                            "control: the two spellings must differ")
+
+        for candidate, named in ((unresolved, real), (real, unresolved)):
+            with self.subTest(candidate=str(candidate)):
+                cmdline = f"66665 cmake --build {named} --target all\n"
+                delete, reason, _ = self.classify(candidate, active=cmdline)
+                self.assertFalse(delete)
+                self.assertEqual(reason, "active_build")
+        # Control: an unrelated path in the same process table reclaims.
+        delete_ctl, reason_ctl, _ = self.classify(
+            unresolved, active="66665 cmake --build /elsewhere\n")
+        self.assertTrue(delete_ctl, reason_ctl)
+
 
 class MainTests(unittest.TestCase):
     def setUp(self):
@@ -181,7 +304,9 @@ class MainTests(unittest.TestCase):
 
     def run_main(self, *argv):
         buffer = io.StringIO()
-        with redirect_stdout(buffer):
+        # stderr too: the progress heartbeat writes there, and letting it reach
+        # the real stream interleaves it with the runner's own dots.
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
             code = dr.main(["--roots", str(self.root), *argv])
         return code, buffer.getvalue()
 
@@ -288,6 +413,57 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("would reclaim", out)
         self.assertIn("reclaimed", out)
 
+    def test_a_missing_scan_root_is_a_configuration_error(self):
+        """A rendered plist pointing at the wrong volume must not exit 0.
+
+        `find_candidates` skips a root it cannot enter, which is right for a
+        host that simply has no builds. At the top level that same silence is
+        how a misconfigured agent reports a clean pass forever while the disk
+        it was installed to protect fills up.
+        """
+        absent = self.root / "no-such-volume"
+        buffer = io.StringIO()
+        with redirect_stdout(buffer):
+            code = dr.main(["--roots", str(absent)])
+        self.assertEqual(code, 2)
+        # Control: the same invocation against the root that does exist.
+        code_ctl, _ = self.run_main()
+        self.assertEqual(code_ctl, 0)
+
+    def test_a_tree_touched_during_the_pass_is_not_deleted(self):
+        """Liveness is sampled once and the pass can run for minutes.
+
+        `du -sk` over a large tree is the long pole, so a build can start after
+        the process scan and before the rmtree. The age is re-read immediately
+        before the irreversible act; here the sizer stands in for that delay.
+        """
+        stale = make_build_tree(self.root / "wt" / "build", age_days=400)
+        real_sizer = dr.dir_size_bytes
+
+        def touching_sizer(path):
+            (path / "CMakeCache.txt").write_text("a build just started")
+            return real_sizer(path)
+
+        with unittest.mock.patch.object(dr, "dir_size_bytes",
+                                        side_effect=touching_sizer):
+            code, report = self.run_json("--fix", "--min-age-days", "7",
+                                         "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertTrue(stale.is_dir(), "a tree written mid-pass must survive")
+        self.assertEqual(report["deleted"], [])
+        self.assertEqual([k["reason"] for k in report["kept"]],
+                         ["touched_during_pass"])
+
+        # Control: the identical run with the real sizer deletes it, so the
+        # keep above is the re-check and not an unrelated refusal. The sizer
+        # above touched the tree, so backdate it again first.
+        age(stale, 400)
+        code_ctl, report_ctl = self.run_json("--fix", "--min-age-days", "7",
+                                             "--pressure-free-gb", "0")
+        self.assertEqual(code_ctl, 0)
+        self.assertEqual(len(report_ctl["deleted"]), 1)
+        self.assertFalse(stale.exists())
+
 
 class FailClosedTests(unittest.TestCase):
     """The janitor must treat "could not measure" as a reason to do less.
@@ -349,6 +525,82 @@ class FailClosedTests(unittest.TestCase):
         with unittest.mock.patch.object(dr, "free_bytes", return_value=None):
             code, _ = self.run_json("--fail-below-gb", "60")
         self.assertEqual(code, 4)
+
+
+class ProgressTests(unittest.TestCase):
+    """The heartbeat that keeps a working pass distinguishable from a wedged one."""
+
+    def test_rate_limit_suppresses_then_releases(self):
+        stream = io.StringIO()
+        progress = dr.Progress(interval_s=1000.0, stream=stream)
+        self.assertFalse(progress.emit("first"),
+                         "a line inside the interval must be suppressed")
+        self.assertEqual(stream.getvalue(), "")
+        # Control, same instrument and same stream: past the interval it fires.
+        progress._last -= 1001.0
+        self.assertTrue(progress.emit("second"))
+        self.assertIn("second", stream.getvalue())
+
+    def test_force_ignores_the_rate_limit(self):
+        stream = io.StringIO()
+        progress = dr.Progress(interval_s=1000.0, stream=stream)
+        self.assertTrue(progress.emit("urgent", force=True))
+        self.assertIn("urgent", stream.getvalue())
+        # Control: without force, the very next call is still suppressed.
+        self.assertFalse(progress.emit("routine"))
+        self.assertNotIn("routine", stream.getvalue())
+
+    def test_write_is_flushed_so_the_mtime_moves(self):
+        """A buffered line leaves the log exactly as stale as it was."""
+        with tempfile.TemporaryDirectory() as td:
+            log = pathlib.Path(td) / "reclaim.log"
+            with log.open("w") as handle:
+                dr.Progress(stream=handle).emit("beat", force=True)
+                # Read from a SECOND descriptor while the writer is still open:
+                # unflushed bytes are invisible here.
+                self.assertIn("beat", log.read_text())
+
+
+class ProgressWiringTests(MainTests):
+    """The heartbeat has to reach a real pass, not just exist."""
+
+    def run_with_stderr(self, *argv):
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = dr.main(["--roots", str(self.root), *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_heartbeat_never_contaminates_the_json_document(self):
+        make_build_tree(self.root / "old" / "build", age_days=400)
+        code, out, err = self.run_with_stderr(
+            "--json", "--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        # The whole point: stdout still parses, and the lines went somewhere.
+        report = json.loads(out)
+        self.assertEqual(len(report["deleted"]), 1)
+        self.assertIn("disk_reclaim:", err)
+        self.assertNotIn("disk_reclaim:", out)
+
+    def test_pass_start_and_candidate_count_are_announced(self):
+        make_build_tree(self.root / "old" / "build", age_days=400)
+        _, _, err = self.run_with_stderr(
+            "--json", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertIn("pass starting", err)
+        self.assertIn("candidate(s)", err)
+
+    def test_the_tree_being_deleted_is_named_before_the_rmtree(self):
+        """The sole record of which tree was half deleted if the pass is killed."""
+        stale = make_build_tree(self.root / "old" / "build", age_days=400)
+        _, _, err = self.run_with_stderr(
+            "--json", "--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertIn(f"removing {stale}", err)
+        # Control: a dry run reclaims nothing, so it must announce no removal.
+        fresh = make_build_tree(self.root / "other" / "build", age_days=400)
+        _, _, err_dry = self.run_with_stderr(
+            "--json", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertTrue(fresh.is_dir())
+        self.assertNotIn("removing ", err_dry)
 
 
 if __name__ == "__main__":
