@@ -34,14 +34,34 @@
   wrong volume passes every check and reports a clean exit 0 forever while the
   volume it was installed to protect fills up. m3 is exactly that shape: it
   keeps code and worktrees on Workshop and still has a populated ~/Code on the
-  boot disk. Free space, the pressure tier, and the floor are judged on every
-  volume the roots span, so the healthier disk cannot mask the full one.
+  boot disk. Free space is measured on every volume the roots span, and the
+  TARTCI_RECLAIM_FAIL_BELOW_GB floor is judged against the tightest of them, so
+  a healthy disk cannot certify a full one. Pressure is scoped the other way,
+  per volume: only build directories that live on a volume under
+  TARTCI_RECLAIM_PRESSURE_FREE_GB get the shorter
+  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate. Failing more is the safe
+  direction; deleting more is not, and a boot disk dipping below the threshold
+  is not a reason to reclaim week-old builds off a volume with terabytes free.
 
-  Depth 3 is deliberate and should not be raised. It covers both real shapes,
-  Code/<repo>/build and Code/agent-worktrees/<worktree>/build-cov, and nothing
-  else. Every measured build-named directory below that depth on m3 belongs to
-  something that must never be deleted: external/skia-build/build, cargo
-  target/debug/build, node_modules/*/build, and .git/refs/heads/build.
+  Depth 5, not 3. Depth 3 reaches Code/<repo>/build and
+  Code/agent-worktrees/<worktree>/build-cov, but it cannot see the nest that
+  now holds the largest single reclaimable tree on the fleet,
+  <root>/<repo>/.claude/worktrees/<worktree>/build, which sits five levels
+  below the scan root on every host. On m3 that blind spot was 14.86 GiB of
+  the 1020.17 GiB reclaimable under Workshop, 14.64 GiB of it in one
+  directory. Depth is the right knob rather than a per-host list of nests:
+  one number names the same pattern on m3, m5 and m1, and a nest list rots
+  the next time a worktree root moves.
+
+  A deeper walk does not weaken the guards, because the marker, source-marker,
+  live-process and age tests are all depth independent. Measured on m3's
+  Workshop root, depth 5 exposes 94 build-named directories that depth 3 never
+  saw and 88 of them are refused for carrying no generated-tree marker, which
+  is exactly what external/skia-build/build, cargo target/debug/build and
+  node_modules/*/build are. The 6 that pass are regenerable CMake trees.
+
+  Stop at 5. Deeper scans find no further reclaimable bytes and only cost
+  walk time, so 5 is the smallest depth that misses nothing.
 
   TARTCI_RECLAIM_FAIL_BELOW_GB is the escalation half: a host still under the
   floor after a pass exits non-zero, so launchd records a failing janitor
@@ -88,7 +108,7 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_RECLAIM_MAXDEPTH</key>
-        <string>3</string>
+        <string>5</string>
         <key>TARTCI_RECLAIM_MIN_AGE_DAYS</key>
         <string>30</string>
         <key>TARTCI_RECLAIM_PRESSURE_FREE_GB</key>

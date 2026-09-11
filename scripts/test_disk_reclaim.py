@@ -653,6 +653,37 @@ class MultiVolumeTests(unittest.TestCase):
     def separate_volumes(self):
         return {str(self.a): 101, str(self.b): 202}
 
+    def test_the_short_gate_applies_only_to_the_pressured_volume(self):
+        """A low boot disk must not shorten the gate on a healthy volume.
+
+        Pressure selects the aggressive direction, so scoping it per volume is
+        the difference between reclaiming the disk that is actually full and
+        deleting a week-old build tree off a volume with terabytes free.
+        """
+        make_build_tree(self.a / "wt" / "build", age_days=10)
+        make_build_tree(self.b / "wt" / "build", age_days=10)
+        argv = ("--min-age-days", "30", "--pressure-free-gb", "200",
+                "--pressure-min-age-days", "7")
+        code, report = self.run_json(
+            *argv,
+            free={str(self.a): 10 * dr.GIB, str(self.b): 900 * dr.GIB},
+            devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertTrue(report["pressure"])
+        taken = {entry["path"] for entry in report["deleted"]}
+        self.assertIn(str(self.a / "wt" / "build"), taken)
+        self.assertNotIn(str(self.b / "wt" / "build"), taken)
+        # Control: move the pressure to the other volume and the selection must
+        # flip. Without it this passes on an implementation that simply never
+        # reclaims anything found under the second root.
+        _, control = self.run_json(
+            *argv,
+            free={str(self.a): 900 * dr.GIB, str(self.b): 10 * dr.GIB},
+            devices=self.separate_volumes())
+        taken_ctl = {entry["path"] for entry in control["deleted"]}
+        self.assertIn(str(self.b / "wt" / "build"), taken_ctl)
+        self.assertNotIn(str(self.a / "wt" / "build"), taken_ctl)
+
     def test_a_second_volume_below_the_floor_fails_the_pass(self):
         plenty = 900 * dr.GIB
         starved = 3 * dr.GIB

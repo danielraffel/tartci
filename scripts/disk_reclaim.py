@@ -450,8 +450,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("TARTCI_RECLAIM_ROOTS"),
         help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and /Volumes/Workshop/Code exist)")
     parser.add_argument("--maxdepth", type=int,
-                        default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "3")),
-                        help="directory depth below each root to scan (default 3)")
+                        default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "5")),
+                        help="directory depth below each root to scan (default 5)")
     parser.add_argument("--min-age-days", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_MIN_AGE_DAYS", "30")),
                         help="always reclaim a build dir idle at least this long (default 30)")

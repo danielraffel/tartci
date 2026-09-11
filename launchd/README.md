@@ -615,19 +615,43 @@ step tells you what the rollout is actually worth on that host. Under `--fix`
 the same figure is what was freed.
 
 Scan roots are discovered rather than declared: the janitor keeps whichever of
-`~/Code` and `/Volumes/Workshop/Code` the host actually has, and judges free
-space, the pressure tier, and the floor on every volume those roots span.
+`~/Code` and `/Volumes/Workshop/Code` the host actually has, and measures free
+space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
+floor is judged against the tightest of those volumes, so a healthy disk cannot
+certify a full one. Pressure is scoped per volume instead: only candidates on a
+volume under `TARTCI_RECLAIM_PRESSURE_FREE_GB` take the shorter
+`TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS` gate, because failing more is safe and
+deleting more is not.
 `TARTCI_RECLAIM_ROOTS` still overrides with a colon-separated list, but reach
 for it only for a one-off run. A declared root that exists on the wrong volume
 is the one fault nothing downstream can catch: the pass reports a clean exit 0
 forever while the volume it was installed to protect fills up, which is what
 `$HOME/Code` did on a host that keeps its code on Workshop.
 
-The scan depth of 3 is deliberate. It covers `Code/<repo>/build` and
-`Code/agent-worktrees/<worktree>/build-cov` and nothing else; the build-named
-directories below that depth are `external/skia-build/build`, cargo
-`target/debug/build`, `node_modules/*/build`, and `.git/refs/heads/build`, none
-of which may be deleted. Raising it is a hazard, not a coverage improvement.
+The scan depth is 5, raised from an earlier 3. Depth 3 reached
+`Code/<repo>/build` and `Code/agent-worktrees/<worktree>/build-cov`, but it
+could not see `<root>/<repo>/.claude/worktrees/<worktree>/build`, a nest that
+sits five levels below the scan root and now holds the largest single
+reclaimable tree on the fleet. On m3 that blind spot was 14.86 GiB of the
+1020.17 GiB reclaimable under Workshop, and 14.64 GiB of it was one directory.
+Depth is the right knob rather than a per-host list of nests, because one
+number names the same pattern on m3, m5 and m1, while a nest list rots the next
+time a worktree root moves.
+
+Scanning deeper does not weaken the guards, since the marker, source-marker,
+live-process and age tests are all depth independent. Measured on m3's Workshop
+root, depth 5 exposes 94 build-named directories that depth 3 never saw, and 88
+of them are refused for carrying no generated-tree marker: that is precisely
+what `external/skia-build/build`, cargo `target/debug/build`, and
+`node_modules/*/build` are. The 6 that pass the marker gates are regenerable
+CMake trees, and they still face the live-process and age gates before anything
+is removed.
+
+Stop at 5. Deeper scans surface no further reclaimable bytes and only cost walk
+time, so 5 is the smallest depth that misses nothing. Depth is also not what
+decides whether a host reclaims anything: on a host whose build trees are
+rebuilt daily, the age gate is the binding constraint, and lowering that gate to
+chase the bytes would delete trees that are still live.
 
 Logs land in
 `~/Library/Logs/tartci/tartci-reclaim.log`. The agent runs hourly rather than
