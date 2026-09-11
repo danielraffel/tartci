@@ -97,6 +97,110 @@ class FindCandidatesTests(unittest.TestCase):
         self.assertEqual(dr.find_candidates([self.root / "absent"], maxdepth=3), [])
 
 
+class ScanDepthTests(unittest.TestCase):
+    """Depth 5 is the shipped default, and it must reach the worktree nest.
+
+    The janitor shipped at depth 3, which reached <root>/<repo>/build and
+    <root>/agent-worktrees/<worktree>/build-cov but stopped one level short of
+    <root>/<repo>/.claude/worktrees/<worktree>/build. On m3 that nest held the
+    largest single reclaimable tree on the volume: 14.64 GiB of the 14.86 GiB
+    depth 3 could not see, so the miss was most of the deep bytes rather than a
+    rounding error.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        # macOS puts TMPDIR under /var, a symlink to /private/var, and the
+        # janitor resolves its roots. Resolve here so paths compare equal.
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def nest(self) -> pathlib.Path:
+        """The shape depth 3 missed, five levels below the scan root."""
+        return self.root / "pulp" / ".claude" / "worktrees" / "agent-x" / "build"
+
+    @staticmethod
+    def env_without_depth() -> dict[str, str]:
+        """The real environment minus the depth override.
+
+        Cleared outright it would take PATH with it, and the pass shells out
+        to `ps` to sample live builds.
+        """
+        return {key: value for key, value in os.environ.items()
+                if key != "TARTCI_RECLAIM_MAXDEPTH"}
+
+    def run_json(self, *argv):
+        buffer = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, self.env_without_depth(),
+                                      clear=True):
+            with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+                code = dr.main(["--roots", str(self.root), "--json", *argv])
+        return code, json.loads(buffer.getvalue())
+
+    def test_default_maxdepth_is_five(self):
+        with unittest.mock.patch.dict(os.environ, self.env_without_depth(),
+                                      clear=True):
+            self.assertEqual(dr.build_parser().parse_args([]).maxdepth, 5)
+        # Control: the environment still overrides. Without it, the 5 above
+        # would pass just as happily on a default nothing can reach.
+        with unittest.mock.patch.dict(
+                os.environ, {"TARTCI_RECLAIM_MAXDEPTH": "7"}, clear=False):
+            self.assertEqual(dr.build_parser().parse_args([]).maxdepth, 7)
+
+    def test_the_worktree_nest_is_reached_at_five_and_missed_at_three(self):
+        deep = make_build_tree(self.nest())
+        shallow = make_build_tree(self.root / "pulp" / "build")
+        self.assertNotIn(deep, dr.find_candidates([self.root], maxdepth=3))
+        # Control: depth 3 is not simply blind here. It finds the shallow tree
+        # in the same fixture, so the miss above is the depth bound and not a
+        # scan that returned nothing at all.
+        self.assertIn(shallow, dr.find_candidates([self.root], maxdepth=3))
+        found = dr.find_candidates([self.root], maxdepth=5)
+        self.assertIn(deep, found)
+        self.assertIn(shallow, found)
+
+    def test_a_default_pass_reclaims_the_nest(self):
+        """The default must reach the nest, not merely an explicit --maxdepth.
+
+        find_candidates has always accepted a deeper bound; what was wrong was
+        the number every hourly pass actually ran with.
+        """
+        deep = make_build_tree(self.nest(), age_days=400)
+        code, report = self.run_json("--fix")
+        self.assertEqual(code, 0)
+        self.assertEqual([record["path"] for record in report["deleted"]],
+                         [str(deep)])
+        self.assertFalse(deep.exists())
+
+    def test_depth_five_exposes_vendored_payloads_and_still_refuses_them(self):
+        """Past depth 3 the marker gate is what protects a vendored tree.
+
+        Depth 3 kept external/skia-build/build out of reach by an accident of
+        geometry rather than by judging it. Depth 5 sees it, so the refusal has
+        to come from the absent generated-tree marker. Measured on m3, depth 5
+        newly exposed 94 build-named directories and refused 88 of them exactly
+        this way.
+        """
+        vendored = self.root / "pulp" / "external" / "skia-build" / "build"
+        (vendored / "lib").mkdir(parents=True)
+        (vendored / "lib" / "libskia.a").write_text("prebuilt")
+        age(vendored, 400)
+        code, report = self.run_json("--maxdepth", "5", "--fix")
+        self.assertEqual(code, 0)
+        self.assertIn(str(vendored),
+                      [record["path"] for record in report["kept"]])
+        self.assertTrue(vendored.exists())
+        # Control: the identical path carrying a generated marker IS reclaimed,
+        # so the survival above is the marker gate doing the work and not the
+        # scan quietly failing to reach five levels down.
+        make_build_tree(vendored, age_days=400)
+        code_ctl, report_ctl = self.run_json("--maxdepth", "5", "--fix")
+        self.assertEqual(code_ctl, 0)
+        self.assertEqual([record["path"] for record in report_ctl["deleted"]],
+                         [str(vendored)])
+        self.assertFalse(vendored.exists())
+
+
 class _RefusingEntry:
     """A scandir entry whose stat fails with a chosen errno.
 
