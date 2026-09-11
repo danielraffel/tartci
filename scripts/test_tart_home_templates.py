@@ -15,6 +15,13 @@ TART_TEMPLATES = (
     ROOT / "launchd/com.danielraffel.pulp.tart-runner-macos-release.plist.template",
     ROOT / "launchd/com.danielraffel.pulp.tart-runner-linux.plist.template",
     ROOT / "launchd/com.danielraffel.tartci.reap.plist.template",
+    # The watchdog probes the Tart inventory to decide whether a supervisor is
+    # crash-looping or merely quiet under a long build, and it deletes nothing
+    # itself but triggers a bootout that does. A LaunchAgent inherits no login
+    # shell, so without a rendered TART_HOME its `tart list` reads the default
+    # store, comes back empty on any host that keeps VMs elsewhere, and the
+    # probe is blind exactly when it is load-bearing.
+    ROOT / "launchd/com.danielraffel.tartci.launchd-watchdog.plist.template",
 )
 
 
@@ -31,6 +38,23 @@ class TartHomeTemplateTests(unittest.TestCase):
                 "<key>TART_HOME</key>\n        <string>$HOME/VMs</string>",
                 body,
                 f"{template.name} would reset an external-store host on reinstall",
+            )
+
+    def test_documented_install_shape_substitutes_the_store(self) -> None:
+        # A template that carries $TART_HOME but documents an install command
+        # that never substitutes it ships a literal "$TART_HOME" into launchd,
+        # which is the same blindness as omitting the key entirely.
+        for template in TART_TEMPLATES:
+            body = template.read_text(encoding="utf-8")
+            header = body.split("-->", 1)[0]
+            substituted = (
+                "render_launchd_template.py" in header
+                or "$TART_HOME|" in header
+            )
+            self.assertTrue(
+                substituted,
+                f"{template.name} documents an install that leaves "
+                "$TART_HOME unsubstituted",
             )
 
     def test_fresh_gate_migration_requires_and_renders_tart_home(self) -> None:

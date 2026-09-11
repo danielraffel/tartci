@@ -156,6 +156,13 @@ PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
+# Set only by handle_supervisor_signal, and only when a run was still in flight
+# when the signal arrived. A signal is not proof the job is over: launchd
+# delivers SIGTERM for any bootout, including one the launchd watchdog issues on
+# a misread, while the guest may still be executing a required gate job.
+# Deleting that VM force-fails a live job with no failed step, so teardown
+# refuses the destructive half in this window.
+SIGNAL_LIVE_ASSIGNMENT=0
 CURRENT_JOB_ID=""
 CURRENT_WORKFLOW_NAME=""
 CURRENT_JOB_CAPTURE_STATUS="not-attempted"
@@ -767,6 +774,15 @@ terminate_current_guardian(){
 
 discard_current_vm(){
   [ -n "$CURRENT_VM" ] || return 0
+  if [ "${SIGNAL_LIVE_ASSIGNMENT:-0}" = 1 ]; then
+    # Nonterminal on purpose: the caller keeps owning the lease and the
+    # reservation, because the VM really is still consuming that capacity. The
+    # janitor reaps the VM once it is genuinely residue; a deleted guest under a
+    # live job is not recoverable at all.
+    note "refusing teardown of $CURRENT_VM — run ${CURRENT_RUN_ID:-} was still in flight when the supervisor was signalled"
+    event teardown_refused "vm=$CURRENT_VM reason=live_assignment run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}"
+    return 1
+  fi
   note "stopping — tearing down in-flight VM $CURRENT_VM"
   stop_current_aqua_runner
   if ! terminate_current_guardian; then
@@ -815,6 +831,10 @@ handle_supervisor_signal(){
     CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
     CURRENT_JOB_RECEIPT='{"kind":"terminal_unknown","detail":"supervisor_signal"}'
   fi
+  # A captured run id is the one signal that positively identifies work we would
+  # be destroying. Scan/assignment state alone can outlive a finished job, so it
+  # quarantines the observation above without also blocking reclamation.
+  [ -z "$CURRENT_RUN_ID" ] || SIGNAL_LIVE_ASSIGNMENT=1
   event supervisor_signal "INT/TERM quarantine=$CURRENT_ASSIGNMENT_QUARANTINE"
   cleanup
   trap - EXIT
