@@ -325,6 +325,41 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(delete)
         self.assertEqual(reason, "source_tree")
 
+    def test_every_source_marker_refuses_the_tree_on_its_own(self):
+        """Each spelling in SOURCE_MARKERS has to stop a delete by itself.
+
+        Only .git carried any test weight, and the other three are exactly the
+        spellings that tell a checkout apart from generator output. The scan
+        reaches <repo>/.claude/worktrees/<worktree>/ now, so a typo in one of
+        them costs a source tree rather than a build directory, and that is the
+        single irreversible decision this script makes.
+        """
+        # Spelled out rather than read from dr.SOURCE_MARKERS. Iterating the
+        # constant under test makes the loop shrink with it, so deleting three
+        # of the four spellings left this green -- confirmed by breaking it.
+        spellings = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
+        self.assertEqual(set(dr.SOURCE_MARKERS), set(spellings),
+                         "a marker changed without a case here to cover it")
+        for index, marker in enumerate(spellings):
+            with self.subTest(marker=marker):
+                path = make_build_tree(self.root / f"wt{index}" / "build",
+                                       age_days=400)
+                # Written as a file for every marker, .git included: a linked
+                # worktree's .git is a regular file holding a gitdir: line, and
+                # a linked worktree is the shape living in that nest.
+                (path / marker).write_text("{}")
+                age(path, 400)
+                delete, reason, _ = self.classify(path)
+                self.assertFalse(delete, marker)
+                self.assertEqual(reason, "source_tree", marker)
+        # Control: the same tree at the same age carrying no source marker must
+        # be taken. Without it every assertion above passes just as well on an
+        # implementation that never deletes anything in this fixture.
+        control = make_build_tree(self.root / "unmarked" / "build",
+                                  age_days=400)
+        delete, reason, _ = self.classify(control)
+        self.assertTrue(delete, reason)
+
     def test_live_build_command_line_protects_the_tree(self):
         path = make_build_tree(self.root / "wt" / "build", age_days=400)
         cmdline = f"66665 cmake --build {path} --target all\n"
