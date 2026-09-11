@@ -238,6 +238,31 @@ class AssignmentV2Tests(unittest.TestCase):
         self.assertIn("scanner_rc=2", events)
         self.assertIn("GitHub API failed", events)
 
+    def test_blind_selection_is_never_published_to_the_selection_cache(self) -> None:
+        """A blind scan is an absence of observation, not an observation of absence.
+
+        Publishing `ERR` into the positive selection cache replays one transient
+        GitHub failure as a blind verdict for the whole cache TTL. During that
+        window the lane performs no observation at all, so it cannot recover on
+        the next poll, and a supervisor that restarts for fresh credentials
+        re-reads the same stale blind verdict from disk.
+        """
+        self._state(api_fail=True)
+        blind = self._runner("--print-selection")
+        self.assertEqual(blind.returncode, 0, blind.stderr)
+        self.assertEqual(blind.stdout.split("\t", 1)[0], "ERR")
+        for cache in (self.root / "state").glob("*.assignment-v2-selection.cache"):
+            self.assertNotIn(
+                "ERR", cache.read_text(encoding="utf-8"), "blind verdict was cached"
+            )
+
+        # GitHub recovers. Rewrite the scanner state directly rather than via
+        # _state(), which clears the cache and would hide the replay under test.
+        self.state.write_text(json.dumps({"merge": True}), encoding="utf-8")
+        recovered = self._runner("--print-selection")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.stdout.strip().split("\t")[0], "1")
+
     def test_malformed_label_element_denies_selection(self) -> None:
         self._state(malformed=True)
         result = self._runner("--print-selection")
