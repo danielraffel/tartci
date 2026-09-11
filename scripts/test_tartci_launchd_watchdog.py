@@ -85,13 +85,17 @@ check(disabled == {"com.example.retired"},
 STALE = wd.DEFAULT_STALE_LOG_S
 RESTART_GRACE = wd.DEFAULT_RESTART_GRACE_S
 
-# The incident signature: non-zero exit + a 2-week-stale log → wedged.
+# The incident signature: non-zero exit + a 2-week-stale log + NO VM running →
+# wedged. `vm_running` is stated explicitly because it is part of the signature,
+# not an incidental default: the wedged agent exited 126 before its script could
+# run, so nothing was ever built and no VM existed.
 v, _ = wd.classify("spawn scheduled", 126, log_age_s=14 * 24 * 3600,
-                   stale_log_s=STALE)
+                   stale_log_s=STALE, vm_running=False)
 check(v == "wedged", f"exit126 + stale log must be wedged, got {v}")
 
 # Missing log alongside a non-zero exit → wedged (died before it could log).
-v, _ = wd.classify("spawn scheduled", 126, log_age_s=None, stale_log_s=STALE)
+v, _ = wd.classify("spawn scheduled", 126, log_age_s=None, stale_log_s=STALE,
+                   vm_running=False)
 check(v == "wedged", f"exit126 + missing log must be wedged, got {v}")
 
 # Non-zero exit but a FRESH log → a live restart, not the invisible wedge.
@@ -168,6 +172,73 @@ check(v == "healthy", f"unloaded agent (state None) must be healthy, not resurre
 # Same for a stopped agent that last exited 0 while unloaded.
 v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=False)
 check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
+
+
+# ── the VM guard on the crash-loop signature ────────────────────────────────
+# `serve --loop` exits EX_TEMPFAIL (75) BY DESIGN so launchd hands the respawn a
+# fresh App-auth environment, and launchd keeps reporting that non-zero code for
+# the whole life of the respawned supervisor. A long gate job then writes nothing
+# for its duration, so "sticky non-zero exit + stale log" describes a perfectly
+# healthy mid-build supervisor exactly as loudly as it describes a crash-loop.
+# Healing one is a bootout, which SIGTERMs the supervisor and tears the guest
+# down under a live job. The VM probe is the only signal that separates them.
+v, reason = wd.classify(
+    "running", 75, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=True,
+)
+check(v != "wedged",
+      f"sticky EX_TEMPFAIL + stale log WHILE a VM builds must not be wedged, got {v}: {reason}")
+check(v == "healthy",
+      f"sticky EX_TEMPFAIL + stale log while a VM builds must be healthy, got {v}: {reason}")
+
+# Any sticky non-zero exit, not only 75: a supervisor that exited 1, respawned,
+# and is now mid-build presents the identical signature.
+v, _ = wd.classify(
+    "running", 1, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=True,
+)
+check(v == "healthy", f"sticky exit 1 + stale log while a VM builds must be healthy, got {v}")
+
+# Fail-safe, exactly as the alive-but-frozen branch does: an unavailable
+# inventory is neither idle nor busy, so refuse rather than guess. Destroying a
+# live gate VM is not recoverable; declining to heal is.
+v, reason = wd.classify(
+    "running", 75, log_age_s=STALE + 200, stale_log_s=STALE,
+    vm_running=None, vm_probe_reason="Tart executable unavailable",
+)
+check(v == "unknown", f"blind VM probe must refuse crash-loop recovery, got {v}: {reason}")
+check(v != "wedged", f"blind VM probe must never heal a crash-loop, got {v}")
+check("Tart executable unavailable" in reason,
+      f"unavailable inventory cause must survive classification: {reason}")
+
+# Missing log is the same decision: a VM is building, so this is not the wedge.
+v, _ = wd.classify(
+    "running", 75, log_age_s=None, stale_log_s=STALE, vm_running=True,
+)
+check(v == "healthy", f"missing log while a VM builds must not be wedged, got {v}")
+
+# ...and the real detector is NOT neutered. No VM is running in the incident
+# signature (the script never ran), so these must still heal.
+v, _ = wd.classify(
+    "spawn scheduled", 126, log_age_s=14 * 24 * 3600, stale_log_s=STALE,
+    vm_running=False,
+)
+check(v == "wedged", f"exit126 + stale log + NO VM must still be wedged, got {v}")
+
+v, _ = wd.classify(
+    "spawn scheduled", 126, log_age_s=None, stale_log_s=STALE, vm_running=False,
+)
+check(v == "wedged", f"exit126 + missing log + NO VM must still be wedged, got {v}")
+
+v, _ = wd.classify(
+    "spawn scheduled", 75, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=False,
+)
+check(v == "wedged", f"exit75 + stale log + NO VM must still be wedged, got {v}")
+
+# A fresh log still short-circuits to healthy before the probe is consulted, so
+# a blind probe cannot turn an ordinary live restart into a refusal.
+v, _ = wd.classify(
+    "running", 75, log_age_s=5.0, stale_log_s=STALE, vm_running=None,
+)
+check(v == "healthy", f"non-zero exit + fresh log must stay healthy even when blind, got {v}")
 
 
 # ── Tart executable + inventory probe ───────────────────────────────────────
