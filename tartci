@@ -685,9 +685,9 @@ EOF
         else
           local readiness_rc=$?
           if [ "$readiness_rc" = 127 ]; then
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
           else
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":0,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}'
           fi
         fi
       fi
@@ -723,9 +723,18 @@ import json, sys
 fleet = json.loads(sys.argv[1])
 if fleet["managed"]:
     print(f"fleet ready: {'yes' if fleet['fleet_ready'] else 'NO'}")
-    print(f"verified running supervisors: {fleet['verified_running_supervisors']}/{fleet['expected_supervisors']}")
+    verified = fleet["verified_running_supervisors"]
+    if verified is None:
+        print("verified running supervisors: unknown (not checked from here)")
+    else:
+        print(f"verified running supervisors: {verified}/{fleet['expected_supervisors']}")
     for problem in fleet["problems"]:
-        print(f"  problem: {problem['code']}" + (f" ({problem['label']})" if 'label' in problem else ""))
+        line = f"  problem: {problem['code']}"
+        if "label" in problem:
+            line += f" ({problem['label']})"
+        if problem.get("detail"):
+            line += f": {problem['detail']}"
+        print(line)
 else:
     print("fleet ready: unknown (legacy/unmanaged)")
 PY

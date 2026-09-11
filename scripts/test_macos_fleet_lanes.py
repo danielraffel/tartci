@@ -504,7 +504,11 @@ class MacosFleetLaneTests(unittest.TestCase):
 
             with mock.patch.object(fleet, "verify_receipt", side_effect=ValueError("tampered")):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
-            self.assertEqual(value["verified_running_supervisors"], 0)
+            # None, never 0: an unverifiable receipt means the supervisors were
+            # not checked, which must not be reported as having checked them and
+            # found none running. A healthy fleet observed from the wrong root
+            # would otherwise read as a dead one.
+            self.assertIsNone(value["verified_running_supervisors"])
             self.assertEqual(value["problems"][0]["code"], "receipt_mismatch")
 
     def test_heartbeat_identity_spans_wrapper_and_direct_topologies(self) -> None:
