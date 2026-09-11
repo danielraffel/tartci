@@ -2005,5 +2005,108 @@ replaces_launchd_labels=REPLACEMENT
                     self.assertIn("replaces_launchd_labels", result.stderr)
 
 
+
+class ServingBlockedTests(unittest.TestCase):
+    """A fresh heartbeat proves a supervisor is alive, never that it serves.
+
+    A lane that keeps winning a host reservation and then losing the VM lease
+    heartbeats on a normal cadence forever, so the age-only test cannot see it.
+    These pin the separation in both directions: a short block is ordinary
+    contention and must stay verified, a long one must stop counting as
+    realized capacity.
+    """
+
+    def _readiness(self, extra_state: dict, **kwargs) -> dict:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            receipt = {"plists": {"one.plist": "a"}, "retired_launchd_labels": []}
+            start = "Mon Sep  1 00:00:00 2026"
+            state_dir = root / "one-state"
+            state_dir.mkdir()
+            state = {
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "supervisor_pid": "101",
+                "supervisor_pid_started_at": start,
+            }
+            state.update(extra_state)
+            (state_dir / "one.state.json").write_text(json.dumps(state))
+            (agents / "one.plist").write_bytes(plistlib.dumps({
+                "EnvironmentVariables": {
+                    "HOME": str(root), "TARTCI_STATE_DIR": str(state_dir),
+                },
+            }))
+            running = subprocess.CompletedProcess(
+                [], 0, "state = running\npid = 101\n", ""
+            )
+            domain = subprocess.CompletedProcess([], 0, "", "")
+            process_table = subprocess.CompletedProcess(
+                [], 0,
+                f"101 1 {start} bash {root}/.local/share/tartci-generations/"
+                "current/providers/tart-macos/runner.sh --loop\n",
+                "",
+            )
+            args = (Path("receipt"), Path("config"), agents, Path("support"))
+            with mock.patch.object(fleet, "verify_receipt", return_value=receipt), \
+                 mock.patch.object(
+                     fleet.subprocess, "run",
+                     side_effect=[running, process_table, domain],
+                 ), \
+                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
+                return fleet.fleet_readiness(
+                    *args, participating=True, pool_state="on", **kwargs
+                )
+
+    @staticmethod
+    def _ago(seconds: int) -> str:
+        moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)
+        return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def test_a_long_block_stops_counting_as_realized_capacity(self) -> None:
+        value = self._readiness({"serving_blocked_since": self._ago(7200)})
+        problems = {item["code"]: item for item in value["problems"]}
+        self.assertIn("serving_blocked", problems)
+        self.assertIn("blocked_seconds=", problems["serving_blocked"]["detail"])
+        self.assertEqual(value["verified_running_supervisors"], 0)
+        self.assertFalse(value["fleet_ready"])
+
+    def test_ordinary_contention_stays_verified(self) -> None:
+        """The inverse failure: a lane blocked for a minute is just waiting its
+        turn behind a live build, and flagging that would manufacture alarms on
+        a healthy fleet."""
+        value = self._readiness({"serving_blocked_since": self._ago(60)})
+        self.assertNotIn(
+            "serving_blocked", {item["code"] for item in value["problems"]}
+        )
+        self.assertEqual(value["verified_running_supervisors"], 1)
+        self.assertTrue(value["fleet_ready"])
+
+    def test_a_generation_predating_the_field_is_not_reported_blocked(self) -> None:
+        """Hosts run whatever generation was last installed. An older runner
+        never writes the marker, and its absence is ignorance, not health."""
+        value = self._readiness({})
+        self.assertNotIn(
+            "serving_blocked", {item["code"] for item in value["problems"]}
+        )
+        self.assertEqual(value["verified_running_supervisors"], 1)
+
+    def test_an_unreadable_marker_is_reported_rather_than_skipped(self) -> None:
+        value = self._readiness({"serving_blocked_since": "not-a-timestamp"})
+        self.assertIn(
+            "serving_blocked_invalid",
+            {item["code"] for item in value["problems"]},
+        )
+        self.assertEqual(value["verified_running_supervisors"], 0)
+
+    def test_the_threshold_is_configurable(self) -> None:
+        value = self._readiness(
+            {"serving_blocked_since": self._ago(600)}, blocked_serving_seconds=300
+        )
+        self.assertIn(
+            "serving_blocked", {item["code"] for item in value["problems"]}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
