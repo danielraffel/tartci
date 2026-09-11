@@ -249,6 +249,14 @@ def free_bytes(path: pathlib.Path) -> int | None:
     Returning 0 here would be read as a full disk, which selects the SHORTER
     pressure age gate. An unreadable volume would then reclaim harder than a
     healthy one, so the unknown case has to stay distinct from zero.
+
+    The failure branch looks dead, because main() refuses an unreadable scan
+    root before any measurement is taken. It is not: the post-fix re-measure
+    runs after a whole pass has walked and deleted, which on a loaded host is
+    minutes after that check, and the volume it re-measures is a mount point
+    (m3 scans /Volumes/Workshop). An unmount inside that window, or an EIO off
+    a failing disk, reaches here. Deleting this branch would turn that into a
+    traceback out of the janitor instead of an honest "unknown".
     """
     try:
         return shutil.disk_usage(path).free
