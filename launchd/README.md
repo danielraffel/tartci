@@ -320,6 +320,34 @@ instead of waiting for the generic 30-minute stale-log threshold. Participation
 OFF remains authoritative, and other nonzero exit classes retain the conservative
 stale-log rule.
 
+An interval agent is quiet by design between runs, so the shared 30-minute
+stale-log threshold would call an hourly agent frozen on every other pass and
+boot out an agent that is working. The watchdog reads `StartInterval` from each
+agent's own plist and widens that agent's bound to twice its interval. The bound
+never shortens: a one-minute agent keeps the 30-minute floor, and only a slower
+agent widens past it. Two intervals is the smallest bound that survives one
+skipped run. An absent, zero, negative, or non-integer `StartInterval` yields no
+bound rather than a zero one, because a zero would collapse the threshold and
+make every agent read as wedged.
+
+A reload is also refused outright for an interval agent that is currently
+`running`. Such an agent is running its one job, not serving a loop that can be
+interrupted anywhere: the reclaimer is mid-`rmtree`, and booting it out there
+leaves a half-deleted tree no later pass can classify. The watchdog logs the
+refusal and lets the next interval start it cleanly.
+
+Not every nonzero exit is a wedge. Some agents exit with a code that reports an
+application condition: the program ran to completion and is naming something a
+reload cannot fix. The reclaimer's 2 (unusable scan root), 3 (still below the
+free-space floor), and 4 (process table unreadable, so nothing could be proven
+idle) are those. Treating them as the crash-loop signature boots out a working
+agent every hour and buries the condition it was reporting, so they get their
+own verdict, `attention`: it is reported, `--status` exits non-zero on it, and
+it is marked `!` rather than a tick, but it is never healed. Everything not
+listed stays on the wedge path on purpose. 126 and 127 (not executable, not
+found) and signal-derived exits are exactly the no-Full-Disk-Access wedge class
+this watchdog exists to recover.
+
 Per-lane launchd enablement is also authoritative. A host may participate while
 legacy, release, sanitizer, Linux, or Windows plists remain explicitly disabled.
 The watchdog reads `launchctl print-disabled` once per pass and never reloads an
@@ -501,6 +529,186 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 
 Then install the LaunchAgent once the report is clean. Logs land in
 `~/Library/Logs/tartci/tartci-reap.log`.
+
+### Disk reclaimer
+
+`com.danielraffel.tartci.reclaim.plist.template` runs the second janitor:
+
+```sh
+tartci reclaim --json --fix
+```
+
+The reap agent above frees the VM store; this one frees the volume underneath
+it. They are separate because they protect different things: reap keys off a
+tartci ownership marker on a VM, and no such marker exists on a developer's
+build directory.
+
+It exists because the disk axis of a lease is fatal rather than degrading. A
+host whose data volume fills denies EVERY lease `disk_capacity_exceeded` and
+stops serving, while its share of the load moves silently to whatever host is
+left. m5 reached 14 GiB free on a 3.6 TiB volume, with 488 build directories
+totalling 1.32 TB and no cleanup agent of any kind, and refused 276 leases
+before anyone noticed the gate was dead rather than slow.
+
+Deletion is safe-by-construction in the same shape as reap. A directory is
+removed only when every positive check passes: its basename is a build-directory
+name (`build`, `build-<key>`, `build-cov*`, `build-coverage*`), it carries a
+generated-tree marker (`CMakeCache.txt`, `build.ninja`, `CMakeFiles/`), it
+carries no source marker (`.git`, `CMakeLists.txt`, `Cargo.toml`,
+`package.json`) of its own, no live build process names its path, and nothing
+inside it changed inside the age gate. A directory that merely has the name is
+skipped, and the report says which check rejected it.
+
+Be precise about what the liveness check is worth, because it is the one gate
+that sounds stronger than it is. It compares each candidate's path against the
+command lines of live build processes, both as spelled and resolved through
+realpath, so a build invoked with a relative path from inside its own tree can
+name a directory the scan cannot match. It is a cheap first filter, not a proof
+of idleness. The gate that actually carries the weight is the age re-check: the
+mtime is read a second time immediately before `shutil.rmtree`, so a tree that
+was touched between the scan and the delete is kept and reported as
+`touched_during_pass`. The window that matters is the one between deciding and
+deleting, and that is the window the re-check closes.
+
+A candidate whose age cannot be measured is never deleted. `EACCES`, `EPERM`,
+`EIO`, and `ELOOP` while walking a tree mean the janitor could not see it, and
+it is kept with the reason `unmeasured`. A vanished entry (`ENOENT`) is
+deliberately not in that set: it is a normal, constant event on a live build
+tree, and it is positive evidence the tree is busy rather than a failure to
+measure.
+
+A `--fix` pass writes a bounded heartbeat to stderr, which the plist points at
+the same log file as stdout, so the JSON document on stdout stays parseable. It
+announces the pass start and the candidate count, then at most one line every
+five minutes as it works, and one line naming each tree immediately before it
+is removed. That last line is never rate limited. Two reasons: the watchdog reads this agent's
+liveness from its log mtime, so a long working pass must not look frozen, and if
+the process is killed mid-unlink that last line is the only record of which tree
+was left half deleted.
+
+Two age tiers, so an idle host keeps recent build dirs warm and a full host
+reclaims harder: `TARTCI_RECLAIM_MIN_AGE_DAYS` (30) always applies, and the
+shorter `TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS` (7) applies as well once free
+space drops below `TARTCI_RECLAIM_PRESSURE_FREE_GB` (200).
+
+`TARTCI_RECLAIM_FAIL_BELOW_GB` (60) closes the escalation half. A host still
+below the floor after a pass exits 3 with a named reason on stderr, so launchd
+records a failing janitor and a supervisor sees a full disk rather than only
+seeing refused leases. That gap is why the m5 outage ran for days.
+
+Exit 4 is the separate case, and the distinction matters to whoever reads the
+recorded status: 3 means the pass measured the host and it is genuinely still
+full, while 4 means a measurement the decision depends on could not be taken at
+all (the process table, or free space with a floor set), so nothing was deleted
+and nothing was certified. Both are failures, but 3 asks for disk and 4 asks why
+the janitor cannot see. Exit 2 means no scan root resolved, and 0 means the pass
+ran and the host is above its floor.
+
+This agent prevents a slow fill; it does not rescue a host that filled today.
+The age gates are the binding constraint, by design: measured against m5's real
+tree on 2026-09-10, right after the outage was cleared by hand, a 30-day pass
+found 128 candidates and would have deleted none, and even the 7-day pressure
+tier reclaimed only 1.6 GiB, because nearly every surviving build directory had
+been written in the preceding week. The same scan at a 12-hour gate would have
+deleted 98 directories totalling 616 GiB, which is the measure of how much the
+gate is holding back rather than failing to see. A host that fills with work
+genuinely younger than the pressure gate is meant to exit 3 and escalate to a
+human, never to delete a build somebody is still using.
+
+Run it report-only first. Without `--fix` the pass is a dry run and prints what
+it would remove:
+
+```sh
+"$HOME/.local/bin/tartci" reclaim
+```
+
+A dry run reports the bytes a `--fix` pass would free, both in the summary line
+("would reclaim N GiB") and in the JSON `reclaimed_bytes`, so the report-only
+step tells you what the rollout is actually worth on that host. Under `--fix`
+the same figure is what was freed.
+
+Scan roots are discovered rather than declared: the janitor keeps whichever of
+`~/Code` and `/Volumes/Workshop/Code` the host actually has, and measures free
+space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
+floor is judged against the tightest of those volumes, so a healthy disk cannot
+certify a full one. Pressure is scoped per volume instead: only candidates on a
+volume under `TARTCI_RECLAIM_PRESSURE_FREE_GB` take the shorter
+`TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS` gate, because failing more is safe and
+deleting more is not.
+`TARTCI_RECLAIM_ROOTS` still overrides with a colon-separated list, but reach
+for it only for a one-off run. A declared root that exists on the wrong volume
+is the one fault nothing downstream can catch: the pass reports a clean exit 0
+forever while the volume it was installed to protect fills up, which is what
+`$HOME/Code` did on a host that keeps its code on Workshop.
+
+The scan depth is 5, raised from an earlier 3. Depth 3 reached
+`Code/<repo>/build` and `Code/agent-worktrees/<worktree>/build-cov`, but it
+could not see `<root>/<repo>/.claude/worktrees/<worktree>/build`, a nest that
+sits five levels below the scan root and now holds the largest single
+reclaimable tree on the fleet. On m3 that blind spot was 14.86 GiB of the
+1020.17 GiB reclaimable under Workshop, and 14.64 GiB of it was one directory.
+Depth is the right knob rather than a per-host list of nests, because one
+number names the same pattern on m3, m5 and m1, while a nest list rots the next
+time a worktree root moves.
+
+Scanning deeper does not weaken the guards, since the marker, source-marker,
+live-process and age tests are all depth independent. Measured on m3's Workshop
+root, depth 5 exposes 94 build-named directories that depth 3 never saw, and 88
+of them are refused for carrying no generated-tree marker: that is precisely
+what `external/skia-build/build`, cargo `target/debug/build`, and
+`node_modules/*/build` are. The 6 that pass the marker gates are regenerable
+CMake trees, and they still face the live-process and age gates before anything
+is removed.
+
+Stop at 5. Deeper scans surface no further reclaimable bytes and only cost walk
+time, so 5 is the smallest depth that misses nothing. Depth is also not what
+decides whether a host reclaims anything: on a host whose build trees are
+rebuilt daily, the age gate is the binding constraint, and lowering that gate to
+chase the bytes would delete trees that are still live.
+
+Logs land in
+`~/Library/Logs/tartci/tartci-reclaim.log`. The agent runs hourly rather than
+the reap agent's five minutes: a pass walks the scan roots and sizes
+candidates, and a disk fills over days.
+
+That log is bounded, because it lives on the volume the janitor exists to
+protect and launchd appends every pass to it forever. Nothing used to truncate
+it: m3 was carrying 368 MiB of tartci logs when the bound was written. Each
+pass renames the log aside at startup once it reaches
+`TARTCI_RECLAIM_LOG_MAX_BYTES` (8 MiB) and keeps `TARTCI_RECLAIM_LOG_GENERATIONS`
+(5) of it. `TARTCI_RECLAIM_LOG` must name the same path as `StandardOutPath`,
+which is what the template does; leaving it unset disables rotation entirely.
+
+It renames rather than truncates, because launchd opens `StandardOutPath` fresh
+on every spawn of a `StartInterval` job. That was measured on a throwaway job
+rather than assumed, and it has a visible consequence: the descriptor a pass
+inherited still points at the inode it just renamed, so the pass that triggers a
+rotation writes into generation 1 and the new file starts collecting at the next
+spawn. The worst case on disk is therefore generations x (max bytes + one
+pass's output), roughly 40 MiB, not generations x max bytes exactly.
+
+`tartci status` reports whether this host has the agent, whether launchd holds
+it, when it last wrote its log, and the free space on each volume the janitor
+scans. Ask it before assuming a host is protected: the failure it exists to
+catch is silent, because a host that never got the agent looks exactly like a
+host whose passes are all finding nothing.
+
+It reports both janitors on their own lines, the disk reclaimer above and the
+VM reaper from the Janitor section, because a host can carry either, both, or
+neither: m3 has the VM reaper and no disk reclaimer, while m1 and m5 have no VM
+reaper at all. A single collapsed line would have read as healthy on exactly
+the host that is half covered.
+
+It reads the roots from `disk_reclaim` itself rather than keeping its own list,
+so status cannot disagree with the janitor about which volumes are scanned, and
+it prints `unknown` rather than a figure when a volume cannot be read. An
+unreadable volume is not a healthy one.
+
+Pulp ships its own `tools/scripts/clean_build_cov.sh`, which covers only
+`build-cov*` inside one checkout. That stays: it is the repo-local convenience
+for an external cloner who has no tartci. This agent is the fleet-wide job, and
+it covers the ordinary `build/` and `build-<key>/` directories that were the
+bulk of m5's 1.32 TB.
 
 All unattended macOS, macOS-release, Linux, Windows, and reap agents explicitly
 set `TARTCI_GH_CLI=ghapp`. Install the wrapper in the LaunchAgent `PATH` on

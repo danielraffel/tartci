@@ -533,6 +533,224 @@ wd._run = original_run
 reload_plist_dir.cleanup()
 
 
+# ── interval agents: staleness bound, application exits, reload refusal ──
+
+def _agent_plist(directory: Path, label: str, log: Path,
+                 interval: int | None = None) -> Path:
+    """Write a LaunchAgent plist the way a rendered tartci template writes one."""
+    data: dict = {"Label": label, "ProgramArguments": ["/bin/true"],
+                  "StandardOutPath": str(log)}
+    if interval is not None:
+        data["StartInterval"] = interval
+    path = directory / f"{label}.plist"
+    with path.open("wb") as fh:
+        plistlib.dump(data, fh)
+    return path
+
+
+def _print_output(state: str, exit_code: str) -> str:
+    return f"state = {state}\nlast exit code = {exit_code}\nexit timeout = 5\n"
+
+
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reclaim.log"
+    log.write_text("a pass ran\n")
+
+    # The reader itself, before anything depends on it.
+    hourly = _agent_plist(root, "com.danielraffel.tartci.reclaim", log, interval=3600)
+    check(wd._start_interval_from_plist(str(hourly)) == 3600,
+          "control: a declared StartInterval must be read back verbatim")
+    no_interval = _agent_plist(root, "com.danielraffel.tartci.orchard-worker", log)
+    check(wd._start_interval_from_plist(str(no_interval)) is None,
+          "an agent with no StartInterval has no interval bound")
+    for bad, why in ((0, "zero"), (-5, "negative"), ("3600", "a string"),
+                     (True, "a bool")):
+        junk = root / "junk.plist"
+        with junk.open("wb") as fh:
+            plistlib.dump({"Label": "com.danielraffel.tartci.junk",
+                           "StartInterval": bad}, fh)
+        check(wd._start_interval_from_plist(str(junk)) is None,
+              f"{why} StartInterval must be None, never a collapsed bound")
+    check(wd._start_interval_from_plist(str(root / "absent.plist")) is None,
+          "an unreadable plist must not raise")
+
+# An hourly agent is quiet between runs by design. The shared 1800s bound calls
+# it frozen on every other pass and boots out an agent that is working.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reclaim.log"
+    log.write_text("last pass\n")
+    os.utime(log, (wd.utcnow() - 2400, wd.utcnow() - 2400))
+    label = "com.danielraffel.tartci.reap"        # not in APPLICATION_EXIT_CODES
+    hourly = _agent_plist(root, label, log, interval=3600)
+    shared = _agent_plist(root, label + "-noint", log)
+
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (0, _print_output("running", "(never exited)"), "")
+        # Control FIRST, on the same instrument and the same log age: without a
+        # declared interval this agent reads as alive-but-frozen.
+        control = wd.gather_health(label + "-noint", str(shared), STALE,
+                                   vm_running=False)
+        bounded = wd.gather_health(label, str(hourly), STALE, vm_running=False)
+        # And the bound never SHORTENS. A one-minute agent keeps the 1800s
+        # floor, so a 600s gap is still healthy; 2 x 60s alone would call it
+        # frozen five times over.
+        brief = root / "brief.log"
+        brief.write_text("last pass\n")
+        os.utime(brief, (wd.utcnow() - 600, wd.utcnow() - 600))
+        fast = _agent_plist(root, label + "-fast", brief, interval=60)
+        floored = wd.gather_health(label + "-fast", str(fast), STALE,
+                                   vm_running=False)
+        # ... and the widening is 2 x interval, not unbounded patience.
+        stretched = _agent_plist(root, label + "-stretched", log, interval=60)
+        still_wedged = wd.gather_health(label + "-stretched", str(stretched),
+                                        STALE, vm_running=False)
+    finally:
+        wd._run = original_run
+    check(control.verdict == "wedged",
+          f"control: no interval + 2400s stale log must be wedged, got {control}")
+    check(bounded.verdict == "healthy",
+          f"an hourly agent quiet for 2400s must not be wedged, got {bounded}")
+    check(floored.verdict == "healthy",
+          f"2 x 60s must never shorten the 1800s floor, got {floored}")
+    check(still_wedged.verdict == "wedged",
+          f"a 2400s gap must stay wedged at the 1800s floor, got {still_wedged}")
+
+# An exit code the reclaimer DOCUMENTS is the agent reporting a condition, not
+# a crash loop. Healing it reboots a working agent every hour and buries the
+# condition; calling it healthy hides it. It gets its own verdict.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reclaim.log"
+    log.write_text("pass finished\n")
+    os.utime(log, (wd.utcnow() - 9999, wd.utcnow() - 9999))
+    label = "com.danielraffel.tartci.reclaim"
+    plist = _agent_plist(root, label, log, interval=3600)
+    other = _agent_plist(root, "com.danielraffel.tartci.orchard-worker", log)
+
+    original_run = wd._run
+    try:
+        verdicts = {}
+        for code in (2, 3, 4):
+            wd._run = lambda _cmd, c=code: (
+                0, _print_output("not running", str(c)), "")
+            verdicts[code] = wd.gather_health(label, str(plist), STALE,
+                                              vm_running=False)
+        # Controls, same instrument, same stale log:
+        # 126 is the no-Full-Disk-Access wedge class and must stay healable.
+        wd._run = lambda _cmd: (0, _print_output("not running", "126"), "")
+        wedge_control = wd.gather_health(label, str(plist), STALE, vm_running=False)
+        # and the map is per-label, so exit 3 from another agent is still a wedge.
+        wd._run = lambda _cmd: (0, _print_output("not running", "3"), "")
+        label_control = wd.gather_health("com.danielraffel.tartci.orchard-worker",
+                                         str(other), STALE, vm_running=False)
+    finally:
+        wd._run = original_run
+    for code, health in verdicts.items():
+        check(health.verdict == "attention",
+              f"documented exit {code} must be attention, got {health}")
+        check("reload would only repeat it" in health.reason,
+              f"exit {code} must say why it is not healed: {health.reason}")
+    check(wedge_control.verdict == "wedged",
+          f"control: exit 126 must stay on the wedge path, got {wedge_control}")
+    check(label_control.verdict == "wedged",
+          f"control: exit 3 from another label is still a wedge, got {label_control}")
+
+# A running interval agent is running its ONE job. bootout lands mid-rmtree and
+# leaves a half-deleted tree no later pass can classify.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reclaim.log"
+    log.write_text("working\n")
+    hourly = _agent_plist(root, "com.danielraffel.tartci.reclaim", log,
+                          interval=3600)
+    plain = _agent_plist(root, "com.danielraffel.tartci.orchard-worker", log)
+
+    def _reloader(state: str):
+        seen: list[list[str]] = []
+        phase = {"loaded": True}
+
+        def fake(cmd: list[str]) -> tuple[int, str, str]:
+            seen.append(cmd)
+            if cmd[1] == "bootout":
+                phase["loaded"] = False
+                return 0, "", ""
+            if cmd[1] == "bootstrap":
+                phase["loaded"] = True
+                return 0, "", ""
+            if cmd[1] == "print":
+                if phase["loaded"]:
+                    return 0, _print_output(state, "(never exited)"), ""
+                return 113, "", "Could not find service"
+            return 0, "", ""
+
+        return fake, seen
+
+    original_run = wd._run
+    try:
+        wd._run, calls_running = _reloader("running")
+        refused = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
+        # Control 1: the same running state with no declared interval reloads.
+        wd._run, calls_plain = _reloader("running")
+        plain_ok = wd.reload_agent("com.danielraffel.tartci.orchard-worker",
+                                   str(plain))
+        # Control 2: the same interval agent NOT running is reloaded, so the
+        # refusal above is the running state and not the plist.
+        wd._run, calls_idle = _reloader("not running")
+        idle_ok = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
+    finally:
+        wd._run = original_run
+    check(not refused, "a running interval agent must refuse reload")
+    check(not any(c[1] == "bootout" for c in calls_running),
+          "the refusal must happen before bootout, not after")
+    check(plain_ok and any(c[1] == "bootout" for c in calls_plain),
+          "control: a running agent with no interval still reloads")
+    check(idle_ok and any(c[1] == "bootout" for c in calls_idle),
+          "control: an idle interval agent still reloads")
+
+# End to end through main(): attention is reported, never healed, and it makes
+# --status exit non-zero. Without the consumer wiring the verdict is invented
+# and then silently dropped.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    agents_dir = root / "LaunchAgents"
+    agents_dir.mkdir()
+    log = root / "reclaim.log"
+    log.write_text("pass finished\n")
+    os.utime(log, (wd.utcnow() - 9999, wd.utcnow() - 9999))
+    _agent_plist(agents_dir, "com.danielraffel.tartci.reclaim", log, interval=3600)
+
+    def _status(exit_code: str) -> tuple[int, str]:
+        import io
+        from contextlib import redirect_stdout
+        original_run = wd._run
+        buf = io.StringIO()
+        try:
+            wd._run = lambda _cmd: (0, _print_output("not running", exit_code), "")
+            with mock.patch.object(
+                wd, "probe_tart_vm_running",
+                return_value=wd.TartVMProbe(False, "idle", "/bin/true", str(root))
+            ), redirect_stdout(buf):
+                rc = wd.main(["--status", "--launch-agents-dir", str(agents_dir),
+                              "--participation-file", str(root / "participate")])
+        finally:
+            wd._run = original_run
+        return rc, buf.getvalue()
+
+    rc_attention, out_attention = _status("3")
+    rc_clean, out_clean = _status("(never exited)")
+    check(rc_attention == 1,
+          "--status must exit non-zero on an agent reporting a condition")
+    check("!" in out_attention,
+          f"attention needs its own mark, not a tick: {out_attention!r}")
+    check("[healed" not in out_attention and "would-heal" not in out_attention,
+          f"attention must never be healed: {out_attention!r}")
+    check(rc_clean == 0,
+          f"control: the same agent exiting cleanly must exit 0, got {rc_clean}")
+
+
 # ── rate limiter ─────────────────────────────────────────────────────────────
 NOW = 1_000_000.0
 WINDOW = 3600

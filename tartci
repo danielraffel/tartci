@@ -7,6 +7,7 @@
 #
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
+#   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
@@ -284,6 +285,10 @@ cmd_timings() {
 
 cmd_runtime() {
   exec python3 "$HERE/scripts/runtime_measure.py" "$@"
+}
+
+cmd_reclaim() {
+  exec python3 "$HERE/scripts/disk_reclaim.py" "$@"
 }
 
 cmd_windows() {
@@ -756,10 +761,11 @@ PY
   esac
 }
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
+  reclaim) shift; cmd_reclaim "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;

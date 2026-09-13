@@ -1409,6 +1409,22 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   the new complete receipt if that deadline fires.
   TartCI does not delete user work in response to this receipt.
 
+  A denial is a symptom, and nothing in the lease path fixes its cause. The
+  `com.danielraffel.tartci.reclaim` LaunchAgent
+  (`launchd/com.danielraffel.tartci.reclaim.plist.template`) is what keeps a
+  host from reaching the denial at all: hourly, it removes regenerable build
+  directories that are idle past an age gate, and exits non-zero when the host
+  is still below `TARTCI_RECLAIM_FAIL_BELOW_GB` afterwards so a full disk
+  surfaces as a failing agent rather than only as refused leases. Preview a host
+  with `tartci reclaim` (dry run) before installing it; see
+  `launchd/README.md`. Ask `tartci status` whether this host actually has that
+  agent, whether launchd holds it, and how much room is left on each volume it
+  scans: a host that never got the agent looks exactly like a host whose passes
+  are all finding nothing, and that is how m3 ran a stale generation while m1
+  and m5 carried no reap agent at all. This does not contradict the line above: the reclaimer
+  deletes generated build output that carries no source marker, never a
+  checkout.
+
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately
   exceeds the approximately 19 GiB store growth observed during a Pulp full
