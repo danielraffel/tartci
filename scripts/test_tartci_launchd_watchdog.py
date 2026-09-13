@@ -395,6 +395,15 @@ with tempfile.TemporaryDirectory() as td:
         "runtime health is owned by Shipyard" in health.reason,
         "persistent Actions services must never enter TartCI stale-log healing",
     )
+    # A delegation may only pass when it names the ARTIFACT carrying the other
+    # side's verdict. The bare sentence printed a checkmark for three months
+    # over a service crash-looping with no registration file; naming the file
+    # is what lets a reader tell "the other side is looking" apart from
+    # "delegated into the void".
+    check(
+        "host-attestation.json" in health.reason,
+        f"delegation must name the artifact it delegates to, got {health.reason!r}",
+    )
 
 # Missing runner + participation ON is the fleet-offline incident: it must heal.
 v, reason = wd.classify(None, None, log_age_s=None, stale_log_s=STALE,
