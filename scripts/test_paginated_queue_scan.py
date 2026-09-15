@@ -1035,7 +1035,47 @@ print(json.dumps(payload))
             self.assertIn('scripts/queue_scan.py"', body, runner)
             self.assertIn("--shared-cache-file", body, runner)
             self.assertIn("TARTCI_SHARED_QUEUE_CACHE", body, runner)
-            self.assertIn("2>/dev/null || echo ERR", body, runner)
+            # The contract is that a FAILED scan becomes the `ERR` sentinel, so a
+            # failure is never misread as an empty queue. Whether stderr is
+            # discarded on the way is a separate question — and discarding it is
+            # a defect, not part of this contract (see the macOS test below).
+            self.assertIn("|| echo ERR", body, runner)
+
+    def test_macos_supervisor_keeps_the_scanner_diagnostic(self) -> None:
+        """A blind supervisor must be able to say WHY.
+
+        The scanner prints the reason on stderr and only a count on stdout, so
+        routing that stderr to /dev/null leaves the supervisor able to report
+        that it is blind but never what failed. That cost a multi-hour outage in
+        which every other signal — auth, quota, proxy, launchd state — read
+        healthy and the one line naming the fault had already been thrown away.
+        """
+        body = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("run_scan_capture", body)
+        # Every macOS scan call site routes through the capturing wrapper.
+        self.assertGreaterEqual(body.count("run_scan_capture "), 3)
+        self.assertNotIn("--match-labels 1 2>/dev/null", body)
+
+    def test_scan_diagnostic_keeps_both_ends_of_the_stream(self) -> None:
+        """Keeping a deeper tail is still last-line-wins.
+
+        A wrapper prints the cause first and its own summary last, so any
+        tail-only rule loses the cause as soon as the wrapper is more verbose
+        than the depth chosen — `tail -n 3` keeps a two-line wrapper's cause and
+        loses a four-line one's, and no caller can predict how chatty a wrapper
+        will be. Both ends must be kept, with the elision declared.
+        """
+        macos = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", macos)
+        self.assertIn("line(s) elided", macos)
+        # The diagnostic must never be captured by a tail-only rule again.
+        self.assertNotIn('tail -n 3 >"$SCAN_ERROR_FILE"', macos)
+        self.assertNotIn('tail -n 1 >"$SCAN_ERROR_FILE"', macos)
+
+        v2 = (RUNNERS[0].parent / "assignment-v2.lib.sh").read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", v2)
+        self.assertNotIn("tail -n 1", v2)
+        self.assertNotIn("tail -n 3", v2)
 
     def test_macos_supervisor_passes_opt_in_minimum_queue_age(self) -> None:
         body = RUNNERS[0].read_text(encoding="utf-8")
