@@ -1375,7 +1375,14 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   capacity via `--capacity-mem-mb`); admission is `min(core-budget,
   memory-budget)`, so a build is refused when it would exhaust RAM even if cores
   are free. Legacy core-only records are estimated as `cores × per-job memory`
-  so a mixed store never over-admits.
+  so a mixed store never over-admits. The gate reserve applies on this axis too
+  (`reserved_gate_mem_mb`, overridable with `--reserved-gate-mem-mb`): a
+  non-gate lease is held to `capacity - reserve`, because a non-gate build that
+  fits the non-gate *core* budget could otherwise consume the RAM the next gate
+  VM needs and darken the required `macos` gate. The reserve is derived
+  proportional to `reserved_gate_cores` and clamped so non-gate work always
+  keeps at least one compile job's worth. A denial names which limit bound it
+  (`memory_limit_class`: `non_gate` or `host`).
 - **Disk as a third, per-volume axis** — macOS/Linux Tart clones reserve growth
   against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN_WORK`.
   Device ID, not a spelling of the path, is the accounting key, so aliases on
