@@ -52,6 +52,7 @@ class LeaseCliTestCase(unittest.TestCase):
         reserved: int = 0,
         mem_mb: int | None = None,
         capacity_mem_mb: int = 0,
+        reserved_mem_mb: int = 0,
         disk_path: Path | None = None,
         disk_growth_mb: int = 0,
         disk_floor_mb: int = 0,
@@ -91,6 +92,8 @@ class LeaseCliTestCase(unittest.TestCase):
             str(capacity),
             "--reserved-gate-cores",
             str(reserved),
+            "--reserved-gate-mem-mb",
+            str(reserved_mem_mb),
             "--priority",
             priority,
             "--pid",
@@ -393,6 +396,133 @@ class LeaseMemoryAxisTests(LeaseCliTestCase):
         # explicit 1000 + legacy estimate (3 * 1536 = 4608) = 5608, NOT 1000.
         self.assertEqual(cap["used_mem_mb"], 1000 + 4608)
         self.assertEqual(cap["memory_accounting"], "estimated_legacy")
+
+    def test_reserved_gate_memory_is_unavailable_to_non_gate_leases(self) -> None:
+        """A non-gate lease may not spend the memory a gate VM is owed.
+
+        Cores are deliberately abundant here (capacity 20, 1 core each) so the
+        only thing that can deny the second lease is the memory reserve. This is
+        the live shape the reserve exists for: a gate VM and a shipyard-local
+        build coexist, and the build must not be able to fill the budget the
+        next gate VM needs.
+        """
+        self.acquire(
+            "build",
+            1,
+            capacity=20,
+            capacity_mem_mb=16384,
+            reserved_mem_mb=8192,
+            mem_mb=8192,
+            priority="build",
+        )
+        denied = self.acquire(
+            "extra-build",
+            1,
+            capacity=20,
+            capacity_mem_mb=16384,
+            reserved_mem_mb=8192,
+            mem_mb=1024,
+            priority="build",
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "memory_exceeded")
+        self.assertTrue(body["exceeded_axis"]["memory"])
+        self.assertFalse(body["exceeded_axis"]["cores"])
+        # Denied against the NON-GATE limit, not the host budget: 8192 + 1024
+        # is well inside the 16384 the host has.
+        self.assertEqual(body["memory_limit_class"], "non_gate")
+        self.assertEqual(body["memory_limit_mb"], 8192)
+
+        # The reserve it was denied against is real: the gate takes it.
+        gate = json.loads(
+            self.acquire(
+                "gate",
+                1,
+                capacity=20,
+                capacity_mem_mb=16384,
+                reserved_mem_mb=8192,
+                mem_mb=8192,
+                priority="gate",
+            ).stdout
+        )
+        self.assertTrue(gate["ok"])
+        self.assertEqual(gate["capacity"]["used_mem_mb"], 16384)
+
+    def test_gate_memory_usage_still_blocks_host_wide_overcommit(self) -> None:
+        """The reserve narrows the non-gate class; it does not widen the host."""
+        self.acquire(
+            "gate",
+            1,
+            capacity=20,
+            capacity_mem_mb=16384,
+            reserved_mem_mb=8192,
+            mem_mb=16384,
+            priority="gate",
+        )
+        denied = self.acquire(
+            "build",
+            1,
+            capacity=20,
+            capacity_mem_mb=16384,
+            reserved_mem_mb=8192,
+            mem_mb=512,
+            priority="build",
+            check=False,
+        )
+        self.assertEqual(denied.returncode, 75)
+        body = json.loads(denied.stdout)
+        self.assertEqual(body["reason"], "memory_exceeded")
+
+    def test_gate_lease_is_not_held_to_the_non_gate_memory_limit(self) -> None:
+        """A gate lease may spend its own reserve — that is what it is for."""
+        body = json.loads(
+            self.acquire(
+                "gate",
+                1,
+                capacity=20,
+                capacity_mem_mb=16384,
+                reserved_mem_mb=8192,
+                mem_mb=12288,
+                priority="gate",
+            ).stdout
+        )
+        self.assertTrue(body["ok"])  # 12288 > the 8192 non-gate limit
+        self.assertEqual(body["capacity"]["non_gate_limit_mem_mb"], 8192)
+        self.assertEqual(body["capacity"]["non_gate_used_mem_mb"], 0)
+
+    def test_memory_reserve_leaves_non_gate_at_least_one_compile_job(self) -> None:
+        """An over-sized reserve is clamped, never down to a zero non-gate class."""
+        body = json.loads(
+            self.acquire(
+                "build",
+                1,
+                capacity=20,
+                capacity_mem_mb=4096,
+                reserved_mem_mb=999999,
+                mem_mb=1536,
+                priority="build",
+            ).stdout
+        )
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["capacity"]["reserved_gate_mem_mb"], 4096 - 1536)
+        self.assertEqual(body["capacity"]["non_gate_limit_mem_mb"], 1536)
+
+    def test_memory_reserve_is_inert_when_the_axis_is_off(self) -> None:
+        body = json.loads(
+            self.acquire(
+                "a",
+                1,
+                capacity=20,
+                capacity_mem_mb=0,
+                reserved_mem_mb=999999,
+                mem_mb=999999,
+                priority="build",
+            ).stdout
+        )
+        self.assertTrue(body["ok"])
+        self.assertNotIn("reserved_gate_mem_mb", body["capacity"])
 
     def test_memory_axis_is_off_when_capacity_mem_is_zero(self) -> None:
         body = json.loads(

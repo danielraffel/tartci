@@ -283,6 +283,23 @@ def build_profile(
         lease_capacity_mem_mb = 0
     pulp_build_mem_budget_mb = lease_capacity_mem_mb
 
+    # Memory mirror of reserved_gate_cores: the slice of the memory budget a
+    # non-gate lease may not consume. Held proportional to the core reserve —
+    # the gate's reserved share of the host is the same share on both axes.
+    # Without it the memory axis carries no priority term at all, so a non-gate
+    # build can fill the budget a gate VM needs and darken a required-gate slot
+    # while the gate's reserved CORES sit idle. Clamped so non-gate work always
+    # keeps at least one compile job's worth, mirroring the core reserve's own
+    # "non-gate never drops below 1" clamp.
+    if lease_capacity_mem_mb > PER_COMPILE_JOB_MEM_MB and reserved_gate > 0:
+        reserved_gate_mem_mb = min(
+            lease_capacity_mem_mb * reserved_gate // lease_capacity,
+            lease_capacity_mem_mb - PER_COMPILE_JOB_MEM_MB,
+        )
+    else:
+        reserved_gate_mem_mb = 0
+    non_gate_capacity_mem_mb = max(0, lease_capacity_mem_mb - reserved_gate_mem_mb)
+
     return {
         "schema": 2,
         "host": {
@@ -304,6 +321,8 @@ def build_profile(
         "headroom_mem_mb": headroom_mem_mb,
         "link_lto_reserve_mem_mb": link_lto_reserve_mem_mb,
         "lease_capacity_mem_mb": lease_capacity_mem_mb,
+        "reserved_gate_mem_mb": reserved_gate_mem_mb,
+        "non_gate_capacity_mem_mb": non_gate_capacity_mem_mb,
         "per_compile_job_mem_mb": PER_COMPILE_JOB_MEM_MB,
         "pulp_build_mem_budget_mb": pulp_build_mem_budget_mb,
         "qos": defaults.qos,
@@ -333,6 +352,8 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "PULP_BUILD_JOBS": profile["pulp_build_jobs"],
         "TARTCI_HOST_MEM_MB": profile["mem_mb"],
         "TARTCI_LEASE_CAPACITY_MEM_MB": profile["lease_capacity_mem_mb"],
+        "TARTCI_GATE_RESERVED_MEM_MB": profile["reserved_gate_mem_mb"],
+        "TARTCI_NON_GATE_CAPACITY_MEM_MB": profile["non_gate_capacity_mem_mb"],
         "TARTCI_LINK_LTO_RESERVE_MEM_MB": profile["link_lto_reserve_mem_mb"],
         "TARTCI_PER_JOB_MEM_MB": profile["per_compile_job_mem_mb"],
         "PULP_BUILD_MEM_BUDGET_MB": profile["pulp_build_mem_budget_mb"],
