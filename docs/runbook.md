@@ -1392,6 +1392,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
   diagnosis.
 
+- **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
+  charged on the memory axis is the figure the clone is booted with
+  (`tart set --cpu C --memory M`). A clone otherwise inherits its golden's baked
+  memory, so the charge and the boot size would agree only by coincidence, and
+  Pulp's guest-side build governor derives its job count from the memory the
+  guest can actually see. The size is derived after the non-gate core clamp, so
+  a clamped lane is charged for the cores it receives; an explicit
+  `TARTCI_<PROVIDER>_VM_MEM_MB` override is used verbatim instead.
+  `TARTCI_VM_LEASE_MIN_MEM_MB` / `TARTCI_VM_LEASE_MAX_MEM_MB` bound the
+  derivation. Raise the ceiling only against a fresh measurement of
+  per-Virtualization-process RSS against configured guest memory: that ratio
+  runs above 1, so concurrent guests cost more host RAM than they are
+  configured for.
+
   Managed macOS fleet lanes also set one host-level
   `TARTCI_DISK_DENIAL_RECEIPT_DIR` and their configured stable
   `TARTCI_RECEIPT_HOST_ID` (`m1`, `studio`, or `m5`). After every lease attempt,
