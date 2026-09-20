@@ -945,6 +945,33 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["4096", "10240"])
 
+    def test_derived_guest_memory_survives_a_failing_host_profile(self) -> None:
+        """A profile hiccup falls back instead of ending the caller.
+
+        Callers run under `set -e`, where a bare assignment from a command
+        substitution that exits non-zero ends the enclosing function before any
+        fallback can apply. The helper is called DIRECTLY here, not through a
+        substitution: a substitution subshell swallows that abort, which would
+        make this test unable to fail.
+        """
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            tartci_profile_value() {{ return 3; }}
+            tartci_vm_lease_derived_mem_mb 7
+            printf '\\nreached-the-end\\n'
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 1536 fallback → 4/3 * 6 * 1536 = 12288, and execution continued.
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["12288", "reached-the-end"]
+        )
+
     def test_guest_memory_is_derived_after_the_non_gate_core_clamp(self) -> None:
         """A clamped lane is charged for the cores it GETS, not the ones it asked for.
 

@@ -234,7 +234,12 @@ tartci_vm_lease_derived_mem_mb(){
   ceiling="${TARTCI_VM_LEASE_MAX_MEM_MB:-16384}"
   tartci_positive_int_or_empty "$floor" || floor=8192
   tartci_positive_int_or_empty "$ceiling" || ceiling=16384
-  per_job="$(tartci_profile_value per_compile_job_mem_mb 2>/dev/null)"
+  # Tolerate a profile hiccup rather than aborting a VM boot over it: the
+  # caller runs under `set -e`, where a bare command substitution that exits
+  # non-zero would end the acquisition before the fallback below could apply.
+  # per_compile_job_mem_mb is a fixed constant in host_profile.py, so the
+  # fallback is that same value and not a guess.
+  per_job="$(tartci_profile_value per_compile_job_mem_mb 2>/dev/null)" || per_job=""
   tartci_positive_int_or_empty "$per_job" || per_job=1536
   local jobs=$(( cores - 1 ))
   [ "$jobs" -ge 1 ] || jobs=1
