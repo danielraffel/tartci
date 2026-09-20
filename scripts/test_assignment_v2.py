@@ -238,6 +238,71 @@ class AssignmentV2Tests(unittest.TestCase):
         self.assertIn("scanner_rc=2", events)
         self.assertIn("GitHub API failed", events)
 
+    def test_blind_selection_is_never_published_to_the_selection_cache(self) -> None:
+        """A blind scan is an absence of observation, not an observation of absence.
+
+        Publishing `ERR` into the positive selection cache replays one transient
+        GitHub failure as a blind verdict for the whole cache TTL. During that
+        window the lane performs no observation at all, so it cannot recover on
+        the next poll, and a supervisor that restarts for fresh credentials
+        re-reads the same stale blind verdict from disk.
+        """
+        self._state(api_fail=True)
+        blind = self._runner("--print-selection")
+        self.assertEqual(blind.returncode, 0, blind.stderr)
+        self.assertEqual(blind.stdout.split("\t", 1)[0], "ERR")
+        # Assert the ABSENCE positively. Iterating the glob and asserting
+        # `ERR not in <contents>` passes vacuously on the fixed code, because no
+        # cache file is written at all -- the loop body never runs, and a test
+        # whose assertion cannot execute is not a control.
+        self.assertEqual(
+            sorted((self.root / "state").glob("*.assignment-v2-selection.cache")),
+            [],
+            "a blind verdict created a selection cache",
+        )
+
+        # GitHub recovers. Rewrite the scanner state directly rather than via
+        # _state(), which clears the cache and would hide the replay under test.
+        self.state.write_text(json.dumps({"merge": True}), encoding="utf-8")
+        recovered = self._runner("--print-selection")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.stdout.strip().split("\t")[0], "1")
+        # ...and a real observation IS published, so the guard rejects only the
+        # blind verdict rather than disabling the cache outright.
+        caches = sorted((self.root / "state").glob("*.assignment-v2-selection.cache"))
+        self.assertEqual(len(caches), 1, "recovery published no selection cache")
+        self.assertRegex(
+            caches[0].read_text(encoding="utf-8"), r"^\d+\t1\|", "cached value is not a real observation"
+        )
+
+    def test_a_blind_scan_leaves_an_expired_numeric_entry_byte_identical(self) -> None:
+        """Declining to cache must not mutate the entry already on disk.
+
+        The fix returns early rather than overwriting, so an expired numeric
+        entry survives a blind poll untouched. That is safe only because the
+        reader rejects it on age -- if it were ever replayed, declining to write
+        would have traded a blind verdict for a stale positive one, which is
+        worse. Assert the bytes, so a future refactor that "helpfully" refreshes
+        the timestamp is caught here.
+        """
+        self._state(merge=True)
+        seeded = self._runner("--print-selection")
+        self.assertEqual(seeded.returncode, 0, seeded.stderr)
+        caches = sorted((self.root / "state").glob("*.assignment-v2-selection.cache"))
+        self.assertEqual(len(caches), 1, "no selection cache to seed the expiry case")
+        cache = caches[0]
+        # Backdate well past any TTL so the entry is expired, not merely old.
+        stale = "1\t" + cache.read_text(encoding="utf-8").split("\t", 1)[1]
+        cache.write_text(stale, encoding="utf-8")
+
+        self.state.write_text(json.dumps({"api_fail": True}), encoding="utf-8")
+        blind = self._runner("--print-selection")
+        self.assertEqual(blind.returncode, 0, blind.stderr)
+        self.assertEqual(blind.stdout.split("\t", 1)[0], "ERR")
+        self.assertEqual(
+            cache.read_text(encoding="utf-8"), stale, "a blind poll rewrote the cached entry"
+        )
+
     def test_malformed_label_element_denies_selection(self) -> None:
         self._state(malformed=True)
         result = self._runner("--print-selection")
