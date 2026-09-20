@@ -1281,6 +1281,22 @@ macOS serve loop treats the cap as already full and waits. Disable the lease
 consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
 debugging.
 
+A lane may also declare `process_type`, which sets the rendered LaunchAgent's
+`ProcessType`. The accepted values are the four `launchd.plist(5)` documents:
+`Background`, `Standard`, `Adaptive`, `Interactive`. A lane that omits the key
+renders `Background`, which is what every lane had before the key existed. The
+key matters because launchd throttles a `Background` job: the exhaustive
+event-class queue scan is a long chain of short GitHub API calls, and the
+per-call latency -- not the `assignment_scan_timeout_seconds` budget -- is what
+decides whether the scan finishes. A supervisor cannot lift its own
+classification (`taskpolicy -B` on itself does not restore the latency), so the
+value has to be in the plist, which is rendered from the profile: editing an
+installed plist by hand is reverted by the next render. Pulp's gate lanes
+declare `Adaptive`; release lanes stay `Background`. Promotion out of the
+background band is a launchd heuristic, so treat a declared `Adaptive` as a
+request, and confirm what the host actually did with
+`launchctl print gui/$(id -u)/<label> | grep 'spawn type'`.
+
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
 file**, never on the outer ssh command line (cmd.exe's 8191-char limit blows
