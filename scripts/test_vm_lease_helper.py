@@ -893,6 +893,211 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "5")  # gate lease unclamped
 
+    def test_derived_guest_memory_inverts_the_guest_job_formula(self) -> None:
+        """Guest memory is the inverse of Pulp's governed-build.sh bound.
+
+        That script derives jobs = mem_mb * 3 / 4 / per_job and takes
+        min(cores, jobs). Sizing at 4/3 * (cores - 1) * per_job therefore makes
+        the guest pick cores - 1 jobs: its full vCPU count less the one job of
+        slack the guest's own link/LTO peak needs.
+        """
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            tartci_profile_value() {{ echo 1536; }}
+            for c in 2 4 7 12; do
+              printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb "$c")"
+            done
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sizes = [int(line) for line in proc.stdout.strip().splitlines()]
+        # 2 and 4 cores fall on the 8192 floor; 7 derives 4/3*6*1536; 12 would
+        # derive 22528 and is held at the 16384 ceiling.
+        self.assertEqual(sizes, [8192, 8192, 12288, 16384])
+        for cores, mem in zip((2, 4, 7, 12), sizes):
+            guest_jobs = mem * 3 // 4 // 1536
+            self.assertGreaterEqual(guest_jobs, 1)
+            # The guest never derives MORE jobs than it has vCPUs, and for any
+            # lane the ceiling does not bind it gets cores - 1.
+            self.assertLessEqual(min(cores, guest_jobs), cores)
+        self.assertEqual(min(7, sizes[2] * 3 // 4 // 1536), 6)
+
+    def test_derived_guest_memory_honours_floor_and_ceiling_overrides(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            export TARTCI_VM_LEASE_MIN_MEM_MB=4096
+            export TARTCI_VM_LEASE_MAX_MEM_MB=10240
+            source {HELPER}
+            tartci_profile_value() {{ echo 1536; }}
+            printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb 2)"
+            printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb 24)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["4096", "10240"])
+
+    def test_guest_memory_is_derived_after_the_non_gate_core_clamp(self) -> None:
+        """A clamped lane is charged for the cores it GETS, not the ones it asked for.
+
+        Deriving before the clamp would bill a 8-core request against a 3-core
+        non-gate budget as if it had 8 vCPUs.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_profile_value() {{
+                  case "$1" in
+                    non_gate_capacity_cores) echo 3 ;;
+                    per_compile_job_mem_mb) echo 1536 ;;
+                    *) echo 0 ;;
+                  esac
+                }}
+                # No explicit memory → the size must come from the clamped cores.
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux "" {Path(td)}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["lease_size_cores"], r["lease_size_mem_mb"])'
+                printf 'exported=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Clamped to 3 cores → 4/3 * 2 * 1536 = 4096, held up by the 8192 floor.
+        # Derived from the REQUESTED 8 it would have been 4/3*7*1536 = 14336.
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["3 8192", "exported=8192"]
+        )
+
+    def test_charged_guest_memory_is_the_memory_applied_to_the_clone(self) -> None:
+        """The plumbing invariant: charged memory and booted memory are one number.
+
+        This is the defect the whole change exists to close — admission charged
+        a memory figure and then booted the clone at the golden's baked size,
+        so the guest's own build governor sized itself from a number the host
+        never reserved. The test walks the provider's real sequence: acquire,
+        read the exported size back, size the clone, then compare what the
+        lease store recorded against what `tart set` received.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            bindir = tmp / "bin"
+            bindir.mkdir()
+            marker = tmp / "tart-args"
+            _write_exec(
+                bindir / "tart",
+                f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {marker}\n",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export PATH={bindir}:$PATH
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={tmp / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                lease_cores=7
+                lease_mem=""
+                tartci_acquire_vm_lease demo-vm "$lease_cores" tart-macos-vm gate pulp-build "$lease_mem" {tmp}
+                lease_cores="${{TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}}"
+                lease_mem="${{TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}}"
+                tartci_set_tart_vm_size demo-vm "$lease_cores" "$lease_mem"
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["lease_size_mem_mb"])'
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            charged = int(proc.stdout.strip().splitlines()[-1])
+            applied_lines = marker.read_text(encoding="utf-8").strip().splitlines()
+
+        self.assertEqual(len(applied_lines), 1, applied_lines)
+        match = re.search(r"--memory (\d+)", applied_lines[0])
+        self.assertIsNotNone(
+            match, f"tart was never given a --memory: {applied_lines[0]!r}"
+        )
+        applied = int(match.group(1))
+        self.assertEqual(
+            applied,
+            charged,
+            "the clone booted at a size the host never reserved",
+        )
+        # And the control: the number is the derived one, not some default that
+        # happens to match. 7 cores → 4/3 * 6 * 1536 = 12288.
+        self.assertEqual(charged, 12288)
+
+    def test_release_clears_the_exported_guest_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={tmp / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease demo-vm 7 tart-macos-vm gate pulp-build "" {tmp}
+                printf 'held=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                tartci_release_vm_lease
+                printf 'released=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["held=12288", "released="]
+        )
+
+    def test_break_glass_still_exports_a_guest_size(self) -> None:
+        """Leases off still has to hand the provider a size to boot at."""
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_VM_LEASES=0
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease demo-vm 7 tart-macos-vm gate pulp-build "" {Path(td)}
+                printf '%s %s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES" "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "7 12288")
+
     def test_provider_mem_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(
             f"""
@@ -909,9 +1114,10 @@ PY
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # macos override; linux bogus → per-guest default 8192; windows from
-        # WIN_MEMORY fallback.
-        self.assertEqual(proc.stdout.strip().splitlines(), ["12288", "8192", "8192"])
+        # macos override used verbatim; linux bogus → EMPTY, so acquisition
+        # derives the size from the cores it actually grants; windows keeps its
+        # caller-supplied WIN_MEMORY fallback (that lane sizes its own guest).
+        self.assertEqual(proc.stdout.strip().splitlines(), ["12288", "", "8192"])
 
     def test_acquire_charges_explicit_vm_memory(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -968,7 +1174,29 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), f"{1024**3} {store_path.resolve()}")
 
-    def test_tart_cpu_set_uses_acquired_core_count(self) -> None:
+    def test_tart_size_set_applies_both_acquired_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / "tart-args"
+            _write_exec(tmp / "tart", f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {marker}\n")
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export PATH={tmp}:$PATH
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                source {HELPER}
+                tartci_set_tart_vm_size demo-vm 4 16384
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "set demo-vm --cpu 4 --memory 16384",
+            )
+
+    def test_tart_cpu_set_alias_still_sizes_only_the_cpu_axis(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             marker = tmp / "tart-args"

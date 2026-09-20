@@ -174,11 +174,16 @@ tartci_vm_lease_cores(){
   printf '%s' "$value"
 }
 
-# Memory (MB) a VM lease should reserve on the host memory axis. Explicit
-# per-provider override wins; else a conservative per-guest default — a macOS or
-# Linux CI guest wants ~8 GiB, and Windows already carries WIN_MEMORY_MB. Passing
-# this (rather than letting leases.py derive cores*per-job) keeps VM accounting
-# honest: a VM's real RAM footprint is its guest memory, not its vCPU count.
+# Memory (MB) a VM lease should reserve on the host memory axis. An explicit
+# per-provider override wins and is used verbatim; otherwise this returns EMPTY
+# and tartci_acquire_vm_lease derives the size from the lease's finally-granted
+# core count (see tartci_vm_lease_derived_mem_mb). The derivation cannot happen
+# here because the core count is not final until after the non-gate clamp inside
+# acquisition. qemu-windows keeps its caller-supplied WIN_MEMORY_MB fallback:
+# that lane sizes its own guest and is not vCPU-derived.
+# Passing a real number (rather than letting leases.py derive cores*per-job)
+# keeps VM accounting honest: a VM's real RAM footprint is its guest memory,
+# not its vCPU count.
 tartci_vm_lease_mem_mb(){
   local provider="$1" fallback="${2:-}" value=""
   case "$provider" in
@@ -193,9 +198,50 @@ tartci_vm_lease_mem_mb(){
       ;;
   esac
   if ! tartci_positive_int_or_empty "$value"; then
-    value="${fallback:-8192}"
+    value="${fallback:-}"
   fi
-  tartci_positive_int_or_empty "$value" || value=8192
+  tartci_positive_int_or_empty "$value" || value=""
+  printf '%s' "$value"
+}
+
+# Guest memory (MB) for a VM lease of $1 granted cores — the amount charged on
+# the host memory axis AND applied to the guest, which must be the same number.
+#
+# C vCPUs are worth (4/3 * C * per_compile_job_mem_mb): the exact inverse of the
+# guest-side governor's own bound in Pulp's tools/ci/governed-build.sh, which
+# computes jobs = mem_mb * 3 / 4 / 1536 and takes min(cores, that). The 3/4 and
+# the 1536 are a CROSS-REPO CONTRACT with that script — change one, change both.
+# per_compile_job_mem_mb is read from the host profile rather than hardcoded so
+# the two stay tied to a single definition of "one compile job".
+#
+# Sized for C-1 jobs, not C. The exact inverse leaves the guest zero slack: it
+# would spend its whole compile budget on compile jobs while the guest's own
+# link/LTO peak, its runner agent and its OS are unaccounted for. The host
+# profile subtracts a flat link_lto_reserve_mem_mb for exactly this reason and
+# the guest formula has no equivalent, so the slack has to come from here.
+# Guest-internal swap is invisible to every host-side signal, so this errs small.
+#
+# Floor and ceiling are deliberate. The floor keeps small lanes (a 3-core m1
+# guest) from shrinking below the size they boot at today. The ceiling is a
+# staged-rollout limit, not a derived quantity: measured per-Virtualization
+# process RSS runs well above configured guest memory, so two concurrent guests
+# at a higher size can approach host RAM. Raise it only against a fresh
+# RSS-to-configured measurement at the current size.
+tartci_vm_lease_derived_mem_mb(){
+  local cores="$1" per_job="" floor ceiling value
+  tartci_positive_int_or_empty "$cores" || cores=1
+  floor="${TARTCI_VM_LEASE_MIN_MEM_MB:-8192}"
+  ceiling="${TARTCI_VM_LEASE_MAX_MEM_MB:-16384}"
+  tartci_positive_int_or_empty "$floor" || floor=8192
+  tartci_positive_int_or_empty "$ceiling" || ceiling=16384
+  per_job="$(tartci_profile_value per_compile_job_mem_mb 2>/dev/null)"
+  tartci_positive_int_or_empty "$per_job" || per_job=1536
+  local jobs=$(( cores - 1 ))
+  [ "$jobs" -ge 1 ] || jobs=1
+  value=$(( jobs * per_job * 4 / 3 ))
+  [ "$value" -ge "$floor" ] || value="$floor"
+  [ "$ceiling" -ge "$floor" ] || ceiling="$floor"
+  [ "$value" -le "$ceiling" ] || value="$ceiling"
   printf '%s' "$value"
 }
 
@@ -401,6 +447,15 @@ tartci_acquire_vm_lease(){
     TARTCI_ACTIVE_VM_LEASE_ID=""
     # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
     TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+    # Break-glass still sizes the guest: the invariant is "the guest boots at
+    # what was charged", and a disabled lease store charges nothing but still
+    # has to hand the provider a size. Derived from the unclamped request,
+    # because with leases off there is no clamp.
+    if ! tartci_positive_int_or_empty "$mem_mb"; then
+      mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+    fi
+    # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+    TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
     _tartci_vm_lease_bypass_state=(authorized)
     tartci_observe_disk_admission '{"ok":true,"reason":"leases_disabled"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
     return 0
@@ -420,8 +475,16 @@ tartci_acquire_vm_lease(){
     tartci_vm_lease_note "clamping $kind lease cores $cores -> $_ngc (non-gate budget)"
     cores="$_ngc"
   fi
-  # An explicit VM memory size charges the memory axis its real footprint;
-  # omitted (empty) lets leases.py fall back to the cores*per-job estimate.
+  # Size the guest from the cores this lease will actually be granted — i.e.
+  # AFTER the clamp above. Deriving from the requested count would charge a
+  # clamped non-gate lane for cores it never gets (a 14-core request clamped to
+  # 12 would still be billed for 14).
+  if ! tartci_positive_int_or_empty "$mem_mb"; then
+    mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  fi
+  # The VM memory size charges the memory axis its real footprint. It is also
+  # the size the guest is booted at (tartci_set_tart_vm_size): what admission
+  # charges and what the guest boots with must be the same number.
   local mem_args=()
   if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
     mem_args=(--mem-mb "$mem_mb")
@@ -494,6 +557,8 @@ tartci_acquire_vm_lease(){
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
   tartci_start_vm_lease_heartbeat "$lease_id"
   if [ -n "$disk_path" ]; then
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
@@ -555,11 +620,28 @@ tartci_release_vm_lease(){
   _tartci_vm_lease_bypass_state=()
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES=""
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB=""
   return 0
 }
 
-tartci_set_tart_vm_cpu(){
-  local vm_name="$1" cores="$2"
+# Apply the lease's granted size to the clone. Both axes, in one call: a clone
+# inherits its golden's CPU *and* memory, so setting only --cpu leaves the guest
+# booting at the golden's baked memory however much the lease charged for. That
+# silently breaks the plumbing invariant — the guest's own build governor sizes
+# itself from the memory it can see, so it would derive its job count from the
+# golden's number while the host reserved a different one.
+tartci_set_tart_vm_size(){
+  local vm_name="$1" cores="$2" mem_mb="${3:-}"
   tartci_positive_int_or_empty "$cores" || cores=1
-  tart set "$vm_name" --cpu "$cores"
+  if tartci_positive_int_or_empty "$mem_mb"; then
+    tart set "$vm_name" --cpu "$cores" --memory "$mem_mb"
+  else
+    tart set "$vm_name" --cpu "$cores"
+  fi
+}
+
+# Retained name for callers that only size the CPU axis.
+tartci_set_tart_vm_cpu(){
+  tartci_set_tart_vm_size "$1" "$2" ""
 }
