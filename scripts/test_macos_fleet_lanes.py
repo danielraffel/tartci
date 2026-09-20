@@ -1523,6 +1523,102 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn(key, result.stderr)
 
+    def test_process_type_accepts_only_documented_launchd_values(self) -> None:
+        base = CONFIG.read_text()
+        self.assertIn('process_type = "Adaptive"', base)
+        rejected = {
+            "unknown": 'process_type = "Fast"',
+            "lowercase": 'process_type = "adaptive"',
+            "wrong-type": "process_type = 1",
+            "empty": 'process_type = ""',
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, replacement in rejected.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(
+                        base.replace('process_type = "Adaptive"', replacement, 1)
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 2, result.stdout + result.stderr
+                    )
+                    self.assertIn("process_type", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            for value in fleet.PROCESS_TYPES:
+                with self.subTest(accepted=value):
+                    path = Path(td) / f"ok-{value}.toml"
+                    path.write_text(
+                        base.replace(
+                            'process_type = "Adaptive"',
+                            f'process_type = "{value}"',
+                            1,
+                        )
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_undeclared_lane_still_renders_the_background_default(self) -> None:
+        body = CONFIG.read_text().replace('process_type = "Adaptive"\n', "", 1)
+        self.assertNotIn("process_type", body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "no-process-type.toml"
+            path.write_text(body)
+            output = Path(td) / "rendered"
+            rendered = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "render",
+                 str(path), "--output", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            values = [
+                plistlib.loads(plist.read_bytes())
+                for plist in sorted(output.glob("*.plist"))
+            ]
+            self.assertTrue(values)
+            self.assertEqual(
+                {value["ProcessType"] for value in values}, {"Background"}
+            )
+
+    def test_only_pulp_gate_supervisors_leave_the_background_band(self) -> None:
+        for host_id, config in HOST_CONFIGS.items():
+            with self.subTest(host=host_id):
+                with tempfile.TemporaryDirectory() as td:
+                    rendered = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "render",
+                         str(config), "--output", td],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                    by_label = {
+                        value["Label"]: value["ProcessType"]
+                        for value in (
+                            plistlib.loads(plist.read_bytes())
+                            for plist in sorted(Path(td).glob("*.plist"))
+                        )
+                    }
+                promoted = {
+                    label for label, kind in by_label.items() if kind == "Adaptive"
+                }
+                prefix = (
+                    "com.danielraffel.tartci.tart-runner-macos-fleet."
+                    f"{host_id}.pulp-gate"
+                )
+                # Both supervisors of the gate lane, and nothing else --
+                # release and the other product gates stay Background.
+                self.assertEqual(promoted, {prefix, f"{prefix}.slot2"})
+                self.assertEqual(
+                    {kind for label, kind in by_label.items()
+                     if label not in promoted},
+                    {"Background"},
+                )
+
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
         with tempfile.TemporaryDirectory() as td:

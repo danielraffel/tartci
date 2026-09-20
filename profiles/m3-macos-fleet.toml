@@ -56,6 +56,12 @@ replaces_launchd_labels = [
   "com.danielraffel.pulp.tart-runner",
   "com.danielraffel.pulp.tart-runner-slot2",
 ]
+# The queue scan this supervisor runs is latency-sensitive: a Background
+# supervisor's GitHub API calls measured materially slower than the same calls
+# at normal priority, and every observed scan failure on this lane is a
+# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
+# promote the supervisor out of the background band. Gate lanes only.
+process_type = "Adaptive"
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
