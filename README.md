@@ -555,6 +555,52 @@ on/off lifecycle. A normal generated fleet deployment retires only the prior
 `com.danielraffel.pulp.tart-runner-macos-release` controller after the pool is
 closed; the profile does not grant authority over unrelated auxiliary agents.
 
+### Diagnose a fleet host
+`tartci doctor fleet [--json]` answers "how is this host configured, is it
+working, and if not why" in one read-only query, so the answer does not have to
+be reassembled from a dozen commands and remembered context.
+
+```bash
+./tartci doctor fleet            # human-readable, with the reason each state exists
+./tartci doctor fleet --json     # same findings, machine-readable
+./tartci doctor fleet --no-census  # skip the GitHub runner census entirely
+```
+
+It reports five things, and reports UNKNOWN with a code whenever one cannot be
+determined rather than falling back to the reassuring value:
+
+- **Which generation the host actually execs**, read from each installed
+  LaunchAgent's `ProgramArguments`, against the cohort the install receipt
+  records. These diverge silently, because staging a generation writes a receipt
+  and exits 0 whether or not anything execs it.
+- **Whether the host can receive a generation at all.** A host whose agents exec
+  a sealed Developer ID launcher bundle runs that bundle's own sealed copy of the
+  cohort, so a generation stage alone changes nothing it runs.
+- **Whether the host can drain.** A stock persistent Actions listener has no safe
+  local drain primitive, so `tartci pool drain` refuses without an authoritative
+  held-idle receipt -- after it has already written `participation=0` and
+  `pool-state=draining`. Knowing this before a deploy is the only way not to
+  enter that half-drained state.
+- **A runner census across both registration scopes.** The repository endpoint
+  omits organization-scoped runners without saying so, so a scope that cannot be
+  read makes the census incomplete and no count is quoted as capacity. Runners
+  here are ephemeral and minted per job, so **zero online at idle is normal** and
+  the output says so.
+- **Why the host is not ready**, as the machine-readable problem code, plus a
+  reconciliation: readiness is computed against a support root, so a git checkout
+  and the installed generation return different verdicts for the same host at the
+  same instant. The installed generation's verdict is authoritative because that
+  is the tree the running supervisors execute; a disagreement between the two is
+  itself reported.
+
+Exit codes: `0` healthy, `1` a problem was found, `2` something could not be
+determined. Unknown is deliberately distinct from healthy.
+
+Each reason code carries a row in `scripts/fleet_reasons.json` recording why the
+state exists, the supported remedy, and -- for the states an operator is most
+tempted to "fix" -- what not to do. A test asserts every code emitted has a row
+and every row is cited, so the table cannot drift away from the code.
+
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for tartci VM
 CI hosts. It emits capacity, supervisor heartbeat, VM/overlay, GitHub runner,
