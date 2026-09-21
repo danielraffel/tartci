@@ -190,9 +190,9 @@ CLEANED_UP=0
 #
 # The cause is deliberately not enumerated. A lease denial, an admission
 # refusal and a cause nobody has written down yet all produce the same
-# observable — the lane took a slot against real queued demand and served
-# nothing — so the streak is counted at the one place every cause returns
-# through rather than at each cause in turn. Only an assignment clears it: a
+# observable: the lane took a slot against real queued demand and served
+# nothing. So the streak is counted at the one place every cause returns
+# through, rather than at each cause in turn. Only an assignment clears it: a
 # granted lease, a booted VM and a registered runner each prove a step, never
 # that the lane is serving.
 SERVING_BLOCKED_SINCE=""

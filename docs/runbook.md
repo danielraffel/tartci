@@ -1623,8 +1623,8 @@ lanes change.
   cannot fix would turn a serving outage into a control-plane outage. Use
   `tartci pool status --require-serving` (exit 9) when you want a nonzero gate
   on service specifically.
-- `tartci host-profile --delivery [--json]` — how code actually reaches each
-  lane on this host, read off the live plist. Reports the delivery mechanism
+- `tartci host-profile --delivery [--json]` reports how code actually reaches
+  each lane on this host, read off the live plist. Reports the delivery mechanism
   (`generation` or `sealed-bundle`), the commit in force inside the artifact
   the plist really execs, whether that is stale relative to this checkout, and
   whether `fleet-macos install --apply` updates the lane at all. On a sealed
