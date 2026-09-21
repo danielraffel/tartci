@@ -7,9 +7,12 @@
 #
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
+#   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
+#                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
+#   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
 #   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
@@ -125,6 +128,12 @@ cmd_doctor() {
   if [ "${1:-}" = "--reap" ]; then
     shift
     exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
+  # `doctor fleet` is the fleet-wide diagnosis; bare `doctor` stays the host
+  # prereq report, which must keep passing on hosts that run no fleet at all.
+  if [ "${1:-}" = "fleet" ]; then
+    shift
+    exec python3 "$HERE/scripts/fleet_doctor.py" "$@"
   fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
@@ -379,19 +388,48 @@ cmd_launchd() {
   esac
 }
 
+# A drain or an immediate stop removes this host from every label it serves.
+# When no other host serves a required gate label, that takes the label to zero
+# runners and stalls every pull request waiting on it, so the mutation is
+# refused unless the caller names the consequence with --allow-last-serving-host.
+# An indeterminate answer — an unreachable runner scope, an unresolvable host
+# identity — refuses too: it cannot tell "another host is serving" apart from
+# "nobody is".
+tartci_pool_capacity_floor_preflight() {
+  local action="$1" allow="$2" output rc=0
+  local -a floor_args=(check --action "$action")
+  [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
+  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  case "$rc" in
+    0)
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+      ;;
+    127)
+      echo "pool $action refused: the capacity floor needs Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+      return 11
+      ;;
+    *)
+      printf '%s\n' "${output:-pool $action refused: the capacity floor failed without a typed cause}" >&2
+      return 11
+      ;;
+  esac
+}
+
 cmd_pool() {
   # host-level CI participation switch ("this machine, not now").
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
-  local arg
+  local arg allow_last_serving_host=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
+      --allow-last-serving-host) allow_last_serving_host=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
@@ -401,6 +439,7 @@ cmd_pool() {
       local target=1
       [ "$sub" = off ] && target=0
       if [ "$sub" = off ]; then
+        tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
         tartci_pool_write_state off
@@ -620,6 +659,7 @@ EOF
       echo "repaired orphaned pool transition lock"
       ;;
     drain)
+      tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
       tartci_pool_write_participation 0
@@ -659,11 +699,12 @@ EOF
       done
       ;;
     status)
-      local status_json=0 require_ready=0
+      local status_json=0 require_ready=0 require_serving=0
       for arg in "$@"; do
         case "$arg" in
           --json) status_json=1 ;;
           --require-ready) require_ready=1 ;;
+          --require-serving) require_serving=1 ;;
           *) echo "$pool_usage" >&2; return 2 ;;
         esac
       done
@@ -673,7 +714,7 @@ EOF
       lock_health_json="$(tartci_pool_lock_health_json)" \
         || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
-      local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[]}'
+      local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[]}'
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
       if [ -f "$fleet_receipt" ] || [ -n "$managed_plists" ]; then
@@ -685,9 +726,9 @@ EOF
         else
           local readiness_rc=$?
           if [ "$readiness_rc" = 127 ]; then
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
           else
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[{"code":"readiness_probe_failed"}]}'
           fi
         fi
       fi
@@ -728,6 +769,30 @@ if fleet["managed"]:
         print("verified running supervisors: unknown (not checked from here)")
     else:
         print(f"verified running supervisors: {verified}/{fleet['expected_supervisors']}")
+    # Deliberately its own line and not folded into `fleet ready`. A supervisor
+    # can be installed, loaded, running and freshly heartbeating while serving
+    # nothing at all, and printing only the first four made a lane that cloned
+    # 35 times an hour and served zero jobs read as healthy.
+    serving = fleet.get("serving") or {}
+    blocked = serving.get("blocked")
+    lanes = serving.get("blocked_lanes") or []
+    unmeasurable = serving.get("unmeasurable_lanes") or []
+    if blocked is None:
+        print("serving: unknown (not checked from here)")
+    elif blocked:
+        print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
+        for lane in lanes:
+            streak = lane.get("streak")
+            print(
+                f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
+                f"streak={'unknown' if streak is None else streak} "
+                f"last_phase={lane.get('last_phase') or '-'}"
+            )
+    else:
+        print("serving: ok")
+    for label in unmeasurable:
+        # Not "ok". The lane predates the counter, so nothing here can see it.
+        print(f"  serving unmeasurable: {label} (generation predates the serving counter)")
     for problem in fleet["problems"]:
         line = f"  problem: {problem['code']}"
         if "label" in problem:
@@ -756,12 +821,24 @@ PY
       then
         return 8
       fi
+      # A separate gate from --require-ready on purpose: a caller asking
+      # "is this host installed and running" and one asking "is this host
+      # actually serving" want different answers, and an upstream refusal
+      # that blocks every lane at once must not fail the first question.
+      if [ "$require_serving" = 1 ] && ! python3 - "$fleet_readiness" <<'SERVINGPY'
+import json, sys
+serving = json.loads(sys.argv[1]).get("serving") or {}
+raise SystemExit(0 if serving.get("blocked") is False else 1)
+SERVINGPY
+      then
+        return 9
+      fi
       ;;
     *) echo "$pool_usage"; return 2 ;;
   esac
 }
 
-usage() { sed -n '2,36p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;

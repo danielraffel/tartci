@@ -49,9 +49,20 @@ assignment_scan_max_workers = 4
 # recent exhaustive receipt across VM boot instead of repeating the full Pulp
 # backlog scan while holding an unregistered VM.
 assignment_top_tier_receipt_max_age_seconds = 180
+# When the REST scan fails closed, ask the local Shipyard daemon's webhook feed
+# whether demand exists before idling blind. It is consulted only after a scan
+# failure and can only report presence, so a healthy scan never reaches it and
+# a silent feed changes nothing.
+assignment_feed_rescue = true
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
+# The queue scan this supervisor runs is latency-sensitive: a Background
+# supervisor's GitHub API calls measured materially slower than the same calls
+# at normal priority, and every observed scan failure on this lane is a
+# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
+# promote the supervisor out of the background band. Gate lanes only.
+process_type = "Adaptive"
 
 [[lane.tier]]
 label = "pulp-build-merge-group"

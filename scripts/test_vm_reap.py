@@ -449,5 +449,131 @@ else:
             delete_runner.assert_not_called()
 
 
+class SupervisorServingDigestTests(unittest.TestCase):
+    """The digest every observer reads has to carry the serve-less streak.
+
+    `observe macos` and the lane reports render whatever lands here. A state
+    file can record three hours of taking work and serving none, and if the
+    digest drops the field the tools downstream can only show a fresh
+    heartbeat, which reads as health.
+    """
+
+    def run_digest(self, root: Path, *extra: str):
+        args = vm_reap.parse_args([
+            "--repo", "danielraffel/pulp", "--state-root", str(root),
+            "--prefixes", "pulp-,linux-ephr-,win-ephr-,tartci-", *extra,
+        ])
+        with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+             mock.patch.object(vm_reap, "github_runners", return_value=[]):
+            return vm_reap.build_digest(args)
+
+    def test_the_digest_carries_the_serve_less_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            root.mkdir(parents=True)
+            (root / "lane-01.state.json").write_text(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "tart-macos", "runner": "lane-01", "vm": "",
+                "phase": "waiting", "lifecycle": "ephemeral",
+                "serving_blocked_since": "2026-09-20T00:00:00Z",
+                "serving_blocked_streak": 143,
+                "serving_blocked_last_phase": "admission-error",
+                "supervisor_pid": "101",
+            }))
+            digest, _ = self.run_digest(root)
+        supervisors = {item["runner"]: item for item in digest["supervisors"]}
+        self.assertIn("lane-01", supervisors)
+        lane = supervisors["lane-01"]
+        self.assertEqual(lane["serving_blocked_since"], "2026-09-20T00:00:00Z")
+        self.assertEqual(lane["serving_blocked_streak"], 143)
+        self.assertEqual(lane["serving_blocked_last_phase"], "admission-error")
+
+    def test_a_generation_predating_the_counter_reads_as_absent_not_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            root.mkdir(parents=True)
+            (root / "lane-02.state.json").write_text(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "tart-macos", "runner": "lane-02", "vm": "",
+                "phase": "waiting", "lifecycle": "ephemeral",
+                "supervisor_pid": "102",
+            }))
+            digest, _ = self.run_digest(root)
+        lane = {item["runner"]: item for item in digest["supervisors"]}["lane-02"]
+        self.assertIsNone(lane["serving_blocked_streak"])
+
+class RunnerCensusScopeTests(unittest.TestCase):
+    """The janitor reads both registration scopes, never one."""
+
+    def payload(self, rows):
+        return mock.Mock(returncode=0, stdout=json.dumps([{"runners": rows}]), stderr="")
+
+    def test_both_scopes_are_read_and_rows_carry_their_endpoint(self) -> None:
+        repo_row = {"id": 1, "name": "studio-pulp-gate-01", "status": "online"}
+        org_row = {"id": 2, "name": "pulp-intel-macmini", "status": "online"}
+        responses = {
+            "repos/danielraffel/pulp/actions/runners?per_page=100": self.payload([repo_row]),
+            "orgs/danielraffel/actions/runners?per_page=100": self.payload([org_row]),
+        }
+        seen = []
+
+        def fake_run_bounded(argv, **kwargs):
+            seen.append(argv[2])
+            return responses[argv[2]]
+
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", side_effect=fake_run_bounded):
+            rows = vm_reap.github_runners("danielraffel/pulp")
+
+        self.assertEqual(len(seen), 2)
+        names = [row["name"] for row in rows]
+        self.assertIn("pulp-intel-macmini", names)
+        by_name = {row["name"]: row for row in rows}
+        self.assertEqual(
+            by_name["studio-pulp-gate-01"]["_endpoint"],
+            "repos/danielraffel/pulp/actions/runners",
+        )
+        self.assertEqual(
+            by_name["pulp-intel-macmini"]["_endpoint"], "orgs/danielraffel/actions/runners"
+        )
+
+    def test_one_unreadable_scope_is_reported_not_silently_empty(self) -> None:
+        good = self.payload([{"id": 1, "name": "studio-pulp-gate-01", "status": "online"}])
+
+        def fake_run_bounded(argv, **kwargs):
+            if argv[2].startswith("orgs/"):
+                return mock.Mock(returncode=1, stdout="", stderr="HTTP 403")
+            return good
+
+        problems: list[str] = []
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", side_effect=fake_run_bounded):
+            rows = vm_reap.github_runners("danielraffel/pulp", problems=problems)
+
+        self.assertEqual([row["name"] for row in rows], ["studio-pulp-gate-01"])
+        self.assertEqual(problems, ["github_runners_scope_unreadable:organization"])
+
+    def test_every_scope_unreadable_is_an_observation_failure(self) -> None:
+        failure = mock.Mock(returncode=1, stdout="", stderr="HTTP 403")
+
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", return_value=failure):
+            with self.assertRaises(ObservationError):
+                vm_reap.github_runners("danielraffel/pulp")
+
+    def test_delete_addresses_a_runner_through_its_own_scope(self) -> None:
+        response = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run", return_value=response) as mutate_run:
+            vm_reap.delete_runner(
+                "danielraffel/pulp", 2, "pulp-intel-macmini", "orgs/danielraffel/actions/runners"
+            )
+
+        self.assertEqual(
+            mutate_run.call_args.args[0][-1], "orgs/danielraffel/actions/runners/2"
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

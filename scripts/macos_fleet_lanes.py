@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 import tartci_support_manifest as support_manifest
@@ -33,6 +34,11 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
+# launchd.plist(5) documents exactly these ProcessType values. A supervisor
+# left Background is throttled by the system for latency-insensitive work,
+# which lengthens every GitHub API call its queue scan makes.
+PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
+DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane",
@@ -47,6 +53,9 @@ STACKED_IMAGE_KEYS = {
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
 LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
+# A signed launcher bundle execs its own frozen copy of the support cohort.
+SEALED_SUPPORT = "Contents/Resources/support"
+SEALED_METADATA = "Contents/Resources/bundle.json"
 WORKTREE_CLEANUP_KEYS = {
     "provider", "repo", "primary", "prefix", "main_ref",
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
@@ -55,9 +64,9 @@ LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
-    "assignment_omit_labels", "supervisors",
+    "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
-    "assignment_top_tier_receipt_max_age_seconds",
+    "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
@@ -366,6 +375,12 @@ def load(path: Path) -> dict:
         supervisors = lane.get("supervisors", 1)
         if type(supervisors) is not int or supervisors not in (1, 2):
             fail(f"lane {lane_id}: supervisors must be 1 or 2")
+        process_type = lane.get("process_type")
+        if process_type is not None and process_type not in PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type must be one of "
+                f"{list(PROCESS_TYPES)}"
+            )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
             fail(f"lane {lane_id}: unsupported assignment_mode")
@@ -402,6 +417,14 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_top_tier_receipt_max_age_seconds "
                 "must be an integer from 0 through 300 on an event-class-v2 lane"
+            )
+        feed_rescue = lane.get("assignment_feed_rescue")
+        if feed_rescue is not None and (
+                assignment_mode != "event-class-v2"
+                or type(feed_rescue) is not bool):
+            fail(
+                f"lane {lane_id}: assignment_feed_rescue must be a boolean on "
+                "an event-class-v2 lane"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -641,6 +664,109 @@ def persistent_plist_records(data: dict, agents_dir: Path) -> dict[str, dict]:
     return records
 
 
+def _sealed_bundle_root(program: Path) -> Path | None:
+    """Return the app bundle whose sealed cohort `program` would execute."""
+    parents = program.parents
+    if len(parents) < 3:
+        return None
+    bundle = parents[2]
+    if parents[0].name != "MacOS" or parents[1].name != "Contents":
+        return None
+    return bundle if bundle.suffix == ".app" else None
+
+
+def assert_executed_generation(
+    agents_dir: Path,
+    names: Iterable[str],
+    *,
+    launch_entrypoint: Path,
+    source_commit: str,
+    manifest_sha256: str,
+) -> dict[str, dict]:
+    """Prove every installed LaunchAgent executes the support generation it records.
+
+    Staging a generation no LaunchAgent can reach is a no-op that still writes a
+    receipt, so the evidence is the exec path in the installed plist's
+    ProgramArguments rather than any exit code. A signed launcher bundle execs
+    its own sealed copy of the cohort, and that copy counts as the generation
+    only while it carries the exact installed commit and manifest digest; a
+    bundle sealed around an older cohort keeps running the older code no matter
+    what a newer generation put on disk.
+    """
+    launch_entrypoint = launch_entrypoint.resolve()
+    records: dict[str, dict] = {}
+    for name in sorted(names):
+        installed = agents_dir / name
+        if installed.is_symlink() or not installed.is_file():
+            fail(f"install_ineffective: fleet LaunchAgent is unavailable: {installed}")
+        try:
+            value = plistlib.loads(installed.read_bytes())
+        except (plistlib.InvalidFileException, ValueError) as exc:
+            fail(f"install_ineffective: fleet LaunchAgent is malformed: {installed}: {exc}")
+        arguments = value.get("ProgramArguments")
+        if (not isinstance(arguments, list) or not arguments
+                or not all(isinstance(argument, str) for argument in arguments)):
+            fail(
+                "install_ineffective: fleet LaunchAgent declares no executable "
+                f"program: {installed}"
+            )
+        if any(
+            argument == str(launch_entrypoint)
+            or (argument.startswith("/") and Path(argument).resolve() == launch_entrypoint)
+            for argument in arguments
+        ):
+            records[name] = {
+                "kind": "generation", "executes": str(launch_entrypoint),
+            }
+            continue
+        program = Path(arguments[0])
+        bundle = _sealed_bundle_root(program)
+        if bundle is None:
+            fail(
+                f"install_ineffective: launcher execs {program} which is not the "
+                f"installed generation {launch_entrypoint} ({name})"
+            )
+        sealed_launch = bundle / SEALED_SUPPORT / support_manifest.LAUNCH_NAME
+        if sealed_launch.is_symlink() or not sealed_launch.is_file():
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: the sealed cohort "
+                f"has no launch entrypoint ({name})"
+            )
+        try:
+            metadata = json.loads((bundle / SEALED_METADATA).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"metadata is unreadable: {exc} ({name})"
+            )
+        if not isinstance(metadata, dict):
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"metadata is malformed ({name})"
+            )
+        sealed_commit = str(metadata.get("source_commit", "")) or "<missing>"
+        sealed_manifest = str(metadata.get("support_manifest_sha256", "")) or "<missing>"
+        if sealed_commit != source_commit or sealed_manifest != manifest_sha256:
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"{sealed_commit}/{sealed_manifest} is not installed cohort "
+                f"{source_commit}/{manifest_sha256} ({name})"
+            )
+        records[name] = {
+            "kind": "sealed-bundle", "executes": str(sealed_launch),
+        }
+    if not records:
+        fail(
+            "install_ineffective: no fleet LaunchAgent executes the installed "
+            f"generation {launch_entrypoint}"
+        )
+    return records
+
+
 def write_receipt(
     config: Path,
     agents_dir: Path,
@@ -704,6 +830,13 @@ def write_receipt(
             source_commit=source_authority_commit,
         )
     persistent_records = persistent_plist_records(data, agents_dir)
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=support["source_commit"],
+        manifest_sha256=manifest_sha256,
+    )
     receipt = {
         "schema": 4 if persistent_records else 3,
         "profile": data.get("name", config.stem),
@@ -717,7 +850,7 @@ def write_receipt(
         "support": {
             "root": str(support_root),
             "manifest_path": str(manifest_path),
-            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest_sha256,
             "repository": support["repository"],
             "source_commit": support["source_commit"],
             "members": support["members"],
@@ -855,6 +988,12 @@ def verify_receipt(
     for label in expected_retired:
         if (agents_dir / f"{label}.plist").exists():
             fail(f"declared legacy LaunchAgent became installable again: {label}")
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=verified_support["source_commit"],
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    )
     return receipt
 
 
@@ -1176,9 +1315,12 @@ def fleet_readiness(
     pool_state: str,
     stale_heartbeat_seconds: int = 300,
     blocked_serving_seconds: int = 5400,
+    blocked_serving_streak: int = 6,
 ) -> dict:
     """Report realized receipt-backed capacity separately from pool intent."""
     problems: list[dict[str, str]] = []
+    serving_blocked_lanes: list[dict[str, object]] = []
+    serving_unmeasurable_lanes: list[str] = []
     try:
         receipt = verify_receipt(receipt_path, config, agents_dir, support_root)
     except (OSError, ValueError) as exc:
@@ -1191,6 +1333,13 @@ def fleet_readiness(
             "fleet_ready": False,
             "verified_running_supervisors": None,
             "expected_supervisors": None,
+            "serving": {
+                "blocked": None,
+                "blocked_lanes": [],
+                "unmeasurable_lanes": [],
+                "streak_threshold": blocked_serving_streak,
+                "blocked_seconds_threshold": blocked_serving_seconds,
+            },
             "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
         }
 
@@ -1361,10 +1510,24 @@ def fleet_readiness(
                     })
                     continue
                 # A fresh heartbeat proves the supervisor is alive, not that it
-                # is serving. One that keeps winning a host reservation and then
-                # losing the VM lease heartbeats normally forever, so age alone
-                # cannot see it. Absent field = a generation that predates it;
-                # treat that as "not measurable" rather than "not blocked".
+                # is serving. One that keeps taking a slot against real queued
+                # demand and then failing before assignment heartbeats normally
+                # forever, so age alone cannot see it. Absent field = a
+                # generation that predates it; treat that as "not measurable"
+                # rather than "not blocked".
+                #
+                # This does NOT decrement verified_running and does NOT become a
+                # `problems` entry, so it cannot clear `fleet_ready`. The two
+                # answer different questions: `fleet_ready` is host-local and
+                # host-fixable, while the dominant cause of a blocked lane is
+                # upstream and hits every lane on every host at once. Gating the
+                # fleet on an upstream condition it cannot fix converts a
+                # serving outage into a control-plane outage, and destroys the
+                # warm supervisors that are the recovery path. It is reported
+                # instead as its own named state, which is loud on its own.
+                streak_raw = matching_state.get("serving_blocked_streak")
+                if streak_raw is None:
+                    serving_unmeasurable_lanes.append(label)
                 blocked_since = str(matching_state.get("serving_blocked_since", "") or "")
                 if blocked_since:
                     try:
@@ -1377,16 +1540,37 @@ def fleet_readiness(
                             "detail": blocked_since,
                         })
                         continue
+                    streak: int | None
+                    if streak_raw is None:
+                        streak = None
+                    else:
+                        try:
+                            streak = int(streak_raw)
+                        except (TypeError, ValueError):
+                            problems.append({
+                                "code": "serving_blocked_streak_invalid",
+                                "label": label, "detail": str(streak_raw),
+                            })
+                            continue
                     blocked_for = (now - blocked_at).total_seconds()
-                    if blocked_for > blocked_serving_seconds:
-                        problems.append({
-                            "code": "serving_blocked", "label": label,
-                            "detail": (
-                                f"blocked_seconds={int(blocked_for)} "
-                                "(alive, repeatedly denied a VM lease)"
+                    # Two gates doing two jobs. The streak is the SHAPE gate: it
+                    # counts consecutive work entries that served nothing, so a
+                    # lane whose failures are interleaved with served jobs never
+                    # reaches it however many errors it logs. The duration is the
+                    # TRANSIENCE gate, so an upstream blip cannot raise a
+                    # fleet-wide alarm. A pre-streak generation has only the
+                    # duration gate, which is the behaviour it already had.
+                    if blocked_for > blocked_serving_seconds and (
+                        streak is None or streak >= blocked_serving_streak
+                    ):
+                        serving_blocked_lanes.append({
+                            "label": label,
+                            "blocked_seconds": int(blocked_for),
+                            "streak": streak,
+                            "last_phase": str(
+                                matching_state.get("serving_blocked_last_phase", "") or ""
                             ),
                         })
-                        continue
                 verified_running += 1
 
     if admission_open and len(persistent_loaded_outputs) == len(persistent_labels):
@@ -1454,6 +1638,13 @@ def fleet_readiness(
         ),
         "verified_running_supervisors": verified_running,
         "expected_supervisors": len(labels),
+        "serving": {
+            "blocked": bool(serving_blocked_lanes),
+            "blocked_lanes": serving_blocked_lanes,
+            "unmeasurable_lanes": sorted(serving_unmeasurable_lanes),
+            "streak_threshold": blocked_serving_streak,
+            "blocked_seconds_threshold": blocked_serving_seconds,
+        },
         "problems": problems,
     }
 
@@ -1588,6 +1779,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = str(
             lane["assignment_top_tier_receipt_max_age_seconds"]
         )
+    if lane.get("assignment_feed_rescue"):
+        env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
@@ -1611,7 +1804,7 @@ def lane_plist(
         "KeepAlive": True,
         "StandardOutPath": f"{host['log_root']}/macos-fleet-{identity}.log",
         "StandardErrorPath": f"{host['log_root']}/macos-fleet-{identity}.log",
-        "ProcessType": "Background",
+        "ProcessType": lane.get("process_type", DEFAULT_PROCESS_TYPE),
         # Give the supervisor's TERM trap a deterministic cleanup window and
         # retain launchd ownership of ordinary provider descendants.
         "ExitTimeOut": 30,
@@ -1665,6 +1858,7 @@ def main(argv: list[str] | None = None) -> int:
     readiness.add_argument("--pool-state", choices=("on", "off", "draining"), required=True)
     readiness.add_argument("--stale-heartbeat-seconds", type=int, default=300)
     readiness.add_argument("--blocked-serving-seconds", type=int, default=5400)
+    readiness.add_argument("--blocked-serving-streak", type=int, default=6)
     args = parser.parse_args(argv)
     try:
         if args.command == "probe-launch-helper":
@@ -1688,6 +1882,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.participating == "1", args.pool_state,
                 args.stale_heartbeat_seconds,
                 args.blocked_serving_seconds,
+                args.blocked_serving_streak,
             ), sort_keys=True))
             return 0
         if args.command == "verify-installed":

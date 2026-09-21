@@ -243,7 +243,7 @@ queued_work(){
 }
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
-  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_priority
+  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
   local build_parallel_effective
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
@@ -286,6 +286,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return "$lease_rc"
   }
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
   build_parallel_effective="$BUILD_PARALLEL_LEVEL"
   if [ "$build_parallel_effective" -gt "$lease_cores" ]; then
     build_parallel_effective="$lease_cores"
@@ -301,8 +302,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
-  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
-    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
     discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
@@ -361,7 +362,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
       || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
       write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_linux_vm
       return "$admission_rc"
     fi

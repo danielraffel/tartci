@@ -77,9 +77,73 @@ class MacosGateSlot2Tests(unittest.TestCase):
             ],
         )
         self.assertEqual(env["TARTCI_MACOS_VM_CORES"], "6")
-        self.assertEqual(env["TARTCI_MACOS_VM_MEM_MB"], "8192")
+        # Guest memory is derived from the granted cores, never pinned here.
+        self.assertNotIn("TARTCI_MACOS_VM_MEM_MB", env)
         self.assertEqual(env["TART_HOME"], str(self.tart_home))
         self.assertEqual(env["TARTCI_CCACHE_MAX_SIZE"], "40G")
+
+    def test_both_gate_slots_agree_on_guest_memory_sizing(self) -> None:
+        """Neither gate slot may pin guest memory — they must size the same way.
+
+        Both slots serve the same required check. Guest memory is derived from a
+        lease's granted cores, and the guest's own build governor derives its job
+        count from the memory it can see, so a pin on one slot and not the other
+        makes one slot build at half the parallelism of its sibling. That
+        presents as "the gate is slower on one slot" with nothing to point at.
+
+        The primary slot is a launchd template and the second is a rendered
+        profile, so this compares the two surfaces directly rather than trusting
+        either one alone.
+        """
+        rendered = self.render()
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        env = plistlib.loads(self.slot2.read_bytes())["EnvironmentVariables"]
+        # self.primary is the primary template already rendered in setUp, so
+        # this compares the two slots as an operator would actually install them.
+        primary = self.primary.read_text(encoding="utf-8")
+
+        for key in ("TARTCI_MACOS_VM_MEM_MB", "PULP_MACOS_VM_MEM_MB"):
+            self.assertNotIn(key, env, f"slot 2 pins {key}")
+            self.assertNotIn(key, primary, f"the primary slot pins {key}")
+
+        # Control: this is reading the real surfaces, not two empty strings. Both
+        # carry env configuration, so "no memory key" is a finding, not a miss.
+        self.assertIn("TARTCI_RUNNER_SLOT", env)
+        self.assertIn("<key>TARTCI", primary)
+
+    def test_no_launchd_renderer_pins_guest_memory(self) -> None:
+        """The same rule, swept across every agent renderer in the repo.
+
+        Two paths is the count observed today, not a proven bound — a third
+        renderer added later would reintroduce the divergence silently. This
+        matches only EMITTING positions (a quoted dict key followed by a value,
+        or a plist <key> element), so the documented
+        TARTCI_MACOS_VM_MEM_MB override a provider READS stays available.
+        """
+        import re
+
+        keys = ("TARTCI_MACOS_VM_MEM_MB", "PULP_MACOS_VM_MEM_MB",
+                "TARTCI_LINUX_VM_MEM_MB", "PULP_LINUX_VM_MEM_MB")
+        emitting = re.compile(
+            r"""(["']({keys})["']\s*:)|(<key>({keys})</key>)""".format(keys="|".join(keys))
+        )
+        surfaces = sorted(ROOT.glob("scripts/*.py")) + sorted(ROOT.glob("launchd/*.template"))
+        offenders = []
+        for path in surfaces:
+            if path.name.startswith("test_"):
+                continue
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if emitting.search(line):
+                    offenders.append(f"{path.relative_to(ROOT)}:{number}: {line.strip()}")
+
+        self.assertEqual(
+            offenders, [],
+            "a launchd agent pins guest memory; it is derived from the lease's "
+            "granted cores so both gate slots size their guests identically",
+        )
+        # Control: the sweep really read the renderers. Without this, an empty
+        # `offenders` could just mean the glob matched nothing.
+        self.assertGreater(len(surfaces), 20, "the renderer sweep found no files to scan")
 
     def test_validator_rejects_malformed_plist_without_platform_tools(self) -> None:
         self.slot2.write_text("not a plist")

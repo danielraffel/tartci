@@ -12,6 +12,9 @@ import argparse
 import json
 import os
 import re
+import datetime
+import hashlib
+import pathlib
 import subprocess
 import sys
 from typing import Any, Sequence
@@ -60,6 +63,19 @@ VERDICT_REASONS = {
     },
 }
 U64_MAX = (1 << 64) - 1
+# An `error` verdict is not one thing.  Some error reasons mean Shipyard *looked*
+# and found dirt it could not clear; those stay fail-closed forever.  The rest
+# mean Shipyard could not look at all, which is a statement about Shipyard's own
+# reachability and says nothing about the queue.  Only the second class may ever
+# degrade, and only after it has repeated.
+INCONCLUSIVE_ERROR_REASONS = {
+    "observation_failed",
+    "authority_failed",
+    "revalidation_failed",
+}
+# `mutation_failed` is a positive observation of a superseded run that Shipyard
+# failed to cancel; `invalid_labels` is local misconfiguration.  Never degrade.
+CONCLUSIVE_ERROR_REASONS = {"invalid_labels", "mutation_failed"}
 
 
 class ConfigurationError(ValueError):
@@ -88,7 +104,10 @@ def validate_verdict(
     base: str,
     labels: Sequence[str],
     process_exit: int,
+    unknown_reason: list[str] | None = None,
 ) -> dict[str, Any]:
+    if unknown_reason is None:
+        unknown_reason = []
     if not isinstance(value, dict):
         raise ValueError("admission verdict must be a JSON object")
     if (
@@ -101,13 +120,17 @@ def validate_verdict(
     reason = value.get("reason")
     if verdict not in VERDICT_EXIT:
         raise ValueError("unexpected admission verdict")
-    if (
-        not isinstance(reason, str)
-        or not REASON_PATTERN.fullmatch(reason)
-        or reason not in REASONS
-        or reason not in VERDICT_REASONS[verdict]
-    ):
+    if not isinstance(reason, str) or not REASON_PATTERN.fullmatch(reason):
         raise ValueError("admission reason does not match verdict")
+    if reason not in REASONS or reason not in VERDICT_REASONS[verdict]:
+        # Shipyard is versioned separately, so an unrecognized pairing under an
+        # `error` verdict is skew, not proof of a dirty queue: the breaker
+        # classifies it as inconclusive.  `admit` and `defer` stay strict --
+        # widening `admit` would let a future reason silently become an
+        # admission, and `defer` already backs off without stopping the fleet.
+        if verdict != "error":
+            raise ValueError("admission reason does not match verdict")
+        unknown_reason.append(reason)
     if process_exit != VERDICT_EXIT[verdict]:
         raise ValueError("admission verdict does not match process exit")
     if value.get("repo") != repo or value.get("base") != base:
@@ -141,6 +164,70 @@ def validate_verdict(
     if verdict == "admit" and blockers:
         raise ValueError("admit verdict must not contain blockers")
     return value
+
+
+def _state_dir() -> pathlib.Path:
+    raw = os.environ.get("TARTCI_ADMISSION_CLEAN_STATE_DIR")
+    base = pathlib.Path(raw) if raw else pathlib.Path.home() / ".tartci/state"
+    return base / "admission-clean"
+
+
+def _bounded_env_int(name: str, default: int, low: int, high: int) -> int:
+    raw = os.environ.get(name, str(default))
+    if not re.fullmatch(r"[0-9]+", raw) or not low <= int(raw) <= high:
+        raise ConfigurationError(f"{name} must be {low}..{high}")
+    return int(raw)
+
+
+def _counter_path(repo: str, base: str, labels: Sequence[str]) -> pathlib.Path:
+    # Key per lane target.  Two lanes sharing a state dir must not pool each
+    # other's failures into a degrade that neither one earned.
+    key = hashlib.sha256(
+        "\n".join([repo, base, ",".join(labels)]).encode()
+    ).hexdigest()[:32]
+    return _state_dir() / f"inconclusive.{key}.json"
+
+
+def _read_counter(path: pathlib.Path) -> int:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return 0
+    count = value.get("consecutive") if isinstance(value, dict) else None
+    return count if type(count) is int and count >= 0 else 0
+
+
+def _write_counter(path: pathlib.Path, count: int, reason: str) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(
+            {
+                "consecutive": count,
+                "reason": reason,
+                "updated_at": _now_rfc3339(),
+            }
+        )
+        # Atomic replace so a concurrent lane never reads a torn counter.
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, path)
+    except OSError:
+        # The breaker is a safety valve; never fail admission over its bookkeeping.
+        pass
+
+
+def _clear_counter(path: pathlib.Path) -> None:
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _now_rfc3339() -> str:
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .strftime("%Y-%m-%dT%H:%M:%SZ")
+    )
 
 
 def bounded_timeout() -> int:
@@ -198,15 +285,77 @@ def run(args: argparse.Namespace) -> int:
         raw = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise ValueError("Shipyard admission output was not JSON") from error
-    value = validate_verdict(
-        raw,
-        repo=args.repo,
-        base=args.base,
-        labels=labels,
-        process_exit=completed.returncode,
+    unknown_reason: list[str] = []
+    try:
+        value = validate_verdict(
+            raw,
+            repo=args.repo,
+            base=args.base,
+            labels=labels,
+            process_exit=completed.returncode,
+            unknown_reason=unknown_reason,
+        )
+    except ValueError:
+        # Persist what Shipyard actually said before failing.  The previous
+        # behaviour discarded the envelope, so a version skew could only be
+        # diagnosed by reading Shipyard's source.
+        _persist_rejected(args, completed.stdout)
+        raise
+    return _apply_breaker(args, labels, value, bool(unknown_reason))
+
+
+def _persist_rejected(args: argparse.Namespace, stdout: str) -> None:
+    try:
+        directory = _state_dir()
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "rejected-envelope.json").write_text(stdout[:65536])
+    except OSError:
+        pass
+
+
+def _apply_breaker(
+    args: argparse.Namespace,
+    labels: Sequence[str],
+    value: dict[str, Any],
+    unknown_reason: bool,
+) -> int:
+    verdict = value["verdict"]
+    reason = value["reason"]
+    path = _counter_path(args.repo, args.base, labels)
+    if verdict != "error":
+        # A real admit or defer proves Shipyard can observe again.
+        _clear_counter(path)
+        print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        return VERDICT_EXIT[verdict]
+    inconclusive = unknown_reason or reason in INCONCLUSIVE_ERROR_REASONS
+    if not inconclusive:
+        # Shipyard looked and found dirt it could not clear.  Stay closed.
+        print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        return VERDICT_EXIT[verdict]
+    degrade_after = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_DEGRADE_AFTER", 3, 1, 100
     )
-    print(json.dumps(value, separators=(",", ":"), sort_keys=True))
-    return VERDICT_EXIT[value["verdict"]]
+    degrade_max = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_DEGRADE_MAX", 20, 1, 10000
+    )
+    count = _read_counter(path) + 1
+    _write_counter(path, count, reason)
+    if count < degrade_after or count > degrade_max:
+        # Below the threshold the gate keeps its full strength; above the cap it
+        # closes again so a permanent outage cannot leave the gate open forever.
+        print(json.dumps(value, separators=(",", ":"), sort_keys=True))
+        return VERDICT_EXIT[verdict]
+    degraded = dict(value)
+    degraded["tartci_degraded"] = True
+    degraded["tartci_consecutive_inconclusive"] = count
+    print(json.dumps(degraded, separators=(",", ":"), sort_keys=True))
+    print(
+        f"admission-clean DEGRADED: {count} consecutive inconclusive verdicts "
+        f"({reason}); admitting without a clean proof. Gate closes again after "
+        f"{degrade_max}.",
+        file=sys.stderr,
+    )
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:

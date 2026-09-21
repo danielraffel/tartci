@@ -33,6 +33,11 @@ def parse_args(
         command_parser.add_argument(
             "--reserved-gate-cores", type=int, help="cores withheld from non-gate leases"
         )
+        command_parser.add_argument(
+            "--reserved-gate-mem-mb",
+            type=int,
+            help="memory in MB withheld from non-gate leases",
+        )
         command_parser.add_argument("--gate-priority", type=int, default=priority_classes["gate"])
         command_parser.add_argument("--stale-secs", type=int, default=stale_secs)
         command_parser.add_argument("--role", choices=valid_roles)

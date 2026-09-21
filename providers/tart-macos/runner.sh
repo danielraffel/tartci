@@ -182,11 +182,25 @@ CURRENT_REGISTERED_RUNNER=""
 CURRENT_RUNNER_API_ROOT=""
 CURRENT_AQUA_LABEL=""
 CLEANED_UP=0
-# Set when a VM lease is denied, cleared when one is granted or when the queue
-# drains. Carries the START of the blocked streak, not the latest denial, so a
-# supervisor that keeps re-entering work and keeps failing stays measurable
-# across the other phases it cycles through while blocked.
+# Set when a work entry ends without serving a job, cleared when a job is
+# actually assigned or when the queue drains. Carries the START of the blocked
+# streak, not the latest failure, so a supervisor that keeps re-entering work
+# and keeps failing stays measurable across the other phases it cycles through
+# while blocked.
+#
+# The cause is deliberately not enumerated. A lease denial, an admission
+# refusal and a cause nobody has written down yet all produce the same
+# observable: the lane took a slot against real queued demand and served
+# nothing. So the streak is counted at the one place every cause returns
+# through, rather than at each cause in turn. Only an assignment clears it: a
+# granted lease, a booted VM and a registered runner each prove a step, never
+# that the lane is serving.
 SERVING_BLOCKED_SINCE=""
+SERVING_BLOCKED_STREAK=0
+SERVING_BLOCKED_LAST_PHASE=""
+# 1 once the current work entry has had a job assigned to it.
+CURRENT_SERVED=0
+LAST_HEARTBEAT_PHASE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -478,6 +492,118 @@ clear_jit_admission_denied(){
   rm -f "$(jit_denial_file_for "$runner_group_id" "$labels")"
 }
 
+# -- Scan diagnostics -------------------------------------------------------
+# A queue/assignment scanner reports WHY it failed on stderr; its stdout is only
+# a count. Discarding that stderr leaves the supervisor able to report that it is
+# blind but never why, which is what turned a one-line interpreter fault into a
+# multi-hour outage. Keep the last diagnostic so the blind path can print it.
+SCAN_ERROR_FILE="$STATE_DIR/$RUNNER_NAME.scan-last-error"
+
+# Keep BOTH ends of a diagnostic stream, with an explicit elision marker.
+#
+# A wrapper prints the underlying CAUSE first and its own summary last, so any
+# "keep the last N lines" rule drops the cause the moment the wrapper is more
+# verbose than N. Deepening the tail does not fix last-line-wins — it only moves
+# the cliff: `tail -n 3` keeps a two-line wrapper's cause and loses a four-line
+# one's, and nothing lets a caller predict how chatty a wrapper will be. Keeping
+# the head as well is what makes the cause survive at any length, and the marker
+# means an elided middle is never mistaken for the whole stream.
+scan_diagnostic_digest(){
+  awk -v head_n="${2:-3}" -v tail_n="${3:-3}" -v max_col="${4:-240}" '
+    /^[[:space:]]*$/ { next }
+    {
+      lines[++count] = (length($0) > max_col) \
+        ? substr($0, 1, max_col) "..." : $0
+    }
+    END {
+      if (count == 0) exit 0
+      if (count <= head_n + tail_n) {
+        for (i = 1; i <= count; i++) print lines[i]
+        exit 0
+      }
+      for (i = 1; i <= head_n; i++) print lines[i]
+      printf "[... %d line(s) elided ...]\n", count - head_n - tail_n
+      for (i = count - tail_n + 1; i <= count; i++) print lines[i]
+    }
+  ' "$1"
+}
+
+run_scan_capture(){
+  local err rc
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-scan-err.XXXXXX")" || { "$@"; return $?; }
+  "$@" 2>"$err"
+  rc=$?
+  if [ -s "$err" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    scan_diagnostic_digest "$err" >"$SCAN_ERROR_FILE" 2>/dev/null || true
+  fi
+  rm -f "$err"
+  return $rc
+}
+
+# Most recent scanner diagnostic, flattened to a single line for the log.
+scan_last_error(){
+  [ -r "$SCAN_ERROR_FILE" ] || return 0
+  tr '\n' '|' <"$SCAN_ERROR_FILE" 2>/dev/null | sed 's/|$//'
+}
+
+clear_scan_error(){ rm -f "$SCAN_ERROR_FILE" 2>/dev/null || true; }
+
+read_blind_restarts(){
+  local v=0
+  [ -r "${BLIND_RESTART_FILE:-}" ] && read -r v <"$BLIND_RESTART_FILE" 2>/dev/null
+  case "$v" in ''|*[!0-9]*) v=0;; esac
+  printf '%s' "$v"
+}
+
+write_blind_restarts(){
+  [ -n "${BLIND_RESTART_FILE:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" >"$BLIND_RESTART_FILE" 2>/dev/null || true
+}
+
+reset_blind_restarts(){
+  [ -n "${BLIND_RESTART_FILE:-}" ] && rm -f "$BLIND_RESTART_FILE" 2>/dev/null
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] && rm -f "$BLIND_ESCALATION_FILE" 2>/dev/null
+  return 0
+}
+
+# True while a recent escalation notice still stands, so the alert is raised
+# once per window rather than on every poll.
+blind_escalation_is_fresh(){
+  local window="${TARTCI_SCAN_BLIND_ESCALATION_REPEAT_SECS:-900}" mtime now
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] || return 1
+  [ -r "$BLIND_ESCALATION_FILE" ] || return 1
+  # GNU `stat -f` means "filesystem", not "format": it prints a block of fs
+  # detail AND fails, so chaining the two dialects with `||` concatenates that
+  # dump onto the real answer. Try each independently and accept only a number.
+  mtime="$(stat -c %Y "$BLIND_ESCALATION_FILE" 2>/dev/null)"
+  case "$mtime" in ''|*[!0-9]*) mtime="";; esac
+  if [ -z "$mtime" ]; then
+    mtime="$(stat -f %m "$BLIND_ESCALATION_FILE" 2>/dev/null)"
+    case "$mtime" in ''|*[!0-9]*) return 1;; esac
+  fi
+  now="$(date +%s)"
+  [ $((now - mtime)) -lt "$window" ]
+}
+
+# A file a human (or `tartci status`) can find without reading a log tail.
+write_blind_escalation(){
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '{"ts":"%s","runner":"%s","host":"%s","restarts":"%s","detail":"%s"}\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$RUNNER_NAME" "$HOST_NAME" \
+    "$(json_sanitize "$1")" "$(json_sanitize "${2:-no diagnostic captured}")" \
+    >"$BLIND_ESCALATION_FILE" 2>/dev/null || true
+}
+
+# Publish a diagnostic captured by a caller that runs its own scanner.
+record_scan_error(){
+  [ -n "${1:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" >"$SCAN_ERROR_FILE" 2>/dev/null || true
+}
+
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
 event(){
   local kind="$1" detail="${2:-}" ts
@@ -489,11 +615,12 @@ event(){
 
 heartbeat(){
   local phase="$1" ts state_file tmp_file
+  LAST_HEARTBEAT_PHASE="$phase"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -552,7 +679,7 @@ queued_work(){
     printf '%s\n' "$total"
     return 0
   fi
-  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+  run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     "${WORKFLOW_ARGS[@]}" \
     --labels "$LABELS" \
@@ -562,7 +689,7 @@ queued_work(){
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE" \
-    --match-labels 1 2>/dev/null || echo ERR
+    --match-labels 1 || echo ERR
 }
 
 print_queued_work(){
@@ -601,7 +728,7 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
-  "${scan_cmd[@]}" --match-labels 1 2>/dev/null
+  run_scan_capture "${scan_cmd[@]}" --match-labels 1
 }
 
 # Print `count|registration labels|zero-based tier`. A scan error at any tier is
@@ -696,7 +823,7 @@ priority_demand(){
   # advisory lane that idles during a gh outage — strictly safer than risking the
   # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
   # are declared first and assigned separately so `||` actually fires.)
-  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+  run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     --workflow "$YIELD_WORKFLOW" \
     --labels "$YIELD_LABELS" \
@@ -707,7 +834,7 @@ priority_demand(){
     --state-file "$STATE_DIR/priority-queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
-    --match-labels 1 2>/dev/null \
+    --match-labels 1 \
     || { printf '%s\n' 1; return 0; }
 }
 
@@ -1183,6 +1310,7 @@ run_runner_until_done(){
         capture_current_job && break
         sleep 2
       done
+      CURRENT_SERVED=1
       event job_assigned "$(grep 'Running job:' "$runner_log" | tail -1)"
       heartbeat job-running
     fi
@@ -1243,10 +1371,13 @@ run_one(){
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
+  # Before the first early return, not beside the other CURRENT_* resets: the
+  # pre-clone admission bail below returns above those.
+  CURRENT_SERVED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
-  local lease_cores lease_priority lease_rc
+  local lease_cores lease_mem lease_priority lease_rc
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
@@ -1260,6 +1391,41 @@ run_one(){
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
+  fi
+  # The verdict is a function of (repo, labels) alone — see
+  # providers/common/admission-clean.lib.sh, which forwards exactly those two
+  # plus the lane's static base branch — so it can be asked BEFORE the CoW
+  # clone instead of only after a full clone and boot. A refusal here skips the
+  # clone, the disk reservation and the VM lease entirely, so a lane whose
+  # admission authority is down backs off cheaply instead of minting and
+  # discarding a VM every cycle.
+  #
+  # This is an early bail, not the gate. The authoritative check still runs at
+  # the JIT boundary below, where freshness is what matters; nothing here can
+  # admit a VM that the boundary check would refuse.
+  if tartci_admission_clean_enabled; then
+    local precheck_json="" precheck_rc=0
+    heartbeat admission-precheck
+    event admission_precheck "repo=$REPO labels=$selected_labels"
+    if precheck_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+      precheck_rc=0
+    else
+      precheck_rc=$?
+    fi
+    # One rolling envelope per lane: the reason now travels in the event, so
+    # this is a fallback copy and must not grow a file per attempt.
+    [ -z "$precheck_json" ] \
+      || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
+    if [ "$precheck_rc" -ne 0 ]; then
+      local precheck_detail
+      precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
+        || precheck_detail="reason=unreadable"
+      heartbeat "$([ "$precheck_rc" -eq 3 ] && printf admission-precheck-deferred || printf admission-precheck-error)"
+      event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
+        "rc=$precheck_rc pre_clone=true $precheck_detail"
+      note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
+      return "$precheck_rc"
+    fi
   fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
@@ -1302,8 +1468,8 @@ run_one(){
     heartbeat vm-lease-denied
     return "$lease_rc"
   fi
-  SERVING_BLOCKED_SINCE=""
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
@@ -1316,8 +1482,8 @@ run_one(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
-    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
@@ -1424,10 +1590,13 @@ run_one(){
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
       heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
-        "rc=$admission_rc unregistered=true"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off"
+        "rc=$admission_rc unregistered=true $admission_detail"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_vm
       tartci_release_vm_lease
       return "$admission_rc"
@@ -1598,6 +1767,11 @@ if [ "$LOOP" = 1 ]; then
   # manual recovery, automated. A blip self-heals on the next successful poll (blind resets to 0).
   blind=0
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
+  # The restart remedy is bounded. It survives the restart it triggers, so it
+  # must live on disk rather than in this process.
+  BLIND_RESTART_MAX="${TARTCI_SCAN_BLIND_RESTART_MAX:-3}"
+  BLIND_RESTART_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-restarts"
+  BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
   heartbeat loop
   while true; do
     if ! tartci_pool_admission_open; then
@@ -1626,17 +1800,46 @@ if [ "$LOOP" = 1 ]; then
     # VM). Any successful poll resets the counter, so a transient blip costs nothing.
     if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
       blind=$((blind + 1))
-      note "SCAN BLIND (gh queue scan failed) ${blind}/${BLIND_MAX} — NOT idling as empty (running_macos_vms=$r/$cap)"
-      event scan_blind "consecutive=$blind running=$r/$cap"
+      scan_detail="$(scan_last_error)"
+      # Report WHAT was observed. The old text named `gh`, a component this code
+      # never observed failing, and sent every reader to audit a healthy CLI.
+      note "SCAN BLIND ${blind}/${BLIND_MAX} — queue scan failed: ${scan_detail:-no diagnostic captured} — NOT idling as empty (running_macos_vms=$r/$cap)"
+      event scan_blind "consecutive=$blind running=$r/$cap detail=${scan_detail:-no diagnostic captured}"
       heartbeat scan_blind
       if [ "$blind" -ge "$BLIND_MAX" ]; then
-        note "SCAN BLIND ~$((blind * POLL))s — self-restarting the supervisor for fresh gh auth (launchd KeepAlive respawns)"
-        event scan_blind_restart "seconds=$((blind * POLL))"
+        blind_restarts="$(read_blind_restarts)"
+        if [ "$blind_restarts" -ge "$BLIND_RESTART_MAX" ]; then
+          # Restarting buys a fresh process. Causes that a fresh process cannot
+          # clear (a broken interpreter, a revoked credential, an API change)
+          # are unaffected, so repeating it forever hides a stuck host behind a
+          # log that looks like it is recovering. Stay up and fail-closed — the
+          # lane must still recover by itself when the cause clears — but stop
+          # pretending a remedy is being applied, and make it visible.
+          # Escalate loudly, then throttle: the condition is re-evaluated every
+          # poll, and an alert repeated every ${POLL}s is one a human filters out.
+          if ! blind_escalation_is_fresh; then
+          note "SCAN BLIND UNRESOLVED after $blind_restarts supervisor restarts — restarting again will not help. Last diagnostic: ${scan_detail:-none captured}. This host is serving NOTHING for this lane; a human needs to look. Details: $SCAN_ERROR_FILE"
+          event scan_blind_escalated \
+            "restarts=$blind_restarts seconds=$((blind * POLL)) detail=${scan_detail:-no diagnostic captured}"
+          heartbeat scan_blind_escalated
+          write_blind_escalation "$blind_restarts" "$scan_detail"
+          fi
+          sleep "$POLL"; continue
+        fi
+        note "SCAN BLIND ~$((blind * POLL))s — restarting the supervisor (attempt $((blind_restarts + 1))/$BLIND_RESTART_MAX; launchd KeepAlive respawns)"
+        event scan_blind_restart "seconds=$((blind * POLL)) restart=$((blind_restarts + 1))/$BLIND_RESTART_MAX detail=${scan_detail:-no diagnostic captured}"
+        write_blind_restarts "$((blind_restarts + 1))"
         exit 75
       fi
       sleep "$POLL"; continue
     fi
+    if [ "$blind" -ne 0 ]; then
+      note "scan recovered after ${blind} blind poll(s)"
+      event scan_recovered "after=$blind"
+    fi
     blind=0
+    reset_blind_restarts
+    clear_scan_error
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0
@@ -1657,6 +1860,20 @@ if [ "$LOOP" = 1 ]; then
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # Every cause of clone-without-serve returns through here, so the streak
+      # is counted here rather than at each cause. Counted per work ENTRY, not
+      # per error: a lane that alternates a failure with a served job never
+      # accumulates, while a lane that only fails accumulates every cycle.
+      if [ "$CURRENT_SERVED" = 1 ]; then
+        SERVING_BLOCKED_SINCE=""
+        SERVING_BLOCKED_STREAK=0
+        SERVING_BLOCKED_LAST_PHASE=""
+      else
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      fi
       if [ -n "$CURRENT_VM" ]; then
         note "teardown remained nonterminal — exiting for launchd process-group cleanup"
         event teardown_restart "vm=$CURRENT_VM rc=$run_rc"
@@ -1677,9 +1894,15 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap priority_demand=$p)"
-      # No queued work means nothing is being denied; only contention counts as
-      # blocked, so an idle pass ends the streak rather than inflating it.
-      [ "${q:-0}" -gt 0 ] || SERVING_BLOCKED_SINCE=""
+      # No queued work means nothing is being refused; only demand that the
+      # lane took and did not serve counts as blocked, so an idle pass ends the
+      # streak rather than inflating it. A lane with no VMs and no demand is
+      # the designed resting state of an ephemeral fleet, not a fault.
+      if [ "${q:-0}" -le 0 ]; then
+        SERVING_BLOCKED_SINCE=""
+        SERVING_BLOCKED_STREAK=0
+        SERVING_BLOCKED_LAST_PHASE=""
+      fi
       heartbeat waiting
       sleep "$POLL"
     fi

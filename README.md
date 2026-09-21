@@ -37,7 +37,16 @@ idle receipt before tartci will boot it out; without that receipt drain remains
 pending and exits nonzero. The current supported Shipyard CLI does not produce
 this receipt; do not create it by hand. Persistent-runner drains therefore stay
 fail-closed until an authoritative producer is deployed. `pool off` remains
-immediate and may terminate work. A later `pool on` restores only the exact
+immediate and may terminate work.
+
+Both `drain` and `off` run a **capacity floor** first
+(`scripts/capacity_floor.py`): they refuse when no host other than this one
+serves a required gate label, because that mutation takes the label to zero
+runners and stalls every pull request waiting on it. The refusal names the
+label and the host; `--allow-last-serving-host` proceeds anyway. An
+indeterminate answer — an unreadable runner scope, an unresolvable host
+identity — refuses too, since it cannot tell "another host is serving" apart
+from "nobody is". A later `pool on` restores only the exact
 dynamic and persistent services named by the verified fleet profile receipt;
 it does not revive arbitrary `actions.runner.*` plists or legacy Tart controllers.
 See the runbook.
@@ -558,6 +567,52 @@ on/off lifecycle. A normal generated fleet deployment retires only the prior
 `com.danielraffel.pulp.tart-runner-macos-release` controller after the pool is
 closed; the profile does not grant authority over unrelated auxiliary agents.
 
+### Diagnose a fleet host
+`tartci doctor fleet [--json]` answers "how is this host configured, is it
+working, and if not why" in one read-only query, so the answer does not have to
+be reassembled from a dozen commands and remembered context.
+
+```bash
+./tartci doctor fleet            # human-readable, with the reason each state exists
+./tartci doctor fleet --json     # same findings, machine-readable
+./tartci doctor fleet --no-census  # skip the GitHub runner census entirely
+```
+
+It reports five things, and reports UNKNOWN with a code whenever one cannot be
+determined rather than falling back to the reassuring value:
+
+- **Which generation the host actually execs**, read from each installed
+  LaunchAgent's `ProgramArguments`, against the cohort the install receipt
+  records. These diverge silently, because staging a generation writes a receipt
+  and exits 0 whether or not anything execs it.
+- **Whether the host can receive a generation at all.** A host whose agents exec
+  a sealed Developer ID launcher bundle runs that bundle's own sealed copy of the
+  cohort, so a generation stage alone changes nothing it runs.
+- **Whether the host can drain.** A stock persistent Actions listener has no safe
+  local drain primitive, so `tartci pool drain` refuses without an authoritative
+  held-idle receipt -- after it has already written `participation=0` and
+  `pool-state=draining`. Knowing this before a deploy is the only way not to
+  enter that half-drained state.
+- **A runner census across both registration scopes.** The repository endpoint
+  omits organization-scoped runners without saying so, so a scope that cannot be
+  read makes the census incomplete and no count is quoted as capacity. Runners
+  here are ephemeral and minted per job, so **zero online at idle is normal** and
+  the output says so.
+- **Why the host is not ready**, as the machine-readable problem code, plus a
+  reconciliation: readiness is computed against a support root, so a git checkout
+  and the installed generation return different verdicts for the same host at the
+  same instant. The installed generation's verdict is authoritative because that
+  is the tree the running supervisors execute; a disagreement between the two is
+  itself reported.
+
+Exit codes: `0` healthy, `1` a problem was found, `2` something could not be
+determined. Unknown is deliberately distinct from healthy.
+
+Each reason code carries a row in `scripts/fleet_reasons.json` recording why the
+state exists, the supported remedy, and -- for the states an operator is most
+tempted to "fix" -- what not to do. A test asserts every code emitted has a row
+and every row is cited, so the table cannot drift away from the code.
+
 ### Reap stale CI residue
 `tartci doctor --reap --json` is the report-only Tier-2 janitor for tartci VM
 CI hosts. It emits capacity, supervisor heartbeat, VM/overlay, GitHub runner,
@@ -612,6 +667,19 @@ redact GitHub runner `--jitconfig` payloads and truncate long command lines by
 default; use `--process-line-width N` if a wider diagnostic view is needed. Use
 `--no-guest` when the VM is already gone or SSH is not useful, `--runner NAME`
 to narrow a host with multiple supervisors, and `--json` for scripts.
+
+It reports **supervisor coverage** as `supervisors=<matched>/<expected>`, where
+`matched` comes from the lanes' heartbeat state files and `expected` comes from
+the fleet LaunchAgents `launchctl` reports loaded. Two sources on purpose: a
+view that goes blind against the state files cannot also silence its own
+denominator. Exit codes: **0** the view is trustworthy (coverage complete, or
+the host genuinely runs no fleet lanes), **3** coverage shortfall — it matched
+fewer supervisors than are loaded, or could not establish how many should be
+there, and the output says `BLIND:` or `UNKNOWN:` rather than reporting an idle
+host. Anything else is an ordinary error. This implements the standing contract
+in `docs/runbook.md` ("treat an unreadable state file as a real health problem,
+not as 'no active runner'"): matching nothing where lanes are loaded is a
+failure to observe, never an observation that the host is idle.
 
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux

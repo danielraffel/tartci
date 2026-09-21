@@ -29,6 +29,10 @@ WORKFLOW_TIERS = (
 )
 CLASS_LABELS = "pulp-build-merge-group,pulp-build-pr-head"
 LEGACY_LABEL = "pulp-gate-fast"
+# Guest memory is derived from a lease's granted cores (see
+# tartci_vm_lease_derived_mem_mb). No gate-lane agent may pin it: the two gate
+# slots serve the same required check and must size their guests the same way.
+GUEST_MEMORY_KEYS = ("TARTCI_MACOS_VM_MEM_MB", "PULP_MACOS_VM_MEM_MB")
 ABSOLUTE_PATH = (
     "/opt/homebrew/bin:/usr/local/bin:{home}/.local/bin:"
     "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -83,8 +87,14 @@ def slot2_profile(home: str, tart_home: str, ccache_max_size: str = "40G") -> di
             "TARTCI_MACOS_LOGS": f"{home}/Library/Logs/tartci/macos-gate-slot2-jobs",
             "TARTCI_QUEUE_LANE_ID": "pulp-macos-gate-slot2",
             "TARTCI_MACOS_VM_CAP": "2",
+            # Cores are this lane's capacity decision; guest MEMORY is derived
+            # from them at lease time and must not be pinned here. Both gate
+            # slots serve the same required check, and the primary slot pins
+            # neither — so a literal here makes slot 2 boot a differently sized
+            # guest than its sibling, and the guest's own build governor sizes
+            # its job count from the memory it can see. That divergence shows up
+            # as "the gate is slower on one slot" with nothing to point at.
             "TARTCI_MACOS_VM_CORES": "6",
-            "TARTCI_MACOS_VM_MEM_MB": "8192",
         },
     }
 
@@ -134,11 +144,18 @@ def validate_slot2(value: dict[str, Any], sibling: dict[str, Any] | None = None)
         "TARTCI_RUNNER_SLOT": "2",
         "TARTCI_MACOS_VM_CAP": "2",
         "TARTCI_MACOS_VM_CORES": "6",
-        "TARTCI_MACOS_VM_MEM_MB": "8192",
     }
     _expect(errors, value.get("Label") == SLOT2_LABEL, f"Label must be {SLOT2_LABEL}")
     for key, expected in required_env.items():
         _expect(errors, env.get(key) == expected, f"{key} must be {expected!r}")
+    # Absence is the contract, so validation has to assert it. Dropping the key
+    # from the rendered agent without checking for it here would let an
+    # installed plist keep a stale pin and still validate.
+    for key in GUEST_MEMORY_KEYS:
+        _expect(errors, key not in env,
+                f"{key} must not be set: guest memory is derived from the lease's "
+                "granted cores, and pinning it here desynchronises this slot from "
+                "the primary gate slot")
     _expect(errors, args[-4:] == ["--slot", "2", "--labels", labels],
             "ProgramArguments must end with the canonical slot and base labels")
     _expect(errors, LEGACY_LABEL not in labels, "legacy generic label leaked into runner labels")
