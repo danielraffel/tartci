@@ -512,6 +512,31 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   override it: the suite runs on hosts whose lanes are scanning through the
   default path, so a test that inherits it both fails on production contention
   and adds to it.
+  What the scan costs depends on the answer, not on the queue. A run listing is
+  walked page by page and each page is handed straight to the job scan, so a
+  matching queued job on the first page ends the scan there: the later pages,
+  the `in_progress` listing, and the snapshot reconciliation that makes an
+  empty listing trustworthy are never bought. Measured against the same
+  fixture, presence costs 3 calls where absence costs 21. Absence is unchanged
+  and still exhaustive, because only looking everywhere can establish it, so an
+  idle lane still pays the full enumeration every poll. A torn listing is
+  therefore fatal only when nothing matched: a scan holding a witness reports
+  it rather than going blind, which on M3 is the `pagination ended before
+  total_count` family, 235 of 956 blind polls.
+  Workflow name to id is the one input that does not change between polls, so
+  it is cached in `~/.tartci/state/assignment-workflow-ids.json` for 300
+  seconds and shared by every lane on the host. That call alone was 240 of
+  those 956 blind polls. A cached id is only ever spent on its own workflow's
+  listing call, so an id that stops resolving fails the scan closed there and
+  the cache cannot turn a broken lookup into an empty queue; the lifetime
+  bounds the narrower case of a second workflow appearing under an
+  already-cached display name. Set
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS=0` to disable it and resolve
+  the ids on every poll. Tests must override
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE` for the same reason they override
+  the lock path, and additionally because a cache shared between tests is a
+  channel between them: one test's resolved id satisfies the next test's
+  lookup, so the listing call that test exists to exercise is never made.
 
 - **The Shipyard push feed can rescue a blind scan; it can never report an
   empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
