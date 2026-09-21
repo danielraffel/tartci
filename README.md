@@ -335,6 +335,28 @@ keeps scans *succeeding* so the self-heal rarely has to fire. Quick host check:
 `runner.sh --print-queue` should print a number; if it prints `ERR`, that host's
 `gh`/App auth is degraded — fix the token, not the runner.
 
+**Why a scan failed, in the scan's own words.** Every scanner failure leads with
+a reason code, so the supervisor publishes a cause rather than only the fact
+that it is blind:
+
+| Reason | What it means |
+|---|---|
+| `no_valid_credentials` | The caller is not authenticated. `gh` does not fail when its credential is missing or rejected — it falls back to **anonymous** requests, which GitHub meters at **60/hour per IP**, shared by every host behind that address. Fix the credential; adding capacity or waiting does nothing. |
+| `rate_limited` | An authenticated identity spent an allowance it really was issued (5000/hour for a user credential, more for an App installation). The message names the identity and its ceiling. |
+| `lock_contention` | Another lane held the host-global queue observation lock past the bounded wait. |
+| `timeout` / `pagination` / `budget_exhausted` / `api_error` | The observation did not complete; the text says which way. |
+
+A 403 alone cannot tell the first two apart, and reading one as the other is how
+a credential fault gets diagnosed as a busy queue. So the scan proves its
+identity **before** it reads the queue, by asking `rate_limit` (which costs no
+quota and answers even when the allowance is gone): a 60/hour ceiling is proof
+the request carried no credential and is refused by name, and a 403 that GitHub
+answers with its invitation to authenticate is reported the same way. The
+measurement is reused for a bounded window rather than repeated every poll, and
+is discarded the moment a credential is refused. Check a host with
+`gh api rate_limit --jq .resources.core.limit`; `60` means that host is
+anonymous.
+
 Use Shipyard's queue-front observation (`shipyard runner fleet-status`) when
 the operational question is whether a required merge gate is making progress.
 Tart CI owns disposable VM capacity and bounded job discovery; Shipyard owns
