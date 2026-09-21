@@ -44,6 +44,38 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   diagnosis and pre-admission detector (live attribution plus focused tests),
   MEDIUM for final TCC durability until that replacement-build canary runs.
 
+## A webhook 403 has three causes and only one is a credential (2026-09-21)
+
+- **`shipyard-daemon-health` clears the token cache and refreshes every five
+  minutes until it hits its escalation limit, and the daemon still cannot
+  register its webhook.** → *Cause:* the GitHub App installation is missing
+  `repository_hooks`. GitHub reports that as HTTP 403 "Resource not accessible
+  by integration", which is byte-for-byte as much a 403 as a dead credential —
+  so the watchdog applied the credential remedy to a credential that was
+  working perfectly, failed identically every cycle, and reported nothing an
+  operator could act on. Three different faults arrive as 403: a missing App
+  permission (a human must grant it), a classic token missing
+  `admin:repo_hook` (a one-time `gh auth refresh`), and a genuinely dead or
+  anonymous credential (the only one worth clearing anything for). → *Fix:* the
+  watchdog now classifies before it heals, and answers a permission fault by
+  escalating and touching nothing. Never read "403" alone as "rotate the
+  credential".
+
+- **Every webhook delivery fails to connect and no alarm fires anywhere.** →
+  *Cause:* this host's tailnet name changed — Tailscale re-registers a
+  duplicate node under a `-N` suffix and the old name stops resolving — while
+  the registered hook kept the old name. The daemon printed a correct tunnel
+  URL and GitHub served a correct hook record; each side was individually
+  truthful and nobody compared them. Nothing consumed the feed either, so its
+  failure had no symptom. → *Fix:* `shipyard daemon reconcile` performs the
+  comparison (exit 0 in sync, 1 warn, 2 alarm, 3 blocked on a human) and the
+  watchdog routes on it. When diagnosing by hand, read the host's own identity
+  from `tailscale status --json` → `.Self.DNSName` (strip the trailing dot).
+  The CLI is **not** on a non-interactive PATH, so `command -v tailscale`
+  returns empty on a perfectly healthy host — resolve
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale` explicitly and treat a
+  failure to read the identity as UNKNOWN, never as "no drift".
+
 ## Cross-cutting (AVF / QEMU media)
 
 - **"Invalid disk image. The disk image format is not recognized."**
@@ -260,15 +292,25 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   ```sh
   ghapp api repos/OWNER/REPO/actions/variables \
     --jq '.variables[] | select(.name=="PULP_LOCAL_MACOS_RUNS_ON_JSON") | .value'
-  ghapp api repos/OWNER/REPO/actions/runners \
-    --jq '[.runners[] | select([.labels[].name]|index("pulp-build-vm"))]
-          | map("\(.name) busy=\(.busy)")'
+  scripts/runner_census.py --repo OWNER/REPO --label pulp-build-vm --json
   ```
 
   → *Fix:* add gate-eligible capacity, or accept the concurrency. Do **not**
   raise the merge queue's `max_entries_to_build` to compensate: extra entries
   contend for the same eligible runners and the wait simply moves from GitHub's
   queue into the host lease store.
+
+- **A runner census counts only half the fleet.** `repos/<owner>/<repo>/actions/
+  runners` lists repository-registered runners and omits organization-registered
+  ones; `orgs/<owner>/actions/runners` lists the other half. Neither endpoint
+  says the other exists, so a single-scope census answers "how many runners
+  serve this label" with a confident wrong number — measured on one live fleet
+  as 3 at repository scope while 4 more sat at organization scope.
+  → *Diagnose:* `scripts/runner_census.py --repo OWNER/REPO --label LABEL`
+  reads both and prints UNREACHABLE for a scope it could not read, because a
+  scope that went unread is not a scope that was empty.
+  → *Fix:* decide capacity from both scopes. A zero from one endpoint is the
+  dangerous reading: it looks like there is nothing to protect.
 
 - **A host's role says `dedicated-builder` but it serves no gate work.**
   Same incident: the 28-core Mac Studio (`TARTCI_AGENT_BUILD_CAP_CORES=12`,
@@ -420,9 +462,21 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
   → *Failure behavior:* lock acquisition is bounded by
-  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default). The
-  exhaustive assignment scanner's total deadline is 180 seconds by default,
-  leaving a serialized waiter time to perform its own scan after the lock opens.
+  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
+  the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
+  (180 seconds by default) budgets the scan that follows it. The two are
+  sequential, not nested: the scan deadline starts when the lock is acquired,
+  so a lane that queued behind four other supervisors still scans with a full
+  budget, and a scan can take at most lock timeout plus scan timeout overall.
+  They were nested until 2026-09-21, which made the budget
+  `180 - however long this host's queue happened to be`. A waiter then ran its
+  exhaustive pass on the remainder and passed that remainder to `gh` as a
+  shortened per-call timeout, so the call was killed mid-pass and the lane
+  reported the queue unobservable. Measured on M1 over 24 hours, 96 scans died
+  on a GitHub call clamped below the lane's configured 30-second limit, with a
+  median of 14.6 seconds left; the failure is invisible in the logs because it
+  arrives as `GitHub API failed ... timed out`, indistinguishable at a glance
+  from a slow API.
   Timeout
   is scan-blind/fail-closed: do not report zero demand, publish partial cache
   state, or start a lower-priority VM. The supervisor retries normally.
@@ -445,8 +499,80 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   exhaustive receipt across VM boot. Cancellation can then cost one bounded
   idle JIT runner, but lower tiers still require live exhaustive pre-mint proof
   and can never bypass newly arrived higher-priority work.
+  Shortening `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` is not a throughput
+  lever. Five contending lanes were measured at 120, 60, 30 and 10 seconds and
+  completed the same 12-13 scans each time, because the lock -- not the wait --
+  is what rations observation; only the wasted attempts grew, from 48 to 203.
+  A shorter wait does buy slightly fairer sharing, and caps how long a
+  supervisor's poll can block (that ceiling is the lock timeout plus the scan
+  timeout, so the 120-second default admits a 300-second poll). Choose it for
+  those two properties, never expecting more scans.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
-  host is explicitly pointed at the same replacement path.
+  host is explicitly pointed at the same replacement path. Tests must always
+  override it: the suite runs on hosts whose lanes are scanning through the
+  default path, so a test that inherits it both fails on production contention
+  and adds to it.
+  What the scan costs depends on the answer, not on the queue. A run listing is
+  walked page by page and each page is handed straight to the job scan, so a
+  matching queued job on the first page ends the scan there: the later pages,
+  the `in_progress` listing, and the snapshot reconciliation that makes an
+  empty listing trustworthy are never bought. Measured against the same
+  fixture, presence costs 3 calls where absence costs 21. Absence is unchanged
+  and still exhaustive, because only looking everywhere can establish it, so an
+  idle lane still pays the full enumeration every poll. A torn listing is
+  therefore fatal only when nothing matched: a scan holding a witness reports
+  it rather than going blind, which on M3 is the `pagination ended before
+  total_count` family, 235 of 956 blind polls.
+  Workflow name to id is the one input that does not change between polls, so
+  it is cached in `~/.tartci/state/assignment-workflow-ids.json` for 300
+  seconds and shared by every lane on the host. That call alone was 240 of
+  those 956 blind polls. A cached id is only ever spent on its own workflow's
+  listing call, so an id that stops resolving fails the scan closed there and
+  the cache cannot turn a broken lookup into an empty queue; the lifetime
+  bounds the narrower case of a second workflow appearing under an
+  already-cached display name. Set
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS=0` to disable it and resolve
+  the ids on every poll. Tests must override
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE` for the same reason they override
+  the lock path, and additionally because a cache shared between tests is a
+  channel between them: one test's resolved id satisfies the next test's
+  lookup, so the listing call that test exists to exercise is never made.
+
+- **The Shipyard push feed can rescue a blind scan; it can never report an
+  empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
+  a tier scan that failed closed asks the local Shipyard daemon's
+  `workflow_job` webhook feed whether demand exists before the supervisor
+  idles blind. The feed is a second opinion from outside the GitHub REST API,
+  so it survives exactly the per-call timeouts that make the scan fail.
+  → *The asymmetry is the whole design.* A witness on the feed proves presence
+  and nothing can retract it. Silence proves nothing at all: a severed feed, an
+  unregistered webhook and a genuinely empty queue are the same bytes. So the
+  rescue only ever converts `ERR` into "there is demand"; every refusal leaves
+  the blind verdict exactly as the scanner left it, and `scan_blind` handling —
+  including the ~180s self-restart — runs unchanged.
+  → *It runs only after the scan already failed*, so a healthy lane never
+  consults it and no feed defect can regress one. The exhaustive caller is
+  excluded: a 100-entry replay ring is not a queue census, and that caller
+  wants a magnitude.
+  → *Age comes from the subscriber's own first sighting, not the job.*
+  Shipyard's normalized `workflow_job` payload carries no timestamp
+  (`action`, `run_id`, `job_id`, `repo`, `name`, `status`, `conclusion`,
+  `runner_name`, `labels`) and the daemon replays its ring unstamped, so a
+  frame is undatable. The ledger at
+  `$STATE_DIR/<runner>.feed-ledger.json` records when this subscriber first saw
+  each job id. A webhook cannot arrive before the job was queued, so that
+  measures *less* than the true wait and can only withhold a job that is in
+  fact old enough — never release one that is too young. A lost ledger costs a
+  delay, never a premature boot.
+  → *Every outcome is announced*: `assignment_feed_rescue` on a rescue,
+  `assignment_feed_degraded` with the daemon's own reason on any refusal. A
+  failing feed must never look like a quiet lane.
+  → *Diagnose by hand* with
+  `python3 scripts/shipyard_event_feed.py --repo … --require-label … --labels …
+  --min-observed-age-seconds … --ledger /tmp/probe.json`. Exit 0 means demand
+  was observed; exit 3 means the feed licensed no decision. Exit 3 is **not**
+  "the queue is empty", and the CLI deliberately prints no count at all rather
+  than a `0` a caller could misread.
 
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
   A run that ends `legacy label remains loaded; refusing replacement startup` →

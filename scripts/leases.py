@@ -366,12 +366,30 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     per_job_mem = int(
         profile.get("per_compile_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB)
     )
+    per_job_mem = max(1, per_job_mem)
+    total_mem = max(0, total_mem)
+    # Memory mirror of reserved_gate_cores. The core reserve alone does not
+    # protect the gate: memory is a second, independent admission axis, so a
+    # non-gate lease that fits in the non-gate CORE budget can still consume the
+    # RAM a gate VM needs and darken a required-gate slot. Clamped like the core
+    # reserve so the non-gate class always keeps at least one compile job.
+    reserved_mem = (
+        int(args.reserved_gate_mem_mb)
+        if getattr(args, "reserved_gate_mem_mb", None) is not None
+        else int(profile.get("reserved_gate_mem_mb", 0))
+    )
+    reserved_mem = (
+        min(max(0, reserved_mem), total_mem - per_job_mem)
+        if total_mem > per_job_mem
+        else 0
+    )
     return {
         "total": max(1, total),
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
-        "total_mem_mb": max(0, total_mem),
-        "per_job_mem_mb": max(1, per_job_mem),
+        "total_mem_mb": total_mem,
+        "reserved_gate_mem_mb": reserved_mem,
+        "per_job_mem_mb": per_job_mem,
     }
 
 
@@ -398,12 +416,23 @@ def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
         per_job_mem = int(cfg.get("per_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB))
         used_mem = sum(record_mem_mb(record, per_job_mem) for record in records)
         legacy = any(not record_has_explicit_mem(record) for record in records)
+        reserved_mem = int(cfg.get("reserved_gate_mem_mb", 0))
+        non_gate_mem_limit = max(per_job_mem, total_mem - reserved_mem)
+        non_gate_used_mem = sum(
+            record_mem_mb(record, per_job_mem)
+            for record in records
+            if record_int(record, "priority") < cfg["gate_priority"]
+        )
         result.update(
             {
                 "total_mem_mb": total_mem,
                 "used_mem_mb": used_mem,
                 "available_mem_mb": max(0, total_mem - used_mem),
                 "per_job_mem_mb": per_job_mem,
+                "reserved_gate_mem_mb": reserved_mem,
+                "non_gate_limit_mem_mb": non_gate_mem_limit,
+                "non_gate_used_mem_mb": non_gate_used_mem,
+                "non_gate_available_mem_mb": max(0, non_gate_mem_limit - non_gate_used_mem),
                 "memory_accounting": "estimated_legacy" if legacy else "explicit",
             }
         )
@@ -587,10 +616,24 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             if getattr(args, "mem_mb", None) is not None
             else lease_size * cfg["per_job_mem_mb"]
         )
-        mem_exceeded = (
-            cfg["total_mem_mb"] > 0
+        # Two memory checks, mirroring the two core checks above: the host-wide
+        # budget binds every lease, and a non-gate lease is additionally held to
+        # total - reserved_gate_mem_mb so it cannot spend the gate's reserve.
+        mem_axis_on = cfg["total_mem_mb"] > 0
+        mem_limit = cfg["total_mem_mb"]
+        used_mem_for_limit = current_usage.get("used_mem_mb", 0)
+        if priority < cfg["gate_priority"]:
+            mem_limit = max(
+                cfg["per_job_mem_mb"],
+                cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
+            )
+            used_mem_for_limit = current_usage.get("non_gate_used_mem_mb", 0)
+        total_mem_exceeded = (
+            mem_axis_on
             and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
         )
+        class_mem_exceeded = mem_axis_on and used_mem_for_limit + req_mem > mem_limit
+        mem_exceeded = total_mem_exceeded or class_mem_exceeded
         disk_state = (
             disk_capacity(active, disk, requested_disk_bytes, disk_floor_bytes)
             if disk is not None
@@ -619,6 +662,10 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 },
                 "requested_cores": lease_size,
                 "requested_mem_mb": req_mem,
+                "memory_limit_mb": mem_limit if mem_axis_on else 0,
+                "memory_limit_class": (
+                    "non_gate" if priority < cfg["gate_priority"] else "host"
+                ),
                 "priority": priority,
                 "priority_class": priority_class,
                 "capacity": current_usage,
@@ -909,6 +956,12 @@ def emit(result: dict[str, Any], json_output: bool) -> None:
             f"{cap['used_cores']}/{cap['total_cores']} cores used "
             f"(reserved gate {cap['reserved_gate_cores']})"
         )
+        if cap.get("total_mem_mb"):
+            print(
+                "        "
+                f"{cap['used_mem_mb']}/{cap['total_mem_mb']} MB used "
+                f"(reserved gate {cap['reserved_gate_mem_mb']})"
+            )
         for record in result["leases"]:
             print(
                 f"  {record.get('id')} cores={record.get('lease_size_cores')} "
