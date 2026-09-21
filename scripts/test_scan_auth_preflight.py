@@ -91,7 +91,9 @@ def _write_exec(path: Path, body: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-class ScanAuthPreflight(unittest.TestCase):
+class ScannerHarness(unittest.TestCase):
+    """Drive the real scanner CLI against a fake GitHub."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -152,6 +154,10 @@ class ScanAuthPreflight(unittest.TestCase):
             if line.strip()
         ]
 
+
+class ScanAuthPreflight(ScannerHarness):
+    """An anonymous identity is refused; an authenticated one proceeds."""
+
     def test_anonymous_identity_is_refused_and_authenticated_proceeds(self) -> None:
         """The refusal is named, and it happens before the queue is read."""
         refused = self._scan(60)
@@ -211,7 +217,7 @@ class ScanAuthPreflight(unittest.TestCase):
         )
 
 
-class ProbeRefusalDoesNotBlindALane(unittest.TestCase):
+class ProbeRefusalDoesNotBlindALane(ScannerHarness):
     """A CLI that will not answer the probe is not proof of anything.
 
     `ghapp` serves a path carrying a repository but refuses `rate_limit`
@@ -227,35 +233,20 @@ class ProbeRefusalDoesNotBlindALane(unittest.TestCase):
         "ghapp: exact repository provenance is required; use --repo OWNER/REPO"
     )
 
-    def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
-        self.gh = self.root / "fake-gh"
-        _write_exec(self.gh, FAKE_GH)
-        self.call_log = self.root / "calls"
-        self.call_log.write_text("", encoding="utf-8")
-        self.case = ScanAuthPreflight("test_a_403_is_attributed_to_the_identity_that_hit_it")
-        self.case.root = self.root
-        self.case.gh = self.gh
-        self.case.call_log = self.call_log
-
-    def tearDown(self) -> None:
-        self.temp.cleanup()
-
     def test_an_unanswerable_probe_still_reads_the_queue(self) -> None:
-        served = self.case._scan(15000, probe_refusal=self.PROVENANCE_REFUSAL)
+        served = self._scan(15000, probe_refusal=self.PROVENANCE_REFUSAL)
         self.assertEqual(served.returncode, 0, served.stderr)
         self.assertEqual(served.stdout.strip(), "1")
         self.assertIn("identity unproven", served.stderr)
         self.assertIn("cli_refused", served.stderr)
         # The refusal never reached GitHub, so it is asked once, not retried.
         self.assertEqual(
-            len([path for path in self.case._calls() if path == "rate_limit"]),
+            len([path for path in self._calls() if path == "rate_limit"]),
             1,
         )
 
     def test_an_unproven_identity_still_names_an_anonymous_403(self) -> None:
-        refused = self.case._scan(
+        refused = self._scan(
             15000,
             queue_failure=ANONYMOUS_403,
             probe_refusal=self.PROVENANCE_REFUSAL,
