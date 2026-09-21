@@ -375,19 +375,48 @@ cmd_launchd() {
   esac
 }
 
+# A drain or an immediate stop removes this host from every label it serves.
+# When no other host serves a required gate label, that takes the label to zero
+# runners and stalls every pull request waiting on it, so the mutation is
+# refused unless the caller names the consequence with --allow-last-serving-host.
+# An indeterminate answer — an unreachable runner scope, an unresolvable host
+# identity — refuses too: it cannot tell "another host is serving" apart from
+# "nobody is".
+tartci_pool_capacity_floor_preflight() {
+  local action="$1" allow="$2" output rc=0
+  local -a floor_args=(check --action "$action")
+  [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
+  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  case "$rc" in
+    0)
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+      ;;
+    127)
+      echo "pool $action refused: the capacity floor needs Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+      return 11
+      ;;
+    *)
+      printf '%s\n' "${output:-pool $action refused: the capacity floor failed without a typed cause}" >&2
+      return 11
+      ;;
+  esac
+}
+
 cmd_pool() {
   # host-level CI participation switch ("this machine, not now").
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
-  local arg
+  local arg allow_last_serving_host=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
+      --allow-last-serving-host) allow_last_serving_host=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
@@ -397,6 +426,7 @@ cmd_pool() {
       local target=1
       [ "$sub" = off ] && target=0
       if [ "$sub" = off ]; then
+        tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
         tartci_pool_write_state off
@@ -616,6 +646,7 @@ EOF
       echo "repaired orphaned pool transition lock"
       ;;
     drain)
+      tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
       tartci_pool_write_participation 0

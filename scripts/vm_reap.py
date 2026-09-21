@@ -25,6 +25,7 @@ import sys
 import time
 from typing import Any
 
+import runner_census
 from bounded_subprocess import ObservationError, require_success, run_bounded
 
 
@@ -254,31 +255,56 @@ def macos_running_count(
     return count
 
 
+def github_runner_census(
+    repo: str,
+    timeout: float = 15.0,
+    budget: ObservationBudget | None = None,
+) -> runner_census.RunnerCensus:
+    """Read every registration scope that can serve `repo`.
+
+    A repository-only listing omits organization-registered runners, so the
+    janitor would classify a registration it cannot see as absent. Both scopes
+    are read and a scope that fails is recorded as unread, never as empty.
+    """
+
+    def run_json(argv: list[str]) -> Any:
+        return (
+            budget.run_json(argv, timeout, "github_runners")
+            if budget
+            else observe_json(argv, timeout=timeout, operation="github_runners")
+        )
+
+    fetch = runner_census.cli_fetcher(github_cli(), run_json=run_json)
+    return runner_census.collect(repo, fetch)
+
+
 def github_runners(
     repo: str,
     timeout: float = 15.0,
     budget: ObservationBudget | None = None,
+    problems: list[str] | None = None,
 ) -> list[dict[str, Any]]:
-    argv = [
-        github_cli(),
-        "api",
-        f"repos/{repo}/actions/runners?per_page=100",
-        "--paginate",
-        "--slurp",
-    ]
-    data = (
-        budget.run_json(argv, timeout, "github_runners")
-        if budget
-        else observe_json(argv, timeout=timeout, operation="github_runners")
-    )
-    runners: list[dict[str, Any]] = []
-    if isinstance(data, dict):
-        runners = data.get("runners") or []
-    elif isinstance(data, list):
-        for page in data:
-            if isinstance(page, dict):
-                runners.extend(page.get("runners") or [])
-    return runners
+    """Runner rows from every scope, each carrying the endpoint that owns it.
+
+    Deletion and inspection must address a registration through its own scope,
+    so every row keeps `_endpoint`. A scope that could not be read is reported
+    through `problems` so a short list reads as partial rather than complete; a
+    census where no scope could be read is an observation failure, not an empty
+    fleet.
+    """
+    census = github_runner_census(repo, timeout, budget)
+    if census.unreachable and len(census.unreachable) == len(census.scopes):
+        raise ObservationError("github_runners", "unreadable", census.unreachable_detail())
+    if problems is not None:
+        for scope in census.unreachable:
+            problems.append(f"github_runners_scope_unreadable:{scope.scope}")
+    rows: list[dict[str, Any]] = []
+    for record in census.runners:
+        row = dict(record.raw)
+        row["_scope"] = record.scope
+        row["_endpoint"] = record.endpoint
+        rows.append(row)
+    return rows
 
 
 def delete_vm(name: str, running: bool) -> list[str]:
@@ -291,14 +317,23 @@ def delete_vm(name: str, running: bool) -> list[str]:
     return fixed
 
 
-def delete_runner(repo: str, runner_id: Any, runner_name: str) -> str:
+def delete_runner(
+    repo: str, runner_id: Any, runner_name: str, endpoint: str = ""
+) -> str:
+    """Delete one registration through the scope that owns it.
+
+    A repository URL cannot address an organization registration, so the
+    endpoint recorded on the runner row is authoritative and the repository
+    endpoint is only the fallback for a caller that has none.
+    """
+    target = endpoint or f"repos/{repo}/actions/runners"
     run(
         [
             github_cli(),
             "api",
             "-X",
             "DELETE",
-            f"repos/{repo}/actions/runners/{runner_id}",
+            f"{target}/{runner_id}",
         ],
         check=True,
     )
@@ -663,6 +698,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 args.repo,
                 args.github_timeout_secs,
                 observation_budget,
+                problems,
             )
         except ObservationError as exc:
             unreadable.append(exc.problem_code)
@@ -710,7 +746,14 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     if args.fix:
                         if action == "delete_offline_runner":
                             try:
-                                fixed.append(delete_runner(args.repo, runner.get("id"), name))
+                                fixed.append(
+                                    delete_runner(
+                                        args.repo,
+                                        runner.get("id"),
+                                        name,
+                                        str(runner.get("_endpoint") or ""),
+                                    )
+                                )
                             except Exception as exc:  # noqa: BLE001
                                 problems.append(f"fix_failed:delete_offline_runner:{name}:{exc}")
                 elif status == "offline" and busy:

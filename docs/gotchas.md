@@ -292,15 +292,25 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   ```sh
   ghapp api repos/OWNER/REPO/actions/variables \
     --jq '.variables[] | select(.name=="PULP_LOCAL_MACOS_RUNS_ON_JSON") | .value'
-  ghapp api repos/OWNER/REPO/actions/runners \
-    --jq '[.runners[] | select([.labels[].name]|index("pulp-build-vm"))]
-          | map("\(.name) busy=\(.busy)")'
+  scripts/runner_census.py --repo OWNER/REPO --label pulp-build-vm --json
   ```
 
   → *Fix:* add gate-eligible capacity, or accept the concurrency. Do **not**
   raise the merge queue's `max_entries_to_build` to compensate: extra entries
   contend for the same eligible runners and the wait simply moves from GitHub's
   queue into the host lease store.
+
+- **A runner census counts only half the fleet.** `repos/<owner>/<repo>/actions/
+  runners` lists repository-registered runners and omits organization-registered
+  ones; `orgs/<owner>/actions/runners` lists the other half. Neither endpoint
+  says the other exists, so a single-scope census answers "how many runners
+  serve this label" with a confident wrong number — measured on one live fleet
+  as 3 at repository scope while 4 more sat at organization scope.
+  → *Diagnose:* `scripts/runner_census.py --repo OWNER/REPO --label LABEL`
+  reads both and prints UNREACHABLE for a scope it could not read, because a
+  scope that went unread is not a scope that was empty.
+  → *Fix:* decide capacity from both scopes. A zero from one endpoint is the
+  dangerous reading: it looks like there is nothing to protect.
 
 - **A host's role says `dedicated-builder` but it serves no gate work.**
   Same incident: the 28-core Mac Studio (`TARTCI_AGENT_BUILD_CAP_CORES=12`,
