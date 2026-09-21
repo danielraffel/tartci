@@ -1602,6 +1602,35 @@ lanes change.
   generation. Supervisor counts are control-plane health, not the host's two-VM
   physical capacity. Use `tartci pool status --require-ready` for a nonzero gate;
   ordinary status remains observational.
+- **`serving` is a separate verdict from `fleet_ready`, and both are printed.**
+  A supervisor can be receipted, loaded, running and freshly heartbeating while
+  serving nothing at all: a lane that takes queued work and fails before a job
+  is assigned looks identical to a healthy idle one from every liveness signal.
+  `pool status` therefore prints a `serving:` line reading `ok`, `BLOCKED` or
+  `unknown`, and the JSON carries a `serving` object with the blocked lanes,
+  each lane's serve-less streak, and the phase it last reached.
+  A lane is reported blocked only when both gates trip: a streak of consecutive
+  work entries that served nothing (`--blocked-serving-streak`, default 6) and
+  elapsed time since the streak began (`--blocked-serving-seconds`, default
+  5400). The streak is the shape test, so failures interleaved with served jobs
+  never accumulate; the elapsed time is the transience test, so an upstream
+  blip cannot raise a fleet-wide alarm. A lane with no queued demand clears its
+  streak on every idle pass, so zero VMs at rest never reads as blocked.
+  A blocked lane deliberately does NOT clear `fleet_ready` and does not
+  decrement the verified supervisor count. `fleet_ready` is a host-local,
+  host-fixable question, and the dominant cause of a blocked lane is upstream
+  and hits every lane on every host at once; gating the fleet on a condition it
+  cannot fix would turn a serving outage into a control-plane outage. Use
+  `tartci pool status --require-serving` (exit 9) when you want a nonzero gate
+  on service specifically.
+- `tartci host-profile --delivery [--json]` — how code actually reaches each
+  lane on this host, read off the live plist. Reports the delivery mechanism
+  (`generation` or `sealed-bundle`), the commit in force inside the artifact
+  the plist really execs, whether that is stale relative to this checkout, and
+  whether `fleet-macos install --apply` updates the lane at all. On a sealed
+  host that command stages a generation the launcher never execs, so it is a
+  silent no-op there; the report says so per lane rather than leaving it to be
+  inferred from a hostname.
 - `tartci pool repair-lock` — recover a transition lock orphaned by power loss,
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an
