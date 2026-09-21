@@ -449,5 +449,60 @@ else:
             delete_runner.assert_not_called()
 
 
+class SupervisorServingDigestTests(unittest.TestCase):
+    """The digest every observer reads has to carry the serve-less streak.
+
+    `observe macos` and the lane reports render whatever lands here. A state
+    file can record three hours of taking work and serving none, and if the
+    digest drops the field the tools downstream can only show a fresh
+    heartbeat, which reads as health.
+    """
+
+    def run_digest(self, root: Path, *extra: str):
+        args = vm_reap.parse_args([
+            "--repo", "danielraffel/pulp", "--state-root", str(root),
+            "--prefixes", "pulp-,linux-ephr-,win-ephr-,tartci-", *extra,
+        ])
+        with mock.patch.object(vm_reap.shutil, "which", return_value="/usr/bin/tool"), \
+             mock.patch.object(vm_reap, "tart_vms", return_value=[]), \
+             mock.patch.object(vm_reap, "github_runners", return_value=[]):
+            return vm_reap.build_digest(args)
+
+    def test_the_digest_carries_the_serve_less_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            root.mkdir(parents=True)
+            (root / "lane-01.state.json").write_text(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "tart-macos", "runner": "lane-01", "vm": "",
+                "phase": "waiting", "lifecycle": "ephemeral",
+                "serving_blocked_since": "2026-09-20T00:00:00Z",
+                "serving_blocked_streak": 143,
+                "serving_blocked_last_phase": "admission-error",
+                "supervisor_pid": "101",
+            }))
+            digest, _ = self.run_digest(root)
+        supervisors = {item["runner"]: item for item in digest["supervisors"]}
+        self.assertIn("lane-01", supervisors)
+        lane = supervisors["lane-01"]
+        self.assertEqual(lane["serving_blocked_since"], "2026-09-20T00:00:00Z")
+        self.assertEqual(lane["serving_blocked_streak"], 143)
+        self.assertEqual(lane["serving_blocked_last_phase"], "admission-error")
+
+    def test_a_generation_predating_the_counter_reads_as_absent_not_zero(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "state"
+            root.mkdir(parents=True)
+            (root / "lane-02.state.json").write_text(json.dumps({
+                "ts": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "provider": "tart-macos", "runner": "lane-02", "vm": "",
+                "phase": "waiting", "lifecycle": "ephemeral",
+                "supervisor_pid": "102",
+            }))
+            digest, _ = self.run_digest(root)
+        lane = {item["runner"]: item for item in digest["supervisors"]}["lane-02"]
+        self.assertIsNone(lane["serving_blocked_streak"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
