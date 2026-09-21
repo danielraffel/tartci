@@ -1074,8 +1074,13 @@ print(json.dumps(payload))
 
         v2 = (RUNNERS[0].parent / "assignment-v2.lib.sh").read_text(encoding="utf-8")
         self.assertIn("scan_diagnostic_digest", v2)
-        self.assertNotIn("tail -n 1", v2)
-        self.assertNotIn("tail -n 3", v2)
+        # Scoped to the scanner's own error file. A file-wide ban also catches
+        # unrelated readers of other streams -- the feed rescue summarises its
+        # own stderr the same way -- which makes this fail for a line it is not
+        # about, and the contract here is only that the scan diagnostic is never
+        # captured by a tail-only rule.
+        self.assertNotIn('tail -n 1 "$error_file"', v2)
+        self.assertNotIn('tail -n 3 "$error_file"', v2)
 
     def test_macos_supervisor_passes_opt_in_minimum_queue_age(self) -> None:
         body = RUNNERS[0].read_text(encoding="utf-8")
