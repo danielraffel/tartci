@@ -272,4 +272,98 @@ set -e
 grep -q '^supervisor_signal|INT/TERM quarantine=signal_teardown_unknown' "$EVENTS"
 grep -q '^cleanup|signal_teardown_unknown' "$EVENTS"
 
+# A runner log carrying the runner's own closing line is local terminal proof.
+RUNNER_LOG="$TMP/actions-runner.log"
+write_runner_log(){
+  : >"$RUNNER_LOG"
+  printf '%s\n' "2026-09-21 22:58:32Z: Running job: macos" >>"$RUNNER_LOG"
+  [ "${1:-complete}" != complete ] || printf '%s\n' \
+    "2026-09-21 23:40:11Z: Job macos completed with result: Succeeded" >>"$RUNNER_LOG"
+}
+
+# An observation that never resolved is not evidence of a stall. A clean
+# listener exit plus the runner's own completion line is terminal proof, so the
+# job keeps its terminal receipt instead of a quarantine.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*observation=budget_exhausted.*evidence=runner_local.*result=Succeeded' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# The same failed measurement still quarantines when the listener itself exited
+# badly: a nonzero rc is not a clean completion.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*evidence=measurement_failed' "$EVENTS"
+
+# A clean exit without the runner's closing line proves nothing either.
+reset_state
+write_runner_log truncated
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=budget_exhausted.*evidence=measurement_failed' "$EVENTS"
+
+# A missing log is the same absence of proof.
+reset_state
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$TMP/no-such-runner.log"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+
+# A completed observation that saw the workflow still running outranks local
+# terminal proof. Positive stall evidence must still quarantine, or the verdict
+# above would have disarmed quarantine altogether.
+for stalled in active terminal_pending_run; do
+  reset_state
+  write_runner_log complete
+  CURRENT_JOB_CAPTURE_STATUS="$stalled"
+  CURRENT_JOB_RECEIPT="{\"kind\":\"$stalled\"}"
+  record_terminal_job_receipt 0 "$RUNNER_LOG"
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exited_workflow_active ]
+  grep -q "^job_lifecycle_quarantine|.*observation=$stalled.*evidence=github_api" "$EVENTS"
+  if grep -q '^job_terminal_receipt|' "$EVENTS"; then exit 1; fi
+done
+
+# The listener hands its own log to the receipt, so a completed job that never
+# resolved an observation finalizes as terminal end to end.
+reset_state
+write_runner_log complete
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+finalize_listener_receipt 0 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*evidence=runner_local' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# An unpinned host observes on the shipped defaults, so those defaults decide
+# whether a scan can finish at all. Discovery measures 93 to 106 seconds
+# against sixty concurrent runs; the lifecycle budget admits an attempt only
+# while it has time left, and its boundary is the shipped value.
+reset_state
+CURRENT_JOB_SCAN_SPENT=360
+unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+if capture_current_job discover; then exit 1; fi
+[ "$CURRENT_JOB_CAPTURE_STATUS" = budget_exhausted ]
+reset_state
+CURRENT_JOB_SCAN_SPENT=359
+CURRENT_JOB_CAPTURE_STATUS=probe
+capture_current_job discover || true
+[ "$CURRENT_JOB_CAPTURE_STATUS" != budget_exhausted ]
+# A per-attempt budget under the measured scan cost can only ever report a
+# failed measurement, so the shipped attempt timeout has to outlast it.
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}' "$ROOT/providers/tart-macos/runner.sh"
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}' "$ROOT/providers/tart-macos/runner.sh"
+
 printf 'current job lifecycle: ok\n'
