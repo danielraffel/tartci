@@ -15,6 +15,9 @@ deleted only when EVERY positive check passes:
   * it carries a generated-tree marker (`CMakeCache.txt`, `build.ninja`, or
     `CMakeFiles/`), so a source directory that merely has the name is skipped,
   * it carries no source marker (`.git`, `CMakeLists.txt`) of its own,
+  * nor one anywhere in the few levels below it, because the tree is removed
+    whole and a fetched dependency at `_deps/<name>-src/.git` is a real
+    checkout,
   * no live build process references its path,
   * nothing inside it has been modified inside the age gate.
 
@@ -116,6 +119,63 @@ def has_marker(path: pathlib.Path, markers: Iterable[str]) -> str | None:
         if (path / marker).exists():
             return marker
     return None
+
+
+#: How far below a candidate a source checkout is looked for. A build tree
+#: puts fetched dependencies two levels down (`_deps/<name>-src/.git`), and a
+#: developer parking a worktree inside one puts it at depth one, so a bound of
+#: four covers both with a sub-directory to spare.
+NESTED_SOURCE_MAXDEPTH = 4
+
+#: How far below a candidate the pre-delete age re-read looks. Deeper than the
+#: scan pass on purpose: the process guard only sees an ABSOLUTE path in a
+#: command line, so a build driven as `cd build && make` is invisible to it and
+#: this walk is the only thing left. The Makefiles generator writes objects at
+#: `CMakeFiles/<target>.dir/<nested/src>.o`, which a two-level walk never sees.
+RECHECK_MAXDEPTH = 4
+
+
+def nested_source_marker(
+    path: pathlib.Path, maxdepth: int = NESTED_SOURCE_MAXDEPTH,
+) -> tuple[str | None, bool]:
+    """Look for a source checkout BELOW `path`. Returns (marker path, readable).
+
+    The depth-0 marker check answers "is this directory itself a source tree".
+    It does not answer the question that actually loses work, because a build
+    tree is deleted whole: a fetched dependency at `_deps/<name>-src/.git`, or
+    a worktree someone parked inside a scratch build dir, is a real checkout
+    that no later pass can bring back. A pristine dependency is re-fetchable;
+    one carrying local edits, or one with no `.git` of its own, is not.
+
+    `readable` is the same refusal-versus-answer distinction the age scan and
+    the process scan make. A subtree we were refused could hold a checkout, so
+    "could not look" must never render as "nothing there".
+    """
+    stack: list[tuple[pathlib.Path, int]] = [(path, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth >= maxdepth:
+            continue
+        try:
+            entries = list(os.scandir(current))
+        except OSError as error:
+            if error.errno in UNMEASURABLE_ERRNOS:
+                return None, False
+            continue
+        for entry in entries:
+            child = pathlib.Path(entry.path)
+            if depth > 0 and entry.name in SOURCE_MARKERS:
+                # A linked worktree's `.git` is a regular file, and a
+                # `CMakeLists.txt` is never a directory, so this deliberately
+                # does not test the entry's type.
+                return str(child), True
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            stack.append((child, depth + 1))
+    return None, True
 
 
 def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Path]:
@@ -342,6 +402,11 @@ def classify(
     marker = has_marker(path, GENERATED_MARKERS)
     if marker is None:
         return False, "not_a_build_tree", age_days
+    nested, readable = nested_source_marker(path)
+    if not readable:
+        return False, "nested_scan_unreadable", age_days
+    if nested is not None:
+        return False, f"nested_source_tree ({nested})", age_days
     if active is None:
         return False, "process_scan_unavailable", age_days
     if active and names_candidate(active, path_spellings(path)):
@@ -542,6 +607,20 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # Every other knob widens or narrows what is examined. These two decide
+    # whether anything is examined at all: a zero age gate deletes every
+    # generated tree the scan reaches the moment it reaches it, and a
+    # non-positive depth makes `find_candidates` return nothing while still
+    # exiting 0, which is a janitor that reports success for doing nothing.
+    if args.maxdepth < 1:
+        print("disk_reclaim: --maxdepth must be at least 1", file=sys.stderr)
+        return 2
+    for name, value in (("--min-age-days", args.min_age_days),
+                        ("--pressure-min-age-days", args.pressure_min_age_days)):
+        if value <= 0:
+            print(f"disk_reclaim: {name} must be greater than zero",
+                  file=sys.stderr)
+            return 2
     # Before anything is printed: this pass appends to that file, and an
     # unbounded receipt on the volume we are protecting is the problem.
     if args.log_path:
@@ -632,10 +711,21 @@ def main(argv: list[str] | None = None) -> int:
             # line the argv guard cannot see) has touched this tree since, so
             # it no longer clears the gate. One bounded stat walk against an
             # operation that already pays for a recursive unlink.
-            recheck = newest_mtime(path)
+            recheck = newest_mtime(path, RECHECK_MAXDEPTH)
             if recheck is None or \
                     (time.time() - recheck) / 86400.0 < candidate_min_age:
                 record["reason"] = "touched_during_pass"
+                kept.append(record)
+                continue
+            # A checkout can be created inside the tree between the scan and
+            # here, and this is the last moment it can still be saved.
+            nested_now, nested_readable = nested_source_marker(path)
+            if not nested_readable:
+                record["reason"] = "nested_scan_unreadable"
+                kept.append(record)
+                continue
+            if nested_now is not None:
+                record["reason"] = f"nested_source_tree ({nested_now})"
                 kept.append(record)
                 continue
             # Forced, never rate limited: an rmtree is the longest single

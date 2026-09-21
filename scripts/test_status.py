@@ -10,6 +10,8 @@ import pathlib
 import plistlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -234,6 +236,46 @@ class StatusOutputTests(unittest.TestCase):
             _, text = self._quiet_main([])
         self.assertIn("launchd not reachable", text)
         self.assertNotIn("installed and loaded", text)
+
+
+class DiskSpaceBoundTests(unittest.TestCase):
+    """A status command must not hang on the volume it is reporting about.
+
+    Root discovery resolves paths and stats the volume each sits on, and one
+    of this fleet's roots is an external mount. Those calls have no timeout of
+    their own, so a wedged mount would block `tartci status` for as long as the
+    mount stays wedged -- during exactly the incident it is being run to
+    explain.
+    """
+
+    def test_a_wedged_volume_scan_returns_instead_of_hanging(self):
+        started = threading.Event()
+
+        def never_answers(_declared):
+            started.set()
+            time.sleep(30)
+            raise AssertionError("unreachable within the test's lifetime")
+
+        with mock.patch.object(
+                status.disk_reclaim, "parse_roots", never_answers):
+            begin = time.monotonic()
+            result = status.disk_space(timeout=0.2)
+            elapsed = time.monotonic() - begin
+        self.assertTrue(started.wait(5), "the scan never started")
+        self.assertLess(elapsed, 10, "disk_space blocked on the wedged scan")
+        self.assertIn("wedged mount", result.get("error", ""))
+
+    def test_a_volume_that_answers_is_reported_normally(self):
+        # THE CONTROL. Every assertion above is also satisfied by a
+        # disk_space() that has stopped measuring anything at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                    os.environ, {"TARTCI_RECLAIM_ROOTS": tmp}):
+                result = status.disk_space()
+        self.assertNotIn("error", result)
+        self.assertTrue(result["roots_declared"])
+        self.assertIsInstance(result["tightest_free_bytes"], int)
+        self.assertGreater(result["tightest_free_bytes"], 0)
 
 
 if __name__ == "__main__":

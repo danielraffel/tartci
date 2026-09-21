@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import platform
@@ -130,7 +131,8 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     return out
 
 
-def disk_space(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def disk_space(settings: dict[str, Any] | None = None,
+               timeout: float = 5.0) -> dict[str, Any]:
     """Free space on the volumes the reclaim janitor actually scans.
 
     Root discovery is disk_reclaim's own, not a second list, because a status
@@ -141,14 +143,32 @@ def disk_space(settings: dict[str, Any] | None = None) -> dict[str, Any]:
 
     For the same reason the installed plist's roots win over this shell's
     environment when the two disagree -- the janitor runs under the plist.
+
+    Bounded, like every other outbound call here. Root discovery resolves the
+    paths and then stats the volume each one sits on, and on this fleet one of
+    those is external. A wedged or stale mount blocks those calls in the
+    kernel with no timeout of their own, which would hang `tartci status`
+    exactly during the incident someone runs it to understand. The worker is
+    abandoned rather than joined on timeout, because a thread parked in an
+    uninterruptible stat cannot be recalled -- only stopped waiting for.
     """
     declared = (settings or {}).get("TARTCI_RECLAIM_ROOTS") \
         or os.environ.get("TARTCI_RECLAIM_ROOTS")
+
+    def measure() -> tuple[list[Any], dict[str, Any]]:
+        found = disk_reclaim.parse_roots(declared)
+        return found, disk_reclaim.volumes_free_bytes(found)
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        roots = disk_reclaim.parse_roots(declared)
-        volumes = disk_reclaim.volumes_free_bytes(roots)
+        roots, volumes = executor.submit(measure).result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return {"error": f"volume scan did not answer within {timeout}s; "
+                         "a scan root may be on a wedged mount"}
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)}
+    finally:
+        executor.shutdown(wait=False)
     return {
         "roots": [str(root) for root in roots],
         "roots_declared": bool(declared),

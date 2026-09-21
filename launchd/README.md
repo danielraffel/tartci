@@ -330,11 +330,14 @@ skipped run. An absent, zero, negative, or non-integer `StartInterval` yields no
 bound rather than a zero one, because a zero would collapse the threshold and
 make every agent read as wedged.
 
-A reload is also refused outright for an interval agent that is currently
-`running`. Such an agent is running its one job, not serving a loop that can be
-interrupted anywhere: the reclaimer is mid-`rmtree`, and booting it out there
-leaves a half-deleted tree no later pass can classify. The watchdog logs the
-refusal and lets the next interval start it cleanly.
+A reload is also refused outright for a `running` agent named in
+`UNINTERRUPTIBLE_AGENTS`. Such an agent is running one job that cannot be cut
+anywhere: the reclaimer is mid-`rmtree`, and booting it out there leaves a
+half-deleted tree no later pass can classify. The watchdog logs the refusal and
+lets the next interval start it cleanly. Membership is declared rather than
+inferred from the plist carrying a `StartInterval`, because every supervisor
+tick on these hosts is an interval agent too and those are safe to cut -
+inferring it would retire the alive-but-frozen heal for all of them.
 
 Not every nonzero exit is a wedge. Some agents exit with a code that reports an
 application condition: the program ran to completion and is naming something a
@@ -652,7 +655,13 @@ number names the same pattern on m3, m5 and m1, while a nest list rots the next
 time a worktree root moves.
 
 Scanning deeper does not weaken the guards, since the marker, source-marker,
-live-process and age tests are all depth independent. Measured on m3's Workshop
+live-process and age tests are all depth independent. A build tree is removed
+whole, so the source-marker test is asked twice: once about the directory
+itself, and once about everything up to four levels below it. A build tree that
+fetched its dependencies holds real checkouts at `_deps/<name>-src/.git`, and
+one carrying local edits - or one with no `.git` of its own - does not come
+back. A subtree that cannot be read counts as a possible checkout, not as an
+absent one, so the tree is kept. Measured on m3's Workshop
 root, depth 5 exposes 94 build-named directories that depth 3 never saw, and 88
 of them are refused for carrying no generated-tree marker: that is precisely
 what `external/skia-build/build`, cargo `target/debug/build`, and

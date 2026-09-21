@@ -100,6 +100,16 @@ DEFAULT_RESTART_GRACE_S = 60
 # buries the condition it was reporting. Everything NOT listed here stays on
 # the wedge path on purpose - 126/127 (not executable, not found) and
 # signal-derived exits are exactly the no-Full-Disk-Access wedge class.
+# Labels whose single run cannot be interrupted at an arbitrary point. A
+# bootout mid-run leaves state no later pass can classify: the reclaimer is
+# mid-rmtree, so the tree it was removing is left half-deleted. Membership is
+# declared rather than inferred from the plist carrying a StartInterval,
+# because every supervisor tick on this host is also an interval agent and
+# those ARE safe to cut - inferring it would silently retire the
+# alive-but-frozen heal for all of them, which is the watchdog's main job.
+UNINTERRUPTIBLE_AGENTS: frozenset[str] = frozenset({
+    "com.danielraffel.tartci.reclaim",
+})
 APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
     "com.danielraffel.tartci.reclaim": {
         2: "unusable scan root or bad arguments",
@@ -638,12 +648,9 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
     )
     if loaded_rc == 0:
         state, _ = parse_launchctl_print(loaded_out)
-        if state == "running" and _start_interval_from_plist(plist_path) is not None:
-            # An interval agent that is running is running its ONE job, not
-            # serving a loop that can be interrupted anywhere. The reclaimer is
-            # mid-rmtree; booting it out there leaves a half-deleted tree that
-            # no later pass can classify. Refuse loudly and let the next
-            # interval start it cleanly.
+        if state == "running" and label in UNINTERRUPTIBLE_AGENTS:
+            # This agent's run cannot be cut anywhere. Refuse loudly and let
+            # the next interval start it cleanly.
             return False
         exit_timeout = parse_launchctl_exit_timeout(loaded_out)
         if exit_timeout is None or exit_timeout == 0:

@@ -658,8 +658,12 @@ with tempfile.TemporaryDirectory() as td:
     check(label_control.verdict == "wedged",
           f"control: exit 3 from another label is still a wedge, got {label_control}")
 
-# A running interval agent is running its ONE job. bootout lands mid-rmtree and
-# leaves a half-deleted tree no later pass can classify.
+# A running agent declared uninterruptible must not be cut: bootout lands
+# mid-rmtree and leaves a half-deleted tree no later pass can classify. The
+# controls pin the refusal to the DECLARATION, not to the plist shape -- every
+# supervisor tick on this host is an interval agent too, and inferring the
+# refusal from the interval would retire the alive-but-frozen heal for all of
+# them without a single test going red.
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     log = root / "reclaim.log"
@@ -667,6 +671,11 @@ with tempfile.TemporaryDirectory() as td:
     hourly = _agent_plist(root, "com.danielraffel.tartci.reclaim", log,
                           interval=3600)
     plain = _agent_plist(root, "com.danielraffel.tartci.orchard-worker", log)
+    # Same plist SHAPE as the reclaimer -- an hourly interval agent -- but not
+    # declared uninterruptible. This is the control that fails if the refusal
+    # is ever re-derived from the StartInterval.
+    ticker = _agent_plist(root, "com.danielraffel.tartci.queue-tick", log,
+                          interval=3600)
 
     def _reloader(state: str):
         seen: list[list[str]] = []
@@ -692,21 +701,29 @@ with tempfile.TemporaryDirectory() as td:
     try:
         wd._run, calls_running = _reloader("running")
         refused = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
-        # Control 1: the same running state with no declared interval reloads.
+        # Control 1: the same running state, no declared interval, reloads.
         wd._run, calls_plain = _reloader("running")
         plain_ok = wd.reload_agent("com.danielraffel.tartci.orchard-worker",
                                    str(plain))
+        # Control 1b: a running agent with the SAME hourly interval that is not
+        # declared uninterruptible still heals.
+        wd._run, calls_tick = _reloader("running")
+        tick_ok = wd.reload_agent("com.danielraffel.tartci.queue-tick",
+                                  str(ticker))
         # Control 2: the same interval agent NOT running is reloaded, so the
         # refusal above is the running state and not the plist.
         wd._run, calls_idle = _reloader("not running")
         idle_ok = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
     finally:
         wd._run = original_run
-    check(not refused, "a running interval agent must refuse reload")
+    check(not refused, "a running uninterruptible agent must refuse reload")
     check(not any(c[1] == "bootout" for c in calls_running),
           "the refusal must happen before bootout, not after")
     check(plain_ok and any(c[1] == "bootout" for c in calls_plain),
           "control: a running agent with no interval still reloads")
+    check(tick_ok and any(c[1] == "bootout" for c in calls_tick),
+          "control: a running interval agent that is NOT declared "
+          "uninterruptible still heals")
     check(idle_ok and any(c[1] == "bootout" for c in calls_idle),
           "control: an idle interval agent still reloads")
 

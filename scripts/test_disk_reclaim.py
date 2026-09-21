@@ -360,6 +360,77 @@ class ClassifyTests(unittest.TestCase):
         delete, reason, _ = self.classify(control)
         self.assertTrue(delete, reason)
 
+    def test_a_fetched_dependency_checkout_stops_the_delete(self):
+        """A build tree is deleted whole, so what is INSIDE it is at stake.
+
+        The depth-0 marker check answers "is this directory a source tree" and
+        cannot answer this: a build tree that fetched its dependencies holds
+        real checkouts at `_deps/<name>-src/.git`, and a dependency carrying
+        local edits, or one with no `.git` of its own, does not come back.
+        """
+        for depth, parts in enumerate((
+            ("mywork",),                       # a worktree parked inside
+            ("_deps", "dawn-src"),             # the FetchContent shape
+            ("_deps", "dawn-src", "third"),    # one level deeper again
+        )):
+            with self.subTest(parts=parts):
+                path = make_build_tree(self.root / f"d{depth}" / "build",
+                                       age_days=400)
+                nested = path.joinpath(*parts)
+                nested.mkdir(parents=True)
+                (nested / "CMakeLists.txt").write_text("project(dep)")
+                (nested / ".git").write_text("gitdir: elsewhere")
+                age(path, 400)
+                delete, reason, _ = self.classify(path)
+                self.assertFalse(delete, reason)
+                self.assertTrue(reason.startswith("nested_source_tree"), reason)
+        # Control. Every refusal above is also satisfied by a classifier that
+        # has stopped deleting anything at all, so the same tree carrying the
+        # same nested directory WITHOUT a source marker must still be taken.
+        control = make_build_tree(self.root / "control" / "build",
+                                  age_days=400)
+        plain = control / "_deps" / "dawn-src"
+        plain.mkdir(parents=True)
+        (plain / "dawn.cpp").write_text("int main(){}")
+        age(control, 400)
+        delete, reason, _ = self.classify(control)
+        self.assertTrue(delete, reason)
+
+    def test_a_nested_scan_that_was_refused_is_not_an_absence(self):
+        # Same refusal-versus-answer rule the age and process scans follow. A
+        # subtree we could not read could hold a checkout.
+        path = make_build_tree(self.root / "locked" / "build", age_days=400)
+        (path / "_deps").mkdir()
+        (path / "_deps" / "dep-src").mkdir()
+        age(path, 400)
+        real_scandir = dr.os.scandir
+
+        def refusing(target):
+            # Refused at depth two, which the age scan's shallower walk never
+            # enters. Refusing higher would make `newest_mtime` answer
+            # "unmeasured" first and this test would never reach the scan it
+            # names -- which is how it was first written, and how it failed.
+            if str(target).endswith("dep-src"):
+                raise PermissionError(errno.EACCES, "refused", str(target))
+            return real_scandir(target)
+
+        with unittest.mock.patch.object(dr.os, "scandir", refusing):
+            delete, reason, _ = self.classify(path)
+        self.assertFalse(delete)
+        self.assertEqual(reason, "nested_scan_unreadable")
+        # Control: the identical tree, readable, is taken.
+        delete, reason, _ = self.classify(path)
+        self.assertTrue(delete, reason)
+
+    def test_the_nested_scan_does_not_mistake_the_tree_for_its_own_content(self):
+        # The candidate's OWN markers are guard-0's job. If this scan counted
+        # them the generated-marker path would never delete anything, and the
+        # control in every test above would be the thing that broke.
+        path = make_build_tree(self.root / "plain" / "build", age_days=400)
+        found, readable = dr.nested_source_marker(path)
+        self.assertTrue(readable)
+        self.assertIsNone(found)
+
     def test_live_build_command_line_protects_the_tree(self):
         path = make_build_tree(self.root / "wt" / "build", age_days=400)
         cmdline = f"66665 cmake --build {path} --target all\n"
@@ -675,6 +746,37 @@ class FailClosedTests(unittest.TestCase):
         self.assertEqual(code_ctl, 0)
         self.assertTrue(report_ctl["process_scan_ok"])
         self.assertEqual(len(report_ctl["deleted"]), 1)
+        self.assertFalse(stale.is_dir())
+
+    def test_a_zero_age_gate_is_refused_rather_than_obeyed(self):
+        """The two knobs that decide whether anything is examined at all.
+
+        A zero age gate deletes every generated tree the scan reaches the
+        moment it reaches it, and a depth below one makes the scan return
+        nothing while still exiting 0 - a janitor reporting success for having
+        looked nowhere. Both are refusals, not defaults to clamp, because a
+        clamped value would run a pass the operator did not ask for.
+        """
+        stale = make_build_tree(self.root / "wt" / "build", age_days=400)
+        for argv in (("--min-age-days", "0"),
+                     ("--min-age-days", "-1"),
+                     ("--pressure-min-age-days", "0"),
+                     ("--maxdepth", "0")):
+            with self.subTest(argv=argv):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = dr.main(["--roots", str(self.root), "--json",
+                                    "--fix", *argv])
+                self.assertEqual(code, 2)
+                self.assertEqual(buffer.getvalue(), "",
+                                 "a refused run must not emit a report")
+                self.assertTrue(stale.is_dir(), argv)
+        # Control: the same --fix run with both knobs positive does delete,
+        # so the refusals above are the flags and not the fixture.
+        code, report = self.run_json("--fix", "--min-age-days", "7",
+                                     "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(report["deleted"]), 1)
         self.assertFalse(stale.is_dir())
 
     def test_unknown_free_space_selects_the_longer_age_gate(self):
