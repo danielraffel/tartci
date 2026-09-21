@@ -503,6 +503,77 @@ class SupervisorServingDigestTests(unittest.TestCase):
         lane = {item["runner"]: item for item in digest["supervisors"]}["lane-02"]
         self.assertIsNone(lane["serving_blocked_streak"])
 
+class RunnerCensusScopeTests(unittest.TestCase):
+    """The janitor reads both registration scopes, never one."""
+
+    def payload(self, rows):
+        return mock.Mock(returncode=0, stdout=json.dumps([{"runners": rows}]), stderr="")
+
+    def test_both_scopes_are_read_and_rows_carry_their_endpoint(self) -> None:
+        repo_row = {"id": 1, "name": "studio-pulp-gate-01", "status": "online"}
+        org_row = {"id": 2, "name": "pulp-intel-macmini", "status": "online"}
+        responses = {
+            "repos/danielraffel/pulp/actions/runners?per_page=100": self.payload([repo_row]),
+            "orgs/danielraffel/actions/runners?per_page=100": self.payload([org_row]),
+        }
+        seen = []
+
+        def fake_run_bounded(argv, **kwargs):
+            seen.append(argv[2])
+            return responses[argv[2]]
+
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", side_effect=fake_run_bounded):
+            rows = vm_reap.github_runners("danielraffel/pulp")
+
+        self.assertEqual(len(seen), 2)
+        names = [row["name"] for row in rows]
+        self.assertIn("pulp-intel-macmini", names)
+        by_name = {row["name"]: row for row in rows}
+        self.assertEqual(
+            by_name["studio-pulp-gate-01"]["_endpoint"],
+            "repos/danielraffel/pulp/actions/runners",
+        )
+        self.assertEqual(
+            by_name["pulp-intel-macmini"]["_endpoint"], "orgs/danielraffel/actions/runners"
+        )
+
+    def test_one_unreadable_scope_is_reported_not_silently_empty(self) -> None:
+        good = self.payload([{"id": 1, "name": "studio-pulp-gate-01", "status": "online"}])
+
+        def fake_run_bounded(argv, **kwargs):
+            if argv[2].startswith("orgs/"):
+                return mock.Mock(returncode=1, stdout="", stderr="HTTP 403")
+            return good
+
+        problems: list[str] = []
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", side_effect=fake_run_bounded):
+            rows = vm_reap.github_runners("danielraffel/pulp", problems=problems)
+
+        self.assertEqual([row["name"] for row in rows], ["studio-pulp-gate-01"])
+        self.assertEqual(problems, ["github_runners_scope_unreadable:organization"])
+
+    def test_every_scope_unreadable_is_an_observation_failure(self) -> None:
+        failure = mock.Mock(returncode=1, stdout="", stderr="HTTP 403")
+
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run_bounded", return_value=failure):
+            with self.assertRaises(ObservationError):
+                vm_reap.github_runners("danielraffel/pulp")
+
+    def test_delete_addresses_a_runner_through_its_own_scope(self) -> None:
+        response = mock.Mock(returncode=0, stdout="{}", stderr="")
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": "ghapp"}), \
+             mock.patch.object(vm_reap, "run", return_value=response) as mutate_run:
+            vm_reap.delete_runner(
+                "danielraffel/pulp", 2, "pulp-intel-macmini", "orgs/danielraffel/actions/runners"
+            )
+
+        self.assertEqual(
+            mutate_run.call_args.args[0][-1], "orgs/danielraffel/actions/runners/2"
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
