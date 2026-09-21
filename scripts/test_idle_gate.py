@@ -132,6 +132,7 @@ esac
         # merge group that can arrive later.
         stub = """#!/usr/bin/env bash
 case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":15000,"remaining":14999}}}' ;;
   *actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
   *actions/workflows/99/runs*status=pending*) printf '%s\n' '{"workflow_runs":[]}' ;;
   *actions/workflows/99/runs*status=queued*) printf '%s\n' '{"workflow_runs":[{"id":101,"name":"Build and Test","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z"}]}' ;;

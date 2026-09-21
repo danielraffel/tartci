@@ -588,6 +588,8 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
         scanner.args = Namespace(max_workers=3)
         scanner._observation_lock = lambda: contextlib.nullcontext()
+        # This test is about worker parallelism; identity is proven elsewhere.
+        scanner._preflight_identity = lambda: None
         scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
         # This scanner is built with __new__, so it carries none of __init__'s
         # state. No stubbed run reports a witness, which is what keeps this an
@@ -663,6 +665,9 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
 
     _HANGING_JOBS_GH = """#!/usr/bin/env python3
 import json, sys, time
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); q = parse_qs(p.query)
 if p.path.endswith('/actions/workflows'):
@@ -807,6 +812,9 @@ else:
                 gh,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1])
 if p.path.endswith('/actions/workflows'):
@@ -880,6 +888,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); q = parse_qs(p.query); page = int(q.get('page', ['1'])[0]); status = q.get('status', [''])[0]
 if p.path.endswith('/actions/workflows'):
@@ -914,6 +925,9 @@ else: raise SystemExit(4)
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 if '/actions/workflows?' in sys.argv[-1]:
     print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
 else:
@@ -939,6 +953,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 if '/actions/workflows?' in sys.argv[-1]:
     print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
 else:
@@ -961,7 +978,11 @@ else:
             fake = Path(directory) / "fake-gh"
             _write_exec(
                 fake,
-                "#!/usr/bin/env python3\nimport json\n"
+                "#!/usr/bin/env python3\nimport json, sys\n"
+                "if sys.argv[-1] == 'rate_limit':\n"
+                "    print(json.dumps({'resources': {'core': "
+                "{'limit': 15000, 'remaining': 14999}}}))\n"
+                "    raise SystemExit(0)\n"
                 "print(json.dumps({'total_count': 2, 'workflows': "
                 "[{'id': 1, 'name': 'Build and Test'}, {'id': 2, 'name': 'Build and Test'}]}))\n",
             )
@@ -983,6 +1004,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); page = int(parse_qs(p.query).get('page', ['1'])[0])
 if p.path.endswith('/actions/workflows'):
@@ -1025,6 +1049,9 @@ class AssignmentScannerTransientFaultTests(unittest.TestCase):
     #: actually re-issued the failed call rather than skipping it.
     _GH = '''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 
 FAIL_ON = os.environ["FAKE_GH_FAIL_ON"]
@@ -1178,6 +1205,9 @@ class AssignmentScannerWitnessTests(unittest.TestCase):
 
     _GH = '''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 
 LEDGER = os.environ["FAKE_GH_LEDGER"]
