@@ -25,6 +25,7 @@ from gh_identity import (
     GitHubIdentity,
     classify_failure,
     forget_identity,
+    remember_unproven,
     resolve_identity,
 )
 
@@ -151,9 +152,32 @@ class QueueScanner:
         one address. The scan that follows then fails closed for a reason
         nothing records. The ceiling is read from `rate_limit`, which costs no
         quota and answers even when the allowance is spent.
+
+        A ceiling that proves anonymity stops the scan. A probe the CLI will
+        not answer does not: `ghapp` refuses an endpoint carrying no repository
+        (the fleet's lanes run from a directory that is not a checkout), and
+        blinding every lane over that would be the outage this exists to
+        prevent. The identity is then carried as unproven, and an anonymous
+        403 is still named from GitHub's own wording.
         """
-        self.identity = resolve_identity(
-            lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+        try:
+            self.identity = resolve_identity(
+                lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+            )
+            return
+        except AuthPreflightError as error:
+            if error.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(error)
+        except (OSError, RuntimeError, ValueError) as error:
+            reason = classify_failure(str(error), None)
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(reason)
+        self.identity = remember_unproven(self.args.gh_cli)
+        print(
+            f"queue scan identity unproven, reading the queue anyway: {detail}",
+            file=os.sys.stderr,
         )
 
     def _gh(self, path: str) -> dict[str, Any]:

@@ -50,6 +50,10 @@ with open(os.environ["CALL_LOG"], "a", encoding="utf-8") as handle:
     handle.write(path + "\n")
 
 ceiling = int(os.environ["CORE_LIMIT"])
+refusal = os.environ.get("PROBE_REFUSAL", "")
+if path == "rate_limit" and refusal:
+    print(refusal, file=sys.stderr)
+    raise SystemExit(1)
 if path == "rate_limit":
     print(json.dumps({"resources": {"core": {
         "limit": ceiling, "remaining": int(os.environ.get("CORE_REMAINING", "0")),
@@ -100,7 +104,12 @@ class ScanAuthPreflight(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def _env(self, core_limit: int, queue_failure: str = "") -> dict[str, str]:
+    def _env(
+        self,
+        core_limit: int,
+        queue_failure: str = "",
+        probe_refusal: str = "",
+    ) -> dict[str, str]:
         base = [
             directory
             for directory in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
@@ -113,9 +122,15 @@ class ScanAuthPreflight(unittest.TestCase):
             "CORE_LIMIT": str(core_limit),
             "CORE_REMAINING": "0",
             "QUEUE_FAILURE": queue_failure,
+            "PROBE_REFUSAL": probe_refusal,
         }
 
-    def _scan(self, core_limit: int, queue_failure: str = "") -> subprocess.CompletedProcess:
+    def _scan(
+        self,
+        core_limit: int,
+        queue_failure: str = "",
+        probe_refusal: str = "",
+    ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [
                 sys.executable, str(SCANNER),
@@ -127,7 +142,7 @@ class ScanAuthPreflight(unittest.TestCase):
                 "--observation-lock-file", str(self.root / "observation.lock"),
             ],
             capture_output=True, text=True, check=False,
-            env=self._env(core_limit, queue_failure),
+            env=self._env(core_limit, queue_failure, probe_refusal),
         )
 
     def _calls(self) -> list[str]:
@@ -194,6 +209,59 @@ class ScanAuthPreflight(unittest.TestCase):
             "a transient fault is still retried; only the authentication "
             "fault stops on the first attempt",
         )
+
+
+class ProbeRefusalDoesNotBlindALane(unittest.TestCase):
+    """A CLI that will not answer the probe is not proof of anything.
+
+    `ghapp` serves a path carrying a repository but refuses `rate_limit`
+    unless it can derive provenance, and the fleet's lanes run from a home
+    directory rather than a checkout. Reading that refusal as a failed
+    preflight would blind every lane on the fleet -- the exact outage the
+    preflight exists to prevent -- so it is carried as an unproven identity
+    and the queue is still read.
+    """
+
+    # What the fleet's wrapper actually prints for an endpoint with no repo.
+    PROVENANCE_REFUSAL = (
+        "ghapp: exact repository provenance is required; use --repo OWNER/REPO"
+    )
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.gh = self.root / "fake-gh"
+        _write_exec(self.gh, FAKE_GH)
+        self.call_log = self.root / "calls"
+        self.call_log.write_text("", encoding="utf-8")
+        self.case = ScanAuthPreflight("test_a_403_is_attributed_to_the_identity_that_hit_it")
+        self.case.root = self.root
+        self.case.gh = self.gh
+        self.case.call_log = self.call_log
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_an_unanswerable_probe_still_reads_the_queue(self) -> None:
+        served = self.case._scan(15000, probe_refusal=self.PROVENANCE_REFUSAL)
+        self.assertEqual(served.returncode, 0, served.stderr)
+        self.assertEqual(served.stdout.strip(), "1")
+        self.assertIn("identity unproven", served.stderr)
+        self.assertIn("cli_refused", served.stderr)
+        # The refusal never reached GitHub, so it is asked once, not retried.
+        self.assertEqual(
+            len([path for path in self.case._calls() if path == "rate_limit"]),
+            1,
+        )
+
+    def test_an_unproven_identity_still_names_an_anonymous_403(self) -> None:
+        refused = self.case._scan(
+            15000,
+            queue_failure=ANONYMOUS_403,
+            probe_refusal=self.PROVENANCE_REFUSAL,
+        )
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("no_valid_credentials", refused.stderr)
 
 
 class ReasonReachesTheSupervisor(unittest.TestCase):

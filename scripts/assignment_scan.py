@@ -33,12 +33,14 @@ from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
 from gh_identity import (
+    CLI_REFUSED,
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
     GitHubIdentity,
     ScanFailure,
     classify_failure,
     forget_identity,
+    remember_unproven,
     resolve_identity,
 )
 
@@ -184,6 +186,10 @@ class AssignmentScanner:
                 # from the 60/hour allowance every host behind this IP shares.
                 forget_identity()
                 raise ScanError(str(reason))
+            if reason.reason_code == CLI_REFUSED:
+                # The request never reached GitHub, so another attempt only
+                # collects the same local refusal.
+                raise ScanError(str(reason))
             raise TransientApiFault(str(reason))
         try:
             payload = json.loads(result.stdout)
@@ -203,9 +209,32 @@ class AssignmentScanner:
         one address. The scan that follows then fails closed for a reason
         nothing records. The ceiling is read from `rate_limit`, which costs no
         quota and answers even when the allowance is spent.
+
+        A ceiling that proves anonymity stops the scan. A probe the CLI will
+        not answer does not: `ghapp` refuses an endpoint carrying no repository
+        (the fleet's lanes run from a directory that is not a checkout), and
+        blinding every lane over that would be the outage this exists to
+        prevent. The identity is then carried as unproven, and an anonymous
+        403 is still named from GitHub's own wording.
         """
-        self.identity = resolve_identity(
-            lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+        try:
+            self.identity = resolve_identity(
+                lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+            )
+            return
+        except AuthPreflightError as error:
+            if error.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(error)
+        except ScanError as error:
+            reason = self._reason(str(error))
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                raise ScanError(str(reason)) from error
+            detail = str(reason)
+        self.identity = remember_unproven(self.args.gh_cli)
+        print(
+            f"assignment scan identity unproven, reading the queue anyway: {detail}",
+            file=sys.stderr,
         )
 
     def _reason(self, text: str) -> ScanFailure:

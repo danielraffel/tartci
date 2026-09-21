@@ -41,6 +41,11 @@ ANONYMOUS = "anonymous"
 USER = "user"
 APP_INSTALLATION = "app-installation"
 AUTHENTICATED = "authenticated"
+# A CLI that will not answer the probe leaves the identity unproven. That
+# is not the same as proving it anonymous, and it must not be treated as
+# either: blinding a lane because a wrapper declined to answer would cost
+# exactly the outage this preflight exists to prevent.
+UNPROVEN = "unproven"
 
 NO_VALID_CREDENTIALS = "no_valid_credentials"
 RATE_LIMITED = "rate_limited"
@@ -49,6 +54,7 @@ TIMEOUT = "timeout"
 LOCK_CONTENTION = "lock_contention"
 PAGINATION = "pagination"
 BUDGET_EXHAUSTED = "budget_exhausted"
+CLI_REFUSED = "cli_refused"
 API_ERROR = "api_error"
 
 REASON_CODES = (
@@ -59,6 +65,7 @@ REASON_CODES = (
     LOCK_CONTENTION,
     PAGINATION,
     BUDGET_EXHAUSTED,
+    CLI_REFUSED,
     API_ERROR,
 )
 
@@ -79,6 +86,16 @@ _BAD_CREDENTIAL_MARKERS = (
 )
 _TIMEOUT_MARKERS = ("timed out", "timeout", ":timeout:")
 _LOCK_MARKERS = ("observation lock", "lock timed out", "lock contention")
+# A wrapped CLI can decline a request without ever reaching GitHub. That is a
+# statement about the wrapper, never about the queue or the credential, so it
+# is never retried and never read as evidence either way.
+_CLI_REFUSAL_MARKERS = (
+    "repository provenance is required",
+    "outside privileged grammar",
+    "unknown command",
+    "unrecognized arguments",
+    "no such subcommand",
+)
 _PAGINATION_MARKERS = (
     "pagination",
     "total_count",
@@ -111,7 +128,11 @@ class GitHubIdentity:
 
     @property
     def authenticated(self) -> bool:
-        return self.kind != ANONYMOUS
+        return self.kind not in (ANONYMOUS, UNPROVEN)
+
+    @property
+    def proven(self) -> bool:
+        return self.kind != UNPROVEN
 
     def describe(self) -> str:
         limit = "unknown" if self.core_limit is None else f"{self.core_limit}/hour"
@@ -184,11 +205,29 @@ def identity_from_rate_limit(
     )
 
 
+def unproven_identity(
+    detail: str = "", env: Mapping[str, str] | None = None
+) -> GitHubIdentity:
+    """An identity the caller could not measure, and must not assume."""
+
+    return GitHubIdentity(
+        kind=UNPROVEN,
+        core_limit=None,
+        core_remaining=None,
+        token_source=token_source(env),
+    )
+
+
 def require_authenticated(identity: GitHubIdentity) -> GitHubIdentity:
     """Admit an authenticated identity; refuse an anonymous one by name."""
 
     if identity.authenticated:
         return identity
+    if not identity.proven:
+        raise AuthPreflightError(
+            IDENTITY_PREFLIGHT_UNAVAILABLE,
+            "the effective identity could not be measured",
+        )
     raise AuthPreflightError(
         NO_VALID_CREDENTIALS,
         "gh is unauthenticated; requests would fall back to anonymous "
@@ -241,6 +280,7 @@ def _read_receipt(
         USER,
         APP_INSTALLATION,
         AUTHENTICATED,
+        UNPROVEN,
     ):
         return None
     age = time.time() - float(stamped)
@@ -309,7 +349,7 @@ def resolve_identity(
     path = _receipt_path(env)
     ttl = _receipt_ttl(env)
     cached = _read_receipt(path, gh_cli, source, ttl)
-    if cached is not None and cached.authenticated:
+    if cached is not None and (cached.authenticated or not cached.proven):
         return cached
     identity = identity_from_rate_limit(fetch(), source=source)
     # Only an admitted identity is remembered. Nothing may stay behind that
@@ -317,6 +357,23 @@ def resolve_identity(
     require_authenticated(identity)
     if ttl > 0:
         _write_receipt(path, gh_cli, identity)
+    return identity
+
+
+def remember_unproven(
+    gh_cli: str = "gh", env: Mapping[str, str] | None = None
+) -> GitHubIdentity:
+    """Record that the identity could not be measured, for a bounded window.
+
+    Without this the same unanswerable probe is attempted every poll, and the
+    same notice is written every poll. Remembering the outcome asks once per
+    window instead, and says so once.
+    """
+
+    identity = unproven_identity(env=env)
+    ttl = _receipt_ttl(env)
+    if ttl > 0:
+        _write_receipt(_receipt_path(env), gh_cli, identity)
     return identity
 
 
@@ -395,6 +452,12 @@ def classify_failure(
         return ScanFailure(
             NO_VALID_CREDENTIALS,
             f"GitHub rejected the credential{described}: {_excerpt(message)}",
+        )
+    if _matches(message, _CLI_REFUSAL_MARKERS):
+        return ScanFailure(
+            CLI_REFUSED,
+            f"the configured CLI declined the request before reaching GitHub: "
+            f"{_excerpt(message)}",
         )
     if "budget exhausted" in message.lower():
         return ScanFailure(
