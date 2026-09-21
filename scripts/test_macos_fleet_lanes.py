@@ -644,7 +644,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertEqual(data["host"]["tart_home"], expected[host_id][0])
                 self.assertEqual(
                     data["host"].get("github_api_timeout_seconds"),
-                    30 if host_id == "m1" else None,
+                    30,
+                    f"{host_id}: every fleet host pins the GitHub API timeout at 30s. "
+                    "The 15s default was the dominant assignment-scan failure on the "
+                    "hosts that had not pinned it (m3 88%, m5 81%, measured 2026-09-21).",
                 )
                 self.assertEqual(
                     data["host"].get("persistent_runner_labels", []),
@@ -751,7 +754,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertTrue(all(
                         value["EnvironmentVariables"].get("TARTCI_GH_TIMEOUT_SECS")
-                        == ("30" if host_id == "m1" else None)
+                        == "30"
                         for value in values
                     ))
                     self.assertTrue(all(
@@ -2321,6 +2324,44 @@ class ServingBlockedTests(unittest.TestCase):
             blocked_serving_seconds=300, blocked_serving_streak=2,
         )
         self.assertTrue(self._blocked(value))
+
+
+class ShippedProfileGitHubTimeoutTests(unittest.TestCase):
+    """Every production macOS fleet profile must pin the GitHub API timeout.
+
+    The generic default is 15s. Measured 2026-09-21, a single GitHub call
+    exceeding that default was the dominant assignment-scan failure on the
+    hosts that had not pinned it: m3 184/209 (88%), m5 213/263 (81%). m1,
+    which pinned 30, showed the inverse split. The calls are not slow in
+    isolation; they exceed 15s under concurrent supervisors. Dropping the key
+    silently reverts a host to 15s, so pin it here rather than rely on review.
+    """
+
+    def _fleet_profiles(self):
+        paths = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertTrue(paths, "no *-macos-fleet.toml profiles found: the glob is wrong")
+        return paths
+
+    def test_every_fleet_profile_pins_the_github_api_timeout(self) -> None:
+        missing = []
+        for path in self._fleet_profiles():
+            with path.open("rb") as handle:
+                data = tomllib.load(handle)
+            if "github_api_timeout_seconds" not in data.get("host", {}):
+                missing.append(path.name)
+        self.assertEqual(
+            missing, [],
+            "these fleet profiles do not pin host.github_api_timeout_seconds and "
+            "so silently fall back to the 15s default: " + ", ".join(missing),
+        )
+
+    def test_the_pinned_timeout_is_within_the_validated_range(self) -> None:
+        for path in self._fleet_profiles():
+            with path.open("rb") as handle:
+                value = tomllib.load(handle)["host"]["github_api_timeout_seconds"]
+            self.assertIsInstance(value, int, f"{path.name}: must be an integer")
+            self.assertGreaterEqual(value, 5, f"{path.name}: below the validated floor")
+            self.assertLessEqual(value, 60, f"{path.name}: above the validated ceiling")
 
 
 if __name__ == "__main__":

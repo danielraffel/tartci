@@ -7,6 +7,11 @@ home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
+# Measured 2026-09-21: of 263 assignment-scan failures on this host in 24h,
+# 213 (81%) were a single GitHub call exceeding the generic 15-second default,
+# against 28 lock timeouts. Same shape as m3. The calls are not slow in
+# isolation; they exceed 15s under concurrent supervisors.
+github_api_timeout_seconds = 30
 persistent_runner_labels = [
   "actions.runner.danielraffel-pulp.pulp-preamble-m5",
 ]
