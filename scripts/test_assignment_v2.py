@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import socket
 import stat
 import subprocess
 import tempfile
@@ -228,6 +229,146 @@ class AssignmentV2Tests(unittest.TestCase):
         self.state.write_text(json.dumps({"merge": True, "pr": True}), encoding="utf-8")
         denied = self._runner("--print-pre-mint-selection", "1")
         self.assertEqual(denied.stdout.strip(), "0", denied.stderr)
+
+    # --- Shipyard push-feed rescue --------------------------------------
+
+    def _feed_daemon(self, *, registered: bool = True, jobs=(), fresh: bool = True):
+        """A Unix-socket stand-in for the local Shipyard daemon."""
+        sock_path = self.root / "daemon.sock"
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(sock_path))
+        server.listen(8)
+        stop = threading.Event()
+        status = {
+            "type": "status",
+            "registered_repos": ["generous-corp/pulp"] if registered else [],
+            "configured_repos": ["generous-corp/pulp"],
+            "last_event_at": time.time() if fresh else time.time() - 99999,
+            "subscribers": 0,
+            "last_error": None,
+        }
+
+        def client(conn):
+            try:
+                conn.settimeout(2.0)
+                conn.sendall(
+                    json.dumps({"protocol": 3, "type": "hello"}).encode() + b"\n"
+                )
+                kind = json.loads(conn.makefile("rb").readline() or b"{}").get("type")
+                if kind == "status":
+                    conn.sendall(json.dumps(status).encode() + b"\n")
+                elif kind == "subscribe":
+                    for payload in jobs:
+                        conn.sendall(
+                            json.dumps(
+                                {"kind": "workflow_job", "payload": payload}
+                            ).encode()
+                            + b"\n"
+                        )
+            except OSError:
+                pass
+            finally:
+                conn.close()
+
+        def serve():
+            server.settimeout(0.3)
+            while not stop.is_set():
+                try:
+                    conn, _ = server.accept()
+                except (socket.timeout, OSError):
+                    continue
+                threading.Thread(target=client, args=(conn,), daemon=True).start()
+
+        threading.Thread(target=serve, daemon=True).start()
+        self.addCleanup(stop.set)
+        self.addCleanup(server.close)
+        self.env["TARTCI_SHIPYARD_DAEMON_SOCKET"] = str(sock_path)
+        return sock_path
+
+    @staticmethod
+    def _queued_job(label: str = "pulp-build-merge-group", job_id: int = 501) -> dict:
+        return {
+            "repo": "Generous-Corp/pulp",
+            "status": "queued",
+            "job_id": job_id,
+            "run_id": 900,
+            "labels": BASE + [label],
+        }
+
+    def _events(self) -> str:
+        path = self.root / "state" / "events.jsonl"
+        return path.read_text(encoding="utf-8") if path.exists() else ""
+
+    def test_feed_rescues_a_blind_scan_when_the_lane_opts_in(self) -> None:
+        """A failed scan plus an independent webhook witness is still demand."""
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self._feed_daemon(jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", result.stdout)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+        self.assertIn('"event":"assignment_feed_rescue"', self._events())
+
+    def test_a_severed_feed_leaves_the_blind_verdict_and_says_so(self) -> None:
+        """No events must never become `no work`: the lane stays blind."""
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self._feed_daemon(jobs=[])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR")
+        events = self._events()
+        self.assertIn('"event":"assignment_feed_degraded"', events)
+        self.assertIn('"event":"assignment_scan_error"', events)
+
+    def test_an_unregistered_repo_cannot_rescue(self) -> None:
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self._feed_daemon(registered=False, jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR", result.stderr)
+        self.assertIn('"event":"assignment_feed_degraded"', self._events())
+
+    def test_a_stale_daemon_cannot_rescue(self) -> None:
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self._feed_daemon(fresh=False, jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR", result.stderr)
+
+    def test_an_absent_daemon_socket_cannot_rescue(self) -> None:
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self.env["TARTCI_SHIPYARD_DAEMON_SOCKET"] = str(self.root / "nowhere.sock")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR", result.stderr)
+        self.assertIn('"event":"assignment_feed_degraded"', self._events())
+
+    def test_a_witness_younger_than_the_lane_minimum_cannot_rescue(self) -> None:
+        self._state(api_fail=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self.env["TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS"] = "600"
+        self._feed_daemon(jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR", result.stderr)
+
+    def test_the_rescue_is_off_unless_the_lane_opts_in(self) -> None:
+        self._state(api_fail=True)
+        self._feed_daemon(jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.split("\t", 1)[0], "ERR", result.stderr)
+        self.assertNotIn("assignment_feed", self._events())
+
+    def test_a_healthy_scan_never_consults_the_feed(self) -> None:
+        """The rescue is additive: a working lane must not change at all."""
+        self._state(merge=True)
+        self.env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+        self._feed_daemon(jobs=[self._queued_job()])
+        result = self._runner("--print-selection")
+        self.assertEqual(result.stdout.strip().split("\t")[0], "1", result.stderr)
+        self.assertNotIn("assignment_feed", self._events())
 
     def test_api_failure_denies_selection(self) -> None:
         self._state(api_fail=True)

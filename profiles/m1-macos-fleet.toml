@@ -49,6 +49,11 @@ assignment_scan_max_workers = 4
 # recent exhaustive receipt across VM boot instead of repeating the full Pulp
 # backlog scan while holding an unregistered VM.
 assignment_top_tier_receipt_max_age_seconds = 180
+# When the REST scan fails closed, ask the local Shipyard daemon's webhook feed
+# whether demand exists before idling blind. It is consulted only after a scan
+# failure and can only report presence, so a healthy scan never reaches it and
+# a silent feed changes nothing.
+assignment_feed_rescue = true
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = ["com.danielraffel.pulp.tart-runner-macos-gate"]
