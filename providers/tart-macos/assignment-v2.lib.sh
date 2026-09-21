@@ -147,6 +147,13 @@ tartci_assignment_feed_rescue(){
   return 0
 }
 
+# Print `count|registration labels|zero-based tier`. A scan error at any tier is
+# fail-closed: never skip a blind higher class and hand its capacity to a lower
+# one. A failed scan leaves that class's demand UNKNOWN, not zero, and the two
+# must not converge here -- electing a lower class would mint a runner that
+# cannot serve the blind one, and the numeric verdict would clear the
+# supervisor's scan-blind counter, disabling the very self-heal that recovers
+# the blind scan. `ERR` carries the uncertainty out intact instead.
 tartci_assignment_v2_select_live(){
   local tier_label q tier=0
   while IFS= read -r tier_label; do

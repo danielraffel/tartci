@@ -56,16 +56,33 @@ if state.get("legacy"):
 if state.get("malformed"):
     jobs.append({"id": 204, "status": "queued", "labels": %s + [{"bad": "label"}]})
 
-if parsed.path.endswith("/actions/workflows"):
-    print(json.dumps({"total_count": 1, "workflows": [{"id": 99, "name": "Build and Test"}]}))
-elif "/actions/workflows/99/runs" in parsed.path or parsed.path.endswith("/actions/runs"):
-    timestamp = (dt.datetime.now(dt.timezone.utc).strftime("%%Y-%%m-%%dT%%H:%%M:%%SZ")
-                 if state.get("fresh") else "2026-08-25T00:00:00Z")
-    runs = ([{"id": 101, "name": "Build and Test", "status": status,
+timestamp = (dt.datetime.now(dt.timezone.utc).strftime("%%Y-%%m-%%dT%%H:%%M:%%SZ")
+             if state.get("fresh") else "2026-08-25T00:00:00Z")
+
+
+def runs_page(run_id, name):
+    runs = ([{"id": run_id, "name": name, "status": status,
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
-    print(json.dumps({"total_count": len(runs), "workflow_runs": runs if page == 1 else []}))
-elif "/actions/runs/101/jobs" in parsed.path:
+    return json.dumps({"total_count": len(runs),
+                       "workflow_runs": runs if page == 1 else []})
+
+
+# Fail exactly one workflow's run listing, so a single tier can be made blind
+# while every other tier stays observable. `api_fail` blinds them all at once.
+blind = state.get("blind_workflow")
+if blind and "/actions/workflows/" + str(blind) + "/runs" in parsed.path:
+    raise SystemExit(9)
+
+if parsed.path.endswith("/actions/workflows"):
+    print(json.dumps({"total_count": 2, "workflows": [
+        {"id": 99, "name": "Build and Test"},
+        {"id": 98, "name": "Merge Gate"}]}))
+elif "/actions/workflows/99/runs" in parsed.path or parsed.path.endswith("/actions/runs"):
+    print(runs_page(101, "Build and Test"))
+elif "/actions/workflows/98/runs" in parsed.path:
+    print(runs_page(102, "Merge Gate"))
+elif "/actions/runs/101/jobs" in parsed.path or "/actions/runs/102/jobs" in parsed.path:
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
@@ -379,6 +396,57 @@ class AssignmentV2Tests(unittest.TestCase):
         self.assertIn('"event":"assignment_scan_error"', events)
         self.assertIn("scanner_rc=2", events)
         self.assertIn("GitHub API failed", events)
+
+    # Two tiers on DISTINCT workflows, so exactly one of them can be blinded.
+    # Sharing a workflow (as every other test here does) makes both tiers issue
+    # identical API calls, which cannot separate "the top tier is blind" from
+    # "every tier is blind" -- the distinction this pair exists to draw.
+    SPLIT_TIERS = (
+        "pulp-build-merge-group|Merge Gate\n"
+        "pulp-build-pr-head|Build and Test"
+    )
+
+    def _split_tier_runner(self, **values: bool) -> subprocess.CompletedProcess[str]:
+        self.env["TARTCI_RUNNER_WORKFLOW_TIERS"] = self.SPLIT_TIERS
+        self._state(**values)
+        return self._runner("--print-selection")
+
+    def test_a_blind_top_tier_never_hands_its_capacity_to_a_lower_class(self) -> None:
+        """A scan error at any tier is fail-closed: a blind higher class is never
+        skipped so a lower one can take its capacity.
+
+        The top tier's demand is UNKNOWN, not zero. Electing pr-head here would
+        mint a runner that cannot serve merge-group work, and -- because the
+        supervisor resets its scan-blind counter on any numeric verdict -- would
+        also hide the top tier's blindness from the self-heal that exists to
+        recover it. Unknown must stay unknown all the way out of the function.
+        """
+        # blind_workflow=98 is Merge Gate, tier 0. Tier 1 has REAL demand (pr).
+        result = self._split_tier_runner(pr=True, fresh=True, blind_workflow=98)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.split("\t", 1)[0],
+            "ERR",
+            "a blind top tier must not elect the lower class: " + result.stdout,
+        )
+        self.assertNotIn(
+            "pulp-build-pr-head",
+            result.stdout,
+            "the lower class must not be advertised on a blind verdict",
+        )
+
+    def test_the_blind_top_tier_control_can_elect_the_lower_class(self) -> None:
+        """Control for the test above: same split-workflow config, nothing blind.
+
+        Without this the ERR assertion is vacuous -- it would pass just as well
+        if the harness could never reach or elect tier 1 at all. Here tier 0 is
+        observable and genuinely empty, so tier 1 MUST win with a real count.
+        """
+        result = self._split_tier_runner(pr=True, fresh=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        count, labels = result.stdout.split("\t")[0], result.stdout.split("\t")[1]
+        self.assertEqual(count, "1", result.stdout)
+        self.assertIn("pulp-build-pr-head", labels, result.stdout)
 
     def test_blind_selection_is_never_published_to_the_selection_cache(self) -> None:
         """A blind scan is an absence of observation, not an observation of absence.
