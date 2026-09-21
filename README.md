@@ -85,7 +85,10 @@ hardware. Without a shared budget they oversubscribe — two hosts melted in Jul
   consumer's build wrapper reads.
 - **Agent surfaces** — `tartci host-profile` (derived budget), `tartci leases`
   (inspect/acquire/release the store), `tartci status` (provider/capacity/role
-  state), and `tartci profile validate` (check lane selectability).
+  state, free space on the volumes the reclaim janitor scans, and whether each
+  janitor -- the disk reclaimer and the VM reaper -- is installed and loaded on
+  this host), and `tartci profile validate`
+  (check lane selectability).
 - **One scheduler path** — GitHub Actions distributes label-matched jobs,
   Shipyard supervises queue progress, and Tart CI provides governed local VMs.
   Orchard is not part of the supported or operational fleet path. Upgraded
