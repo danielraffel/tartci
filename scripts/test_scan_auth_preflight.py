@@ -16,7 +16,6 @@ Run:  python3 scripts/test_scan_auth_preflight.py
 """
 from __future__ import annotations
 
-import json
 import os
 import stat
 import subprocess
