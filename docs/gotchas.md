@@ -452,9 +452,21 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
   → *Failure behavior:* lock acquisition is bounded by
-  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default). The
-  exhaustive assignment scanner's total deadline is 180 seconds by default,
-  leaving a serialized waiter time to perform its own scan after the lock opens.
+  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
+  the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
+  (180 seconds by default) budgets the scan that follows it. The two are
+  sequential, not nested: the scan deadline starts when the lock is acquired,
+  so a lane that queued behind four other supervisors still scans with a full
+  budget, and a scan can take at most lock timeout plus scan timeout overall.
+  They were nested until 2026-09-21, which made the budget
+  `180 - however long this host's queue happened to be`. A waiter then ran its
+  exhaustive pass on the remainder and passed that remainder to `gh` as a
+  shortened per-call timeout, so the call was killed mid-pass and the lane
+  reported the queue unobservable. Measured on M1 over 24 hours, 96 scans died
+  on a GitHub call clamped below the lane's configured 30-second limit, with a
+  median of 14.6 seconds left; the failure is invisible in the logs because it
+  arrives as `GitHub API failed ... timed out`, indistinguishable at a glance
+  from a slow API.
   Timeout
   is scan-blind/fail-closed: do not report zero demand, publish partial cache
   state, or start a lower-priority VM. The supervisor retries normally.
@@ -477,8 +489,19 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   exhaustive receipt across VM boot. Cancellation can then cost one bounded
   idle JIT runner, but lower tiers still require live exhaustive pre-mint proof
   and can never bypass newly arrived higher-priority work.
+  Shortening `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` is not a throughput
+  lever. Five contending lanes were measured at 120, 60, 30 and 10 seconds and
+  completed the same 12-13 scans each time, because the lock -- not the wait --
+  is what rations observation; only the wasted attempts grew, from 48 to 203.
+  A shorter wait does buy slightly fairer sharing, and caps how long a
+  supervisor's poll can block (that ceiling is the lock timeout plus the scan
+  timeout, so the 120-second default admits a 300-second poll). Choose it for
+  those two properties, never expecting more scans.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
-  host is explicitly pointed at the same replacement path.
+  host is explicitly pointed at the same replacement path. Tests must always
+  override it: the suite runs on hosts whose lanes are scanning through the
+  default path, so a test that inherits it both fails on production contention
+  and adds to it.
 
 - **The Shipyard push feed can rescue a blind scan; it can never report an
   empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
