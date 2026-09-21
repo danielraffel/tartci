@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -362,6 +363,10 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         scanner.args = Namespace(max_workers=3)
         scanner._observation_lock = lambda: contextlib.nullcontext()
         scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
+        # This scanner is built with __new__, so it carries none of __init__'s
+        # state. No stubbed run reports a witness, which is what keeps this an
+        # exhaustive-sum assertion.
+        scanner.witness = threading.Event()
         lock = threading.Lock()
         active = 0
         peak = 0
@@ -650,6 +655,7 @@ else:
                     "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
                     "--require-label", "pulp-build-merge-group",
                     "--gh-cli", str(fake), "--retry-backoff", "0",
+                    "--observation-lock-file", str(root / "observation.lock"),
                     *(extra or []),
                 ],
                 text=True, capture_output=True, check=False, env=environment,
@@ -719,3 +725,169 @@ else:
                 )
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(flag, result.stderr)
+
+
+class AssignmentScannerWitnessTests(unittest.TestCase):
+    """Presence may stop early; absence may not.
+
+    The scan is asked whether a class has queued demand. One matching job
+    settles that for good, so looking further cannot change the answer and the
+    scan stops. Nothing settles the opposite short of looking everywhere, so a
+    zero is only ever reported after a complete pass. These tests hold both
+    halves, because the saving is only safe while the second half is true.
+    """
+
+    #: `RUNS` runs exist; only the last one carries a matching queued job, so a
+    #: scan that stops early still has to walk most of them. The ledger records
+    #: every request, which is how "did it stop?" becomes measurable.
+    RUNS = 8
+
+    _GH = '''#!/usr/bin/env python3
+import json, os, sys
+from urllib.parse import parse_qs, urlparse
+
+LEDGER = os.environ["FAKE_GH_LEDGER"]
+RUNS = int(os.environ["FAKE_GH_RUNS"])
+MATCH = os.environ["FAKE_GH_MATCH"]
+
+target = sys.argv[-1]
+with open(LEDGER, "a") as handle:
+    handle.write(target + "\\n")
+
+p = urlparse("https://x/" + target)
+status = parse_qs(p.query).get("status", [""])[0]
+
+if p.path.endswith("/actions/workflows"):
+    print(json.dumps({"total_count": 1, "workflows": [{"id": 99, "name": "Build and Test"}]}))
+elif "/actions/workflows/99/runs" in p.path:
+    if status != "queued":
+        print(json.dumps({"total_count": 0, "workflow_runs": []}))
+    else:
+        runs = [{"id": i, "name": "Build and Test"} for i in range(1, RUNS + 1)]
+        print(json.dumps({"total_count": len(runs), "workflow_runs": runs}))
+elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
+    run_id = int(p.path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+    matches = {"none": set(), "last": {RUNS}, "all": set(range(1, RUNS + 1))}[MATCH]
+    if run_id in matches:
+        print(json.dumps({"total_count": 1, "jobs": [{"id": run_id, "status": "queued", "labels": %s}]}))
+    else:
+        print(json.dumps({"total_count": 1, "jobs": [{"id": run_id, "status": "in_progress", "labels": []}]}))
+else:
+    raise SystemExit(4)
+''' % repr(BASE + ["pulp-build-merge-group"])
+
+    def _scan(self, match: str, extra: list[str] | None = None):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake, ledger = root / "fake-gh", root / "ledger"
+            ledger.write_text("")
+            _write_exec(fake, self._GH)
+            result = subprocess.run(
+                [
+                    "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                    "--workflow", "Build and Test",
+                    "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
+                    "--require-label", "pulp-build-merge-group",
+                    "--gh-cli", str(fake), "--max-workers", "1",
+                    "--observation-lock-file", str(root / "observation.lock"),
+                    *(extra or []),
+                ],
+                text=True, capture_output=True, check=False,
+                env=dict(os.environ, FAKE_GH_LEDGER=str(ledger),
+                         FAKE_GH_RUNS=str(self.RUNS), FAKE_GH_MATCH=match),
+            )
+            jobs = [r for r in ledger.read_text().splitlines() if "/jobs?" in r]
+            return result, jobs
+
+    def test_absence_is_still_proved_exhaustively(self) -> None:
+        """The fail-closed half: reporting zero requires looking everywhere.
+
+        This is the guarantee the early exit is allowed to exist alongside. A
+        zero that stopped early would idle a lane that has work waiting, which
+        is the exact failure this scanner was built to prevent.
+        """
+        result, jobs = self._scan("none")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0")
+        self.assertEqual(len(jobs), self.RUNS, jobs)
+
+    def test_one_witness_ends_the_scan(self) -> None:
+        """The saving: presence needs one match, not a census."""
+        result, jobs = self._scan("all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        self.assertEqual(len(jobs), 1, jobs)
+
+    def test_a_late_witness_still_stops_the_remaining_runs(self) -> None:
+        """Only the last run matches: it must still not scan past it."""
+        result, jobs = self._scan("last")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        self.assertEqual(len(jobs), self.RUNS, jobs)
+
+    def test_exhaustive_count_opt_out_reports_the_true_magnitude(self) -> None:
+        """Diagnosis can still buy the real number."""
+        result, jobs = self._scan("all", extra=["--exhaustive-count"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.RUNS))
+        self.assertEqual(len(jobs), self.RUNS, jobs)
+
+
+class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
+    """Guard the licence that permits the early exit.
+
+    Stopping at the first witness is only sound while no caller needs the
+    count's magnitude — the scan reports `1` for any non-zero demand. That is a
+    property of the shell that consumes it, not of the scanner, so it cannot be
+    enforced where it is relied upon. This reads the consumer and fails if the
+    count is ever compared against anything but zero or used in arithmetic,
+    which is what would silently invalidate the early exit.
+    """
+
+    LIB = ROOT / "providers" / "tart-macos" / "assignment-v2.lib.sh"
+    DEMAND = re.compile(r'\[\s*"\$\{?(q|cached_q)\}?"\s+-(?:gt|lt|ge|le|eq|ne)\s+(\S+)\s*\]')
+    ARITHMETIC = re.compile(r'\$\(\(([^)]*\b(?:q|cached_q)\b[^)]*)\)\)')
+
+    def test_the_demand_count_is_only_ever_compared_against_zero(self) -> None:
+        source = self.LIB.read_text()
+        comparisons = self.DEMAND.findall(source)
+        # Control: if this finds nothing the regex has drifted and the guard is
+        # vacuous, so an empty match set is a failure, not a pass.
+        self.assertGreater(len(comparisons), 0, "no demand comparisons found — guard is blind")
+        offenders = [(name, operand) for name, operand in comparisons if operand != "0"]
+        self.assertEqual(
+            offenders, [],
+            "assignment demand is compared against a non-zero magnitude, which "
+            "revokes the licence for the scanner's first-witness early exit: "
+            f"{offenders}",
+        )
+
+    def test_arithmetic_on_the_count_only_happens_where_it_is_bought(self) -> None:
+        """Summing counts is legitimate, but only with an exhaustive scan.
+
+        The scanner reports 1 for any non-zero demand, so adding those values
+        together produces a number that means nothing. The one caller that does
+        add them is a report, and it must therefore ask for the true magnitude.
+        A new arithmetic caller that does not is the regression this catches.
+        """
+        source = self.LIB.read_text()
+        bodies = dict(re.findall(r"\n(\w+)\(\)\{\n(.*?)\n\}\n", source, re.S))
+        # Control: the parser must actually see the function we know does this.
+        self.assertIn("tartci_assignment_v2_total_demand", bodies,
+                      "function parser found nothing — guard is blind")
+        using_arithmetic = {
+            name for name, body in bodies.items() if self.ARITHMETIC.search(body)
+        }
+        self.assertEqual(
+            using_arithmetic, {"tartci_assignment_v2_total_demand"},
+            f"unexpected arithmetic on assignment demand: {using_arithmetic}",
+        )
+        for name in using_arithmetic:
+            self.assertRegex(
+                bodies[name], r'tartci_assignment_v2_tier_demand "\$tier_label" 1',
+                f"{name} does arithmetic on a witness count without buying the "
+                "exhaustive one",
+            )
+        # Control: the arithmetic probe does fire on real arithmetic.
+        self.assertEqual(self.ARITHMETIC.findall("x=$((q + 1))"), ["q + 1"],
+                         "arithmetic probe is broken")

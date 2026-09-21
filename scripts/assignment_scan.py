@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Fail-closed, exhaustive queue scan for exclusive JIT assignment classes."""
+"""Fail-closed queue scan for exclusive JIT assignment classes.
+
+The scan answers one question: does this assignment class have queued demand?
+Presence and absence are not symmetric answers to it. A single matching job is
+a complete proof of presence — no further looking can retract it — while
+absence is only ever established by looking everywhere. So the scan stops at
+the first witness and reports `1`, and pays the exhaustive pass only to report
+`0`.
+
+That asymmetry is what keeps the scan affordable without weakening it. Every
+caller tests the result against zero, so a witness carries the same decision a
+full count would, and the expensive exhaustive pass is still mandatory before
+any claim that there is nothing to serve — which is the claim that would idle a
+lane with work waiting. Pass --exhaustive-count for the true magnitude when
+diagnosing; it is not needed to make a decision.
+"""
 from __future__ import annotations
 
 import argparse
@@ -78,6 +93,7 @@ class AssignmentScanner:
         self.api_calls = 0
         self.api_calls_lock = threading.Lock()
         self.observation_lock_fd: int | None = None
+        self.witness = threading.Event()
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
@@ -295,6 +311,10 @@ class AssignmentScanner:
         return list(found.values())
 
     def _scan_run(self, run: dict[str, Any]) -> int:
+        if self.witness.is_set():
+            # Another run already produced a witness, so this run cannot change
+            # the verdict. Returning before the request is the whole saving.
+            return 0
         matches: set[int] = set()
         run_id = int(run["id"])
         prefix = (
@@ -345,6 +365,10 @@ class AssignmentScanner:
             if not isinstance(job_id, int):
                 raise ScanError(f"matching queued job in run {run_id} has no integer id")
             matches.add(job_id)
+            if not self.args.exhaustive_count:
+                # One witness settles the question the caller actually asks.
+                self.witness.set()
+                return len(matches)
         return len(matches)
 
     def scan(self) -> int:
@@ -361,7 +385,13 @@ class AssignmentScanner:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.args.max_workers
             ) as executor:
-                return sum(executor.map(self._scan_run, runs), start=0)
+                total = sum(executor.map(self._scan_run, runs), start=0)
+        if self.witness.is_set():
+            # Deliberately not the running total: the scan stopped early, so the
+            # total is a partial count and reporting it would invent precision
+            # the observation does not have. Callers test this against zero.
+            return 1
+        return total
 
 
 def parse_args() -> argparse.Namespace:
@@ -371,6 +401,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", required=True)
     parser.add_argument("--require-label", required=True)
     parser.add_argument("--min-age-seconds", type=int, default=0)
+    parser.add_argument(
+        "--exhaustive-count",
+        action="store_true",
+        default=os.environ.get("TARTCI_ASSIGNMENT_SCAN_EXHAUSTIVE_COUNT") == "1",
+    )
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
     parser.add_argument(
         "--api-retries",
