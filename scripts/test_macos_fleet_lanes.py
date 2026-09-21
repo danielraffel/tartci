@@ -2323,5 +2323,103 @@ class ServingBlockedTests(unittest.TestCase):
         self.assertTrue(self._blocked(value))
 
 
+class ExecutedGenerationTests(unittest.TestCase):
+    """The installed generation must be the one a LaunchAgent actually runs."""
+
+    LANE = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate.plist"
+    COMMIT = "b" * 40
+    MANIFEST = "c" * 64
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.agents = self.root / "LaunchAgents"
+        self.agents.mkdir()
+        self.generation = self.root / f"generations/{self.COMMIT}-{self.MANIFEST[:16]}"
+        self.generation.mkdir(parents=True)
+        self.launch = self.generation / support_manifest.LAUNCH_NAME
+        self.launch.write_text("#!/bin/bash\nexit 0\n")
+        self.launch.chmod(0o555)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_plist(self, arguments: list[str]) -> None:
+        (self.agents / self.LANE).write_bytes(plistlib.dumps({
+            "Label": self.LANE.removesuffix(".plist"),
+            "ProgramArguments": arguments,
+            "RunAtLoad": True,
+        }, sort_keys=False))
+
+    def seal_bundle(self, *, commit: str, manifest_sha256: str) -> Path:
+        """Materialize a launcher bundle around a frozen copy of some cohort."""
+        bundle = self.root / "libexec/TartCILauncher.app"
+        executable = bundle / "Contents/MacOS/tartci-launcher"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/bash\nexit 0\n")
+        executable.chmod(0o755)
+        sealed = bundle / fleet.SEALED_SUPPORT
+        sealed.mkdir(parents=True)
+        sealed_launch = sealed / support_manifest.LAUNCH_NAME
+        sealed_launch.write_text("#!/bin/bash\nexit 0\n")
+        sealed_launch.chmod(0o555)
+        (bundle / fleet.SEALED_METADATA).write_text(json.dumps({
+            "schema": 1,
+            "source_commit": commit,
+            "support_manifest_sha256": manifest_sha256,
+            "profile_policy_sha256": "d" * 64,
+            "tart_home": "/Volumes/Workshop/VMs",
+        }, sort_keys=True))
+        self.write_plist([str(executable), "--lane", "studio-pulp-gate"])
+        return sealed_launch
+
+    def assert_executed(self) -> dict:
+        return fleet.assert_executed_generation(
+            self.agents, [self.LANE],
+            launch_entrypoint=self.launch,
+            source_commit=self.COMMIT,
+            manifest_sha256=self.MANIFEST,
+        )
+
+    def test_sealed_launcher_around_a_stale_cohort_fails_the_install(self) -> None:
+        sealed_launch = self.seal_bundle(commit="a" * 40, manifest_sha256="e" * 64)
+        with self.assertRaises(ValueError) as caught:
+            self.assert_executed()
+        message = str(caught.exception)
+        self.assertIn("install_ineffective", message)
+        self.assertIn(str(sealed_launch), message)
+        self.assertIn(str(self.launch.resolve()), message)
+        self.assertIn(f"{'a' * 40}/{'e' * 64}", message)
+        self.assertIn(f"{self.COMMIT}/{self.MANIFEST}", message)
+
+    def test_sealed_launcher_around_the_installed_cohort_succeeds(self) -> None:
+        sealed_launch = self.seal_bundle(
+            commit=self.COMMIT, manifest_sha256=self.MANIFEST
+        )
+        self.assertEqual(self.assert_executed(), {self.LANE: {
+            "kind": "sealed-bundle", "executes": str(sealed_launch),
+        }})
+
+    def test_launch_agent_running_the_generation_directly_succeeds(self) -> None:
+        self.write_plist(["/bin/bash", str(self.launch), "serve", "macos", "--loop"])
+        self.assertEqual(self.assert_executed(), {self.LANE: {
+            "kind": "generation", "executes": str(self.launch.resolve()),
+        }})
+
+    def test_launch_agent_running_a_foreign_program_fails_the_install(self) -> None:
+        self.write_plist(["/usr/bin/true", "--lane", "studio-pulp-gate"])
+        with self.assertRaisesRegex(ValueError, "install_ineffective"):
+            self.assert_executed()
+
+    def test_sealed_cohort_without_a_launch_entrypoint_fails_the_install(self) -> None:
+        sealed_launch = self.seal_bundle(
+            commit=self.COMMIT, manifest_sha256=self.MANIFEST
+        )
+        sealed_launch.chmod(0o755)
+        sealed_launch.unlink()
+        with self.assertRaisesRegex(ValueError, "no launch entrypoint"):
+            self.assert_executed()
+
+
 if __name__ == "__main__":
     unittest.main()
