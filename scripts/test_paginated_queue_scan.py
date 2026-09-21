@@ -19,6 +19,15 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
+# The scanners prove which credential they are using before they read the
+# queue, so a fake GitHub must answer that question too. 15000/hour is the
+# ceiling a GitHub App installation token reports; 60 would be the anonymous
+# fallback the preflight exists to refuse.
+AUTHENTICATED_RATE_LIMIT = {
+    "resources": {"core": {"limit": 15000, "remaining": 14999, "reset": 1}}
+}
+
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"
 SPEC = importlib.util.spec_from_file_location("queue_scan", MODULE_PATH)
@@ -91,6 +100,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
     @staticmethod
     def _base_api(runs: list[dict[str, Any]], eligible_id: int | None) -> Callable[[str], dict[str, Any]]:
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
@@ -141,6 +152,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         job_fetches = 0
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             nonlocal job_fetches
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
@@ -236,6 +249,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
@@ -289,6 +304,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         fetched_page_two: list[int] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=pending" in path or "status=in_progress" in path:
@@ -356,6 +373,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         fetched_page_two: list[int] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=pending" in path or "status=in_progress" in path:
@@ -446,6 +465,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             if "/actions/runs?status=queued" in path:
                 return {"workflow_runs": runs}
@@ -483,6 +504,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api([], None)(path)
 
@@ -499,6 +522,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api([], None)(path)
 
@@ -528,6 +553,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
             calls: list[str] = []
 
             def api(path: str) -> dict[str, Any]:
+                if path == "rate_limit":
+                    return AUTHENTICATED_RATE_LIMIT
                 calls.append(path)
                 if "/actions/workflows/41/runs?" in path:
                     raise queue_scan.GitHubApiError(path, 1, "HTTP 404: Not Found")
@@ -556,6 +583,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         run = _run(999, origin)
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
@@ -597,6 +626,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         barrier = threading.Barrier(9)
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             with calls_lock:
                 calls.append(path)
             return self._base_api(runs, eligible["id"])(path)
@@ -650,6 +681,9 @@ class PaginatedQueueScanTests(unittest.TestCase):
                 """#!/usr/bin/env python3
 import fcntl, json, os, sys
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 with open(os.environ["CALL_COUNTER"], "a+", encoding="utf-8") as handle:
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     handle.write(path + "\\n")
@@ -766,6 +800,8 @@ print(json.dumps(payload))
         guard = threading.Lock()
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             nonlocal active, peak
             with guard:
                 active += 1
@@ -821,7 +857,9 @@ with open(activity, 'a+', encoding='utf-8') as handle:
 try:
     time.sleep(0.02)
     path = sys.argv[-1]
-    if path.endswith('/actions/workflows?per_page=100'):
+    if path == 'rate_limit':
+        payload = {'resources': {'core': {'limit': 15000, 'remaining': 14999}}}
+    elif path.endswith('/actions/workflows?per_page=100'):
         payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
     elif 'status=pending' in path or 'status=queued' in path or 'status=in_progress' in path:
         payload = {'workflow_runs': []}
@@ -873,6 +911,9 @@ finally:
             stub.write_text(
                 """#!/usr/bin/env python3
 import fcntl, json, os, sys, time
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 with open(os.environ['CALLS'], 'a+', encoding='utf-8') as handle:
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX); handle.write(sys.argv[-1] + '\\n'); handle.flush()
 try:
@@ -982,6 +1023,8 @@ print(json.dumps(payload))
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api(runs, None)(path)
 
@@ -1010,6 +1053,8 @@ print(json.dumps(payload))
         runs = [_run(1, origin)]
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:

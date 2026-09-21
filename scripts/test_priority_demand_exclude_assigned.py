@@ -29,6 +29,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+
+# The scanners prove which credential they are using before they read the
+# queue, so a fake GitHub must answer that question too. 15000/hour is the
+# ceiling a GitHub App installation token reports; 60 would be the anonymous
+# fallback the preflight exists to refuse.
+AUTHENTICATED_RATE_LIMIT = {
+    "resources": {"core": {"limit": 15000, "remaining": 14999, "reset": 1}}
+}
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"
 SPEC = importlib.util.spec_from_file_location("queue_scan", MODULE_PATH)
@@ -66,6 +75,8 @@ def _api(job: dict[str, Any]) -> Callable[[str], dict[str, Any]]:
     run = _run(4242)
 
     def api(path: str) -> dict[str, Any]:
+        if path == "rate_limit":
+            return AUTHENTICATED_RATE_LIMIT
         if path.endswith("/actions/workflows?per_page=100"):
             return {"workflows": [{"id": 99, "name": "Build and Test"}]}
         if "status=in_progress" in path or "status=queued" in path:

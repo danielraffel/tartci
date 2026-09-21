@@ -115,6 +115,7 @@ class IdleGateFailClosed(unittest.TestCase):
         r = self._run(
             """#!/usr/bin/env bash
 case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":15000,"remaining":14999}}}' ;;
   *actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
   *actions/workflows/99/runs*) printf '%s\n' '{"workflow_runs":[]}' ;;
   *) exit 1 ;;

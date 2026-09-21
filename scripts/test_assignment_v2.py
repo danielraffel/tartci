@@ -53,6 +53,9 @@ from urllib.parse import parse_qs, urlparse
 
 state = json.load(open(os.environ["ASSIGNMENT_STATE"], encoding="utf-8"))
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 if state.get("api_fail") and "/runs?" in path:
     raise SystemExit(9)
 parsed = urlparse("https://example.invalid/" + path)
