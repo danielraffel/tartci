@@ -299,6 +299,25 @@ def coverage_line(digest: dict[str, Any]) -> str:
     return f"supervisors={matched}/{expected}"
 
 
+def serving_suffix(supervisor: dict[str, Any]) -> str:
+    """Render the serve-less streak beside the heartbeat, never instead of it.
+
+    `phase=waiting heartbeat_age=3s` is what a lane that has not served a job
+    in three hours looks like, so the line that already reads as health has to
+    carry the contradicting fact or nobody will go looking for it.
+    """
+    since = supervisor.get("serving_blocked_since")
+    streak = supervisor.get("serving_blocked_streak")
+    if not since and not streak:
+        return ""
+    parts = [f"serving_blocked_since={since or '?'}"]
+    parts.append(f"serve_less_streak={streak if streak is not None else '?'}")
+    last_phase = supervisor.get("serving_blocked_last_phase")
+    if last_phase:
+        parts.append(f"last_phase={last_phase}")
+    return " " + " ".join(parts)
+
+
 def print_human(data: dict[str, Any]) -> None:
     digest = data.get("digest") or {}
     capacity = digest.get("capacity") or {}
@@ -340,6 +359,7 @@ def print_human(data: dict[str, Any]) -> None:
             f"phase={supervisor.get('phase') or '?'} "
             f"vm={supervisor.get('vm') or '-'} "
             f"heartbeat_age={format_age(supervisor.get('heartbeat_age_secs'))}"
+            f"{serving_suffix(supervisor)}"
         )
         for job in obs.get("github_jobs") or []:
             step = job.get("active_step") or {}

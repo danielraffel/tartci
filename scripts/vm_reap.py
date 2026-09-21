@@ -779,6 +779,12 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "job_id": state.get("job_id"),
                 "ts": state.get("ts"),
                 "heartbeat_age_secs": state.get("_age_secs"),
+                # A fresh heartbeat beside a growing serve-less streak is the
+                # signature of a lane that is alive and serving nothing, so the
+                # two have to be readable in the same glance.
+                "serving_blocked_since": state.get("serving_blocked_since"),
+                "serving_blocked_streak": state.get("serving_blocked_streak"),
+                "serving_blocked_last_phase": state.get("serving_blocked_last_phase"),
                 "supervisor_pid": state.get("supervisor_pid"),
                 "supervisor_pid_started_at": state.get("supervisor_pid_started_at"),
                 "owner_pid_alive": state.get("_owner_pid_alive"),
