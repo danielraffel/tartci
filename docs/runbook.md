@@ -78,7 +78,8 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 The new Mac is now governed, serving its lanes, and drainable exactly like the
 rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
 `pool off` unloads its agents immediately and remains an emergency/idle-only
-operation.
+operation. Both refuse when this host is the only one serving a required gate
+label; `--allow-last-serving-host` takes that label to zero deliberately.
 
 ---
 
@@ -108,10 +109,13 @@ check. Only after both checks are terminal-idle may you invoke `pool off`, which
 unloads LaunchAgents immediately rather than draining them:
 
 ```bash
-gh api repos/OWNER/REPO/actions/runners --paginate \
-  --jq '.runners[] | select(.name | contains("HOST_TAG")) | [.name,.status,.busy] | @tsv'
+# Both registration scopes. A repository listing omits organization-registered
+# runners silently, so a repository-only census reports a smaller fleet than
+# exists and its zero reads as "nothing here".
+scripts/runner_census.py --repo OWNER/REPO --label pulp-build-pr-head
 # Every runner for this host must report busy=false, and routing/admission for
-# the host must remain disabled for the duration of the migration.
+# the host must remain disabled for the duration of the migration. A census that
+# prints UNREACHABLE for a scope has not proven anything about that scope.
 
 pgrep -fl 'tart run'                      # must print no active VM process
 /opt/homebrew/bin/tart list --format json # every entry must report Running=false

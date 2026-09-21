@@ -37,7 +37,16 @@ idle receipt before tartci will boot it out; without that receipt drain remains
 pending and exits nonzero. The current supported Shipyard CLI does not produce
 this receipt; do not create it by hand. Persistent-runner drains therefore stay
 fail-closed until an authoritative producer is deployed. `pool off` remains
-immediate and may terminate work. A later `pool on` restores only the exact
+immediate and may terminate work.
+
+Both `drain` and `off` run a **capacity floor** first
+(`scripts/capacity_floor.py`): they refuse when no host other than this one
+serves a required gate label, because that mutation takes the label to zero
+runners and stalls every pull request waiting on it. The refusal names the
+label and the host; `--allow-last-serving-host` proceeds anyway. An
+indeterminate answer — an unreadable runner scope, an unresolvable host
+identity — refuses too, since it cannot tell "another host is serving" apart
+from "nobody is". A later `pool on` restores only the exact
 dynamic and persistent services named by the verified fleet profile receipt;
 it does not revive arbitrary `actions.runner.*` plists or legacy Tart controllers.
 See the runbook.

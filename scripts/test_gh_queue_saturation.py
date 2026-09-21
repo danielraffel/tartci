@@ -137,5 +137,85 @@ class IsoAgeTests(unittest.TestCase):
         self.assertEqual(sat._iso_age_secs(iso, self.NOW), 0)
 
 
+class PartialCensusTests(unittest.TestCase):
+    """An unread registration scope makes "no capacity" unproven, not true."""
+
+    def _classify(self, runners, *, census_complete):
+        return sat.classify_saturation(
+            154, runners, [1800],
+            queue_trip=TRIP, grace_secs=GRACE, required_labels=REQUIRED,
+            census_complete=census_complete,
+        )
+
+    def test_complete_census_with_no_runner_concludes_no_capacity(self) -> None:
+        v = self._classify([], census_complete=True)
+
+        self.assertFalse(v.capacity_unknown)
+        self.assertTrue(any("no idle required-gate runner" in r for r in v.reasons))
+
+    def test_partial_census_with_no_runner_reports_unknown(self) -> None:
+        v = self._classify([], census_complete=False)
+
+        self.assertTrue(v.capacity_unknown)
+        self.assertFalse(v.saturated)
+        self.assertTrue(any("UNKNOWN" in r for r in v.reasons))
+        self.assertFalse(any("no idle required-gate runner" in r for r in v.reasons))
+
+    def test_a_found_runner_is_capacity_even_from_a_partial_census(self) -> None:
+        v = self._classify([_runner("studio-01")], census_complete=False)
+
+        self.assertFalse(v.capacity_unknown)
+        self.assertTrue(v.saturated)
+
+
+class GatherScopeTests(unittest.TestCase):
+    """The capacity leg reads both registration scopes."""
+
+    def gather(self, runner_pages: dict, *, fail: set = frozenset()):
+        seen: list[str] = []
+
+        def fake_gh_json(args):
+            path = args[1]
+            seen.append(path)
+            if "actions/runs?" in path:
+                return {"total_count": 0, "workflow_runs": []}
+            for endpoint in fail:
+                if path.startswith(endpoint):
+                    raise RuntimeError("HTTP 403")
+            for endpoint, rows in runner_pages.items():
+                if path.startswith(endpoint):
+                    return {"runners": rows}
+            return {"runners": []}
+
+        original_gh, original_json = sat._gh, sat._gh_json
+        sat._gh, sat._gh_json = (lambda: "ghapp"), fake_gh_json
+        try:
+            return sat.gather("Generous-Corp/pulp"), seen
+        finally:
+            sat._gh, sat._gh_json = original_gh, original_json
+
+    def test_an_organization_only_runner_reaches_the_classifier(self) -> None:
+        (queued, runners, ages, complete), seen = self.gather(
+            {
+                "orgs/Generous-Corp/actions/runners": [
+                    {"name": "pulp-intel-macmini", "status": "online", "busy": False,
+                     "labels": [{"name": "self-hosted"}, {"name": "macOS"}]}
+                ]
+            }
+        )
+
+        self.assertIn("orgs/Generous-Corp/actions/runners?per_page=100", seen)
+        self.assertEqual([r["name"] for r in runners], ["pulp-intel-macmini"])
+        self.assertTrue(complete)
+
+    def test_an_unreadable_scope_marks_the_census_incomplete(self) -> None:
+        (queued, runners, ages, complete), _ = self.gather(
+            {}, fail={"orgs/Generous-Corp/actions/runners"}
+        )
+
+        self.assertFalse(complete)
+        self.assertEqual(runners, [])
+
+
 if __name__ == "__main__":
     unittest.main()
