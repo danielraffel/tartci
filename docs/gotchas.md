@@ -638,6 +638,24 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   follow-up: the final classification must clear the warning only when the
   same runner identity is busy and its current lease/PID ownership is fresh.
 
+- **A `merge_group` run sits `queued` forever and every scan pass fetches its
+  jobs.**
+  → *Cause:* a dequeued merge queue entry can leave its workflow run reporting
+  `queued` permanently — queue branch deleted, `jobs: []`, cancel saying
+  "already completed", force-cancel saying "not queued", and delete returning
+  403 to both the App and a maintainer. Nothing in the run's status
+  distinguishes it from a live entry and no operation removes it.
+  → *Effect, precisely:* it does **not** inflate a merge-group demand count —
+  its zero jobs match no class label. It costs one extra `runs/<id>/jobs` call
+  on every scan pass of every lane, permanently, and a scan fails closed when
+  any single request exceeds `TARTCI_GH_TIMEOUT_SECS`, so the added call makes
+  a blind scan more likely.
+  → *Fix:* `StaleDemandClassifier` quarantines a `merge_group` run whose queue
+  branch is confirmed absent AND which carries no queued job, on POSITIVE
+  determination only — a timeout still counts the run. Full account:
+  `docs/stale-merge-group-demand.md`.
+
+
 ## Windows (QEMU)
 
 - **Install media won't boot — BCD `0xc000000d` (\EFI\Microsoft\Boot\BCD).**

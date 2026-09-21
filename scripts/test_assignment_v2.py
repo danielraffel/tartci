@@ -75,6 +75,42 @@ query = parse_qs(parsed.query)
 page = int(query.get("page", ["1"])[0])
 status = query.get("status", [""])[0]
 
+# Every request, in order. Lets a test assert what was NOT asked for, which is
+# the only way to observe a fetch that was correctly skipped.
+if os.environ.get("ASSIGNMENT_CALLS"):
+    with open(os.environ["ASSIGNMENT_CALLS"], "a", encoding="utf-8") as fh:
+        fh.write(parsed.path + "\n")
+
+# A per-TIER failure channel. `api_fail` fails every tier at once and so cannot
+# express the case that matters: a high tier that cannot be observed while a
+# lower tier is perfectly healthy. Each tier scan opens with the workflow
+# listing, so counting those gives each tier a number.
+session = 0
+if os.environ.get("ASSIGNMENT_SESSION"):
+    counter = os.environ["ASSIGNMENT_SESSION"]
+    try:
+        session = int(open(counter, encoding="utf-8").read().strip() or 0)
+    except (OSError, ValueError):
+        session = 0
+    if parsed.path.endswith("/actions/workflows"):
+        session += 1
+        with open(counter, "w", encoding="utf-8") as fh:
+            fh.write(str(session))
+if session and session in [int(n) for n in state.get("fail_tier_sessions", [])]:
+    if parsed.path.endswith("/runs"):
+        raise SystemExit(9)
+
+if parsed.path.startswith("/repos/") and "/git/ref/" in parsed.path:
+    mode = state.get("ghost_ref", "absent")
+    if mode == "present":
+        print(json.dumps({"ref": parsed.path.split("/git/ref/", 1)[1]}))
+        raise SystemExit(0)
+    if mode == "error":
+        print("gh: server error (HTTP 502)", file=sys.stderr)
+        raise SystemExit(1)
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    raise SystemExit(1)
+
 jobs = []
 if state.get("merge"):
     jobs.append({"id": 201, "status": "queued", "labels": %s + ["pulp-build-merge-group"]})
@@ -93,6 +129,16 @@ def runs_page(run_id, name):
     runs = ([{"id": run_id, "name": name, "status": status,
               "created_at": timestamp, "updated_at": timestamp}]
             if status == "queued" and jobs else [])
+    # The ghost: a merge_group run whose queue entry is long gone. Nothing in
+    # its own status says so. It reports queued forever, and its head_branch
+    # names a queue branch that no longer exists. It rides the first workflow's
+    # listing so the second workflow keeps its own independent fixture.
+    if run_id == 101 and state.get("ghost") and status == "queued":
+        runs.append({"id": 103, "name": name, "status": status,
+                     "event": "merge_group",
+                     "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
+                     "created_at": "2026-08-18T00:00:00Z",
+                     "updated_at": "2026-08-18T00:00:00Z"})
     return json.dumps({"total_count": len(runs),
                        "workflow_runs": runs if page == 1 else []})
 
@@ -111,14 +157,23 @@ elif "/actions/workflows/99/runs" in parsed.path or parsed.path.endswith("/actio
     print(runs_page(101, "Build and Test"))
 elif "/actions/workflows/98/runs" in parsed.path:
     print(runs_page(102, "Merge Gate"))
+elif "/actions/runs/103/jobs" in parsed.path:
+    ghost_jobs = []
+    if state.get("ghost_job"):
+        ghost_jobs.append({"id": 302, "status": "queued",
+                           "labels": %s + ["pulp-build-merge-group"]})
+    print(json.dumps({"total_count": len(ghost_jobs),
+                      "jobs": ghost_jobs if page == 1 else []}))
 elif "/actions/runs/101/jobs" in parsed.path or "/actions/runs/102/jobs" in parsed.path:
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
-''' % (repr(BASE), repr(BASE), repr(BASE), repr(BASE))
+''' % (repr(BASE), repr(BASE), repr(BASE), repr(BASE), repr(BASE))
 
 
-class AssignmentV2Tests(unittest.TestCase):
+class RunnerFixture:
+    """Shared runner fixture. Not a TestCase, so it is never collected."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
@@ -158,6 +213,8 @@ class AssignmentV2Tests(unittest.TestCase):
             env=self.env,
         )
 
+
+class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
     def test_eligibility_matrix_and_v2_registration_labels(self) -> None:
         cases = (
             ({"merge": True}, "1", "pulp-build-merge-group"),
@@ -599,6 +656,19 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         spec.loader.exec_module(module)
         scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
         scanner.args = Namespace(max_workers=3, workflow_id_cache_ttl=0)
+        # This test hand-builds the object to observe executor concurrency, so
+        # it has to supply the collaborators scan() uses. The classifier is
+        # switched off here: what is under test is the worker bound, not
+        # staleness.
+        scanner.stale_demand = module.StaleDemandClassifier(
+            scanner,
+            Namespace(
+                stale_demand_classifier=False,
+                stale_demand_ttl_seconds=1,
+                stale_demand_min_age_seconds=0,
+                stale_demand_quarantine_file=os.devnull,
+            ),
+        )
         scanner._observation_lock = lambda: contextlib.nullcontext()
         scanner._cached_workflow_ids = lambda: {"Build and Test": 99}
         scanner._ordered_run_listings = lambda _ids: ["runs?status=queued"]
@@ -1024,6 +1094,111 @@ else:
             )
         self.assertEqual(result.returncode, 2)
         self.assertIn("duplicate id", result.stderr)
+
+
+class StaleDemandTests(RunnerFixture, unittest.TestCase):
+    """The two halves of the ordering defect, and the contradiction behind it.
+
+    A merge queue entry that has been dequeued can leave its workflow run
+    reporting `queued` forever: the queue branch is deleted, the run carries no
+    jobs, a normal cancel says the run already completed, a force-cancel says it
+    is not queued, and deleting it is forbidden. The run's own status is
+    therefore not evidence about whether it can still run, and demand counted
+    from that status never drains.
+
+    Because tiers are walked highest-first, an undrainable top tier is not a
+    local problem: it either outranks every lower tier forever, or — when its
+    scan fails outright — it aborts the walk and makes every lower tier
+    unobservable too.
+    """
+
+    def _events(self) -> str:
+        return "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in sorted(self.root.rglob("events.jsonl"))
+        )
+
+    def _quarantine(self) -> dict:
+        path = self.root / ".tartci" / "state" / "stale-demand-quarantine.json"
+        if not path.is_file():
+            return {}
+        # The file is versioned under a "runs" key. Reading the top level
+        # instead would make every "not quarantined" assertion below pass
+        # vacuously, which is exactly how a control disarms itself.
+        return json.loads(path.read_text(encoding="utf-8")).get("runs", {})
+
+    def _caches(self) -> list:
+        return sorted((self.root / "state").glob("*.assignment-v2-selection.cache"))
+
+    def test_ghost_merge_group_run_is_quarantined_not_counted(self) -> None:
+        self._state(ghost=True, ghost_ref="absent")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().split("\t")[0], "0", result.stdout)
+        entry = self._quarantine().get("103")
+        self.assertIsNotNone(entry, self._quarantine())
+        self.assertEqual(entry["reason"], "queue_branch_absent_and_no_queued_job")
+        self.assertIn("assignment_stale_demand", self._events())
+
+    def test_live_merge_group_run_is_counted_and_never_quarantined(self) -> None:
+        # THE CONTROL for every exclusion above. A classifier that quarantined
+        # everything would satisfy the ghost tests perfectly and silently
+        # strand all real merge-group work.
+        self._state(ghost=True, ghost_job=True, ghost_ref="present")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", result.stdout)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+        self.assertNotIn("103", self._quarantine())
+
+    def test_indeterminate_branch_probe_counts_the_run(self) -> None:
+        # Positive determination only. An API error is not evidence of
+        # staleness, and treating it as evidence would rebuild the demand
+        # suppressor this guard exists to prevent.
+        self._state(ghost=True, ghost_job=True, ghost_ref="error")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().split("\t")[0], "1", result.stdout)
+        self.assertNotIn("103", self._quarantine())
+
+    def test_absent_branch_with_a_queued_job_is_still_counted(self) -> None:
+        # Exclusion requires BOTH halves, and this is the combination the
+        # conjunction exists to protect: a queue branch that probes absent
+        # while the run still carries a queued job. Excluding on the branch
+        # alone would drop real merge-group work on the strength of one probe,
+        # and a merge-group job dropped is a merge that never lands. No
+        # observed stale run has this shape — the ghost carries no jobs — so
+        # nothing is given up by refusing to act on it.
+        self._state(ghost=True, ghost_job=True, ghost_ref="absent")
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", result.stdout)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+        # And it must not be REMEMBERED as stale either: a persisted verdict
+        # outlives the single probe that produced it.
+        self.assertNotIn("103", self._quarantine())
+
+    def test_quarantined_run_is_not_fetched_again(self) -> None:
+        # The ghost's real cost is not a phantom count. It is one extra job
+        # fetch on every pass of every lane, permanently — and that added call
+        # is what pushes an otherwise healthy scan past its API timeout.
+        calls = self.root / "calls"
+        self.env["ASSIGNMENT_CALLS"] = str(calls)
+        self._state(ghost=True, ghost_ref="absent")
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        # CONTROL. The first pass must have fetched it, or the second pass
+        # skipping it proves nothing.
+        self.assertIn("/actions/runs/103/jobs", calls.read_text(encoding="utf-8"))
+        calls.unlink()
+        self._state(ghost=True, ghost_ref="absent")
+        self.assertEqual(self._runner("--print-selection").returncode, 0)
+        second = calls.read_text(encoding="utf-8")
+        self.assertNotIn("/actions/runs/103/jobs", second)
+        # ...and the pass still happened, rather than being short-circuited
+        # somewhere that would make the absence meaningless.
+        self.assertIn("/actions/workflows", second)
 
 
 class AssignmentScannerTransientFaultTests(unittest.TestCase):
@@ -1620,6 +1795,92 @@ else:
         self.assertEqual(alive.returncode, 0, alive.stderr)
         self.assertEqual(alive.stdout.strip(), "1")
         self.assertEqual(alive_census["workflows"], 0, alive_census)
+
+
+class StaleDemandConjunctionTests(unittest.TestCase):
+    """The conjunction itself, on the classifier rather than through a scan.
+
+    A scan stops at the first matching queued job, so a run that carries one
+    never reaches the classifier at all. That makes the end-to-end cases above
+    agree with the conjunction without exercising it: break the branch probe
+    and they still pass. The half that must never fire -- a branch confirmed
+    absent while the run still carries a queued job -- is therefore only
+    reachable here, and it is the half whose failure would strand real
+    merge-group work.
+    """
+
+    def _classifier(self, branch_live, quarantine):
+        spec = spec_from_file_location("assignment_scan_conjunction", SCANNER)
+        assert spec is not None and spec.loader is not None
+        module = module_from_spec(spec)
+        spec.loader.exec_module(module)
+        classifier = module.StaleDemandClassifier(
+            None,
+            Namespace(
+                stale_demand_classifier=True,
+                stale_demand_ttl_seconds=3600,
+                stale_demand_min_age_seconds=0,
+                stale_demand_quarantine_file=str(quarantine),
+            ),
+        )
+        classifier._branch_live = lambda _run: branch_live
+        return classifier
+
+    @staticmethod
+    def _ghost():
+        return {
+            "id": 103,
+            "event": "merge_group",
+            "head_branch": "gh-readonly-queue/main/pr-7677-abc123",
+            "created_at": "2026-08-18T00:00:00Z",
+        }
+
+    def _run_case(self, branch_live, queued_jobs):
+        with tempfile.TemporaryDirectory() as directory:
+            quarantine = Path(directory) / "stale-demand-quarantine.json"
+            classifier = self._classifier(branch_live, quarantine)
+            excluded = classifier.classify(self._ghost(), queued_jobs)
+            classifier.persist()
+            remembered = (
+                json.loads(quarantine.read_text(encoding="utf-8")).get("runs", {})
+                if quarantine.is_file() else {}
+            )
+            return excluded, remembered
+
+    def test_both_halves_absent_excludes_and_remembers(self) -> None:
+        # The positive control. Without this every refusal below is satisfied
+        # by a classifier that simply never excludes anything.
+        excluded, remembered = self._run_case(branch_live=False, queued_jobs=0)
+        self.assertTrue(excluded)
+        self.assertEqual(
+            remembered.get("103", {}).get("reason"),
+            "queue_branch_absent_and_no_queued_job",
+        )
+
+    def test_absent_branch_with_a_queued_job_is_never_excluded(self) -> None:
+        # The combination that could remove real demand. One probe saying the
+        # queue branch is gone must not discard a run that still carries work.
+        excluded, remembered = self._run_case(branch_live=False, queued_jobs=1)
+        self.assertFalse(excluded)
+        self.assertNotIn("103", remembered)
+
+    def test_indeterminate_probe_is_not_evidence_of_staleness(self) -> None:
+        excluded, remembered = self._run_case(branch_live=None, queued_jobs=0)
+        self.assertFalse(excluded)
+        self.assertNotIn("103", remembered)
+
+    def test_a_live_branch_is_never_excluded(self) -> None:
+        excluded, remembered = self._run_case(branch_live=True, queued_jobs=0)
+        self.assertFalse(excluded)
+        self.assertNotIn("103", remembered)
+
+    def test_a_run_that_is_not_merge_group_is_out_of_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            classifier = self._classifier(
+                False, Path(directory) / "stale-demand-quarantine.json"
+            )
+            run = dict(self._ghost(), event="pull_request")
+            self.assertFalse(classifier.classify(run, 0))
 
 
 # Every test class must be defined before the runner starts, so this stays the
