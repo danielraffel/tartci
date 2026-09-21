@@ -61,7 +61,7 @@ tartci_assignment_v2_tier_labels(){
 # consumes every run/job page and fails on API uncertainty or truncation. Its
 # explicit require-label predicate rejects generic-only jobs.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc
+  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
@@ -85,6 +85,16 @@ tartci_assignment_v2_tier_demand(){
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
   fi
+  # The scanner's stderr is captured so it cannot pollute the demand count on
+  # stdout, and then deleted. Evidence written there is therefore invisible
+  # unless it is lifted out here: on the SUCCESS path the file is discarded
+  # entirely, which is exactly the path a stale run is detected on. Promote each
+  # stale-demand line to a typed event before the file goes away.
+  while IFS= read -r evidence; do
+    [ -n "$evidence" ] || continue
+    event assignment_stale_demand \
+      "tier=$tier_label detail=$(printf '%s' "$evidence" | cut -c1-512)"
+  done < <(grep '^stale-demand: ' "$error_file" 2>/dev/null | sed 's/^stale-demand: //')
   rm -f "$error_file"
   return "$rc"
 }
