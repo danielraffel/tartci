@@ -33,6 +33,11 @@ SAFE_ID = re.compile(r"^[a-z0-9][a-z0-9.-]*$")
 REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 REQUIRED_BASE_LABELS = {"self-hosted", "macOS", "ARM64"}
 LEASE_PRIORITIES = {"background", "build", "vm", "runner", "gate"}
+# launchd.plist(5) documents exactly these ProcessType values. A supervisor
+# left Background is throttled by the system for latency-insensitive work,
+# which lengthens every GitHub API call its queue scan makes.
+PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
+DEFAULT_PROCESS_TYPE = "Background"
 TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane",
@@ -55,7 +60,7 @@ LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
-    "assignment_omit_labels", "supervisors",
+    "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
@@ -366,6 +371,12 @@ def load(path: Path) -> dict:
         supervisors = lane.get("supervisors", 1)
         if type(supervisors) is not int or supervisors not in (1, 2):
             fail(f"lane {lane_id}: supervisors must be 1 or 2")
+        process_type = lane.get("process_type")
+        if process_type is not None and process_type not in PROCESS_TYPES:
+            fail(
+                f"lane {lane_id}: process_type must be one of "
+                f"{list(PROCESS_TYPES)}"
+            )
         assignment_mode = lane.get("assignment_mode")
         if assignment_mode is not None and assignment_mode != "event-class-v2":
             fail(f"lane {lane_id}: unsupported assignment_mode")
@@ -1611,7 +1622,7 @@ def lane_plist(
         "KeepAlive": True,
         "StandardOutPath": f"{host['log_root']}/macos-fleet-{identity}.log",
         "StandardErrorPath": f"{host['log_root']}/macos-fleet-{identity}.log",
-        "ProcessType": "Background",
+        "ProcessType": lane.get("process_type", DEFAULT_PROCESS_TYPE),
         # Give the supervisor's TERM trap a deterministic cleanup window and
         # retain launchd ownership of ordinary provider descendants.
         "ExitTimeOut": 30,
