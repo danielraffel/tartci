@@ -11,10 +11,9 @@ closed with no statement of cause.
 This module supplies the two facts that end the ambiguity. `resolve_identity`
 measures the effective identity before a scan reads the queue, so an anonymous
 caller is refused by name instead of silently spending a shared 60/hour
-allowance.
-`classify_failure` turns a scanner error into a reason code, and reads a
-403 against the anonymous ceiling as an authentication fault rather than a
-generic rate limit.
+allowance. `classify_failure` turns a scanner error into a reason code, and
+reads a 403 against the anonymous ceiling as an authentication fault rather
+than a generic rate limit.
 """
 from __future__ import annotations
 
@@ -33,8 +32,8 @@ from typing import Any
 # no authenticated identity is issued this allowance.
 ANONYMOUS_CORE_LIMIT = 60
 # A user or OAuth credential is issued 5000/hour. An app installation token is
-# issued at least that and scales with installation size (15000/hour is the
-# ceiling this fleet's installation reports).
+# issued at least that and scales with installation size, so anything above the
+# user ceiling is read as an installation rather than matched to a fixed value.
 USER_CORE_LIMIT = 5000
 
 ANONYMOUS = "anonymous"
