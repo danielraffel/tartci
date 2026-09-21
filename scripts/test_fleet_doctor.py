@@ -20,39 +20,66 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fleet_doctor as fd  # noqa: E402
+import host_profile as hp  # noqa: E402
 
-GEN_ROOT = "/home/tester/.local/share/tartci-generations"
 COMMIT_A = "a" * 40
 COMMIT_B = "b" * 40
 MANIFEST_A = "1" * 64
 MANIFEST_B = "2" * 64
-FLEET_LABEL = fd.FLEET_LABEL_PREFIX + "studio.pulp-gate"
+FLEET_LABEL = hp.FLEET_LABEL_PREFIX + "studio.pulp-gate"
 
 
-def installed(commit: str = COMMIT_A, manifest: str = MANIFEST_A) -> dict:
-    root = f"{GEN_ROOT}/{commit}-{manifest[:16]}"
+def gen_root(home: pathlib.Path) -> pathlib.Path:
+    """The generations root shape host_profile's classifier recognises."""
+    return home / ".local" / "share" / "tartci-generations"
+
+
+def installed(home: pathlib.Path, commit: str = COMMIT_A,
+              manifest: str = MANIFEST_A) -> dict:
+    root = gen_root(home) / f"{commit}-{manifest[:16]}"
     return {"source_commit": commit, "support_manifest_sha256": manifest,
-            "root": root, "launch_entrypoint": f"{root}/{fd.LAUNCH_NAME}"}
+            "root": str(root), "launch_entrypoint": str(root / ".tartci-launch")}
+
+
+def write_generation(home: pathlib.Path, commit: str, manifest: str) -> str:
+    """Stage a generation on disk and return the entrypoint a lane would exec."""
+    root = gen_root(home) / f"{commit}-{manifest[:16]}"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / hp.GENERATION_MANIFEST).write_text(json.dumps({
+        "schema": 1, "repository": "danielraffel/tartci",
+        "source_commit": commit, "members": [{"name": "tartci"}]}))
+    entrypoint = root / ".tartci-launch"
+    entrypoint.write_text("#!/bin/sh\n")
+    return str(entrypoint)
+
+
+def write_bundle(home: pathlib.Path, commit: str, manifest: str) -> str:
+    """Install a sealed launcher bundle and return the program a lane would exec."""
+    bundle = home / ".local" / "libexec" / "TartCILauncher.app"
+    (bundle / "Contents" / "MacOS").mkdir(parents=True, exist_ok=True)
+    (bundle / "Contents" / "Resources").mkdir(parents=True, exist_ok=True)
+    (bundle / hp.SEALED_BUNDLE_MARKER).write_text(json.dumps({
+        "schema": 1, "source_commit": commit,
+        "support_manifest_sha256": manifest,
+        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Workshop/VMs"}))
+    program = bundle / "Contents" / "MacOS" / "tartci-launcher"
+    program.write_text("#!/bin/sh\n")
+    return str(program)
 
 
 def write_agent(agents: pathlib.Path, label: str, program: str,
                 environment: dict | None = None) -> None:
+    agents.mkdir(parents=True, exist_ok=True)
     job = {"Label": label, "ProgramArguments": [program, "--lane", "x"]}
     if environment is not None:
         job["EnvironmentVariables"] = environment
     (agents / f"{label}.plist").write_bytes(plistlib.dumps(job))
 
 
-def write_bundle(root: pathlib.Path, commit: str, manifest: str) -> pathlib.Path:
-    bundle = root / "TartCILauncher.app"
-    (bundle / "Contents" / "MacOS").mkdir(parents=True)
-    (bundle / "Contents" / "Resources" / "support").mkdir(parents=True)
-    (bundle / "Contents" / "MacOS" / "tartci-launcher").write_text("#!/bin/sh\n")
-    (bundle / fd.SEALED_METADATA).write_text(json.dumps({
-        "schema": 1, "source_commit": commit,
-        "support_manifest_sha256": manifest,
-        "profile_policy_sha256": "0" * 64, "tart_home": "/Volumes/Workshop/VMs"}))
-    return bundle
+def delivery(home: pathlib.Path) -> dict:
+    """The real host_profile delivery report over a fixture host."""
+    return hp.build_delivery_report(
+        agents=home / "Library" / "LaunchAgents", repo_root=home)
 
 
 # ── 1. Which generation the host actually execs ────────────────────────────
@@ -62,14 +89,12 @@ class ExecutedGenerationTests(unittest.TestCase):
     def test_bad_sealed_bundle_carries_an_older_cohort(self):
         """The silent failure: a receipt names a cohort nothing execs."""
         with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            agents = root / "LaunchAgents"
-            agents.mkdir()
-            bundle = write_bundle(root, COMMIT_B, MANIFEST_B)
-            write_agent(agents, FLEET_LABEL,
-                        str(bundle / "Contents/MacOS/tartci-launcher"))
+            home = pathlib.Path(tmp)
+            write_generation(home, COMMIT_A, MANIFEST_A)
+            program = write_bundle(home, COMMIT_B, MANIFEST_B)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, program)
             finding = fd.check_executed_generation(
-                fd.exec_map(agents), installed(COMMIT_A, MANIFEST_A))
+                delivery(home), installed(home, COMMIT_A, MANIFEST_A))
         self.assertEqual(finding.state, fd.PROBLEM)
         self.assertEqual(finding.code, "effective_generation_mismatch")
         effective = finding.facts["effective_generation"][FLEET_LABEL]
@@ -78,63 +103,69 @@ class ExecutedGenerationTests(unittest.TestCase):
 
     def test_good_sealed_bundle_carries_the_installed_cohort(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            agents = root / "LaunchAgents"
-            agents.mkdir()
-            bundle = write_bundle(root, COMMIT_A, MANIFEST_A)
-            write_agent(agents, FLEET_LABEL,
-                        str(bundle / "Contents/MacOS/tartci-launcher"))
+            home = pathlib.Path(tmp)
+            write_generation(home, COMMIT_A, MANIFEST_A)
+            program = write_bundle(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, program)
             finding = fd.check_executed_generation(
-                fd.exec_map(agents), installed(COMMIT_A, MANIFEST_A))
+                delivery(home), installed(home, COMMIT_A, MANIFEST_A))
         self.assertEqual(finding.state, fd.OK)
         self.assertEqual(finding.code, "effective_generation_matches")
 
     def test_bad_direct_exec_points_at_a_superseded_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            stale = f"{GEN_ROOT}/{COMMIT_B}-{MANIFEST_B[:16]}/{fd.LAUNCH_NAME}"
-            write_agent(agents, FLEET_LABEL, stale)
-            finding = fd.check_executed_generation(fd.exec_map(agents), installed())
+            home = pathlib.Path(tmp)
+            write_generation(home, COMMIT_A, MANIFEST_A)
+            stale = write_generation(home, COMMIT_B, MANIFEST_B)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, stale)
+            finding = fd.check_executed_generation(delivery(home), installed(home))
         self.assertEqual(finding.state, fd.PROBLEM)
         self.assertEqual(finding.code, "effective_generation_mismatch")
 
     def test_good_direct_exec_points_at_the_installed_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            write_agent(agents, FLEET_LABEL, installed()["launch_entrypoint"])
-            finding = fd.check_executed_generation(fd.exec_map(agents), installed())
+            home = pathlib.Path(tmp)
+            current = write_generation(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, current)
+            finding = fd.check_executed_generation(delivery(home), installed(home))
         self.assertEqual(finding.state, fd.OK)
 
     def test_unreadable_sealed_metadata_is_unknown_not_agreement(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            agents = root / "LaunchAgents"
-            agents.mkdir()
-            bundle = write_bundle(root, COMMIT_A, MANIFEST_A)
-            (bundle / fd.SEALED_METADATA).write_text("{not json")
-            write_agent(agents, FLEET_LABEL,
-                        str(bundle / "Contents/MacOS/tartci-launcher"))
-            finding = fd.check_executed_generation(fd.exec_map(agents), installed())
+            home = pathlib.Path(tmp)
+            write_generation(home, COMMIT_A, MANIFEST_A)
+            program = write_bundle(home, COMMIT_A, MANIFEST_A)
+            (home / ".local" / "libexec" / "TartCILauncher.app"
+             / hp.SEALED_BUNDLE_MARKER).write_text("{not json")
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, program)
+            finding = fd.check_executed_generation(delivery(home), installed(home))
         self.assertEqual(finding.state, fd.UNKNOWN)
         self.assertEqual(finding.code, "program_unresolvable")
 
     def test_missing_receipt_with_agents_is_unknown_not_ok(self):
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            write_agent(agents, FLEET_LABEL, installed()["launch_entrypoint"])
-            finding = fd.check_executed_generation(fd.exec_map(agents), None)
+            home = pathlib.Path(tmp)
+            current = write_generation(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, current)
+            finding = fd.check_executed_generation(delivery(home), None)
         self.assertEqual(finding.state, fd.UNKNOWN)
         self.assertEqual(finding.code, "installed_generation_unknown")
 
     def test_unmanaged_host_is_not_applicable_not_a_fault(self):
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            finding = fd.check_executed_generation(fd.exec_map(agents), None)
+            home = pathlib.Path(tmp)
+            write_agent(home / "Library" / "LaunchAgents",
+                        "com.danielraffel.pulp.tart-runner-linux", "/bin/true")
+            finding = fd.check_executed_generation(delivery(home), None)
         self.assertEqual(finding.state, fd.NOT_APPLICABLE)
+
+    def test_unreadable_agents_dir_is_unknown_not_an_empty_host(self):
+        """No plists at all is blindness; no FLEET plists is a bare host."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            finding = fd.check_executed_generation(delivery(home), None)
+        self.assertEqual(finding.state, fd.UNKNOWN)
+        self.assertEqual(finding.code, "agents_dir_unreadable")
 
 
 # ── 2. Can this host receive a deploy at all ───────────────────────────────
@@ -143,34 +174,44 @@ class ExecutedGenerationTests(unittest.TestCase):
 class GenerationDeliveryTests(unittest.TestCase):
     def test_bad_sealed_bundle_cannot_receive_a_staged_generation(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = pathlib.Path(tmp)
-            agents = root / "LaunchAgents"
-            agents.mkdir()
-            bundle = write_bundle(root, COMMIT_A, MANIFEST_A)
-            write_agent(agents, FLEET_LABEL,
-                        str(bundle / "Contents/MacOS/tartci-launcher"))
-            finding = fd.check_generation_delivery(fd.exec_map(agents))
+            home = pathlib.Path(tmp)
+            program = write_bundle(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, program)
+            finding = fd.check_generation_delivery(delivery(home))
         self.assertEqual(finding.state, fd.PROBLEM)
         self.assertEqual(finding.code, "sealed_launcher_bundle")
         self.assertIs(finding.facts["can_receive_generation"], False)
+        self.assertTrue(finding.facts["how_to_update"])
 
     def test_good_direct_exec_can_receive_a_staged_generation(self):
         """A sealed bundle is the fault; a generation-path exec must not fire."""
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            write_agent(agents, FLEET_LABEL, installed()["launch_entrypoint"])
-            finding = fd.check_generation_delivery(fd.exec_map(agents))
+            home = pathlib.Path(tmp)
+            current = write_generation(home, COMMIT_A, MANIFEST_A)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL, current)
+            finding = fd.check_generation_delivery(delivery(home))
         self.assertEqual(finding.state, fd.OK)
         self.assertIs(finding.facts["can_receive_generation"], True)
 
+    def test_one_sealed_lane_makes_the_whole_host_undeliverable(self):
+        """A mixed host cannot be updated by a stage, whatever its other lanes do."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = pathlib.Path(tmp)
+            agents = home / "Library" / "LaunchAgents"
+            current = write_generation(home, COMMIT_A, MANIFEST_A)
+            write_agent(agents, FLEET_LABEL, current)
+            program = write_bundle(home, COMMIT_A, MANIFEST_A)
+            write_agent(agents, hp.FLEET_LABEL_PREFIX + "studio.forge-gate", program)
+            finding = fd.check_generation_delivery(delivery(home))
+        self.assertEqual(finding.state, fd.PROBLEM)
+        self.assertIs(finding.facts["can_receive_generation"], False)
+
     def test_unresolvable_program_reports_unknown_capability(self):
         with tempfile.TemporaryDirectory() as tmp:
-            agents = pathlib.Path(tmp) / "LaunchAgents"
-            agents.mkdir()
-            (agents / f"{FLEET_LABEL}.plist").write_bytes(
-                plistlib.dumps({"Label": FLEET_LABEL}))
-            finding = fd.check_generation_delivery(fd.exec_map(agents))
+            home = pathlib.Path(tmp)
+            write_agent(home / "Library" / "LaunchAgents", FLEET_LABEL,
+                        "/usr/local/bin/something-else")
+            finding = fd.check_generation_delivery(delivery(home))
         self.assertEqual(finding.state, fd.UNKNOWN)
         self.assertIsNone(finding.facts["can_receive_generation"])
 

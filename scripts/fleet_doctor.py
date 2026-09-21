@@ -24,6 +24,8 @@ from __future__ import annotations
 import json
 import plistlib
 import subprocess
+
+import host_profile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
@@ -39,11 +41,7 @@ PROBLEM = "problem"
 UNKNOWN = "unknown"
 NOT_APPLICABLE = "not_applicable"
 
-FLEET_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
 PERSISTENT_LABEL_PREFIX = "actions.runner."
-SEALED_METADATA = "Contents/Resources/bundle.json"
-SEALED_SUPPORT = "Contents/Resources/support"
-LAUNCH_NAME = ".tartci-launch"
 HELD_IDLE = "held-idle"
 REASONS_PATH = Path(__file__).resolve().parent / "fleet_reasons.json"
 
@@ -109,18 +107,15 @@ def load_reasons(path: Path = REASONS_PATH) -> dict[str, dict]:
 # ── LaunchAgent exec resolution ────────────────────────────────────────────
 #
 # What a host runs is the program in the installed plist's ProgramArguments,
-# never what an installer most recently staged. The two diverge silently: a
-# signed launcher bundle execs its own sealed copy of the support cohort, so
-# staging a newer generation beside it changes nothing that runs.
-
-
-def fleet_labels(agents_dir: Path) -> list[str]:
-    """Managed fleet LaunchAgent labels installed on this host."""
-    return sorted(
-        path.name.removesuffix(".plist")
-        for path in agents_dir.glob(f"{FLEET_LABEL_PREFIX}*.plist")
-        if path.is_file() and not path.is_symlink()
-    )
+# never what an installer most recently staged. The classification of that
+# program -- sealed launcher bundle versus generation path -- and the identity
+# marker inside the artifact it execs are host_profile's delivery report, which
+# is consumed here rather than re-derived. What this module adds is the
+# comparison that report does not make: the in-force identity against the
+# INSTALL RECEIPT. host_profile measures drift against the checkout's git HEAD,
+# which answers "is this artifact old" and not "is this the artifact the last
+# install claims to have delivered". The second question is the one a silent
+# no-op hides behind.
 
 
 def persistent_labels(agents_dir: Path) -> list[str]:
@@ -134,68 +129,6 @@ def persistent_labels(agents_dir: Path) -> list[str]:
         for path in agents_dir.glob(f"{PERSISTENT_LABEL_PREFIX}*.plist")
         if path.is_file() and not path.is_symlink()
     )
-
-
-def sealed_bundle_root(program: Path) -> Path | None:
-    """The app bundle whose sealed cohort `program` would execute, if any."""
-    parents = program.parents
-    if len(parents) < 3:
-        return None
-    if parents[0].name != "MacOS" or parents[1].name != "Contents":
-        return None
-    bundle = parents[2]
-    return bundle if bundle.suffix == ".app" else None
-
-
-def resolve_exec(plist_path: Path) -> dict:
-    """Resolve one LaunchAgent to the cohort identity it actually executes.
-
-    Identity is the (source_commit, support_manifest_sha256) pair the executed
-    cohort carries, not a directory name. Generation directories are named from
-    that pair today, but deriving identity from a naming convention would make
-    this report a mismatch the moment the convention moved.
-    """
-    try:
-        value = plistlib.loads(plist_path.read_bytes())
-    except (OSError, plistlib.InvalidFileException, ValueError) as exc:
-        return {"kind": "unresolved", "detail": f"unreadable LaunchAgent: {exc}"}
-    arguments = value.get("ProgramArguments")
-    if (not isinstance(arguments, list) or not arguments
-            or not isinstance(arguments[0], str) or not arguments[0]):
-        return {"kind": "unresolved", "detail": "LaunchAgent declares no program"}
-    program = Path(arguments[0])
-    bundle = sealed_bundle_root(program)
-    if bundle is None:
-        return {"kind": "generation-path", "program": str(program),
-                "launch_entrypoint": str(program)}
-    sealed_launch = bundle / SEALED_SUPPORT / LAUNCH_NAME
-    try:
-        metadata = json.loads((bundle / SEALED_METADATA).read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        return {"kind": "unresolved", "program": str(program),
-                "bundle": str(bundle),
-                "detail": f"sealed cohort metadata is unreadable: {exc}"}
-    if not isinstance(metadata, dict):
-        return {"kind": "unresolved", "program": str(program),
-                "bundle": str(bundle),
-                "detail": "sealed cohort metadata is malformed"}
-    return {
-        "kind": "sealed-bundle",
-        "program": str(program),
-        "bundle": str(bundle),
-        "launch_entrypoint": str(sealed_launch),
-        "source_commit": str(metadata.get("source_commit", "")) or None,
-        "support_manifest_sha256": str(
-            metadata.get("support_manifest_sha256", "")) or None,
-    }
-
-
-def exec_map(agents_dir: Path) -> dict[str, dict]:
-    """Resolve every managed fleet LaunchAgent once, for the checks that share it."""
-    return {
-        label: resolve_exec(agents_dir / f"{label}.plist")
-        for label in fleet_labels(agents_dir)
-    }
 
 
 def installed_generation(receipt: dict | None) -> dict | None:
@@ -218,34 +151,38 @@ def installed_generation(receipt: dict | None) -> dict | None:
             "root": root, "launch_entrypoint": launch_path}
 
 
-def _executes_installed(resolved: dict, installed: dict) -> bool | None:
-    """Does this agent execute the installed cohort? None when unresolvable."""
-    if resolved["kind"] == "unresolved":
+def _executes_installed(lane: dict, installed: dict) -> bool | None:
+    """Does this lane execute the installed cohort? None when unresolvable."""
+    identity = lane.get("in_force") or {}
+    commit = identity.get("source_commit")
+    if lane.get("delivery") == "unknown" or not commit:
         return None
-    if resolved["kind"] == "sealed-bundle":
-        commit = resolved.get("source_commit")
-        manifest = resolved.get("support_manifest_sha256")
-        if commit is None or manifest is None:
+    if lane["delivery"] == "sealed-bundle":
+        manifest = identity.get("support_manifest_sha256")
+        if not manifest:
             return None
         return (commit == installed["source_commit"]
                 and manifest == installed["support_manifest_sha256"])
-    # A direct exec names the generation's own launch entrypoint, so the
-    # receipt's recorded path is an exact comparison with no convention in it.
-    expected = installed.get("launch_entrypoint")
-    if not expected:
+    # A generation lane execs that generation's own launch entrypoint, so the
+    # receipt's recorded path compares exactly with no naming convention in it.
+    expected = installed.get("root") or (
+        str(Path(installed["launch_entrypoint"]).parent)
+        if installed.get("launch_entrypoint") else None)
+    artifact = lane.get("artifact_root")
+    if not expected or artifact is None:
         return None
-    return resolved["launch_entrypoint"] == expected
+    return Path(artifact) == Path(expected)
 
 
-def check_executed_generation(execs: dict[str, dict],
-                              installed: dict | None,
-                              *, agents_dir_readable: bool = True) -> Finding:
+def check_executed_generation(report: dict, installed: dict | None) -> Finding:
     """Report the cohort the host EXECUTES against the one it records as installed."""
     check = "executed_generation"
-    if not agents_dir_readable:
+    lanes = report.get("lanes") or []
+    if not lanes and not report.get("plists_seen"):
         return Finding(check, UNKNOWN, "agents_dir_unreadable",
-                       "the LaunchAgent directory could not be listed")
-    if not execs and installed is None:
+                       "no plist at all was readable in the LaunchAgent directory",
+                       {"agents_dir": report.get("agents_dir")})
+    if not lanes and installed is None:
         return Finding(check, NOT_APPLICABLE, "no_managed_launchagents",
                        "this host installs no managed fleet LaunchAgents and "
                        "holds no install receipt")
@@ -254,8 +191,8 @@ def check_executed_generation(execs: dict[str, dict],
             check, UNKNOWN, "installed_generation_unknown",
             "managed LaunchAgents are installed but no readable install receipt "
             "says which cohort they should execute",
-            {"labels": sorted(execs)})
-    if not execs:
+            {"labels": sorted(lane["label"] for lane in lanes)})
+    if not lanes:
         return Finding(
             check, PROBLEM, "no_managed_launchagents",
             "an install receipt records a cohort but no managed fleet "
@@ -265,27 +202,28 @@ def check_executed_generation(execs: dict[str, dict],
     effective: dict[str, dict] = {}
     mismatched: list[str] = []
     unresolved: list[str] = []
-    for label, resolved in sorted(execs.items()):
-        verdict = _executes_installed(resolved, installed)
-        effective[label] = {
-            "kind": resolved["kind"],
-            "launch_entrypoint": resolved.get("launch_entrypoint"),
-            "source_commit": resolved.get("source_commit"),
-            "support_manifest_sha256": resolved.get("support_manifest_sha256"),
+    for lane in sorted(lanes, key=lambda row: row["label"]):
+        verdict = _executes_installed(lane, installed)
+        identity = lane.get("in_force") or {}
+        effective[lane["label"]] = {
+            "delivery": lane.get("delivery"),
+            "artifact_root": lane.get("artifact_root"),
+            "source_commit": identity.get("source_commit"),
+            "support_manifest_sha256": identity.get("support_manifest_sha256"),
             "executes_installed": verdict,
-            "detail": resolved.get("detail"),
+            "detail": identity.get("detail") or lane.get("detail"),
         }
         if verdict is None:
-            unresolved.append(label)
+            unresolved.append(lane["label"])
         elif not verdict:
-            mismatched.append(label)
+            mismatched.append(lane["label"])
 
     facts = {"installed_generation": installed, "effective_generation": effective}
     if mismatched:
         return Finding(
             check, PROBLEM, "effective_generation_mismatch",
             "the generation this host EXECUTES is not the generation it records "
-            f"as installed ({len(mismatched)} of {len(execs)} agents): "
+            f"as installed ({len(mismatched)} of {len(lanes)} lanes): "
             + ", ".join(mismatched),
             facts)
     if unresolved:
@@ -295,48 +233,56 @@ def check_executed_generation(execs: dict[str, dict],
             + ", ".join(unresolved),
             facts)
     return Finding(check, OK, "effective_generation_matches",
-                   f"all {len(execs)} managed agents execute the installed cohort",
+                   f"all {len(lanes)} managed lanes execute the installed cohort",
                    facts)
 
 
-def check_generation_delivery(execs: dict[str, dict],
-                              *, agents_dir_readable: bool = True) -> Finding:
+def check_generation_delivery(report: dict) -> Finding:
     """Report whether staging a generation can change what this host executes.
 
-    A host whose agents exec a sealed launcher bundle cannot be updated by a
-    generation stage at all: the stage succeeds, the receipt is written, and the
-    bundle keeps executing its own sealed copy. Answering this before a deploy
-    is the difference between a no-op nobody notices and a deploy nobody starts.
+    The verdict is host_profile's own `accepts_generation_install`, so there is
+    exactly one classifier of delivery shape on this host and no second opinion
+    to drift. What is added here is the aggregate: one lane that cannot receive
+    a generation makes the host undeliverable by that route, whatever its
+    siblings do.
     """
     check = "generation_delivery"
-    if not agents_dir_readable:
+    lanes = report.get("lanes") or []
+    if not lanes and not report.get("plists_seen"):
         return Finding(check, UNKNOWN, "agents_dir_unreadable",
-                       "the LaunchAgent directory could not be listed",
-                       {"can_receive_generation": None})
-    if not execs:
+                       "no plist at all was readable in the LaunchAgent directory",
+                       {"can_receive_generation": None,
+                        "agents_dir": report.get("agents_dir")})
+    if not lanes:
         return Finding(check, NOT_APPLICABLE, "no_managed_launchagents",
                        "this host installs no managed fleet LaunchAgents",
                        {"can_receive_generation": None})
-    sealed = sorted(l for l, r in execs.items() if r["kind"] == "sealed-bundle")
-    unresolved = sorted(l for l, r in execs.items() if r["kind"] == "unresolved")
-    if unresolved:
+    unknown = sorted(lane["label"] for lane in lanes
+                     if lane.get("accepts_generation_install") is None)
+    sealed = sorted(lane["label"] for lane in lanes
+                    if lane.get("accepts_generation_install") is False)
+    remedies = sorted({lane["how_to_update"] for lane in lanes
+                       if lane["label"] in sealed and lane.get("how_to_update")})
+    if unknown:
         return Finding(
             check, UNKNOWN, "delivery_unknown",
-            "some agents declare no resolvable program, so it is not known "
-            "whether a staged generation would reach them: " + ", ".join(unresolved),
-            {"can_receive_generation": None, "unresolved": unresolved,
-             "sealed_bundle_agents": sealed})
+            "some lanes declare no recognised launch entrypoint, so it is not "
+            "known whether a staged generation would reach them: "
+            + ", ".join(unknown),
+            {"can_receive_generation": None, "unresolved": unknown,
+             "sealed_bundle_lanes": sealed})
     if sealed:
-        bundles = sorted({execs[label]["bundle"] for label in sealed})
+        roots = sorted({lane["artifact_root"] for lane in lanes
+                        if lane["label"] in sealed and lane.get("artifact_root")})
         return Finding(
             check, PROBLEM, "sealed_launcher_bundle",
             "this host executes a sealed launcher bundle, so a generation stage "
-            "alone cannot change what it runs: " + ", ".join(bundles),
-            {"can_receive_generation": False, "sealed_bundle_agents": sealed,
-             "bundles": bundles})
+            "alone cannot change what it runs: " + ", ".join(roots),
+            {"can_receive_generation": False, "sealed_bundle_lanes": sealed,
+             "bundles": roots, "how_to_update": remedies})
     return Finding(
         check, OK, "generation_path_exec",
-        f"all {len(execs)} managed agents exec a generation path directly, so a "
+        f"all {len(lanes)} managed lanes exec a generation path directly, so a "
         "staged generation reaches them",
         {"can_receive_generation": True})
 
@@ -700,7 +646,10 @@ def lane_registrations(agents_dir: Path) -> dict[str, dict]:
     A profile says what was intended; only the installed plist says what runs.
     """
     out: dict[str, dict] = {}
-    for label in fleet_labels(agents_dir):
+    for label in sorted(
+            path.name.removesuffix(".plist")
+            for path in agents_dir.glob(f"{host_profile.FLEET_LABEL_PREFIX}*.plist")
+            if path.is_file() and not path.is_symlink()):
         try:
             value = plistlib.loads((agents_dir / f"{label}.plist").read_bytes())
         except (OSError, plistlib.InvalidFileException, ValueError):
@@ -742,7 +691,10 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
     config_dir = config_dir or (home / ".config" / "tartci")
     readable = agents_dir.is_dir()
-    execs = exec_map(agents_dir) if readable else {}
+    # One delivery classification per run, shared by both generation checks, so
+    # they cannot disagree about what a lane execs.
+    delivery = host_profile.build_delivery_report(
+        agents=agents_dir, repo_root=support_root)
 
     receipt_path = config_dir / "macos-fleet-install.json"
     try:
@@ -752,8 +704,8 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     installed = installed_generation(receipt)
 
     findings = [
-        check_executed_generation(execs, installed, agents_dir_readable=readable),
-        check_generation_delivery(execs, agents_dir_readable=readable),
+        check_executed_generation(delivery, installed),
+        check_generation_delivery(delivery),
         check_drain_capability(
             agents_dir, config_dir / "persistent-runner-admission-hold",
             agents_dir_readable=readable),
