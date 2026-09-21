@@ -7,6 +7,8 @@
 #
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
+#   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
+#                              # deploy/drain capability, dual-scope runner census
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
@@ -125,6 +127,12 @@ cmd_doctor() {
   if [ "${1:-}" = "--reap" ]; then
     shift
     exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
+  # `doctor fleet` is the fleet-wide diagnosis; bare `doctor` stays the host
+  # prereq report, which must keep passing on hosts that run no fleet at all.
+  if [ "${1:-}" = "fleet" ]; then
+    shift
+    exec python3 "$HERE/scripts/fleet_doctor.py" "$@"
   fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
@@ -794,7 +802,7 @@ SERVINGPY
   esac
 }
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,28p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
