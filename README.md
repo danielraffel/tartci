@@ -343,6 +343,7 @@ that it is blind:
 |---|---|
 | `no_valid_credentials` | The caller is not authenticated. `gh` does not fail when its credential is missing or rejected — it falls back to **anonymous** requests, which GitHub meters at **60/hour per IP**, shared by every host behind that address. Fix the credential; adding capacity or waiting does nothing. |
 | `rate_limited` | An authenticated identity spent an allowance it really was issued (5000/hour for a user credential, more for an App installation). The message names the identity and its ceiling. |
+| `cli_refused` | The configured CLI declined before reaching GitHub — `ghapp` refuses an endpoint carrying no repository when its working directory is not a checkout. It is never retried, and it leaves the identity *unproven* rather than anonymous: the queue is still read. |
 | `lock_contention` | Another lane held the host-global queue observation lock past the bounded wait. |
 | `timeout` / `pagination` / `budget_exhausted` / `api_error` | The observation did not complete; the text says which way. |
 
