@@ -312,15 +312,12 @@ def resolve_identity(
     if cached is not None and cached.authenticated:
         return cached
     identity = identity_from_rate_limit(fetch(), source=source)
+    # Only an admitted identity is remembered. Nothing may stay behind that
+    # would vouch on the next poll for one that was refused.
+    require_authenticated(identity)
     if ttl > 0:
         _write_receipt(path, gh_cli, identity)
-    try:
-        return require_authenticated(identity)
-    except AuthPreflightError:
-        # Nothing may stay behind that would vouch for a refused identity on
-        # the next poll; the fault is re-measured instead of remembered.
-        forget_identity(env)
-        raise
+    return identity
 
 
 def _matches(text: str, markers: Sequence[str]) -> bool:
@@ -328,11 +325,18 @@ def _matches(text: str, markers: Sequence[str]) -> bool:
     return any(marker in lowered for marker in markers)
 
 
-def _tail(text: str, limit: int = 200) -> str:
+def _excerpt(text: str, limit: int = 240) -> str:
+    """Keep the head of a diagnostic, where the cause is stated.
+
+    A wrapper prints the underlying cause first and its own summary last, so
+    trimming from the front keeps the half that names the fault and drops the
+    half that restates it.
+    """
+
     collapsed = " ".join(text.split())
     if len(collapsed) <= limit:
         return collapsed
-    return collapsed[-limit:]
+    return collapsed[:limit] + " [...]"
 
 
 def already_coded(text: str) -> bool:
@@ -366,7 +370,7 @@ def classify_failure(
     if _matches(message, _LOCK_MARKERS):
         return ScanFailure(
             LOCK_CONTENTION,
-            f"another observation held the host queue lock: {_tail(message)}",
+            f"another observation held the host queue lock: {_excerpt(message)}",
         )
     if _matches(message, _RATE_LIMIT_MARKERS):
         if _matches(message, (_ANONYMOUS_MARKER,)) or anonymous_ceiling:
@@ -380,30 +384,30 @@ def classify_failure(
                 f"GitHub refused the request at the {ceiling}/hour ANONYMOUS "
                 "ceiling, which no authenticated identity is issued: the "
                 f"caller sent no valid credential{described}. Restore "
-                f"authentication; this is not a capacity problem: {_tail(message)}",
+                f"authentication; this is not a capacity problem: {_excerpt(message)}",
             )
         return ScanFailure(
             RATE_LIMITED,
             f"an authenticated identity exhausted its allowance{described}: "
-            f"{_tail(message)}",
+            f"{_excerpt(message)}",
         )
     if _matches(message, _BAD_CREDENTIAL_MARKERS):
         return ScanFailure(
             NO_VALID_CREDENTIALS,
-            f"GitHub rejected the credential{described}: {_tail(message)}",
+            f"GitHub rejected the credential{described}: {_excerpt(message)}",
         )
     if "budget exhausted" in message.lower():
         return ScanFailure(
             BUDGET_EXHAUSTED,
-            f"the scan spent its own API call budget: {_tail(message)}",
+            f"the scan spent its own API call budget: {_excerpt(message)}",
         )
     if _matches(message, _PAGINATION_MARKERS):
         return ScanFailure(
             PAGINATION,
-            f"the queue could not be paged completely: {_tail(message)}",
+            f"the queue could not be paged completely: {_excerpt(message)}",
         )
     if _matches(message, _TIMEOUT_MARKERS):
         return ScanFailure(
-            TIMEOUT, f"the observation ran out of time: {_tail(message)}"
+            TIMEOUT, f"the observation ran out of time: {_excerpt(message)}"
         )
-    return ScanFailure(API_ERROR, _tail(message) or "no detail reported")
+    return ScanFailure(API_ERROR, _excerpt(message) or "no detail reported")
