@@ -298,7 +298,14 @@ class ProviderIntegrationTests(unittest.TestCase):
         for provider in PROVIDERS:
             body = provider.read_text(encoding="utf-8")
             with self.subTest(provider=provider):
-                gate = body.index("tartci_admission_clean", body.index("run_one"))
+                # Anchor on the AUTHORITATIVE call, by the variable it fills.
+                # `tartci_admission_clean` alone is no longer unique: the macOS
+                # provider also probes before the clone, and matching the first
+                # occurrence would measure that early bail instead of the gate.
+                gate = body.index(
+                    'admission_json="$(tartci_admission_clean',
+                    body.index("run_one"),
+                )
                 mint = body.index("generate-jitconfig", body.index("run_one"))
                 if "qemu-windows" in str(provider):
                     boot = body.index('if [ "$up" != 1 ]', body.index("run_one"))
