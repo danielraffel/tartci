@@ -44,6 +44,38 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   diagnosis and pre-admission detector (live attribution plus focused tests),
   MEDIUM for final TCC durability until that replacement-build canary runs.
 
+## A webhook 403 has three causes and only one is a credential (2026-09-21)
+
+- **`shipyard-daemon-health` clears the token cache and refreshes every five
+  minutes until it hits its escalation limit, and the daemon still cannot
+  register its webhook.** → *Cause:* the GitHub App installation is missing
+  `repository_hooks`. GitHub reports that as HTTP 403 "Resource not accessible
+  by integration", which is byte-for-byte as much a 403 as a dead credential —
+  so the watchdog applied the credential remedy to a credential that was
+  working perfectly, failed identically every cycle, and reported nothing an
+  operator could act on. Three different faults arrive as 403: a missing App
+  permission (a human must grant it), a classic token missing
+  `admin:repo_hook` (a one-time `gh auth refresh`), and a genuinely dead or
+  anonymous credential (the only one worth clearing anything for). → *Fix:* the
+  watchdog now classifies before it heals, and answers a permission fault by
+  escalating and touching nothing. Never read "403" alone as "rotate the
+  credential".
+
+- **Every webhook delivery fails to connect and no alarm fires anywhere.** →
+  *Cause:* this host's tailnet name changed — Tailscale re-registers a
+  duplicate node under a `-N` suffix and the old name stops resolving — while
+  the registered hook kept the old name. The daemon printed a correct tunnel
+  URL and GitHub served a correct hook record; each side was individually
+  truthful and nobody compared them. Nothing consumed the feed either, so its
+  failure had no symptom. → *Fix:* `shipyard daemon reconcile` performs the
+  comparison (exit 0 in sync, 1 warn, 2 alarm, 3 blocked on a human) and the
+  watchdog routes on it. When diagnosing by hand, read the host's own identity
+  from `tailscale status --json` → `.Self.DNSName` (strip the trailing dot).
+  The CLI is **not** on a non-interactive PATH, so `command -v tailscale`
+  returns empty on a perfectly healthy host — resolve
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale` explicitly and treat a
+  failure to read the identity as UNKNOWN, never as "no drift".
+
 ## Cross-cutting (AVF / QEMU media)
 
 - **"Invalid disk image. The disk image format is not recognized."**
