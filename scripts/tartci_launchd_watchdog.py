@@ -561,9 +561,25 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         # the stale-log classifier below could bootout a healthy runner. This
         # watchdog owns only the fail-closed installation-presence audit for
         # these services; Actions runtime/job health stays with Shipyard.
+        #
+        # That delegation used to end here, as a bare sentence, and it was
+        # wrong for three months: this branch printed a checkmark over a
+        # service in a `spawn scheduled` crash loop with 3,684 launches and no
+        # `.runner` registration file, while Shipyard knew nothing about this
+        # host at all. Both halves passed their own check by pointing at the
+        # other.
+        #
+        # The rule now: a delegation may only pass when it names the ARTIFACT
+        # carrying the other side's verdict, and absence of that artifact is a
+        # fault. `tartci_host_attestation.py` writes it; Shipyard's landability
+        # preflight reads it and reports Unknown - never Served - when it is
+        # missing or stale. The verdict is still not computed here, because
+        # that is genuinely Shipyard's half; what changed is that the reader is
+        # told where to look and can tell absence from health.
         return AgentHealth(
             label, plist_path, log_path, state, last_exit, log_age, "healthy",
-            "declared runner executable exists; runtime health is owned by Shipyard",
+            "declared runner executable exists; runtime health is owned by Shipyard "
+            f"via {attestation_reference()}",
         )
     pool_runner = is_pool_runner(label)
     if pool_runner and service_enabled is False:
@@ -598,6 +614,21 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
+
+
+def attestation_reference() -> str:
+    """Name the artifact this watchdog delegates runtime health to.
+
+    Reports the path and, when the file is present, its age - so a reader of
+    this line can tell "delegated and the other side is looking" apart from
+    "delegated into the void", which is what the bare sentence could not say.
+    """
+    root = os.environ.get("TARTCI_HOME") or os.path.join(os.path.expanduser("~"), ".tartci")
+    path = os.path.join(root, "state", "host-attestation.json")
+    if not os.path.exists(path):
+        return f"{path} (MISSING - delegation is unverified)"
+    age = int(max(0.0, utcnow() - os.path.getmtime(path)))
+    return f"{path} ({age}s old)"
 
 
 def is_pool_runner(label: str) -> bool:

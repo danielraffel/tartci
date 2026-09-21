@@ -101,6 +101,167 @@ def _object_list(payload: Any, key: str, path: str) -> list[dict[str, Any]]:
     return value
 
 
+class StaleDemandClassifier:
+    """Refuses to count demand from a merge_group run that can no longer run.
+
+    A dequeued merge queue entry can leave its workflow run reporting `queued`
+    indefinitely: the queue branch is deleted, the run carries no jobs, a normal
+    cancel reports the run already completed, a force-cancel reports it is not
+    queued, and deleting it is forbidden. Nothing in the run's own status
+    distinguishes that from a live entry, so demand derived from status alone
+    never drains and the class it belongs to outranks every lower tier forever.
+
+    Classification is POSITIVE DETERMINATION ONLY. An API error, a timeout, or
+    any indeterminate answer leaves the run counted. Treating uncertainty as
+    staleness would turn this guard into the silent demand-suppressor it exists
+    to prevent, which is the more dangerous of the two failures: a run wrongly
+    counted wastes a boot, a run wrongly discarded strands real work.
+
+    A run is excluded from demand only when BOTH its queue branch is confirmed
+    absent AND it is confirmed to carry no queued job — the exact signature
+    above — and it is remembered on that same conjunction, so later passes skip
+    its job fetch entirely. Requiring both halves keeps the one combination that
+    could remove real demand (a branch confirmed absent while queued jobs
+    remain) out of scope; a live branch carrying no queued job already
+    contributes nothing to count.
+    """
+
+    CLASSIFIED_EVENT = "merge_group"
+
+    def __init__(self, scanner: "AssignmentScanner", args: argparse.Namespace) -> None:
+        self.scanner = scanner
+        self.enabled = args.stale_demand_classifier
+        self.ttl = args.stale_demand_ttl_seconds
+        self.min_age = args.stale_demand_min_age_seconds
+        self.path = Path(args.stale_demand_quarantine_file)
+        self.lock = threading.Lock()
+        self.evidence: list[dict[str, Any]] = []
+        self.quarantined: dict[str, dict[str, Any]] = {}
+        self.dirty = False
+        if self.enabled:
+            self.quarantined = self._load()
+
+    # ── persistence ──
+    def _load(self) -> dict[str, dict[str, Any]]:
+        # A quarantine we cannot read is an empty quarantine: the only cost is
+        # re-doing work. Refusing to scan because a cache file is corrupt would
+        # make a cosmetic problem fail the fleet.
+        try:
+            payload = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        runs = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(runs, dict):
+            return {}
+        now = time.time()
+        live: dict[str, dict[str, Any]] = {}
+        for run_id, record in runs.items():
+            if not isinstance(record, dict):
+                continue
+            at = record.get("quarantined_at")
+            if not isinstance(at, (int, float)):
+                continue
+            if now - at >= self.ttl:
+                self.dirty = True
+                continue
+            live[str(run_id)] = record
+        return live
+
+    def persist(self) -> None:
+        if not self.enabled or not self.dirty:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"runs": self.quarantined}, indent=2, sort_keys=True) + "\n"
+            )
+            os.replace(tmp, self.path)
+        except OSError:
+            # Losing the memo costs an API call next pass and nothing else.
+            pass
+
+    # ── evidence ──
+    def note(self, kind: str, run: dict[str, Any], **fields: Any) -> None:
+        record = {
+            "evidence": kind,
+            "run_id": run.get("id"),
+            "event": run.get("event"),
+            "head_branch": run.get("head_branch"),
+            **fields,
+        }
+        with self.lock:
+            self.evidence.append(record)
+
+    def emit(self) -> None:
+        # stderr only. stdout carries the demand count the caller parses.
+        for record in self.evidence:
+            print("stale-demand: " + json.dumps(record, sort_keys=True), file=sys.stderr)
+
+    # ── classification ──
+    def considers(self, run: dict[str, Any]) -> bool:
+        if not self.enabled:
+            return False
+        if str(run.get("event", "")).lower() != self.CLASSIFIED_EVENT:
+            return False
+        # A merge_group run that is genuinely in flight is the normal case and
+        # must cost nothing. Only a run that has been queued long enough to be
+        # anomalous is worth an extra call.
+        stamp = str(run.get("created_at") or run.get("updated_at") or "")
+        try:
+            created = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        except (AttributeError, ValueError):
+            return False
+        age = (dt.datetime.now(dt.timezone.utc) - created).total_seconds()
+        return age >= self.min_age
+
+    def remembered(self, run: dict[str, Any]) -> bool:
+        """True when a previous pass proved this run stale — skip its jobs fetch."""
+        if not self.considers(run):
+            return False
+        record = self.quarantined.get(str(run.get("id")))
+        if record is None:
+            return False
+        self.note("quarantine_hit", run, reason=record.get("reason"))
+        return True
+
+    def classify(self, run: dict[str, Any], queued_jobs: int) -> bool:
+        """Return True when this run's demand must not be counted."""
+        if not self.considers(run):
+            return False
+        has_job = queued_jobs > 0
+        branch_live = self._branch_live(run)
+        if branch_live is None:
+            # Indeterminate. Count the run; say so, so a persistent
+            # indeterminate answer is visible rather than silently benign.
+            self.note("indeterminate", run, queued_jobs=queued_jobs)
+            return False
+        if branch_live or has_job:
+            # Either half alone is not enough. A branch confirmed absent beside
+            # a run that still carries a queued job is the one combination that
+            # could remove real demand, and no observed stale run has that
+            # shape; a live branch with no queued job already contributes zero.
+            # So exclusion requires BOTH halves, which is also the signature
+            # that governs persistence below.
+            return False
+        reason = "queue_branch_absent_and_no_queued_job"
+        self.note("excluded", run, reason=reason, queued_jobs=queued_jobs)
+        with self.lock:
+            self.quarantined[str(run.get("id"))] = {
+                "quarantined_at": time.time(),
+                "reason": reason,
+                "head_branch": run.get("head_branch"),
+            }
+            self.dirty = True
+        return True
+
+    def _branch_live(self, run: dict[str, Any]) -> bool | None:
+        branch = run.get("head_branch")
+        if not isinstance(branch, str) or not branch.strip():
+            return None
+        return self.scanner.ref_exists(f"heads/{branch.strip()}")
+
+
 class AssignmentScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -127,6 +288,7 @@ class AssignmentScanner:
         self.observation_lock_fd: int | None = None
         self.witness = threading.Event()
         self.workflow_id_cache_path = Path(args.workflow_id_cache_file)
+        self.stale_demand = StaleDemandClassifier(self, args)
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
@@ -229,6 +391,38 @@ class AssignmentScanner:
                         f"{error} (after {attempt} attempt(s))"
                     ) from error
         raise AssertionError("unreachable")
+
+    def ref_exists(self, ref: str) -> bool | None:
+        """True / False / None for present / confirmed absent / indeterminate.
+
+        `_gh` deliberately collapses every non-200 into a fail-closed error. A
+        staleness verdict needs the opposite: it must be able to tell a definite
+        404 apart from a timeout, because only the first is evidence.
+        """
+        path = f"repos/{self.args.repo}/git/ref/{ref}"
+        with self.api_calls_lock:
+            if self.api_calls >= self.args.max_api_calls:
+                return None
+            self.api_calls += 1
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        try:
+            result = run_bounded(
+                [self.args.gh_cli, "api", path],
+                timeout=min(self.args.gh_timeout, remaining),
+                operation="assignment_scan_ref_probe",
+                pass_fds=(self.observation_lock_fd,)
+                if self.observation_lock_fd is not None
+                else (),
+            )
+        except (OSError, ObservationError):
+            return None
+        if result.returncode == 0:
+            return True
+        if "404" in (result.stderr or ""):
+            return False
+        return None
 
     def _pages(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
         """Read a whole listing into memory, restarting a torn pass.
@@ -475,7 +669,14 @@ class AssignmentScanner:
             # the verdict. Returning before the request is the whole saving.
             return 0
         matches: set[int] = set()
+        queued_jobs = 0
         run_id = int(run["id"])
+        # A run already proved stale is not fetched again. That fetch is not
+        # free: a permanently queued run is re-read by every lane on every
+        # pass, and that added call is what pushes an otherwise healthy scan
+        # past its API timeout and blinds the host.
+        if self.stale_demand.remembered(run):
+            return 0
         prefix = (
             f"repos/{self.args.repo}/actions/runs/{run_id}"
             "/jobs?filter=latest"
@@ -483,6 +684,7 @@ class AssignmentScanner:
         for job in self._pages(prefix, "jobs"):
             if str(job.get("status", "")).lower() != "queued":
                 continue
+            queued_jobs += 1
             labels_raw = job.get("labels")
             if not isinstance(labels_raw, list):
                 raise ScanError(f"queued job in run {run_id} has invalid labels")
@@ -528,6 +730,12 @@ class AssignmentScanner:
                 # One witness settles the question the caller actually asks.
                 self.witness.set()
                 return len(matches)
+        # Reached only when the loop ran to the end, so `queued_jobs` is the
+        # run's complete count. A run that produced a witness returned above
+        # and is never classified, which is correct: a matching queued job is
+        # demand whatever its queue branch says.
+        if self.stale_demand.classify(run, queued_jobs):
+            return 0
         return len(matches)
 
     def scan(self) -> int:
@@ -578,6 +786,10 @@ class AssignmentScanner:
                         self._walk_listing(prefix, "workflow_runs", visit)
                 except WitnessAbandon:
                     pass
+        # Published on every exit path, including the abandoned one: a run
+        # proved stale before the witness landed is still worth remembering.
+        self.stale_demand.persist()
+        self.stale_demand.emit()
         if self.witness.is_set():
             # Deliberately not the running total: the scan stopped early, so the
             # total is a partial count and reporting it would invent precision
@@ -645,6 +857,22 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS", "1")),
     )
     parser.add_argument(
+        "--stale-demand-classifier",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("TARTCI_STALE_DEMAND_CLASSIFIER", "1") != "0",
+    )
+    parser.add_argument(
+        "--stale-demand-ttl-seconds",
+        type=int,
+        default=int(os.environ.get("TARTCI_STALE_DEMAND_TTL_SECS", "21600")),
+    )
+    parser.add_argument(
+        "--stale-demand-min-age-seconds",
+        type=int,
+        default=int(os.environ.get("TARTCI_STALE_DEMAND_MIN_AGE_SECS", "1800")),
+    )
+    parser.add_argument("--stale-demand-quarantine-file", default=None)
+    parser.add_argument(
         "--workflow-id-cache-file",
         default=os.environ.get("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE")
         or str(Path.home() / ".tartci/state/assignment-workflow-ids.json"),
@@ -694,6 +922,16 @@ def parse_args() -> argparse.Namespace:
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
+    if args.stale_demand_ttl_seconds <= 0:
+        parser.error("--stale-demand-ttl-seconds must be positive")
+    if args.stale_demand_min_age_seconds < 0:
+        parser.error("--stale-demand-min-age-seconds must be non-negative")
+    if args.stale_demand_quarantine_file is None:
+        # Follows whatever state directory the observation lock uses, so a test
+        # or a redirected fleet root does not write into the real one.
+        args.stale_demand_quarantine_file = str(
+            Path(args.observation_lock_file).parent / "stale-demand-quarantine.json"
+        )
     if not math.isfinite(args.workflow_id_cache_ttl):
         parser.error("--workflow-id-cache-ttl must be finite")
     return args
