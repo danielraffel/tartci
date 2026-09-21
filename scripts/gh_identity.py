@@ -205,9 +205,7 @@ def identity_from_rate_limit(
     )
 
 
-def unproven_identity(
-    detail: str = "", env: Mapping[str, str] | None = None
-) -> GitHubIdentity:
+def unproven_identity(env: Mapping[str, str] | None = None) -> GitHubIdentity:
     """An identity the caller could not measure, and must not assume."""
 
     return GitHubIdentity(
