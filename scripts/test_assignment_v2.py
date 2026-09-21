@@ -1372,6 +1372,250 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
                          "arithmetic probe is broken")
 
 
+class AssignmentScanCheapPresenceTests(unittest.TestCase):
+    """What the walk buys, and what it still refuses to conclude.
+
+    Presence and absence are priced differently on purpose. A matching queued
+    job is a complete proof that no further looking can retract, so the walk
+    stops on it. Absence is only ever established by looking everywhere, so it
+    still costs the whole enumeration and every reconciliation. Each test here
+    runs both cells, because a cheap path that can only report presence and a
+    fail-closed path that can only report failure are each worthless alone.
+    """
+
+    QUEUED = 6
+    INPROG = 12
+
+    _GH = '''#!/usr/bin/env python3
+import json, os, sys
+from urllib.parse import parse_qs, urlparse
+
+LEDGER = os.environ["LEDGER"]
+QUEUED = int(os.environ["QUEUED"])
+INPROG = int(os.environ["INPROG"])
+MATCH = {int(x) for x in os.environ.get("MATCH", "").split(",") if x}
+TEAR = os.environ.get("TEAR", "")
+GONE = os.environ.get("GONE", "")
+FAIL_ON = os.environ.get("FAIL_ON", "")
+
+target = sys.argv[-1]
+with open(LEDGER, "a") as handle:
+    handle.write(target + "\\n")
+if FAIL_ON and FAIL_ON in target:
+    sys.stderr.write("net/http: TLS handshake timeout\\n")
+    raise SystemExit(1)
+
+p = urlparse("https://x/" + target)
+status = parse_qs(p.query).get("status", [""])[0]
+
+if p.path.endswith("/actions/workflows"):
+    print(json.dumps({"total_count": 1,
+                      "workflows": [{"id": 99, "name": "Build and Test"}]}))
+elif "/actions/workflows/" in p.path and p.path.endswith("/runs"):
+    workflow = int(p.path.split("/actions/workflows/", 1)[1].split("/", 1)[0])
+    if GONE and workflow == int(GONE):
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        raise SystemExit(1)
+    ids = (list(range(1, QUEUED + 1)) if status == "queued"
+           else list(range(1001, 1001 + INPROG)))
+    # A torn listing counts one more run than its body carries, which is what
+    # a run leaving `queued` between the count and the body looks like.
+    print(json.dumps({"total_count": len(ids) + (1 if TEAR == status else 0),
+                      "workflow_runs": [{"id": i, "name": "Build and Test"} for i in ids]}))
+elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
+    run_id = int(p.path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+    if run_id in MATCH:
+        print(json.dumps({"total_count": 1, "jobs": [
+            {"id": run_id, "status": "queued", "labels": %s}]}))
+    else:
+        print(json.dumps({"total_count": 1, "jobs": [
+            {"id": run_id, "status": "in_progress", "labels": []}]}))
+else:
+    raise SystemExit(4)
+''' % repr(BASE + ["pulp-build-merge-group"])
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.fake = self.root / "fake-gh"
+        _write_exec(self.fake, self._GH)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _scan(self, cache: Path | None = None, ttl: str = "0", **envx):
+        """Run one scan and return its result plus a per-endpoint call census."""
+        ledger = self.root / f"ledger-{len(list(self.root.glob('ledger-*')))}"
+        ledger.write_text("")
+        environment = dict(
+            os.environ, LEDGER=str(ledger),
+            QUEUED=str(self.QUEUED), INPROG=str(self.INPROG),
+            **{key: str(value) for key, value in envx.items()},
+        )
+        result = subprocess.run(
+            [
+                "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                "--workflow", "Build and Test",
+                "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
+                "--require-label", "pulp-build-merge-group",
+                "--gh-cli", str(self.fake), "--max-workers", "1",
+                "--retry-backoff", "0",
+                "--observation-lock-file", str(self.root / "observation.lock"),
+                "--workflow-id-cache-file",
+                str(cache if cache is not None else self.root / "unused-cache.json"),
+                "--workflow-id-cache-ttl", ttl,
+            ],
+            text=True, capture_output=True, check=False, env=environment,
+        )
+        calls = [line for line in ledger.read_text().splitlines() if line]
+        census = {
+            "workflows": len([c for c in calls if "/actions/workflows?" in c]),
+            "queued": len([c for c in calls if "status=queued" in c]),
+            "in_progress": len([c for c in calls if "status=in_progress" in c]),
+            "jobs": len([c for c in calls if "/jobs?" in c]),
+            "total": len(calls),
+        }
+        runs = [int(c.split("/actions/runs/", 1)[1].split("/", 1)[0])
+                for c in calls if "/jobs?" in c]
+        return result, census, runs
+
+    def test_a_witness_stops_the_walk_before_the_in_progress_listing(self) -> None:
+        """A queued run answers the question, so the other listing is not read.
+
+        The control is the same fixture with nothing to find: that scan must
+        read the `in_progress` listing, because a queued job can sit in a run
+        that is already in progress and absence has to account for it.
+        """
+        found, census, _ = self._scan(MATCH="1")
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual(found.stdout.strip(), "1")
+        self.assertEqual(census["in_progress"], 0, census)
+
+        empty, empty_census, _ = self._scan(MATCH="")
+        self.assertEqual(empty.returncode, 0, empty.stderr)
+        self.assertEqual(empty.stdout.strip(), "0")
+        self.assertEqual(empty_census["in_progress"], 1, empty_census)
+
+    def test_presence_costs_materially_less_than_proving_absence(self) -> None:
+        """The saving, as a number rather than an adjective."""
+        found, found_census, _ = self._scan(MATCH="1")
+        empty, empty_census, _ = self._scan(MATCH="")
+        self.assertEqual(found.stdout.strip(), "1")
+        self.assertEqual(empty.stdout.strip(), "0")
+        # Workflow listing, queued listing, one run's jobs. Nothing else.
+        self.assertEqual(found_census["total"], 3, found_census)
+        # Both listings, plus every run in both of them.
+        self.assertEqual(
+            empty_census["total"], 3 + self.QUEUED + self.INPROG, empty_census
+        )
+        self.assertGreater(empty_census["total"], 5 * found_census["total"])
+
+    def test_absence_is_reported_only_after_every_run_is_examined(self) -> None:
+        """The fail-closed half: zero is a claim about everywhere.
+
+        The control proves the assertion can fail: the same fixture with a
+        match reports 1 having examined almost none of these runs, so the
+        exhaustive set is a property of the absent cell and not of the fixture.
+        """
+        empty, _, examined = self._scan(MATCH="")
+        self.assertEqual(empty.stdout.strip(), "0")
+        expected = set(range(1, self.QUEUED + 1)) | set(
+            range(1001, 1001 + self.INPROG)
+        )
+        self.assertEqual(set(examined), expected)
+
+        found, _, found_examined = self._scan(MATCH="1")
+        self.assertEqual(found.stdout.strip(), "1")
+        self.assertLess(len(found_examined), len(expected))
+
+    def test_a_torn_listing_with_nothing_to_find_is_unknown_not_empty(self) -> None:
+        """The error this scanner exists to prevent.
+
+        A listing whose body never adds up to its own count was not read as one
+        snapshot, so it cannot support a claim of absence. It must leave the
+        scan blind rather than report a zero that would idle a lane. The
+        control is the same fixture untorn, which does report zero.
+        """
+        torn, _, _ = self._scan(MATCH="", TEAR="queued")
+        self.assertEqual(torn.returncode, 2, torn.stdout)
+        self.assertNotEqual(torn.stdout.strip(), "0")
+        self.assertIn("assignment scan failed closed", torn.stderr)
+
+        clean, _, _ = self._scan(MATCH="")
+        self.assertEqual(clean.returncode, 0, clean.stderr)
+        self.assertEqual(clean.stdout.strip(), "0")
+
+    def test_a_restarted_pass_does_not_rescan_what_it_already_scanned(self) -> None:
+        """A re-read listing hands back runs whose jobs are already known."""
+        torn, census, examined = self._scan(MATCH="", TEAR="queued")
+        self.assertEqual(torn.returncode, 2, torn.stdout)
+        # Control: the restart has to have happened, or dedup proves nothing.
+        self.assertGreater(census["queued"], 1, census)
+        self.assertEqual(len(examined), len(set(examined)), examined)
+
+    def test_a_failing_call_fails_closed(self) -> None:
+        """A call that never answered is not evidence the queue is empty."""
+        broken, _, _ = self._scan(MATCH="1", FAIL_ON="/jobs?")
+        self.assertEqual(broken.returncode, 2, broken.stdout)
+        self.assertNotEqual(broken.stdout.strip(), "0")
+
+        working, _, _ = self._scan(MATCH="1")
+        self.assertEqual(working.returncode, 0, working.stderr)
+        self.assertEqual(working.stdout.strip(), "1")
+
+    def test_a_warm_workflow_id_cache_stops_paying_for_the_listing(self) -> None:
+        """The one input that does not change between polls is read once."""
+        cache = self.root / "workflow-ids.json"
+        first, first_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first_census["workflows"], 1, first_census)
+
+        second, second_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout.strip(), "1")
+        self.assertEqual(second_census["workflows"], 0, second_census)
+
+    def test_an_expired_workflow_id_cache_is_resolved_again(self) -> None:
+        """The staleness window is bounded, so the entry is not permanent."""
+        cache = self.root / "workflow-ids.json"
+        self._scan(cache=cache, ttl="300", MATCH="1")
+        fresh, fresh_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(fresh_census["workflows"], 0, fresh_census)
+
+        payload = json.loads(cache.read_text())
+        payload["Generous-Corp/pulp"]["fetched_at"] -= 10_000
+        cache.write_text(json.dumps(payload))
+        expired, expired_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(expired.returncode, 0, expired.stderr)
+        self.assertEqual(expired_census["workflows"], 1, expired_census)
+
+    def test_an_unreadable_workflow_id_cache_is_a_miss_not_a_failure(self) -> None:
+        """The cache only ever saves a call, so a broken one costs that call."""
+        cache = self.root / "workflow-ids.json"
+        cache.write_text("{not json at all")
+        result, census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        self.assertEqual(census["workflows"], 1, census)
+
+    def test_a_cached_id_that_stops_resolving_fails_the_scan_closed(self) -> None:
+        """The cache cannot turn a broken lookup into an empty queue.
+
+        A cached id is only ever spent on that workflow's own listing call, so
+        an id that no longer resolves fails there. The control is the same warm
+        cache against a workflow that still exists.
+        """
+        cache = self.root / "workflow-ids.json"
+        self._scan(cache=cache, ttl="300", MATCH="1")
+
+        gone, _, _ = self._scan(cache=cache, ttl="300", MATCH="1", GONE="99")
+        self.assertEqual(gone.returncode, 2, gone.stdout)
+        self.assertNotEqual(gone.stdout.strip(), "0")
+
+        alive, alive_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(alive.returncode, 0, alive.stderr)
+        self.assertEqual(alive.stdout.strip(), "1")
+        self.assertEqual(alive_census["workflows"], 0, alive_census)
+
+
 # Every test class must be defined before the runner starts, so this stays the
 # last statement in the file. Placed earlier it silently truncates the suite:
 # the classes below the call are never defined and their tests never run.
