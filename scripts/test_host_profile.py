@@ -99,6 +99,43 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertEqual(encoded["lease_capacity_mem_mb"], 6144)
         self.assertEqual(encoded["pulp_build_mem_budget_mb"], 6144)
 
+    def test_memory_reserve_mirrors_the_core_reserve(self) -> None:
+        """reserved_gate_mem_mb holds the gate's share on the memory axis too.
+
+        Pinned to the live m3 shape: 28 cores / 96 GiB dedicated-builder, whose
+        core reserve is 14 of a 26-core budget. The memory reserve must be the
+        same share of the 80 GiB memory budget, or the gate is protected on one
+        axis and exposed on the other.
+        """
+        profile = host_profile.build_profile(
+            role="dedicated-builder", cores=28, memory_mb=98304
+        )
+        self.assertEqual(profile["lease_capacity_cores"], 26)
+        self.assertEqual(profile["reserved_gate_cores"], 14)
+        self.assertEqual(profile["lease_capacity_mem_mb"], 81920)
+        self.assertEqual(profile["reserved_gate_mem_mb"], 81920 * 14 // 26)
+        self.assertEqual(
+            profile["non_gate_capacity_mem_mb"],
+            81920 - profile["reserved_gate_mem_mb"],
+        )
+
+    def test_memory_reserve_never_starves_the_non_gate_class(self) -> None:
+        """Even a tiny budget leaves non-gate work one compile job's worth."""
+        profile = host_profile.build_profile(
+            role="dedicated-builder", cores=28, memory_mb=17408
+        )
+        # 17 GiB - 8 GiB headroom - 8 GiB link reserve = 1 GiB budget, which is
+        # under one compile job — the reserve must collapse rather than zero the
+        # non-gate class out.
+        self.assertEqual(profile["lease_capacity_mem_mb"], 1536)
+        self.assertEqual(profile["reserved_gate_mem_mb"], 0)
+        self.assertEqual(profile["non_gate_capacity_mem_mb"], 1536)
+
+    def test_memory_reserve_is_zero_when_the_axis_is_off(self) -> None:
+        profile = host_profile.build_profile(role="light", cores=10, memory_mb=0)
+        self.assertEqual(profile["reserved_gate_mem_mb"], 0)
+        self.assertEqual(profile["non_gate_capacity_mem_mb"], 0)
+
     def test_memory_axis_off_when_ram_unknown(self) -> None:
         profile = host_profile.build_profile(role="light", cores=10, memory_mb=0)
         self.assertEqual(profile["lease_capacity_mem_mb"], 0)

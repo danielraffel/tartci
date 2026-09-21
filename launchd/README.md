@@ -220,8 +220,11 @@ tri-state (`running`, `idle`, or `unavailable`) and resolves
 `TARTCI_TART_CLI`, PATH, then the canonical Homebrew locations. It preserves an
 explicit `TART_HOME` or derives `[host].tart_home` from the installed fleet
 profile; it never treats Tart's unrelated default store as authoritative. The
-watchdog still refuses alive-but-frozen recovery when inventory is unavailable,
-so this diagnostic distinction does not weaken the long-build guard. Do not put relay hostnames,
+watchdog refuses both alive-but-frozen and crash-loop recovery when inventory is
+unavailable, so this diagnostic distinction does not weaken the long-build
+guard. That refusal is only as good as the rendered `TART_HOME`: a LaunchAgent
+inherits no login shell, so an agent installed without it reads Tart's default
+store, reports an empty inventory, and reads every long build as an idle host. Do not put relay hostnames,
 GitHub tokens, or proxy variables in shell startup files; the profile records
 only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
 While pool participation is off, reconciliation loads and proves only the
@@ -284,8 +287,16 @@ can catch it — recovery must live outside the wedged agent. The watchdog
 (`scripts/tartci_launchd_watchdog.py`) discovers every tartci LaunchAgent, and
 for each reads `launchctl print` (`last exit code`, `state`) plus the log mtime.
 It heals crash-looping agents when they **exited non-zero AND their log has gone
-stale** (the two together distinguish the invisible crash-loop from a healthy
-between-jobs idle, whose "waiting" log is always fresh). Healing is the same full
+stale AND no VM is running** (the first two together distinguish the invisible
+crash-loop from a healthy between-jobs idle, whose "waiting" log is always
+fresh; the third separates it from a supervisor that is simply quiet inside a
+long build). The VM condition is load-bearing rather than belt-and-braces: a
+`serve --loop` exits `EX_TEMPFAIL` by design and launchd reports that non-zero
+code for the whole life of the respawned job, so a supervisor that writes
+nothing for the 30-minute stale threshold while a required gate job builds is
+indistinguishable from a crash-loop on exit code and log age alone. Healing it
+boots out the supervisor under that live job and takes its guest with it. An
+inventory that cannot be read is reported `unknown` and never healed. Healing is the same full
 bootout+bootstrap+kickstart, rate-limited (default: max 3 heals per label per
 hour) so a genuinely broken plist logs loudly to
 `~/Library/Logs/tartci/tartci-launchd-watchdog.log` instead of thrashing. It
@@ -318,8 +329,10 @@ plist should be active.
 
 ```
 mkdir -p "$HOME/Library/Logs/tartci"
-sed -e "s|\$HOME|$HOME|g" \
+: "${TART_HOME:?declare this host's Tart VM store}"
+python3 scripts/render_launchd_template.py \
   launchd/com.danielraffel.tartci.launchd-watchdog.plist.template \
+  --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
   > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"

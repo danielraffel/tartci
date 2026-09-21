@@ -504,6 +504,65 @@ class PoolCommandHelpTests(unittest.TestCase):
             )
             self.assertEqual(required.returncode, 8, required.stderr)
 
+            # The JSON carries None; the human-readable rendering is what an
+            # operator acts on, so assert the text itself cannot be read as a
+            # count of zero running supervisors.
+            human = subprocess.run(
+                [str(ROOT / "tartci"), "pool", "status"],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(human.returncode, 0, human.stderr)
+            self.assertIn(
+                "verified running supervisors: unknown", human.stdout
+            )
+            self.assertNotIn("verified running supervisors: 0", human.stdout)
+            # The detail must travel with the code -- "unknown" without a
+            # reason is just a quieter dead end. The cause varies (absent
+            # receipt here, a root mismatch when run from a source checkout),
+            # so assert the code carries a detail rather than one phrasing.
+            self.assertIn("problem: receipt_mismatch: ", human.stdout)
+
+    def test_unavailable_toml_interpreter_reports_unknown_not_zero(self) -> None:
+        """The probe that cannot run must not render as a probe that found nothing.
+
+        This branch is reached on a host whose PATH resolves only a Python
+        without tomllib -- the same PATH shape a LaunchAgent inherits. It is a
+        different code path from a bad receipt but the identical reading error,
+        so it gets its own control rather than riding on the other test.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            home = root / "home"
+            agents = home / "Library/LaunchAgents"
+            agents.mkdir(parents=True)
+            state = home / ".config/tartci"
+            state.mkdir(parents=True)
+            (state / "pool-state").write_text("on\n")
+            (state / "native-build-participation").write_text("1\n")
+            label = "com.danielraffel.tartci.tart-runner-macos-fleet.test.gate"
+            with (agents / f"{label}.plist").open("wb") as handle:
+                plistlib.dump({"Label": label, "ProgramArguments": ["/bin/true"]}, handle)
+            # /bin/sh resolves but has no tomllib, so the resolver exits 127.
+            env = {**os.environ, "HOME": str(home), "TARTCI_PYTHON": "/bin/sh"}
+
+            body = json.loads(subprocess.run(
+                [str(ROOT / "tartci"), "pool", "status", "--json"],
+                text=True, capture_output=True, check=False, env=env,
+            ).stdout)
+            self.assertEqual(
+                body["fleet"]["problems"][0]["code"],
+                "python_toml_interpreter_unavailable",
+            )
+            self.assertIsNone(body["fleet"]["verified_running_supervisors"])
+
+            human = subprocess.run(
+                [str(ROOT / "tartci"), "pool", "status"],
+                text=True, capture_output=True, check=False, env=env,
+            )
+            self.assertEqual(human.returncode, 0, human.stderr)
+            self.assertIn("verified running supervisors: unknown", human.stdout)
+            self.assertNotIn("verified running supervisors: 0", human.stdout)
+
     def _run_pool(
         self, root: Path, *args: str
     ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:

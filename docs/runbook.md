@@ -1391,7 +1391,14 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   capacity via `--capacity-mem-mb`); admission is `min(core-budget,
   memory-budget)`, so a build is refused when it would exhaust RAM even if cores
   are free. Legacy core-only records are estimated as `cores × per-job memory`
-  so a mixed store never over-admits.
+  so a mixed store never over-admits. The gate reserve applies on this axis too
+  (`reserved_gate_mem_mb`, overridable with `--reserved-gate-mem-mb`): a
+  non-gate lease is held to `capacity - reserve`, because a non-gate build that
+  fits the non-gate *core* budget could otherwise consume the RAM the next gate
+  VM needs and darken the required `macos` gate. The reserve is derived
+  proportional to `reserved_gate_cores` and clamped so non-gate work always
+  keeps at least one compile job's worth. A denial names which limit bound it
+  (`memory_limit_class`: `non_gate` or `host`).
 - **Disk as a third, per-volume axis** — macOS/Linux Tart clones reserve growth
   against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN_WORK`.
   Device ID, not a spelling of the path, is the accounting key, so aliases on
@@ -1400,6 +1407,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   transaction as CPU/RAM admission. JSON status and denial records emit
   `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
   diagnosis.
+
+- **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
+  charged on the memory axis is the figure the clone is booted with
+  (`tart set --cpu C --memory M`). A clone otherwise inherits its golden's baked
+  memory, so the charge and the boot size would agree only by coincidence, and
+  Pulp's guest-side build governor derives its job count from the memory the
+  guest can actually see. The size is derived after the non-gate core clamp, so
+  a clamped lane is charged for the cores it receives; an explicit
+  `TARTCI_<PROVIDER>_VM_MEM_MB` override is used verbatim instead.
+  `TARTCI_VM_LEASE_MIN_MEM_MB` / `TARTCI_VM_LEASE_MAX_MEM_MB` bound the
+  derivation. Raise the ceiling only against a fresh measurement of
+  per-Virtualization-process RSS against configured guest memory: that ratio
+  runs above 1, so concurrent guests cost more host RAM than they are
+  configured for.
 
   Managed macOS fleet lanes also set one host-level
   `TARTCI_DISK_DENIAL_RECEIPT_DIR` and their configured stable

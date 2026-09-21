@@ -156,6 +156,13 @@ PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
+# Set only by handle_supervisor_signal, and only when a run was still in flight
+# when the signal arrived. A signal is not proof the job is over: launchd
+# delivers SIGTERM for any bootout, including one the launchd watchdog issues on
+# a misread, while the guest may still be executing a required gate job.
+# Deleting that VM force-fails a live job with no failed step, so teardown
+# refuses the destructive half in this window.
+SIGNAL_LIVE_ASSIGNMENT=0
 CURRENT_JOB_ID=""
 CURRENT_WORKFLOW_NAME=""
 CURRENT_JOB_CAPTURE_STATUS="not-attempted"
@@ -175,6 +182,11 @@ CURRENT_REGISTERED_RUNNER=""
 CURRENT_RUNNER_API_ROOT=""
 CURRENT_AQUA_LABEL=""
 CLEANED_UP=0
+# Set when a VM lease is denied, cleared when one is granted or when the queue
+# drains. Carries the START of the blocked streak, not the latest denial, so a
+# supervisor that keeps re-entering work and keeps failing stays measurable
+# across the other phases it cycles through while blocked.
+SERVING_BLOCKED_SINCE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -481,7 +493,7 @@ heartbeat(){
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -767,6 +779,15 @@ terminate_current_guardian(){
 
 discard_current_vm(){
   [ -n "$CURRENT_VM" ] || return 0
+  if [ "${SIGNAL_LIVE_ASSIGNMENT:-0}" = 1 ]; then
+    # Nonterminal on purpose: the caller keeps owning the lease and the
+    # reservation, because the VM really is still consuming that capacity. The
+    # janitor reaps the VM once it is genuinely residue; a deleted guest under a
+    # live job is not recoverable at all.
+    note "refusing teardown of $CURRENT_VM — run ${CURRENT_RUN_ID:-} was still in flight when the supervisor was signalled"
+    event teardown_refused "vm=$CURRENT_VM reason=live_assignment run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}"
+    return 1
+  fi
   note "stopping — tearing down in-flight VM $CURRENT_VM"
   stop_current_aqua_runner
   if ! terminate_current_guardian; then
@@ -815,6 +836,10 @@ handle_supervisor_signal(){
     CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
     CURRENT_JOB_RECEIPT='{"kind":"terminal_unknown","detail":"supervisor_signal"}'
   fi
+  # A captured run id is the one signal that positively identifies work we would
+  # be destroying. Scan/assignment state alone can outlive a finished job, so it
+  # quarantines the observation above without also blocking reclamation.
+  [ -z "$CURRENT_RUN_ID" ] || SIGNAL_LIVE_ASSIGNMENT=1
   event supervisor_signal "INT/TERM quarantine=$CURRENT_ASSIGNMENT_QUARANTINE"
   cleanup
   trap - EXIT
@@ -1221,7 +1246,7 @@ run_one(){
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
-  local lease_cores lease_priority
+  local lease_cores lease_mem lease_priority lease_rc
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
@@ -1265,9 +1290,21 @@ run_one(){
   lease_cores="$(tartci_vm_lease_cores tart-macos)"
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
+  lease_rc=0
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" \
-    tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
+    tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || lease_rc=$?
+  if [ "$lease_rc" -ne 0 ]; then
+    # The only loop path that reaches work and then fails before any heartbeat.
+    # Without this the supervisor is silent while healthy, and a checker that
+    # can only see heartbeat age has no choice but to call it stale.
+    [ -n "$SERVING_BLOCKED_SINCE" ] \
+      || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    heartbeat vm-lease-denied
+    return "$lease_rc"
+  fi
+  SERVING_BLOCKED_SINCE=""
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
@@ -1280,8 +1317,8 @@ run_one(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
-    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
@@ -1641,6 +1678,9 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap priority_demand=$p)"
+      # No queued work means nothing is being denied; only contention counts as
+      # blocked, so an idle pass ends the streak rather than inflating it.
+      [ "${q:-0}" -gt 0 ] || SERVING_BLOCKED_SINCE=""
       heartbeat waiting
       sleep "$POLL"
     fi
