@@ -569,3 +569,153 @@ else:
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class AssignmentScannerTransientFaultTests(unittest.TestCase):
+    """A fault that carries no verdict about the queue must not end the scan.
+
+    Every scan here presents exactly one queued job matching the tier, so the
+    only correct complete answer is "1". A scan that reports 0 has under-counted
+    the queue and would idle a lane that has work; a scan that exits non-zero
+    has failed closed, which is correct only when the queue truly could not be
+    observed.
+    """
+
+    #: One `gh` stub, parameterised by which call it should sabotage and how
+    #: many times. It records every request so a test can prove the retry
+    #: actually re-issued the failed call rather than skipping it.
+    _GH = '''#!/usr/bin/env python3
+import json, os, sys
+from urllib.parse import parse_qs, urlparse
+
+FAIL_ON = os.environ["FAKE_GH_FAIL_ON"]
+FAIL_TIMES = int(os.environ["FAKE_GH_FAIL_TIMES"])
+LEDGER = os.environ["FAKE_GH_LEDGER"]
+MODE = os.environ.get("FAKE_GH_MODE", "transport")
+
+target = sys.argv[-1]
+with open(LEDGER, "a") as handle:
+    handle.write(target + "\\n")
+with open(LEDGER) as handle:
+    seen = [line for line in handle.read().splitlines() if FAIL_ON in line]
+
+p = urlparse("https://x/" + target)
+q = parse_qs(p.query)
+page = int(q.get("page", ["1"])[0])
+status = q.get("status", [""])[0]
+sabotage = FAIL_ON in target and len(seen) <= FAIL_TIMES
+
+if sabotage and MODE == "transport":
+    # What production emitted 543 times: gh itself fails, stdout is empty.
+    sys.stderr.write("net/http: TLS handshake timeout\\n")
+    raise SystemExit(1)
+
+if p.path.endswith("/actions/workflows"):
+    print(json.dumps({"total_count": 1, "workflows": [{"id": 99, "name": "Build and Test"}]}))
+elif "/actions/workflows/99/runs" in p.path:
+    if status != "queued":
+        print(json.dumps({"total_count": 0, "workflow_runs": []}))
+    elif sabotage and MODE == "race":
+        # A run left `queued` between the count and the body: total_count says
+        # two, the page carries one, and the page is short. Production called
+        # this "pagination ended before total_count (N < M)" 231 times.
+        print(json.dumps({"total_count": 2, "workflow_runs": [{"id": 101, "name": "Build and Test"}]}))
+    else:
+        print(json.dumps({"total_count": 1, "workflow_runs": [{"id": 101, "name": "Build and Test"}]}))
+elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
+    print(json.dumps({"total_count": 1, "jobs": [{"id": 1, "status": "queued", "labels": %s}]}))
+else:
+    raise SystemExit(4)
+''' % repr(BASE + ["pulp-build-merge-group"])
+
+    def _scan(self, fail_on: str, fail_times: int, mode: str = "transport",
+              extra: list[str] | None = None) -> tuple[subprocess.CompletedProcess, list[str]]:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "fake-gh"
+            ledger = root / "ledger"
+            ledger.write_text("")
+            _write_exec(fake, self._GH)
+            environment = dict(
+                os.environ,
+                FAKE_GH_FAIL_ON=fail_on,
+                FAKE_GH_FAIL_TIMES=str(fail_times),
+                FAKE_GH_LEDGER=str(ledger),
+                FAKE_GH_MODE=mode,
+            )
+            result = subprocess.run(
+                [
+                    "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                    "--workflow", "Build and Test",
+                    "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
+                    "--require-label", "pulp-build-merge-group",
+                    "--gh-cli", str(fake), "--retry-backoff", "0",
+                    *(extra or []),
+                ],
+                text=True, capture_output=True, check=False, env=environment,
+            )
+            return result, ledger.read_text().splitlines()
+
+    def test_a_transient_call_fault_is_retried_rather_than_ending_the_scan(self) -> None:
+        """The production defect: one dropped call must not discard the scan."""
+        result, requests = self._scan("actions/workflows?", fail_times=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        # The retry must be a real re-issue of the same call, not a skip.
+        attempts = [line for line in requests if "actions/workflows?" in line]
+        self.assertEqual(len(attempts), 2, requests)
+
+    def test_a_transient_fault_on_a_per_run_jobs_call_is_retried(self) -> None:
+        """The per-run fan-out is where N chances to fail live."""
+        result, requests = self._scan("/jobs?", fail_times=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        self.assertEqual(len([r for r in requests if "/jobs?" in r]), 2, requests)
+
+    def test_a_pagination_race_restarts_the_whole_pass(self) -> None:
+        """A torn listing is retried as a pass, never spliced together."""
+        result, requests = self._scan(
+            "actions/workflows/99/runs", fail_times=1, mode="race"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+        queued = [r for r in requests if "status=queued" in r]
+        self.assertEqual(len(queued), 2, requests)
+
+    def test_a_persistent_fault_still_fails_closed(self) -> None:
+        """Retry is not failing open: an unobservable queue still exits 2.
+
+        This is the protection the scan exists for. The supervisor reads a
+        non-zero exit as the absence of an observation and refuses to idle the
+        lane as empty; a zero here would silently strand queued work.
+        """
+        result, requests = self._scan("actions/workflows?", fail_times=99)
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn("assignment scan failed closed", result.stderr)
+        self.assertIn("after 3 attempt(s)", result.stderr)
+        self.assertNotIn("0", result.stdout.strip() or "x")
+        # Bounded: three attempts, not an unbounded hammer.
+        self.assertEqual(len([r for r in requests if "actions/workflows?" in r]), 3, requests)
+
+    def test_retries_are_configurable_and_zero_restores_the_old_behaviour(self) -> None:
+        """`--api-retries 0` is exactly the pre-fix scanner, for bisecting."""
+        result, requests = self._scan(
+            "actions/workflows?", fail_times=1, extra=["--api-retries", "0"]
+        )
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(len([r for r in requests if "actions/workflows?" in r]), 1, requests)
+
+    def test_retry_counts_are_validated(self) -> None:
+        for flag, value in (("--api-retries", "-1"), ("--pagination-retries", "9"),
+                            ("--retry-backoff", "-1")):
+            with self.subTest(flag=flag):
+                result = subprocess.run(
+                    [
+                        "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                        "--workflow", "Build and Test", "--labels", "pulp-build-pr-head",
+                        "--require-label", "pulp-build-pr-head", flag, value,
+                    ],
+                    text=True, capture_output=True, check=False,
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(flag, result.stderr)
