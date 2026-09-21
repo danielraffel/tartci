@@ -610,6 +610,19 @@ default; use `--process-line-width N` if a wider diagnostic view is needed. Use
 `--no-guest` when the VM is already gone or SSH is not useful, `--runner NAME`
 to narrow a host with multiple supervisors, and `--json` for scripts.
 
+It reports **supervisor coverage** as `supervisors=<matched>/<expected>`, where
+`matched` comes from the lanes' heartbeat state files and `expected` comes from
+the fleet LaunchAgents `launchctl` reports loaded. Two sources on purpose: a
+view that goes blind against the state files cannot also silence its own
+denominator. Exit codes: **0** the view is trustworthy (coverage complete, or
+the host genuinely runs no fleet lanes), **3** coverage shortfall — it matched
+fewer supervisors than are loaded, or could not establish how many should be
+there, and the output says `BLIND:` or `UNKNOWN:` rather than reporting an idle
+host. Anything else is an ordinary error. This implements the standing contract
+in `docs/runbook.md` ("treat an unreadable state file as a real health problem,
+not as 'no active runner'"): matching nothing where lanes are loaded is a
+failure to observe, never an observation that the host is idle.
+
 ### x86_64 cross / emulation (smoke, not a gate)
 The guest is ARM64 (Apple Virtualization has no x86). `tartci up linux
 --target-arch x86_64` cross-compiles for x64 (gcc/g++-x86-64-linux-gnu) and runs

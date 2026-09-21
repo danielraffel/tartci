@@ -282,6 +282,23 @@ def format_age(value: Any) -> str:
     return f"{value}s"
 
 
+def coverage_line(digest: dict[str, Any]) -> str:
+    """Render supervisor coverage, distinguishing blindness from emptiness.
+
+    `matched/expected` is the whole point: 0/5 is a tool that cannot see, 0/0
+    is a host with no lanes, and 0/? is a tool that could not establish the
+    expectation. Printing only the matched count made all three identical.
+    """
+    cov = digest.get("supervisor_coverage") or {}
+    matched = cov.get("matched")
+    expected = cov.get("expected")
+    if matched is None:
+        return "supervisors=?"
+    if expected is None:
+        return f"supervisors={matched}/? (expected count unavailable)"
+    return f"supervisors={matched}/{expected}"
+
+
 def print_human(data: dict[str, Any]) -> None:
     digest = data.get("digest") or {}
     capacity = digest.get("capacity") or {}
@@ -290,12 +307,29 @@ def print_human(data: dict[str, Any]) -> None:
         "tartci observe macos - "
         f"host={digest.get('host') or '?'} "
         f"capacity={capacity.get('running_macos_vms')}/{capacity.get('macos_cap')} "
-        f"free={capacity.get('free')} problems={len(problems)}"
+        f"free={capacity.get('free')} "
+        f"{coverage_line(digest)} "
+        f"problems={len(problems)}"
     )
     for problem in problems:
         print(f"  problem: {problem}")
     if not data.get("observations"):
-        print("  no matching macOS supervisors")
+        cov = digest.get("supervisor_coverage") or {}
+        expected = cov.get("expected")
+        if expected:
+            # Blind, not empty. Say which, and never let this read as health.
+            print(
+                f"  BLIND: matched 0 of {expected} macOS fleet supervisors that "
+                "launchd reports loaded — this is a failure to observe, not an "
+                "observation that the host is idle"
+            )
+        elif expected is None:
+            print(
+                "  UNKNOWN: no supervisors matched and the expected lane count "
+                "could not be established (launchctl unreadable)"
+            )
+        else:
+            print("  no macOS fleet supervisors are loaded on this host")
         return
 
     for obs in data["observations"]:
@@ -368,6 +402,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def observe_exit_code(data: dict[str, Any]) -> int:
+    """0 only when the view is trustworthy.
+
+    A read-only view that returns 0 while blind is indistinguishable from a
+    healthy one to every caller that checks status rather than reading prose.
+    Coverage shortfall is 3 so it cannot be confused with a usage error (2).
+    """
+    digest = data.get("digest") or {}
+    cov = digest.get("supervisor_coverage") or {}
+    matched, expected = cov.get("matched"), cov.get("expected")
+    if expected is None:
+        return 3 if not data.get("observations") else 0
+    if isinstance(matched, int) and matched < expected:
+        return 3
+    return 0
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
     data = collect(args)
@@ -375,7 +426,7 @@ def main(argv: list[str]) -> int:
         print(json.dumps(data, indent=2, sort_keys=True))
     else:
         print_human(data)
-    return 0
+    return observe_exit_code(data)
 
 
 if __name__ == "__main__":
