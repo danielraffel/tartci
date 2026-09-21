@@ -1261,6 +1261,41 @@ run_one(){
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
   fi
+  # The verdict is a function of (repo, labels) alone — see
+  # providers/common/admission-clean.lib.sh, which forwards exactly those two
+  # plus the lane's static base branch — so it can be asked BEFORE the CoW
+  # clone instead of only after a full clone and boot. A refusal here skips the
+  # clone, the disk reservation and the VM lease entirely, so a lane whose
+  # admission authority is down backs off cheaply instead of minting and
+  # discarding a VM every cycle.
+  #
+  # This is an early bail, not the gate. The authoritative check still runs at
+  # the JIT boundary below, where freshness is what matters; nothing here can
+  # admit a VM that the boundary check would refuse.
+  if tartci_admission_clean_enabled; then
+    local precheck_json="" precheck_rc=0
+    heartbeat admission-precheck
+    event admission_precheck "repo=$REPO labels=$selected_labels"
+    if precheck_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+      precheck_rc=0
+    else
+      precheck_rc=$?
+    fi
+    # One rolling envelope per lane: the reason now travels in the event, so
+    # this is a fallback copy and must not grow a file per attempt.
+    [ -z "$precheck_json" ] \
+      || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
+    if [ "$precheck_rc" -ne 0 ]; then
+      local precheck_detail
+      precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
+        || precheck_detail="reason=unreadable"
+      heartbeat "$([ "$precheck_rc" -eq 3 ] && printf admission-precheck-deferred || printf admission-precheck-error)"
+      event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
+        "rc=$precheck_rc pre_clone=true $precheck_detail"
+      note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
+      return "$precheck_rc"
+    fi
+  fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
     tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \
@@ -1425,10 +1460,13 @@ run_one(){
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
       heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
-        "rc=$admission_rc unregistered=true"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off"
+        "rc=$admission_rc unregistered=true $admission_detail"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_vm
       tartci_release_vm_lease
       return "$admission_rc"
