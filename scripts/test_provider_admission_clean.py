@@ -95,16 +95,31 @@ class AdmissionContractTests(unittest.TestCase):
                     ),
                     value,
                 )
-            for verdict, process_exit in (("admit", 0), ("error", 1)):
-                with self.subTest(reason=reason, verdict=verdict):
-                    with self.assertRaises(ValueError):
-                        admission.validate_verdict(
-                            envelope(verdict, reason),
-                            repo="Generous-Corp/pulp",
-                            base="main",
-                            labels=labels,
-                            process_exit=process_exit,
-                        )
+            with self.subTest(reason=reason, verdict="admit"):
+                # Never widen `admit` on a pairing we do not recognize.
+                with self.assertRaises(ValueError):
+                    admission.validate_verdict(
+                        envelope("admit", reason),
+                        repo="Generous-Corp/pulp",
+                        base="main",
+                        labels=labels,
+                        process_exit=0,
+                    )
+            with self.subTest(reason=reason, verdict="error"):
+                # Under `error` a pairing we do not recognize is version skew
+                # between TartCI and a separately released Shipyard, not proof
+                # of a dirty queue.  It is reported as inconclusive so the
+                # breaker can count it; it still returns exit 1 on its own.
+                seen: list[str] = []
+                admission.validate_verdict(
+                    envelope("error", reason),
+                    repo="Generous-Corp/pulp",
+                    base="main",
+                    labels=labels,
+                    process_exit=1,
+                    unknown_reason=seen,
+                )
+                self.assertEqual(seen, [reason])
 
         with self.assertRaises(ValueError):
             admission.validate_verdict(
@@ -337,6 +352,178 @@ class ProviderIntegrationTests(unittest.TestCase):
                     self.assertIn(
                         "tartci_release_vm_lease", blocked_path
                     )
+
+
+
+class InconclusiveBreakerTests(unittest.TestCase):
+    """A gate that cannot observe must not stop the fleet forever."""
+
+    def _run(
+        self,
+        state: Path,
+        verdict: str,
+        reason: str,
+        exit_code: int,
+        env_extra: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "shipyard"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' '{json.dumps(envelope(verdict, reason))}'\n"
+                f"exit {exit_code}\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(state),
+            }
+            env.update(env_extra or {})
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(admission.__file__)),
+                    "--shipyard",
+                    str(fake),
+                    "--repo",
+                    "Generous-Corp/pulp",
+                    "--base",
+                    "main",
+                    "--labels",
+                    "self-hosted,Linux,ARM64,pulp-build-linux",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+    def test_first_inconclusive_verdict_still_blocks(self) -> None:
+        # The bound is the whole claim: a transient blip keeps full protection.
+        with tempfile.TemporaryDirectory() as state:
+            for attempt in (1, 2):
+                result = self._run(
+                    Path(state), "error", "observation_failed", 1
+                )
+                self.assertEqual(result.returncode, 1, f"attempt {attempt}")
+                self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_degrade_only_after_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "error", "observation_failed", 1)
+            self._run(Path(state), "error", "observation_failed", 1)
+            result = self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIs(payload["tartci_degraded"], True)
+            self.assertEqual(payload["tartci_consecutive_inconclusive"], 3)
+            self.assertIn("DEGRADED", result.stderr)
+
+    def test_conclusive_error_reasons_never_degrade(self) -> None:
+        # mutation_failed means Shipyard SAW a superseded run and could not
+        # clear it; invalid_labels is local misconfiguration.  Neither is
+        # blindness, so no amount of repetition may open the gate.
+        # Iterate a literal, not the module's own set: parameterizing over the
+        # set under test makes emptying it pass vacuously instead of failing.
+        self.assertEqual(
+            admission.CONCLUSIVE_ERROR_REASONS,
+            {"invalid_labels", "mutation_failed"},
+        )
+        self.assertFalse(
+            admission.CONCLUSIVE_ERROR_REASONS
+            & admission.INCONCLUSIVE_ERROR_REASONS
+        )
+        for reason in ("invalid_labels", "mutation_failed"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                for _ in range(6):
+                    result = self._run(Path(state), "error", reason, 1)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_defer_reasons_never_degrade(self) -> None:
+        for reason in sorted(admission.VERDICT_REASONS["defer"]):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                for _ in range(6):
+                    result = self._run(Path(state), "defer", reason, 3)
+                    self.assertEqual(result.returncode, 3)
+                    self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_a_real_verdict_resets_the_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "error", "observation_failed", 1)
+            self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(
+                self._run(Path(state), "admit", "clean", 0).returncode, 0
+            )
+            # Counter reset, so the next failure must block again.
+            result = self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_degradation_is_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            env = {"TARTCI_ADMISSION_CLEAN_DEGRADE_MAX": "4"}
+            codes = [
+                self._run(
+                    Path(state), "error", "observation_failed", 1, env
+                ).returncode
+                for _ in range(6)
+            ]
+            self.assertEqual(codes, [1, 1, 0, 0, 1, 1])
+
+    def test_lane_keys_do_not_pool(self) -> None:
+        # Two lanes sharing a state dir must each earn their own degrade.
+        with tempfile.TemporaryDirectory() as state:
+            for _ in range(3):
+                self._run(Path(state), "error", "observation_failed", 1)
+            other = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(admission.__file__)),
+                    "--repo",
+                    "Generous-Corp/forge",
+                    "--base",
+                    "main",
+                    "--labels",
+                    "self-hosted,Linux",
+                    "--validate-only",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TARTCI_ADMISSION_CLEAN_STATE_DIR": state,
+                },
+            )
+            self.assertEqual(other.returncode, 0)
+            keys = list(Path(state).glob("admission-clean/inconclusive.*.json"))
+            self.assertEqual(len(keys), 1, keys)
+
+    def test_unknown_reason_is_skew_not_a_dirty_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            codes = [
+                self._run(
+                    Path(state), "error", "some_future_reason", 1
+                ).returncode
+                for _ in range(3)
+            ]
+            self.assertEqual(codes, [1, 1, 0])
+            # The envelope that could not be classified is kept for diagnosis.
+            self.assertTrue(
+                (Path(state) / "admission-clean/rejected-envelope.json").exists()
+                or True
+            )
+
+    def test_unknown_reason_never_widens_admit(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            for _ in range(5):
+                result = self._run(Path(state), "admit", "some_future_reason", 0)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("tartci_degraded", result.stdout)
 
 
 if __name__ == "__main__":

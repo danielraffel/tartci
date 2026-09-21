@@ -1160,7 +1160,35 @@ provider LaunchAgent. Optionally set `TARTCI_SHIPYARD_CLI` (default `shipyard`),
 `TARTCI_ADMISSION_CLEAN_TIMEOUT_SECS` (default 300, range 1..1800). Required
 mode fails closed: a typed `admit` is the only path to JIT registration.
 `defer` or any operational/contract error tears down the still-unregistered VM,
-releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`. Keep the
+releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`.
+
+An `error` verdict is not one thing, and the difference decides whether the
+fleet can stop. `mutation_failed` and `invalid_labels` are conclusive: Shipyard
+either saw a superseded run it could not cancel, or the lane is misconfigured.
+Those stay closed permanently. `observation_failed`, `authority_failed`, and
+`revalidation_failed` mean Shipyard could not look at all, which says nothing
+about the queue -- as does an `error` reason this TartCI generation does not
+recognize, since Shipyard is released separately. Backoff alone does not bound
+those: a blindness that outlasts the backoff stops every lane for the repo
+indefinitely, and if the cause scales with the repo's own backlog the outage
+prevents the draining that would end it.
+
+So an inconclusive verdict opens a bounded circuit breaker instead. The first
+`TARTCI_ADMISSION_CLEAN_DEGRADE_AFTER` (default 3) consecutive inconclusive
+verdicts still fail closed, so a transient blip keeps the gate at full
+strength. Past that the gate emits a degraded admit carrying
+`tartci_degraded`, logs a loud line, and counts up to
+`TARTCI_ADMISSION_CLEAN_DEGRADE_MAX` (default 20), after which it closes again
+rather than staying open forever. Any real `admit` or `defer` resets the count.
+Counters live per `(repo, base, labels)` under
+`TARTCI_ADMISSION_CLEAN_STATE_DIR` so lanes never pool each other's failures.
+A rejected envelope is written to `rejected-envelope.json` in that directory,
+so a Shipyard contract skew is diagnosable without reading Shipyard's source.
+
+Degrading trades one ephemeral single-job VM that a superseded run may claim --
+bounded, non-corrupting, and unable to satisfy the current head's required
+checks -- against an unbounded fleet stop. Never widen this to `admit`
+verdicts. Keep the
 mode `disabled` only during the staged TartCI-before-Shipyard rollout.
 The managed macOS fleet profiles always render `required`; for event-class V2,
 the gate runs after guest preflight and immediately before repository-access
