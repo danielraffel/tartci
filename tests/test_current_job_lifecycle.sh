@@ -5,6 +5,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+# The scanner defaults its observation lock to the HOST's real one. This suite
+# runs on machines whose fleet lanes are scanning through that lock right now,
+# so without a private one the test blocks on production, fails with
+# "host queue observation lock timed out", and adds contention to the resource
+# it was starved by.
+export TARTCI_QUEUE_OBSERVATION_LOCK_FILE="$TMP/queue-observation.lock"
+
 # Exercise the production shell functions directly while replacing only their
 # external GitHub/event/heartbeat/cleanup boundaries.
 eval "$(sed -n '/^handle_supervisor_signal(){/,/^ensure_runner_version(){/p' \

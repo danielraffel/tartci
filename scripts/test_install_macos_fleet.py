@@ -16,6 +16,8 @@ from pathlib import Path
 
 import tartci_support_manifest as support_manifest
 import network_profile as network
+import macos_fleet_lanes as fleet
+import macos_launcher_identity
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1077,6 +1079,151 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertEqual(
             first_loaded["loaded_services"], second_loaded["loaded_services"]
         )
+
+
+    def install_and_seal(self, *, commit: str, manifest_sha256: str) -> dict:
+        """Install a real generation, then seal a launcher bundle around a cohort.
+
+        A launch_helper lane renders ProgramArguments naming the signed bundle,
+        never the staged generation, so plist-versus-render equality cannot tell
+        an effective install from one whose new generation nothing execs. Only
+        the Developer ID signature check is substituted here, because a test
+        cannot mint one.
+        """
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        receipt = json.loads(
+            (self.home / ".config/tartci/macos-fleet-install.json").read_text()
+        )
+        support = receipt["support"]
+        bundle = self.home / ".local/libexec/TartCILauncher.app"
+        executable = bundle / "Contents/MacOS/tartci-launcher"
+        executable.parent.mkdir(parents=True, exist_ok=True)
+        executable.write_text("#!/bin/sh\nexit 0\n")
+        executable.chmod(0o755)
+        sealed = bundle / fleet.SEALED_SUPPORT
+        sealed.mkdir(parents=True, exist_ok=True)
+        sealed_launch = sealed / support_manifest.LAUNCH_NAME
+        sealed_launch.write_text("#!/bin/sh\nexit 0\n")
+        sealed_launch.chmod(0o555)
+        (bundle / fleet.SEALED_METADATA).write_text(json.dumps({
+            "schema": 1,
+            "source_commit": commit,
+            "support_manifest_sha256": manifest_sha256,
+            "profile_policy_sha256": "d" * 64,
+            "tart_home": "/Volumes/Workshop/VMs",
+        }, sort_keys=True))
+        approval = self.home / ".config/tartci/m3-launcher-approved.sha256"
+        approval.write_text("e" * 64 + "\n")
+        approval.chmod(0o600)
+        helper_config = self.root / "fleet-launch-helper.toml"
+        helper_config.write_text(
+            self.config.read_text()
+            .replace(f'tart_home = "{self.home}/VMs"', 'tart_home = "/Volumes/Workshop/VMs"')
+            .replace("[github_app]", textwrap.dedent(f"""\
+                [launch_helper]
+                path = "{bundle}"
+                approval_sha256_path = "{approval}"
+                identifier = "com.danielraffel.tartci.launcher"
+                team_id = "95CX6P84C4"
+
+                [github_app]"""))
+        )
+        for installed in self.agents.glob("*macos-fleet*.plist"):
+            installed.unlink()
+        data = fleet.load(helper_config)
+        for name, body in fleet.rendered_plists(
+            data, launch_entrypoint=Path(support["launch_entrypoint"]["path"])
+        ).items():
+            target = self.agents / name
+            target.write_bytes(body)
+            target.chmod(0o644)
+            self.assertEqual(
+                plistlib.loads(body)["ProgramArguments"][0], str(executable)
+            )
+        return {
+            "config": helper_config,
+            "support": support,
+            "sealed_launch": sealed_launch,
+            "output": self.root / "receipt.json",
+        }
+
+    def write_receipt(self, fixture: dict) -> None:
+        support = fixture["support"]
+        record = {
+            "schema": 1, "path": str(self.home / ".local/libexec/TartCILauncher.app"),
+            "source_commit": support["source_commit"],
+        }
+        with mock.patch.object(
+            macos_launcher_identity, "verify", return_value=record
+        ), mock.patch.object(
+            macos_launcher_identity, "profile_policy_digest", return_value="d" * 64
+        ):
+            fleet.write_receipt(
+                fixture["config"], self.agents, fixture["output"],
+                Path(support["root"]),
+                Path(support["manifest_path"]),
+                Path(support["entrypoint"]["path"]),
+                Path(support["entrypoint"]["path"]),
+                Path(support["launch_entrypoint"]["path"]),
+                support["source_commit"],
+            )
+
+    def test_launcher_sealed_around_a_stale_cohort_fails_the_receipt(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        with self.assertRaises(ValueError) as caught:
+            self.write_receipt(fixture)
+        message = str(caught.exception)
+        self.assertIn("install_ineffective", message)
+        self.assertIn(str(fixture["sealed_launch"]), message)
+        self.assertIn(fixture["support"]["launch_entrypoint"]["path"], message)
+        self.assertFalse(fixture["output"].exists())
+
+    def test_launcher_sealed_around_the_installed_cohort_writes_the_receipt(self) -> None:
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        support = json.loads(
+            (self.home / ".config/tartci/macos-fleet-install.json").read_text()
+        )["support"]
+        fixture = self.install_and_seal(
+            commit=support["source_commit"],
+            manifest_sha256=support["manifest_sha256"],
+        )
+        self.write_receipt(fixture)
+        written = json.loads(fixture["output"].read_text())
+        self.assertEqual(written["support"]["root"], support["root"])
+
+
+    def test_verifier_rejects_a_launcher_resealed_around_a_stale_cohort(self) -> None:
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        support = json.loads(
+            (self.home / ".config/tartci/macos-fleet-install.json").read_text()
+        )["support"]
+        fixture = self.install_and_seal(
+            commit=support["source_commit"],
+            manifest_sha256=support["manifest_sha256"],
+        )
+        self.write_receipt(fixture)
+        bundle = self.home / ".local/libexec/TartCILauncher.app"
+        (bundle / fleet.SEALED_METADATA).write_text(json.dumps({
+            "schema": 1,
+            "source_commit": "a" * 40,
+            "support_manifest_sha256": "f" * 64,
+            "profile_policy_sha256": "d" * 64,
+            "tart_home": "/Volumes/Workshop/VMs",
+        }, sort_keys=True))
+        record = json.loads(fixture["output"].read_text())["launch_helper"]
+        with mock.patch.object(
+            macos_launcher_identity, "verify", return_value=record
+        ), mock.patch.object(
+            macos_launcher_identity, "profile_policy_digest", return_value="d" * 64
+        ):
+            with self.assertRaisesRegex(ValueError, "install_ineffective"):
+                fleet.verify_receipt(
+                    fixture["output"], fixture["config"], self.agents,
+                    Path(fixture["support"]["root"]),
+                )
 
 
 if __name__ == "__main__":

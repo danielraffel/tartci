@@ -11,6 +11,25 @@
 #      propagated, so registration loops on HTTP 403 and live mode never goes
 #      healthy. Detected by fresh (mtime<5m) repeated 403s in the daemon log.
 #      Remedy: clear the token cache + `shipyard daemon refresh`.
+#   1b. BLOCKED on a permission a human must grant — the daemon is trying to
+#      register a webhook the GitHub App installation is not allowed to manage
+#      (`repository_hooks`). GitHub reports this as HTTP 403 "Resource not
+#      accessible by integration", which is byte-for-byte as much a 403 as a
+#      dead credential — so signature #1's remedy (clear the token cache and
+#      refresh) is applied to a credential that was never the problem, fails,
+#      and repeats until the escalation limit. That is not a heal; it is a
+#      watchdog thrashing against a fault it structurally cannot fix. Detected
+#      BEFORE #1 and answered by escalating immediately: log loudly, name the
+#      permission, and touch nothing.
+#
+#   1c. WEBHOOK URL DRIFT — the daemon's own tunnel URL and the URL GitHub has
+#      registered have diverged, typically because this host's tailnet name
+#      changed underneath a registration made under the old one. Every delivery
+#      then fails to connect while every component reports healthy, because
+#      each side is individually correct and nobody compares them. `shipyard
+#      daemon reconcile` performs that comparison; its exit code classifies the
+#      result (0 in sync, 1 warn, 2 alarm, 3 blocked on a human).
+#
 #   2. SILENT progress wedge — the daemon process is UP (`daemon status` says
 #      "daemon running") but is NOT actually functional: tunnel inactive and/or
 #      no repo registered, and its log has gone quiet (frozen), so signature #1
@@ -41,6 +60,7 @@ HLOG="$HOME/Library/Logs/shipyard-daemon-health.log"
 STAMP="$HOME/Library/Application Support/shipyard/.health-refresh-stamps"   # epoch per refresh
 REFRESH_WINDOW_S=3600      # count refreshes within the last hour
 REFRESH_MAX=4              # >= this many in-window + still wedged → escalate, stop thrashing
+LOG_FRESH_MIN=5            # a log touched within this many minutes counts as live evidence
 note(){ printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >> "$HLOG"; }
 
 [ -x "$SY" ] || { note "shipyard not at $SY — skip"; exit 0; }
@@ -75,6 +95,31 @@ heal(){
   "$SY" daemon refresh >/dev/null 2>&1 && note "  refreshed" || note "  refresh failed"
 }
 
+# --- classification -------------------------------------------------------
+#
+# The distinction this whole script turns on: a fault the watchdog CAN fix by
+# restarting something, versus a fault only a human can fix by granting
+# something. Answering the second with the remedy for the first is how a
+# watchdog burns its escalation budget while the actual defect goes unreported.
+
+# Does this shipyard build know how to reconcile? Older binaries do not, and an
+# unsupported subcommand must degrade to "no verdict" — never to a verdict.
+reconcile_supported(){ "$SY" daemon reconcile --help >/dev/null 2>&1; }
+
+# Fresh evidence in the daemon log that registration is blocked on a GitHub App
+# permission rather than on a credential.
+webhook_permission_blocked(){
+  [ -f "$DAEMON_LOG" ] || return 1
+  [ -n "$(find "$DAEMON_LOG" -mmin -"$LOG_FRESH_MIN" 2>/dev/null)" ] || return 1
+  tail -50 "$DAEMON_LOG" 2>/dev/null \
+    | grep -qiE 'resource not accessible by integration|BLOCKED on a GitHub App permission|repository_hooks'
+}
+
+# Escalate without healing. Used for every fault whose remedy is a human
+# action: refreshing would change nothing and would consume the refresh budget
+# that a genuinely wedged daemon needs.
+escalate(){ note "ESCALATE (no auto-heal possible): $*"; }
+
 status="$("$SY" daemon status 2>/dev/null || true)"
 
 # (0) DOWN → start fresh.
@@ -84,6 +129,37 @@ if ! printf '%s' "$status" | grep -q 'daemon running'; then
   record_refresh
   "$SY" daemon start >/dev/null 2>&1 && note "  started" || note "  start failed"
   exit 0
+fi
+
+# (1a) BLOCKED on a GitHub App permission. Checked FIRST, because the evidence
+# for it also satisfies check (1) — and (1)'s remedy is clearing a credential
+# that is working fine. Report and stop; do not spend a refresh.
+if webhook_permission_blocked; then
+  escalate "webhook registration is refused by GitHub App permissions (repository_hooks). \
+A human must grant it in the GitHub App settings and accept it on the affected repositories. \
+The credential is VALID — clearing the token cache or refreshing the daemon cannot fix this and has not been attempted."
+  exit 0
+fi
+
+# (1b) WEBHOOK URL DRIFT / delivery failure, from shipyard's own comparison of
+# the URL it intends against the one GitHub holds. Skipped silently on builds
+# that predate the subcommand.
+if reconcile_supported; then
+  "$SY" daemon reconcile >/dev/null 2>&1
+  verdict=$?
+  case "$verdict" in
+    0) : ;;                                    # desired and observed agree
+    1) note "webhook reconcile: warning (non-blocking drift)" ;;
+    3) escalate "webhook reconcile is BLOCKED on a human action (run: shipyard daemon reconcile — it names the specific permission)."; exit 0 ;;
+    2)
+      # A restart makes the daemon re-register under its CURRENT identity,
+      # which is the fix when the drift is a stale registration. If drift
+      # survives that, restarting again cannot help — escalate instead.
+      heal "webhook URL drift or failing deliveries (shipyard daemon reconcile exit 2)"
+      exit 0
+      ;;
+    *) note "webhook reconcile returned unexpected status $verdict — treating as no verdict" ;;
+  esac
 fi
 
 # (1) ACTIVE webhook-403 loop (log fresh + repeated 403s).

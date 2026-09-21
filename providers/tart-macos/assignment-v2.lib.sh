@@ -60,9 +60,16 @@ tartci_assignment_v2_tier_labels(){
 # Assignment admission needs a complete current view. The dedicated scanner
 # consumes every run/job page and fails on API uncertainty or truncation. Its
 # explicit require-label predicate rejects generic-only jobs.
+# The scanner stops at the first matching job and reports 1, because every
+# admission decision only asks whether demand exists. Pass exhaustive=1 to buy
+# the true magnitude instead; only reporting needs it, and it costs a full scan.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc evidence
+  local tier_label="$1" exhaustive="${2:-0}" workflow tier_args=() selected_labels
+  local error_file detail rc count_args=() evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
+  # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
+  # variable under `set -u`, so the expansion must be guarded, not just quoted.
+  [ "$exhaustive" = 1 ] && count_args=(--exhaustive-count)
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
   done < <(tier_workflow_args "$tier_label")
@@ -75,15 +82,28 @@ tartci_assignment_v2_tier_demand(){
     --labels "$selected_labels" \
     --require-label "$tier_label" \
     --min-age-seconds "$MIN_QUEUED_AGE" \
+    ${count_args[@]+"${count_args[@]}"} \
     --gh-cli "$GH_CLI" 2>"$error_file"; then
     rc=0
   else
     rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
-    detail="$(tail -n 1 "$error_file" | cut -c1-512)"
+    # Keep BOTH ends: a wrapper prints the underlying cause BEFORE its own
+    # summary, so any tail-only rule discards the line that identifies the real
+    # fault and keeps the one that misattributes it. The head/tail budget is
+    # sized so the 512-byte event field cannot chop the summary back off.
+    # Publish the same text for the supervisor's blind path to report.
+    detail="$(scan_diagnostic_digest "$error_file" 2 2 110 | tr '\n' '|' \
+      | sed 's/|$//' | cut -c1-512)"
+    record_scan_error "$detail"
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
+    if [ "$exhaustive" != 1 ] \
+       && tartci_assignment_feed_rescue "$tier_label" "$selected_labels"; then
+      rm -f "$error_file"
+      return 0
+    fi
   fi
   # The scanner's stderr is captured so it cannot pollute the demand count on
   # stdout, and then deleted. Evidence written there is therefore invisible
@@ -99,6 +119,58 @@ tartci_assignment_v2_tier_demand(){
   return "$rc"
 }
 
+# Second opinion for a scan that already failed closed, from a source that is
+# not the GitHub REST API: the local Shipyard daemon's webhook push feed.
+#
+# It runs ONLY after the scan failed, so a healthy lane never reaches it and no
+# feed defect can regress one. It can only ever turn a blind poll into "there
+# is demand" -- the feed cannot observe absence (a severed feed and an empty
+# queue are the same silence), so a refusal leaves the blind result exactly as
+# the scanner left it and the supervisor's existing scan-blind handling runs
+# unchanged. The exhaustive caller is excluded because it wants a magnitude,
+# and a replay ring is not a queue census.
+#
+# Every outcome is announced. A feed that is failing must not look like a lane
+# that is merely quiet.
+tartci_assignment_feed_rescue(){
+  local tier_label="$1" selected_labels="$2" out err_file reason rc socket_arg=()
+  [ "${TARTCI_ASSIGNMENT_FEED_RESCUE:-0}" = 1 ] || return 1
+  if [ -n "${TARTCI_SHIPYARD_DAEMON_SOCKET:-}" ]; then
+    socket_arg=(--socket "$TARTCI_SHIPYARD_DAEMON_SOCKET")
+  fi
+  mkdir -p "$STATE_DIR"
+  err_file="$(mktemp "$STATE_DIR/$RUNNER_NAME.feed-rescue.XXXXXX")" || return 1
+  if out="$(python3 "$TARTCI_ROOT/scripts/shipyard_event_feed.py" \
+    --repo "$REPO" \
+    --require-label "$tier_label" \
+    --labels "$selected_labels" \
+    --min-observed-age-seconds "$MIN_QUEUED_AGE" \
+    --ledger "$STATE_DIR/$RUNNER_NAME.feed-ledger.json" \
+    ${socket_arg[@]+"${socket_arg[@]}"} 2>"$err_file")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  reason="$(tail -n 1 "$err_file" | cut -c1-512)"
+  rm -f "$err_file"
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -qxE '[1-9][0-9]*'; then
+    event assignment_feed_degraded \
+      "tier=$tier_label feed_rc=$rc detail=${reason:-no feed detail}"
+    return 1
+  fi
+  event assignment_feed_rescue \
+    "tier=$tier_label detail=${reason:-feed observed demand}"
+  printf '%s\n' "$out"
+  return 0
+}
+
+# Print `count|registration labels|zero-based tier`. A scan error at any tier is
+# fail-closed: never skip a blind higher class and hand its capacity to a lower
+# one. A failed scan leaves that class's demand UNKNOWN, not zero, and the two
+# must not converge here -- electing a lower class would mint a runner that
+# cannot serve the blind one, and the numeric verdict would clear the
+# supervisor's scan-blind counter, disabling the very self-heal that recovers
+# the blind scan. `ERR` carries the uncertainty out intact instead.
 tartci_assignment_v2_select_live(){
   local tier_label q tier=0
   while IFS= read -r tier_label; do
@@ -191,7 +263,7 @@ tartci_assignment_v2_total_demand(){
   local tier_label q total=0
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
-    q="$(tartci_assignment_v2_tier_demand "$tier_label")" || {
+    q="$(tartci_assignment_v2_tier_demand "$tier_label" 1)" || {
       printf 'ERR\n'
       return 0
     }

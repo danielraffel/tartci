@@ -1,0 +1,117 @@
+{
+  "schema": 1,
+  "purpose": "Why a fleet state exists, for the states where the honest answer is counterintuitive and the intuitive fix is destructive. Keyed by the reason codes fleet_doctor emits; every code carries a row and every row is cited by a code.",
+  "reasons": {
+    "agents_dir_unreadable": {
+      "summary": "The LaunchAgent directory could not be listed.",
+      "why": "Every generation, delivery and drain fact is read from installed LaunchAgents. With the directory unreadable there is no evidence at all, which is reported as unknown rather than as an empty host.",
+      "remedy": "Check the path and its permissions, then re-run. Treat every other finding in this run as unverified.",
+      "do_not": "Do not read an unreadable agents directory as a host with no agents."
+    },
+    "census_complete": {
+      "summary": "Both registration scopes were read.",
+      "why": "Runners register at repository scope or at organization scope, and the repository endpoint omits organization runners without saying so. Only a census that read both can be quoted as capacity."
+    },
+    "census_incomplete": {
+      "summary": "A registration scope could not be read.",
+      "why": "The scope that failed is exactly where a missing runner might live, so a label absent from an incomplete census is unknown, never unserved. A smaller number reads as a confident finding and is the more dangerous error.",
+      "remedy": "Restore access to the failed endpoint and re-run before making any capacity decision.",
+      "do_not": "Do not quote the partial count as the runner population."
+    },
+    "census_module_unavailable": {
+      "summary": "The dual-scope census module is absent from this support root.",
+      "why": "Reading only the repository endpoint would produce a confident undercount, so no census is reported rather than a single-scope one.",
+      "remedy": "Install a support generation that carries scripts/runner_census.py, or pass --no-census to state that capacity was deliberately not measured."
+    },
+    "census_repo_unknown": {
+      "summary": "No managed lane declares a runner repository.",
+      "why": "Census targets are derived from each installed lane's own TARTCI_RUNNER_REPO, because the plist is what launchd hands the supervisor. With none declared there is no target to measure.",
+      "remedy": "Pass --repo OWNER/REPO explicitly, or check that the installed lane plists still carry their runner environment."
+    },
+    "delivery_unknown": {
+      "summary": "Some agent declares no resolvable program.",
+      "why": "Whether a staged generation reaches this host depends entirely on what its agents exec. An agent whose program cannot be resolved makes the answer unknown for the whole host.",
+      "remedy": "Inspect the named LaunchAgent's ProgramArguments before planning a deploy.",
+      "do_not": "Do not start a deploy on the assumption that the unresolved agent behaves like its siblings."
+    },
+    "effective_generation_matches": {
+      "summary": "Every managed agent executes the cohort the receipt records as installed.",
+      "why": "Installed and effective are separate facts. They agree here, which is the only state in which a receipt can be read as a statement about what runs."
+    },
+    "effective_generation_mismatch": {
+      "summary": "The host executes a different cohort than the one it records as installed.",
+      "why": "Staging a generation writes a receipt whether or not anything execs it. A host in this state runs old code while every receipt, exit code and status line reports the new one, so the fix an operator believes they shipped was never delivered.",
+      "remedy": "Deliver the cohort by the route this host actually execs, then re-run and confirm effective matches installed. For a sealed launcher host see sealed_launcher_bundle.",
+      "do_not": "Do not treat the install receipt, or a zero exit from the installer, as evidence that the new code is running."
+    },
+    "fleet_not_ready": {
+      "summary": "The authoritative support root reports the fleet not ready.",
+      "why": "The named problem code is the machine-readable cause and is the thing to act on; the word NO by itself has sent operators to rebuild parts that were never broken.",
+      "remedy": "Act on the reported problem code, not on the readiness verdict."
+    },
+    "fleet_ready": {
+      "summary": "The installed generation reports the fleet ready.",
+      "why": "Readiness is reported from the installed generation because that is the tree the running supervisors execute."
+    },
+    "generation_path_exec": {
+      "summary": "Agents exec a generation path directly, so a staged generation reaches them.",
+      "why": "This is the delivery shape in which install means what it appears to mean: the next generation replaces what execs."
+    },
+    "hold_receipt_malformed": {
+      "summary": "The held-idle receipt could not be read, or is not exactly held-idle.",
+      "why": "The receipt is compared exactly. A near-miss is not a weaker yes, it is a no, and drain will refuse on it.",
+      "remedy": "Resolve the file's state before attempting a drain.",
+      "do_not": "Do not write the receipt by hand to make this pass. See persistent_runners_without_hold_receipt."
+    },
+    "hold_receipt_present": {
+      "summary": "Persistent listeners are covered by an exact held-idle receipt.",
+      "why": "The receipt authorizes exactly one drain era and is invalidated when the pool reopens."
+    },
+    "installed_generation_unknown": {
+      "summary": "Managed agents are installed but no readable receipt says which cohort they should execute.",
+      "why": "Without an installed identity there is nothing to compare the executed cohort against, so the comparison is unknown rather than passing by default.",
+      "remedy": "Restore or re-write the install receipt before judging what this host runs."
+    },
+    "no_managed_launchagents": {
+      "summary": "No managed fleet LaunchAgent is installed.",
+      "why": "With no receipt either, this host is simply not a managed fleet host. With a receipt present it is a real fault: something records a cohort that nothing executes.",
+      "remedy": "If a receipt exists, install the fleet lanes or remove the stale receipt."
+    },
+    "no_persistent_runners": {
+      "summary": "No persistent Actions listener is installed, so drain terminalizes on provider agents alone.",
+      "why": "Ephemeral providers finish their current job and then wait at the admission gate, which is a safe local drain primitive. Only a stock persistent listener lacks one."
+    },
+    "persistent_runners_without_hold_receipt": {
+      "summary": "Drain will refuse, and it refuses after the host is already opted out.",
+      "why": "A stock persistent Actions listener has no safe local drain primitive: worker absence misses the interval between a job being accepted and its worker spawning, so stopping on that evidence can kill a running job. Draining safely requires removing the host from routing and publishing a held-idle receipt only once the scheduler reports every persistent runner idle. No supported producer ships that receipt today. Drain writes participation=0 and pool-state=draining before it discovers this, so a refusal leaves the host opted out with its agents still loaded.",
+      "remedy": "Do not begin a drain on this host. If one has already refused, return the host to service with tartci pool on, which also invalidates any stale hold receipt.",
+      "do_not": "Do not create the held-idle receipt by hand. It asserts that a scheduler observed every persistent runner idle. Writing it locally asserts an observation nothing made, and authorizes stopping a listener that may be holding a live job."
+    },
+    "program_unresolvable": {
+      "summary": "The executed cohort could not be resolved for some agent.",
+      "why": "The executed cohort is read from ProgramArguments and, for a signed launcher, from the bundle's sealed metadata. When neither can be read the agent's identity is unknown, which must not be reported as agreement.",
+      "remedy": "Inspect the named LaunchAgent and its program before trusting any generation claim for this host."
+    },
+    "readiness_not_managed": {
+      "summary": "This host carries no managed fleet profile.",
+      "why": "Legacy and provider-only hosts are legitimate. Readiness does not apply to them and is not reported as a failure."
+    },
+    "readiness_probe_failed": {
+      "summary": "Readiness could not be determined.",
+      "why": "The probe needs a Python 3.11 or newer interpreter with tomllib and a support root that carries the readiness script. macOS ships 3.9, so a stock interpreter fails the probe. Reporting that as not ready would invent a fleet fault out of a missing interpreter.",
+      "remedy": "Set TARTCI_PYTHON to a 3.11+ interpreter, or check that the support root named in the receipt still exists."
+    },
+    "readiness_verdict_depends_on_invocation": {
+      "summary": "Two support roots on this host return different readiness verdicts for the same fleet.",
+      "why": "Readiness is computed against a support root, and the support root comes from whichever copy of the CLI asked. A git checkout and the installed generation therefore disagree at the same instant, each correct about the tree it measured and each read as a statement about the fleet. A checkout reports receipt_mismatch because the receipt names the installed generation's root, not the checkout's.",
+      "remedy": "Read the installed generation's verdict as authoritative, since that is the tree the running supervisors execute. Run the installed CLI, not a checkout, when asking whether the fleet is up.",
+      "do_not": "Do not report a checkout's readiness verdict as the host's."
+    },
+    "sealed_launcher_bundle": {
+      "summary": "This host execs a sealed launcher bundle, so a generation stage alone cannot change what it runs.",
+      "why": "Agents exec a signed Developer ID app, and that app runs its own sealed copy of the support cohort from inside the bundle. Staging a newer generation beside it succeeds, writes a receipt and exits 0 while the bundle keeps executing the cohort it was sealed around. This is how a host silently misses every fix it appears to have received.",
+      "remedy": "Deliver a re-signed launcher bundle built around the new cohort and install with --launch-helper-source, refreshing the pinned approval digest, then confirm the executed cohort matches the installed one.",
+      "do_not": "Do not read a zero exit from fleet-macos install --apply on this host as evidence that the new generation is running."
+    }
+  }
+}

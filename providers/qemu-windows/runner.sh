@@ -463,7 +463,10 @@ run_one(){ # $1=iteration index
       || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
       write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off ($admission_detail)"
       cleanup_job success
       return "$admission_rc"
     fi

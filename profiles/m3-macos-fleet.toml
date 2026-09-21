@@ -9,6 +9,12 @@ home = "/Users/danielraffel"
 tart_home = "/Volumes/Workshop/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
+# Measured 2026-09-21: of 209 assignment-scan failures on this host in 24h,
+# 184 (88%) were a single GitHub call exceeding the generic 15-second default,
+# versus 4 (1.9%) attributable to the scan budget. m1, which already sets 30,
+# shows the inverse split. The calls are not slow in isolation; they exceed 15s
+# under concurrent supervisors, which is exactly the case this knob exists for.
+github_api_timeout_seconds = 30
 
 # Daniel-only external-volume execution. The stable Developer-ID identity is
 # the TCC responsible process; public/home-backed profiles do not inherit it.
@@ -56,6 +62,12 @@ replaces_launchd_labels = [
   "com.danielraffel.pulp.tart-runner",
   "com.danielraffel.pulp.tart-runner-slot2",
 ]
+# The queue scan this supervisor runs is latency-sensitive: a Background
+# supervisor's GitHub API calls measured materially slower than the same calls
+# at normal priority, and every observed scan failure on this lane is a
+# per-call timeout rather than the 180s scan budget. Adaptive lets launchd
+# promote the supervisor out of the background band. Gate lanes only.
+process_type = "Adaptive"
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
