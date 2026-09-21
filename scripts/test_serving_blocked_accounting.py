@@ -33,8 +33,10 @@ ACCOUNTING_RE = re.compile(
     r'run_one "\$i" "\$selected_labels" "\$selected_tier" \|\| run_rc=\$\?\n'
     r'(?P<block>(?:.*?\n)*?      fi\n)',
 )
+# Deliberately does not pin the comparison operator: the test has to fail on a
+# wrong condition by EXECUTING it, not by failing to find the block.
 IDLE_RE = re.compile(
-    r'(?P<block>^      if \[ "\$\{q:-0\}" -le 0 \]; then\n(?:.*?\n)*?^      fi$)',
+    r'(?P<block>^      if \[ "\$\{q:-0\}" -[a-z]+ 0 \]; then\n(?:.*?\n)*?^      fi$)',
     re.MULTILINE,
 )
 
