@@ -60,9 +60,16 @@ tartci_assignment_v2_tier_labels(){
 # Assignment admission needs a complete current view. The dedicated scanner
 # consumes every run/job page and fails on API uncertainty or truncation. Its
 # explicit require-label predicate rejects generic-only jobs.
+# The scanner stops at the first matching job and reports 1, because every
+# admission decision only asks whether demand exists. Pass exhaustive=1 to buy
+# the true magnitude instead; only reporting needs it, and it costs a full scan.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" workflow tier_args=() selected_labels error_file detail rc
+  local tier_label="$1" exhaustive="${2:-0}" workflow tier_args=() selected_labels
+  local error_file detail rc count_args=()
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
+  # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
+  # variable under `set -u`, so the expansion must be guarded, not just quoted.
+  [ "$exhaustive" = 1 ] && count_args=(--exhaustive-count)
   while IFS= read -r workflow; do
     [ -n "$workflow" ] && tier_args+=(--workflow "$workflow")
   done < <(tier_workflow_args "$tier_label")
@@ -75,6 +82,7 @@ tartci_assignment_v2_tier_demand(){
     --labels "$selected_labels" \
     --require-label "$tier_label" \
     --min-age-seconds "$MIN_QUEUED_AGE" \
+    ${count_args[@]+"${count_args[@]}"} \
     --gh-cli "$GH_CLI" 2>"$error_file"; then
     rc=0
   else
@@ -181,7 +189,7 @@ tartci_assignment_v2_total_demand(){
   local tier_label q total=0
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
-    q="$(tartci_assignment_v2_tier_demand "$tier_label")" || {
+    q="$(tartci_assignment_v2_tier_demand "$tier_label" 1)" || {
       printf 'ERR\n'
       return 0
     }
