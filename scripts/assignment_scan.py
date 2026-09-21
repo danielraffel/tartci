@@ -362,7 +362,10 @@ class AssignmentScanner:
             payload = json.loads(
                 self.workflow_id_cache_path.read_text(encoding="utf-8")
             )
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            # ValueError covers both malformed JSON and a file that is not
+            # even UTF-8. Neither is a reason to blind a lane: the cache only
+            # ever saves a call, so anything unreadable is simply a miss.
             return None
         if not isinstance(payload, dict):
             return None
@@ -401,7 +404,7 @@ class AssignmentScanner:
                 payload = json.loads(
                     self.workflow_id_cache_path.read_text(encoding="utf-8")
                 )
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError):
                 payload = {}
             if not isinstance(payload, dict):
                 payload = {}
@@ -412,8 +415,14 @@ class AssignmentScanner:
             tmp = self.workflow_id_cache_path.with_name(
                 f"{self.workflow_id_cache_path.name}.{os.getpid()}.tmp"
             )
-            tmp.write_text(json.dumps(payload), encoding="utf-8")
-            os.replace(tmp, self.workflow_id_cache_path)
+            try:
+                tmp.write_text(json.dumps(payload), encoding="utf-8")
+                os.replace(tmp, self.workflow_id_cache_path)
+            finally:
+                # A replace that did not happen must not leave the temp file
+                # behind in state every lane on this host shares.
+                with contextlib.suppress(OSError):
+                    tmp.unlink()
         except OSError:
             return
 

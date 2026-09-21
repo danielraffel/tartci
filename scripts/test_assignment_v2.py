@@ -1590,11 +1590,17 @@ else:
     def test_an_unreadable_workflow_id_cache_is_a_miss_not_a_failure(self) -> None:
         """The cache only ever saves a call, so a broken one costs that call."""
         cache = self.root / "workflow-ids.json"
-        cache.write_text("{not json at all")
-        result, census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "1")
-        self.assertEqual(census["workflows"], 1, census)
+        # Text that is not JSON, and bytes that are not even text. The second
+        # raises a decode error rather than a JSON error, so catching only the
+        # latter would fail the scan closed and blind the lane over a file
+        # whose only job is to save one call.
+        for corrupt in (b"{not json at all", b"\xff\xfe\x00binary garbage"):
+            with self.subTest(corrupt=corrupt[:8]):
+                cache.write_bytes(corrupt)
+                result, census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "1")
+                self.assertEqual(census["workflows"], 1, census)
 
     def test_a_cached_id_that_stops_resolving_fails_the_scan_closed(self) -> None:
         """The cache cannot turn a broken lookup into an empty queue.
