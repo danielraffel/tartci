@@ -1026,18 +1026,16 @@ else:
         self.assertIn("duplicate id", result.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class AssignmentScannerTransientFaultTests(unittest.TestCase):
     """A fault that carries no verdict about the queue must not end the scan.
 
-    Every scan here presents exactly one queued job matching the tier, so the
-    only correct complete answer is "1". A scan that reports 0 has under-counted
-    the queue and would idle a lane that has work; a scan that exits non-zero
-    has failed closed, which is correct only when the queue truly could not be
-    observed.
+    Unless a test asks for `match=0`, every scan here presents exactly one
+    queued job matching the tier, so the only correct complete answer is "1". A
+    scan that reports 0 has under-counted the queue and would idle a lane that
+    has work; a scan that exits non-zero has failed closed, which is correct
+    only when the queue truly could not be observed. The `match=0` cell is the
+    control: with nothing to find, the same fault must be survived by looking
+    everywhere rather than by stopping early.
     """
 
     #: One `gh` stub, parameterised by which call it should sabotage and how
@@ -1051,6 +1049,7 @@ FAIL_ON = os.environ["FAKE_GH_FAIL_ON"]
 FAIL_TIMES = int(os.environ["FAKE_GH_FAIL_TIMES"])
 LEDGER = os.environ["FAKE_GH_LEDGER"]
 MODE = os.environ.get("FAKE_GH_MODE", "transport")
+MATCH = os.environ.get("FAKE_GH_MATCH", "1") == "1"
 
 target = sys.argv[-1]
 with open(LEDGER, "a") as handle:
@@ -1082,13 +1081,16 @@ elif "/actions/workflows/99/runs" in p.path:
     else:
         print(json.dumps({"total_count": 1, "workflow_runs": [{"id": 101, "name": "Build and Test"}]}))
 elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
-    print(json.dumps({"total_count": 1, "jobs": [{"id": 1, "status": "queued", "labels": %s}]}))
+    labels = %s if MATCH else []
+    print(json.dumps({"total_count": 1, "jobs": [
+        {"id": 1, "status": "queued" if MATCH else "in_progress", "labels": labels}]}))
 else:
     raise SystemExit(4)
 ''' % repr(BASE + ["pulp-build-merge-group"])
 
     def _scan(self, fail_on: str, fail_times: int, mode: str = "transport",
-              extra: list[str] | None = None) -> tuple[subprocess.CompletedProcess, list[str]]:
+              extra: list[str] | None = None,
+              match: int = 1) -> tuple[subprocess.CompletedProcess, list[str]]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake = root / "fake-gh"
@@ -1101,6 +1103,7 @@ else:
                 FAKE_GH_FAIL_TIMES=str(fail_times),
                 FAKE_GH_LEDGER=str(ledger),
                 FAKE_GH_MODE=mode,
+                FAKE_GH_MATCH=str(match),
             )
             result = subprocess.run(
                 [
@@ -1133,14 +1136,36 @@ else:
         self.assertEqual(len([r for r in requests if "/jobs?" in r]), 2, requests)
 
     def test_a_pagination_race_restarts_the_whole_pass(self) -> None:
-        """A torn listing is retried as a pass, never spliced together."""
+        """A torn listing is retried as a pass, never spliced together.
+
+        Nothing matches here, so the torn page carries no witness and the only
+        route to an answer is a clean re-read of the listing. Reporting 0 off
+        the torn page would under-count the queue.
+        """
         result, requests = self._scan(
-            "actions/workflows/99/runs", fail_times=1, mode="race"
+            "actions/workflows/99/runs", fail_times=1, mode="race", match=0
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "0")
+        queued = [r for r in requests if "status=queued" in r]
+        self.assertEqual(len(queued), 2, requests)
+
+    def test_a_torn_listing_does_not_discard_a_witness_it_already_holds(self) -> None:
+        """The other cell: a matching job on the torn page settles the scan.
+
+        Reconciliation exists to make an empty listing believable. Once a run
+        on the page has produced a matching queued job, there is no emptiness
+        left to establish, so re-reading the listing cannot change the answer
+        and is not bought. Production logged this tear 231 times as a blind
+        poll while the proof was sitting on the page it had just read.
+        """
+        result, requests = self._scan(
+            "actions/workflows/99/runs", fail_times=1, mode="race", match=1
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "1")
         queued = [r for r in requests if "status=queued" in r]
-        self.assertEqual(len(queued), 2, requests)
+        self.assertEqual(len(queued), 1, requests)
 
     def test_a_persistent_fault_still_fails_closed(self) -> None:
         """Retry is not failing open: an unobservable queue still exits 2.
@@ -1345,3 +1370,10 @@ class AssignmentDemandIsOnlyEverAPredicateTests(unittest.TestCase):
         # Control: the arithmetic probe does fire on real arithmetic.
         self.assertEqual(self.ARITHMETIC.findall("x=$((q + 1))"), ["q + 1"],
                          "arithmetic probe is broken")
+
+
+# Every test class must be defined before the runner starts, so this stays the
+# last statement in the file. Placed earlier it silently truncates the suite:
+# the classes below the call are never defined and their tests never run.
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
