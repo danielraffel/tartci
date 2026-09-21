@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import tempfile
+import time
 import threading
 import unittest
 from pathlib import Path
@@ -211,6 +214,152 @@ class FeedTests(unittest.TestCase):
     def test_required_label_absent_from_runner_labels_is_a_config_error(self):
         with self.assertRaises(feed.FeedError):
             feed.read_feed(REPO, "nope-label", LABELS, socket_path=self.path, now=NOW)
+
+
+class ObservedAgeLedgerTests(unittest.TestCase):
+    """The ledger dates a witness by first sighting, which can only run late."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.ledger = Path(self.tmp.name) / "ledger.json"
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def result(self, *jobs):
+        return feed.FeedResult(
+            feed.Verdict.FRESH, "x", [j["payload"] for j in jobs]
+        )
+
+    def test_a_just_seen_witness_is_not_yet_old_enough(self):
+        count, reason = feed.eligible_witnesses(
+            self.result(job()), self.ledger, 600.0, now=NOW
+        )
+        self.assertEqual(count, 0)
+        self.assertIn("not an empty queue", reason)
+
+    def test_the_same_witness_qualifies_once_observed_long_enough(self):
+        feed.eligible_witnesses(self.result(job()), self.ledger, 600.0, now=NOW)
+        count, _ = feed.eligible_witnesses(
+            self.result(job()), self.ledger, 600.0, now=NOW + 601
+        )
+        self.assertEqual(count, 1)
+
+    def test_first_sighting_is_not_re_dated_by_later_polls(self):
+        for offset in (0, 100, 200):
+            feed.eligible_witnesses(
+                self.result(job()), self.ledger, 600.0, now=NOW + offset
+            )
+        entry = json.loads(self.ledger.read_text(encoding="utf-8"))["1"]
+        self.assertEqual(entry["first_seen"], NOW)
+
+    def test_a_non_fresh_verdict_yields_no_witness_and_keeps_its_reason(self):
+        count, reason = feed.eligible_witnesses(
+            feed.FeedResult(feed.Verdict.STALE, "severed"), self.ledger, 0.0, now=NOW
+        )
+        self.assertEqual(count, 0)
+        self.assertEqual(reason, "severed")
+
+    def test_a_witness_with_no_integer_id_refuses_the_whole_read(self):
+        """One shared key would let the first job vouch for every other."""
+        count, reason = feed.eligible_witnesses(
+            self.result(job(job_id=None), job(job_id=None)),
+            self.ledger, 600.0, now=NOW,
+        )
+        self.assertEqual(count, 0)
+        self.assertIn("no integer id", reason)
+        self.assertIn("not an empty queue", reason)
+
+    def test_a_stale_entry_is_pruned_rather_than_retained_forever(self):
+        feed.eligible_witnesses(self.result(job()), self.ledger, 0.0, now=NOW)
+        feed.eligible_witnesses(
+            self.result(job(job_id=2)), self.ledger, 0.0, now=NOW + 100_000
+        )
+        self.assertEqual(
+            list(json.loads(self.ledger.read_text(encoding="utf-8"))), ["2"]
+        )
+
+
+class CliContractTests(unittest.TestCase):
+    """The CLI must never hand the shell a number that reads as `no work`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / "daemon.sock"
+        self.ledger = Path(self.tmp.name) / "ledger.json"
+        self.daemon = None
+
+    def tearDown(self):
+        if self.daemon:
+            self.daemon.close()
+        self.tmp.cleanup()
+
+    def run_cli(self, status, events, min_age="0"):
+        self.path.unlink(missing_ok=True)
+        if status is not None:
+            self.daemon = FakeDaemon(self.path, status, events)
+        return subprocess.run(
+            [
+                sys.executable, "-B",
+                str(Path(__file__).resolve().parent / "shipyard_event_feed.py"),
+                "--repo", REPO,
+                "--require-label", REQUIRE,
+                "--labels", ",".join(LABELS),
+                "--min-observed-age-seconds", min_age,
+                "--ledger", str(self.ledger),
+                "--socket", str(self.path),
+                "--collect-timeout-seconds", "0.6",
+            ],
+            text=True, capture_output=True, check=False,
+        )
+
+    # --- the crux -------------------------------------------------------
+
+    def test_a_feed_that_licensed_nothing_prints_no_count_at_all(self):
+        """Printing `0` here would idle a lane. Stdout must stay empty."""
+        for label, status, events in (
+            ("live but silent", live_status(), []),
+            ("severed socket", None, []),
+            ("unregistered repo", live_status(registered=()), [job()]),
+        ):
+            with self.subTest(label):
+                if self.daemon:
+                    self.daemon.close()
+                    self.daemon = None
+                result = self.run_cli(status, events)
+                self.assertEqual(result.returncode, feed.EXIT_NO_LICENCE)
+                self.assertEqual(result.stdout.strip(), "")
+                self.assertIn("licensed no decision", result.stderr)
+
+    def test_no_licence_and_demand_are_different_exit_codes(self):
+        self.assertNotEqual(feed.EXIT_NO_LICENCE, feed.EXIT_DEMAND)
+
+    # --- the positive path ----------------------------------------------
+
+    def test_an_observed_witness_prints_one_and_exits_zero(self):
+        result = self.run_cli(live_status(), [job()])
+        self.assertEqual(result.returncode, feed.EXIT_DEMAND, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+
+    def test_a_witness_younger_than_the_lane_minimum_is_withheld(self):
+        result = self.run_cli(live_status(), [job()], min_age="600")
+        self.assertEqual(result.returncode, feed.EXIT_NO_LICENCE)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_a_witness_observed_long_enough_is_released(self):
+        self.ledger.write_text(
+            json.dumps({"1": {"first_seen": time.time() - 900,
+                              "last_seen": time.time()}}),
+            encoding="utf-8",
+        )
+        result = self.run_cli(live_status(), [job()], min_age="600")
+        self.assertEqual(result.returncode, feed.EXIT_DEMAND, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+
+
+def live_status(**kw):
+    kw.setdefault("last_event_at", time.time())
+    return status_frame(**kw)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import enum
 import json
+import os
 import socket
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -284,3 +286,174 @@ def read_feed(
         "feed is live but showed no matching queued job; "
         "absence of events is not evidence of an empty queue",
     )
+
+
+# --- observed-age ledger -------------------------------------------------
+#
+# A lane may require a queued job to have waited `min_queued_age_seconds`
+# before it is worth booting a VM for. The scan reads that age from the job's
+# own `created_at`. The feed cannot: Shipyard's normalized `workflow_job`
+# payload carries no timestamp, and the daemon replays its ring without
+# stamping one, so a replayed frame is undatable by construction.
+#
+# What a subscriber CAN date is its own first sighting. A webhook cannot arrive
+# before the job was queued, so `first_seen >= queued_at`, and therefore
+# `now - first_seen <= now - queued_at`. Measuring age from `first_seen` is an
+# UNDER-estimate of the true wait, so it can only ever withhold a job that is
+# in fact old enough -- never release one that is too young. Erring late means
+# the scan answers instead, which is the behaviour this whole path falls back
+# to anyway.
+
+DEFAULT_LEDGER_RETENTION_S = 21_600.0
+
+
+def _load_ledger(path: Path) -> dict:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _store_ledger(path: Path, ledger: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(ledger), encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        # A ledger that cannot be persisted re-dates every job on the next
+        # poll, which only delays eligibility. Never fatal.
+        pass
+
+
+def eligible_witnesses(
+    result: FeedResult,
+    ledger_path: Path,
+    min_observed_age_s: float,
+    now: float | None = None,
+    retention_s: float = DEFAULT_LEDGER_RETENTION_S,
+) -> tuple[int, str]:
+    """Count FRESH witnesses this subscriber has observed queued long enough.
+
+    Returns `(count, reason)`. A zero count is never evidence of an empty
+    queue -- it means this feed did not license a decision, so the caller must
+    keep whatever the scan told it.
+    """
+    if result.verdict is not Verdict.FRESH:
+        return 0, result.detail
+    stamp = time.time() if now is None else now
+    ledger = _load_ledger(ledger_path)
+    eligible = 0
+    oldest = None
+    for payload in result.events:
+        job_id = payload.get("job_id")
+        if not isinstance(job_id, int) or isinstance(job_id, bool):
+            # Distinct jobs sharing one ledger key would let the first one to
+            # age in vouch for all the rest, releasing work that never waited.
+            # Refuse the read rather than key on a value that cannot identify.
+            return 0, (
+                f"refusing a malformed feed: queued job has no integer id "
+                f"({job_id!r}); not an empty queue"
+            )
+        key = str(job_id)
+        entry = ledger.get(key)
+        first_seen = entry.get("first_seen") if isinstance(entry, dict) else None
+        if not isinstance(first_seen, (int, float)):
+            first_seen = stamp
+        ledger[key] = {"first_seen": float(first_seen), "last_seen": stamp}
+        observed = stamp - float(first_seen)
+        if observed >= min_observed_age_s:
+            eligible += 1
+        elif oldest is None or observed > oldest:
+            oldest = observed
+    # Pruning only reaches jobs that have LEFT the feed: `last_seen` is
+    # refreshed above for every job still being witnessed, so an entry cannot
+    # be aged out from under a job that is still queued.
+    for key in [
+        k
+        for k, v in ledger.items()
+        if not isinstance(v, dict)
+        or not isinstance(v.get("last_seen"), (int, float))
+        or stamp - float(v["last_seen"]) > retention_s
+    ]:
+        del ledger[key]
+    _store_ledger(ledger_path, ledger)
+    if eligible:
+        return eligible, (
+            f"{eligible} witness(es) observed queued for at least "
+            f"{min_observed_age_s:.0f}s"
+        )
+    return 0, (
+        f"{result.matched} witness(es) on the feed but none observed for "
+        f"{min_observed_age_s:.0f}s (oldest observed "
+        f"{0.0 if oldest is None else oldest:.0f}s); not an empty queue"
+    )
+
+
+# Exit codes. `NO_LICENCE` deliberately has no "the queue is empty" reading:
+# it says this feed did not license a decision, so the caller keeps its own.
+EXIT_DEMAND = 0
+EXIT_USAGE = 2
+EXIT_NO_LICENCE = 3
+
+
+def main(argv=None) -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Report queued demand observed on the local Shipyard daemon feed. "
+            "Exit 0 means demand was positively observed. Any other exit means "
+            "this feed licensed no decision -- never that the queue is empty."
+        )
+    )
+    parser.add_argument("--repo", required=True)
+    parser.add_argument("--require-label", required=True)
+    parser.add_argument("--labels", required=True)
+    parser.add_argument("--min-observed-age-seconds", type=float, default=0.0)
+    parser.add_argument("--ledger", required=True)
+    parser.add_argument("--socket", default=str(DEFAULT_SOCKET))
+    parser.add_argument(
+        "--freshness-window-seconds", type=float, default=DEFAULT_FRESHNESS_WINDOW_S
+    )
+    parser.add_argument(
+        "--collect-timeout-seconds", type=float, default=DEFAULT_COLLECT_TIMEOUT_S
+    )
+    parser.add_argument(
+        "--connect-timeout-seconds", type=float, default=DEFAULT_CONNECT_TIMEOUT_S
+    )
+    args = parser.parse_args(argv)
+    if args.min_observed_age_seconds < 0:
+        parser.error("--min-observed-age-seconds must be non-negative")
+    labels = [item for item in args.labels.split(",") if item.strip()]
+
+    try:
+        result = read_feed(
+            args.repo,
+            args.require_label,
+            labels,
+            socket_path=Path(args.socket),
+            freshness_window_s=args.freshness_window_seconds,
+            collect_timeout_s=args.collect_timeout_seconds,
+            connect_timeout_s=args.connect_timeout_seconds,
+        )
+    except FeedError as error:
+        print(f"feed licensed no decision: {error}", file=sys.stderr)
+        return EXIT_USAGE
+
+    count, reason = eligible_witnesses(
+        result, Path(args.ledger), args.min_observed_age_seconds
+    )
+    if count:
+        # One witness settles the only question the caller asks, and the feed
+        # cannot claim a magnitude: a replay ring is not a queue census.
+        print(1)
+        print(f"feed observed demand: {reason}", file=sys.stderr)
+        return EXIT_DEMAND
+    print(f"feed licensed no decision: {reason}", file=sys.stderr)
+    return EXIT_NO_LICENCE
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

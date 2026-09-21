@@ -480,6 +480,42 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
   host is explicitly pointed at the same replacement path.
 
+- **The Shipyard push feed can rescue a blind scan; it can never report an
+  empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
+  a tier scan that failed closed asks the local Shipyard daemon's
+  `workflow_job` webhook feed whether demand exists before the supervisor
+  idles blind. The feed is a second opinion from outside the GitHub REST API,
+  so it survives exactly the per-call timeouts that make the scan fail.
+  → *The asymmetry is the whole design.* A witness on the feed proves presence
+  and nothing can retract it. Silence proves nothing at all: a severed feed, an
+  unregistered webhook and a genuinely empty queue are the same bytes. So the
+  rescue only ever converts `ERR` into "there is demand"; every refusal leaves
+  the blind verdict exactly as the scanner left it, and `scan_blind` handling —
+  including the ~180s self-restart — runs unchanged.
+  → *It runs only after the scan already failed*, so a healthy lane never
+  consults it and no feed defect can regress one. The exhaustive caller is
+  excluded: a 100-entry replay ring is not a queue census, and that caller
+  wants a magnitude.
+  → *Age comes from the subscriber's own first sighting, not the job.*
+  Shipyard's normalized `workflow_job` payload carries no timestamp
+  (`action`, `run_id`, `job_id`, `repo`, `name`, `status`, `conclusion`,
+  `runner_name`, `labels`) and the daemon replays its ring unstamped, so a
+  frame is undatable. The ledger at
+  `$STATE_DIR/<runner>.feed-ledger.json` records when this subscriber first saw
+  each job id. A webhook cannot arrive before the job was queued, so that
+  measures *less* than the true wait and can only withhold a job that is in
+  fact old enough — never release one that is too young. A lost ledger costs a
+  delay, never a premature boot.
+  → *Every outcome is announced*: `assignment_feed_rescue` on a rescue,
+  `assignment_feed_degraded` with the daemon's own reason on any refusal. A
+  failing feed must never look like a quiet lane.
+  → *Diagnose by hand* with
+  `python3 scripts/shipyard_event_feed.py --repo … --require-label … --labels …
+  --min-observed-age-seconds … --ledger /tmp/probe.json`. Exit 0 means demand
+  was observed; exit 3 means the feed licensed no decision. Exit 3 is **not**
+  "the queue is empty", and the CLI deliberately prints no count at all rather
+  than a `0` a caller could misread.
+
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
   A run that ends `legacy label remains loaded; refusing replacement startup` →
   `migration failed; restoring prior LaunchAgent configuration` →

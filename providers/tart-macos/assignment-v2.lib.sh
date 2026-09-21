@@ -92,9 +92,59 @@ tartci_assignment_v2_tier_demand(){
     detail="$(tail -n 1 "$error_file" | cut -c1-512)"
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
+    if [ "$exhaustive" != 1 ] \
+       && tartci_assignment_feed_rescue "$tier_label" "$selected_labels"; then
+      rm -f "$error_file"
+      return 0
+    fi
   fi
   rm -f "$error_file"
   return "$rc"
+}
+
+# Second opinion for a scan that already failed closed, from a source that is
+# not the GitHub REST API: the local Shipyard daemon's webhook push feed.
+#
+# It runs ONLY after the scan failed, so a healthy lane never reaches it and no
+# feed defect can regress one. It can only ever turn a blind poll into "there
+# is demand" -- the feed cannot observe absence (a severed feed and an empty
+# queue are the same silence), so a refusal leaves the blind result exactly as
+# the scanner left it and the supervisor's existing scan-blind handling runs
+# unchanged. The exhaustive caller is excluded because it wants a magnitude,
+# and a replay ring is not a queue census.
+#
+# Every outcome is announced. A feed that is failing must not look like a lane
+# that is merely quiet.
+tartci_assignment_feed_rescue(){
+  local tier_label="$1" selected_labels="$2" out err_file reason rc socket_arg=()
+  [ "${TARTCI_ASSIGNMENT_FEED_RESCUE:-0}" = 1 ] || return 1
+  if [ -n "${TARTCI_SHIPYARD_DAEMON_SOCKET:-}" ]; then
+    socket_arg=(--socket "$TARTCI_SHIPYARD_DAEMON_SOCKET")
+  fi
+  mkdir -p "$STATE_DIR"
+  err_file="$(mktemp "$STATE_DIR/$RUNNER_NAME.feed-rescue.XXXXXX")" || return 1
+  if out="$(python3 "$TARTCI_ROOT/scripts/shipyard_event_feed.py" \
+    --repo "$REPO" \
+    --require-label "$tier_label" \
+    --labels "$selected_labels" \
+    --min-observed-age-seconds "$MIN_QUEUED_AGE" \
+    --ledger "$STATE_DIR/$RUNNER_NAME.feed-ledger.json" \
+    ${socket_arg[@]+"${socket_arg[@]}"} 2>"$err_file")"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  reason="$(tail -n 1 "$err_file" | cut -c1-512)"
+  rm -f "$err_file"
+  if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -qxE '[1-9][0-9]*'; then
+    event assignment_feed_degraded \
+      "tier=$tier_label feed_rc=$rc detail=${reason:-no feed detail}"
+    return 1
+  fi
+  event assignment_feed_rescue \
+    "tier=$tier_label detail=${reason:-feed observed demand}"
+  printf '%s\n' "$out"
+  return 0
 }
 
 tartci_assignment_v2_select_live(){

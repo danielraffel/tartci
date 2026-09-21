@@ -62,7 +62,7 @@ LANE_KEYS = {
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
-    "assignment_top_tier_receipt_max_age_seconds",
+    "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
@@ -413,6 +413,14 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_top_tier_receipt_max_age_seconds "
                 "must be an integer from 0 through 300 on an event-class-v2 lane"
+            )
+        feed_rescue = lane.get("assignment_feed_rescue")
+        if feed_rescue is not None and (
+                assignment_mode != "event-class-v2"
+                or type(feed_rescue) is not bool):
+            fail(
+                f"lane {lane_id}: assignment_feed_rescue must be a boolean on "
+                "an event-class-v2 lane"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -1651,6 +1659,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = str(
             lane["assignment_top_tier_receipt_max_age_seconds"]
         )
+    if lane.get("assignment_feed_rescue"):
+        env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
