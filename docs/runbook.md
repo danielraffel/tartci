@@ -1160,7 +1160,35 @@ provider LaunchAgent. Optionally set `TARTCI_SHIPYARD_CLI` (default `shipyard`),
 `TARTCI_ADMISSION_CLEAN_TIMEOUT_SECS` (default 300, range 1..1800). Required
 mode fails closed: a typed `admit` is the only path to JIT registration.
 `defer` or any operational/contract error tears down the still-unregistered VM,
-releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`. Keep the
+releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`.
+
+An `error` verdict is not one thing, and the difference decides whether the
+fleet can stop. `mutation_failed` and `invalid_labels` are conclusive: Shipyard
+either saw a superseded run it could not cancel, or the lane is misconfigured.
+Those stay closed permanently. `observation_failed`, `authority_failed`, and
+`revalidation_failed` mean Shipyard could not look at all, which says nothing
+about the queue -- as does an `error` reason this TartCI generation does not
+recognize, since Shipyard is released separately. Backoff alone does not bound
+those: a blindness that outlasts the backoff stops every lane for the repo
+indefinitely, and if the cause scales with the repo's own backlog the outage
+prevents the draining that would end it.
+
+So an inconclusive verdict opens a bounded circuit breaker instead. The first
+`TARTCI_ADMISSION_CLEAN_DEGRADE_AFTER` (default 3) consecutive inconclusive
+verdicts still fail closed, so a transient blip keeps the gate at full
+strength. Past that the gate emits a degraded admit carrying
+`tartci_degraded`, logs a loud line, and counts up to
+`TARTCI_ADMISSION_CLEAN_DEGRADE_MAX` (default 20), after which it closes again
+rather than staying open forever. Any real `admit` or `defer` resets the count.
+Counters live per `(repo, base, labels)` under
+`TARTCI_ADMISSION_CLEAN_STATE_DIR` so lanes never pool each other's failures.
+A rejected envelope is written to `rejected-envelope.json` in that directory,
+so a Shipyard contract skew is diagnosable without reading Shipyard's source.
+
+Degrading trades one ephemeral single-job VM that a superseded run may claim --
+bounded, non-corrupting, and unable to satisfy the current head's required
+checks -- against an unbounded fleet stop. Never widen this to `admit`
+verdicts. Keep the
 mode `disabled` only during the staged TartCI-before-Shipyard rollout.
 The managed macOS fleet profiles always render `required`; for event-class V2,
 the gate runs after guest preflight and immediately before repository-access
@@ -1281,6 +1309,22 @@ macOS serve loop treats the cap as already full and waits. Disable the lease
 consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
 debugging.
 
+A lane may also declare `process_type`, which sets the rendered LaunchAgent's
+`ProcessType`. The accepted values are the four `launchd.plist(5)` documents:
+`Background`, `Standard`, `Adaptive`, `Interactive`. A lane that omits the key
+renders `Background`, which is what every lane had before the key existed. The
+key matters because launchd throttles a `Background` job: the exhaustive
+event-class queue scan is a long chain of short GitHub API calls, and the
+per-call latency -- not the `assignment_scan_timeout_seconds` budget -- is what
+decides whether the scan finishes. A supervisor cannot lift its own
+classification (`taskpolicy -B` on itself does not restore the latency), so the
+value has to be in the plist, which is rendered from the profile: editing an
+installed plist by hand is reverted by the next render. Pulp's gate lanes
+declare `Adaptive`; release lanes stay `Background`. Promotion out of the
+background band is a launchd heuristic, so treat a declared `Adaptive` as a
+request, and confirm what the host actually did with
+`launchctl print gui/$(id -u)/<label> | grep 'spawn type'`.
+
 **Windows gotchas preserved from the Pulp original** (debugged live; don't
 "simplify" them away): the multi-KB JIT blob is **streamed via ssh stdin into a
 file**, never on the outer ssh command line (cmd.exe's 8191-char limit blows
@@ -1375,7 +1419,14 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   capacity via `--capacity-mem-mb`); admission is `min(core-budget,
   memory-budget)`, so a build is refused when it would exhaust RAM even if cores
   are free. Legacy core-only records are estimated as `cores × per-job memory`
-  so a mixed store never over-admits.
+  so a mixed store never over-admits. The gate reserve applies on this axis too
+  (`reserved_gate_mem_mb`, overridable with `--reserved-gate-mem-mb`): a
+  non-gate lease is held to `capacity - reserve`, because a non-gate build that
+  fits the non-gate *core* budget could otherwise consume the RAM the next gate
+  VM needs and darken the required `macos` gate. The reserve is derived
+  proportional to `reserved_gate_cores` and clamped so non-gate work always
+  keeps at least one compile job's worth. A denial names which limit bound it
+  (`memory_limit_class`: `non_gate` or `host`).
 - **Disk as a third, per-volume axis** — macOS/Linux Tart clones reserve growth
   against `TART_HOME`; Windows overlays reserve against `TARTCI_WIN_WORK`.
   Device ID, not a spelling of the path, is the accounting key, so aliases on
@@ -1384,6 +1435,20 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   transaction as CPU/RAM admission. JSON status and denial records emit
   `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
   diagnosis.
+
+- **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
+  charged on the memory axis is the figure the clone is booted with
+  (`tart set --cpu C --memory M`). A clone otherwise inherits its golden's baked
+  memory, so the charge and the boot size would agree only by coincidence, and
+  Pulp's guest-side build governor derives its job count from the memory the
+  guest can actually see. The size is derived after the non-gate core clamp, so
+  a clamped lane is charged for the cores it receives; an explicit
+  `TARTCI_<PROVIDER>_VM_MEM_MB` override is used verbatim instead.
+  `TARTCI_VM_LEASE_MIN_MEM_MB` / `TARTCI_VM_LEASE_MAX_MEM_MB` bound the
+  derivation. Raise the ceiling only against a fresh measurement of
+  per-Virtualization-process RSS against configured guest memory: that ratio
+  runs above 1, so concurrent guests cost more host RAM than they are
+  configured for.
 
   Managed macOS fleet lanes also set one host-level
   `TARTCI_DISK_DENIAL_RECEIPT_DIR` and their configured stable
@@ -1537,6 +1602,35 @@ lanes change.
   generation. Supervisor counts are control-plane health, not the host's two-VM
   physical capacity. Use `tartci pool status --require-ready` for a nonzero gate;
   ordinary status remains observational.
+- **`serving` is a separate verdict from `fleet_ready`, and both are printed.**
+  A supervisor can be receipted, loaded, running and freshly heartbeating while
+  serving nothing at all: a lane that takes queued work and fails before a job
+  is assigned looks identical to a healthy idle one from every liveness signal.
+  `pool status` therefore prints a `serving:` line reading `ok`, `BLOCKED` or
+  `unknown`, and the JSON carries a `serving` object with the blocked lanes,
+  each lane's serve-less streak, and the phase it last reached.
+  A lane is reported blocked only when both gates trip: a streak of consecutive
+  work entries that served nothing (`--blocked-serving-streak`, default 6) and
+  elapsed time since the streak began (`--blocked-serving-seconds`, default
+  5400). The streak is the shape test, so failures interleaved with served jobs
+  never accumulate; the elapsed time is the transience test, so an upstream
+  blip cannot raise a fleet-wide alarm. A lane with no queued demand clears its
+  streak on every idle pass, so zero VMs at rest never reads as blocked.
+  A blocked lane deliberately does NOT clear `fleet_ready` and does not
+  decrement the verified supervisor count. `fleet_ready` is a host-local,
+  host-fixable question, and the dominant cause of a blocked lane is upstream
+  and hits every lane on every host at once; gating the fleet on a condition it
+  cannot fix would turn a serving outage into a control-plane outage. Use
+  `tartci pool status --require-serving` (exit 9) when you want a nonzero gate
+  on service specifically.
+- `tartci host-profile --delivery [--json]` reports how code actually reaches
+  each lane on this host, read off the live plist. Reports the delivery mechanism
+  (`generation` or `sealed-bundle`), the commit in force inside the artifact
+  the plist really execs, whether that is stale relative to this checkout, and
+  whether `fleet-macos install --apply` updates the lane at all. On a sealed
+  host that command stages a generation the launcher never execs, so it is a
+  silent no-op there; the report says so per lane rather than leaving it to be
+  inferred from a hostname.
 - `tartci pool repair-lock` — recover a transition lock orphaned by power loss,
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an

@@ -644,7 +644,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 self.assertEqual(data["host"]["tart_home"], expected[host_id][0])
                 self.assertEqual(
                     data["host"].get("github_api_timeout_seconds"),
-                    30 if host_id == "m1" else None,
+                    30,
+                    f"{host_id}: every fleet host pins the GitHub API timeout at 30s. "
+                    "The 15s default was the dominant assignment-scan failure on the "
+                    "hosts that had not pinned it (m3 88%, m5 81%, measured 2026-09-21).",
                 )
                 self.assertEqual(
                     data["host"].get("persistent_runner_labels", []),
@@ -751,7 +754,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertTrue(all(
                         value["EnvironmentVariables"].get("TARTCI_GH_TIMEOUT_SECS")
-                        == ("30" if host_id == "m1" else None)
+                        == "30"
                         for value in values
                     ))
                     self.assertTrue(all(
@@ -1527,6 +1530,102 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn(key, result.stderr)
 
+    def test_process_type_accepts_only_documented_launchd_values(self) -> None:
+        base = CONFIG.read_text()
+        self.assertIn('process_type = "Adaptive"', base)
+        rejected = {
+            "unknown": 'process_type = "Fast"',
+            "lowercase": 'process_type = "adaptive"',
+            "wrong-type": "process_type = 1",
+            "empty": 'process_type = ""',
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, replacement in rejected.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(
+                        base.replace('process_type = "Adaptive"', replacement, 1)
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 2, result.stdout + result.stderr
+                    )
+                    self.assertIn("process_type", result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            for value in fleet.PROCESS_TYPES:
+                with self.subTest(accepted=value):
+                    path = Path(td) / f"ok-{value}.toml"
+                    path.write_text(
+                        base.replace(
+                            'process_type = "Adaptive"',
+                            f'process_type = "{value}"',
+                            1,
+                        )
+                    )
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_undeclared_lane_still_renders_the_background_default(self) -> None:
+        body = CONFIG.read_text().replace('process_type = "Adaptive"\n', "", 1)
+        self.assertNotIn("process_type", body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "no-process-type.toml"
+            path.write_text(body)
+            output = Path(td) / "rendered"
+            rendered = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "render",
+                 str(path), "--output", str(output)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            values = [
+                plistlib.loads(plist.read_bytes())
+                for plist in sorted(output.glob("*.plist"))
+            ]
+            self.assertTrue(values)
+            self.assertEqual(
+                {value["ProcessType"] for value in values}, {"Background"}
+            )
+
+    def test_only_pulp_gate_supervisors_leave_the_background_band(self) -> None:
+        for host_id, config in HOST_CONFIGS.items():
+            with self.subTest(host=host_id):
+                with tempfile.TemporaryDirectory() as td:
+                    rendered = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "render",
+                         str(config), "--output", td],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                    by_label = {
+                        value["Label"]: value["ProcessType"]
+                        for value in (
+                            plistlib.loads(plist.read_bytes())
+                            for plist in sorted(Path(td).glob("*.plist"))
+                        )
+                    }
+                promoted = {
+                    label for label, kind in by_label.items() if kind == "Adaptive"
+                }
+                prefix = (
+                    "com.danielraffel.tartci.tart-runner-macos-fleet."
+                    f"{host_id}.pulp-gate"
+                )
+                # Both supervisors of the gate lane, and nothing else --
+                # release and the other product gates stay Background.
+                self.assertEqual(promoted, {prefix, f"{prefix}.slot2"})
+                self.assertEqual(
+                    {kind for label, kind in by_label.items()
+                     if label not in promoted},
+                    {"Background"},
+                )
+
     def test_supervisor_count_wrong_type_fails_without_traceback(self) -> None:
         body = CONFIG.read_text().replace("supervisors = 2", 'supervisors = "2"', 1)
         with tempfile.TemporaryDirectory() as td:
@@ -2009,11 +2108,12 @@ replaces_launchd_labels=REPLACEMENT
 class ServingBlockedTests(unittest.TestCase):
     """A fresh heartbeat proves a supervisor is alive, never that it serves.
 
-    A lane that keeps winning a host reservation and then losing the VM lease
+    A lane that keeps taking queued work and failing before assignment
     heartbeats on a normal cadence forever, so the age-only test cannot see it.
-    These pin the separation in both directions: a short block is ordinary
-    contention and must stay verified, a long one must stop counting as
-    realized capacity.
+    These pin the separation in every direction: a short block is ordinary
+    contention, a lane with no demand at all is the designed resting state of
+    an ephemeral fleet, and only a long run of work entries that served nothing
+    is a fault.
     """
 
     def _readiness(self, extra_state: dict, **kwargs) -> dict:
@@ -2063,33 +2163,141 @@ class ServingBlockedTests(unittest.TestCase):
         moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)
         return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def test_a_long_block_stops_counting_as_realized_capacity(self) -> None:
-        value = self._readiness({"serving_blocked_since": self._ago(7200)})
-        problems = {item["code"]: item for item in value["problems"]}
-        self.assertIn("serving_blocked", problems)
-        self.assertIn("blocked_seconds=", problems["serving_blocked"]["detail"])
-        self.assertEqual(value["verified_running_supervisors"], 0)
-        self.assertFalse(value["fleet_ready"])
+    def _blocked(self, value: dict) -> bool:
+        return value["serving"]["blocked"]
 
-    def test_ordinary_contention_stays_verified(self) -> None:
-        """The inverse failure: a lane blocked for a minute is just waiting its
-        turn behind a live build, and flagging that would manufacture alarms on
-        a healthy fleet."""
-        value = self._readiness({"serving_blocked_since": self._ago(60)})
+    # -- the fault itself ----------------------------------------------------
+
+    def test_a_long_serve_less_streak_reports_the_lane_blocked(self) -> None:
+        """The measured outage: three hours of taking work and serving none."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 143,
+            "serving_blocked_last_phase": "admission-error",
+        })
+        self.assertTrue(self._blocked(value))
+        lanes = value["serving"]["blocked_lanes"]
+        self.assertEqual([lane["label"] for lane in lanes], ["one"])
+        self.assertEqual(lanes[0]["streak"], 143)
+        self.assertEqual(lanes[0]["last_phase"], "admission-error")
+        self.assertGreaterEqual(lanes[0]["blocked_seconds"], 10800)
+
+    def test_a_blocked_lane_is_not_a_fleet_readiness_problem(self) -> None:
+        """The design decision, stated as an assertion.
+
+        The dominant cause of a blocked lane is upstream and hits every lane on
+        every host at once, so folding it into `fleet_ready` would let one
+        upstream refusal fail the gate that decides whether hosts stay in the
+        fleet -- converting a serving outage into a control-plane outage, and
+        destroying the warm supervisors that are the recovery path. The
+        supervisor really is installed, loaded and running; that claim stays
+        true and the contradicting fact gets its own name.
+        """
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 143,
+        })
+        self.assertTrue(self._blocked(value))
         self.assertNotIn(
             "serving_blocked", {item["code"] for item in value["problems"]}
         )
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
 
-    def test_a_generation_predating_the_field_is_not_reported_blocked(self) -> None:
-        """Hosts run whatever generation was last installed. An older runner
-        never writes the marker, and its absence is ignorance, not health."""
-        value = self._readiness({})
-        self.assertNotIn(
-            "serving_blocked", {item["code"] for item in value["problems"]}
-        )
+    # -- the false positives -------------------------------------------------
+
+    def test_an_idle_lane_with_no_demand_is_not_blocked(self) -> None:
+        """The critical false positive.
+
+        Zero VMs at rest is the DESIGNED state of an ephemeral on-demand fleet,
+        not a symptom. A lane polling an empty queue clears the streak on every
+        pass, so it must read exactly like a lane that just finished a job.
+        """
+        value = self._readiness({
+            "phase": "waiting",
+            "vm": "",
+            "serving_blocked_since": "",
+            "serving_blocked_streak": 0,
+        })
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["serving"]["blocked_lanes"], [])
         self.assertEqual(value["verified_running_supervisors"], 1)
+        self.assertTrue(value["fleet_ready"])
+
+    def test_ordinary_contention_stays_verified(self) -> None:
+        """A lane blocked for a minute is waiting its turn behind a live build,
+        and flagging that would manufacture alarms on a healthy fleet."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(60),
+            "serving_blocked_streak": 1,
+        })
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["verified_running_supervisors"], 1)
+        self.assertTrue(value["fleet_ready"])
+
+    def test_a_fast_retry_burst_below_the_duration_floor_is_not_blocked(self) -> None:
+        """The transience gate. An upstream blip can drive the streak past the
+        threshold in minutes; raising a fleet-wide alarm on that would be its
+        own outage."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(120),
+            "serving_blocked_streak": 200,
+        })
+        self.assertFalse(self._blocked(value))
+
+    def test_a_long_block_below_the_streak_floor_is_not_blocked(self) -> None:
+        """The shape gate. Duration alone cannot tell a lane that is failing
+        from one that is merely slow, which is why the threshold is a streak
+        and not an elapsed time or an error count."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 2,
+        })
+        self.assertFalse(self._blocked(value))
+
+    def test_healthy_and_failing_cadences_land_on_opposite_sides(self) -> None:
+        """The threshold against the real numbers.
+
+        Healthy: ~1.6 work entries/hour at job-per-mint ~1.00, so the streak is
+        reset by nearly every entry and three hours of it reaches ~1. Failing:
+        ~35 entries/hour at job-per-mint 0.00, so three hours reaches ~105. The
+        threshold of 6 sits between them with an order of magnitude of margin
+        on the failing side and 3.75 hours of consecutive total failure needed
+        to reach it on the healthy side.
+        """
+        hours = 3
+        healthy_streak = 1
+        failing_streak = int(35 * hours)
+        self.assertLess(healthy_streak, 6)
+        self.assertGreater(failing_streak, 6 * 10)
+        healthy = self._readiness({
+            "serving_blocked_since": self._ago(3600 * hours),
+            "serving_blocked_streak": healthy_streak,
+        })
+        failing = self._readiness({
+            "serving_blocked_since": self._ago(3600 * hours),
+            "serving_blocked_streak": failing_streak,
+        })
+        self.assertFalse(self._blocked(healthy))
+        self.assertTrue(self._blocked(failing))
+
+    # -- blindness is not health --------------------------------------------
+
+    def test_a_generation_predating_the_streak_is_reported_unmeasurable(self) -> None:
+        """Hosts run whatever generation was last installed. An older runner
+        never writes the counter, and its absence is ignorance, not health."""
+        value = self._readiness({})
+        self.assertEqual(value["serving"]["unmeasurable_lanes"], ["one"])
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["verified_running_supervisors"], 1)
+
+    def test_a_generation_predating_the_streak_keeps_the_duration_only_test(self) -> None:
+        """Do not regress the lease-denial path on a host that has not been
+        redeployed: without a counter to read, the elapsed-time test is the
+        only evidence there is, and it still fires."""
+        value = self._readiness({"serving_blocked_since": self._ago(7200)})
+        self.assertTrue(self._blocked(value))
+        self.assertIsNone(value["serving"]["blocked_lanes"][0]["streak"])
 
     def test_an_unreadable_marker_is_reported_rather_than_skipped(self) -> None:
         value = self._readiness({"serving_blocked_since": "not-a-timestamp"})
@@ -2099,13 +2307,61 @@ class ServingBlockedTests(unittest.TestCase):
         )
         self.assertEqual(value["verified_running_supervisors"], 0)
 
-    def test_the_threshold_is_configurable(self) -> None:
-        value = self._readiness(
-            {"serving_blocked_since": self._ago(600)}, blocked_serving_seconds=300
-        )
+    def test_an_unreadable_streak_is_reported_rather_than_skipped(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": "many",
+        })
         self.assertIn(
-            "serving_blocked", {item["code"] for item in value["problems"]}
+            "serving_blocked_streak_invalid",
+            {item["code"] for item in value["problems"]},
         )
+        self.assertFalse(self._blocked(value))
+
+    def test_the_thresholds_are_configurable(self) -> None:
+        value = self._readiness(
+            {"serving_blocked_since": self._ago(600), "serving_blocked_streak": 3},
+            blocked_serving_seconds=300, blocked_serving_streak=2,
+        )
+        self.assertTrue(self._blocked(value))
+
+
+class ShippedProfileGitHubTimeoutTests(unittest.TestCase):
+    """Every production macOS fleet profile must pin the GitHub API timeout.
+
+    The generic default is 15s. Measured 2026-09-21, a single GitHub call
+    exceeding that default was the dominant assignment-scan failure on the
+    hosts that had not pinned it: m3 184/209 (88%), m5 213/263 (81%). m1,
+    which pinned 30, showed the inverse split. The calls are not slow in
+    isolation; they exceed 15s under concurrent supervisors. Dropping the key
+    silently reverts a host to 15s, so pin it here rather than rely on review.
+    """
+
+    def _fleet_profiles(self):
+        paths = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertTrue(paths, "no *-macos-fleet.toml profiles found: the glob is wrong")
+        return paths
+
+    def test_every_fleet_profile_pins_the_github_api_timeout(self) -> None:
+        missing = []
+        for path in self._fleet_profiles():
+            with path.open("rb") as handle:
+                data = tomllib.load(handle)
+            if "github_api_timeout_seconds" not in data.get("host", {}):
+                missing.append(path.name)
+        self.assertEqual(
+            missing, [],
+            "these fleet profiles do not pin host.github_api_timeout_seconds and "
+            "so silently fall back to the 15s default: " + ", ".join(missing),
+        )
+
+    def test_the_pinned_timeout_is_within_the_validated_range(self) -> None:
+        for path in self._fleet_profiles():
+            with path.open("rb") as handle:
+                value = tomllib.load(handle)["host"]["github_api_timeout_seconds"]
+            self.assertIsInstance(value, int, f"{path.name}: must be an integer")
+            self.assertGreaterEqual(value, 5, f"{path.name}: below the validated floor")
+            self.assertLessEqual(value, 60, f"{path.name}: above the validated ceiling")
 
 
 if __name__ == "__main__":

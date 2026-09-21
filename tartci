@@ -9,6 +9,7 @@
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
+#   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
 #   tartci network-profile [status|reconcile|rollback] # opt-in host relay convergence
 #   tartci leases [status|acquire|release|heartbeat|reap] # inspect the host lease store
 #   tartci profile <cmd>       # list/show/explain/plan routing profiles
@@ -379,7 +380,7 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving]"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
@@ -654,11 +655,12 @@ EOF
       done
       ;;
     status)
-      local status_json=0 require_ready=0
+      local status_json=0 require_ready=0 require_serving=0
       for arg in "$@"; do
         case "$arg" in
           --json) status_json=1 ;;
           --require-ready) require_ready=1 ;;
+          --require-serving) require_serving=1 ;;
           *) echo "$pool_usage" >&2; return 2 ;;
         esac
       done
@@ -668,7 +670,7 @@ EOF
       lock_health_json="$(tartci_pool_lock_health_json)" \
         || lock_health_json='{"state":"unobservable","present":null}'
       local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
-      local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[]}'
+      local fleet_readiness='{"managed":false,"fleet_ready":null,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[]}'
       local managed_plists=""
       managed_plists="$(find "$agents_dir" -maxdepth 1 -name 'com.danielraffel.tartci.tart-runner-macos-fleet.*.plist' -print -quit 2>/dev/null || true)"
       if [ -f "$fleet_receipt" ] || [ -n "$managed_plists" ]; then
@@ -680,9 +682,9 @@ EOF
         else
           local readiness_rc=$?
           if [ "$readiness_rc" = 127 ]; then
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[{"code":"python_toml_interpreter_unavailable"}]}'
           else
-            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"problems":[{"code":"readiness_probe_failed"}]}'
+            fleet_readiness='{"managed":true,"fleet_ready":false,"verified_running_supervisors":null,"expected_supervisors":null,"serving":{"blocked":null,"blocked_lanes":[],"unmeasurable_lanes":[]},"problems":[{"code":"readiness_probe_failed"}]}'
           fi
         fi
       fi
@@ -723,6 +725,30 @@ if fleet["managed"]:
         print("verified running supervisors: unknown (not checked from here)")
     else:
         print(f"verified running supervisors: {verified}/{fleet['expected_supervisors']}")
+    # Deliberately its own line and not folded into `fleet ready`. A supervisor
+    # can be installed, loaded, running and freshly heartbeating while serving
+    # nothing at all, and printing only the first four made a lane that cloned
+    # 35 times an hour and served zero jobs read as healthy.
+    serving = fleet.get("serving") or {}
+    blocked = serving.get("blocked")
+    lanes = serving.get("blocked_lanes") or []
+    unmeasurable = serving.get("unmeasurable_lanes") or []
+    if blocked is None:
+        print("serving: unknown (not checked from here)")
+    elif blocked:
+        print(f"serving: BLOCKED ({len(lanes)} lane(s) took queued work and served nothing)")
+        for lane in lanes:
+            streak = lane.get("streak")
+            print(
+                f"  lane {lane['label']}: blocked_seconds={lane['blocked_seconds']} "
+                f"streak={'unknown' if streak is None else streak} "
+                f"last_phase={lane.get('last_phase') or '-'}"
+            )
+    else:
+        print("serving: ok")
+    for label in unmeasurable:
+        # Not "ok". The lane predates the counter, so nothing here can see it.
+        print(f"  serving unmeasurable: {label} (generation predates the serving counter)")
     for problem in fleet["problems"]:
         line = f"  problem: {problem['code']}"
         if "label" in problem:
@@ -750,6 +776,18 @@ raise SystemExit(0 if json.loads(sys.argv[1]).get("fleet_ready") is True else 1)
 PY
       then
         return 8
+      fi
+      # A separate gate from --require-ready on purpose: a caller asking
+      # "is this host installed and running" and one asking "is this host
+      # actually serving" want different answers, and an upstream refusal
+      # that blocks every lane at once must not fail the first question.
+      if [ "$require_serving" = 1 ] && ! python3 - "$fleet_readiness" <<'SERVINGPY'
+import json, sys
+serving = json.loads(sys.argv[1]).get("serving") or {}
+raise SystemExit(0 if serving.get("blocked") is False else 1)
+SERVINGPY
+      then
+        return 9
       fi
       ;;
     *) echo "$pool_usage"; return 2 ;;

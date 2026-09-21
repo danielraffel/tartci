@@ -9,6 +9,7 @@
 TARTCI_ADMISSION_CLEAN_MODE="${TARTCI_ADMISSION_CLEAN_MODE:-disabled}"
 TARTCI_ADMISSION_CLEAN_BASE="${TARTCI_ADMISSION_CLEAN_BASE:-main}"
 TARTCI_SHIPYARD_CLI="${TARTCI_SHIPYARD_CLI:-shipyard}"
+TARTCI_ADMISSION_CLEAN_ERROR_CHARS="${TARTCI_ADMISSION_CLEAN_ERROR_CHARS:-120}"
 
 tartci_validate_admission_clean_config() {
   local repo="${1:-}" labels="${2:-}"
@@ -50,4 +51,23 @@ tartci_admission_clean() {
     --repo "$repo" \
     --base "$TARTCI_ADMISSION_CLEAN_BASE" \
     --labels "$labels"
+}
+
+# Render an admission envelope as a bounded single-line detail for a provider
+# event or log line: the typed reason plus the head of the underlying error.
+# Without it a refusal reports only its exit code, and the reason is reachable
+# only by finding the per-VM envelope on disk.
+#
+# Fails open to a fixed marker. A diagnostic must never be able to break the
+# failure path it is describing, so a missing python3, a rotated envelope and
+# malformed JSON all render rather than abort.
+tartci_admission_clean_detail() {
+  local envelope="${1:-}" rendered=""
+  if rendered="$(printf '%s' "$envelope" \
+    | python3 "$TARTCI_ROOT/scripts/admission_clean_detail.py" \
+      --max-error-chars "$TARTCI_ADMISSION_CLEAN_ERROR_CHARS" 2>/dev/null)"; then
+    printf '%s' "$rendered"
+  else
+    printf '%s' "reason=unreadable"
+  fi
 }

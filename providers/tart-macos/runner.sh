@@ -182,11 +182,25 @@ CURRENT_REGISTERED_RUNNER=""
 CURRENT_RUNNER_API_ROOT=""
 CURRENT_AQUA_LABEL=""
 CLEANED_UP=0
-# Set when a VM lease is denied, cleared when one is granted or when the queue
-# drains. Carries the START of the blocked streak, not the latest denial, so a
-# supervisor that keeps re-entering work and keeps failing stays measurable
-# across the other phases it cycles through while blocked.
+# Set when a work entry ends without serving a job, cleared when a job is
+# actually assigned or when the queue drains. Carries the START of the blocked
+# streak, not the latest failure, so a supervisor that keeps re-entering work
+# and keeps failing stays measurable across the other phases it cycles through
+# while blocked.
+#
+# The cause is deliberately not enumerated. A lease denial, an admission
+# refusal and a cause nobody has written down yet all produce the same
+# observable: the lane took a slot against real queued demand and served
+# nothing. So the streak is counted at the one place every cause returns
+# through, rather than at each cause in turn. Only an assignment clears it: a
+# granted lease, a booted VM and a registered runner each prove a step, never
+# that the lane is serving.
 SERVING_BLOCKED_SINCE=""
+SERVING_BLOCKED_STREAK=0
+SERVING_BLOCKED_LAST_PHASE=""
+# 1 once the current work entry has had a job assigned to it.
+CURRENT_SERVED=0
+LAST_HEARTBEAT_PHASE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -601,11 +615,12 @@ event(){
 
 heartbeat(){
   local phase="$1" ts state_file tmp_file
+  LAST_HEARTBEAT_PHASE="$phase"
   ts="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   state_file="$STATE_DIR/$RUNNER_NAME.state.json"
   tmp_file="$(mktemp "$state_file.tmp.XXXXXX")" || return 1
   if cat >"$tmp_file" <<EOF
-{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
+{"ts":"$ts","provider":"tart-macos","host":"$(json_sanitize "$HOST_NAME")","runner":"$RUNNER_NAME","vm":"${CURRENT_VM:-}","vm_ip":"$(json_sanitize "${CURRENT_IP:-}")","phase":"$(json_sanitize "$phase")","lifecycle":"ephemeral","labels":"$(json_sanitize "$CURRENT_LABELS")","repo":"$(json_sanitize "$REPO")","run_id":"$(json_sanitize "${CURRENT_RUN_ID:-}")","job_id":"$(json_sanitize "${CURRENT_JOB_ID:-}")","assignment_observation":"$(json_sanitize "$CURRENT_JOB_CAPTURE_STATUS")","assignment_quarantine":"$(json_sanitize "$CURRENT_ASSIGNMENT_QUARANTINE")","serving_blocked_since":"$(json_sanitize "$SERVING_BLOCKED_SINCE")","serving_blocked_streak":$SERVING_BLOCKED_STREAK,"serving_blocked_last_phase":"$(json_sanitize "$SERVING_BLOCKED_LAST_PHASE")","supervisor_pid":"$SUPERVISOR_PID","supervisor_pid_started_at":"$(json_sanitize "$SUPERVISOR_PID_STARTED_AT")"}
 EOF
   then
     mv -f "$tmp_file" "$state_file"
@@ -1295,6 +1310,7 @@ run_runner_until_done(){
         capture_current_job && break
         sleep 2
       done
+      CURRENT_SERVED=1
       event job_assigned "$(grep 'Running job:' "$runner_log" | tail -1)"
       heartbeat job-running
     fi
@@ -1355,10 +1371,13 @@ run_one(){
   # static $RUNNER_NAME, which would collide with an orphaned registration and wedge
   # the gate. $RUNNER_NAME stays the stable lane identity for state/heartbeat.
   local i="$1" selected_labels="${2:-$LABELS}" selected_tier="${3:-0}" vm
+  # Before the first early return, not beside the other CURRENT_* resets: the
+  # pre-clone admission bail below returns above those.
+  CURRENT_SERVED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
-  local lease_cores lease_priority lease_rc
+  local lease_cores lease_mem lease_priority lease_rc
   local t_start t_booted t_runner_done t_done logdir=""
   t_start="$(now_epoch)"
   selected_group_id="$(runner_group_id_for_tier "$selected_tier")" \
@@ -1372,6 +1391,41 @@ run_one(){
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
+  fi
+  # The verdict is a function of (repo, labels) alone — see
+  # providers/common/admission-clean.lib.sh, which forwards exactly those two
+  # plus the lane's static base branch — so it can be asked BEFORE the CoW
+  # clone instead of only after a full clone and boot. A refusal here skips the
+  # clone, the disk reservation and the VM lease entirely, so a lane whose
+  # admission authority is down backs off cheaply instead of minting and
+  # discarding a VM every cycle.
+  #
+  # This is an early bail, not the gate. The authoritative check still runs at
+  # the JIT boundary below, where freshness is what matters; nothing here can
+  # admit a VM that the boundary check would refuse.
+  if tartci_admission_clean_enabled; then
+    local precheck_json="" precheck_rc=0
+    heartbeat admission-precheck
+    event admission_precheck "repo=$REPO labels=$selected_labels"
+    if precheck_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+      precheck_rc=0
+    else
+      precheck_rc=$?
+    fi
+    # One rolling envelope per lane: the reason now travels in the event, so
+    # this is a fallback copy and must not grow a file per attempt.
+    [ -z "$precheck_json" ] \
+      || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
+    if [ "$precheck_rc" -ne 0 ]; then
+      local precheck_detail
+      precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
+        || precheck_detail="reason=unreadable"
+      heartbeat "$([ "$precheck_rc" -eq 3 ] && printf admission-precheck-deferred || printf admission-precheck-error)"
+      event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
+        "rc=$precheck_rc pre_clone=true $precheck_detail"
+      note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
+      return "$precheck_rc"
+    fi
   fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
@@ -1414,8 +1468,8 @@ run_one(){
     heartbeat vm-lease-denied
     return "$lease_rc"
   fi
-  SERVING_BLOCKED_SINCE=""
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
@@ -1428,8 +1482,8 @@ run_one(){
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
     return 1
   fi
-  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
-    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
     discard_current_vm
     tartci_release_vm_lease
     runtime_emit_complete fail boot_failed 1 "" "$logdir"
@@ -1536,10 +1590,13 @@ run_one(){
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
       heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
-        "rc=$admission_rc unregistered=true"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off"
+        "rc=$admission_rc unregistered=true $admission_detail"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_vm
       tartci_release_vm_lease
       return "$admission_rc"
@@ -1803,6 +1860,20 @@ if [ "$LOOP" = 1 ]; then
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # Every cause of clone-without-serve returns through here, so the streak
+      # is counted here rather than at each cause. Counted per work ENTRY, not
+      # per error: a lane that alternates a failure with a served job never
+      # accumulates, while a lane that only fails accumulates every cycle.
+      if [ "$CURRENT_SERVED" = 1 ]; then
+        SERVING_BLOCKED_SINCE=""
+        SERVING_BLOCKED_STREAK=0
+        SERVING_BLOCKED_LAST_PHASE=""
+      else
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      fi
       if [ -n "$CURRENT_VM" ]; then
         note "teardown remained nonterminal — exiting for launchd process-group cleanup"
         event teardown_restart "vm=$CURRENT_VM rc=$run_rc"
@@ -1823,9 +1894,15 @@ if [ "$LOOP" = 1 ]; then
       sleep "$POLL"
     else
       note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap priority_demand=$p)"
-      # No queued work means nothing is being denied; only contention counts as
-      # blocked, so an idle pass ends the streak rather than inflating it.
-      [ "${q:-0}" -gt 0 ] || SERVING_BLOCKED_SINCE=""
+      # No queued work means nothing is being refused; only demand that the
+      # lane took and did not serve counts as blocked, so an idle pass ends the
+      # streak rather than inflating it. A lane with no VMs and no demand is
+      # the designed resting state of an ephemeral fleet, not a fault.
+      if [ "${q:-0}" -le 0 ]; then
+        SERVING_BLOCKED_SINCE=""
+        SERVING_BLOCKED_STREAK=0
+        SERVING_BLOCKED_LAST_PHASE=""
+      fi
       heartbeat waiting
       sleep "$POLL"
     fi

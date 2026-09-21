@@ -310,6 +310,9 @@ def unlink_state(path_text: str) -> str:
     return f"state_deleted:{path_text}"
 
 
+import fleet_lane_discovery
+
+
 def split_paths(value: str | None) -> list[str]:
     if not value:
         return []
@@ -321,12 +324,37 @@ def split_paths(value: str | None) -> list[str]:
     return paths
 
 
-def state_dirs_from_args(args: argparse.Namespace) -> list[pathlib.Path]:
+def scoped_view(args: argparse.Namespace) -> bool:
+    """True when the caller narrowed the view away from the whole-host default."""
+    if split_paths(args.state_dir):
+        return True
+    default_root = os.environ.get(
+        "TARTCI_STATE_ROOT", str(pathlib.Path.home() / ".tartci/state")
+    )
+    return pathlib.Path(args.state_root).expanduser() != pathlib.Path(default_root).expanduser()
+
+
+def state_dirs_from_args(
+    args: argparse.Namespace,
+    lanes: list[fleet_lane_discovery.Lane] | None = None,
+) -> list[pathlib.Path]:
+    """State directories to read.
+
+    The legacy roots below are the single-lane layout. Fleet lanes each write
+    to their OWN directory named by their installed plist, so a host running
+    fleet lanes had every supervisor outside this list and matched zero. The
+    lane directories come from launchd (see fleet_lane_discovery), never from
+    a second hard-coded path list -- one source of truth is the whole point.
+    """
     explicit = split_paths(args.state_dir)
     if explicit:
         return [pathlib.Path(path).expanduser() for path in explicit]
     root = pathlib.Path(args.state_root).expanduser()
-    return [root, root / "macos", root / "linux", root / "windows"]
+    dirs = [root, root / "macos", root / "linux", root / "windows"]
+    for lane_dir in fleet_lane_discovery.lane_state_dirs(lanes):
+        if lane_dir not in dirs:
+            dirs.append(lane_dir)
+    return dirs
 
 
 def safe_owned_path(path_text: Any, runner_name: str) -> pathlib.Path | None:
@@ -384,8 +412,24 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     fixed: list[str] = []
     unreadable: list[str] = []
 
-    state_dirs = state_dirs_from_args(args)
+    # Lane discovery applies to the DEFAULT, whole-host view only. A caller
+    # that passed --state-dir or pointed --state-root elsewhere has
+    # deliberately scoped the view, and silently widening it back to every
+    # loaded lane would both surprise them and make this digest depend on live
+    # host state. In that case the expected count is unknown rather than zero:
+    # a narrowed view has no business asserting what the host should have.
+    if scoped_view(args):
+        lanes, lane_problems = None, []
+    else:
+        lanes, lane_problems = fleet_lane_discovery.discover_lanes()
+    problems.extend(lane_problems)
+    state_dirs = state_dirs_from_args(args, lanes)
     prefixes = [p for p in args.prefixes.split(",") if p]
+    # Fleet VMs are named `<host_id>-<identity>-...`, which the legacy literal
+    # prefix list does not cover. Derive them from the discovered lanes.
+    for derived in fleet_lane_discovery.runner_name_prefixes(lanes or []):
+        if derived not in prefixes:
+            prefixes.append(derived)
     protected = [p for p in args.protected_names.split(",") if p]
     tart_providers = {"", "tart-macos", "tart-linux"}
 
@@ -691,6 +735,19 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 runner["owner_pid_alive"] = owner_pid_alive
                 runner["state_file"] = state_file
 
+    # The poka-yoke. `matched` counts supervisor heartbeats found in the state
+    # files; `expected` counts fleet lanes launchd reports loaded. They come
+    # from DIFFERENT sources on purpose, so a tool that goes blind against the
+    # state files cannot also silence its own denominator -- which is exactly
+    # how "no matching macOS supervisors" came to be printed beside
+    # "problems=0" on a host running five lanes.
+    supervisor_coverage = fleet_lane_discovery.coverage(
+        len(states), lanes, "launchctl"
+    )
+    coverage_problem = fleet_lane_discovery.coverage_problem(supervisor_coverage)
+    if coverage_problem:
+        problems.append(coverage_problem)
+
     digest = {
         "ts": iso(now),
         "host": socket.gethostname(),
@@ -709,6 +766,7 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "observation_timeout_secs": args.observation_timeout_secs,
         },
         "capacity": capacity,
+        "supervisor_coverage": supervisor_coverage.as_dict(),
         "supervisors": [
             {
                 "runner": state.get("runner"),
@@ -721,6 +779,12 @@ def build_digest(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "job_id": state.get("job_id"),
                 "ts": state.get("ts"),
                 "heartbeat_age_secs": state.get("_age_secs"),
+                # A fresh heartbeat beside a growing serve-less streak is the
+                # signature of a lane that is alive and serving nothing, so the
+                # two have to be readable in the same glance.
+                "serving_blocked_since": state.get("serving_blocked_since"),
+                "serving_blocked_streak": state.get("serving_blocked_streak"),
+                "serving_blocked_last_phase": state.get("serving_blocked_last_phase"),
                 "supervisor_pid": state.get("supervisor_pid"),
                 "supervisor_pid_started_at": state.get("supervisor_pid_started_at"),
                 "owner_pid_alive": state.get("_owner_pid_alive"),

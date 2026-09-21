@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Fail-closed, exhaustive queue scan for exclusive JIT assignment classes."""
+"""Fail-closed queue scan for exclusive JIT assignment classes.
+
+The scan answers one question: does this assignment class have queued demand?
+Presence and absence are not symmetric answers to it. A single matching job is
+a complete proof of presence — no further looking can retract it — while
+absence is only ever established by looking everywhere. So the scan stops at
+the first witness and reports `1`, and pays the exhaustive pass only to report
+`0`.
+
+That asymmetry is what keeps the scan affordable without weakening it. Every
+caller tests the result against zero, so a witness carries the same decision a
+full count would, and the expensive exhaustive pass is still mandatory before
+any claim that there is nothing to serve — which is the claim that would idle a
+lane with work waiting. Pass --exhaustive-count for the true magnitude when
+diagnosing; it is not needed to make a decision.
+"""
 from __future__ import annotations
 
 import argparse
@@ -20,10 +35,34 @@ from bounded_subprocess import ObservationError, run_bounded
 
 
 PER_PAGE = 100
+_RETRY_BACKOFF_CAP = 4.0
 
 
 class ScanError(RuntimeError):
     """The queue could not be observed completely and authoritatively."""
+
+
+class TransientApiFault(ScanError):
+    """One API call failed in a way a fresh attempt can resolve.
+
+    A dropped connection, a TLS handshake that never completed, a call killed
+    at its own timeout: none of these are evidence about the queue, so
+    abandoning the whole scan on the first one throws away an observation that
+    a retry would have completed. Retrying is not failing open — an exhausted
+    retry budget still raises, and the scan still fails closed.
+    """
+
+
+class PaginationRace(ScanError):
+    """The listing mutated between pages, so this pass never saw one snapshot.
+
+    Runs enter and leave `queued`/`in_progress` continuously on an active
+    repository, so `total_count` and the page bodies are not read atomically.
+    That is churn in the thing being measured, not API unreliability, and a
+    fresh pass usually lands between edits. Accepting a torn read instead
+    would under-count the queue, which is the one error this scanner exists to
+    prevent, so the pass is retried rather than salvaged.
+    """
 
 
 def _object_list(payload: Any, key: str, path: str) -> list[dict[str, Any]]:
@@ -49,19 +88,22 @@ class AssignmentScanner:
             raise ScanError("the required assignment-class label is empty")
         if self.required_label not in self.runner_labels:
             raise ScanError("required assignment-class label is absent from runner labels")
+        # Provisional only: --scan-timeout budgets the SCAN, and the scan has
+        # not started yet. _observation_lock rebases this the instant the lock
+        # is held, so waiting for the lock never eats the scan's budget. The
+        # provisional value still bounds anything that reads the deadline
+        # before acquisition, so no path is ever unbounded.
         self.deadline = time.monotonic() + args.scan_timeout
         self.observation_lock_path = Path(args.observation_lock_file)
         self.api_calls = 0
         self.api_calls_lock = threading.Lock()
         self.observation_lock_fd: int | None = None
+        self.witness = threading.Event()
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
         self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_deadline = min(
-            self.deadline,
-            time.monotonic() + self.args.observation_lock_timeout,
-        )
+        lock_deadline = time.monotonic() + self.args.observation_lock_timeout
         with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
             while True:
                 try:
@@ -76,6 +118,16 @@ class AssignmentScanner:
                             f"{self.args.observation_lock_timeout}s"
                         )
                     time.sleep(0.05)
+            # The wait is over, so the scan begins now. Budgeting the scan from
+            # invocation instead charged it for however long the queue behind
+            # this host-global lock happened to be, which is the one quantity
+            # the scan does not control: a lane that waited most of its budget
+            # then ran an exhaustive pass on the remainder, and the leftover
+            # was handed to `gh` as a shortened per-call timeout, so the scan
+            # died mid-pass and reported the queue unobservable. The total is
+            # still bounded -- by --observation-lock-timeout plus
+            # --scan-timeout, each explicit.
+            self.deadline = time.monotonic() + self.args.scan_timeout
             try:
                 self.observation_lock_fd = os.dup(handle.fileno())
                 os.set_inheritable(self.observation_lock_fd, True)
@@ -87,7 +139,7 @@ class AssignmentScanner:
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
-    def _gh(self, path: str) -> dict[str, Any]:
+    def _gh_once(self, path: str) -> dict[str, Any]:
         with self.api_calls_lock:
             if self.api_calls >= self.args.max_api_calls:
                 raise ScanError(
@@ -107,20 +159,50 @@ class AssignmentScanner:
                 else (),
             )
         except (OSError, ObservationError) as error:
-            raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
+            raise TransientApiFault(
+                f"GitHub API unavailable for {path}: {error}"
+            ) from error
         if result.returncode:
-            raise ScanError(
+            raise TransientApiFault(
                 f"GitHub API failed for {path}: {result.stderr.strip()}"
             )
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
-            raise ScanError(f"GitHub API returned invalid JSON for {path}") from error
+            raise TransientApiFault(
+                f"GitHub API returned invalid JSON for {path}"
+            ) from error
         if not isinstance(payload, dict):
             raise ScanError(f"GitHub API returned non-object for {path}")
         return payload
 
-    def _pages(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
+    def _retry_sleep(self, attempt: int) -> bool:
+        """Back off before the next attempt, or report that none is affordable.
+
+        The nap is clamped to the time actually left, so a retry can never push
+        the scan past the deadline the caller budgeted for it.
+        """
+        delay = min(self.args.retry_backoff * (2 ** (attempt - 1)), _RETRY_BACKOFF_CAP)
+        remaining = self.deadline - time.monotonic()
+        if remaining <= delay:
+            return False
+        time.sleep(delay)
+        return True
+
+    def _gh(self, path: str) -> dict[str, Any]:
+        """Read one API page, retrying only faults that carry no queue verdict."""
+        attempts = self.args.api_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._gh_once(path)
+            except TransientApiFault as error:
+                if attempt == attempts or not self._retry_sleep(attempt):
+                    raise ScanError(
+                        f"{error} (after {attempt} attempt(s))"
+                    ) from error
+        raise AssertionError("unreachable")
+
+    def _pages_once(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
         seen_ids: set[int] = set()
         expected_total: int | None = None
@@ -141,7 +223,7 @@ class AssignmentScanner:
             if expected_total is None:
                 expected_total = total
             elif total != expected_total:
-                raise ScanError(
+                raise PaginationRace(
                     f"GitHub API total_count changed during pagination for {path_prefix}"
                 )
             page_ids: list[int] = []
@@ -150,7 +232,7 @@ class AssignmentScanner:
                 if not isinstance(item_id, int):
                     raise ScanError(f"GitHub API returned item without integer id for {path}")
                 if item_id in seen_ids:
-                    raise ScanError(
+                    raise PaginationRace(
                         f"GitHub API returned duplicate id during pagination for {path_prefix}"
                     )
                 seen_ids.add(item_id)
@@ -160,7 +242,9 @@ class AssignmentScanner:
                 first_page_ids = tuple(page_ids)
             if len(items) >= total:
                 if len(items) != total:
-                    raise ScanError(f"GitHub API pagination exceeded total_count for {path}")
+                    raise PaginationRace(
+                        f"GitHub API pagination exceeded total_count for {path}"
+                    )
                 if page > 1:
                     verify_path = f"{path_prefix}{separator}per_page={PER_PAGE}&page=1"
                     verify_payload = self._gh(verify_path)
@@ -168,13 +252,13 @@ class AssignmentScanner:
                     verify_total = verify_payload.get("total_count")
                     verify_ids = tuple(item.get("id") for item in verify_items)
                     if verify_total != expected_total or verify_ids != first_page_ids:
-                        raise ScanError(
+                        raise PaginationRace(
                             f"GitHub API first page changed during pagination for {path_prefix}"
                         )
                 return items
             if len(page_items) < PER_PAGE:
                 if len(items) < total:
-                    raise ScanError(
+                    raise PaginationRace(
                         f"GitHub API pagination ended before total_count for {path} "
                         f"({len(items)} < {total})"
                     )
@@ -182,6 +266,24 @@ class AssignmentScanner:
         raise ScanError(
             f"GitHub API pagination truncated at {self.args.max_pages} pages for {path_prefix}"
         )
+
+    def _pages(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
+        """Read a whole listing, restarting a pass that the queue moved under.
+
+        The retry is of the entire pagination, never of one page: pages are only
+        consistent with each other within a single pass, so resuming a torn read
+        mid-way would splice two different snapshots together.
+        """
+        attempts = self.args.pagination_retries + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                return self._pages_once(path_prefix, key)
+            except PaginationRace as error:
+                if attempt == attempts or not self._retry_sleep(attempt):
+                    raise ScanError(
+                        f"{error} (after {attempt} pagination attempt(s))"
+                    ) from error
+        raise AssertionError("unreachable")
 
     def _workflow_ids(self) -> dict[str, int]:
         workflows = self._pages(
@@ -221,6 +323,10 @@ class AssignmentScanner:
         return list(found.values())
 
     def _scan_run(self, run: dict[str, Any]) -> int:
+        if self.witness.is_set():
+            # Another run already produced a witness, so this run cannot change
+            # the verdict. Returning before the request is the whole saving.
+            return 0
         matches: set[int] = set()
         run_id = int(run["id"])
         prefix = (
@@ -271,14 +377,19 @@ class AssignmentScanner:
             if not isinstance(job_id, int):
                 raise ScanError(f"matching queued job in run {run_id} has no integer id")
             matches.add(job_id)
+            if not self.args.exhaustive_count:
+                # One witness settles the question the caller actually asks.
+                self.witness.set()
+                return len(matches)
         return len(matches)
 
     def scan(self) -> int:
         # Every fleet supervisor shares this host-global observation slot. The
         # exhaustive scanner can issue many GitHub calls; overlapping scans for
         # different lanes made individually healthy ghapp requests time out and
-        # left the host scan-blind. The bounded lock wait is part of the overall
-        # deadline and failure remains fail-closed.
+        # left the host scan-blind. The wait is bounded separately from the scan
+        # budget, so queueing behind other lanes costs this scan time to finish
+        # but never time to work; failure remains fail-closed either way.
         with self._observation_lock():
             runs = self._runs()
             # Concurrency remains opt-in for a measured host. The reliable
@@ -287,7 +398,13 @@ class AssignmentScanner:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.args.max_workers
             ) as executor:
-                return sum(executor.map(self._scan_run, runs), start=0)
+                total = sum(executor.map(self._scan_run, runs), start=0)
+        if self.witness.is_set():
+            # Deliberately not the running total: the scan stopped early, so the
+            # total is a partial count and reporting it would invent precision
+            # the observation does not have. Callers test this against zero.
+            return 1
+        return total
 
 
 def parse_args() -> argparse.Namespace:
@@ -297,7 +414,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels", required=True)
     parser.add_argument("--require-label", required=True)
     parser.add_argument("--min-age-seconds", type=int, default=0)
+    parser.add_argument(
+        "--exhaustive-count",
+        action="store_true",
+        default=os.environ.get("TARTCI_ASSIGNMENT_SCAN_EXHAUSTIVE_COUNT") == "1",
+    )
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
+    parser.add_argument(
+        "--api-retries",
+        type=int,
+        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_API_RETRIES", "2")),
+    )
+    parser.add_argument(
+        "--pagination-retries",
+        type=int,
+        default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_PAGINATION_RETRIES", "2")),
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=float(os.environ.get("TARTCI_ASSIGNMENT_SCAN_RETRY_BACKOFF_SECS", "0.5")),
+    )
     parser.add_argument(
         "--gh-timeout",
         type=int,
@@ -353,6 +490,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-api-calls must be positive")
     if not 1 <= args.max_workers <= 16:
         parser.error("--max-workers must be between 1 and 16")
+    if not 0 <= args.api_retries <= 8:
+        parser.error("--api-retries must be between 0 and 8")
+    if not 0 <= args.pagination_retries <= 8:
+        parser.error("--pagination-retries must be between 0 and 8")
+    if not math.isfinite(args.retry_backoff) or args.retry_backoff < 0:
+        parser.error("--retry-backoff must be non-negative")
     if (
         not math.isfinite(args.observation_lock_timeout)
         or args.observation_lock_timeout <= 0
