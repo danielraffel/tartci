@@ -6,6 +6,7 @@ import contextlib
 import json
 import os
 import re
+import signal
 import socket
 import stat
 import subprocess
@@ -23,6 +24,19 @@ RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 SCANNER = ROOT / "scripts" / "assignment_scan.py"
 TEMPLATE = ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-macos.plist.template"
 BASE = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
+
+# The scanners default their observation lock to the HOST's real one, so a test
+# that forgets --observation-lock-file serializes against whatever fleet lanes
+# are scanning on this machine -- adding contention to the exact resource these
+# tests measure, and slowing a production lane to do it. Redirecting the
+# default here covers every test in the run, including ones added later that
+# forget the flag. An explicit environment value still wins, so a deliberate
+# integration test can opt out.
+os.environ.setdefault(
+    "TARTCI_QUEUE_OBSERVATION_LOCK_FILE",
+    str(Path(tempfile.mkdtemp(prefix="tartci-test-observation-")) / "queue-observation.lock"),
+)
+HOST_OBSERVATION_LOCK = Path.home() / ".tartci/state/queue-observation.lock"
 
 
 def _write_exec(path: Path, body: str) -> None:
@@ -633,6 +647,214 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
             self.assertIn("observation lock timed out", denied.stderr)
             holder.terminate()
             holder.communicate(timeout=5)
+
+    # --- the scan budget must not be spent waiting for the lock -------------
+    #
+    # --scan-timeout budgets the scan. The wait for the host-global observation
+    # lock is not scanning: it is queueing behind every other lane on the host,
+    # a quantity this scanner does not control. Charging the wait to the scan
+    # made the two nest, so a contended lane ran its exhaustive pass on
+    # whatever was left and handed that remainder to `gh` as a shortened
+    # per-call timeout -- and reported the queue unobservable, which is the one
+    # verdict that idles a lane with work waiting.
+
+    _HANGING_JOBS_GH = """#!/usr/bin/env python3
+import json, sys, time
+from urllib.parse import parse_qs, urlparse
+p = urlparse('https://x/' + sys.argv[-1]); q = parse_qs(p.query)
+if p.path.endswith('/actions/workflows'):
+    print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+elif '/actions/workflows/99/runs' in p.path:
+    if q.get('status', [''])[0] != 'queued':
+        print(json.dumps({'total_count': 0, 'workflow_runs': []}))
+    else:
+        print(json.dumps({'total_count': 1, 'workflow_runs': [{'id': 7, 'name': 'Build and Test'}]}))
+elif '/actions/runs/' in p.path and p.path.endswith('/jobs'):
+    time.sleep(9999)
+else:
+    raise SystemExit(4)
+"""
+
+    @staticmethod
+    def _hold_lock(lock: Path, seconds: float) -> subprocess.Popen:
+        """Own the observation lock for `seconds`, and prove it before returning."""
+        holder = subprocess.Popen(
+            ["python3", "-c",
+             "import fcntl,sys,time\n"
+             "fh=open(sys.argv[1],'a+')\n"
+             "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+             "sys.stderr.write('held\\n'); sys.stderr.flush()\n"
+             "time.sleep(float(sys.argv[2]))\n",
+             str(lock), str(seconds)],
+            text=True, stderr=subprocess.PIPE,
+        )
+        assert holder.stderr is not None
+        if holder.stderr.readline().strip() != "held":
+            holder.kill()
+            raise AssertionError("the lock holder never acquired the lock")
+        return holder
+
+    def _budget_after_waiting(
+        self, hold: float, scan_timeout: int, lock_timeout: float
+    ) -> tuple[float, float]:
+        """Return (budget the scan had left, wall time the scanner took).
+
+        The scanner clamps every GitHub call to `min(--gh-timeout, remaining)`.
+        Setting --gh-timeout far above --scan-timeout makes that clamp exactly
+        `remaining`, and the bounded runner reports it verbatim, so the number
+        in the failure text IS the budget the scan had when it started work.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "isolated-observation.lock"
+            lock.touch()
+            gh = root / "hanging-jobs-gh"
+            _write_exec(gh, self._HANGING_JOBS_GH)
+            holder = self._hold_lock(lock, hold)
+            started = time.monotonic()
+            # The scanner must enforce its own deadline. This ceiling only
+            # stops a broken one hanging the suite, and reports it as the
+            # boundedness failure it is rather than as a harness timeout.
+            ceiling = hold + scan_timeout + 10
+            # Its own session, so blowing the ceiling reaps the never-answering
+            # `gh` stand-in too rather than leaving a 9999s sleeper behind.
+            scan = subprocess.Popen(
+                ["python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                 "--workflow", "Build and Test", "--labels", "pulp-build-merge-group",
+                 "--require-label", "pulp-build-merge-group", "--gh-cli", str(gh),
+                 "--observation-lock-file", str(lock),
+                 "--observation-lock-timeout", str(lock_timeout),
+                 "--scan-timeout", str(scan_timeout), "--gh-timeout", "600",
+                 "--api-retries", "0", "--pagination-retries", "0"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            overran = False
+            try:
+                _, stderr = scan.communicate(timeout=ceiling)
+            except subprocess.TimeoutExpired:
+                overran = True
+                stderr = ""
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(os.getpgid(scan.pid), signal.SIGKILL)
+                scan.communicate(timeout=10)
+            finally:
+                elapsed = time.monotonic() - started
+                holder.kill()
+                holder.communicate(timeout=5)
+            if overran:
+                self.fail(
+                    f"the scan never ended: it outlived its {hold}s lock wait plus its "
+                    f"{scan_timeout}s budget by more than 10s, so its deadline is not enforced"
+                )
+            match = re.search(r"timed out after ([0-9.]+)s", stderr)
+            self.assertIsNotNone(
+                match,
+                "the scan never reached a GitHub call, so it measured no budget: "
+                f"rc={scan.returncode} stderr={stderr!r}",
+            )
+            assert match is not None
+            return float(match.group(1)), elapsed
+
+    def test_scan_budget_is_measured_from_lock_acquisition(self) -> None:
+        hold, scan_timeout = 2.0, 4
+        budget, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
+        # Control: a run where the scanner never actually queued would prove
+        # nothing about what queueing costs it.
+        self.assertGreaterEqual(
+            elapsed, hold,
+            f"the scanner never waited for the lock ({elapsed:.2f}s < {hold}s), so this proved nothing",
+        )
+        self.assertGreater(
+            budget, scan_timeout - hold + 0.5,
+            f"the {hold}s lock wait was charged to the scan: it began work with only "
+            f"{budget:.2f}s of its {scan_timeout}s budget",
+        )
+        # A budget larger than the one configured would mean the deadline is
+        # being extended rather than rebased.
+        self.assertLessEqual(
+            budget, scan_timeout + 0.5,
+            f"the scan claimed {budget:.2f}s against a {scan_timeout}s budget",
+        )
+
+    def test_waiting_longer_for_the_lock_does_not_shrink_the_scan(self) -> None:
+        """The same scan, queued twice as long, must get the same budget."""
+        scan_timeout = 4
+        brief, _ = self._budget_after_waiting(1.0, scan_timeout, lock_timeout=20.0)
+        patient, elapsed = self._budget_after_waiting(3.0, scan_timeout, lock_timeout=20.0)
+        self.assertGreaterEqual(elapsed, 3.0, "the long-wait case never queued")
+        self.assertAlmostEqual(
+            brief, patient, delta=0.75,
+            msg=f"budget tracks the lock wait: 1s wait -> {brief:.2f}s, 3s wait -> {patient:.2f}s",
+        )
+
+    def test_lock_wait_is_not_truncated_by_the_scan_budget(self) -> None:
+        """--observation-lock-timeout means what it says, even when it exceeds --scan-timeout.
+
+        Nesting silently capped the wait at the scan budget, so a lane
+        configured to wait 15s gave up after 3 -- and said "timed out after
+        15.0s" while doing it.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "isolated-observation.lock"
+            lock.touch()
+            gh = root / "empty-queue-gh"
+            _write_exec(
+                gh,
+                """#!/usr/bin/env python3
+import json, sys
+from urllib.parse import parse_qs, urlparse
+p = urlparse('https://x/' + sys.argv[-1])
+if p.path.endswith('/actions/workflows'):
+    print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+else:
+    print(json.dumps({'total_count': 0, 'workflow_runs': [], 'jobs': []}))
+""",
+            )
+            holder = self._hold_lock(lock, 5.0)
+            try:
+                result = subprocess.run(
+                    ["python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                     "--workflow", "Build and Test", "--labels", "pulp-build-merge-group",
+                     "--require-label", "pulp-build-merge-group", "--gh-cli", str(gh),
+                     "--observation-lock-file", str(lock),
+                     "--observation-lock-timeout", "15", "--scan-timeout", "3"],
+                    text=True, capture_output=True, check=False, timeout=60,
+                )
+            finally:
+                holder.kill()
+                holder.communicate(timeout=5)
+            self.assertEqual(
+                result.returncode, 0,
+                "a 15s lock wait was cut short by a 3s scan budget: " + result.stderr,
+            )
+            self.assertEqual(result.stdout.strip(), "0")
+
+    def test_a_scan_stays_bounded_by_its_lock_wait_plus_its_budget(self) -> None:
+        """Rebasing the deadline must not make the deadline optional.
+
+        The supervisor's poll loop blocks on this scanner, so an unbounded scan
+        stops the lane observing at all.
+        """
+        hold, scan_timeout = 2.0, 3
+        _, elapsed = self._budget_after_waiting(hold, scan_timeout, lock_timeout=20.0)
+        self.assertLess(
+            elapsed, hold + scan_timeout + 5.0,
+            f"the scan ran {elapsed:.2f}s, past its {hold}s wait plus {scan_timeout}s budget",
+        )
+
+    def test_tests_never_contend_with_the_hosts_real_observation_lock(self) -> None:
+        """Guard the module-level redirect: this suite runs on live fleet hosts."""
+        # Resolve it the way the scanner does, so deleting the redirect fails
+        # this test rather than silently falling back to the host's lock.
+        effective = Path(
+            os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE") or HOST_OBSERVATION_LOCK
+        ).resolve()
+        self.assertNotEqual(
+            effective, HOST_OBSERVATION_LOCK.resolve(),
+            "the test suite is pointed at the host's production observation lock",
+        )
 
     def test_non_finite_observation_timeout_is_rejected(self) -> None:
         result = subprocess.run(

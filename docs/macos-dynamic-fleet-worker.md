@@ -185,8 +185,11 @@ current generic selectors until their workflows publish reviewed event-class
 labels. Adding those labels is a workflow/governance change, not a fleet-render
 side effect.
 
-M1, M3, and M5 give each exhaustive assignment scan a 180-second overall
-deadline and four API workers. The host-global observation lock admits only one
+M1, M3, and M5 give each exhaustive assignment scan a 180-second budget and
+four API workers. The budget covers the scan only: it starts when the
+host-global observation lock is acquired, so queueing behind another lane
+delays a scan but never shortens it (a scan's overall ceiling is therefore the
+lock timeout plus this budget). The host-global observation lock admits only one
 scan owner, so this is a four-request host ceiling rather than four workers per
 overlapping supervisor. A one-worker canary on 2026-09-01 failed to exhaust the
 large live Pulp queue inside 180 seconds; the prior four-worker scans completed.

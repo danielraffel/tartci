@@ -88,6 +88,11 @@ class AssignmentScanner:
             raise ScanError("the required assignment-class label is empty")
         if self.required_label not in self.runner_labels:
             raise ScanError("required assignment-class label is absent from runner labels")
+        # Provisional only: --scan-timeout budgets the SCAN, and the scan has
+        # not started yet. _observation_lock rebases this the instant the lock
+        # is held, so waiting for the lock never eats the scan's budget. The
+        # provisional value still bounds anything that reads the deadline
+        # before acquisition, so no path is ever unbounded.
         self.deadline = time.monotonic() + args.scan_timeout
         self.observation_lock_path = Path(args.observation_lock_file)
         self.api_calls = 0
@@ -98,10 +103,7 @@ class AssignmentScanner:
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
         self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_deadline = min(
-            self.deadline,
-            time.monotonic() + self.args.observation_lock_timeout,
-        )
+        lock_deadline = time.monotonic() + self.args.observation_lock_timeout
         with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
             while True:
                 try:
@@ -116,6 +118,16 @@ class AssignmentScanner:
                             f"{self.args.observation_lock_timeout}s"
                         )
                     time.sleep(0.05)
+            # The wait is over, so the scan begins now. Budgeting the scan from
+            # invocation instead charged it for however long the queue behind
+            # this host-global lock happened to be, which is the one quantity
+            # the scan does not control: a lane that waited most of its budget
+            # then ran an exhaustive pass on the remainder, and the leftover
+            # was handed to `gh` as a shortened per-call timeout, so the scan
+            # died mid-pass and reported the queue unobservable. The total is
+            # still bounded -- by --observation-lock-timeout plus
+            # --scan-timeout, each explicit.
+            self.deadline = time.monotonic() + self.args.scan_timeout
             try:
                 self.observation_lock_fd = os.dup(handle.fileno())
                 os.set_inheritable(self.observation_lock_fd, True)
@@ -375,8 +387,9 @@ class AssignmentScanner:
         # Every fleet supervisor shares this host-global observation slot. The
         # exhaustive scanner can issue many GitHub calls; overlapping scans for
         # different lanes made individually healthy ghapp requests time out and
-        # left the host scan-blind. The bounded lock wait is part of the overall
-        # deadline and failure remains fail-closed.
+        # left the host scan-blind. The wait is bounded separately from the scan
+        # budget, so queueing behind other lanes costs this scan time to finish
+        # but never time to work; failure remains fail-closed either way.
         with self._observation_lock():
             runs = self._runs()
             # Concurrency remains opt-in for a measured host. The reliable
