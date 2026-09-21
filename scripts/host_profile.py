@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -361,6 +362,234 @@ def shell_exports(profile: dict[str, Any]) -> str:
     return "\n".join(f"{key}={value}" for key, value in values.items())
 
 
+# --- how code actually reaches this host ------------------------------------
+#
+# Two hosts can run the same lane from entirely different artifacts. A
+# generation host execs a staged, write-stripped copy of the repo; a sealed
+# host execs a Developer ID bundle that carries its own copy of the repo
+# inside its signed seal. They are installed by different commands and they
+# go stale independently, and nothing on either host said which it was --
+# so "deploy to m3" was a reasonable conclusion to reach twice about a host
+# where `fleet-macos install --apply` writes a generation nothing ever execs.
+#
+# Everything below is derived from the live plist. A hostname is not evidence.
+
+FLEET_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+GENERATIONS_SEGMENT = "/.local/share/tartci-generations/"
+LAUNCHER_SUFFIX = "/Contents/MacOS/tartci-launcher"
+GENERATION_MANIFEST = ".tartci-support-manifest.json"
+SEALED_BUNDLE_MARKER = "Contents/Resources/bundle.json"
+
+
+def agents_dir() -> Path:
+    return Path(os.environ.get("TARTCI_AGENTS_DIR") or Path.home() / "Library/LaunchAgents")
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def classify_delivery(arguments: list[str]) -> dict:
+    """Name the delivery mechanism from a plist's ProgramArguments alone.
+
+    The two shapes are structurally distinct, so neither needs a hostname:
+    a sealed lane execs `<bundle>.app/Contents/MacOS/tartci-launcher`, a
+    generation lane execs `<generations-root>/<GEN>/.tartci-launch`.
+    """
+    for argument in arguments:
+        if argument.endswith(LAUNCHER_SUFFIX):
+            return {
+                "delivery": "sealed-bundle",
+                "root": argument[: -len(LAUNCHER_SUFFIX)],
+                "entrypoint": argument,
+            }
+    for argument in arguments:
+        if GENERATIONS_SEGMENT in argument and argument.endswith("/.tartci-launch"):
+            return {
+                "delivery": "generation",
+                "root": str(Path(argument).parent),
+                "entrypoint": argument,
+            }
+    return {"delivery": "unknown", "root": None, "entrypoint": None}
+
+
+def in_force_identity(classified: dict) -> dict:
+    """Read the version marker out of the artifact the plist actually execs."""
+    root = classified.get("root")
+    if root is None:
+        return {"source_commit": None, "detail": "no recognised launch entrypoint"}
+    root_path = Path(root)
+    if classified["delivery"] == "sealed-bundle":
+        bundle = _read_json(root_path / SEALED_BUNDLE_MARKER)
+        if bundle is None:
+            return {
+                "source_commit": None,
+                "detail": f"unreadable sealed marker at {root_path / SEALED_BUNDLE_MARKER}",
+            }
+        lanes = _read_json(root_path / "Contents/Resources/lanes.json") or {}
+        return {
+            "source_commit": bundle.get("source_commit"),
+            "support_manifest_sha256": bundle.get("support_manifest_sha256"),
+            "profile_policy_sha256": bundle.get("profile_policy_sha256"),
+            "sealed_lane_ids": sorted((lanes.get("lanes") or {}).keys()) or None,
+            "detail": None,
+        }
+    manifest = _read_json(root_path / GENERATION_MANIFEST)
+    if manifest is None:
+        return {
+            "source_commit": None,
+            "detail": f"unreadable generation manifest at {root_path / GENERATION_MANIFEST}",
+        }
+    return {
+        "source_commit": manifest.get("source_commit"),
+        "repository": manifest.get("repository"),
+        "generation": root_path.name,
+        "detail": None,
+    }
+
+
+def repo_head(repo_root: Path) -> str | None:
+    value = _run_text(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+    return value or None
+
+
+def staleness(in_force_commit: str | None, head: str | None, repo_root: Path) -> dict:
+    """Never guess. An unknown commit and an up-to-date one are not the same."""
+    if head is None:
+        return {"stale": None, "detail": "repo HEAD unavailable from this checkout"}
+    if in_force_commit is None:
+        return {"stale": None, "detail": "no commit recorded in the running artifact"}
+    if in_force_commit == head:
+        return {"stale": False, "detail": None, "repo_head": head}
+    behind = _run_text([
+        "git", "-C", str(repo_root), "rev-list", "--count",
+        f"{in_force_commit}..{head}",
+    ])
+    return {
+        "stale": True,
+        "repo_head": head,
+        "behind_by": int(behind) if behind.isdigit() else None,
+        "detail": (
+            None if behind.isdigit()
+            else "the running commit is not present in this checkout"
+        ),
+    }
+
+
+def build_delivery_report(
+    *, agents: Path | None = None, repo_root: Path | None = None
+) -> dict:
+    """Per-lane delivery mechanism, version in force, and staleness."""
+    agents = agents or agents_dir()
+    repo_root = repo_root or Path(__file__).resolve().parents[1]
+    head = repo_head(repo_root)
+    try:
+        all_plists = sorted(path for path in agents.glob("*.plist"))
+    except OSError:
+        all_plists = []
+    fleet_plists = [
+        path for path in all_plists if path.name.startswith(FLEET_LABEL_PREFIX)
+    ]
+    lanes = []
+    for path in fleet_plists:
+        label = path.name.removesuffix(".plist")
+        try:
+            plist = plistlib.loads(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            lanes.append({
+                "label": label, "delivery": "unknown",
+                "detail": f"unreadable plist: {exc}",
+            })
+            continue
+        arguments = [str(item) for item in (plist.get("ProgramArguments") or [])]
+        classified = classify_delivery(arguments)
+        identity = in_force_identity(classified)
+        sealed = classified["delivery"] == "sealed-bundle"
+        lanes.append({
+            "label": label,
+            "delivery": classified["delivery"],
+            "program_arguments": arguments,
+            "artifact_root": classified["root"],
+            "in_force": identity,
+            "staleness": staleness(identity.get("source_commit"), head, repo_root),
+            # The whole reason this report exists.
+            "accepts_generation_install": None if classified["delivery"] == "unknown" else not sealed,
+            "how_to_update": (
+                "rebuild and re-sign the launcher bundle "
+                "(scripts/build_macos_launcher.sh), then re-approve and reinstall; "
+                "`tartci fleet-macos install --apply` stages a generation this "
+                "lane never execs"
+                if sealed else
+                "`tartci fleet-macos install --apply <profile>` stages a new "
+                "generation and repoints this lane at it"
+                if classified["delivery"] == "generation" else
+                "unrecognised launch entrypoint; inspect ProgramArguments"
+            ),
+        })
+    return {
+        "schema": 1,
+        "hostname": _run_text(["hostname", "-s"]) or None,
+        "agents_dir": str(agents),
+        "repo_root": str(repo_root),
+        "repo_head": head,
+        "lanes": lanes,
+        # The control for the zero case: no fleet lanes beside a nonzero plist
+        # count is a host with no lanes; beside a zero count it is a directory
+        # this process could not read. They must not render identically.
+        "plists_seen": len(all_plists),
+        "fleet_plists_seen": len(fleet_plists),
+    }
+
+
+def delivery_report_text(report: dict) -> str:
+    lines = [
+        f"host: {report['hostname'] or '?'}",
+        f"repo: {report['repo_root']} @ {(report['repo_head'] or 'unknown')[:12]}",
+        f"launch agents: {report['agents_dir']} "
+        f"({report['fleet_plists_seen']} fleet of {report['plists_seen']} plists)",
+    ]
+    if not report["lanes"]:
+        lines.append(
+            "  no fleet lanes on this host"
+            if report["plists_seen"]
+            else "  BLIND: no plists readable at all in that directory"
+        )
+    for lane in report["lanes"]:
+        identity = lane.get("in_force") or {}
+        stale = lane.get("staleness") or {}
+        commit = identity.get("source_commit")
+        if stale.get("stale") is None:
+            verdict = f"staleness unknown ({stale.get('detail')})"
+        elif stale["stale"]:
+            behind = stale.get("behind_by")
+            verdict = (
+                f"STALE, behind repo by {behind} commit(s)" if behind is not None
+                else f"STALE ({stale.get('detail')})"
+            )
+        else:
+            verdict = "current with repo HEAD"
+        lines.append("")
+        lines.append(f"lane {lane['label']}")
+        lines.append(f"  delivery: {lane['delivery']}")
+        lines.append(f"  artifact: {lane.get('artifact_root') or '-'}")
+        lines.append(f"  in force: {commit or 'unknown'} ({verdict})")
+        accepts = lane.get("accepts_generation_install")
+        lines.append(
+            "  fleet-macos install --apply: "
+            + ("updates this lane" if accepts
+               else "NO-OP for this lane" if accepts is False
+               else "unknown")
+        )
+        lines.append(f"  to update: {lane['how_to_update']}")
+        if identity.get("detail"):
+            lines.append(f"  note: {identity['detail']}")
+    return "\n".join(lines)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="tartci host-profile")
     parser.add_argument("--json", action="store_true", help="emit JSON instead of shell exports")
@@ -368,11 +597,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--role-file", help="role file path; defaults to ~/.config/tartci/role")
     parser.add_argument("--cores", type=int, help="override detected core count")
     parser.add_argument("--model", help="override detected host model")
+    parser.add_argument(
+        "--delivery", action="store_true",
+        help="report how code reaches each lane on this host, and whether it is stale",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.delivery:
+        report = build_delivery_report()
+        print(
+            json.dumps(report, indent=2, sort_keys=True) if args.json
+            else delivery_report_text(report)
+        )
+        return 0
     profile = build_profile(
         role=args.role,
         cores=args.cores,

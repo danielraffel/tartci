@@ -94,5 +94,62 @@ class TestObserveRendering(unittest.TestCase):
         )
 
 
+class TestServingBlockedRendering(unittest.TestCase):
+    """The supervisor line is where a serve-less lane hides.
+
+    `phase=waiting heartbeat_age=3s` is exactly what a lane that has not served
+    a job in three hours looks like, so the line that already reads as health
+    has to carry the contradicting fact or nobody goes looking for it.
+    """
+
+    def test_a_serving_lane_adds_nothing(self) -> None:
+        self.assertEqual(
+            macos_observe.serving_suffix({
+                "serving_blocked_since": "", "serving_blocked_streak": 0,
+            }),
+            "",
+        )
+
+    def test_a_blocked_lane_is_named_on_the_supervisor_line(self) -> None:
+        suffix = macos_observe.serving_suffix({
+            "serving_blocked_since": "2026-09-20T00:00:00Z",
+            "serving_blocked_streak": 143,
+            "serving_blocked_last_phase": "admission-error",
+        })
+        self.assertIn("serving_blocked_since=2026-09-20T00:00:00Z", suffix)
+        self.assertIn("serve_less_streak=143", suffix)
+        self.assertIn("last_phase=admission-error", suffix)
+
+    def test_a_generation_predating_the_counter_is_marked_unknown(self) -> None:
+        """Absent is not zero. A lane whose runner never wrote the counter must
+        not render the same as one that wrote 0."""
+        suffix = macos_observe.serving_suffix({
+            "serving_blocked_since": "2026-09-20T00:00:00Z",
+            "serving_blocked_streak": None,
+        })
+        self.assertIn("serve_less_streak=?", suffix)
+
+    def test_the_suffix_reaches_the_printed_line(self) -> None:
+        data = {
+            "digest": {
+                "host": "h", "capacity": {}, "problems": [],
+                "supervisor_coverage": {"matched": 1, "expected": 1},
+            },
+            "observations": [{"supervisor": {
+                "runner": "lane-01", "phase": "waiting", "vm": "",
+                "heartbeat_age_secs": 3,
+                "serving_blocked_since": "2026-09-20T00:00:00Z",
+                "serving_blocked_streak": 143,
+                "serving_blocked_last_phase": "admission-error",
+            }}],
+        }
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            macos_observe.print_human(data)
+        printed = buffer.getvalue()
+        self.assertIn("phase=waiting", printed)
+        self.assertIn("serve_less_streak=143", printed)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

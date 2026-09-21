@@ -6,6 +6,8 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -13,6 +15,9 @@ import unittest
 from pathlib import Path
 
 import host_profile
+
+
+HOST_PROFILE_PATH = Path(host_profile.__file__).resolve()
 
 
 class HostProfileRoleTests(unittest.TestCase):
@@ -229,6 +234,193 @@ class HostProfileMinimalPathTests(unittest.TestCase):
         self.assertGreater(profile["mem_mb"], 0)
         self.assertGreater(profile["lease_capacity_cores"], 0)
         self.assertGreater(profile["pulp_build_mem_budget_mb"], 0)
+
+
+class HostDeliveryReportTests(unittest.TestCase):
+    """How code reaches a lane, read off the live plist and nothing else.
+
+    Two agents concluded "deploy to m3" on a host where the deploy command is
+    a silent no-op, because nothing on the host said which delivery mechanism
+    it uses. The report has to answer that from the plist, never from a
+    hostname, and it has to distinguish "current" from "cannot tell".
+    """
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.agents = self.tmp / "agents"
+        self.agents.mkdir()
+        self.repo = self.tmp / "repo"
+        self.repo.mkdir()
+        self._git("init", "-q", "-b", "main")
+        self._git("config", "user.email", "t@example.com")
+        self._git("config", "user.name", "t")
+        (self.repo / "a").write_text("one")
+        self._git("add", "a")
+        self._git("commit", "-qm", "one")
+        self.old_commit = self._git("rev-parse", "HEAD")
+        (self.repo / "a").write_text("two")
+        self._git("commit", "-qam", "two")
+        self.head = self._git("rev-parse", "HEAD")
+
+    def _git(self, *args: str) -> str:
+        proc = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            text=True, capture_output=True, check=True,
+        )
+        return proc.stdout.strip()
+
+    def _plist(self, label: str, arguments: list[str]) -> None:
+        (self.agents / f"{label}.plist").write_bytes(
+            plistlib.dumps({"Label": label, "ProgramArguments": arguments})
+        )
+
+    def _generation_lane(self, label: str, commit: str) -> Path:
+        gen = self.tmp / "generations" / f"{commit}-deadbeefdeadbeef"
+        gen.mkdir(parents=True)
+        (gen / ".tartci-support-manifest.json").write_text(json.dumps({
+            "schema": 2,
+            "repository": "https://github.com/danielraffel/tartci.git",
+            "source_commit": commit,
+            "members": [],
+        }))
+        launch = (
+            self.tmp / ".local/share/tartci-generations"
+            / f"{commit}-deadbeefdeadbeef"
+        )
+        launch.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(gen), str(launch))
+        self._plist(label, [
+            "/bin/bash", str(launch / ".tartci-launch"), "serve", "macos", "--loop",
+        ])
+        return launch
+
+    def _sealed_lane(self, label: str, commit: str, *, marker: bool = True) -> Path:
+        app = self.tmp / "libexec" / "TartCILauncher.app"
+        (app / "Contents/MacOS").mkdir(parents=True, exist_ok=True)
+        (app / "Contents/Resources").mkdir(parents=True, exist_ok=True)
+        if marker:
+            (app / "Contents/Resources/bundle.json").write_text(json.dumps({
+                "schema": 1,
+                "source_commit": commit,
+                "support_manifest_sha256": "a" * 64,
+                "profile_policy_sha256": "b" * 64,
+                "tart_home": "/Volumes/Workshop/VMs",
+            }))
+            (app / "Contents/Resources/lanes.json").write_text(json.dumps({
+                "schema": 1, "lanes": {"studio-pulp-gate": {"environment": {}}},
+            }))
+        self._plist(label, [
+            str(app / "Contents/MacOS/tartci-launcher"), "--lane", "studio-pulp-gate",
+        ])
+        return app
+
+    def _report(self) -> dict:
+        return host_profile.build_delivery_report(
+            agents=self.agents, repo_root=self.repo
+        )
+
+    # -- the two mechanisms --------------------------------------------------
+
+    def test_a_generation_lane_is_named_and_is_deployable(self) -> None:
+        label = host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate"
+        self._generation_lane(label, self.head)
+        lane = self._report()["lanes"][0]
+        self.assertEqual(lane["delivery"], "generation")
+        self.assertEqual(lane["in_force"]["source_commit"], self.head)
+        self.assertTrue(lane["accepts_generation_install"])
+        self.assertFalse(lane["staleness"]["stale"])
+
+    def test_a_sealed_lane_is_named_and_is_not_deployable(self) -> None:
+        """The finding that cost the time: on this shape the install command
+        stages a generation the launcher never execs."""
+        label = host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate"
+        self._sealed_lane(label, self.head)
+        lane = self._report()["lanes"][0]
+        self.assertEqual(lane["delivery"], "sealed-bundle")
+        self.assertEqual(lane["in_force"]["source_commit"], self.head)
+        self.assertFalse(lane["accepts_generation_install"])
+        self.assertIn("never execs", lane["how_to_update"])
+
+    def test_the_mechanism_is_derived_from_the_plist_not_the_hostname(self) -> None:
+        """Same host, same report run, both mechanisms present. A hostname
+        cannot produce this answer; the ProgramArguments can."""
+        self._generation_lane(
+            host_profile.FLEET_LABEL_PREFIX + "samehost.gen-lane", self.head
+        )
+        self._sealed_lane(
+            host_profile.FLEET_LABEL_PREFIX + "samehost.sealed-lane", self.head
+        )
+        by_label = {
+            lane["label"].rsplit(".", 1)[-1]: lane["delivery"]
+            for lane in self._report()["lanes"]
+        }
+        self.assertEqual(
+            by_label, {"gen-lane": "generation", "sealed-lane": "sealed-bundle"}
+        )
+
+    # -- staleness -----------------------------------------------------------
+
+    def test_an_older_commit_reports_how_far_behind(self) -> None:
+        self._generation_lane(
+            host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate", self.old_commit
+        )
+        stale = self._report()["lanes"][0]["staleness"]
+        self.assertTrue(stale["stale"])
+        self.assertEqual(stale["behind_by"], 1)
+
+    def test_a_commit_absent_from_the_checkout_is_stale_with_no_distance(self) -> None:
+        """Counting commits against a ref this checkout has never seen would
+        report 0, which renders identically to up-to-date."""
+        self._sealed_lane(
+            host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate", "f" * 40
+        )
+        stale = self._report()["lanes"][0]["staleness"]
+        self.assertTrue(stale["stale"])
+        self.assertIsNone(stale["behind_by"])
+        self.assertIn("not present", stale["detail"])
+
+    def test_an_unreadable_marker_is_unknown_and_never_current(self) -> None:
+        """A missing version marker is ignorance. Reporting it as current is
+        the failure mode this whole report exists to end."""
+        self._sealed_lane(
+            host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate",
+            self.head, marker=False,
+        )
+        lane = self._report()["lanes"][0]
+        self.assertIsNone(lane["in_force"]["source_commit"])
+        self.assertIsNone(lane["staleness"]["stale"])
+        self.assertIn("unreadable sealed marker", lane["in_force"]["detail"])
+
+    # -- the zero case gets a control ---------------------------------------
+
+    def test_no_fleet_lanes_is_distinguishable_from_an_unreadable_directory(self) -> None:
+        self._plist("com.example.unrelated", ["/bin/true"])
+        report = self._report()
+        self.assertEqual(report["lanes"], [])
+        self.assertEqual(report["fleet_plists_seen"], 0)
+        self.assertEqual(report["plists_seen"], 1)
+        self.assertIn("no fleet lanes on this host",
+                      host_profile.delivery_report_text(report))
+
+    def test_an_empty_agents_directory_reports_blindness(self) -> None:
+        report = self._report()
+        self.assertEqual(report["plists_seen"], 0)
+        self.assertIn("BLIND", host_profile.delivery_report_text(report))
+
+    def test_the_cli_emits_the_report_as_json(self) -> None:
+        self._generation_lane(
+            host_profile.FLEET_LABEL_PREFIX + "anyhost.pulp-gate", self.head
+        )
+        env = dict(os.environ, TARTCI_AGENTS_DIR=str(self.agents))
+        proc = subprocess.run(
+            [sys.executable, str(HOST_PROFILE_PATH), "--delivery", "--json"],
+            text=True, capture_output=True, check=False, env=env,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(payload["lanes"][0]["delivery"], "generation")
 
 
 if __name__ == "__main__":

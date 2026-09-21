@@ -11,6 +11,10 @@ heartbeat age has no choice but to call it stale.
 These guards pin the two halves that have to hold together: the denial path
 reports itself, and it records when the blocked streak began so "declining
 right now" stays distinguishable from "never serving again".
+
+The streak this path opens is shared with every other cause of a work entry
+that serves nothing; the counting and the clearing live in the loop and are
+covered by test_serving_blocked_accounting.py.
 """
 
 from __future__ import annotations
@@ -68,19 +72,31 @@ class LeaseDeniedHeartbeatTests(unittest.TestCase):
             guard, "the streak start must only be set when not already set"
         )
 
-    def test_a_granted_lease_clears_the_streak(self) -> None:
+    def test_a_granted_lease_does_not_clear_the_streak(self) -> None:
+        """A granted lease is one step, not service.
+
+        This path used to clear the marker the moment the lease was granted,
+        which is correct only if losing the lease is the sole way to fail. It
+        is not: a lane could take the lease, clone, and be refused at admission
+        every cycle for hours, clearing its own evidence each time. The clear
+        now lives in the loop and fires only after a job is assigned, so the
+        denial path here sets the marker and nothing here unsets it.
+        """
         body = function_body(self.source, "run_one")
         tail = body[body.index("tartci_acquire_vm_lease"):]
         denial_end = tail.index('return "$lease_rc"')
-        self.assertIn(
-            'SERVING_BLOCKED_SINCE=""', tail[denial_end:],
-            "serving again must end the streak, or a lane reads blocked forever",
-        )
+        self.assertNotIn('SERVING_BLOCKED_SINCE=""', tail[denial_end:])
 
     def test_an_empty_queue_clears_the_streak(self) -> None:
         """Nothing is being denied when there is no work, so an idle pass must
-        not keep inflating a streak that started under contention."""
-        self.assertIn('[ "${q:-0}" -gt 0 ] || SERVING_BLOCKED_SINCE=""', self.source)
+        not keep inflating a streak that started under contention. A lane with
+        no VMs and no demand is the designed resting state of an ephemeral
+        fleet, and must never read as blocked."""
+        self.assertRegex(
+            self.source,
+            r'(?m)^      if \[ "\$\{q:-0\}" -le 0 \]; then\n'
+            r'        SERVING_BLOCKED_SINCE=""$',
+        )
 
     def test_the_heartbeat_publishes_the_streak(self) -> None:
         body = function_body(self.source, "heartbeat")

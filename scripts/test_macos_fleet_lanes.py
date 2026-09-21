@@ -2105,11 +2105,12 @@ replaces_launchd_labels=REPLACEMENT
 class ServingBlockedTests(unittest.TestCase):
     """A fresh heartbeat proves a supervisor is alive, never that it serves.
 
-    A lane that keeps winning a host reservation and then losing the VM lease
+    A lane that keeps taking queued work and failing before assignment
     heartbeats on a normal cadence forever, so the age-only test cannot see it.
-    These pin the separation in both directions: a short block is ordinary
-    contention and must stay verified, a long one must stop counting as
-    realized capacity.
+    These pin the separation in every direction: a short block is ordinary
+    contention, a lane with no demand at all is the designed resting state of
+    an ephemeral fleet, and only a long run of work entries that served nothing
+    is a fault.
     """
 
     def _readiness(self, extra_state: dict, **kwargs) -> dict:
@@ -2159,33 +2160,141 @@ class ServingBlockedTests(unittest.TestCase):
         moment = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=seconds)
         return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    def test_a_long_block_stops_counting_as_realized_capacity(self) -> None:
-        value = self._readiness({"serving_blocked_since": self._ago(7200)})
-        problems = {item["code"]: item for item in value["problems"]}
-        self.assertIn("serving_blocked", problems)
-        self.assertIn("blocked_seconds=", problems["serving_blocked"]["detail"])
-        self.assertEqual(value["verified_running_supervisors"], 0)
-        self.assertFalse(value["fleet_ready"])
+    def _blocked(self, value: dict) -> bool:
+        return value["serving"]["blocked"]
 
-    def test_ordinary_contention_stays_verified(self) -> None:
-        """The inverse failure: a lane blocked for a minute is just waiting its
-        turn behind a live build, and flagging that would manufacture alarms on
-        a healthy fleet."""
-        value = self._readiness({"serving_blocked_since": self._ago(60)})
+    # -- the fault itself ----------------------------------------------------
+
+    def test_a_long_serve_less_streak_reports_the_lane_blocked(self) -> None:
+        """The measured outage: three hours of taking work and serving none."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 143,
+            "serving_blocked_last_phase": "admission-error",
+        })
+        self.assertTrue(self._blocked(value))
+        lanes = value["serving"]["blocked_lanes"]
+        self.assertEqual([lane["label"] for lane in lanes], ["one"])
+        self.assertEqual(lanes[0]["streak"], 143)
+        self.assertEqual(lanes[0]["last_phase"], "admission-error")
+        self.assertGreaterEqual(lanes[0]["blocked_seconds"], 10800)
+
+    def test_a_blocked_lane_is_not_a_fleet_readiness_problem(self) -> None:
+        """The design decision, stated as an assertion.
+
+        The dominant cause of a blocked lane is upstream and hits every lane on
+        every host at once, so folding it into `fleet_ready` would let one
+        upstream refusal fail the gate that decides whether hosts stay in the
+        fleet -- converting a serving outage into a control-plane outage, and
+        destroying the warm supervisors that are the recovery path. The
+        supervisor really is installed, loaded and running; that claim stays
+        true and the contradicting fact gets its own name.
+        """
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 143,
+        })
+        self.assertTrue(self._blocked(value))
         self.assertNotIn(
             "serving_blocked", {item["code"] for item in value["problems"]}
         )
         self.assertEqual(value["verified_running_supervisors"], 1)
         self.assertTrue(value["fleet_ready"])
 
-    def test_a_generation_predating_the_field_is_not_reported_blocked(self) -> None:
-        """Hosts run whatever generation was last installed. An older runner
-        never writes the marker, and its absence is ignorance, not health."""
-        value = self._readiness({})
-        self.assertNotIn(
-            "serving_blocked", {item["code"] for item in value["problems"]}
-        )
+    # -- the false positives -------------------------------------------------
+
+    def test_an_idle_lane_with_no_demand_is_not_blocked(self) -> None:
+        """The critical false positive.
+
+        Zero VMs at rest is the DESIGNED state of an ephemeral on-demand fleet,
+        not a symptom. A lane polling an empty queue clears the streak on every
+        pass, so it must read exactly like a lane that just finished a job.
+        """
+        value = self._readiness({
+            "phase": "waiting",
+            "vm": "",
+            "serving_blocked_since": "",
+            "serving_blocked_streak": 0,
+        })
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["serving"]["blocked_lanes"], [])
         self.assertEqual(value["verified_running_supervisors"], 1)
+        self.assertTrue(value["fleet_ready"])
+
+    def test_ordinary_contention_stays_verified(self) -> None:
+        """A lane blocked for a minute is waiting its turn behind a live build,
+        and flagging that would manufacture alarms on a healthy fleet."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(60),
+            "serving_blocked_streak": 1,
+        })
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["verified_running_supervisors"], 1)
+        self.assertTrue(value["fleet_ready"])
+
+    def test_a_fast_retry_burst_below_the_duration_floor_is_not_blocked(self) -> None:
+        """The transience gate. An upstream blip can drive the streak past the
+        threshold in minutes; raising a fleet-wide alarm on that would be its
+        own outage."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(120),
+            "serving_blocked_streak": 200,
+        })
+        self.assertFalse(self._blocked(value))
+
+    def test_a_long_block_below_the_streak_floor_is_not_blocked(self) -> None:
+        """The shape gate. Duration alone cannot tell a lane that is failing
+        from one that is merely slow, which is why the threshold is a streak
+        and not an elapsed time or an error count."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": 2,
+        })
+        self.assertFalse(self._blocked(value))
+
+    def test_healthy_and_failing_cadences_land_on_opposite_sides(self) -> None:
+        """The threshold against the real numbers.
+
+        Healthy: ~1.6 work entries/hour at job-per-mint ~1.00, so the streak is
+        reset by nearly every entry and three hours of it reaches ~1. Failing:
+        ~35 entries/hour at job-per-mint 0.00, so three hours reaches ~105. The
+        threshold of 6 sits between them with an order of magnitude of margin
+        on the failing side and 3.75 hours of consecutive total failure needed
+        to reach it on the healthy side.
+        """
+        hours = 3
+        healthy_streak = 1
+        failing_streak = int(35 * hours)
+        self.assertLess(healthy_streak, 6)
+        self.assertGreater(failing_streak, 6 * 10)
+        healthy = self._readiness({
+            "serving_blocked_since": self._ago(3600 * hours),
+            "serving_blocked_streak": healthy_streak,
+        })
+        failing = self._readiness({
+            "serving_blocked_since": self._ago(3600 * hours),
+            "serving_blocked_streak": failing_streak,
+        })
+        self.assertFalse(self._blocked(healthy))
+        self.assertTrue(self._blocked(failing))
+
+    # -- blindness is not health --------------------------------------------
+
+    def test_a_generation_predating_the_streak_is_reported_unmeasurable(self) -> None:
+        """Hosts run whatever generation was last installed. An older runner
+        never writes the counter, and its absence is ignorance, not health."""
+        value = self._readiness({})
+        self.assertEqual(value["serving"]["unmeasurable_lanes"], ["one"])
+        self.assertFalse(self._blocked(value))
+        self.assertEqual(value["verified_running_supervisors"], 1)
+
+    def test_a_generation_predating_the_streak_keeps_the_duration_only_test(self) -> None:
+        """Do not regress the lease-denial path on a host that has not been
+        redeployed: without a counter to read, the elapsed-time test is the
+        only evidence there is, and it still fires."""
+        value = self._readiness({"serving_blocked_since": self._ago(7200)})
+        self.assertTrue(self._blocked(value))
+        self.assertIsNone(value["serving"]["blocked_lanes"][0]["streak"])
 
     def test_an_unreadable_marker_is_reported_rather_than_skipped(self) -> None:
         value = self._readiness({"serving_blocked_since": "not-a-timestamp"})
@@ -2195,13 +2304,23 @@ class ServingBlockedTests(unittest.TestCase):
         )
         self.assertEqual(value["verified_running_supervisors"], 0)
 
-    def test_the_threshold_is_configurable(self) -> None:
-        value = self._readiness(
-            {"serving_blocked_since": self._ago(600)}, blocked_serving_seconds=300
-        )
+    def test_an_unreadable_streak_is_reported_rather_than_skipped(self) -> None:
+        value = self._readiness({
+            "serving_blocked_since": self._ago(10800),
+            "serving_blocked_streak": "many",
+        })
         self.assertIn(
-            "serving_blocked", {item["code"] for item in value["problems"]}
+            "serving_blocked_streak_invalid",
+            {item["code"] for item in value["problems"]},
         )
+        self.assertFalse(self._blocked(value))
+
+    def test_the_thresholds_are_configurable(self) -> None:
+        value = self._readiness(
+            {"serving_blocked_since": self._ago(600), "serving_blocked_streak": 3},
+            blocked_serving_seconds=300, blocked_serving_streak=2,
+        )
+        self.assertTrue(self._blocked(value))
 
 
 if __name__ == "__main__":
