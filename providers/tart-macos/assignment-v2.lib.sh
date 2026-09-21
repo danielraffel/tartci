@@ -89,7 +89,14 @@ tartci_assignment_v2_tier_demand(){
     rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
-    detail="$(tail -n 1 "$error_file" | cut -c1-512)"
+    # Keep BOTH ends: a wrapper prints the underlying cause BEFORE its own
+    # summary, so any tail-only rule discards the line that identifies the real
+    # fault and keeps the one that misattributes it. The head/tail budget is
+    # sized so the 512-byte event field cannot chop the summary back off.
+    # Publish the same text for the supervisor's blind path to report.
+    detail="$(scan_diagnostic_digest "$error_file" 2 2 110 | tr '\n' '|' \
+      | sed 's/|$//' | cut -c1-512)"
+    record_scan_error "$detail"
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
     if [ "$exhaustive" != 1 ] \
