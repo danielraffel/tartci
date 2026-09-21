@@ -38,6 +38,21 @@ os.environ.setdefault(
 )
 HOST_OBSERVATION_LOCK = Path.home() / ".tartci/state/queue-observation.lock"
 
+# The workflow-id cache needs the same treatment for two reasons. Its default
+# file is the HOST's shared one, so a test that forgets the flag would publish
+# fixture workflow ids where every live fleet lane on this machine reads them,
+# aiming production scans at a workflow that does not exist. And a cache shared
+# between tests is a channel between them: one test's resolved id satisfies the
+# next test's lookup, so the listing call that test was written to exercise is
+# never made. Both are closed by defaulting the cache OFF; a test that wants it
+# passes its own --workflow-id-cache-file and a non-zero TTL.
+os.environ.setdefault(
+    "TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE",
+    str(Path(tempfile.mkdtemp(prefix="tartci-test-workflow-ids-")) / "workflow-ids.json"),
+)
+os.environ.setdefault("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS", "0")
+HOST_WORKFLOW_ID_CACHE = Path.home() / ".tartci/state/assignment-workflow-ids.json"
+
 
 def _write_exec(path: Path, body: str) -> None:
     path.write_text(body, encoding="utf-8")
@@ -583,9 +598,13 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
         module = module_from_spec(spec)
         spec.loader.exec_module(module)
         scanner = module.AssignmentScanner.__new__(module.AssignmentScanner)
-        scanner.args = Namespace(max_workers=3)
+        scanner.args = Namespace(max_workers=3, workflow_id_cache_ttl=0)
         scanner._observation_lock = lambda: contextlib.nullcontext()
-        scanner._runs = lambda: [{"id": run_id} for run_id in range(6)]
+        scanner._cached_workflow_ids = lambda: {"Build and Test": 99}
+        scanner._ordered_run_listings = lambda _ids: ["runs?status=queued"]
+        scanner._walk_listing = (
+            lambda _prefix, _key, visit: visit([{"id": run_id} for run_id in range(6)])
+        )
         # This scanner is built with __new__, so it carries none of __init__'s
         # state. No stubbed run reports a witness, which is what keeps this an
         # exhaustive-sum assertion.
@@ -913,6 +932,8 @@ else: raise SystemExit(4)
 import json, sys
 if '/actions/workflows?' in sys.argv[-1]:
     print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
+elif '/jobs' in sys.argv[-1]:
+    print(json.dumps({'total_count': 0, 'jobs': []}))
 else:
     print(json.dumps({'total_count': 200, 'workflow_runs': [{'id': i} for i in range(100)]}))
 """,
@@ -987,6 +1008,8 @@ if p.path.endswith('/actions/workflows'):
 elif '/actions/workflows/99/runs' in p.path and 'status=queued' in p.query:
     start = 1 if page == 1 else 100
     print(json.dumps({'total_count': 101, 'workflow_runs': [{'id': i} for i in range(start, start + (100 if page == 1 else 1))]}))
+elif '/jobs' in p.path:
+    print(json.dumps({'total_count': 0, 'jobs': []}))
 else:
     print(json.dumps({'total_count': 0, 'workflow_runs': []}))
 """,

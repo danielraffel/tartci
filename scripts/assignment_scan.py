@@ -14,6 +14,24 @@ full count would, and the expensive exhaustive pass is still mandatory before
 any claim that there is nothing to serve — which is the claim that would idle a
 lane with work waiting. Pass --exhaustive-count for the true magnitude when
 diagnosing; it is not needed to make a decision.
+
+The asymmetry governs the whole pass, not only its last phase. Enumerating
+every run before reading a single job spends the listing calls, and the
+snapshot reconciliation that makes those listings trustworthy, whether or not
+the first run already settles the question. The witness then cannot arrive
+until the most failure-prone part of the scan is already paid for. So the walk
+hands each page of runs to the job scan as that page arrives, takes the
+listings whose runs are `queued` before the ones that are `in_progress`, and
+abandons the rest the moment a witness appears. Reconciliation is what makes an
+empty listing believable, so it is enforced whenever a listing is walked to its
+end, and skipped only where a witness has already made absence moot.
+
+Resolving a workflow name to its id is the one input that does not change
+between polls, so it is read from a short-lived host-shared cache instead of
+being re-fetched every time. An id that no longer resolves fails the scan
+closed on its own listing call, so the cache cannot turn a broken lookup into
+an empty queue; the bounded lifetime covers the narrower case of a second
+workflow appearing under an already-cached display name.
 """
 from __future__ import annotations
 
@@ -50,6 +68,15 @@ class TransientApiFault(ScanError):
     abandoning the whole scan on the first one throws away an observation that
     a retry would have completed. Retrying is not failing open — an exhausted
     retry budget still raises, and the scan still fails closed.
+    """
+
+
+class WitnessAbandon(Exception):
+    """A matching queued job was seen, so the walk in progress can stop here.
+
+    Carried out of a listing walk rather than returned, because the walk is
+    several frames deep in pagination when the witness lands. It is not a
+    ScanError: nothing failed, and the scan reports presence.
     """
 
 
@@ -99,6 +126,7 @@ class AssignmentScanner:
         self.api_calls_lock = threading.Lock()
         self.observation_lock_fd: int | None = None
         self.witness = threading.Event()
+        self.workflow_id_cache_path = Path(args.workflow_id_cache_file)
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
@@ -202,11 +230,44 @@ class AssignmentScanner:
                     ) from error
         raise AssertionError("unreachable")
 
-    def _pages_once(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
-        items: list[dict[str, Any]] = []
+    def _pages(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
+        """Read a whole listing into memory, restarting a torn pass.
+
+        The retry is of the entire pagination, never of one page: pages are
+        only consistent with each other within a single pass, so resuming a
+        torn read mid-way would splice two different snapshots together. Each
+        attempt therefore collects into a fresh list.
+        """
+        attempts = self.args.pagination_retries + 1
+        for attempt in range(1, attempts + 1):
+            items: list[dict[str, Any]] = []
+            try:
+                self._walk_listing_once(path_prefix, key, items.extend)
+                return items
+            except PaginationRace as error:
+                if attempt == attempts or not self._retry_sleep(attempt):
+                    raise ScanError(
+                        f"{error} (after {attempt} pagination attempt(s))"
+                    ) from error
+        raise AssertionError("unreachable")
+
+    def _walk_listing_once(self, path_prefix: str, key: str, visit: Any) -> None:
+        """Page a listing, handing each page to `visit` the moment it arrives.
+
+        The reconciliation is the same one a whole-listing read performs: a
+        stable total_count, no repeated ids, a body that adds up to that total,
+        and a re-read of the first page once the listing spanned more than one.
+        Those checks are what make an empty listing mean the queue is empty.
+        What differs is when the pages are used. `visit` sees each page before
+        the next is requested, so it can raise WitnessAbandon and leave the
+        remaining pages, and the reconciliation, unbought. That is sound only
+        because abandoning happens exactly when presence is already proved, and
+        a proof of presence is not something a fuller reading could retract.
+        """
         seen_ids: set[int] = set()
         expected_total: int | None = None
         first_page_ids: tuple[int, ...] = ()
+        delivered = 0
         for page in range(1, self.args.max_pages + 1):
             separator = "&" if "?" in path_prefix else "?"
             path = f"{path_prefix}{separator}per_page={PER_PAGE}&page={page}"
@@ -237,11 +298,12 @@ class AssignmentScanner:
                     )
                 seen_ids.add(item_id)
                 page_ids.append(item_id)
-                items.append(item)
             if page == 1:
                 first_page_ids = tuple(page_ids)
-            if len(items) >= total:
-                if len(items) != total:
+            visit(page_items)
+            delivered += len(page_items)
+            if delivered >= total:
+                if delivered != total:
                     raise PaginationRace(
                         f"GitHub API pagination exceeded total_count for {path}"
                     )
@@ -255,35 +317,126 @@ class AssignmentScanner:
                         raise PaginationRace(
                             f"GitHub API first page changed during pagination for {path_prefix}"
                         )
-                return items
+                return
             if len(page_items) < PER_PAGE:
-                if len(items) < total:
+                if delivered < total:
                     raise PaginationRace(
                         f"GitHub API pagination ended before total_count for {path} "
-                        f"({len(items)} < {total})"
+                        f"({delivered} < {total})"
                     )
-                return items
+                return
         raise ScanError(
             f"GitHub API pagination truncated at {self.args.max_pages} pages for {path_prefix}"
         )
 
-    def _pages(self, path_prefix: str, key: str) -> list[dict[str, Any]]:
-        """Read a whole listing, restarting a pass that the queue moved under.
+    def _walk_listing(self, path_prefix: str, key: str, visit: Any) -> None:
+        """Walk a listing, restarting a pass that the queue moved under.
 
-        The retry is of the entire pagination, never of one page: pages are only
-        consistent with each other within a single pass, so resuming a torn read
-        mid-way would splice two different snapshots together.
+        `visit` is called again for the pages a restarted pass re-reads, so it
+        must tolerate seeing a run twice. The caller holds the scanned-run set
+        that makes the repeat free.
         """
         attempts = self.args.pagination_retries + 1
         for attempt in range(1, attempts + 1):
             try:
-                return self._pages_once(path_prefix, key)
+                self._walk_listing_once(path_prefix, key, visit)
+                return
             except PaginationRace as error:
                 if attempt == attempts or not self._retry_sleep(attempt):
                     raise ScanError(
                         f"{error} (after {attempt} pagination attempt(s))"
                     ) from error
         raise AssertionError("unreachable")
+
+    def _cached_workflow_ids(self) -> dict[str, int] | None:
+        """Return every configured workflow's id from cache, or None.
+
+        All or nothing: a partial hit still needs the listing call a full hit
+        exists to avoid, so it is not a hit. An unreadable, malformed or
+        expired cache reads as a miss and the scan resolves the ids live.
+        """
+        ttl = self.args.workflow_id_cache_ttl
+        if ttl <= 0:
+            return None
+        try:
+            payload = json.loads(
+                self.workflow_id_cache_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        entry = payload.get(self.args.repo)
+        if not isinstance(entry, dict):
+            return None
+        fetched_at = entry.get("fetched_at")
+        if not isinstance(fetched_at, (int, float)) or isinstance(fetched_at, bool):
+            return None
+        age = time.time() - fetched_at
+        if not 0 <= age < ttl:
+            return None
+        workflows = entry.get("workflows")
+        if not isinstance(workflows, dict):
+            return None
+        resolved: dict[str, int] = {}
+        for name in self.workflows:
+            workflow_id = workflows.get(name)
+            if not isinstance(workflow_id, int) or isinstance(workflow_id, bool):
+                return None
+            resolved[name] = workflow_id
+        return resolved
+
+    def _store_workflow_ids(self, resolved: dict[str, int]) -> None:
+        """Publish the resolved ids for the other lanes sharing this host.
+
+        Best effort by construction: the cache only ever saves a call, so a
+        host that cannot write one keeps scanning correctly and pays for the
+        listing on every poll.
+        """
+        if self.args.workflow_id_cache_ttl <= 0:
+            return
+        try:
+            self.workflow_id_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                payload = json.loads(
+                    self.workflow_id_cache_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload[self.args.repo] = {
+                "fetched_at": time.time(),
+                "workflows": dict(resolved),
+            }
+            tmp = self.workflow_id_cache_path.with_name(
+                f"{self.workflow_id_cache_path.name}.{os.getpid()}.tmp"
+            )
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            os.replace(tmp, self.workflow_id_cache_path)
+        except OSError:
+            return
+
+    def _ordered_run_listings(self, workflow_ids: dict[str, int]) -> list[str]:
+        """Order the run listings by how likely each is to end the scan early.
+
+        A run that is itself `queued` is where a queued job most often sits, so
+        those listings come before the `in_progress` ones for every configured
+        workflow. An `in_progress` run can still hold a queued job and is still
+        read before any claim of absence; it is only read later.
+        """
+        ordered: list[str] = []
+        for status in ("queued", "in_progress"):
+            seen: set[int] = set()
+            for workflow_id in workflow_ids.values():
+                if workflow_id in seen:
+                    continue
+                seen.add(workflow_id)
+                ordered.append(
+                    f"repos/{self.args.repo}/actions/workflows/{workflow_id}/runs"
+                    f"?status={status}"
+                )
+        return ordered
 
     def _workflow_ids(self) -> dict[str, int]:
         workflows = self._pages(
@@ -306,21 +459,6 @@ class AssignmentScanner:
                 )
             resolved[name] = ids[0]
         return resolved
-
-    def _runs(self) -> list[dict[str, Any]]:
-        found: dict[int, dict[str, Any]] = {}
-        for workflow_id in self._workflow_ids().values():
-            for status in ("queued", "in_progress"):
-                prefix = (
-                    f"repos/{self.args.repo}/actions/workflows/{workflow_id}/runs"
-                    f"?status={status}"
-                )
-                for run in self._pages(prefix, "workflow_runs"):
-                    run_id = run.get("id")
-                    if not isinstance(run_id, int):
-                        raise ScanError("configured workflow run has no integer id")
-                    found[run_id] = run
-        return list(found.values())
 
     def _scan_run(self, run: dict[str, Any]) -> int:
         if self.witness.is_set():
@@ -390,15 +528,47 @@ class AssignmentScanner:
         # left the host scan-blind. The wait is bounded separately from the scan
         # budget, so queueing behind other lanes costs this scan time to finish
         # but never time to work; failure remains fail-closed either way.
+        # Reading the workflow ids from cache is file IO, so it happens
+        # before the host-global lock rather than under it.
+        workflow_ids = self._cached_workflow_ids()
+        total = 0
         with self._observation_lock():
-            runs = self._runs()
+            if workflow_ids is None:
+                workflow_ids = self._workflow_ids()
+                self._store_workflow_ids(workflow_ids)
+            scanned: set[int] = set()
+
             # Concurrency remains opt-in for a measured host. The reliable
             # fleet default is one call stream; raising it multiplies pressure
             # inside the host-global scan and must not happen accidentally.
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=self.args.max_workers
             ) as executor:
-                total = sum(executor.map(self._scan_run, runs), start=0)
+
+                def visit(page_items: list[dict[str, Any]]) -> None:
+                    nonlocal total
+                    fresh: list[dict[str, Any]] = []
+                    for run in page_items:
+                        run_id = run.get("id")
+                        if not isinstance(run_id, int):
+                            raise ScanError("configured workflow run has no integer id")
+                        # A run reachable from two listings, or re-read by a
+                        # restarted pass, is scanned once.
+                        if run_id in scanned:
+                            continue
+                        scanned.add(run_id)
+                        fresh.append(run)
+                    if not fresh:
+                        return
+                    total += sum(executor.map(self._scan_run, fresh), start=0)
+                    if self.witness.is_set():
+                        raise WitnessAbandon
+
+                try:
+                    for prefix in self._ordered_run_listings(workflow_ids):
+                        self._walk_listing(prefix, "workflow_runs", visit)
+                except WitnessAbandon:
+                    pass
         if self.witness.is_set():
             # Deliberately not the running total: the scan stopped early, so the
             # total is a partial count and reporting it would invent precision
@@ -466,6 +636,18 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("TARTCI_ASSIGNMENT_SCAN_MAX_WORKERS", "1")),
     )
     parser.add_argument(
+        "--workflow-id-cache-file",
+        default=os.environ.get("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE")
+        or str(Path.home() / ".tartci/state/assignment-workflow-ids.json"),
+    )
+    parser.add_argument(
+        "--workflow-id-cache-ttl",
+        type=float,
+        default=float(
+            os.environ.get("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS", "300")
+        ),
+    )
+    parser.add_argument(
         "--observation-lock-file",
         default=os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_FILE")
         or str(Path.home() / ".tartci/state/queue-observation.lock"),
@@ -503,6 +685,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
+    if not math.isfinite(args.workflow_id_cache_ttl):
+        parser.error("--workflow-id-cache-ttl must be finite")
     return args
 
 
