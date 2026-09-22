@@ -456,6 +456,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
             self.assertTrue(value["fleet_ready"])
             self.assertEqual(value["verified_running_supervisors"], 2)
+            # The full readiness path reports config verdicts beside, not in,
+            # problems; with no installed profile they are not applicable.
+            self.assertEqual(value["config"]["profile_drift"]["state"], "not_applicable")
+            self.assertEqual(value["config"]["supply"]["state"], "not_applicable")
 
             orphan_table = subprocess.CompletedProcess(
                 [], 0,

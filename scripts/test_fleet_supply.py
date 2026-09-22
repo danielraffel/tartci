@@ -126,8 +126,13 @@ class VerifySupplyTests(unittest.TestCase):
         self.assertEqual(result["state"], "mismatch")
 
     def test_unknown_host_or_unreadable_is_never_match(self) -> None:
-        text = M3.read_text().replace('id = "studio"', 'id = "nohost"', 1)
-        self.assertEqual(self.verdicts(text)["state"], "unknown")
+        # m1 loads with any host id (m3's worktree_cleanup is pinned to studio),
+        # so this reaches the host_id lookup rather than failing validation.
+        m1 = (ROOT / "profiles" / "m1-macos-fleet.toml").read_text()
+        unknown = self.verdicts(m1.replace('id = "m1"', 'id = "nohost"', 1))
+        self.assertEqual(unknown["state"], "unknown")
+        self.assertIn("declares no registrations", unknown["reason"])
+        self.assertEqual(self.verdicts(m1)["state"], "match")  # control
         self.assertEqual(fleet.verify_supply(Path(self.td.name) / "absent.toml",
                                              self.published)["state"], "unknown")
         self.assertEqual(fleet.verify_supply(self.installed, None, "boom")["state"], "unknown")
