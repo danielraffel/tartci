@@ -492,6 +492,118 @@ clear_jit_admission_denied(){
   rm -f "$(jit_denial_file_for "$runner_group_id" "$labels")"
 }
 
+# -- Scan diagnostics -------------------------------------------------------
+# A queue/assignment scanner reports WHY it failed on stderr; its stdout is only
+# a count. Discarding that stderr leaves the supervisor able to report that it is
+# blind but never why, which is what turned a one-line interpreter fault into a
+# multi-hour outage. Keep the last diagnostic so the blind path can print it.
+SCAN_ERROR_FILE="$STATE_DIR/$RUNNER_NAME.scan-last-error"
+
+# Keep BOTH ends of a diagnostic stream, with an explicit elision marker.
+#
+# A wrapper prints the underlying CAUSE first and its own summary last, so any
+# "keep the last N lines" rule drops the cause the moment the wrapper is more
+# verbose than N. Deepening the tail does not fix last-line-wins — it only moves
+# the cliff: `tail -n 3` keeps a two-line wrapper's cause and loses a four-line
+# one's, and nothing lets a caller predict how chatty a wrapper will be. Keeping
+# the head as well is what makes the cause survive at any length, and the marker
+# means an elided middle is never mistaken for the whole stream.
+scan_diagnostic_digest(){
+  awk -v head_n="${2:-3}" -v tail_n="${3:-3}" -v max_col="${4:-240}" '
+    /^[[:space:]]*$/ { next }
+    {
+      lines[++count] = (length($0) > max_col) \
+        ? substr($0, 1, max_col) "..." : $0
+    }
+    END {
+      if (count == 0) exit 0
+      if (count <= head_n + tail_n) {
+        for (i = 1; i <= count; i++) print lines[i]
+        exit 0
+      }
+      for (i = 1; i <= head_n; i++) print lines[i]
+      printf "[... %d line(s) elided ...]\n", count - head_n - tail_n
+      for (i = count - tail_n + 1; i <= count; i++) print lines[i]
+    }
+  ' "$1"
+}
+
+run_scan_capture(){
+  local err rc
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-scan-err.XXXXXX")" || { "$@"; return $?; }
+  "$@" 2>"$err"
+  rc=$?
+  if [ -s "$err" ]; then
+    mkdir -p "$STATE_DIR" 2>/dev/null || true
+    scan_diagnostic_digest "$err" >"$SCAN_ERROR_FILE" 2>/dev/null || true
+  fi
+  rm -f "$err"
+  return $rc
+}
+
+# Most recent scanner diagnostic, flattened to a single line for the log.
+scan_last_error(){
+  [ -r "$SCAN_ERROR_FILE" ] || return 0
+  tr '\n' '|' <"$SCAN_ERROR_FILE" 2>/dev/null | sed 's/|$//'
+}
+
+clear_scan_error(){ rm -f "$SCAN_ERROR_FILE" 2>/dev/null || true; }
+
+read_blind_restarts(){
+  local v=0
+  [ -r "${BLIND_RESTART_FILE:-}" ] && read -r v <"$BLIND_RESTART_FILE" 2>/dev/null
+  case "$v" in ''|*[!0-9]*) v=0;; esac
+  printf '%s' "$v"
+}
+
+write_blind_restarts(){
+  [ -n "${BLIND_RESTART_FILE:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" >"$BLIND_RESTART_FILE" 2>/dev/null || true
+}
+
+reset_blind_restarts(){
+  [ -n "${BLIND_RESTART_FILE:-}" ] && rm -f "$BLIND_RESTART_FILE" 2>/dev/null
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] && rm -f "$BLIND_ESCALATION_FILE" 2>/dev/null
+  return 0
+}
+
+# True while a recent escalation notice still stands, so the alert is raised
+# once per window rather than on every poll.
+blind_escalation_is_fresh(){
+  local window="${TARTCI_SCAN_BLIND_ESCALATION_REPEAT_SECS:-900}" mtime now
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] || return 1
+  [ -r "$BLIND_ESCALATION_FILE" ] || return 1
+  # GNU `stat -f` means "filesystem", not "format": it prints a block of fs
+  # detail AND fails, so chaining the two dialects with `||` concatenates that
+  # dump onto the real answer. Try each independently and accept only a number.
+  mtime="$(stat -c %Y "$BLIND_ESCALATION_FILE" 2>/dev/null)"
+  case "$mtime" in ''|*[!0-9]*) mtime="";; esac
+  if [ -z "$mtime" ]; then
+    mtime="$(stat -f %m "$BLIND_ESCALATION_FILE" 2>/dev/null)"
+    case "$mtime" in ''|*[!0-9]*) return 1;; esac
+  fi
+  now="$(date +%s)"
+  [ $((now - mtime)) -lt "$window" ]
+}
+
+# A file a human (or `tartci status`) can find without reading a log tail.
+write_blind_escalation(){
+  [ -n "${BLIND_ESCALATION_FILE:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '{"ts":"%s","runner":"%s","host":"%s","restarts":"%s","detail":"%s"}\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$RUNNER_NAME" "$HOST_NAME" \
+    "$(json_sanitize "$1")" "$(json_sanitize "${2:-no diagnostic captured}")" \
+    >"$BLIND_ESCALATION_FILE" 2>/dev/null || true
+}
+
+# Publish a diagnostic captured by a caller that runs its own scanner.
+record_scan_error(){
+  [ -n "${1:-}" ] || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  printf '%s\n' "$1" >"$SCAN_ERROR_FILE" 2>/dev/null || true
+}
+
 json_sanitize(){ printf '%s' "$1" | tr '\n\r\t"' '    '; }
 event(){
   local kind="$1" detail="${2:-}" ts
@@ -567,7 +679,7 @@ queued_work(){
     printf '%s\n' "$total"
     return 0
   fi
-  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+  run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     "${WORKFLOW_ARGS[@]}" \
     --labels "$LABELS" \
@@ -577,7 +689,7 @@ queued_work(){
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE" \
-    --match-labels 1 2>/dev/null || echo ERR
+    --match-labels 1 || echo ERR
 }
 
 print_queued_work(){
@@ -616,7 +728,7 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
-  "${scan_cmd[@]}" --match-labels 1 2>/dev/null
+  run_scan_capture "${scan_cmd[@]}" --match-labels 1
 }
 
 # Print `count|registration labels|zero-based tier`. A scan error at any tier is
@@ -711,7 +823,7 @@ priority_demand(){
   # advisory lane that idles during a gh outage — strictly safer than risking the
   # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
   # are declared first and assigned separately so `||` actually fires.)
-  python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+  run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     --workflow "$YIELD_WORKFLOW" \
     --labels "$YIELD_LABELS" \
@@ -722,7 +834,7 @@ priority_demand(){
     --state-file "$STATE_DIR/priority-queue-scan.json" \
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
-    --match-labels 1 2>/dev/null \
+    --match-labels 1 \
     || { printf '%s\n' 1; return 0; }
 }
 
@@ -861,28 +973,54 @@ handle_supervisor_signal(){
   exit 143
 }
 
+# The actions runner announces its own job boundaries in its log. The closing
+# line is direct local proof that the job reached a terminal state, and it
+# costs no API call and no share of the host observation lock.
+runner_log_completion_result(){
+  local log="${1:-}" line
+  [ -n "$log" ] && [ -r "$log" ] || return 1
+  line="$(grep -E ': Job .+ completed with result: .+' "$log" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || return 1
+  printf '%s' "${line##*completed with result: }"
+}
+
 record_terminal_job_receipt(){
-  local runner_rc="$1"
+  local runner_rc="$1" runner_log="${2:-}" local_result
   if [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal ]; then
     CURRENT_ASSIGNMENT_QUARANTINE="none"
-    event job_terminal_receipt "runner_rc=$runner_rc observation=terminal rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
-  else
-    if [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal_pending_run ]; then
-      CURRENT_ASSIGNMENT_QUARANTINE="listener_exited_workflow_active"
-    else
-      CURRENT_ASSIGNMENT_QUARANTINE="listener_exit_terminal_unknown"
-    fi
-    event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    event job_terminal_receipt "runner_rc=$runner_rc observation=terminal evidence=github_api rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
   fi
+  if [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal_pending_run ]; then
+    # A completed observation that still saw the workflow running is positive
+    # evidence of live work, so it outranks any local terminal proof and keeps
+    # the assignment quarantined.
+    CURRENT_ASSIGNMENT_QUARANTINE="listener_exited_workflow_active"
+    event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=github_api quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
+  fi
+  # The observation never resolved. A measurement that failed is not evidence
+  # of a stall, so a clean listener exit plus the runner's own completion line
+  # settles terminality instead.
+  local_result="$(runner_log_completion_result "$runner_log")" || local_result=""
+  if [ "$runner_rc" = 0 ] && [ -n "$local_result" ]; then
+    CURRENT_ASSIGNMENT_QUARANTINE="none"
+    event job_terminal_receipt "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=runner_local result=$local_result rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
+  fi
+  # Nothing proved terminality and nothing observed a stall. The event names
+  # the failed measurement so a reader cannot mistake it for an observed one.
+  CURRENT_ASSIGNMENT_QUARANTINE="listener_exit_terminal_unknown"
+  event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=measurement_failed quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
 }
 
 finalize_listener_receipt(){
-  local runner_rc="$1" listener_assigned="$2"
+  local runner_rc="$1" listener_assigned="$2" runner_log="${3:-}"
   [ "$listener_assigned" = 1 ] || return 0
   if [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ]; then
     capture_current_job revalidate || true
   fi
-  record_terminal_job_receipt "$runner_rc"
+  record_terminal_job_receipt "$runner_rc" "$runner_log"
 }
 
 tartci_is_canonical_positive_decimal(){
@@ -914,11 +1052,17 @@ capture_current_job(){
       scan_spent="$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"
       budget_parameter="cancel_terminal_observation_budget" ;;
     *)
-      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-30}"
+      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}"
       scan_spent="$CURRENT_JOB_SCAN_SPENT"
       budget_parameter="lifecycle_budget" ;;
   esac
-  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-8}"
+  # Discovery walks every in-progress run in the repository one call at a time,
+  # so its cost tracks repository concurrency rather than a constant. Sixty
+  # concurrent runs measure 93 to 106 seconds, and an attempt that cannot
+  # outlast the scan can only ever report a failed measurement. The lifecycle
+  # budget stays the larger of the two because the clamp below lowers an
+  # attempt to whatever the budget has left.
+  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}"
   invalid_parameter=""
   tartci_is_canonical_positive_decimal "$budget" || invalid_parameter="$budget_parameter"
   if [ -z "$invalid_parameter" ]; then
@@ -1233,7 +1377,7 @@ run_runner_until_done(){
     sleep 5
   done
   wait "$ssh_pid" || rc=$?
-  finalize_listener_receipt "$rc" "$assigned"
+  finalize_listener_receipt "$rc" "$assigned" "$runner_log"
   sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
 }
@@ -1655,6 +1799,11 @@ if [ "$LOOP" = 1 ]; then
   # manual recovery, automated. A blip self-heals on the next successful poll (blind resets to 0).
   blind=0
   BLIND_MAX="${TARTCI_SCAN_BLIND_MAX:-$(( (180 + POLL - 1) / POLL ))}"
+  # The restart remedy is bounded. It survives the restart it triggers, so it
+  # must live on disk rather than in this process.
+  BLIND_RESTART_MAX="${TARTCI_SCAN_BLIND_RESTART_MAX:-3}"
+  BLIND_RESTART_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-restarts"
+  BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
   heartbeat loop
   while true; do
     if ! tartci_pool_admission_open; then
@@ -1683,17 +1832,46 @@ if [ "$LOOP" = 1 ]; then
     # VM). Any successful poll resets the counter, so a transient blip costs nothing.
     if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
       blind=$((blind + 1))
-      note "SCAN BLIND (gh queue scan failed) ${blind}/${BLIND_MAX} — NOT idling as empty (running_macos_vms=$r/$cap)"
-      event scan_blind "consecutive=$blind running=$r/$cap"
+      scan_detail="$(scan_last_error)"
+      # Report WHAT was observed. The old text named `gh`, a component this code
+      # never observed failing, and sent every reader to audit a healthy CLI.
+      note "SCAN BLIND ${blind}/${BLIND_MAX} — queue scan failed: ${scan_detail:-no diagnostic captured} — NOT idling as empty (running_macos_vms=$r/$cap)"
+      event scan_blind "consecutive=$blind running=$r/$cap detail=${scan_detail:-no diagnostic captured}"
       heartbeat scan_blind
       if [ "$blind" -ge "$BLIND_MAX" ]; then
-        note "SCAN BLIND ~$((blind * POLL))s — self-restarting the supervisor for fresh gh auth (launchd KeepAlive respawns)"
-        event scan_blind_restart "seconds=$((blind * POLL))"
+        blind_restarts="$(read_blind_restarts)"
+        if [ "$blind_restarts" -ge "$BLIND_RESTART_MAX" ]; then
+          # Restarting buys a fresh process. Causes that a fresh process cannot
+          # clear (a broken interpreter, a revoked credential, an API change)
+          # are unaffected, so repeating it forever hides a stuck host behind a
+          # log that looks like it is recovering. Stay up and fail-closed — the
+          # lane must still recover by itself when the cause clears — but stop
+          # pretending a remedy is being applied, and make it visible.
+          # Escalate loudly, then throttle: the condition is re-evaluated every
+          # poll, and an alert repeated every ${POLL}s is one a human filters out.
+          if ! blind_escalation_is_fresh; then
+          note "SCAN BLIND UNRESOLVED after $blind_restarts supervisor restarts — restarting again will not help. Last diagnostic: ${scan_detail:-none captured}. This host is serving NOTHING for this lane; a human needs to look. Details: $SCAN_ERROR_FILE"
+          event scan_blind_escalated \
+            "restarts=$blind_restarts seconds=$((blind * POLL)) detail=${scan_detail:-no diagnostic captured}"
+          heartbeat scan_blind_escalated
+          write_blind_escalation "$blind_restarts" "$scan_detail"
+          fi
+          sleep "$POLL"; continue
+        fi
+        note "SCAN BLIND ~$((blind * POLL))s — restarting the supervisor (attempt $((blind_restarts + 1))/$BLIND_RESTART_MAX; launchd KeepAlive respawns)"
+        event scan_blind_restart "seconds=$((blind * POLL)) restart=$((blind_restarts + 1))/$BLIND_RESTART_MAX detail=${scan_detail:-no diagnostic captured}"
+        write_blind_restarts "$((blind_restarts + 1))"
         exit 75
       fi
       sleep "$POLL"; continue
     fi
+    if [ "$blind" -ne 0 ]; then
+      note "scan recovered after ${blind} blind poll(s)"
+      event scan_recovered "after=$blind"
+    fi
     blind=0
+    reset_blind_restarts
+    clear_scan_error
     # Only probe priority demand when THIS lane actually has work — no point
     # spending a gh round-trip (and the API quota the secondary-rate-limit cares
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0

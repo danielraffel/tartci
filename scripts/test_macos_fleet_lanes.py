@@ -1469,6 +1469,100 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("host.github_api_timeout_seconds", result.stderr)
 
+    def test_current_job_observation_budgets_are_bounded(self) -> None:
+        base = CONFIG.read_text()
+        pin = "github_api_timeout_seconds = 30"
+        fixtures = {
+            "attempt-too-small": (
+                f"{pin}\ncurrent_job_attempt_timeout_seconds = 29",
+                "host.current_job_attempt_timeout_seconds",
+            ),
+            "attempt-too-large": (
+                f"{pin}\ncurrent_job_attempt_timeout_seconds = 601",
+                "host.current_job_attempt_timeout_seconds",
+            ),
+            "attempt-wrong-type": (
+                f'{pin}\ncurrent_job_attempt_timeout_seconds = "120"',
+                "host.current_job_attempt_timeout_seconds",
+            ),
+            "budget-too-small": (
+                f"{pin}\ncurrent_job_lifecycle_budget_seconds = 59",
+                "host.current_job_lifecycle_budget_seconds",
+            ),
+            "budget-too-large": (
+                f"{pin}\ncurrent_job_lifecycle_budget_seconds = 1801",
+                "host.current_job_lifecycle_budget_seconds",
+            ),
+            # An attempt is lowered to whatever the budget has left, so a
+            # budget under the attempt silently shortens every observation.
+            "budget-under-attempt": (
+                f"{pin}\ncurrent_job_attempt_timeout_seconds = 120"
+                "\ncurrent_job_lifecycle_budget_seconds = 119",
+                "at least",
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, (block, expected) in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(base.replace(pin, block, 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode, 2, result.stdout + result.stderr
+                    )
+                    self.assertIn(expected, result.stderr)
+
+    def test_current_job_observation_budget_renders_or_falls_back(self) -> None:
+        """A declared budget reaches the lane; an omitted one leaves the default."""
+        base = CONFIG.read_text()
+        pin = "github_api_timeout_seconds = 30"
+        declared = base.replace(
+            pin,
+            f"{pin}\ncurrent_job_attempt_timeout_seconds = 150"
+            "\ncurrent_job_lifecycle_budget_seconds = 450",
+            1,
+        )
+        attempt_key = "TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"
+        budget_key = "TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS"
+        with tempfile.TemporaryDirectory() as td:
+            for name, body, expected in (
+                ("declared", declared, ("150", "450")),
+                ("omitted", base, (None, None)),
+            ):
+                with self.subTest(name=name):
+                    config = Path(td) / f"{name}.toml"
+                    config.write_text(body)
+                    out = Path(td) / f"{name}-out"
+                    rendered = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "render", str(config),
+                         "--output", str(out)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(rendered.returncode, 0, rendered.stderr)
+                    plists = [
+                        plistlib.loads(path.read_bytes())
+                        for path in out.glob("*.plist")
+                    ]
+                    self.assertTrue(plists, "render produced no lane plists")
+                    self.assertEqual(
+                        {
+                            (
+                                value["EnvironmentVariables"].get(attempt_key),
+                                value["EnvironmentVariables"].get(budget_key),
+                            )
+                            for value in plists
+                        },
+                        {expected},
+                    )
+        # An omitted key leaves the provider default in force, so the default is
+        # the value an unpinned host actually observes with.
+        runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
+        self.assertIn(f"${{{attempt_key}-120}}", runner)
+        self.assertIn(f"${{{budget_key}-360}}", runner)
+
     def test_assignment_scan_workers_are_bounded_and_v2_only(self) -> None:
         base = CONFIG.read_text()
         fixtures = {
@@ -2324,6 +2418,104 @@ class ServingBlockedTests(unittest.TestCase):
             blocked_serving_seconds=300, blocked_serving_streak=2,
         )
         self.assertTrue(self._blocked(value))
+
+
+class ExecutedGenerationTests(unittest.TestCase):
+    """The installed generation must be the one a LaunchAgent actually runs."""
+
+    LANE = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate.plist"
+    COMMIT = "b" * 40
+    MANIFEST = "c" * 64
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.agents = self.root / "LaunchAgents"
+        self.agents.mkdir()
+        self.generation = self.root / f"generations/{self.COMMIT}-{self.MANIFEST[:16]}"
+        self.generation.mkdir(parents=True)
+        self.launch = self.generation / support_manifest.LAUNCH_NAME
+        self.launch.write_text("#!/bin/bash\nexit 0\n")
+        self.launch.chmod(0o555)
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_plist(self, arguments: list[str]) -> None:
+        (self.agents / self.LANE).write_bytes(plistlib.dumps({
+            "Label": self.LANE.removesuffix(".plist"),
+            "ProgramArguments": arguments,
+            "RunAtLoad": True,
+        }, sort_keys=False))
+
+    def seal_bundle(self, *, commit: str, manifest_sha256: str) -> Path:
+        """Materialize a launcher bundle around a frozen copy of some cohort."""
+        bundle = self.root / "libexec/TartCILauncher.app"
+        executable = bundle / "Contents/MacOS/tartci-launcher"
+        executable.parent.mkdir(parents=True)
+        executable.write_text("#!/bin/bash\nexit 0\n")
+        executable.chmod(0o755)
+        sealed = bundle / fleet.SEALED_SUPPORT
+        sealed.mkdir(parents=True)
+        sealed_launch = sealed / support_manifest.LAUNCH_NAME
+        sealed_launch.write_text("#!/bin/bash\nexit 0\n")
+        sealed_launch.chmod(0o555)
+        (bundle / fleet.SEALED_METADATA).write_text(json.dumps({
+            "schema": 1,
+            "source_commit": commit,
+            "support_manifest_sha256": manifest_sha256,
+            "profile_policy_sha256": "d" * 64,
+            "tart_home": "/Volumes/Workshop/VMs",
+        }, sort_keys=True))
+        self.write_plist([str(executable), "--lane", "studio-pulp-gate"])
+        return sealed_launch
+
+    def assert_executed(self) -> dict:
+        return fleet.assert_executed_generation(
+            self.agents, [self.LANE],
+            launch_entrypoint=self.launch,
+            source_commit=self.COMMIT,
+            manifest_sha256=self.MANIFEST,
+        )
+
+    def test_sealed_launcher_around_a_stale_cohort_fails_the_install(self) -> None:
+        sealed_launch = self.seal_bundle(commit="a" * 40, manifest_sha256="e" * 64)
+        with self.assertRaises(ValueError) as caught:
+            self.assert_executed()
+        message = str(caught.exception)
+        self.assertIn("install_ineffective", message)
+        self.assertIn(str(sealed_launch), message)
+        self.assertIn(str(self.launch.resolve()), message)
+        self.assertIn(f"{'a' * 40}/{'e' * 64}", message)
+        self.assertIn(f"{self.COMMIT}/{self.MANIFEST}", message)
+
+    def test_sealed_launcher_around_the_installed_cohort_succeeds(self) -> None:
+        sealed_launch = self.seal_bundle(
+            commit=self.COMMIT, manifest_sha256=self.MANIFEST
+        )
+        self.assertEqual(self.assert_executed(), {self.LANE: {
+            "kind": "sealed-bundle", "executes": str(sealed_launch),
+        }})
+
+    def test_launch_agent_running_the_generation_directly_succeeds(self) -> None:
+        self.write_plist(["/bin/bash", str(self.launch), "serve", "macos", "--loop"])
+        self.assertEqual(self.assert_executed(), {self.LANE: {
+            "kind": "generation", "executes": str(self.launch.resolve()),
+        }})
+
+    def test_launch_agent_running_a_foreign_program_fails_the_install(self) -> None:
+        self.write_plist(["/usr/bin/true", "--lane", "studio-pulp-gate"])
+        with self.assertRaisesRegex(ValueError, "install_ineffective"):
+            self.assert_executed()
+
+    def test_sealed_cohort_without_a_launch_entrypoint_fails_the_install(self) -> None:
+        sealed_launch = self.seal_bundle(
+            commit=self.COMMIT, manifest_sha256=self.MANIFEST
+        )
+        sealed_launch.chmod(0o755)
+        sealed_launch.unlink()
+        with self.assertRaisesRegex(ValueError, "no launch entrypoint"):
+            self.assert_executed()
 
 
 class ShippedProfileGitHubTimeoutTests(unittest.TestCase):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -37,6 +38,29 @@ from typing import Any, Callable
 AUTHENTICATED_RATE_LIMIT = {
     "resources": {"core": {"limit": 15000, "remaining": 14999, "reset": 1}}
 }
+
+
+# These cases build the scanner in this process, so its preflight would
+# otherwise read and write $HOME/.tartci/state/gh-identity.json -- the live
+# receipt of whatever machine runs the suite. A zero TTL disables the receipt
+# in both directions, so no case here can leave one behind and none can be
+# satisfied by one another case left. That is what keeps a call count a
+# property of the scan rather than of the order the suite happened to run in.
+_RECEIPT_TTL_ENV = "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS"
+_saved_receipt_ttl: str | None = None
+
+
+def setUpModule() -> None:
+    global _saved_receipt_ttl
+    _saved_receipt_ttl = os.environ.get(_RECEIPT_TTL_ENV)
+    os.environ[_RECEIPT_TTL_ENV] = "0"
+
+
+def tearDownModule() -> None:
+    if _saved_receipt_ttl is None:
+        os.environ.pop(_RECEIPT_TTL_ENV, None)
+    else:
+        os.environ[_RECEIPT_TTL_ENV] = _saved_receipt_ttl
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"

@@ -65,7 +65,7 @@ tartci_assignment_v2_tier_labels(){
 # the true magnitude instead; only reporting needs it, and it costs a full scan.
 tartci_assignment_v2_tier_demand(){
   local tier_label="$1" exhaustive="${2:-0}" workflow tier_args=() selected_labels
-  local error_file detail rc count_args=()
+  local error_file detail rc count_args=() evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
   # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
   # variable under `set -u`, so the expansion must be guarded, not just quoted.
@@ -89,7 +89,14 @@ tartci_assignment_v2_tier_demand(){
     rc=$?
   fi
   if [ "$rc" -ne 0 ]; then
-    detail="$(tail -n 1 "$error_file" | cut -c1-512)"
+    # Keep BOTH ends: a wrapper prints the underlying cause BEFORE its own
+    # summary, so any tail-only rule discards the line that identifies the real
+    # fault and keeps the one that misattributes it. The head/tail budget is
+    # sized so the 512-byte event field cannot chop the summary back off.
+    # Publish the same text for the supervisor's blind path to report.
+    detail="$(scan_diagnostic_digest "$error_file" 2 2 110 | tr '\n' '|' \
+      | sed 's/|$//' | cut -c1-512)"
+    record_scan_error "$detail"
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
     if [ "$exhaustive" != 1 ] \
@@ -98,6 +105,16 @@ tartci_assignment_v2_tier_demand(){
       return 0
     fi
   fi
+  # The scanner's stderr is captured so it cannot pollute the demand count on
+  # stdout, and then deleted. Evidence written there is therefore invisible
+  # unless it is lifted out here: on the SUCCESS path the file is discarded
+  # entirely, which is exactly the path a stale run is detected on. Promote each
+  # stale-demand line to a typed event before the file goes away.
+  while IFS= read -r evidence; do
+    [ -n "$evidence" ] || continue
+    event assignment_stale_demand \
+      "tier=$tier_label detail=$(printf '%s' "$evidence" | cut -c1-512)"
+  done < <(grep '^stale-demand: ' "$error_file" 2>/dev/null | sed 's/^stale-demand: //')
   rm -f "$error_file"
   return "$rc"
 }

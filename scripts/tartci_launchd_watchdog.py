@@ -94,6 +94,29 @@ DEFAULT_STALE_LOG_S = 1800  # 30 min
 # If launchd does not respawn it, that explicit restart contract has failed; do
 # not make a known-idle lane wait for the generic 30-minute crash-loop bound.
 DEFAULT_RESTART_GRACE_S = 60
+# Exit codes with which a tartci agent reports APPLICATION state: the program
+# ran to completion and is reporting a condition a reload cannot fix. Treating
+# those as the crash-loop signature boots out a working agent every hour and
+# buries the condition it was reporting. Everything NOT listed here stays on
+# the wedge path on purpose - 126/127 (not executable, not found) and
+# signal-derived exits are exactly the no-Full-Disk-Access wedge class.
+# Labels whose single run cannot be interrupted at an arbitrary point. A
+# bootout mid-run leaves state no later pass can classify: the reclaimer is
+# mid-rmtree, so the tree it was removing is left half-deleted. Membership is
+# declared rather than inferred from the plist carrying a StartInterval,
+# because every supervisor tick on this host is also an interval agent and
+# those ARE safe to cut - inferring it would silently retire the
+# alive-but-frozen heal for all of them, which is the watchdog's main job.
+UNINTERRUPTIBLE_AGENTS: frozenset[str] = frozenset({
+    "com.danielraffel.tartci.reclaim",
+})
+APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
+    "com.danielraffel.tartci.reclaim": {
+        2: "unusable scan root or bad arguments",
+        3: "free space still below the floor after reclaiming",
+        4: "process table unreadable, so no build directory could be proven idle",
+    },
+}
 # Rate limit: at most this many heals per label inside the window.
 DEFAULT_MAX_HEALS = 3
 DEFAULT_HEAL_WINDOW_S = 3600  # 1 hour
@@ -110,7 +133,10 @@ class AgentHealth(NamedTuple):
     state: str | None          # "running" | "spawn scheduled" | None (not loaded)
     last_exit_code: int | None
     log_age_s: float | None    # None when the log is missing
-    verdict: str               # "healthy" | "wedged" | "broken" | "unknown"
+    # "attention" is neither: the agent ran and reported a condition of its
+    # own. It is never healed (a reload would just repeat it) but it IS
+    # reported, and --status exits non-zero on it.
+    verdict: str               # "healthy" | "attention" | "wedged" | "broken" | "unknown"
     reason: str
 
 
@@ -328,6 +354,28 @@ def _log_path_from_plist(plist_path: str) -> str | None:
     return data.get("StandardOutPath") or data.get("StandardErrorPath")
 
 
+def _start_interval_from_plist(plist_path: str) -> int | None:
+    """The agent's own StartInterval in seconds, or None when it has no usable one.
+
+    An interval agent is SUPPOSED to be quiet between runs, so the shared
+    30-minute staleness bound calls an hourly agent frozen on every other pass.
+    The bound has to come from the plist rather than a second flag, because the
+    plist is what actually decides how often the log can be written.
+
+    None (not zero) for an absent, non-integer, or non-positive value: a zero
+    would collapse the staleness bound and make every agent read as wedged.
+    """
+    try:
+        with open(plist_path, "rb") as fh:
+            data = plistlib.load(fh)
+    except Exception:
+        return None
+    interval = data.get("StartInterval")
+    if isinstance(interval, bool) or not isinstance(interval, int):
+        return None
+    return interval if interval > 0 else None
+
+
 def _program_path_from_plist(plist_path: str) -> str | None:
     """Return the executable declared by a LaunchAgent, if one is explicit."""
     try:
@@ -513,9 +561,25 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         # the stale-log classifier below could bootout a healthy runner. This
         # watchdog owns only the fail-closed installation-presence audit for
         # these services; Actions runtime/job health stays with Shipyard.
+        #
+        # That delegation used to end here, as a bare sentence, and it was
+        # wrong for three months: this branch printed a checkmark over a
+        # service in a `spawn scheduled` crash loop with 3,684 launches and no
+        # `.runner` registration file, while Shipyard knew nothing about this
+        # host at all. Both halves passed their own check by pointing at the
+        # other.
+        #
+        # The rule now: a delegation may only pass when it names the ARTIFACT
+        # carrying the other side's verdict, and absence of that artifact is a
+        # fault. `tartci_host_attestation.py` writes it; Shipyard's landability
+        # preflight reads it and reports Unknown - never Served - when it is
+        # missing or stale. The verdict is still not computed here, because
+        # that is genuinely Shipyard's half; what changed is that the reader is
+        # told where to look and can tell absence from health.
         return AgentHealth(
             label, plist_path, log_path, state, last_exit, log_age, "healthy",
-            "declared runner executable exists; runtime health is owned by Shipyard",
+            "declared runner executable exists; runtime health is owned by Shipyard "
+            f"via {attestation_reference()}",
         )
     pool_runner = is_pool_runner(label)
     if pool_runner and service_enabled is False:
@@ -528,13 +592,43 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
             label, plist_path, log_path, state, last_exit, log_age, "unknown",
             "launchd enablement state unavailable; refusing automatic recovery",
         )
+    documented = APPLICATION_EXIT_CODES.get(label, {})
+    if last_exit is not None and last_exit in documented:
+        return AgentHealth(
+            label, plist_path, log_path, state, last_exit, log_age, "attention",
+            f"exited {last_exit}: {documented[last_exit]}. The agent ran and "
+            "reported this itself, so a reload would only repeat it",
+        )
+    # An interval agent is quiet by design between runs, so the shared bound
+    # would call an hourly agent frozen on every other pass. Two intervals is
+    # the smallest bound that survives one skipped run; never SHORTER than the
+    # shared bound, so a fast agent keeps the 30-minute floor.
+    interval_s = _start_interval_from_plist(plist_path)
+    effective_stale_s = stale_log_s
+    if interval_s is not None:
+        effective_stale_s = max(stale_log_s, 2 * interval_s)
     expected_loaded = pool_participating and pool_runner
     verdict, reason = classify(
-        state, last_exit, log_age, stale_log_s, vm_running, expected_loaded,
+        state, last_exit, log_age, effective_stale_s, vm_running, expected_loaded,
         restart_grace_s, vm_probe_reason
     )
     return AgentHealth(label, plist_path, log_path, state, last_exit,
                        log_age, verdict, reason)
+
+
+def attestation_reference() -> str:
+    """Name the artifact this watchdog delegates runtime health to.
+
+    Reports the path and, when the file is present, its age - so a reader of
+    this line can tell "delegated and the other side is looking" apart from
+    "delegated into the void", which is what the bare sentence could not say.
+    """
+    root = os.environ.get("TARTCI_HOME") or os.path.join(os.path.expanduser("~"), ".tartci")
+    path = os.path.join(root, "state", "host-attestation.json")
+    if not os.path.exists(path):
+        return f"{path} (MISSING - delegation is unverified)"
+    age = int(max(0.0, utcnow() - os.path.getmtime(path)))
+    return f"{path} ({age}s old)"
 
 
 def is_pool_runner(label: str) -> bool:
@@ -584,6 +678,11 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
         ["launchctl", "print", f"{dom}/{label}"]
     )
     if loaded_rc == 0:
+        state, _ = parse_launchctl_print(loaded_out)
+        if state == "running" and label in UNINTERRUPTIBLE_AGENTS:
+            # This agent's run cannot be cut anywhere. Refuse loudly and let
+            # the next interval start it cleanly.
+            return False
         exit_timeout = parse_launchctl_exit_timeout(loaded_out)
         if exit_timeout is None or exit_timeout == 0:
             # Zero is infinite; a missing value is likewise not a safe bound.
@@ -738,7 +837,8 @@ def main(argv: list[str] | None = None) -> int:
     if acted:
         save_heal_log(_state_file(), heal_log)
 
-    unhealthy = [r for r in results if r["verdict"] in {"wedged", "broken"}]
+    unhealthy = [r for r in results
+                 if r["verdict"] in {"wedged", "broken", "attention"}]
     if args.json:
         print(json.dumps({
             "ts": _iso(now),
@@ -758,7 +858,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"{_iso(now)} launchd-watchdog: no managed runner "
                   f"LaunchAgents found")
         for r in results:
-            mark = {"healthy": "✓", "wedged": "✗", "broken": "✗", "unknown": "?"}.get(
+            mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
+                    "broken": "✗", "unknown": "?"}.get(
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
             print(f"{_iso(now)}   {mark} {r['label']}: {r['reason']}{act}")

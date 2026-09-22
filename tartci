@@ -7,6 +7,9 @@
 #
 #   tartci doctor              # report host prereqs + stores + shipyard github-auth (always safe)
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
+#   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
+#                              # deploy/drain capability, dual-scope runner census
+#   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci status --json       # report host-local provider/profile state
 #   tartci host-profile [--json] # emit derived role/budget settings
 #   tartci host-profile --delivery [--json] # how code reaches each lane + staleness
@@ -125,6 +128,12 @@ cmd_doctor() {
   if [ "${1:-}" = "--reap" ]; then
     shift
     exec python3 "$HERE/scripts/vm_reap.py" "$@"
+  fi
+  # `doctor fleet` is the fleet-wide diagnosis; bare `doctor` stays the host
+  # prereq report, which must keep passing on hosts that run no fleet at all.
+  if [ "${1:-}" = "fleet" ]; then
+    shift
+    exec python3 "$HERE/scripts/fleet_doctor.py" "$@"
   fi
   echo "tartci doctor — host: $(uname -m) $(sw_vers -productName 2>/dev/null) $(sw_vers -productVersion 2>/dev/null)"
   echo "prereqs:"
@@ -287,6 +296,10 @@ cmd_runtime() {
   exec python3 "$HERE/scripts/runtime_measure.py" "$@"
 }
 
+cmd_reclaim() {
+  exec python3 "$HERE/scripts/disk_reclaim.py" "$@"
+}
+
 cmd_windows() {
   local sub="${1:-}"; shift || true
   case "$sub" in
@@ -375,19 +388,48 @@ cmd_launchd() {
   esac
 }
 
+# A drain or an immediate stop removes this host from every label it serves.
+# When no other host serves a required gate label, that takes the label to zero
+# runners and stalls every pull request waiting on it, so the mutation is
+# refused unless the caller names the consequence with --allow-last-serving-host.
+# An indeterminate answer — an unreachable runner scope, an unresolvable host
+# identity — refuses too: it cannot tell "another host is serving" apart from
+# "nobody is".
+tartci_pool_capacity_floor_preflight() {
+  local action="$1" allow="$2" output rc=0
+  local -a floor_args=(check --action "$action")
+  [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
+  output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  case "$rc" in
+    0)
+      [ -n "$output" ] && printf '%s\n' "$output"
+      return 0
+      ;;
+    127)
+      echo "pool $action refused: the capacity floor needs Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+      return 11
+      ;;
+    *)
+      printf '%s\n' "${output:-pool $action refused: the capacity floor failed without a typed cause}" >&2
+      return 11
+      ;;
+  esac
+}
+
 cmd_pool() {
   # host-level CI participation switch ("this machine, not now").
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
-  local arg
+  local arg allow_last_serving_host=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
+      --allow-last-serving-host) allow_last_serving_host=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
@@ -397,6 +439,7 @@ cmd_pool() {
       local target=1
       [ "$sub" = off ] && target=0
       if [ "$sub" = off ]; then
+        tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
         tartci_pool_write_state off
@@ -616,6 +659,7 @@ EOF
       echo "repaired orphaned pool transition lock"
       ;;
     drain)
+      tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
       tartci_pool_write_participation 0
@@ -794,10 +838,11 @@ SERVINGPY
   esac
 }
 
-usage() { sed -n '2,26p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
+  reclaim) shift; cmd_reclaim "$@" ;;
   status)  shift; cmd_status "$@" ;;
   host-profile) shift; cmd_host_profile "$@" ;;
   network-profile) shift; cmd_network_profile "$@" ;;

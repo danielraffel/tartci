@@ -28,6 +28,29 @@ AUTHENTICATED_RATE_LIMIT = {
 }
 
 
+# These cases build the scanner in this process, so its preflight would
+# otherwise read and write $HOME/.tartci/state/gh-identity.json -- the live
+# receipt of whatever machine runs the suite. A zero TTL disables the receipt
+# in both directions, so no case here can leave one behind and none can be
+# satisfied by one another case left. That is what keeps a call count a
+# property of the scan rather than of the order the suite happened to run in.
+_RECEIPT_TTL_ENV = "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS"
+_saved_receipt_ttl: str | None = None
+
+
+def setUpModule() -> None:
+    global _saved_receipt_ttl
+    _saved_receipt_ttl = os.environ.get(_RECEIPT_TTL_ENV)
+    os.environ[_RECEIPT_TTL_ENV] = "0"
+
+
+def tearDownModule() -> None:
+    if _saved_receipt_ttl is None:
+        os.environ.pop(_RECEIPT_TTL_ENV, None)
+    else:
+        os.environ[_RECEIPT_TTL_ENV] = _saved_receipt_ttl
+
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"
 SPEC = importlib.util.spec_from_file_location("queue_scan", MODULE_PATH)
@@ -1080,7 +1103,52 @@ print(json.dumps(payload))
             self.assertIn('scripts/queue_scan.py"', body, runner)
             self.assertIn("--shared-cache-file", body, runner)
             self.assertIn("TARTCI_SHARED_QUEUE_CACHE", body, runner)
-            self.assertIn("2>/dev/null || echo ERR", body, runner)
+            # The contract is that a FAILED scan becomes the `ERR` sentinel, so a
+            # failure is never misread as an empty queue. Whether stderr is
+            # discarded on the way is a separate question — and discarding it is
+            # a defect, not part of this contract (see the macOS test below).
+            self.assertIn("|| echo ERR", body, runner)
+
+    def test_macos_supervisor_keeps_the_scanner_diagnostic(self) -> None:
+        """A blind supervisor must be able to say WHY.
+
+        The scanner prints the reason on stderr and only a count on stdout, so
+        routing that stderr to /dev/null leaves the supervisor able to report
+        that it is blind but never what failed. That cost a multi-hour outage in
+        which every other signal — auth, quota, proxy, launchd state — read
+        healthy and the one line naming the fault had already been thrown away.
+        """
+        body = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("run_scan_capture", body)
+        # Every macOS scan call site routes through the capturing wrapper.
+        self.assertGreaterEqual(body.count("run_scan_capture "), 3)
+        self.assertNotIn("--match-labels 1 2>/dev/null", body)
+
+    def test_scan_diagnostic_keeps_both_ends_of_the_stream(self) -> None:
+        """Keeping a deeper tail is still last-line-wins.
+
+        A wrapper prints the cause first and its own summary last, so any
+        tail-only rule loses the cause as soon as the wrapper is more verbose
+        than the depth chosen — `tail -n 3` keeps a two-line wrapper's cause and
+        loses a four-line one's, and no caller can predict how chatty a wrapper
+        will be. Both ends must be kept, with the elision declared.
+        """
+        macos = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", macos)
+        self.assertIn("line(s) elided", macos)
+        # The diagnostic must never be captured by a tail-only rule again.
+        self.assertNotIn('tail -n 3 >"$SCAN_ERROR_FILE"', macos)
+        self.assertNotIn('tail -n 1 >"$SCAN_ERROR_FILE"', macos)
+
+        v2 = (RUNNERS[0].parent / "assignment-v2.lib.sh").read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", v2)
+        # Scoped to the scanner's own error file. A file-wide ban also catches
+        # unrelated readers of other streams -- the feed rescue summarises its
+        # own stderr the same way -- which makes this fail for a line it is not
+        # about, and the contract here is only that the scan diagnostic is never
+        # captured by a tail-only rule.
+        self.assertNotIn('tail -n 1 "$error_file"', v2)
+        self.assertNotIn('tail -n 3 "$error_file"', v2)
 
     def test_macos_supervisor_passes_opt_in_minimum_queue_age(self) -> None:
         body = RUNNERS[0].read_text(encoding="utf-8")

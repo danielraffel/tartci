@@ -78,7 +78,8 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 The new Mac is now governed, serving its lanes, and drainable exactly like the
 rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
 `pool off` unloads its agents immediately and remains an emergency/idle-only
-operation.
+operation. Both refuse when this host is the only one serving a required gate
+label; `--allow-last-serving-host` takes that label to zero deliberately.
 
 ---
 
@@ -108,10 +109,13 @@ check. Only after both checks are terminal-idle may you invoke `pool off`, which
 unloads LaunchAgents immediately rather than draining them:
 
 ```bash
-gh api repos/OWNER/REPO/actions/runners --paginate \
-  --jq '.runners[] | select(.name | contains("HOST_TAG")) | [.name,.status,.busy] | @tsv'
+# Both registration scopes. A repository listing omits organization-registered
+# runners silently, so a repository-only census reports a smaller fleet than
+# exists and its zero reads as "nothing here".
+scripts/runner_census.py --repo OWNER/REPO --label pulp-build-pr-head
 # Every runner for this host must report busy=false, and routing/admission for
-# the host must remain disabled for the duration of the migration.
+# the host must remain disabled for the duration of the migration. A census that
+# prints UNREACHABLE for a scope has not proven anything about that scope.
 
 pgrep -fl 'tart run'                      # must print no active VM process
 /opt/homebrew/bin/tart list --format json # every entry must report Running=false
@@ -1473,6 +1477,22 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   deadline; atomic replacement leaves either the preceding complete receipt or
   the new complete receipt if that deadline fires.
   TartCI does not delete user work in response to this receipt.
+
+  A denial is a symptom, and nothing in the lease path fixes its cause. The
+  `com.danielraffel.tartci.reclaim` LaunchAgent
+  (`launchd/com.danielraffel.tartci.reclaim.plist.template`) is what keeps a
+  host from reaching the denial at all: hourly, it removes regenerable build
+  directories that are idle past an age gate, and exits non-zero when the host
+  is still below `TARTCI_RECLAIM_FAIL_BELOW_GB` afterwards so a full disk
+  surfaces as a failing agent rather than only as refused leases. Preview a host
+  with `tartci reclaim` (dry run) before installing it; see
+  `launchd/README.md`. Ask `tartci status` whether this host actually has that
+  agent, whether launchd holds it, and how much room is left on each volume it
+  scans: a host that never got the agent looks exactly like a host whose passes
+  are all finding nothing, and that is how m3 ran a stale generation while m1
+  and m5 carried no reap agent at all. This does not contradict the line above: the reclaimer
+  deletes generated build output that carries no source marker, never a
+  checkout.
 
   Defaults retain `TARTCI_VM_DISK_FREE_FLOOR_GB=25` after all reservations and
   charge `TARTCI_VM_DISK_GROWTH_GB=24` per VM. The 24 GiB value deliberately

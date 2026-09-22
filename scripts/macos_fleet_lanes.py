@@ -21,6 +21,7 @@ import sys
 import tempfile
 import time
 import tomllib
+from collections.abc import Iterable
 from pathlib import Path, PurePosixPath
 
 import tartci_support_manifest as support_manifest
@@ -45,6 +46,8 @@ TOP_KEYS = {
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
     "github_api_timeout_seconds", "persistent_runner_labels",
+    "current_job_attempt_timeout_seconds",
+    "current_job_lifecycle_budget_seconds",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -52,6 +55,9 @@ STACKED_IMAGE_KEYS = {
     "registry_username_file", "registry_token_file", "flat_rollback",
 }
 LAUNCH_HELPER_KEYS = {"path", "approval_sha256_path", "identifier", "team_id"}
+# A signed launcher bundle execs its own frozen copy of the support cohort.
+SEALED_SUPPORT = "Contents/Resources/support"
+SEALED_METADATA = "Contents/Resources/bundle.json"
 WORKTREE_CLEANUP_KEYS = {
     "provider", "repo", "primary", "prefix", "main_ref",
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
@@ -187,6 +193,33 @@ def load(path: Path) -> dict:
             type(github_api_timeout) is not int
             or not 5 <= github_api_timeout <= 60):
         fail("host.github_api_timeout_seconds must be an integer from 5 through 60")
+    attempt_timeout = host.get("current_job_attempt_timeout_seconds")
+    if attempt_timeout is not None and (
+            type(attempt_timeout) is not int
+            or not 30 <= attempt_timeout <= 600):
+        fail(
+            "host.current_job_attempt_timeout_seconds must be an integer "
+            "from 30 through 600"
+        )
+    lifecycle_budget = host.get("current_job_lifecycle_budget_seconds")
+    if lifecycle_budget is not None and (
+            type(lifecycle_budget) is not int
+            or not 60 <= lifecycle_budget <= 1800):
+        fail(
+            "host.current_job_lifecycle_budget_seconds must be an integer "
+            "from 60 through 1800"
+        )
+    # An attempt is lowered to whatever the lifecycle budget has left, so a
+    # budget below the attempt silently shortens every observation.
+    if (
+        attempt_timeout is not None
+        and lifecycle_budget is not None
+        and lifecycle_budget < attempt_timeout
+    ):
+        fail(
+            "host.current_job_lifecycle_budget_seconds must be at least "
+            "host.current_job_attempt_timeout_seconds"
+        )
     persistent_labels = host.get("persistent_runner_labels", [])
     if (
         not isinstance(persistent_labels, list)
@@ -660,6 +693,109 @@ def persistent_plist_records(data: dict, agents_dir: Path) -> dict[str, dict]:
     return records
 
 
+def _sealed_bundle_root(program: Path) -> Path | None:
+    """Return the app bundle whose sealed cohort `program` would execute."""
+    parents = program.parents
+    if len(parents) < 3:
+        return None
+    bundle = parents[2]
+    if parents[0].name != "MacOS" or parents[1].name != "Contents":
+        return None
+    return bundle if bundle.suffix == ".app" else None
+
+
+def assert_executed_generation(
+    agents_dir: Path,
+    names: Iterable[str],
+    *,
+    launch_entrypoint: Path,
+    source_commit: str,
+    manifest_sha256: str,
+) -> dict[str, dict]:
+    """Prove every installed LaunchAgent executes the support generation it records.
+
+    Staging a generation no LaunchAgent can reach is a no-op that still writes a
+    receipt, so the evidence is the exec path in the installed plist's
+    ProgramArguments rather than any exit code. A signed launcher bundle execs
+    its own sealed copy of the cohort, and that copy counts as the generation
+    only while it carries the exact installed commit and manifest digest; a
+    bundle sealed around an older cohort keeps running the older code no matter
+    what a newer generation put on disk.
+    """
+    launch_entrypoint = launch_entrypoint.resolve()
+    records: dict[str, dict] = {}
+    for name in sorted(names):
+        installed = agents_dir / name
+        if installed.is_symlink() or not installed.is_file():
+            fail(f"install_ineffective: fleet LaunchAgent is unavailable: {installed}")
+        try:
+            value = plistlib.loads(installed.read_bytes())
+        except (plistlib.InvalidFileException, ValueError) as exc:
+            fail(f"install_ineffective: fleet LaunchAgent is malformed: {installed}: {exc}")
+        arguments = value.get("ProgramArguments")
+        if (not isinstance(arguments, list) or not arguments
+                or not all(isinstance(argument, str) for argument in arguments)):
+            fail(
+                "install_ineffective: fleet LaunchAgent declares no executable "
+                f"program: {installed}"
+            )
+        if any(
+            argument == str(launch_entrypoint)
+            or (argument.startswith("/") and Path(argument).resolve() == launch_entrypoint)
+            for argument in arguments
+        ):
+            records[name] = {
+                "kind": "generation", "executes": str(launch_entrypoint),
+            }
+            continue
+        program = Path(arguments[0])
+        bundle = _sealed_bundle_root(program)
+        if bundle is None:
+            fail(
+                f"install_ineffective: launcher execs {program} which is not the "
+                f"installed generation {launch_entrypoint} ({name})"
+            )
+        sealed_launch = bundle / SEALED_SUPPORT / support_manifest.LAUNCH_NAME
+        if sealed_launch.is_symlink() or not sealed_launch.is_file():
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: the sealed cohort "
+                f"has no launch entrypoint ({name})"
+            )
+        try:
+            metadata = json.loads((bundle / SEALED_METADATA).read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"metadata is unreadable: {exc} ({name})"
+            )
+        if not isinstance(metadata, dict):
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"metadata is malformed ({name})"
+            )
+        sealed_commit = str(metadata.get("source_commit", "")) or "<missing>"
+        sealed_manifest = str(metadata.get("support_manifest_sha256", "")) or "<missing>"
+        if sealed_commit != source_commit or sealed_manifest != manifest_sha256:
+            fail(
+                f"install_ineffective: launcher execs {sealed_launch} which is not "
+                f"the installed generation {launch_entrypoint}: sealed cohort "
+                f"{sealed_commit}/{sealed_manifest} is not installed cohort "
+                f"{source_commit}/{manifest_sha256} ({name})"
+            )
+        records[name] = {
+            "kind": "sealed-bundle", "executes": str(sealed_launch),
+        }
+    if not records:
+        fail(
+            "install_ineffective: no fleet LaunchAgent executes the installed "
+            f"generation {launch_entrypoint}"
+        )
+    return records
+
+
 def write_receipt(
     config: Path,
     agents_dir: Path,
@@ -723,6 +859,13 @@ def write_receipt(
             source_commit=source_authority_commit,
         )
     persistent_records = persistent_plist_records(data, agents_dir)
+    manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=support["source_commit"],
+        manifest_sha256=manifest_sha256,
+    )
     receipt = {
         "schema": 4 if persistent_records else 3,
         "profile": data.get("name", config.stem),
@@ -736,7 +879,7 @@ def write_receipt(
         "support": {
             "root": str(support_root),
             "manifest_path": str(manifest_path),
-            "manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "manifest_sha256": manifest_sha256,
             "repository": support["repository"],
             "source_commit": support["source_commit"],
             "members": support["members"],
@@ -874,6 +1017,12 @@ def verify_receipt(
     for label in expected_retired:
         if (agents_dir / f"{label}.plist").exists():
             fail(f"declared legacy LaunchAgent became installable again: {label}")
+    assert_executed_generation(
+        agents_dir, expected,
+        launch_entrypoint=launch_entrypoint,
+        source_commit=verified_support["source_commit"],
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    )
     return receipt
 
 
@@ -1613,6 +1762,14 @@ def lane_plist(
         })
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "current_job_attempt_timeout_seconds" in host:
+        env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
+            host["current_job_attempt_timeout_seconds"]
+        )
+    if "current_job_lifecycle_budget_seconds" in host:
+        env["TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS"] = str(
+            host["current_job_lifecycle_budget_seconds"]
+        )
     # An omitted priority delegates to the provider's exact-label policy.
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:

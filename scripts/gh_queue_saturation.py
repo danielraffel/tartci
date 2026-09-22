@@ -54,6 +54,10 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import runner_census  # noqa: E402 — resolved from this script's directory
+
 
 # ── pure decision core (unit-tested; no I/O) ─────────────────────────────────
 
@@ -66,6 +70,7 @@ class Verdict:
     queued_count: int
     idle_runners: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
+    capacity_unknown: bool = False
 
     def as_dict(self) -> dict:
         return {
@@ -76,6 +81,7 @@ class Verdict:
             "queued_count": self.queued_count,
             "idle_runners": self.idle_runners,
             "reasons": self.reasons,
+            "capacity_unknown": self.capacity_unknown,
         }
 
 
@@ -87,6 +93,7 @@ def classify_saturation(
     queue_trip: int,
     grace_secs: int,
     required_labels: set[str],
+    census_complete: bool = True,
 ) -> Verdict:
     """Decide whether the repo is in GitHub-hosted queue starvation.
 
@@ -96,6 +103,10 @@ def classify_saturation(
     required_labels     labels a runner must ALL carry to count as required-gate
                         capacity (e.g. {"self-hosted","macOS"}); empty set means
                         "any self-hosted runner counts".
+    census_complete     whether every runner registration scope was read. A
+                        partial census that found no idle runner has not shown
+                        there is none, so the verdict reports the capacity leg
+                        as unknown instead of concluding it.
 
     Saturation == all three legs of the triad. Any single leg alone is a normal,
     benign state (a deep queue with busy runners is just load; idle runners with
@@ -117,6 +128,7 @@ def classify_saturation(
 
     stuck = any(age >= grace_secs for age in pending_check_ages)
 
+    capacity_unknown = not idle_capacity and not census_complete
     saturated = queue_high and idle_capacity and stuck
 
     reasons: list[str] = []
@@ -130,7 +142,13 @@ def classify_saturation(
     else:
         if not queue_high:
             reasons.append(f"queue shallow ({queued_count} < {queue_trip})")
-        if not idle_capacity:
+        if capacity_unknown:
+            reasons.append(
+                "idle required-gate capacity is UNKNOWN: a runner registration "
+                "scope could not be read, so an unseen idle runner is "
+                "indistinguishable from none"
+            )
+        elif not idle_capacity:
             reasons.append("no idle required-gate runner (busy/offline → runner-health's job, not this)")
         if not stuck:
             reasons.append(f"no required check pending >= {grace_secs}s")
@@ -143,6 +161,7 @@ def classify_saturation(
         queued_count=queued_count,
         idle_runners=idle,
         reasons=reasons,
+        capacity_unknown=capacity_unknown,
     )
 
 
@@ -184,12 +203,17 @@ def _iso_age_secs(iso: str, now_epoch: float) -> int:
     return max(0, int(now_epoch - t.timestamp()))
 
 
-def gather(repo: str, *, now_epoch: float | None = None) -> tuple[int, list[dict], list[int]]:
-    """Collect the three inputs from the GitHub API via `gh`.
+def gather(
+    repo: str, *, now_epoch: float | None = None
+) -> tuple[int, list[dict], list[int], bool]:
+    """Collect the inputs from the GitHub API via the configured App wrapper.
 
-    Returns (queued_count, runners, ages). `ages` is the wait time of the oldest
-    still-`queued` workflow run — a robust proxy for "the required check is stuck
-    pending" that needs no per-check bookkeeping. Empty when the queue is empty.
+    Returns (queued_count, runners, ages, census_complete). `ages` is the wait
+    time of the oldest still-`queued` workflow run — a robust proxy for "the
+    required check is stuck pending" that needs no per-check bookkeeping. Empty
+    when the queue is empty. `census_complete` is false when a runner
+    registration scope could not be read, which makes an empty runner list
+    unproven rather than true.
     """
     import time as _time
 
@@ -199,22 +223,30 @@ def gather(repo: str, *, now_epoch: float | None = None) -> tuple[int, list[dict
     queued_count = int(queued.get("total_count", 0)) if isinstance(queued, dict) else 0
     runs = queued.get("workflow_runs", []) if isinstance(queued, dict) else []
 
-    runners_resp = _gh_json(["api", f"repos/{repo}/actions/runners?per_page=100"])
-    runners = []
-    for r in (runners_resp.get("runners", []) if isinstance(runners_resp, dict) else []):
-        runners.append({
-            "name": r.get("name"),
-            "status": r.get("status"),
-            "busy": r.get("busy"),
-            "labels": [l.get("name") for l in (r.get("labels") or [])],
-        })
+    # Organization-registered runners serve this repository and are absent from
+    # the repository listing, so the capacity leg reads both scopes.
+    # `_gh_json` supplies the wrapper itself, so the fetcher's argv arrives with
+    # the CLI already at the front and is handed on without it.
+    census = runner_census.collect(
+        repo,
+        runner_census.cli_fetcher(_gh(), run_json=lambda argv: _gh_json(argv[1:])),
+    )
+    runners = [
+        {
+            "name": record.name,
+            "status": record.status,
+            "busy": record.busy,
+            "labels": list(record.labels),
+        }
+        for record in census.runners
+    ]
 
     ages: list[int] = []
     if runs:
         oldest = min((str(run.get("created_at") or "") for run in runs if run.get("created_at")), default="")
         if oldest:
             ages.append(_iso_age_secs(oldest, now))
-    return queued_count, runners, ages
+    return queued_count, runners, ages, census.complete
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -233,10 +265,11 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     required = {s for s in (x.strip() for x in args.required_labels.split(",")) if s}
-    queued_count, runners, ages = gather(args.repo)
+    queued_count, runners, ages, census_complete = gather(args.repo)
     v = classify_saturation(
         queued_count, runners, ages,
         queue_trip=args.queue_trip, grace_secs=args.grace_secs, required_labels=required,
+        census_complete=census_complete,
     )
 
     if args.json:
