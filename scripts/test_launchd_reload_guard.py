@@ -42,6 +42,8 @@ PS_TREE = textwrap.dedent("""\
       201   200 sleep 20
       300     1 /Users/x/actions-runner/bin/Runner.Listener run
       301   300 /Users/x/actions-runner/bin/Runner.Worker spawnclient 1 2
+      400     1 /bin/bash /Users/x/tartci/providers/qemu-windows/runner.sh --loop
+      401   400 /opt/homebrew/bin/qemu-system-aarch64 -M virt -accel hvf -drive file=w.qcow2
     """)
 
 
@@ -153,6 +155,19 @@ class LaneBusyProbeTests(unittest.TestCase):
             host.loaded(label, 300)
             (row,) = self._probe(host, label)
             self.assertEqual((row.state, row.worker_kind), (lane_busy.BUSY, "Runner.Worker"))
+
+    def test_qemu_windows_vm_descendant_is_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakeHost(Path(td))
+            label = "com.danielraffel.pulp.qemu-runner-windows"
+            host.loaded(label, 400)
+            host.loaded(SIBLING, 200)
+            busy, idle = self._probe(host, label, SIBLING)
+            self.assertEqual((busy.state, busy.worker_kind, busy.worker_pid),
+                             (lane_busy.BUSY, "qemu-system", 401))
+            self.assertEqual(idle.state, lane_busy.IDLE)
+            table = {1: (0, "sup"), 2: (1, "qemu-img convert a b"), 3: (1, "grep qemu-system")}
+            self.assertIsNone(lane_busy.find_worker(1, table))
 
     def test_absent_is_absent_and_other_print_errors_are_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as td:

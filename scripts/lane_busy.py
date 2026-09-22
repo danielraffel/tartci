@@ -6,6 +6,7 @@ persistent `actions.runner.*` service) is mid-job exactly when the process
 launchd started for it has a live descendant doing the work:
 
   * `tart run ...`   the lane's VM, where an ephemeral runner executes a job
+  * `qemu-system-*`  the Windows lane's VM (QEMU on the host)
   * `Runner.Worker`  a persistent Actions runner executing a job on the host
 
 Stopping the supervisor (`launchctl bootout`, `kickstart -k`, `tartci pool off`)
@@ -46,6 +47,8 @@ UNKNOWN = "unknown"
 WORK_PATTERNS = (
     ("tart run", re.compile(r"(?:^|[\s/])tart\s+run(?:\s|$)")),
     ("Runner.Worker", re.compile(r"(?:^|[\s/])Runner\.Worker(?:\s|$)")),
+    # The Windows lane boots its VM directly on the host (qemu-windows/runner.sh).
+    ("qemu-system", re.compile(r"(?:^|[\s/])qemu-system-[A-Za-z0-9_]+(?:\s|$)")),
 )
 _PID_LINE = re.compile(r"^\s*pid = (\d+)\s*$", re.M)
 
