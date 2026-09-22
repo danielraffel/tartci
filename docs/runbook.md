@@ -915,7 +915,16 @@ installed cohort and activates only services named by that receipt, then
 compares launchd's in-memory arguments and governed environment against the
 receipt before opening admission. Unreceipted persistent or legacy runner
 services require their own explicit install/activation authority; this fleet
-transaction will not start them incidentally. The composed readback is published as
+transaction will not start them incidentally — and, for the same reason, will
+not stop them. `tartci pool off` and `tartci pool drain` act on exactly the set
+`pool on` can bring back, and print every runner agent they deliberately left
+alone; `tartci pool status` marks the same distinction per runner (`pool_owned`
+in `--json`). An operation that stops more than its inverse starts is not a
+pause, it is a deletion: the unscoped version booted out and `launchctl
+disable`d a foreign repository's persistent Actions runner that no `pool on`
+would restore, twice taking the sole server of a required check offline with
+the plist still sitting on disk. Stopping an unreceipted runner is a deliberate
+act performed under its own authority. The composed readback is published as
 `~/.config/tartci/macos-fleet-loaded.json`. Missing helpers, unreceipted runtime
 files, symlinks, mixed generations, stale loaded arguments, or obsolete loaded
 environment fail closed. The prior wrapper/generation remains available for
