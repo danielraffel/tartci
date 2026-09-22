@@ -38,6 +38,8 @@
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
 #                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
 #                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
+#   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
+#   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
 # Stores (override via env): TARTCI_HOME (default ~/.tartci) holds goldens/,
@@ -359,6 +361,9 @@ cmd_launchd() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     reload) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --reload "$@" ;;
+    # PreToolUse classifier for agent shells: exit 2 blocks a raw launchctl
+    # mutation of a lane (see scripts/launchctl_guard.py, `tartci hooks print`).
+    guard) exec python3 "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
       # Reboot/offline rejoin convergence includes the optional per-host relay
@@ -386,7 +391,51 @@ cmd_launchd() {
       fi
       exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" "$@"
       ;;
-    *) echo "usage: tartci launchd <reload <label> | status | heal> [--dry-run] [--json]"; return 2 ;;
+    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
+  esac
+}
+
+# Print (never write) the agent-harness hook settings that route every shell
+# command through `tartci launchd guard`. Installing them is the operator's
+# call: the snippet goes into ~/.claude/settings.json or a repo's
+# .codex/hooks.json by hand.
+cmd_hooks() {
+  local sub="${1:-print}"
+  case "$sub" in
+    print)
+      local shim="$HERE/hooks/claude-pretooluse-launchctl.sh"
+      cat <<JSON
+# Claude Code: merge into ~/.claude/settings.json (or .claude/settings.json)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$shim", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+
+# Codex: merge into .codex/hooks.json (same PreToolUse contract: JSON on stdin,
+# exit 2 blocks with stderr as the reason)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$shim", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+JSON
+      ;;
+    *) echo "usage: tartci hooks print"; return 2 ;;
   esac
 }
 
@@ -858,7 +907,7 @@ SERVINGPY
   esac
 }
 
-usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
@@ -885,6 +934,7 @@ case "${1:-help}" in
   serve)   shift; cmd_serve "$@" ;;
   pool)    shift; cmd_pool "$@" ;;
   launchd) shift; cmd_launchd "$@" ;;
+  hooks)   shift; cmd_hooks "$@" ;;
   help|-h|--help) usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 2 ;;
 esac

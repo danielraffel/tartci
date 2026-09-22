@@ -1416,6 +1416,33 @@ the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) 
 anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
 host-wide "no VM running" gate.
 
+### Keep agents off raw `launchctl` (`tartci launchd guard`)
+
+The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane
+supervisor: no tartci code was on that path, so no tartci refusal could fire.
+The choke point is the agent harness's PreToolUse hook. `tartci launchd guard
+--hook` reads the hook's JSON on stdin and exits 2 (blocking the tool call,
+with the reason on stderr) when a shell command would run `launchctl`
+`kickstart|bootout|unload|remove|kill|disable|stop` against a tartci lane
+(`com.danielraffel.tartci.*`, the legacy `com.danielraffel.{pulp,forge,vellum}
+.tart-runner*` / `pulp.qemu-runner*` supervisors) or an `actions.runner.*`
+service. It sees through `&&`, `;`, `|`, newlines, `bash|sh|zsh -c '…'`,
+`eval`, `$(…)`, `env`/`sudo`/`nohup` prefixes, `launchctl asuser`, `ssh host
+'…'`, `/bin/launchctl`, and `gui/<uid>/<label>`, `user/<uid>/<label>`, plist
+paths or bare labels. A target it cannot resolve statically (a loop variable,
+a glob, labels piped into `xargs`, `bootout gui/<uid>` of the whole domain)
+is blocked too. Read-only verbs (`print`, `list`, `print-disabled`) and
+services outside those families pass silently. The explicit, auditable escape
+hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
+(allowed with a warning). Malformed hook input exits 0 with a note so a broken
+hook never breaks the agent's shell.
+
+`tartci hooks print` prints (never writes) the settings snippet for Claude
+Code (`~/.claude/settings.json`, PreToolUse matcher `Bash`) and for Codex
+(`.codex/hooks.json`), both pointing at `hooks/claude-pretooluse-launchctl.sh`,
+a shim that resolves `tartci` relative to itself. Merge it by hand. Try a
+command without a hook: `tartci launchd guard --command '<cmd>'; echo $?`.
+
 ### Emulation note
 
 Pool jobs build whatever arch the **workflow** targets. The emulated **x86_64**
