@@ -230,6 +230,12 @@ only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
 While pool participation is off, reconciliation loads and proves only the
 relay, writes controller intent to disk, and records it as staged; it never
 starts a disabled controller. `pool on` then bootstraps those exact files.
+A pool transition stops only the services its receipt can restore, so on a
+receipted host an unreceipted legacy controller stays loaded through `pool off`
+and staging refuses with `pool-off controller is still loaded`, naming it.
+Stop that controller under its own authority (`launchctl bootout` its exact
+service target) rather than widening the pool transition, which would disable
+services nothing re-enables.
 
 ```sh
 python3 scripts/render_launchd_template.py \
