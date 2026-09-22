@@ -24,7 +24,7 @@ GITHUB_REPOSITORY = re.compile(
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$"
 )
 ROOT_FILES = {"tartci"}
-ROOT_DIRS = {"launchd", "native", "profiles", "providers", "scripts"}
+ROOT_DIRS = {"fleet", "launchd", "native", "profiles", "providers", "scripts"}
 MANIFEST_NAME = ".tartci-support-manifest.json"
 LAUNCH_NAME = ".tartci-launch"
 TRUSTED_REPOSITORY = "https://github.com/danielraffel/tartci.git"

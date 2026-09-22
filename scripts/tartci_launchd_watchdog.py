@@ -794,6 +794,77 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
     return RELOAD_OK if ok else RELOAD_FAILED
 
 
+# ── configuration drift (report only) ───────────────────────────────────────
+#
+# The heal pass runs on its own StartInterval, so it is the one place that
+# sees installed-vs-declared drift without anyone remembering to ask. It only
+# ever logs: acting on drift (a reload, a refusal) would turn a configuration
+# difference into an outage.
+
+DEFAULT_CONFIG_WARN_INTERVAL_S = 21600  # re-warn an unchanged verdict every 6h
+_TOML_PYTHONS = ("python3.12", "python3.11", "python3", "/opt/homebrew/bin/python3.12",
+                 "/opt/homebrew/bin/python3.11", "/opt/homebrew/bin/python3",
+                 "/usr/local/bin/python3")
+
+
+def _toml_python() -> str | None:
+    for candidate in _TOML_PYTHONS:
+        resolved = shutil.which(candidate) or (candidate if os.path.isfile(candidate) else None)
+        if resolved and subprocess.run([resolved, "-c", "import tomllib"],
+                                        capture_output=True).returncode == 0:
+            return resolved
+    return None
+
+
+def config_verdicts(config: str, receipt: str, support_root: str | None = None) -> dict:
+    """Profile-drift + supply verdicts from this support root. Never raises."""
+    if not os.path.isfile(config):
+        return {"profile_drift": {"state": "not_applicable"},
+                "supply": {"state": "not_applicable"}}
+    root = support_root or os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    unknown = lambda why: {"profile_drift": {"state": "unknown", "reason": why},  # noqa: E731
+                           "supply": {"state": "unknown", "reason": why}}
+    python = _toml_python()
+    if python is None:
+        return unknown("no Python 3.11+ interpreter with tomllib")
+    try:
+        proc = subprocess.run(
+            [python, os.path.join(root, "scripts", "macos_fleet_lanes.py"),
+             "config-verdicts", "--config", config, "--support-root", root,
+             "--receipt", receipt, "--json"],
+            capture_output=True, text=True, timeout=60)
+        value = json.loads(proc.stdout)
+        if not isinstance(value, dict):
+            raise ValueError("not an object")
+        return value
+    except Exception as exc:  # noqa: BLE001 - an unread verdict is unknown
+        return unknown(f"config check failed: {exc}")
+
+
+def config_problem(value: dict) -> str | None:
+    """One-line summary when anything is not ok, else None."""
+    parts = []
+    for key, good in (("profile_drift", "in_sync"), ("supply", "match")):
+        row = value.get(key) if isinstance(value.get(key), dict) else {}
+        state = row.get("state") or "unknown"
+        if state in (good, "not_applicable"):
+            continue
+        detail = row.get("keys") or row.get("mismatched") or ([row["reason"]] if row.get("reason") else [])
+        parts.append(f"{key}={state.upper()}" + (f" ({', '.join(detail)})" if detail else ""))
+    return "; ".join(parts) or None
+
+
+def should_warn_config(summary: str | None, state: dict, now: float,
+                       interval_s: int) -> bool:
+    if summary is None:
+        return False
+    return state.get("summary") != summary or now - float(state.get("warned_at", 0)) >= interval_s
+
+
+def _config_state_file() -> str:
+    return os.path.join(os.path.dirname(_state_file()), "launchd-watchdog-config.json")
+
+
 # ── rate limiting ────────────────────────────────────────────────────────────
 
 def _state_file() -> str:
@@ -858,6 +929,17 @@ def main(argv: list[str] | None = None) -> int:
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
                         "Library", "LaunchAgents"))
+    ap.add_argument("--fleet-config",
+                    default=os.path.join(
+                        os.environ.get("HOME", os.path.expanduser("~")),
+                        ".config", "tartci", "macos-fleet-profile.toml"),
+                    help="installed fleet profile checked for drift (report only)")
+    ap.add_argument("--fleet-receipt",
+                    default=os.path.join(
+                        os.environ.get("HOME", os.path.expanduser("~")),
+                        ".config", "tartci", "macos-fleet-install.json"))
+    ap.add_argument("--config-warn-interval-seconds", type=int,
+                    default=DEFAULT_CONFIG_WARN_INTERVAL_S)
     ap.add_argument("--participation-file",
                     default=os.path.join(
                         os.environ.get("HOME", os.path.expanduser("~")),
@@ -922,6 +1004,26 @@ def main(argv: list[str] | None = None) -> int:
 
     unhealthy = [r for r in results
                  if r["verdict"] in {"wedged", "broken", "attention"}]
+    config = config_verdicts(args.fleet_config, args.fleet_receipt)
+    config_summary = config_problem(config)
+    config["warned"] = False
+    if not args.status and not args.dry_run:
+        path = _config_state_file()
+        try:
+            with open(path) as fh:
+                warn_state = json.load(fh)
+        except Exception:
+            warn_state = {}
+        if should_warn_config(config_summary, warn_state if isinstance(warn_state, dict) else {},
+                              now, args.config_warn_interval_seconds):
+            config["warned"] = True
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path + ".tmp", "w") as fh:
+                    json.dump({"summary": config_summary, "warned_at": now}, fh)
+                os.replace(path + ".tmp", path)
+            except OSError:
+                pass
     if args.json:
         print(json.dumps({
             "ts": _iso(now),
@@ -935,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
                 "tart_home": vm_probe.tart_home,
             },
             "agents": results,
+            "config": config,
         }, indent=2))
     else:
         if not results:
@@ -946,6 +1049,10 @@ def main(argv: list[str] | None = None) -> int:
                 r["verdict"], "?")
             act = f" [{r['action']}]" if "action" in r else ""
             print(f"{_iso(now)}   {mark} {r['label']}: {r['reason']}{act}")
+        if config["warned"] or (args.status and config_summary):
+            # Report only: the watchdog never acts on configuration drift.
+            print(f"{_iso(now)} launchd-watchdog: WARN config: {config_summary} "
+                  "(report only; see `tartci fleet-macos verify-supply` / `profile-drift`)")
     # Status reports unresolved wedges. Healing reports failure only when a
     # reload failed its postcondition; successful recovery exits zero.
     if args.status and unhealthy:

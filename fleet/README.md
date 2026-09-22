@@ -99,6 +99,19 @@ the file does not declare); unknown is never reported as a match.
 checks against `main` instead of the local checkout. `tartci doctor fleet`
 reports the same comparison as its `supply` finding, next to `profile_drift`.
 
+The installed layer also surfaces without anyone asking, report-only:
+`tartci pool status` (text and `--json` under `fleet.config`) prints
+`profile drift:` and `supply:` lines, where a missing or unreadable verdict is
+`UNKNOWN`, never ok; the launchd watchdog heal pass (every 300 s) logs a
+`WARN config:` line when either verdict is not ok, rate-limited to once per
+distinct verdict per 6 hours, and records it in its `--json` output; `pool on`
+and `pool on --plan` print both verdicts first. None of them refuses or acts:
+refusing on drift would turn a configuration difference into a capacity
+outage. `verify-supply` names the tartci commit the published file came from
+and the commit of the host's installed generation when they differ, so a lane
+change between the two is attributed rather than mistaken for drift. Each
+installed generation carries its own `fleet/advertised-labels.json`.
+
 **Observed:** `supply_observed.py` reads completed Actions jobs for one
 repository and attributes each self-hosted job to a declared registration by
 runner name (`<host_id>-<lane>[-slotN]-<NN>-<pid>-<boot>`, or a persistent
