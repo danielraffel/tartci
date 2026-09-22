@@ -78,8 +78,10 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 The new Mac is now governed, serving its lanes, and drainable exactly like the
 rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
 `pool off` unloads its agents immediately and remains an emergency/idle-only
-operation. Both refuse when this host is the only one serving a required gate
-label; `--allow-last-serving-host` takes that label to zero deliberately.
+operation: it refuses (exit 12) while an owned lane is mid-job or its state is
+unreadable, and `--now` is the explicit kill; `pool off --plan` shows what it
+would stop first. Both refuse when this host is the only one serving a required
+gate label; `--allow-last-serving-host` takes that label to zero deliberately.
 
 ---
 
@@ -119,7 +121,10 @@ scripts/runner_census.py --repo OWNER/REPO --label pulp-build-pr-head
 
 pgrep -fl 'tart run'                      # must print no active VM process
 /opt/homebrew/bin/tart list --format json # every entry must report Running=false
-tartci pool off                           # immediate unload; NOT a drain
+tartci pool off --plan                    # what off would stop; mid-job lanes listed
+tartci pool off                           # immediate unload; NOT a drain. Exit 12 =
+                                          # a lane is mid-job/unreadable: re-check, do
+                                          # not reach for --now during a migration
 
 # Cache both sides before removing either installed keg. The legacy bottles are
 # the offline rollback path if installation of the new channel fails.
@@ -1401,7 +1406,7 @@ launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
 only `bootout`+`bootstrap` re-reads the plist. `tartci launchd reload <label>`
 does that full cycle, and it refuses (exit 3, nothing changed) when the lane
 is **mid-job**: the process launchd started for that label owns a `tart run`
-descendant (the lane VM) or a `Runner.Worker` (a persistent Actions runner
+or `qemu-system-*` descendant (the lane VM) or a `Runner.Worker` (a persistent Actions runner
 executing a job). A bootout then kills the job with it. The probe is per
 label (`scripts/lane_busy.py`), so a sibling lane building does not block
 reloading an idle one. An unreadable answer (a `launchctl print` error other
@@ -1673,9 +1678,14 @@ lanes change.
   (no participation/state record, no lock, no launchctl mutation, no drain
   watcher): the state change, the owned services it would stop or start, the
   unowned ones it leaves alone, the capacity-floor verdict, and which lanes are
-  mid-job right now (would be KILLED by `off`, would finish under `drain`). It
-  exits with the code the real transition would refuse with (11 capacity
-  floor, 12 mid-job `off`, 7 invalid receipt for `on`), else 0.
+  mid-job right now (would be KILLED by `off`, would finish under `drain`).
+  For `off`/`drain` it runs every precondition the real transition runs and
+  exits with the code it would refuse with (11 capacity floor, 12 mid-job
+  `off`), else 0. `on --plan` is narrower: it checks only the installed
+  receipt (exit 7). The launch-helper probe (9), the network-profile reconcile
+  (6) and the loaded-generation verification cannot run without acting, so they
+  run only on the real `pool on`, and a `0` from `on --plan` does not promise
+  that `on` succeeds.
 - `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
   bootstrap the installed runner agents. On a receipt-managed macOS fleet, both
   dynamic controllers and persistent `actions.runner.*` services must be named
@@ -1727,6 +1737,10 @@ lanes change.
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an
   orphan blocks rejoin, run `pool off`, then `pool repair-lock`, then `pool on`.
+  `pool off` there refuses with exit 12 while an owned lane is mid-job (or its
+  busy state is unreadable): wait for the job, or use `pool drain`, and re-run
+  it. Reach for `pool off --now` only when killing that job is intended;
+  `pool off --plan` names the lane and process first.
   Providers check for an already-present transition lock before allocating a
   port or VM lease and before cloning or booting. The existing serialized check
   immediately before JIT mint remains authoritative for a lock created after

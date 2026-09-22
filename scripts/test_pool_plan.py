@@ -247,6 +247,8 @@ class PoolPlanTests(unittest.TestCase):
             proc = host.pool("on", "--plan")
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("state: off -> on; participation: 0 -> 1", proc.stdout)
+            self.assertIn("not checked by --plan", proc.stdout)
+            self.assertIn("launch-helper probe (exit 9)", proc.stdout)
             self.assertIn(UNOWNED, proc.stdout)
             self.assertEqual(host.records(), ("0\n", "off\n"))
             self.assertFalse(host.lock.exists())

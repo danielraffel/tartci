@@ -469,10 +469,13 @@ tartci_pool_capacity_floor_preflight() {
   esac
 }
 
-# `tartci pool <on|off|drain> --plan`: every read-only precondition of the
-# transition, printed, with nothing written — no participation/state record, no
-# lock, no launchctl mutation. Exits with the code the real transition would
-# refuse with (11 capacity floor, 12 mid-job off, 7 receipt), else 0.
+# `tartci pool <on|off|drain> --plan`: the transition, printed, with nothing
+# written — no participation/state record, no lock, no launchctl mutation.
+# off/drain run every precondition the real transition runs and exit with its
+# refusal code (11 capacity floor, 12 mid-job off), else 0. `on` checks only
+# the installed receipt (7): its launch-helper probe, network-profile reconcile
+# and loaded-generation verification act on the host, so they run only on the
+# real `pool on`.
 tartci_pool_plan() {
   local sub="$1" host="$2" agents_dir="$3" allow_last="$4" now="$5"
   local part state target_state target_part verdict=0 label loaded
@@ -496,6 +499,8 @@ tartci_pool_plan() {
     else
       agents="$(tartci_pool_runner_agents "$agents_dir")"
     fi
+    echo "  not checked by --plan (they act on the host; the real pool on runs them):"
+    echo "    launch-helper probe (exit 9), network-profile reconcile (6), loaded-generation verification (7)"
   else
     agents="$(tartci_pool_owned_runner_agents "$agents_dir")"
     if [ "$sub" = off ]; then action="disable + bootout"; else action="disable (restart only)"; fi
@@ -553,6 +558,7 @@ cmd_pool() {
   local sub="${1:-status}"; shift || true
   local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
+           (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
   exit 11 capacity floor refused; 12 off refused because a lane is mid-job"
   case "$sub" in
