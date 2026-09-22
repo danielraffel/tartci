@@ -107,7 +107,7 @@ def build(root: Path) -> dict[str, object]:
     tree_modes: dict[str, int] = {}
     tree = _git(
         root, "ls-tree", "-r", "-z", "HEAD", "--",
-        "tartci", "launchd", "native", "profiles", "providers", "scripts",
+        *sorted(ROOT_FILES), *sorted(ROOT_DIRS),
     )
     for record in tree.split("\0"):
         if not record:
