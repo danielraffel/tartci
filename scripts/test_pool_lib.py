@@ -1022,12 +1022,16 @@ class TransitionOwnershipTests(unittest.TestCase):
         launchctl_log = root / "launchctl.log"
         for name, body in {
             "scutil": "#!/bin/sh\nprintf 'test-host\\n'\n",
-            # Logs every invocation; `print` fails so a label reads as stopped
-            # and `bootout` reports the service was there to stop.
+            # Logs every invocation; `print` answers the way launchd does for
+            # an unloaded service (exit 113, "Could not find service"), so a
+            # label reads as stopped AND provably idle, and `bootout` reports
+            # the service was there to stop.
             "launchctl": (
                 "#!/bin/sh\n"
                 'printf \'%s\\n\' "$*" >>"$FAKE_LAUNCHCTL_LOG"\n'
-                '[ "$1" = print ] && exit 1\n'
+                'if [ "$1" = print ]; then\n'
+                '  echo "Could not find service \\"$2\\" in domain" >&2; exit 113\n'
+                "fi\n"
                 "exit 0\n"
             ),
             "nohup": "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$FAKE_NOHUP_LOG\"\n",

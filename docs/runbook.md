@@ -1660,7 +1660,19 @@ lanes change.
 - `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
   and `pool-state=off`, disable restart, and immediately boot out every runner
   agent. It deliberately bypasses a provider's cooperative JIT-start lock, so
-  it can terminate active work; use drain for normal roaming.
+  it can terminate active work; use drain for normal roaming. Because of that,
+  `off` first probes every owned lane (the same per-label probe as `tartci
+  launchd reload`: its launchd pid owns a `tart run` VM or `Runner.Worker`) and
+  refuses with exit 12, before writing anything, when one is mid-job or its
+  state cannot be read. The message names the lane and process. `tartci pool
+  off --now` is the emergency stop that kills that work anyway.
+- `tartci pool <on|off|drain> --plan` — print the transition and write nothing
+  (no participation/state record, no lock, no launchctl mutation, no drain
+  watcher): the state change, the owned services it would stop or start, the
+  unowned ones it leaves alone, the capacity-floor verdict, and which lanes are
+  mid-job right now (would be KILLED by `off`, would finish under `drain`). It
+  exits with the code the real transition would refuse with (11 capacity
+  floor, 12 mid-job `off`, 7 invalid receipt for `on`), else 0.
 - `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
   bootstrap the installed runner agents. On a receipt-managed macOS fleet, both
   dynamic controllers and persistent `actions.runner.*` services must be named
