@@ -1988,10 +1988,47 @@ def _display_path(path: Path) -> str:
         return str(path)
 
 
+TARTCI_ROOT = Path(__file__).resolve().parents[1]
+PUBLISHED_SUPPLY = TARTCI_ROOT / "fleet" / "advertised-labels.json"
+PUBLISHED_SUPPLY_URL = (
+    "https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json"
+)
+FLEET_PROFILE_GLOB = "*-macos-fleet.toml"
+_PERSISTENT_RUNNER_NAME = re.compile(
+    r"^actions\.runner\.[A-Za-z0-9_.-]+\.(?P<name>[A-Za-z0-9_.-]+)$")
+
+
+def fleet_profiles(root: Path = TARTCI_ROOT) -> list[Path]:
+    """Every checked-in macOS fleet profile. Discovery is the glob: no host list."""
+    return sorted((root / "profiles").glob(FLEET_PROFILE_GLOB))
+
+
+def persistent_runners(data: dict) -> list[dict]:
+    """Host-owned persistent Actions services a profile declares.
+
+    Their registered name is the launchd label's last component; their labels
+    are set at registration outside tartci, so only the name is declared.
+    """
+    host_id = data["host"]["id"]
+    rows = []
+    for label in data["host"].get("persistent_runner_labels", []) or []:
+        match = _PERSISTENT_RUNNER_NAME.fullmatch(label)
+        rows.append({
+            "profile": data.get("name") or host_id,
+            "host_id": host_id,
+            "launchd_label": label,
+            "runner_name": match.group("name") if match else None,
+        })
+    return rows
+
+
 def advertised_labels_snapshot(paths: list[Path], commit: str | None) -> dict:
     registrations: list[dict] = []
+    persistent: list[dict] = []
     for path in paths:
-        registrations.extend(advertised_registrations(load(path)))
+        data = load(path)
+        registrations.extend(advertised_registrations(data))
+        persistent.extend(persistent_runners(data))
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
@@ -2000,7 +2037,132 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None) -> dict:
             "profiles": [_display_path(path) for path in paths],
         },
         "registrations": registrations,
+        # Additive to v1: runners a host owns whose labels tartci does not set.
+        "persistent_runners": persistent,
     }
+
+
+def published_snapshot(root: Path = TARTCI_ROOT) -> dict:
+    """The committed form: every fleet profile, commit null.
+
+    A file cannot name the commit that contains it, so the published copy
+    carries no commit; its provenance is the git ref it was read from.
+    """
+    return advertised_labels_snapshot(fleet_profiles(root), None)
+
+
+def render_published(snapshot: dict) -> str:
+    return json.dumps(snapshot, indent=2) + "\n"
+
+
+def read_published(source: str | Path, timeout: float = 15.0) -> dict:
+    text: str
+    if isinstance(source, str) and source.startswith(("https://", "http://")):
+        import urllib.request
+        with urllib.request.urlopen(source, timeout=timeout) as response:  # noqa: S310
+            text = response.read().decode("utf-8")
+    else:
+        text = Path(source).read_text()
+    value = json.loads(text)
+    if not isinstance(value, dict) or value.get("schema") != ADVERTISED_LABELS_SCHEMA:
+        raise ValueError(f"not a {ADVERTISED_LABELS_SCHEMA} document")
+    if not isinstance(value.get("registrations"), list):
+        raise ValueError("published snapshot has no registrations array")
+    return value
+
+
+# ── Supply verification: installed vs declared ──────────────────────────────
+
+MATCH = "MATCH"
+INSTALLED_ONLY = "INSTALLED_ONLY"
+DECLARED_ONLY = "DECLARED_ONLY"
+LABELS_DIFFER = "LABELS_DIFFER"
+SUPPLY_UNKNOWN = "UNKNOWN"
+
+
+def _registration_key(row: dict) -> tuple[str, str]:
+    return row["lane"], row.get("class_label") or ""
+
+
+def _registration_facts(row: dict) -> dict:
+    return {
+        "repo": row["repo"].lower(),
+        "labels": sorted(label.lower() for label in row["labels"]),
+        "workflows": sorted(row["workflows"]),
+        "assignment_mode": row["assignment_mode"],
+    }
+
+
+def verify_supply(installed: Path, published: dict | None,
+                  published_error: str = "") -> dict:
+    """Compare this host's installed registrations with the declared ones.
+
+    `state` is `match`, `mismatch`, or `unknown`; unknown is never a match.
+    """
+    result: dict = {"schema": "tartci.supply-verify/v1", "installed": str(installed),
+                    "host_id": None, "state": "unknown", "reason": None, "lanes": []}
+    if published is None:
+        result["reason"] = f"published supply unreadable: {published_error}"
+        return result
+    try:
+        data = load(installed)
+    except FileNotFoundError:
+        result["reason"] = "installed profile does not exist"
+        return result
+    except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
+        result["reason"] = f"installed profile invalid: {exc}"
+        return result
+    host_id = data["host"]["id"]
+    result["host_id"] = host_id
+    declared = [row for row in published["registrations"] if row.get("host_id") == host_id]
+    if not declared:
+        result["reason"] = (f"host_id {host_id!r} declares no registrations in the "
+                            "published supply, so nothing can be fact-checked")
+        return result
+    have = {_registration_key(row): row for row in advertised_registrations(data)}
+    want = {_registration_key(row): row for row in declared}
+    rows = []
+    for key in sorted(set(have) | set(want)):
+        lane, class_label = key
+        entry: dict = {"lane": lane, "class_label": class_label or None}
+        if key not in want:
+            entry.update(verdict=INSTALLED_ONLY, installed=have[key]["labels"])
+        elif key not in have:
+            entry.update(verdict=DECLARED_ONLY, declared=want[key]["labels"])
+        else:
+            h, w = _registration_facts(have[key]), _registration_facts(want[key])
+            if h == w:
+                entry.update(verdict=MATCH, labels=have[key]["labels"])
+            else:
+                entry.update(verdict=LABELS_DIFFER, differs={
+                    field: {"installed": h[field], "declared": w[field]}
+                    for field in h if h[field] != w[field]})
+        rows.append(entry)
+    result["lanes"] = rows
+    result["state"] = ("match" if all(row["verdict"] == MATCH for row in rows)
+                       else "mismatch")
+    return result
+
+
+def render_supply(result: dict) -> str:
+    lines = [f"supply verify: {result['state'].upper()} host_id={result['host_id'] or '-'}",
+             f"  installed: {result['installed']}"]
+    if result["reason"]:
+        lines.append(f"  reason: {result['reason']}")
+    for row in result["lanes"]:
+        name = row["lane"] + (f" [{row['class_label']}]" if row["class_label"] else "")
+        detail = ""
+        if row["verdict"] == MATCH:
+            detail = ",".join(row["labels"])
+        elif row["verdict"] == INSTALLED_ONLY:
+            detail = "installed registers " + ",".join(row["installed"]) + "; git declares nothing"
+        elif row["verdict"] == DECLARED_ONLY:
+            detail = "git declares " + ",".join(row["declared"]) + "; not installed here"
+        else:
+            detail = "; ".join(f"{k}: installed={v['installed']} declared={v['declared']}"
+                               for k, v in row["differs"].items())
+        lines.append(f"  {row['verdict']:<15} {name}: {detail}")
+    return "\n".join(lines)
 
 
 def reachable(registration: dict, repo: str, workflow: str,
@@ -2187,8 +2349,21 @@ def main(argv: list[str] | None = None) -> int:
     advertised = sub.add_parser(
         "advertised-labels",
         help="offline: the exact label set each lane registers with GitHub")
-    advertised.add_argument("profiles", nargs="+", type=Path)
+    advertised.add_argument("profiles", nargs="*", type=Path)
+    advertised.add_argument("--all", action="store_true",
+                            help="every profiles/*-macos-fleet.toml under the tartci root")
+    advertised.add_argument("--publish", action="store_true",
+                            help="the committed form: --all, commit null, JSON")
+    advertised.add_argument("--check", type=Path, metavar="FILE",
+                            help="exit 1 unless FILE equals the --publish output")
     advertised.add_argument("--json", action="store_true")
+    supply = sub.add_parser(
+        "verify-supply",
+        help="read-only: installed profile's registrations vs the published supply")
+    supply.add_argument("--installed", type=Path, default=None)
+    supply.add_argument("--published", default=str(PUBLISHED_SUPPLY),
+                        help=f"file or URL (default: repo copy; main: {PUBLISHED_SUPPLY_URL})")
+    supply.add_argument("--json", action="store_true")
     drift = sub.add_parser(
         "profile-drift",
         help="read-only: installed profile vs its checked-in source (by name)")
@@ -2200,10 +2375,42 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         if args.command == "advertised-labels":
-            snapshot = advertised_labels_snapshot(
-                args.profiles, git_head(Path(__file__).resolve().parents[1]))
+            if args.publish or args.check:
+                if args.profiles:
+                    parser.error("--publish/--check take no profile arguments")
+                body = render_published(published_snapshot())
+                if args.check:
+                    try:
+                        current = args.check.read_text()
+                    except OSError as exc:
+                        print(f"fleet-macos: {args.check}: {exc}", file=sys.stderr)
+                        return 1
+                    if current != body:
+                        print(f"fleet-macos: {args.check} is stale; regenerate with "
+                              "`tartci fleet-macos advertised-labels --publish > "
+                              "fleet/advertised-labels.json`", file=sys.stderr)
+                        return 1
+                    print(f"up to date: {args.check}")
+                    return 0
+                sys.stdout.write(body)
+                return 0
+            paths = fleet_profiles() if args.all else args.profiles
+            if args.all and args.profiles:
+                parser.error("--all takes no profile arguments")
+            if not paths:
+                parser.error("name profile files or pass --all")
+            snapshot = advertised_labels_snapshot(paths, git_head(TARTCI_ROOT))
             print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
             return 0
+        if args.command == "verify-supply":
+            installed = args.installed or DEFAULT_INSTALLED_PROFILE
+            try:
+                published, error = read_published(args.published), ""
+            except Exception as exc:  # noqa: BLE001 - any unreadable source is UNKNOWN
+                published, error = None, f"{args.published}: {exc}"
+            result = verify_supply(installed, published, error)
+            print(json.dumps(result, indent=2) if args.json else render_supply(result))
+            return {"match": 0, "mismatch": 1}.get(result["state"], 2)
         if args.command == "profile-drift":
             result = profile_drift(args.installed, args.profiles_dir)
             print(json.dumps(result, indent=2, sort_keys=True, default=str)
