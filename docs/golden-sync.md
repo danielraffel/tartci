@@ -66,10 +66,11 @@ assuming — a host on an external/remote volume would differ.
    (now-deleted) golden and dies with `golden not found`:
    ```bash
    L=com.danielraffel.pulp.qemu-runner-windows
-   launchctl bootout gui/$(id -u)/$L 2>/dev/null; sleep 2
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/$L.plist
-   # (equivalently: `tartci launchd reload $L`)
+   tartci launchd reload $L --dry-run   # REFUSE (exit 3) while a VM is running
+   tartci launchd reload $L
    ```
+   Use the tartci reloader, not raw `launchctl bootout`: it refuses while that
+   lane's supervisor owns a `qemu-system-*`/`tart run` VM or a `Runner.Worker`.
    Confirm the next `LOOP` log line shows `golden=<canonical name>`.
 7. **Prune older goldens** once verified — but never delete one a VM is booted
    from (`ps aux | grep qemu-system | grep <old golden>` must be empty).
@@ -117,6 +118,10 @@ golden yet, bake one from scratch (runbook §4), then the rest copy via `--from`
    host with no pin uses the provider default) and **reloads the runner only when
    idle** — via a full bootout+bootstrap (`tartci launchd reload`), because a pin
    is plist env and `kickstart -k` does not re-read it. `--no-reload` to skip.
+   If the reloader refuses (exit 3: lane mid-job or busy state unknown), fails,
+   or tartci is not installed on the target, the lane is left running — there is
+   no raw `launchctl bootout` fallback — and a repointed pin takes effect after
+   `tartci launchd reload <label>` once the lane is idle.
 5. **Prunes** superseded goldens on the target, guarded (never one a running VM
    is backed by), opt-in via `--prune`.
 

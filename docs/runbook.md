@@ -78,8 +78,10 @@ budgets; pin only if you disagree (see "Onboarding a new host").
 The new Mac is now governed, serving its lanes, and drainable exactly like the
 rest of the pool. Use `tartci pool drain` before roaming or disconnecting;
 `pool off` unloads its agents immediately and remains an emergency/idle-only
-operation. Both refuse when this host is the only one serving a required gate
-label; `--allow-last-serving-host` takes that label to zero deliberately.
+operation: it refuses (exit 12) while an owned lane is mid-job or its state is
+unreadable, and `--now` is the explicit kill; `pool off --plan` shows what it
+would stop first. Both refuse when this host is the only one serving a required
+gate label; `--allow-last-serving-host` takes that label to zero deliberately.
 
 ---
 
@@ -119,7 +121,10 @@ scripts/runner_census.py --repo OWNER/REPO --label pulp-build-pr-head
 
 pgrep -fl 'tart run'                      # must print no active VM process
 /opt/homebrew/bin/tart list --format json # every entry must report Running=false
-tartci pool off                           # immediate unload; NOT a drain
+tartci pool off --plan                    # what off would stop; mid-job lanes listed
+tartci pool off                           # immediate unload; NOT a drain. Exit 12 =
+                                          # a lane is mid-job/unreadable: re-check, do
+                                          # not reach for --now during a migration
 
 # Cache both sides before removing either installed keg. The legacy bottles are
 # the offline rollback path if installation of the new channel fails.
@@ -1395,6 +1400,57 @@ the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
+### Reloading a lane supervisor safely (`tartci launchd reload`)
+
+launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
+only `bootout`+`bootstrap` re-reads the plist. `tartci launchd reload <label>`
+does that full cycle, and it refuses (exit 3, nothing changed) when the lane
+is **mid-job**: the process launchd started for that label owns a `tart run`
+or `qemu-system-*` descendant (the lane VM) or a `Runner.Worker` (a persistent Actions runner
+executing a job). A bootout then kills the job with it. The probe is per
+label (`scripts/lane_busy.py`), so a sibling lane building does not block
+reloading an idle one. An unreadable answer (a `launchctl print` error other
+than launchd's "Could not find service", or an unreadable process table) also
+refuses. Wait for the lane to go idle, or `tartci pool drain`; the explicit
+override that accepts killing the job is `--allow-mid-job`.
+
+`--dry-run` runs every precondition, including the mid-job probe, and prints
+the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) or
+`REFUSE: <reason>`. Exit codes for `--reload`: `0` reloaded / would proceed,
+`1` a mutation ran and failed its postcondition, `3` refused before changing
+anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
+host-wide "no VM running" gate.
+
+### Keep agents off raw `launchctl` (`tartci launchd guard`)
+
+The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane
+supervisor: no tartci code was on that path, so no tartci refusal could fire.
+The choke point is the agent harness's PreToolUse hook. `tartci launchd guard
+--hook` reads the hook's JSON on stdin and exits 2 (blocking the tool call,
+with the reason on stderr) when a shell command would run `launchctl`
+`kickstart|bootout|unload|remove|kill|disable|stop` against a runner/lane
+supervisor (`com.danielraffel.<repo>.tart-runner*` / `.qemu-runner*`, which
+includes the fleet lanes `com.danielraffel.tartci.tart-runner-macos-fleet.*`)
+or an `actions.runner.*` service. tartci's non-runner agents (launchd-watchdog,
+reap, reclaim, the relay) are not lanes and pass. Here-document bodies are
+data (a commit message or file that mentions `launchctl bootout` passes)
+unless the heredoc feeds `bash|sh|zsh|dash|ksh` or `ssh`. It sees through `&&`, `;`, `|`, newlines, `bash|sh|zsh -c '…'`,
+`eval`, `$(…)`, `env`/`sudo`/`nohup` prefixes, `launchctl asuser`, `ssh host
+'…'`, `/bin/launchctl`, and `gui/<uid>/<label>`, `user/<uid>/<label>`, plist
+paths or bare labels. A target it cannot resolve statically (a loop variable,
+a glob, labels piped into `xargs`, `bootout gui/<uid>` of the whole domain)
+is blocked too. Read-only verbs (`print`, `list`, `print-disabled`) and
+services outside those families pass silently. The explicit, auditable escape
+hatch is `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself
+(allowed with a warning). Malformed hook input exits 0 with a note so a broken
+hook never breaks the agent's shell.
+
+`tartci hooks print` prints (never writes) the settings snippet for Claude
+Code (`~/.claude/settings.json`, PreToolUse matcher `Bash`) and for Codex
+(`.codex/hooks.json`), both pointing at `hooks/claude-pretooluse-launchctl.sh`,
+a shim that resolves `tartci` relative to itself. Merge it by hand. Try a
+command without a hook: `tartci launchd guard --command '<cmd>'; echo $?`.
+
 ### Emulation note
 
 Pool jobs build whatever arch the **workflow** targets. The emulated **x86_64**
@@ -1612,7 +1668,24 @@ lanes change.
 - `tartci pool off` — write `~/.config/tartci/native-build-participation=0`
   and `pool-state=off`, disable restart, and immediately boot out every runner
   agent. It deliberately bypasses a provider's cooperative JIT-start lock, so
-  it can terminate active work; use drain for normal roaming.
+  it can terminate active work; use drain for normal roaming. Because of that,
+  `off` first probes every owned lane (the same per-label probe as `tartci
+  launchd reload`: its launchd pid owns a `tart run` VM or `Runner.Worker`) and
+  refuses with exit 12, before writing anything, when one is mid-job or its
+  state cannot be read. The message names the lane and process. `tartci pool
+  off --now` is the emergency stop that kills that work anyway.
+- `tartci pool <on|off|drain> --plan` — print the transition and write nothing
+  (no participation/state record, no lock, no launchctl mutation, no drain
+  watcher): the state change, the owned services it would stop or start, the
+  unowned ones it leaves alone, the capacity-floor verdict, and which lanes are
+  mid-job right now (would be KILLED by `off`, would finish under `drain`).
+  For `off`/`drain` it runs every precondition the real transition runs and
+  exits with the code it would refuse with (11 capacity floor, 12 mid-job
+  `off`), else 0. `on --plan` is narrower: it checks only the installed
+  receipt (exit 7). The launch-helper probe (9), the network-profile reconcile
+  (6) and the loaded-generation verification cannot run without acting, so they
+  run only on the real `pool on`, and a `0` from `on --plan` does not promise
+  that `on` succeeds.
 - `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
   bootstrap the installed runner agents. On a receipt-managed macOS fleet, both
   dynamic controllers and persistent `actions.runner.*` services must be named
@@ -1664,6 +1737,10 @@ lanes change.
   reboot, or SIGKILL. It refuses unless admission is already closed (`off` or
   `draining`, participation `0`) and the recorded owner PID is dead. If an
   orphan blocks rejoin, run `pool off`, then `pool repair-lock`, then `pool on`.
+  `pool off` there refuses with exit 12 while an owned lane is mid-job (or its
+  busy state is unreadable): wait for the job, or use `pool drain`, and re-run
+  it. Reach for `pool off --now` only when killing that job is intended;
+  `pool off --plan` names the lane and process first.
   Providers check for an already-present transition lock before allocating a
   port or VM lease and before cloning or booting. The existing serialized check
   immediately before JIT mint remains authoritative for a lock created after

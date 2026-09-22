@@ -1850,6 +1850,294 @@ def lane_plist(
     }
 
 
+# ── Advertised labels (offline) ─────────────────────────────────────────────
+#
+# What GitHub sees at generate-jitconfig is decided by the provider supervisor,
+# not by the profile: providers/tart-macos/runner.sh `select_work` and
+# assignment-v2.lib.sh turn the rendered lane environment into the label set of
+# each JIT registration. The snapshot below replays that exact rule over the
+# environment `lane_plist` renders, so a renderer change and a profile change
+# are both reflected, and no host or GitHub call is needed.
+
+ADVERTISED_LABELS_SCHEMA = "tartci.advertised-labels/v1"
+ADVERTISED_LABELS_REPO = "danielraffel/tartci"
+# runner.sh defaults for a variable the rendered environment leaves unset.
+_RUNNER_DEFAULT_LABELS = "self-hosted,macOS,ARM64,pulp-build-vm"
+_RUNNER_DEFAULT_WORKFLOW = "Build and Test"
+_RUNNER_DEFAULT_OMIT = "pulp-gate-fast"
+_RUNNER_DEFAULT_CLASSES = "pulp-build-merge-group,pulp-build-pr-head"
+
+
+def _csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _dedupe_labels(labels: Iterable[str]) -> list[str]:
+    """GitHub label sets are case-insensitive; keep the first spelling."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for label in labels:
+        key = label.lower()
+        if key not in seen:
+            seen.add(key)
+            out.append(label)
+    return out
+
+
+def registrations_from_env(env: dict[str, str]) -> list[dict]:
+    """Replay runner.sh's registration-label rule over a lane environment.
+
+    Returns one row per distinct registration: its assignment mode, class
+    label, the exact label set passed to generate-jitconfig, and the workflow
+    names that registration mints for.
+    """
+    labels = _csv(env.get("TARTCI_RUNNER_LABELS") or _RUNNER_DEFAULT_LABELS)
+    mode = env.get("TARTCI_RUNNER_ASSIGNMENT_MODE") or "legacy"
+    if mode not in ("legacy", "observe", "event-class-v2"):
+        raise ValueError(f"unsupported assignment mode: {mode}")
+    tiers: list[tuple[str, str]] = []
+    for raw in (env.get("TARTCI_RUNNER_WORKFLOW_TIERS") or "").splitlines():
+        entry = raw.rstrip("\r")
+        if not entry:
+            continue
+        if "|" not in entry:
+            raise ValueError(f"invalid workflow tier entry: {entry}")
+        tier_label, workflow = entry.split("|", 1)
+        if not tier_label or not workflow or "," in tier_label:
+            raise ValueError(f"invalid workflow tier entry: {entry}")
+        tiers.append((tier_label, workflow))
+    if not tiers:
+        if mode == "event-class-v2":
+            raise ValueError("event-class-v2 requires workflow tiers")
+        names = [
+            line.rstrip("\r")
+            for line in (env.get("TARTCI_RUNNER_WORKFLOW_NAMES") or "").splitlines()
+            if line.rstrip("\r")
+        ] or [env.get("TARTCI_RUNNER_WORKFLOW_NAME") or _RUNNER_DEFAULT_WORKFLOW]
+        return [{
+            "assignment_mode": "legacy",
+            "class_label": None,
+            "labels": _dedupe_labels(labels),
+            "workflows": list(dict.fromkeys(names)),
+        }]
+    ordered: list[str] = []
+    workflows: dict[str, list[str]] = {}
+    for tier_label, workflow in tiers:
+        if tier_label not in workflows:
+            ordered.append(tier_label)
+            workflows[tier_label] = []
+        if workflow not in workflows[tier_label]:
+            workflows[tier_label].append(workflow)
+    if mode == "event-class-v2":
+        omitted = {item.lower() for item in _csv(
+            env.get("TARTCI_ASSIGNMENT_V2_OMIT_LABELS", _RUNNER_DEFAULT_OMIT))}
+        classes = {item.lower() for item in _csv(
+            env.get("TARTCI_ASSIGNMENT_V2_CLASS_LABELS", _RUNNER_DEFAULT_CLASSES))}
+        base = [label for label in labels if label.lower() not in omitted | classes]
+        if not base:
+            raise ValueError("V2 assignment omitted every configured runner label")
+        effective = "event-class-v2"
+    else:
+        # `observe` mints the legacy selection; only its log line differs.
+        base = labels
+        effective = "legacy"
+    return [{
+        "assignment_mode": effective,
+        "class_label": tier_label,
+        "labels": _dedupe_labels([*base, tier_label]),
+        "workflows": workflows[tier_label],
+    } for tier_label in ordered]
+
+
+def advertised_registrations(data: dict) -> list[dict]:
+    """Every JIT registration a loaded profile's lanes can mint."""
+    host_id = data["host"]["id"]
+    profile = data.get("name") or host_id
+    rows: list[dict] = []
+    for lane in data["lane"]:
+        env = lane_plist(data, lane)["EnvironmentVariables"]
+        for registration in registrations_from_env(env):
+            rows.append({
+                "profile": profile,
+                "host_id": host_id,
+                "lane": lane["id"],
+                "repo": lane["repo"],
+                **registration,
+            })
+    return rows
+
+
+def git_head(root: Path) -> str | None:
+    """HEAD of the checkout holding ROOT, or None outside a git checkout."""
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=10, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    value = proc.stdout.strip()
+    return value if proc.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", value) else None
+
+
+def _display_path(path: Path) -> str:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def advertised_labels_snapshot(paths: list[Path], commit: str | None) -> dict:
+    registrations: list[dict] = []
+    for path in paths:
+        registrations.extend(advertised_registrations(load(path)))
+    return {
+        "schema": ADVERTISED_LABELS_SCHEMA,
+        "generated_from": {
+            "repo": ADVERTISED_LABELS_REPO,
+            "commit": commit,
+            "profiles": [_display_path(path) for path in paths],
+        },
+        "registrations": registrations,
+    }
+
+
+def reachable(registration: dict, repo: str, workflow: str,
+              job_labels: Iterable[str]) -> bool:
+    """GitHub semantics: a job's labels must be a case-insensitive subset."""
+    have = {label.lower() for label in registration["labels"]}
+    return (registration["repo"].lower() == repo.lower()
+            and workflow in registration["workflows"]
+            and all(label.lower() in have for label in job_labels))
+
+
+# ── Installed-profile drift ─────────────────────────────────────────────────
+#
+# The installer copies a checked-in profile to
+# ~/.config/tartci/macos-fleet-profile.toml. A later edit on either side is
+# invisible to every receipt check, because the receipt binds the installed
+# copy to itself. This compares the two semantically, by key path.
+
+DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
+DEFAULT_PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+
+
+def _flatten(value: object, prefix: str = "") -> dict[str, object]:
+    """Key-path view of a profile. Lanes are keyed by id, not position."""
+    out: dict[str, object] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "lane" and prefix == "" and isinstance(child, list):
+                for index, lane in enumerate(child):
+                    lane_id = lane.get("id") if isinstance(lane, dict) else None
+                    name = f"lane[{lane_id if isinstance(lane_id, str) else '#' + str(index)}]"
+                    out.update(_flatten(lane, name))
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(child, dict) or (
+                    isinstance(child, list) and child
+                    and all(isinstance(item, dict) for item in child)):
+                out.update(_flatten(child, path))
+            else:
+                out[path] = child
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            out.update(_flatten(item, f"{prefix}[{index}]"))
+    else:
+        out[prefix] = value
+    return out
+
+
+def profile_drift(installed: Path, profiles_dir: Path) -> dict:
+    """Semantic key diff between an installed profile and its checked-in source.
+
+    `state` is `in_sync`, `drift`, or `unknown`; unknown carries a reason and
+    is never reported as in sync.
+    """
+    result: dict = {
+        "schema": "tartci.profile-drift/v1",
+        "installed": str(installed),
+        "checked_in": None,
+        "name": None,
+        "state": "unknown",
+        "reason": None,
+        "missing_in_installed": {},
+        "extra_in_installed": {},
+        "changed": {},
+    }
+    try:
+        with installed.open("rb") as handle:
+            installed_data = tomllib.load(handle)
+    except FileNotFoundError:
+        result["reason"] = "installed profile does not exist"
+        return result
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        result["reason"] = f"installed profile unreadable: {exc}"
+        return result
+    name = installed_data.get("name")
+    if not isinstance(name, str) or not name:
+        result["reason"] = "installed profile has no `name`, so no checked-in source can be matched"
+        return result
+    result["name"] = name
+    matches: list[tuple[Path, dict]] = []
+    for candidate in sorted(profiles_dir.glob("*.toml")):
+        try:
+            with candidate.open("rb") as handle:
+                parsed = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if parsed.get("name") == name:
+            matches.append((candidate, parsed))
+    if len(matches) != 1:
+        result["reason"] = (
+            f"{len(matches)} checked-in profiles in {profiles_dir} declare name={name!r}; "
+            "exactly one is required"
+        )
+        return result
+    source_path, source_data = matches[0]
+    result["checked_in"] = str(source_path)
+    have = _flatten(installed_data)
+    want = _flatten(source_data)
+    result["missing_in_installed"] = {k: want[k] for k in sorted(set(want) - set(have))}
+    result["extra_in_installed"] = {k: have[k] for k in sorted(set(have) - set(want))}
+    result["changed"] = {
+        k: {"installed": have[k], "checked_in": want[k]}
+        for k in sorted(set(have) & set(want)) if have[k] != want[k]
+    }
+    drifted = any(result[k] for k in ("missing_in_installed", "extra_in_installed", "changed"))
+    result["state"] = "drift" if drifted else "in_sync"
+    return result
+
+
+def render_profile_drift(result: dict) -> str:
+    lines = [f"profile drift: {result['state'].upper()}",
+             f"  installed:  {result['installed']}",
+             f"  checked-in: {result['checked_in'] or '-'} (name={result['name'] or '-'})"]
+    if result["reason"]:
+        lines.append(f"  reason: {result['reason']}")
+    for key, value in result["missing_in_installed"].items():
+        lines.append(f"  - {key} = {value!r}   (checked in, missing from installed)")
+    for key, value in result["extra_in_installed"].items():
+        lines.append(f"  + {key} = {value!r}   (installed only)")
+    for key, pair in result["changed"].items():
+        lines.append(f"  ~ {key}: installed={pair['installed']!r} checked_in={pair['checked_in']!r}")
+    if result["state"] == "drift":
+        lines.append("  remedy: reinstall from the checked-in profile "
+                     "(tartci fleet-macos install <profile> --apply), or commit the host edit")
+    return "\n".join(lines)
+
+
+def render_advertised(snapshot: dict) -> str:
+    lines = [f"{snapshot['schema']} commit={snapshot['generated_from']['commit'] or '-'}"]
+    for row in snapshot["registrations"]:
+        lines.append(
+            f"{row['profile']}/{row['lane']} [{row['assignment_mode']}] {row['repo']}: "
+            f"{','.join(row['labels'])}  <- {' | '.join(row['workflows'])}"
+        )
+    return "\n".join(lines)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tartci fleet-macos")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -1896,8 +2184,33 @@ def main(argv: list[str] | None = None) -> int:
     readiness.add_argument("--stale-heartbeat-seconds", type=int, default=300)
     readiness.add_argument("--blocked-serving-seconds", type=int, default=5400)
     readiness.add_argument("--blocked-serving-streak", type=int, default=6)
+    advertised = sub.add_parser(
+        "advertised-labels",
+        help="offline: the exact label set each lane registers with GitHub")
+    advertised.add_argument("profiles", nargs="+", type=Path)
+    advertised.add_argument("--json", action="store_true")
+    drift = sub.add_parser(
+        "profile-drift",
+        help="read-only: installed profile vs its checked-in source (by name)")
+    drift.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE)
+    drift.add_argument("--profiles-dir", type=Path, default=DEFAULT_PROFILES_DIR)
+    drift.add_argument("--strict", action="store_true",
+                       help="exit 1 on drift (exit 2 on unknown in every mode)")
+    drift.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
+        if args.command == "advertised-labels":
+            snapshot = advertised_labels_snapshot(
+                args.profiles, git_head(Path(__file__).resolve().parents[1]))
+            print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
+            return 0
+        if args.command == "profile-drift":
+            result = profile_drift(args.installed, args.profiles_dir)
+            print(json.dumps(result, indent=2, sort_keys=True, default=str)
+                  if args.json else render_profile_drift(result))
+            if result["state"] == "unknown":
+                return 2
+            return 1 if args.strict and result["state"] == "drift" else 0
         if args.command == "probe-launch-helper":
             value = probe_launch_helper(
                 args.receipt, args.config, args.agents_dir, args.support_root,

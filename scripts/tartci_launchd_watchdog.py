@@ -43,8 +43,12 @@ Modes
 -----
   (default)         scan managed TartCI + Actions LaunchAgents; heal reloadable wedges
   --status          report health only; never act (exit 0)
-  --reload LABEL    force a full bootout+bootstrap+kickstart of one label
-  --dry-run         report what heal WOULD do; never act
+  --reload LABEL    full bootout+bootstrap+kickstart of one label. Refuses
+                    (exit 3) while that lane is mid-job - its supervisor owns a
+                    `tart run` VM or `Runner.Worker` - or its busy state is
+                    unknown, unless --allow-mid-job. Exit 1 = a step failed.
+  --dry-run         run every precondition and print the plan; never act.
+                    With --reload: exit 0 would proceed, 3 would refuse
   --json            machine-readable output
 
 The pure decision helpers (`parse_launchctl_print`, `classify`) take plain
@@ -667,36 +671,62 @@ def wait_until_unloaded(label: str, timeout_s: float = 10.0,
         time.sleep(poll_s)
 
 
-def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
-    """Full bootout+bootstrap+kickstart — the ONLY thing that clears a stale
-    cached job spec. `kickstart -k` alone re-runs the stale spec, so we never
-    use it in isolation."""
+class ReloadPlan(NamedTuple):
+    """What a full reload would do, decided without changing anything."""
+    proceed: bool
+    reason: str
+    steps: tuple[str, ...]
+    exit_timeout: float | None = None
+
+
+def plan_reload(label: str, plist_path: str) -> ReloadPlan:
+    """Run every reload precondition read-only and return the plan.
+
+    Shared by the real reload and `--dry-run`, so a dry run can never report
+    success for a reload the real one would refuse.
+    """
     dom = _domain()
-    if dry_run:
-        return True
-    loaded_rc, loaded_out, loaded_err = _run(
-        ["launchctl", "print", f"{dom}/{label}"]
-    )
+    target = f"{dom}/{label}"
+    bootstrap = f"bootstrap {dom} {plist_path}"
+    kickstart = f"kickstart -k {target}"
+    loaded_rc, loaded_out, loaded_err = _run(["launchctl", "print", target])
     if loaded_rc == 0:
         state, _ = parse_launchctl_print(loaded_out)
         if state == "running" and label in UNINTERRUPTIBLE_AGENTS:
             # This agent's run cannot be cut anywhere. Refuse loudly and let
             # the next interval start it cleanly.
-            return False
+            return ReloadPlan(False, f"{label} is running and its run cannot be "
+                              "interrupted; the next interval starts it cleanly", ())
         exit_timeout = parse_launchctl_exit_timeout(loaded_out)
         if exit_timeout is None or exit_timeout == 0:
             # Zero is infinite; a missing value is likewise not a safe bound.
             # Refuse before bootout because no bounded reload can prove when it
             # is safe to bootstrap the replacement.
-            return False
+            return ReloadPlan(False, f"{label} has no finite ExitTimeOut, so no "
+                              "bounded reload can prove its teardown finished", ())
+        return ReloadPlan(True, "loaded", (f"bootout {target}", bootstrap, kickstart),
+                          exit_timeout)
+    if not launchctl_reports_absent(loaded_rc, loaded_err):
+        # A permission/domain/IPC error is not proof that bootstrap is safe.
+        return ReloadPlan(False, f"launchctl print {target} failed (exit "
+                          f"{loaded_rc}): {loaded_err.strip()[:200]}", ())
+    return ReloadPlan(True, "not loaded", (bootstrap, kickstart))
+
+
+def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
+    """Full bootout+bootstrap+kickstart — the ONLY thing that clears a stale
+    cached job spec. `kickstart -k` alone re-runs the stale spec, so we never
+    use it in isolation."""
+    dom = _domain()
+    plan = plan_reload(label, plist_path)
+    if dry_run or not plan.proceed:
+        return plan.proceed
+    if plan.exit_timeout is not None:
         _run(["launchctl", "bootout", f"{dom}/{label}"])
         # launchctl bootout can return before the cached job's ExitTimeOut
         # teardown completes. Prove it is gone before loading the new plist.
-        if not wait_until_unloaded(label, timeout_s=exit_timeout + 5.0):
+        if not wait_until_unloaded(label, timeout_s=plan.exit_timeout + 5.0):
             return False
-    elif not launchctl_reports_absent(loaded_rc, loaded_err):
-        # A permission/domain/IPC error is not proof that bootstrap is safe.
-        return False
     rc, _, _ = _run(["launchctl", "bootstrap", dom, plist_path])
     if rc != 0:
         return False
@@ -707,6 +737,61 @@ def reload_agent(label: str, plist_path: str, dry_run: bool = False) -> bool:
     # (rather than state=running) is the correct immediate postcondition.
     rc3, _, _ = _run(["launchctl", "print", f"{dom}/{label}"])
     return rc3 == 0
+
+
+# Exit codes of the explicit `--reload` entry.
+RELOAD_OK = 0          # reloaded, or (--dry-run) every precondition passed
+RELOAD_FAILED = 1      # a mutation ran and failed its postcondition
+RELOAD_REFUSED = 3     # a precondition refused; nothing was changed
+
+
+def mid_job_refusal(label: str) -> str | None:
+    """Why an operator reload of LABEL must not proceed now, or None.
+
+    Per label, not host-wide: a sibling lane building must not block reloading
+    an idle one. Unknown refuses like busy.
+    """
+    import lane_busy
+
+    row = lane_busy.probe([label], run=_run)[0]
+    if row.state == lane_busy.BUSY:
+        return (f"lane {label} is mid-job ({row.detail}: {row.worker_command}); "
+                "a bootout would kill that work")
+    if row.state == lane_busy.UNKNOWN:
+        return (f"lane {label} busy state is unknown ({row.detail}); refusing "
+                "rather than risk killing a running job")
+    return None
+
+
+def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
+                   allow_mid_job: bool) -> int:
+    """The explicit `tartci launchd reload LABEL` entry, with every guard."""
+    plist = os.path.join(launch_agents_dir, f"{label}.plist")
+    verb = "would" if dry_run else "will"
+    if not os.path.exists(plist):
+        print(f"launchd-watchdog: REFUSE: no plist for {label} at {plist}",
+              file=sys.stderr)
+        return RELOAD_REFUSED if dry_run else RELOAD_FAILED
+    if not allow_mid_job:
+        refusal = mid_job_refusal(label)
+        if refusal is not None:
+            print(f"launchd-watchdog: REFUSE: {refusal}.\n"
+                  "  Instead: wait for the lane to go idle and re-run, or run "
+                  "`tartci pool drain` so it finishes its job and stops.\n"
+                  "  Override (kills the job): tartci launchd reload "
+                  f"{label} --allow-mid-job", file=sys.stderr)
+            return RELOAD_REFUSED
+    plan = plan_reload(label, plist)
+    if not plan.proceed:
+        print(f"launchd-watchdog: REFUSE: {plan.reason}", file=sys.stderr)
+        return RELOAD_REFUSED
+    for step in plan.steps:
+        print(f"launchd-watchdog: {verb} {step}")
+    if dry_run:
+        return RELOAD_OK
+    ok = reload_agent(label, plist)
+    print(f"launchd-watchdog: reloaded {label} — {'ok' if ok else 'FAILED'}")
+    return RELOAD_OK if ok else RELOAD_FAILED
 
 
 # ── rate limiting ────────────────────────────────────────────────────────────
@@ -757,7 +842,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--reload", metavar="LABEL",
                     help="force a full bootout+bootstrap+kickstart of one label")
     ap.add_argument("--dry-run", action="store_true",
-                    help="report what heal would do; take no action")
+                    help="report what heal/reload would do; take no action. "
+                    "With --reload: exit 0 if it would proceed, 3 if refused")
+    ap.add_argument("--allow-mid-job", action="store_true",
+                    help="--reload only: proceed even though the lane is "
+                    "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     ap.add_argument("--stale-log-seconds", type=int, default=DEFAULT_STALE_LOG_S)
     ap.add_argument("--restart-grace-seconds", type=int,
@@ -776,15 +865,9 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.reload:
-        plist = os.path.join(args.launch_agents_dir, f"{args.reload}.plist")
-        if not os.path.exists(plist):
-            print(f"launchd-watchdog: no plist for {args.reload} at {plist}",
-                  file=sys.stderr)
-            return 1
-        ok = reload_agent(args.reload, plist, dry_run=args.dry_run)
-        print(f"launchd-watchdog: {'would reload' if args.dry_run else 'reloaded'} "
-              f"{args.reload} — {'ok' if ok else 'FAILED'}")
-        return 0 if ok else 1
+        return reload_command(args.reload, args.launch_agents_dir,
+                              dry_run=args.dry_run,
+                              allow_mid_job=args.allow_mid_job)
 
     agents = discover_agents(args.launch_agents_dir)
     # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and

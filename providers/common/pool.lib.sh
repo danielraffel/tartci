@@ -9,7 +9,8 @@
 #   2. admission state                   -> provider loops refuse to mint a new
 #      JIT runner while draining/off, without disturbing an assigned job.
 #   3. runner LaunchAgents               -> drain disables restart and lets the
-#      current exact job finish; off bootouts immediately. Both halves are
+#      current exact job finish; off bootouts immediately (and so refuses
+#      while an owned lane is mid-job unless --now names that consequence). Both halves are
 #      scoped to the services this host's pool receipt can restore, because an
 #      operation that stops more than its inverse starts is not a pause, it is
 #      a deletion (see tartci_pool_owned_runner_agents).
@@ -26,6 +27,9 @@ TARTCI_POOL_FLEET_RECEIPT="${TARTCI_POOL_FLEET_RECEIPT:-$HOME/.config/tartci/mac
 # The plist glob that is tartci's own by construction: the installer renders
 # exactly these, so they stay in scope even when the receipt is unreadable.
 TARTCI_POOL_FLEET_PLIST_GLOB='com.danielraffel.tartci.tart-runner-macos-fleet.*.plist'
+# Per-lane mid-job probe shared with `tartci launchd reload` (one definition of
+# "mid-job": the label's launchd pid owns a `tart run` or Runner.Worker).
+TARTCI_POOL_LANE_BUSY="${TARTCI_POOL_LANE_BUSY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" 2>/dev/null && pwd)/lane_busy.py}"
 
 # Read participation: 1 = participating, 0 = opted out. Absent means
 # participating — opting out is an explicit act, and a missing/garbage file must
@@ -490,6 +494,28 @@ tartci_pool_lock_handoff_to_listener() {
   [ "$(cat "$TARTCI_POOL_TRANSITION_LOCK/pid" 2>/dev/null || true)" = "$$" ] || return 1
   kill -0 "$listener_pid" 2>/dev/null || return 1
   tartci_pool_lock_release
+}
+
+# Which runner agents this host's pool owns are mid-job right now. Prints one
+# `label<TAB>state<TAB>detail` row per owned agent (state busy|idle|absent|
+# unknown) and returns 0 when none is busy or unknown, 1 when one is busy, 2
+# when any answer is unknown (including a probe that could not run at all).
+# Read-only: `launchctl print` plus one process-table read.
+tartci_pool_mid_job() {
+  local dir="${1:-$HOME/Library/LaunchAgents}" labels label rc=0
+  local -a argv=()
+  labels="$(tartci_pool_owned_runner_agents "$dir")"
+  while IFS= read -r label; do
+    [ -n "$label" ] && argv+=("$label")
+  done <<EOF
+$labels
+EOF
+  [ "${#argv[@]}" -gt 0 ] || return 0
+  python3 "$TARTCI_POOL_LANE_BUSY" "${argv[@]}" || rc=$?
+  case "$rc" in
+    0|1|2) return "$rc" ;;
+    *) printf 'lane busy probe failed (exit %s)\n' "$rc"; return 2 ;;
+  esac
 }
 
 # Return success when PARENT owns a Runner.Worker descendant. Inspection errors

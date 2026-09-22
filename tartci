@@ -28,6 +28,8 @@
 #   tartci runtime <summary|export|recent|backfill|prune|complete>
 #   tartci windows run         # boot the Windows QEMU VM (provider script)
 #   tartci pool <on|drain|off|status> # durable host admission and participation
+#                              # --plan: print the transition, write nothing;
+#                              # off refuses a mid-job lane (exit 12) unless --now
 #   tartci windows optimize    # prewarm/validate a booted Windows golden VM
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
@@ -36,6 +38,10 @@
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
+#                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
+#                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
+#   tartci launchd guard --hook  # PreToolUse classifier: block raw launchctl on lanes
+#   tartci hooks print         # print (never write) Claude/Codex hook settings
 #   tartci help
 #
 # Stores (override via env): TARTCI_HOME (default ~/.tartci) holds goldens/,
@@ -192,13 +198,13 @@ cmd_profile() {
 cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    validate|render|write-receipt|verify-installed|verify-loaded)
+    validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift)
       tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install> ..."; return 2 ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift> ..."; return 2 ;;
   esac
 }
 
@@ -357,6 +363,9 @@ cmd_launchd() {
   local sub="${1:-status}"; shift || true
   case "$sub" in
     reload) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --reload "$@" ;;
+    # PreToolUse classifier for agent shells: exit 2 blocks a raw launchctl
+    # mutation of a lane (see scripts/launchctl_guard.py, `tartci hooks print`).
+    guard) exec python3 "$HERE/scripts/launchctl_guard.py" "$@" ;;
     status) exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" --status "$@" ;;
     heal)
       # Reboot/offline rejoin convergence includes the optional per-host relay
@@ -384,7 +393,51 @@ cmd_launchd() {
       fi
       exec python3 "$HERE/scripts/tartci_launchd_watchdog.py" "$@"
       ;;
-    *) echo "usage: tartci launchd <reload <label> | status | heal> [--dry-run] [--json]"; return 2 ;;
+    *) echo "usage: tartci launchd <reload <label> [--dry-run] [--allow-mid-job] | status | heal [--dry-run] [--json] | guard <--hook|--command CMD>>"; return 2 ;;
+  esac
+}
+
+# Print (never write) the agent-harness hook settings that route every shell
+# command through `tartci launchd guard`. Installing them is the operator's
+# call: the snippet goes into ~/.claude/settings.json or a repo's
+# .codex/hooks.json by hand.
+cmd_hooks() {
+  local sub="${1:-print}"
+  case "$sub" in
+    print)
+      local shim="$HERE/hooks/claude-pretooluse-launchctl.sh"
+      cat <<JSON
+# Claude Code: merge into ~/.claude/settings.json (or .claude/settings.json)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$shim", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+
+# Codex: merge into .codex/hooks.json (same PreToolUse contract: JSON on stdin,
+# exit 2 blocks with stderr as the reason)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          { "type": "command", "command": "$shim", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
+JSON
+      ;;
+    *) echo "usage: tartci hooks print"; return 2 ;;
   esac
 }
 
@@ -416,29 +469,146 @@ tartci_pool_capacity_floor_preflight() {
   esac
 }
 
+# `tartci pool <on|off|drain> --plan`: the transition, printed, with nothing
+# written — no participation/state record, no lock, no launchctl mutation.
+# off/drain run every precondition the real transition runs and exit with its
+# refusal code (11 capacity floor, 12 mid-job off), else 0. `on` checks only
+# the installed receipt (7): its launch-helper probe, network-profile reconcile
+# and loaded-generation verification act on the host, so they run only on the
+# real `pool on`.
+tartci_pool_plan() {
+  local sub="$1" host="$2" agents_dir="$3" allow_last="$4" now="$5"
+  local part state target_state target_part verdict=0 label loaded
+  part="$(tartci_pool_read_participation)"
+  state="$(tartci_pool_read_state)"
+  case "$sub" in on) target_state=on target_part=1 ;; off) target_state=off target_part=0 ;;
+    *) target_state=draining target_part=0 ;; esac
+  echo "pool $sub --plan on $host: nothing will be changed"
+  echo "  state: $state -> $target_state; participation: $part -> $target_part"
+  local agents action
+  if [ "$sub" = on ]; then
+    action="enable + bootstrap + kickstart"
+    local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
+    if tartci_pool_fleet_managed "$agents_dir" "$fleet_receipt"; then
+      if ! agents="$(tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" verify-installed "$fleet_receipt" \
+          --config "$HOME/.config/tartci/macos-fleet-profile.toml" \
+          --agents-dir "$agents_dir" --support-root "$HERE" --print-services 2>&1)"; then
+        echo "  REFUSE: installed macOS fleet profile has no valid receipt: $agents"
+        return 7
+      fi
+    else
+      agents="$(tartci_pool_runner_agents "$agents_dir")"
+    fi
+    echo "  not checked by --plan (they act on the host; the real pool on runs them):"
+    echo "    launch-helper probe (exit 9), network-profile reconcile (6), loaded-generation verification (7)"
+  else
+    agents="$(tartci_pool_owned_runner_agents "$agents_dir")"
+    if [ "$sub" = off ]; then action="disable + bootout"; else action="disable (restart only)"; fi
+  fi
+  echo "  owned runner agents ($action):"
+  while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    loaded=stopped
+    tartci_pool_agent_loaded "$label" && loaded=running
+    printf '    %-64s %s\n' "$label" "$loaded"
+  done <<EOF
+$agents
+EOF
+  [ -n "$agents" ] || echo "    (none)"
+  [ "$sub" = on ] || tartci_pool_report_unowned "$sub" "$agents_dir" | sed 's/^/  /'
+  if [ "$sub" != on ]; then
+    local floor_output floor_rc=0
+    floor_output="$(tartci_pool_capacity_floor_preflight "$sub" "$allow_last" 2>&1)" || floor_rc=$?
+    if [ "$floor_rc" = 0 ]; then
+      echo "  capacity floor: ok${floor_output:+ ($floor_output)}"
+    else
+      echo "  capacity floor: REFUSE (exit $floor_rc): $floor_output"
+      verdict=11
+    fi
+    local mid_rows mid_rc=0 fate
+    mid_rows="$(tartci_pool_mid_job "$agents_dir" 2>&1)" || mid_rc=$?
+    if [ "$sub" = off ]; then fate="would be KILLED"; else fate="would finish its job"; fi
+    echo "  mid-job lanes:"
+    printf '%s\n' "$mid_rows" | awk -F '\t' -v fate="$fate" '
+      $2 == "busy" { printf "    %s: busy, %s (%s)\n", $1, fate, $3; found=1; next }
+      $2 == "unknown" { printf "    %s: UNKNOWN (%s)\n", $1, $3; found=1; next }
+      NF < 2 && NF > 0 { print "    " $0; found=1 }
+      END { if (!found) print "    (none)" }'
+    if [ "$sub" = off ] && [ "$mid_rc" != 0 ]; then
+      if [ "$now" = 1 ]; then
+        echo "  --now given: pool off would stop those lanes immediately"
+      else
+        # The real `off` checks mid-job before the capacity floor.
+        verdict=12
+      fi
+    fi
+  fi
+  case "$verdict" in
+    0) echo "verdict: pool $sub would proceed" ;;
+    11) echo "verdict: pool $sub would REFUSE (capacity floor; --allow-last-serving-host overrides)" ;;
+    12) echo "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, or --now)" ;;
+  esac
+  return "$verdict"
+}
+
 cmd_pool() {
   # host-level CI participation switch ("this machine, not now").
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]"
+  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  --plan   on|off|drain: print what the transition would do and write nothing
+           (off/drain: every precondition; on: the receipt check only)
+  --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  exit 11 capacity floor refused; 12 off refused because a lane is mid-job"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
   esac
-  local arg allow_last_serving_host=0
+  local arg allow_last_serving_host=0 plan=0 now=0
   for arg in "$@"; do
     case "$arg" in
       -h|--help) echo "$pool_usage"; return 0 ;;
       --allow-last-serving-host) allow_last_serving_host=1 ;;
+      --plan) plan=1 ;;
+      --now) now=1 ;;
     esac
   done
   local host; host="$(scutil --get LocalHostName 2>/dev/null || hostname -s 2>/dev/null || echo host)"
   local agents_dir="$HOME/Library/LaunchAgents"
+  if [ "$plan" = 1 ]; then
+    case "$sub" in
+      on|off|drain)
+        tartci_pool_plan "$sub" "$host" "$agents_dir" "$allow_last_serving_host" "$now"
+        return $?
+        ;;
+      *) echo "$pool_usage" >&2; return 2 ;;
+    esac
+  fi
   case "$sub" in
     on|off)
       local target=1
       [ "$sub" = off ] && target=0
       if [ "$sub" = off ]; then
+        # `off` is the emergency stop and kills whatever an owned lane is
+        # running. Refuse that unless the caller names it with --now, and do
+        # it before participation is written, so a refusal changes nothing.
+        if [ "$now" != 1 ]; then
+          local mid_job_rows mid_job_rc=0
+          mid_job_rows="$(tartci_pool_mid_job "$agents_dir" 2>&1)" || mid_job_rc=$?
+          if [ "$mid_job_rc" != 0 ]; then
+            {
+              if [ "$mid_job_rc" = 1 ]; then
+                echo "pool off refused: an owned lane is mid-job, and pool off would kill it:"
+              else
+                echo "pool off refused: could not prove every owned lane idle (busy state unknown):"
+              fi
+              printf '%s\n' "$mid_job_rows" | awk -F '\t' '$2 == "busy" || $2 == "unknown" { printf "  %s: %s (%s)\n", $1, $2, $3; next } NF < 2 && NF > 0 { print "  " $0 }'
+              echo "Use \`tartci pool drain\` to let running jobs finish, \`tartci pool off --plan\`"
+              echo "to see what off would stop, or \`tartci pool off --now\` to stop immediately anyway."
+            } >&2
+            return 12
+          fi
+        fi
         tartci_pool_capacity_floor_preflight off "$allow_last_serving_host" || return $?
         # Emergency stop deliberately bypasses the cooperative JIT-start lock.
         tartci_pool_write_participation 0
@@ -856,7 +1026,7 @@ SERVINGPY
   esac
 }
 
-usage() { sed -n '2,42p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
@@ -883,6 +1053,7 @@ case "${1:-help}" in
   serve)   shift; cmd_serve "$@" ;;
   pool)    shift; cmd_pool "$@" ;;
   launchd) shift; cmd_launchd "$@" ;;
+  hooks)   shift; cmd_hooks "$@" ;;
   help|-h|--help) usage ;;
   *) echo "unknown command: $1"; echo; usage; exit 2 ;;
 esac

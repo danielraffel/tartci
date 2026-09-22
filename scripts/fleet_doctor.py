@@ -64,8 +64,12 @@ CODES: tuple[str, ...] = (
     "hold_receipt_present",
     "installed_generation_unknown",
     "no_managed_launchagents",
+    "no_installed_profile",
     "no_persistent_runners",
     "persistent_runners_without_hold_receipt",
+    "profile_drift",
+    "profile_drift_unknown",
+    "profile_in_sync",
     "program_unresolvable",
     "readiness_not_managed",
     "readiness_probe_failed",
@@ -521,6 +525,54 @@ class Diagnosis:
                 "findings": rows}
 
 
+def check_profile_drift(result: dict | None, *, installed_present: bool,
+                        error: str = "") -> Finding:
+    """Installed fleet profile vs the checked-in profile carrying its name.
+
+    Every receipt check binds the installed copy to itself, so a host whose
+    profile was edited in place, or installed before the checked-in source
+    moved on, verifies clean everywhere else.
+    """
+    if not installed_present:
+        return Finding("profile_drift", NOT_APPLICABLE, "no_installed_profile",
+                       "no installed macOS fleet profile on this host")
+    if result is None or result.get("state") not in ("in_sync", "drift"):
+        reason = error or (result or {}).get("reason") or "drift check produced no verdict"
+        return Finding("profile_drift", UNKNOWN, "profile_drift_unknown", reason,
+                       {"result": result})
+    if result["state"] == "in_sync":
+        return Finding("profile_drift", OK, "profile_in_sync",
+                       f"installed profile matches {result.get('checked_in')}",
+                       {"checked_in": result.get("checked_in")})
+    keys = sorted([*result.get("missing_in_installed", {}),
+                   *result.get("extra_in_installed", {}),
+                   *result.get("changed", {})])
+    return Finding("profile_drift", PROBLEM, "profile_drift",
+                   f"installed profile differs from {result.get('checked_in')} at: "
+                   + ", ".join(keys),
+                   {k: result.get(k) for k in (
+                       "checked_in", "missing_in_installed",
+                       "extra_in_installed", "changed")})
+
+
+def profile_drift_probe(support_root: Path, installed: Path,
+                        python: str | None, timeout: int = 30) -> tuple[dict | None, str]:
+    if python is None:
+        return None, "no Python 3.11+ interpreter with tomllib is available"
+    script = support_root / "scripts" / "macos_fleet_lanes.py"
+    try:
+        proc = subprocess.run(
+            [python, str(script), "profile-drift", "--installed", str(installed),
+             "--profiles-dir", str(support_root / "profiles"), "--json"],
+            capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"drift check did not complete: {exc}"
+    try:
+        return json.loads(proc.stdout), ""
+    except json.JSONDecodeError:
+        return None, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -686,7 +738,9 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             config_dir: Path | None = None, support_root: Path = ROOT,
             repos: Sequence[str] | None = None, gh_cli: str | None = None,
             skip_census: bool = False,
-            probe: Callable[[Path], dict] | None = None) -> list[Finding]:
+            probe: Callable[[Path], dict] | None = None,
+            drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
+            ) -> list[Finding]:
     """Run every check against this host."""
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
     config_dir = config_dir or (home / ".config" / "tartci")
@@ -715,8 +769,16 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     config = config_dir / "macos-fleet-profile.toml"
     installed_root = Path(installed["root"]) if installed and installed.get("root") \
         else None
+    python = toml_python() if probe is None or drift_probe is None else None
+    if config.is_file():
+        drift_result, drift_error = (
+            drift_probe(config) if drift_probe is not None
+            else profile_drift_probe(support_root, config, python))
+        findings.append(check_profile_drift(
+            drift_result, installed_present=True, error=drift_error))
+    else:
+        findings.append(check_profile_drift(None, installed_present=False))
     if probe is None:
-        python = toml_python()
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default
             return readiness_probe(
