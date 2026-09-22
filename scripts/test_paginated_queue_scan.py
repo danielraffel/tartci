@@ -31,8 +31,8 @@ AUTHENTICATED_RATE_LIMIT = {
 # These cases build the scanner in this process, so its preflight would
 # otherwise read and write $HOME/.tartci/state/gh-identity.json -- the live
 # receipt of whatever machine runs the suite. A zero TTL disables the receipt
-# in both directions, so no case here can leave one behind and none can be
-# satisfied by one another case left. That is what keeps a call count a
+# in both directions: no case here can leave a receipt behind, and none can be
+# satisfied by a receipt another case left. That is what keeps a call count a
 # property of the scan rather than of the order the suite happened to run in.
 _RECEIPT_TTL_ENV = "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS"
 _saved_receipt_ttl: str | None = None
