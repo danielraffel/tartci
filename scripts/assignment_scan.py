@@ -50,6 +50,17 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from gh_identity import (
+    CLI_REFUSED,
+    NO_VALID_CREDENTIALS,
+    AuthPreflightError,
+    GitHubIdentity,
+    ScanFailure,
+    classify_failure,
+    forget_identity,
+    remember_unproven,
+    resolve_identity,
+)
 
 
 PER_PAGE = 100
@@ -287,6 +298,9 @@ class AssignmentScanner:
         self.api_calls_lock = threading.Lock()
         self.observation_lock_fd: int | None = None
         self.witness = threading.Event()
+        # Measured by the preflight and carried into every failure, so a
+        # refusal names which credential hit which ceiling.
+        self.identity: GitHubIdentity | None = None
         self.workflow_id_cache_path = Path(args.workflow_id_cache_file)
         self.stale_demand = StaleDemandClassifier(self, args)
 
@@ -350,12 +364,23 @@ class AssignmentScanner:
             )
         except (OSError, ObservationError) as error:
             raise TransientApiFault(
-                f"GitHub API unavailable for {path}: {error}"
+                str(self._reason(f"GitHub API unavailable for {path}: {error}"))
             ) from error
         if result.returncode:
-            raise TransientApiFault(
+            reason = self._reason(
                 f"GitHub API failed for {path}: {result.stderr.strip()}"
             )
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                # Retrying cannot turn an anonymous caller into an
+                # authenticated one, and each attempt spends another request
+                # from the 60/hour allowance every host behind this IP shares.
+                forget_identity()
+                raise ScanError(str(reason))
+            if reason.reason_code == CLI_REFUSED:
+                # The request never reached GitHub, so another attempt only
+                # collects the same local refusal.
+                raise ScanError(str(reason))
+            raise TransientApiFault(str(reason))
         try:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
@@ -365,6 +390,46 @@ class AssignmentScanner:
         if not isinstance(payload, dict):
             raise ScanError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def _preflight_identity(self) -> None:
+        """Refuse to read the queue behind a credential GitHub does not accept.
+
+        An unauthenticated gh does not fail: it falls back to anonymous
+        requests, which GitHub meters at 60/hour per IP for every host behind
+        one address. The scan that follows then fails closed for a reason
+        nothing records. The ceiling is read from `rate_limit`, which costs no
+        quota and answers even when the allowance is spent.
+
+        A ceiling that proves anonymity stops the scan. A probe the CLI will
+        not answer does not: `ghapp` refuses an endpoint carrying no repository
+        (the fleet's lanes run from a directory that is not a checkout), and
+        blinding every lane over that would be the outage this exists to
+        prevent. The identity is then carried as unproven, and an anonymous
+        403 is still named from GitHub's own wording.
+        """
+        try:
+            self.identity = resolve_identity(
+                lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+            )
+            return
+        except AuthPreflightError as error:
+            if error.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(error)
+        except ScanError as error:
+            reason = self._reason(str(error))
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                raise ScanError(str(reason)) from error
+            detail = str(reason)
+        self.identity = remember_unproven(self.args.gh_cli)
+        print(
+            f"assignment scan identity unproven, reading the queue anyway: {detail}",
+            file=sys.stderr,
+        )
+
+    def _reason(self, text: str) -> ScanFailure:
+        """Name a failure against the identity this scan proved it was using."""
+        return classify_failure(text, self.identity)
 
     def _retry_sleep(self, attempt: int) -> bool:
         """Back off before the next attempt, or report that none is affordable.
@@ -750,6 +815,11 @@ class AssignmentScanner:
         workflow_ids = self._cached_workflow_ids()
         total = 0
         with self._observation_lock():
+            # Inside the lock, so the identity probe is serialized, budgeted
+            # and bounded exactly like every other call this scan makes, and
+            # before the first GitHub read so an anonymous caller is refused
+            # rather than spending the shared 60/hour allowance.
+            self._preflight_identity()
             if workflow_ids is None:
                 workflow_ids = self._workflow_ids()
                 self._store_workflow_ids(workflow_ids)
@@ -938,10 +1008,20 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    scanner: AssignmentScanner | None = None
     try:
-        print(AssignmentScanner(parse_args()).scan())
-    except (ScanError, ValueError) as error:
+        args = parse_args()
+        scanner = AssignmentScanner(args)
+        print(scanner.scan())
+    except AuthPreflightError as error:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)
+        return 2
+    except (ScanError, ValueError) as error:
+        identity = scanner.identity if scanner is not None else None
+        print(
+            f"assignment scan failed closed: {classify_failure(str(error), identity)}",
+            file=sys.stderr,
+        )
         return 2
     return 0
 

@@ -23,11 +23,45 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+
+# The scanners prove which credential they are using before they read the
+# queue, so a fake GitHub must answer that question too. 15000/hour is the
+# ceiling a GitHub App installation token reports; 60 would be the anonymous
+# fallback the preflight exists to refuse.
+AUTHENTICATED_RATE_LIMIT = {
+    "resources": {"core": {"limit": 15000, "remaining": 14999, "reset": 1}}
+}
+
+
+# These cases build the scanner in this process, so its preflight would
+# otherwise read and write $HOME/.tartci/state/gh-identity.json -- the live
+# receipt of whatever machine runs the suite. A zero TTL disables the receipt
+# in both directions: no case here can leave a receipt behind, and none can be
+# satisfied by a receipt another case left. That is what keeps a call count a
+# property of the scan rather than of the order the suite happened to run in.
+_RECEIPT_TTL_ENV = "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS"
+_saved_receipt_ttl: str | None = None
+
+
+def setUpModule() -> None:
+    global _saved_receipt_ttl
+    _saved_receipt_ttl = os.environ.get(_RECEIPT_TTL_ENV)
+    os.environ[_RECEIPT_TTL_ENV] = "0"
+
+
+def tearDownModule() -> None:
+    if _saved_receipt_ttl is None:
+        os.environ.pop(_RECEIPT_TTL_ENV, None)
+    else:
+        os.environ[_RECEIPT_TTL_ENV] = _saved_receipt_ttl
+
 
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"
@@ -66,6 +100,8 @@ def _api(job: dict[str, Any]) -> Callable[[str], dict[str, Any]]:
     run = _run(4242)
 
     def api(path: str) -> dict[str, Any]:
+        if path == "rate_limit":
+            return AUTHENTICATED_RATE_LIMIT
         if path.endswith("/actions/workflows?per_page=100"):
             return {"workflows": [{"id": 99, "name": "Build and Test"}]}
         if "status=in_progress" in path or "status=queued" in path:

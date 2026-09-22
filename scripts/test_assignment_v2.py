@@ -68,6 +68,9 @@ from urllib.parse import parse_qs, urlparse
 
 state = json.load(open(os.environ["ASSIGNMENT_STATE"], encoding="utf-8"))
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 if state.get("api_fail") and "/runs?" in path:
     raise SystemExit(9)
 parsed = urlparse("https://example.invalid/" + path)
@@ -670,6 +673,8 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
             ),
         )
         scanner._observation_lock = lambda: contextlib.nullcontext()
+        # This test is about worker parallelism; identity is proven elsewhere.
+        scanner._preflight_identity = lambda: None
         scanner._cached_workflow_ids = lambda: {"Build and Test": 99}
         scanner._ordered_run_listings = lambda _ids: ["runs?status=queued"]
         scanner._walk_listing = (
@@ -749,6 +754,9 @@ print(json.dumps({'total_count': 0, 'workflows': []}))
 
     _HANGING_JOBS_GH = """#!/usr/bin/env python3
 import json, sys, time
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); q = parse_qs(p.query)
 if p.path.endswith('/actions/workflows'):
@@ -893,6 +901,9 @@ else:
                 gh,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1])
 if p.path.endswith('/actions/workflows'):
@@ -966,6 +977,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); q = parse_qs(p.query); page = int(q.get('page', ['1'])[0]); status = q.get('status', [''])[0]
 if p.path.endswith('/actions/workflows'):
@@ -1000,6 +1014,9 @@ else: raise SystemExit(4)
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 if '/actions/workflows?' in sys.argv[-1]:
     print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
 elif '/jobs' in sys.argv[-1]:
@@ -1027,6 +1044,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 if '/actions/workflows?' in sys.argv[-1]:
     print(json.dumps({'total_count': 1, 'workflows': [{'id': 99, 'name': 'Build and Test'}]}))
 else:
@@ -1049,7 +1069,11 @@ else:
             fake = Path(directory) / "fake-gh"
             _write_exec(
                 fake,
-                "#!/usr/bin/env python3\nimport json\n"
+                "#!/usr/bin/env python3\nimport json, sys\n"
+                "if sys.argv[-1] == 'rate_limit':\n"
+                "    print(json.dumps({'resources': {'core': "
+                "{'limit': 15000, 'remaining': 14999}}}))\n"
+                "    raise SystemExit(0)\n"
                 "print(json.dumps({'total_count': 2, 'workflows': "
                 "[{'id': 1, 'name': 'Build and Test'}, {'id': 2, 'name': 'Build and Test'}]}))\n",
             )
@@ -1071,6 +1095,9 @@ else:
                 fake,
                 """#!/usr/bin/env python3
 import json, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 p = urlparse('https://x/' + sys.argv[-1]); page = int(parse_qs(p.query).get('page', ['1'])[0])
 if p.path.endswith('/actions/workflows'):
@@ -1218,6 +1245,9 @@ class AssignmentScannerTransientFaultTests(unittest.TestCase):
     #: actually re-issued the failed call rather than skipping it.
     _GH = '''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 
 FAIL_ON = os.environ["FAKE_GH_FAIL_ON"]
@@ -1398,6 +1428,9 @@ class AssignmentScannerWitnessTests(unittest.TestCase):
 
     _GH = '''#!/usr/bin/env python3
 import json, os, sys
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 from urllib.parse import parse_qs, urlparse
 
 LEDGER = os.environ["FAKE_GH_LEDGER"]
@@ -1580,6 +1613,15 @@ if FAIL_ON and FAIL_ON in target:
     sys.stderr.write("net/http: TLS handshake timeout\\n")
     raise SystemExit(1)
 
+if target == "rate_limit":
+    # These cases price the queue walk, so the identity probe in front of it
+    # is answered with the ceiling an App installation token reports. Left
+    # unanswered it would be retried, and those attempts would be counted
+    # here as if the walk had made them.
+    print(json.dumps({"resources": {"core": {
+        "limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
+
 p = urlparse("https://x/" + target)
 status = parse_qs(p.query).get("status", [""])[0]
 
@@ -1623,6 +1665,12 @@ else:
         environment = dict(
             os.environ, LEDGER=str(ledger),
             QUEUED=str(self.QUEUED), INPROG=str(self.INPROG),
+            # Each scan is an independent measurement, so it proves its own
+            # identity rather than inheriting a receipt from a previous scan
+            # -- or, worse, from the real fleet state in this user's home.
+            TARTCI_GH_IDENTITY_RECEIPT_FILE=str(
+                ledger.parent / f"{ledger.name}-identity.json"
+            ),
             **{key: str(value) for key, value in envx.items()},
         )
         result = subprocess.run(
@@ -1646,8 +1694,10 @@ else:
             "queued": len([c for c in calls if "status=queued" in c]),
             "in_progress": len([c for c in calls if "status=in_progress" in c]),
             "jobs": len([c for c in calls if "/jobs?" in c]),
+            "probe": len([c for c in calls if c == "rate_limit"]),
             "total": len(calls),
         }
+        census["queue"] = census["total"] - census["probe"]
         runs = [int(c.split("/actions/runs/", 1)[1].split("/", 1)[0])
                 for c in calls if "/jobs?" in c]
         return result, census, runs
@@ -1675,13 +1725,18 @@ else:
         empty, empty_census, _ = self._scan(MATCH="")
         self.assertEqual(found.stdout.strip(), "1")
         self.assertEqual(empty.stdout.strip(), "0")
+        # The identity probe is a fixed, quota-free call every scan makes
+        # before it reads anything, so it is priced separately: it is the one
+        # cost that does not move with what the walk finds.
+        self.assertEqual(found_census["probe"], 1, found_census)
+        self.assertEqual(empty_census["probe"], 1, empty_census)
         # Workflow listing, queued listing, one run's jobs. Nothing else.
-        self.assertEqual(found_census["total"], 3, found_census)
+        self.assertEqual(found_census["queue"], 3, found_census)
         # Both listings, plus every run in both of them.
         self.assertEqual(
-            empty_census["total"], 3 + self.QUEUED + self.INPROG, empty_census
+            empty_census["queue"], 3 + self.QUEUED + self.INPROG, empty_census
         )
-        self.assertGreater(empty_census["total"], 5 * found_census["total"])
+        self.assertGreater(empty_census["queue"], 5 * found_census["queue"])
 
     def test_absence_is_reported_only_after_every_run_is_examined(self) -> None:
         """The fail-closed half: zero is a claim about everywhere.

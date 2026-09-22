@@ -19,13 +19,34 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
+from gh_identity import (
+    NO_VALID_CREDENTIALS,
+    AuthPreflightError,
+    GitHubIdentity,
+    classify_failure,
+    forget_identity,
+    remember_unproven,
+    resolve_identity,
+)
 
 RUNS_PER_PAGE = 100
 
 
 class GitHubApiError(RuntimeError):
-    def __init__(self, path: str, returncode: int, stderr: str) -> None:
-        super().__init__(f"GitHub API failed for {path}: {stderr.strip()}")
+    def __init__(
+        self,
+        path: str,
+        returncode: int,
+        stderr: str,
+        identity: "GitHubIdentity | None" = None,
+    ) -> None:
+        # The message leads with a reason code so the cause survives every
+        # hop to the operator log. A scan that reports only that it failed
+        # reads there exactly like a queue with nothing in it.
+        self.reason = classify_failure(
+            f"GitHub API failed for {path}: {stderr.strip()}", identity
+        )
+        super().__init__(str(self.reason))
         self.status = 404 if "HTTP 404" in stderr or "404 Not Found" in stderr else None
         self.returncode = returncode
 
@@ -119,6 +140,45 @@ class QueueScanner:
         self.exclude_assigned = bool(getattr(args, "exclude_assigned", 0))
         self.api_calls = 0
         self.observation_lock_fd: int | None = None
+        # Measured by the preflight and carried into every failure, so a
+        # refusal names which credential hit which ceiling.
+        self.identity: GitHubIdentity | None = None
+
+    def _preflight_identity(self) -> None:
+        """Refuse to read the queue behind a credential GitHub does not accept.
+
+        An unauthenticated gh does not fail: it falls back to anonymous
+        requests, which GitHub meters at 60/hour per IP for every host behind
+        one address. The scan that follows then fails closed for a reason
+        nothing records. The ceiling is read from `rate_limit`, which costs no
+        quota and answers even when the allowance is spent.
+
+        A ceiling that proves anonymity stops the scan. A probe the CLI will
+        not answer does not: `ghapp` refuses an endpoint carrying no repository
+        (the fleet's lanes run from a directory that is not a checkout), and
+        blinding every lane over that would be the outage this exists to
+        prevent. The identity is then carried as unproven, and an anonymous
+        403 is still named from GitHub's own wording.
+        """
+        try:
+            self.identity = resolve_identity(
+                lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+            )
+            return
+        except AuthPreflightError as error:
+            if error.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(error)
+        except (OSError, RuntimeError, ValueError) as error:
+            reason = classify_failure(str(error), None)
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(reason)
+        self.identity = remember_unproven(self.args.gh_cli)
+        print(
+            f"queue scan identity unproven, reading the queue anyway: {detail}",
+            file=os.sys.stderr,
+        )
 
     def _gh(self, path: str) -> dict[str, Any]:
         if self.api_calls >= self.args.max_api_calls:
@@ -135,7 +195,10 @@ class QueueScanner:
             else (),
         )
         if result.returncode:
-            raise GitHubApiError(path, result.returncode, result.stderr)
+            error = GitHubApiError(path, result.returncode, result.stderr, self.identity)
+            if error.reason.reason_code == NO_VALID_CREDENTIALS:
+                forget_identity()
+            raise error
         payload = json.loads(result.stdout)
         if not isinstance(payload, dict):
             raise ValueError(f"GitHub API returned non-object for {path}")
@@ -444,6 +507,9 @@ class QueueScanner:
             with self._observation_lock():
                 self.now = int(time.time())
                 self.api_calls = 0
+                # Inside the lock, so the identity probe is serialized,
+                # budgeted and bounded exactly like every other call.
+                self._preflight_identity()
                 runs = self._runs(discovery)
                 candidates, backlog_ids = self._candidate_runs(runs, discovery)
                 discovered: list[dict[str, Any]] = []
@@ -684,6 +750,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    scanner: QueueScanner | None = None
     try:
         if args.stagger_max_seconds:
             identity = "\0".join(
@@ -699,7 +766,11 @@ def main() -> int:
                 args.stagger_max_seconds * 1000
             )
             time.sleep(delay_ms / 1000)
-        count = QueueScanner(args).scan()
+        scanner = QueueScanner(args)
+        count = scanner.scan()
+    except AuthPreflightError as exc:
+        print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
+        return 1
     except (
         OSError,
         RuntimeError,
@@ -707,7 +778,12 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
+        probed = scanner.identity if scanner is not None else None
+        print(
+            f"queue scan failed ({args.provider}): "
+            f"{classify_failure(str(exc), probed)}",
+            file=os.sys.stderr,
+        )
         return 1
     print(count)
     return 0
