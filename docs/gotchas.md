@@ -212,6 +212,43 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
 ## Queue and pool control
 
+- **A `launchctl bootstrap` of a present, untouched runner plist fails with
+  `Bootstrap failed: 5: Input/output error`.**
+  → *Cause:* the service is `disable`d in the launchd user domain, and
+  `bootstrap` will not load a disabled service. The error names neither the
+  service nor the cause, survives a settle and a retry, and therefore reads as a
+  transient I/O fault. Confirm with `launchctl print-disabled "gui/$(id -u)" |
+  grep <label>`, which is the only surface that says so.
+  → *Fix:* enable first, then bootstrap — a bare bootstrap cannot work:
+
+  ```sh
+  launchctl enable    "gui/$(id -u)/actions.runner.OWNER-REPO.RUNNER-NAME"
+  launchctl bootstrap "gui/$(id -u)" \
+    "$HOME/Library/LaunchAgents/actions.runner.OWNER-REPO.RUNNER-NAME.plist"
+  ```
+
+  → *How a service got disabled without anyone disabling it:* `tartci pool off`
+  and `tartci pool drain` used to `launchctl disable` every runner agent on
+  disk, while `pool on` re-enables only the services the fleet receipt names.
+  Scoped since; see "a pool transition stops only what it can start" below.
+
+- **A pool transition stops only what it can start.**
+  `pool on` activates exactly the services the installed fleet receipt names and
+  refuses to start unreceipted persistent or legacy runner services, which carry
+  their own install authority. `pool off` and `pool drain` are scoped to that
+  same set, and name on stdout every runner agent they deliberately left alone.
+  → *Why:* the unscoped version took down a foreign repository's persistent
+  Actions runner twice (2026-09-05, 2026-09-21). Both times it was the sole
+  server of a required check, both times the loss was invisible — the plist
+  stayed on disk, so every file-existence check passed — and the second time it
+  blocked PRs for ~18 hours. An operation that stops more than its inverse
+  starts is not a pause, it is a deletion.
+  → *Consequence:* on a receipted host, stopping an unreceipted runner is now a
+  deliberate act with its own authority (`launchctl bootout` it directly, or
+  uninstall it through whatever installed it). `tartci pool status` marks which
+  runner agents are outside the receipt, in text and under `pool_owned` in
+  `--json`.
+
 - **Nothing merges for hours; adding runners does not help.**
   → *Cause:* the merge queue is building more entries in parallel than the runner
   pool can serve, so no entry finishes inside `check_response_timeout_minutes` —

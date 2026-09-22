@@ -558,7 +558,7 @@ cmd_pool() {
           fi
         fi
       done <<EOF
-$([ "$sub" = on ] && printf '%s\n' "$activation_agents" || tartci_pool_runner_agents "$agents_dir")
+$([ "$sub" = on ] && printf '%s\n' "$activation_agents" || tartci_pool_owned_runner_agents "$agents_dir")
 EOF
       if [ "$sub" = on ]; then
         if [ "$load_failed" = 0 ] && [ -n "$fleet_plists" ]; then
@@ -627,6 +627,7 @@ EOF
       echo "state: $sub; participation: $target"
       echo "runner agents changed: $n"
       if [ "$sub" = off ]; then
+        tartci_pool_report_unowned off "$agents_dir"
         echo "opted OUT: $host agents unloaded immediately (pool off is not a drain)"
       else
         echo "opted IN: $host is participating in the CI pool"
@@ -667,20 +668,27 @@ EOF
       # Persist no-new-admission before touching any process. Native leases see
       # participation=0; cooperative providers observe pool-state=draining.
       tartci_pool_write_state draining
+      # Scoped to receipt-owned agents: `launchctl disable` suppresses restart
+      # until something enables the service again, and the only thing that does
+      # is `pool on`, which activates the receipted set. Disabling an unowned
+      # runner here retires it permanently and across reboots.
       local label launchd_target
       while IFS= read -r label; do
         [ -n "$label" ] || continue
         launchd_target="$(tartci_pool_launchd_target "$label")"
         launchctl disable "$launchd_target" >/dev/null 2>&1 || true
       done <<EOF
-$(tartci_pool_runner_agents "$agents_dir")
+$(tartci_pool_owned_runner_agents "$agents_dir")
 EOF
       tartci_pool_lock_release
+      # Reported before the held-idle refusal below, so a drain that exits
+      # pending still says which runners it left to their own authority.
+      tartci_pool_report_unowned drain "$agents_dir"
       # Ephemeral providers finish their blocking run_one and then wait at the
       # admission gate. Only hosts with a persistent Actions service need the
       # detached receipt watcher; provider-only hosts terminalize immediately.
       local persistent_agents
-      persistent_agents="$(tartci_pool_runner_agents "$agents_dir" | grep '^actions[.]runner[.]' || true)"
+      persistent_agents="$(tartci_pool_owned_runner_agents "$agents_dir" | grep '^actions[.]runner[.]' || true)"
       if [ -n "$persistent_agents" ]; then
         mkdir -p "$HOME/Library/Logs/tartci"
         nohup "$HERE/tartci" pool _drain-watch \
@@ -732,15 +740,22 @@ EOF
           fi
         fi
       fi
+      # A runner agent this host's pool receipt does not name is one no pool
+      # transition starts or stops. Reporting that per runner is what makes a
+      # lane outside the fleet's model visible here instead of only in a queue
+      # that silently stops draining.
+      local pool_owned_labels
+      pool_owned_labels="$(tartci_pool_owned_runner_agents "$agents_dir")"
       if [ "$status_json" = 1 ]; then
         printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"runners":[' \
           "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness"
-        local first=1 label loaded
+        local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
           loaded=false; tartci_pool_agent_loaded "$label" && loaded=true
+          owned=false; tartci_pool_label_in_set "$label" "$pool_owned_labels" && owned=true
           [ "$first" = 1 ] || printf ','
-          printf '{"label":"%s","loaded":%s}' "$label" "$loaded"; first=0
+          printf '{"label":"%s","loaded":%s,"pool_owned":%s}' "$label" "$loaded" "$owned"; first=0
         done <<EOF
 $(tartci_pool_runner_agents "$agents_dir")
 EOF
@@ -804,11 +819,14 @@ else:
     print("fleet ready: unknown (legacy/unmanaged)")
 PY
         echo "runner agents:"
-        local label loaded any=0
+        local label loaded any=0 ownership
         while IFS= read -r label; do
           [ -n "$label" ] || continue; any=1
           loaded=stopped; tartci_pool_agent_loaded "$label" && loaded=loaded
-          printf '  %-56s %s\n' "$label" "$loaded"
+          ownership=""
+          tartci_pool_label_in_set "$label" "$pool_owned_labels" \
+            || ownership="  (outside the pool receipt: pool on/off leaves it alone)"
+          printf '  %-56s %s%s\n' "$label" "$loaded" "$ownership"
         done <<EOF
 $(tartci_pool_runner_agents "$agents_dir")
 EOF

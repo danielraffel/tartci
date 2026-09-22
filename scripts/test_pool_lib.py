@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import json
 import plistlib
+import re
 import shlex
 import subprocess
 import tempfile
@@ -679,6 +680,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "TARTCI_POOL_STATE_FILE": str(state),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(hold),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
@@ -706,6 +710,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "TARTCI_POOL_STATE_FILE": str(state),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(hold),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
@@ -736,6 +743,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "TARTCI_POOL_STATE_FILE": str(state),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(hold),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
@@ -764,6 +774,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "FAKE_LAUNCHCTL_LOG": str(log),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(hold),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                     "TARTCI_POOL_STATE_FILE": str(state),
                 },
             )
@@ -791,6 +804,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "TARTCI_POOL_STATE_FILE": str(state),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(hold),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
@@ -810,6 +826,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                     "FAKE_LAUNCHCTL_LOG": str(log),
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(Path(td) / "absent"),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=1", proc.stderr)
@@ -824,6 +843,9 @@ class PersistentRunnerDrainTests(unittest.TestCase):
                 {
                     "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(Path(td) / "absent"),
                     "TARTCI_POOL_TRANSITION_LOCK": str(Path(td) / "lock"),
+                    # A fake host must not inherit the real host's fleet
+                    # receipt: it decides which agents a transition owns.
+                    "TARTCI_POOL_FLEET_RECEIPT": str(Path(td) / "absent-receipt.json"),
                 },
             )
             self.assertEqual(proc.stdout.strip(), "rc=0", proc.stderr)
@@ -955,6 +977,411 @@ class ProviderAdmissionContractTests(unittest.TestCase):
         self.assertIn('tartci_pool_read_state)" != on', body)
         self.assertIn('kill -0 "$owner"', body)
         self.assertIn("owner pid is missing or malformed", body)
+
+
+class TransitionOwnershipTests(unittest.TestCase):
+    """A pool transition must stop exactly what its inverse can start.
+
+    `tartci pool on` activates only the services the installed fleet receipt
+    names, and deliberately refuses to start unreceipted persistent or legacy
+    runner services. `pool off` and `pool drain` once acted on every runner
+    agent on disk, so they retired lanes no `pool on` would ever bring back —
+    twice taking down a foreign repository's persistent Actions runner that was
+    the sole server of a required check, silently, because the plist stayed on
+    disk. An operation that stops more than its inverse starts is not a pause,
+    it is a deletion.
+    """
+
+    FLEET_LABEL = "com.danielraffel.tartci.tart-runner-macos-fleet.studio.pulp-gate"
+    UNOWNED_PERSISTENT = "actions.runner.danielraffel-Shipyard.Shipyard-studio-02"
+    UNOWNED_LEGACY = "com.danielraffel.pulp.tart-runner-macos-release"
+
+    def _host(
+        self,
+        root: Path,
+        *,
+        receipt: dict | None,
+        labels: tuple[str, ...],
+    ) -> tuple[Path, Path, dict[str, str]]:
+        """A fake host: an agents dir, an optional fleet receipt, fake launchctl."""
+        home = root / "home"
+        agents = home / "Library" / "LaunchAgents"
+        agents.mkdir(parents=True)
+        for label in labels:
+            with (agents / f"{label}.plist").open("wb") as handle:
+                plistlib.dump(
+                    {"Label": label, "ProgramArguments": ["/bin/true"]}, handle
+                )
+        config = home / ".config" / "tartci"
+        config.mkdir(parents=True)
+        if receipt is not None:
+            (config / "macos-fleet-install.json").write_text(json.dumps(receipt))
+
+        fake_bin = root / "bin"
+        fake_bin.mkdir()
+        launchctl_log = root / "launchctl.log"
+        for name, body in {
+            "scutil": "#!/bin/sh\nprintf 'test-host\\n'\n",
+            # Logs every invocation; `print` fails so a label reads as stopped
+            # and `bootout` reports the service was there to stop.
+            "launchctl": (
+                "#!/bin/sh\n"
+                'printf \'%s\\n\' "$*" >>"$FAKE_LAUNCHCTL_LOG"\n'
+                '[ "$1" = print ] && exit 1\n'
+                "exit 0\n"
+            ),
+            "nohup": "#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$FAKE_NOHUP_LOG\"\n",
+        }.items():
+            script = fake_bin / name
+            script.write_text(body)
+            script.chmod(0o755)
+
+        env = os.environ.copy()
+        env.update(
+            {
+                "HOME": str(home),
+                "PATH": f"{fake_bin}:{env['PATH']}",
+                "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
+                "FAKE_NOHUP_LOG": str(root / "nohup.log"),
+                "TARTCI_POOL_STATE_FILE": str(root / "state"),
+                "TARTCI_POOL_PARTICIPATION_FILE": str(root / "participation"),
+                "TARTCI_POOL_TRANSITION_LOCK": str(root / "lock"),
+                "TARTCI_POOL_PERSISTENT_HOLD_FILE": str(root / "hold"),
+            }
+        )
+        return agents, launchctl_log, env
+
+    def _pool(self, env: dict[str, str], *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(ROOT / "tartci"), "pool", *args],
+            cwd=ROOT, env=env, text=True, capture_output=True, check=False,
+        )
+
+    @staticmethod
+    def _receipt(*labels: str) -> dict:
+        return {
+            "schema": 3,
+            "plists": {f"{label}.plist": {"sha256": "x"} for label in labels},
+            "persistent_plists": {},
+        }
+
+    # ── the regression ──────────────────────────────────────────────────────
+
+    def test_pool_off_does_not_stop_a_runner_it_cannot_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, log, env = self._host(
+                root,
+                receipt=self._receipt(self.FLEET_LABEL),
+                labels=(self.FLEET_LABEL, self.UNOWNED_PERSISTENT, self.UNOWNED_LEGACY),
+            )
+            proc = self._pool(env, "off")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            calls = log.read_text()
+
+            # Control: the transition ran and did stop what it owns. Without
+            # this, "the unowned runner was not touched" would also be the
+            # reading for a `pool off` that did nothing at all.
+            self.assertIn(f"bootout gui/{os.getuid()}/{self.FLEET_LABEL}", calls)
+            self.assertIn(f"disable gui/{os.getuid()}/{self.FLEET_LABEL}", calls)
+
+            # The finding: neither unowned service was stopped, and — the part
+            # that made recovery non-obvious — neither was left `disabled` in
+            # the launchd user domain, where a bare `bootstrap` fails with an
+            # uninformative "Input/output error".
+            for label in (self.UNOWNED_PERSISTENT, self.UNOWNED_LEGACY):
+                self.assertNotIn(f"bootout gui/{os.getuid()}/{label}", calls)
+                self.assertNotIn(f"disable gui/{os.getuid()}/{label}", calls)
+
+    def test_pool_off_names_every_runner_it_left_alone(self) -> None:
+        # Leaving a lane running is only safe if it is said out loud: the 2026
+        # outages were invisible because the plist stayed on disk and nothing
+        # reported the lane as out of scope.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, _, env = self._host(
+                root,
+                receipt=self._receipt(self.FLEET_LABEL),
+                labels=(self.FLEET_LABEL, self.UNOWNED_PERSISTENT),
+            )
+            proc = self._pool(env, "off")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("not touched by pool off", proc.stdout)
+            self.assertIn(self.UNOWNED_PERSISTENT, proc.stdout)
+            self.assertIn("pool on", proc.stdout)
+
+    def test_pool_drain_does_not_disable_a_runner_it_cannot_restore(self) -> None:
+        # `launchctl disable` survives a reboot and is exactly what `pool on`
+        # reverses — for receipted services only. Drain carries the same
+        # asymmetry as off and needs the same scope.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, log, env = self._host(
+                root,
+                receipt=self._receipt(self.FLEET_LABEL),
+                labels=(self.FLEET_LABEL, self.UNOWNED_PERSISTENT),
+            )
+            proc = self._pool(env, "drain")
+            calls = log.read_text() if log.exists() else ""
+            self.assertIn(f"disable gui/{os.getuid()}/{self.FLEET_LABEL}", calls)
+            self.assertNotIn(f"disable gui/{os.getuid()}/{self.UNOWNED_PERSISTENT}", calls)
+            self.assertIn(self.UNOWNED_PERSISTENT, proc.stdout)
+
+    def test_unmanaged_host_still_stops_every_runner_agent(self) -> None:
+        # No receipt and no fleet plists: `pool on` enumerates and activates
+        # every runner agent there, so `off` stopping all of them is already
+        # symmetric. Scoping must not quietly strip an unmanaged host of its
+        # ability to opt out.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, log, env = self._host(
+                root,
+                receipt=None,
+                labels=(self.UNOWNED_PERSISTENT, self.UNOWNED_LEGACY),
+            )
+            proc = self._pool(env, "off")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            calls = log.read_text()
+            for label in (self.UNOWNED_PERSISTENT, self.UNOWNED_LEGACY):
+                self.assertIn(f"bootout gui/{os.getuid()}/{label}", calls)
+            self.assertNotIn("not touched by pool off", proc.stdout)
+
+    def test_pool_status_reports_which_runners_a_transition_owns(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, _, env = self._host(
+                root,
+                receipt=self._receipt(self.FLEET_LABEL),
+                labels=(self.FLEET_LABEL, self.UNOWNED_PERSISTENT),
+            )
+            proc = self._pool(env, "status", "--json")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            owned = {
+                row["label"]: row["pool_owned"]
+                for row in json.loads(proc.stdout)["runners"]
+            }
+            self.assertEqual(
+                owned,
+                {self.FLEET_LABEL: True, self.UNOWNED_PERSISTENT: False},
+            )
+
+    # ── the ownership helpers ───────────────────────────────────────────────
+
+    def _owned(self, agents: Path, receipt: Path | None) -> list[str]:
+        env = {"TARTCI_POOL_FLEET_RECEIPT": str(receipt) if receipt else "/nonexistent"}
+        proc = _bash(f"source {LIB}; tartci_pool_owned_runner_agents {agents}", env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.split()
+
+    def test_receipt_services_reads_lane_and_persistent_plists(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            receipt = Path(td) / "receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    {
+                        "schema": 4,
+                        "plists": {f"{self.FLEET_LABEL}.plist": {}},
+                        "persistent_plists": {
+                            "actions.runner.danielraffel-pulp.pulp-preamble-m5.plist": {}
+                        },
+                    }
+                )
+            )
+            proc = _bash(f"source {LIB}; tartci_pool_receipt_services {receipt}")
+            self.assertEqual(
+                sorted(proc.stdout.split()),
+                sorted(
+                    [
+                        self.FLEET_LABEL,
+                        "actions.runner.danielraffel-pulp.pulp-preamble-m5",
+                    ]
+                ),
+                proc.stderr,
+            )
+
+    def test_declared_persistent_runner_is_owned_and_stoppable(self) -> None:
+        # The inverse guard: a persistent Actions runner the profile declares
+        # IS receipted, so `pool on` restores it and `pool off` must still stop
+        # it. Scoping must not turn every actions.runner.* service untouchable.
+        declared = "actions.runner.danielraffel-pulp.pulp-preamble-m5"
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            receipt = self._receipt(self.FLEET_LABEL)
+            receipt["persistent_plists"] = {f"{declared}.plist": {"sha256": "x"}}
+            _, log, env = self._host(
+                root,
+                receipt=receipt,
+                labels=(self.FLEET_LABEL, declared, self.UNOWNED_PERSISTENT),
+            )
+            proc = self._pool(env, "off")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            calls = log.read_text()
+            self.assertIn(f"bootout gui/{os.getuid()}/{declared}", calls)
+            self.assertNotIn(f"bootout gui/{os.getuid()}/{self.UNOWNED_PERSISTENT}", calls)
+
+    def test_unreadable_receipt_falls_back_to_tartcis_own_fleet_plists(self) -> None:
+        # A fleet host whose receipt is corrupt can still be stopped, but only
+        # over the plists tartci renders itself. Anything else keeps its own
+        # authority until the receipt is repaired — the safe direction, since
+        # the failure mode being fixed is stopping too much.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            for label in (self.FLEET_LABEL, self.UNOWNED_PERSISTENT):
+                (agents / f"{label}.plist").write_text("<plist/>")
+            receipt = root / "receipt.json"
+            receipt.write_text("{ this is not json")
+            self.assertEqual(self._owned(agents, receipt), [self.FLEET_LABEL])
+
+    def test_receipt_naming_an_uninstalled_service_owns_nothing_extra(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            agents = root / "agents"
+            agents.mkdir()
+            (agents / f"{self.FLEET_LABEL}.plist").write_text("<plist/>")
+            receipt = root / "receipt.json"
+            receipt.write_text(
+                json.dumps(
+                    self._receipt(self.FLEET_LABEL, f"{self.FLEET_LABEL}.slot2")
+                )
+            )
+            self.assertEqual(self._owned(agents, receipt), [self.FLEET_LABEL])
+
+    def test_membership_survives_pipefail_and_a_long_set(self) -> None:
+        # `printf | grep -Fxq` reports FAILURE for a match under `set -o
+        # pipefail` once the set outgrows the pipe buffer: grep exits on the
+        # first match and printf takes SIGPIPE. The repo already carries one
+        # scar from that shape (tartci_pool_agent_loaded); the ownership probe
+        # must not reintroduce it, and it is size-dependent, so prove it on a
+        # set far larger than a pipe buffer with the hit at the very front.
+        labels = "\n".join(
+            [self.UNOWNED_PERSISTENT] + [f"filler.label.{n:05d}" for n in range(20000)]
+        )
+        proc = _bash(
+            f"source {LIB}; set -o pipefail; "
+            f"printf '%s\\n' {shlex.quote(labels)} | grep -Fxq {self.UNOWNED_PERSISTENT}; "
+            "legacy=$?; "
+            f"tartci_pool_label_in_set {self.UNOWNED_PERSISTENT} {shlex.quote(labels)}; "
+            "current=$?; echo legacy=$legacy current=$current"
+        )
+        fields = dict(f.split("=") for f in proc.stdout.strip().split())
+        # Control: the pipeline shape really does fail on a match here, so a
+        # passing `current` is evidence about the helper, not about the host.
+        self.assertNotEqual(fields["legacy"], "0", proc.stderr)
+        self.assertEqual(fields["current"], "0", proc.stderr)
+
+        miss = _bash(
+            f"source {LIB}; set -o pipefail; "
+            f"tartci_pool_label_in_set absent.label {shlex.quote(labels)}; echo rc=$?"
+        )
+        self.assertEqual(miss.stdout.strip(), "rc=1", miss.stderr)
+
+    def test_membership_matches_whole_labels_only(self) -> None:
+        for label, haystack, expected in (
+            ("a.b", "a.b\nc.d", "rc=0"),
+            ("a.b", "a.b.slot2\nc.d", "rc=1"),  # prefix must not match
+            ("b", "a.b\nc.d", "rc=1"),          # suffix must not match
+            ("a.b", "", "rc=1"),
+        ):
+            with self.subTest(label=label, haystack=haystack):
+                proc = _bash(
+                    f"source {LIB}; tartci_pool_label_in_set "
+                    f"{shlex.quote(label)} {shlex.quote(haystack)}; echo rc=$?"
+                )
+                self.assertEqual(proc.stdout.strip(), expected, proc.stderr)
+
+    def test_host_with_no_runner_agents_owns_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            agents = Path(td) / "agents"
+            agents.mkdir()
+            self.assertEqual(self._owned(agents, None), [])
+
+    # ── drift guards ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _raw_enumerations(body: str) -> list[str]:
+        """Lines calling the unscoped enumeration, not the owned/unowned pair."""
+        return [
+            line.strip()
+            for line in body.splitlines()
+            if re.search(r"(?<![\w-])tartci_pool_runner_agents\b", line)
+        ]
+
+    def test_only_read_only_surfaces_enumerate_unowned_runner_agents(self) -> None:
+        # The defect was a single enumeration call in a destructive loop, so
+        # catch the next one at the source: name every place the unscoped
+        # enumeration may still be called, and require the rest to go through
+        # the receipt-owned subset.
+        source = (ROOT / "tartci").read_text()
+        on_off = source.index("    on|off)")
+        drain = source.index("    drain)", on_off)
+        watch = source.index("    _drain-watch)", drain)
+        status = source.index("    status)", watch)
+
+        # `on` on an unmanaged host activates the full enumeration; that IS the
+        # restorative set, which is why `off` may mirror it there.
+        self.assertEqual(
+            self._raw_enumerations(source[on_off:drain]),
+            ['activation_agents="$(tartci_pool_runner_agents "$agents_dir")"'],
+        )
+        # Nothing destructive may widen its own scope.
+        self.assertEqual(self._raw_enumerations(source[drain:watch]), [])
+        self.assertEqual(self._raw_enumerations(source[watch:status]), [])
+        # Control: `status` reports the full inventory on purpose, so a scan
+        # that finds nothing anywhere is a broken scan, not a clean repo.
+        self.assertNotEqual(self._raw_enumerations(source[status:]), [])
+
+    def test_the_drain_watcher_bootouts_only_receipt_owned_listeners(self) -> None:
+        helper = LIB.read_text()
+        start = helper.index("tartci_pool_quiesce_persistent_agents_unlocked()")
+        end = helper.index("tartci_pool_quiesce_persistent_agents()", start)
+        body = helper[start:end]
+        self.assertIn("launchctl bootout", body)  # control: it is destructive
+        self.assertEqual(self._raw_enumerations(body), [])
+
+    def test_destructive_loops_iterate_the_receipt_owned_set(self) -> None:
+        source = (ROOT / "tartci").read_text()
+        on_off = source.index("    on|off)")
+        drain = source.index("    drain)", on_off)
+        status = source.index("    status)", drain)
+
+        # `off` shares its loop with `on`; the ternary picks the enumeration.
+        transition = source[on_off:drain]
+        self.assertIn(
+            '|| tartci_pool_owned_runner_agents "$agents_dir")', transition
+        )
+        self.assertNotIn('|| tartci_pool_runner_agents "$agents_dir")', transition)
+
+        drain_body = source[drain:status]
+        self.assertIn('$(tartci_pool_owned_runner_agents "$agents_dir")', drain_body)
+        self.assertNotIn('$(tartci_pool_runner_agents "$agents_dir")', drain_body)
+
+        # The drain watcher bootouts a persistent listener; same scope.
+        self.assertIn(
+            'persistent="$(tartci_pool_owned_runner_agents "$dir" | grep',
+            LIB.read_text(),
+        )
+
+    def test_pool_ownership_reads_the_same_receipt_keys_activation_prints(self) -> None:
+        # `pool on` activates `macos_fleet_lanes.py verify-installed
+        # --print-services`. The ownership helper re-reads that receipt
+        # structurally rather than re-running the heavyweight verification, so
+        # the two must name the same keys. A new owned key added there without
+        # teaching the pool helper would silently shrink `off` again.
+        lanes = (ROOT / "scripts" / "macos_fleet_lanes.py").read_text()
+        start = lanes.index("if args.print_services:")
+        block = lanes[start:start + 400]
+        printed = {
+            key for key in ("plists", "persistent_plists") if f'"{key}"' in block
+        }
+        self.assertEqual(printed, {"plists", "persistent_plists"}, block)
+        self.assertNotIn("receipt_value[\"lane", block)
+
+        helper = LIB.read_text()
+        start = helper.index("tartci_pool_receipt_services()")
+        end = helper.index("tartci_pool_fleet_managed()", start)
+        self.assertIn('for key in ("plists", "persistent_plists"):', helper[start:end])
 
 
 if __name__ == "__main__":
