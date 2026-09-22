@@ -973,28 +973,54 @@ handle_supervisor_signal(){
   exit 143
 }
 
+# The actions runner announces its own job boundaries in its log. The closing
+# line is direct local proof that the job reached a terminal state, and it
+# costs no API call and no share of the host observation lock.
+runner_log_completion_result(){
+  local log="${1:-}" line
+  [ -n "$log" ] && [ -r "$log" ] || return 1
+  line="$(grep -E ': Job .+ completed with result: .+' "$log" 2>/dev/null | tail -1)"
+  [ -n "$line" ] || return 1
+  printf '%s' "${line##*completed with result: }"
+}
+
 record_terminal_job_receipt(){
-  local runner_rc="$1"
+  local runner_rc="$1" runner_log="${2:-}" local_result
   if [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal ]; then
     CURRENT_ASSIGNMENT_QUARANTINE="none"
-    event job_terminal_receipt "runner_rc=$runner_rc observation=terminal rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
-  else
-    if [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal_pending_run ]; then
-      CURRENT_ASSIGNMENT_QUARANTINE="listener_exited_workflow_active"
-    else
-      CURRENT_ASSIGNMENT_QUARANTINE="listener_exit_terminal_unknown"
-    fi
-    event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    event job_terminal_receipt "runner_rc=$runner_rc observation=terminal evidence=github_api rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
   fi
+  if [ "$CURRENT_JOB_CAPTURE_STATUS" = active ] || [ "$CURRENT_JOB_CAPTURE_STATUS" = terminal_pending_run ]; then
+    # A completed observation that still saw the workflow running is positive
+    # evidence of live work, so it outranks any local terminal proof and keeps
+    # the assignment quarantined.
+    CURRENT_ASSIGNMENT_QUARANTINE="listener_exited_workflow_active"
+    event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=github_api quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
+  fi
+  # The observation never resolved. A measurement that failed is not evidence
+  # of a stall, so a clean listener exit plus the runner's own completion line
+  # settles terminality instead.
+  local_result="$(runner_log_completion_result "$runner_log")" || local_result=""
+  if [ "$runner_rc" = 0 ] && [ -n "$local_result" ]; then
+    CURRENT_ASSIGNMENT_QUARANTINE="none"
+    event job_terminal_receipt "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=runner_local result=$local_result rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
+    return 0
+  fi
+  # Nothing proved terminality and nothing observed a stall. The event names
+  # the failed measurement so a reader cannot mistake it for an observed one.
+  CURRENT_ASSIGNMENT_QUARANTINE="listener_exit_terminal_unknown"
+  event job_lifecycle_quarantine "runner_rc=$runner_rc observation=$CURRENT_JOB_CAPTURE_STATUS evidence=measurement_failed quarantine=$CURRENT_ASSIGNMENT_QUARANTINE rerun_eligible=false receipt=$CURRENT_JOB_RECEIPT"
 }
 
 finalize_listener_receipt(){
-  local runner_rc="$1" listener_assigned="$2"
+  local runner_rc="$1" listener_assigned="$2" runner_log="${3:-}"
   [ "$listener_assigned" = 1 ] || return 0
   if [ -n "$CURRENT_RUN_ID" ] && [ -n "$CURRENT_JOB_ID" ]; then
     capture_current_job revalidate || true
   fi
-  record_terminal_job_receipt "$runner_rc"
+  record_terminal_job_receipt "$runner_rc" "$runner_log"
 }
 
 tartci_is_canonical_positive_decimal(){
@@ -1026,11 +1052,17 @@ capture_current_job(){
       scan_spent="$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"
       budget_parameter="cancel_terminal_observation_budget" ;;
     *)
-      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-30}"
+      budget="${TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}"
       scan_spent="$CURRENT_JOB_SCAN_SPENT"
       budget_parameter="lifecycle_budget" ;;
   esac
-  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-8}"
+  # Discovery walks every in-progress run in the repository one call at a time,
+  # so its cost tracks repository concurrency rather than a constant. Sixty
+  # concurrent runs measure 93 to 106 seconds, and an attempt that cannot
+  # outlast the scan can only ever report a failed measurement. The lifecycle
+  # budget stays the larger of the two because the clamp below lowers an
+  # attempt to whatever the budget has left.
+  attempt_timeout="${TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}"
   invalid_parameter=""
   tartci_is_canonical_positive_decimal "$budget" || invalid_parameter="$budget_parameter"
   if [ -z "$invalid_parameter" ]; then
@@ -1345,7 +1377,7 @@ run_runner_until_done(){
     sleep 5
   done
   wait "$ssh_pid" || rc=$?
-  finalize_listener_receipt "$rc" "$assigned"
+  finalize_listener_receipt "$rc" "$assigned" "$runner_log"
   sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
 }

@@ -46,6 +46,8 @@ TOP_KEYS = {
 HOST_KEYS = {
     "id", "home", "tart_home", "cache_root", "log_root",
     "github_api_timeout_seconds", "persistent_runner_labels",
+    "current_job_attempt_timeout_seconds",
+    "current_job_lifecycle_budget_seconds",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -191,6 +193,33 @@ def load(path: Path) -> dict:
             type(github_api_timeout) is not int
             or not 5 <= github_api_timeout <= 60):
         fail("host.github_api_timeout_seconds must be an integer from 5 through 60")
+    attempt_timeout = host.get("current_job_attempt_timeout_seconds")
+    if attempt_timeout is not None and (
+            type(attempt_timeout) is not int
+            or not 30 <= attempt_timeout <= 600):
+        fail(
+            "host.current_job_attempt_timeout_seconds must be an integer "
+            "from 30 through 600"
+        )
+    lifecycle_budget = host.get("current_job_lifecycle_budget_seconds")
+    if lifecycle_budget is not None and (
+            type(lifecycle_budget) is not int
+            or not 60 <= lifecycle_budget <= 1800):
+        fail(
+            "host.current_job_lifecycle_budget_seconds must be an integer "
+            "from 60 through 1800"
+        )
+    # An attempt is lowered to whatever the lifecycle budget has left, so a
+    # budget below the attempt silently shortens every observation.
+    if (
+        attempt_timeout is not None
+        and lifecycle_budget is not None
+        and lifecycle_budget < attempt_timeout
+    ):
+        fail(
+            "host.current_job_lifecycle_budget_seconds must be at least "
+            "host.current_job_attempt_timeout_seconds"
+        )
     persistent_labels = host.get("persistent_runner_labels", [])
     if (
         not isinstance(persistent_labels, list)
@@ -1733,6 +1762,14 @@ def lane_plist(
         })
     if "github_api_timeout_seconds" in host:
         env["TARTCI_GH_TIMEOUT_SECS"] = str(host["github_api_timeout_seconds"])
+    if "current_job_attempt_timeout_seconds" in host:
+        env["TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS"] = str(
+            host["current_job_attempt_timeout_seconds"]
+        )
+    if "current_job_lifecycle_budget_seconds" in host:
+        env["TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS"] = str(
+            host["current_job_lifecycle_budget_seconds"]
+        )
     # An omitted priority delegates to the provider's exact-label policy.
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:
