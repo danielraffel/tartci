@@ -1421,6 +1421,14 @@ the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) 
 anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
 host-wide "no VM running" gate.
 
+### Published fleet supply and how to fact-check it
+
+`fleet/advertised-labels.json` is the declared label supply other projects read
+(raw URL and contract in `fleet/README.md`). Check a host against it with
+`tartci fleet-macos verify-supply` (also the `supply` finding of `tartci doctor
+fleet`), and check GitHub's job history against it with
+`scripts/supply_observed.py --repo OWNER/REPO`.
+
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
 The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane
