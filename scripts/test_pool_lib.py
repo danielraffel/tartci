@@ -1255,27 +1255,29 @@ class TransitionOwnershipTests(unittest.TestCase):
         # scar from that shape (tartci_pool_agent_loaded); the ownership probe
         # must not reintroduce it, and it is size-dependent, so prove it on a
         # set far larger than a pipe buffer with the hit at the very front.
-        labels = "\n".join(
-            [self.UNOWNED_PERSISTENT] + [f"filler.label.{n:05d}" for n in range(20000)]
-        )
+        # The set is built inside the shell, not passed through argv: Linux caps
+        # a single argument at 128 KiB (MAX_ARG_STRLEN) where macOS does not, so
+        # handing it over as an argument passes locally and dies in CI with
+        # `Argument list too long`.
+        target = self.UNOWNED_PERSISTENT
         proc = _bash(
-            f"source {LIB}; set -o pipefail; "
-            f"printf '%s\\n' {shlex.quote(labels)} | grep -Fxq {self.UNOWNED_PERSISTENT}; "
-            "legacy=$?; "
-            f"tartci_pool_label_in_set {self.UNOWNED_PERSISTENT} {shlex.quote(labels)}; "
-            "current=$?; echo legacy=$legacy current=$current"
+            f"source {LIB}\n"
+            "set -o pipefail\n"
+            "haystack=\"$(awk 'BEGIN { print \"" + target + "\"; "
+            'for (i = 0; i < 20000; i++) printf "filler.label.%05d\\n", i }\')"\n'
+            f'printf \'%s\\n\' "$haystack" | grep -Fxq "{target}"; legacy=$?\n'
+            f'tartci_pool_label_in_set "{target}" "$haystack"; current=$?\n'
+            'tartci_pool_label_in_set absent.label "$haystack"; miss=$?\n'
+            'echo legacy=$legacy current=$current miss=$miss bytes=${#haystack}\n'
         )
         fields = dict(f.split("=") for f in proc.stdout.strip().split())
-        # Control: the pipeline shape really does fail on a match here, so a
-        # passing `current` is evidence about the helper, not about the host.
+        # Control: the set really is far larger than any pipe buffer, and the
+        # pipeline shape really does fail on a match at this size — so a passing
+        # `current` is evidence about the helper, not about the host.
+        self.assertGreater(int(fields["bytes"]), 256 * 1024, proc.stderr)
         self.assertNotEqual(fields["legacy"], "0", proc.stderr)
         self.assertEqual(fields["current"], "0", proc.stderr)
-
-        miss = _bash(
-            f"source {LIB}; set -o pipefail; "
-            f"tartci_pool_label_in_set absent.label {shlex.quote(labels)}; echo rc=$?"
-        )
-        self.assertEqual(miss.stdout.strip(), "rc=1", miss.stderr)
+        self.assertEqual(fields["miss"], "1", proc.stderr)
 
     def test_membership_matches_whole_labels_only(self) -> None:
         for label, haystack, expected in (
