@@ -103,5 +103,68 @@ class GoldensCli(unittest.TestCase):
             shutil.rmtree(empty, ignore_errors=True)
 
 
+
+class ApplySnippetReload(unittest.TestCase):
+    """The remote apply step must never raw-bootout a lane tartci refused."""
+
+    LABEL = "com.danielraffel.pulp.tart-runner-linux"
+
+    def _snippet(self) -> str:
+        text = open(GOLDENS_SH).read()
+        start = text.index("_apply_snippet(){ cat <<'SNIP'\n") + len("_apply_snippet(){ cat <<'SNIP'\n")
+        return text[start:text.index("\nSNIP\n", start)]
+
+    def _apply(self, tartci_rc):
+        home = tempfile.mkdtemp(prefix="tartci-goldens-home-")
+        bindir = os.path.join(home, "bin")
+        os.makedirs(bindir)
+        calls = os.path.join(home, "launchctl.log")
+        with open(os.path.join(bindir, "launchctl"), "w") as fh:
+            fh.write('#!/bin/sh\nprintf "%s\\n" "$*" >> "' + calls + '"\n')
+        os.chmod(os.path.join(bindir, "launchctl"), 0o755)
+        logs = os.path.join(home, "Library", "Logs", "tartci")
+        os.makedirs(logs)
+        with open(os.path.join(logs, "tart-runner-linux.log"), "w") as fh:
+            fh.write("idle: waiting for work\n")
+        if tartci_rc is not None:
+            tdir = os.path.join(home, ".local", "share", "tartci")
+            os.makedirs(tdir)
+            with open(os.path.join(tdir, "tartci"), "w") as fh:
+                fh.write(f'#!/bin/sh\nprintf "%s\\n" "$*" >> "{home}/tartci.log"\nexit {tartci_rc}\n')
+            os.chmod(os.path.join(tdir, "tartci"), 0o755)
+        env = dict(os.environ, HOME=home, PATH=f"{bindir}:{os.environ['PATH']}")
+        proc = subprocess.run(
+            ["bash", "-s", "--", home, "pulp-linux-build-x.qcow2", self.LABEL, "1", "0", "linux"],
+            input=self._snippet(), env=env, capture_output=True, text=True)
+        raw = open(calls).read() if os.path.exists(calls) else ""
+        tartci_calls = (open(os.path.join(home, "tartci.log")).read()
+                        if os.path.exists(os.path.join(home, "tartci.log")) else "")
+        return proc, raw, tartci_calls
+
+    def test_refused_reload_leaves_the_lane_alone(self):
+        proc, raw, tartci_calls = self._apply(3)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn(f"launchd reload {self.LABEL}", tartci_calls)
+        self.assertIn("reload refused", proc.stdout)
+        self.assertNotIn("bootout", raw)
+        self.assertNotIn("bootstrap", raw)
+
+    def test_failed_reload_does_not_fall_back_to_raw_launchctl(self):
+        proc, raw, _ = self._apply(1)
+        self.assertIn("reload failed", proc.stdout)
+        self.assertEqual(raw, "")
+
+    def test_missing_tartci_does_not_raw_reload(self):
+        proc, raw, _ = self._apply(None)
+        self.assertIn("not reloading", proc.stdout)
+        self.assertEqual(raw, "")
+
+    def test_successful_reload_is_reported(self):
+        # Control: the same harness reaches tartci and reports success, so the
+        # refusals above are the exit-code handling, not an unreached branch.
+        proc, _, tartci_calls = self._apply(0)
+        self.assertIn("reloaded runner via 'tartci launchd reload'", proc.stdout)
+        self.assertIn(self.LABEL, tartci_calls)
+
 if __name__ == "__main__":
     unittest.main()

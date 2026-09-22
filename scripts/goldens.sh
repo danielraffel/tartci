@@ -142,16 +142,22 @@ fi
 if [ "$reload" = 1 ]; then
   log="$HOME/Library/Logs/tartci/${label##*.}.log"
   if tail -1 "$log" 2>/dev/null | grep -q 'waiting'; then
-    if [ -x "$HOME/.local/share/tartci/tartci" ] \
-       && "$HOME/.local/share/tartci/tartci" launchd reload "$label" >/dev/null 2>&1; then
-      note "reloaded runner via 'tartci launchd reload' (was idle)"
+    # Only tartci's reloader may stop the lane: it re-checks that THIS label
+    # owns no VM/job right before bootout, which a log-tail heuristic cannot.
+    # Never fall back to a raw bootout: a refusal (exit 3: mid-job or busy
+    # state unknown) must leave the lane running.
+    tartci_bin="$HOME/.local/share/tartci/tartci"
+    pending="an unpinned lane picks up the new golden next cycle; a repointed pin takes effect after 'tartci launchd reload $label' once the lane is idle"
+    if [ ! -x "$tartci_bin" ]; then
+      note "not reloading: tartci is not installed at $tartci_bin — $pending"
     else
-      u="$(id -u)"; launchctl bootout "gui/$u/$label" 2>/dev/null; sleep 3
-      if launchctl bootstrap "gui/$u" "$plist" 2>/dev/null; then
-        note "reloaded runner (bootout+bootstrap, was idle)"
-      else
-        note "reload failed — new pin applies on the runner's next natural cycle"
-      fi
+      reload_rc=0
+      "$tartci_bin" launchd reload "$label" >/dev/null 2>&1 || reload_rc=$?
+      case "$reload_rc" in
+        0) note "reloaded runner via 'tartci launchd reload' (was idle)" ;;
+        3) note "reload refused by 'tartci launchd reload' (lane mid-job or busy state unknown) — $pending" ;;
+        *) note "reload failed (tartci launchd reload exit $reload_rc) — $pending" ;;
+      esac
     fi
   else
     note "runner busy — new golden applies on its next cycle (not reloading mid-job)"
