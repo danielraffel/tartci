@@ -21,9 +21,10 @@ Raw launchctl is dangerous on a lane for two reasons:
 Contract (`--hook`): read a PreToolUse JSON object on stdin
 ({"tool_name": ..., "tool_input": {"command": ...}}). Exit 2 with the reason
 on stderr when the command would run launchctl kickstart|bootout|unload|
-remove|kill|disable|stop against a tartci-managed lane supervisor or an
+remove|kill|disable|stop against a tartci runner/lane supervisor or an
 `actions.runner.*` service, or against a target that cannot be resolved
-statically (a variable, a glob, stdin via xargs). Exit 0 otherwise, silently.
+statically (a variable, a glob, stdin via xargs). Here-document bodies are
+data unless they feed a shell interpreter or ssh. Exit 0 otherwise, silently.
 `TARTCI_ALLOW_RAW_LAUNCHCTL=1` written in the command itself is the explicit,
 auditable escape hatch (exit 0 with a warning). Malformed input exits 0 with
 a note: a broken hook must not break the agent's shell.
@@ -42,16 +43,16 @@ from typing import NamedTuple
 DANGEROUS_VERBS = frozenset({
     "kickstart", "bootout", "unload", "remove", "kill", "disable", "stop",
 })
-# Label families tartci renders or supervises (see tartci_pool_runner_agents
-# and lane_plist): fleet lanes are com.danielraffel.tartci.tart-runner-macos-
-# fleet.<host>.<lane>[.slotN]; legacy lanes keep their per-repo prefixes.
-MANAGED_PREFIXES = (
-    "com.danielraffel.tartci.",
-    "actions.runner.",
-    "com.danielraffel.pulp.tart-runner",
-    "com.danielraffel.pulp.qemu-runner",
-    "com.danielraffel.forge.tart-runner",
-    "com.danielraffel.vellum.tart-runner",
+# Runner/lane supervisor families, the same set tartci_pool_runner_agents
+# enumerates: fleet lanes (com.danielraffel.tartci.tart-runner-macos-fleet.
+# <host>.<lane>[.slotN], rendered by lane_plist), legacy per-repo tart/qemu
+# runners (com.danielraffel.pulp.tart-runner, ...-macos-gate-slot2,
+# com.danielraffel.pulp.qemu-runner-windows, forge/vellum tart-runners), and
+# persistent Actions services. tartci's non-runner agents (launchd-watchdog,
+# reap, reclaim, the relay) are deliberately outside it: no job runs in them.
+LANE_LABEL = re.compile(
+    r"^(?:actions\.runner\.."
+    r"|com\.danielraffel\.[a-z0-9-]+\.(?:tart|qemu)-runner(?:$|[-.]))"
 )
 ESCAPE = re.compile(r"(?:^|[\s;&|(])TARTCI_ALLOW_RAW_LAUNCHCTL=1(?=$|[\s;&|)])")
 SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
@@ -118,6 +119,61 @@ def _extract_substitutions(command: str) -> tuple[str, list[str]]:
             out.append(command[i])
             i += 1
     return "".join(out), bodies
+
+
+def _heredoc_feeds_shell(prefix: str) -> bool:
+    """Whether the command owning a `<<` reads its stdin as shell commands.
+
+    PREFIX is the line text before the operator. The owner is the last simple
+    command in it: `bash`, `sh -s`, `sudo zsh`, `ssh host` execute the body;
+    `cat`, `git commit -F -`, `tee` treat it as data.
+    """
+    segment = re.split(r"\$\(|`|[;&|()]", prefix)[-1]
+    try:
+        words = shlex.split(segment)
+    except ValueError:
+        words = segment.split()
+    words = [word for word in words if not re.fullmatch(r"\d*[<>]&?\S*", word)]
+    words, _ = _strip_wrappers(words, {})
+    if not words:
+        return False
+    head = os.path.basename(words[0])
+    if head in SHELLS:
+        # With -c the script is the argument; the heredoc is only its stdin.
+        return not any(re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", word) for word in words[1:])
+    return head in ("ssh", "autossh")
+
+
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*(['\"]?)([A-Za-z0-9_.\-]+)\2")
+
+
+def _split_heredocs(command: str) -> tuple[str, list[str]]:
+    """Remove here-document bodies, returning (command, bodies run as shell).
+
+    A heredoc body is data (a commit message, a file being written) unless the
+    command it feeds is a shell interpreter or ssh, in which case it is
+    returned for classification as commands.
+    """
+    lines = command.split("\n")
+    kept: list[str] = []
+    shell_bodies: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        kept.append(line)
+        index += 1
+        for match in HEREDOC.finditer(line):
+            strip_tabs, word = match.group(1) == "-", match.group(3)
+            body: list[str] = []
+            while index < len(lines):
+                candidate = lines[index]
+                index += 1
+                if (candidate.lstrip("\t") if strip_tabs else candidate) == word:
+                    break
+                body.append(candidate)
+            if _heredoc_feeds_shell(line[:match.start()]):
+                shell_bodies.append("\n".join(body))
+    return "\n".join(kept), shell_bodies
 
 
 def _simple_commands(tokens: list[str]) -> list[list[str]]:
@@ -231,7 +287,7 @@ def _launchctl_hits(args: list[str], from_stdin: bool, variables: dict[str, str]
             hits.append(Hit(verb, target.replace(UNRESOLVED, "$(...)"),
                             "the target is computed at run time, so it cannot be "
                             "shown to be outside tartci's lanes"))
-        elif label.startswith(MANAGED_PREFIXES):
+        elif LANE_LABEL.match(label):
             hits.append(Hit(verb, target, "it is a tartci-managed lane supervisor "
                             "or Actions runner service"))
     return hits
@@ -272,8 +328,11 @@ def classify(command: str, depth: int = 0,
     if depth > MAX_DEPTH:
         return [Hit("?", command[:80], "nesting too deep to classify")]
     variables = {} if variables is None else variables
-    flattened, bodies = _extract_substitutions(command)
     hits: list[Hit] = []
+    command, shell_bodies = _split_heredocs(command)
+    for body in shell_bodies:
+        hits.extend(classify(body, depth + 1, dict(variables)))
+    flattened, bodies = _extract_substitutions(command)
     for body in bodies:
         hits.extend(classify(body, depth + 1, dict(variables)))
     try:

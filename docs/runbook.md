@@ -1423,10 +1423,13 @@ supervisor: no tartci code was on that path, so no tartci refusal could fire.
 The choke point is the agent harness's PreToolUse hook. `tartci launchd guard
 --hook` reads the hook's JSON on stdin and exits 2 (blocking the tool call,
 with the reason on stderr) when a shell command would run `launchctl`
-`kickstart|bootout|unload|remove|kill|disable|stop` against a tartci lane
-(`com.danielraffel.tartci.*`, the legacy `com.danielraffel.{pulp,forge,vellum}
-.tart-runner*` / `pulp.qemu-runner*` supervisors) or an `actions.runner.*`
-service. It sees through `&&`, `;`, `|`, newlines, `bash|sh|zsh -c '…'`,
+`kickstart|bootout|unload|remove|kill|disable|stop` against a runner/lane
+supervisor (`com.danielraffel.<repo>.tart-runner*` / `.qemu-runner*`, which
+includes the fleet lanes `com.danielraffel.tartci.tart-runner-macos-fleet.*`)
+or an `actions.runner.*` service. tartci's non-runner agents (launchd-watchdog,
+reap, reclaim, the relay) are not lanes and pass. Here-document bodies are
+data (a commit message or file that mentions `launchctl bootout` passes)
+unless the heredoc feeds `bash|sh|zsh|dash|ksh` or `ssh`. It sees through `&&`, `;`, `|`, newlines, `bash|sh|zsh -c '…'`,
 `eval`, `$(…)`, `env`/`sudo`/`nohup` prefixes, `launchctl asuser`, `ssh host
 '…'`, `/bin/launchctl`, and `gui/<uid>/<label>`, `user/<uid>/<label>`, plist
 paths or bare labels. A target it cannot resolve statically (a loop variable,

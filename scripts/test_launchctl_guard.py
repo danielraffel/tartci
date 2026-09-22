@@ -107,6 +107,62 @@ class ClassifierTests(unittest.TestCase):
             f"TARTCI_ALLOW_RAW_LAUNCHCTL=0 launchctl kickstart -k gui/501/{LANE}")[0], 2)
 
 
+class HeredocTests(unittest.TestCase):
+    """A heredoc body is data unless it feeds a shell interpreter or ssh."""
+
+    DATA = [
+        # A commit message that documents the incident.
+        "git commit -m \"$(cat <<'EOF'\nfix: stop agents raw-kicking lanes\n\n"
+        f"launchctl kickstart -k gui/501/{LANE} killed a VM.\nEOF\n)\"",
+        # A runbook being written to a file.
+        f"cat > /tmp/runbook.md <<'EOF'\nNever run:\n  launchctl bootout gui/501/{LANE}\nEOF",
+        # A commit message on stdin with a bare verb.
+        "git commit -F - <<X\nwhy launchctl bootout is dangerous:\nlaunchctl bootout\nX",
+        # <<- strips tabs from the terminator.
+        f"cat <<-EOF > notes\n\tlaunchctl stop {RUNNER}\n\tEOF",
+    ]
+    SHELL = [
+        f"bash <<'EOF'\nlaunchctl bootout gui/501/{LANE}\nEOF",
+        f"sh -s <<EOF\necho hi\nlaunchctl kickstart -k gui/501/{LANE}\nEOF",
+        f"sudo zsh <<'EOF'\nlaunchctl bootout gui/501/{LANE}\nEOF",
+        f"ssh m5 <<'EOF'\nlaunchctl bootout gui/501/{LANE}\nEOF",
+        f"cat <<'EOF' > x\nlaunchctl bootout gui/501/{LANE}\nEOF\n"
+        f"launchctl kickstart -k gui/501/{LANE}",
+    ]
+
+    def test_heredoc_bodies_are_data(self) -> None:
+        for command in self.DATA:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command), (0, ""))
+
+    def test_heredoc_into_a_shell_is_classified(self) -> None:
+        # Positive control for the data cases: the same bodies fed to an
+        # interpreter, or a real command after the heredoc, still block.
+        for command in self.SHELL:
+            with self.subTest(command=command):
+                self.assertEqual(guard.decide(command)[0], 2)
+
+
+class LaneFamilyTests(unittest.TestCase):
+    def test_tartci_non_runner_agents_are_not_lanes(self) -> None:
+        for label in ("com.danielraffel.tartci.launchd-watchdog",
+                      "com.danielraffel.tartci.reap",
+                      "com.danielraffel.tartci.reclaim",
+                      "com.danielraffel.tartci.http-connect-ssh-relay"):
+            with self.subTest(label=label):
+                self.assertEqual(guard.decide(f"launchctl kickstart -k gui/501/{label}"), (0, ""))
+
+    def test_every_runner_family_is_a_lane(self) -> None:
+        for label in (LANE, f"{LANE}.slot2", RUNNER, LEGACY,
+                      "com.danielraffel.pulp.tart-runner",
+                      "com.danielraffel.pulp.tart-runner-macos-gate-slot2",
+                      "com.danielraffel.pulp.qemu-runner-windows",
+                      "com.danielraffel.forge.tart-runner-macos",
+                      "com.danielraffel.vellum.tart-runner-macos"):
+            with self.subTest(label=label):
+                self.assertEqual(guard.decide(f"launchctl kickstart -k gui/501/{label}")[0], 2)
+
+
 class HookEntryTests(unittest.TestCase):
     def _hook(self, payload: str, via: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(via, input=payload, text=True, capture_output=True,
