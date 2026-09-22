@@ -36,6 +36,8 @@
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)
 #   tartci launchd <reload <label>|status|heal>  # heal a wedged serve LaunchAgent (full bootout+bootstrap)
+#                              # reload refuses a mid-job lane (exit 3) unless --allow-mid-job;
+#                              # --dry-run prints the plan or REFUSE (exit 0 / 3)
 #   tartci help
 #
 # Stores (override via env): TARTCI_HOME (default ~/.tartci) holds goldens/,

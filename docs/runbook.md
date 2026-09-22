@@ -1395,6 +1395,27 @@ the Build and Test `pulp-build-vm` lane, and do not flip
 `PULP_RELEASE_MACOS_RUNS_ON_JSON` away from the fallback lane until a real
 Release CLI proof has claimed `pulp-build-vm-release` and completed.
 
+### Reloading a lane supervisor safely (`tartci launchd reload`)
+
+launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
+only `bootout`+`bootstrap` re-reads the plist. `tartci launchd reload <label>`
+does that full cycle, and it refuses (exit 3, nothing changed) when the lane
+is **mid-job**: the process launchd started for that label owns a `tart run`
+descendant (the lane VM) or a `Runner.Worker` (a persistent Actions runner
+executing a job). A bootout then kills the job with it. The probe is per
+label (`scripts/lane_busy.py`), so a sibling lane building does not block
+reloading an idle one. An unreadable answer (a `launchctl print` error other
+than launchd's "Could not find service", or an unreadable process table) also
+refuses. Wait for the lane to go idle, or `tartci pool drain`; the explicit
+override that accepts killing the job is `--allow-mid-job`.
+
+`--dry-run` runs every precondition, including the mid-job probe, and prints
+the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) or
+`REFUSE: <reason>`. Exit codes for `--reload`: `0` reloaded / would proceed,
+`1` a mutation ran and failed its postcondition, `3` refused before changing
+anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
+host-wide "no VM running" gate.
+
 ### Emulation note
 
 Pool jobs build whatever arch the **workflow** targets. The emulated **x86_64**
