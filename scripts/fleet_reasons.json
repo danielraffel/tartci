@@ -72,6 +72,10 @@
       "why": "Without an installed identity there is nothing to compare the executed cohort against, so the comparison is unknown rather than passing by default.",
       "remedy": "Restore or re-write the install receipt before judging what this host runs."
     },
+    "no_installed_profile": {
+      "summary": "This host has no installed macOS fleet profile.",
+      "why": "Only a host that installed a fleet profile can drift from its checked-in source; the check has nothing to compare here."
+    },
     "no_managed_launchagents": {
       "summary": "No managed fleet LaunchAgent is installed.",
       "why": "With no receipt either, this host is simply not a managed fleet host. With a receipt present it is a real fault: something records a cohort that nothing executes.",
@@ -86,6 +90,21 @@
       "why": "A stock persistent Actions listener has no safe local drain primitive: worker absence misses the interval between a job being accepted and its worker spawning, so stopping on that evidence can kill a running job. Draining safely requires removing the host from routing and publishing a held-idle receipt only once the scheduler reports every persistent runner idle. No supported producer ships that receipt today. Drain writes participation=0 and pool-state=draining before it discovers this, so a refusal leaves the host opted out with its agents still loaded.",
       "remedy": "Do not begin a drain on this host. If one has already refused, return the host to service with tartci pool on, which also invalidates any stale hold receipt.",
       "do_not": "Do not create the held-idle receipt by hand. It asserts that a scheduler observed every persistent runner idle. Writing it locally asserts an observation nothing made, and authorizes stopping a listener that may be holding a live job."
+    },
+    "profile_drift": {
+      "summary": "The installed fleet profile differs from the checked-in profile with the same name.",
+      "why": "Every receipt check verifies the installed copy against itself, so a host edited in place, or installed before the checked-in profile moved on, passes all of them while running settings nobody reviewed (for example a missing github_api_timeout_seconds silently reverting to the 15-second default).",
+      "remedy": "Decide which side is right. Reinstall from the checked-in profile with `tartci fleet-macos install <profile> --apply` (drain first), or commit the host's edit to profiles/.",
+      "do_not": "Do not hand-edit the installed profile to match; the receipt and rendered plists would then disagree with it."
+    },
+    "profile_drift_unknown": {
+      "summary": "The installed profile could not be compared with a checked-in source.",
+      "why": "An unparsable profile, a missing `name`, zero or several checked-in profiles with that name, or no tomllib interpreter all leave the comparison unanswered, which is not the same as in sync.",
+      "remedy": "Run `tartci fleet-macos profile-drift` for the specific reason."
+    },
+    "profile_in_sync": {
+      "summary": "The installed fleet profile matches its checked-in source key for key.",
+      "why": "Receipts bind the installed copy to itself, so only a comparison against the checked-in profile carrying the same name can say the host runs what the repository describes."
     },
     "program_unresolvable": {
       "summary": "The executed cohort could not be resolved for some agent.",

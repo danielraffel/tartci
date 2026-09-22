@@ -2012,6 +2012,122 @@ def reachable(registration: dict, repo: str, workflow: str,
             and all(label.lower() in have for label in job_labels))
 
 
+# ── Installed-profile drift ─────────────────────────────────────────────────
+#
+# The installer copies a checked-in profile to
+# ~/.config/tartci/macos-fleet-profile.toml. A later edit on either side is
+# invisible to every receipt check, because the receipt binds the installed
+# copy to itself. This compares the two semantically, by key path.
+
+DEFAULT_INSTALLED_PROFILE = Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"
+DEFAULT_PROFILES_DIR = Path(__file__).resolve().parents[1] / "profiles"
+
+
+def _flatten(value: object, prefix: str = "") -> dict[str, object]:
+    """Key-path view of a profile. Lanes are keyed by id, not position."""
+    out: dict[str, object] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if key == "lane" and prefix == "" and isinstance(child, list):
+                for index, lane in enumerate(child):
+                    lane_id = lane.get("id") if isinstance(lane, dict) else None
+                    name = f"lane[{lane_id if isinstance(lane_id, str) else '#' + str(index)}]"
+                    out.update(_flatten(lane, name))
+                continue
+            path = f"{prefix}.{key}" if prefix else key
+            if isinstance(child, dict) or (
+                    isinstance(child, list) and child
+                    and all(isinstance(item, dict) for item in child)):
+                out.update(_flatten(child, path))
+            else:
+                out[path] = child
+    elif isinstance(value, list):
+        for index, item in enumerate(value):
+            out.update(_flatten(item, f"{prefix}[{index}]"))
+    else:
+        out[prefix] = value
+    return out
+
+
+def profile_drift(installed: Path, profiles_dir: Path) -> dict:
+    """Semantic key diff between an installed profile and its checked-in source.
+
+    `state` is `in_sync`, `drift`, or `unknown`; unknown carries a reason and
+    is never reported as in sync.
+    """
+    result: dict = {
+        "schema": "tartci.profile-drift/v1",
+        "installed": str(installed),
+        "checked_in": None,
+        "name": None,
+        "state": "unknown",
+        "reason": None,
+        "missing_in_installed": {},
+        "extra_in_installed": {},
+        "changed": {},
+    }
+    try:
+        with installed.open("rb") as handle:
+            installed_data = tomllib.load(handle)
+    except FileNotFoundError:
+        result["reason"] = "installed profile does not exist"
+        return result
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        result["reason"] = f"installed profile unreadable: {exc}"
+        return result
+    name = installed_data.get("name")
+    if not isinstance(name, str) or not name:
+        result["reason"] = "installed profile has no `name`, so no checked-in source can be matched"
+        return result
+    result["name"] = name
+    matches: list[tuple[Path, dict]] = []
+    for candidate in sorted(profiles_dir.glob("*.toml")):
+        try:
+            with candidate.open("rb") as handle:
+                parsed = tomllib.load(handle)
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if parsed.get("name") == name:
+            matches.append((candidate, parsed))
+    if len(matches) != 1:
+        result["reason"] = (
+            f"{len(matches)} checked-in profiles in {profiles_dir} declare name={name!r}; "
+            "exactly one is required"
+        )
+        return result
+    source_path, source_data = matches[0]
+    result["checked_in"] = str(source_path)
+    have = _flatten(installed_data)
+    want = _flatten(source_data)
+    result["missing_in_installed"] = {k: want[k] for k in sorted(set(want) - set(have))}
+    result["extra_in_installed"] = {k: have[k] for k in sorted(set(have) - set(want))}
+    result["changed"] = {
+        k: {"installed": have[k], "checked_in": want[k]}
+        for k in sorted(set(have) & set(want)) if have[k] != want[k]
+    }
+    drifted = any(result[k] for k in ("missing_in_installed", "extra_in_installed", "changed"))
+    result["state"] = "drift" if drifted else "in_sync"
+    return result
+
+
+def render_profile_drift(result: dict) -> str:
+    lines = [f"profile drift: {result['state'].upper()}",
+             f"  installed:  {result['installed']}",
+             f"  checked-in: {result['checked_in'] or '-'} (name={result['name'] or '-'})"]
+    if result["reason"]:
+        lines.append(f"  reason: {result['reason']}")
+    for key, value in result["missing_in_installed"].items():
+        lines.append(f"  - {key} = {value!r}   (checked in, missing from installed)")
+    for key, value in result["extra_in_installed"].items():
+        lines.append(f"  + {key} = {value!r}   (installed only)")
+    for key, pair in result["changed"].items():
+        lines.append(f"  ~ {key}: installed={pair['installed']!r} checked_in={pair['checked_in']!r}")
+    if result["state"] == "drift":
+        lines.append("  remedy: reinstall from the checked-in profile "
+                     "(tartci fleet-macos install <profile> --apply), or commit the host edit")
+    return "\n".join(lines)
+
+
 def render_advertised(snapshot: dict) -> str:
     lines = [f"{snapshot['schema']} commit={snapshot['generated_from']['commit'] or '-'}"]
     for row in snapshot["registrations"]:
@@ -2073,6 +2189,14 @@ def main(argv: list[str] | None = None) -> int:
         help="offline: the exact label set each lane registers with GitHub")
     advertised.add_argument("profiles", nargs="+", type=Path)
     advertised.add_argument("--json", action="store_true")
+    drift = sub.add_parser(
+        "profile-drift",
+        help="read-only: installed profile vs its checked-in source (by name)")
+    drift.add_argument("--installed", type=Path, default=DEFAULT_INSTALLED_PROFILE)
+    drift.add_argument("--profiles-dir", type=Path, default=DEFAULT_PROFILES_DIR)
+    drift.add_argument("--strict", action="store_true",
+                       help="exit 1 on drift (exit 2 on unknown in every mode)")
+    drift.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.command == "advertised-labels":
@@ -2080,6 +2204,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.profiles, git_head(Path(__file__).resolve().parents[1]))
             print(json.dumps(snapshot, indent=2) if args.json else render_advertised(snapshot))
             return 0
+        if args.command == "profile-drift":
+            result = profile_drift(args.installed, args.profiles_dir)
+            print(json.dumps(result, indent=2, sort_keys=True, default=str)
+                  if args.json else render_profile_drift(result))
+            if result["state"] == "unknown":
+                return 2
+            return 1 if args.strict and result["state"] == "drift" else 0
         if args.command == "probe-launch-helper":
             value = probe_launch_helper(
                 args.receipt, args.config, args.agents_dir, args.support_root,

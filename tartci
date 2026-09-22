@@ -192,13 +192,13 @@ cmd_profile() {
 cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels)
+    validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift)
       tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels> ..."; return 2 ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift> ..."; return 2 ;;
   esac
 }
 
