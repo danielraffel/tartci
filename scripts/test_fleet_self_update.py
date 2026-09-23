@@ -57,6 +57,7 @@ class FakeSystem(su.System):
         self.signing_rc = 0
         self.rollback_install_rc = 0
         self.broken_target = False     # the new generation fails verification
+        self.broken_previous = False   # ...and so does the restored one
         self.on_rc = 0
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
@@ -205,7 +206,8 @@ class FakeSystem(su.System):
                 self.pool_state = "on"
             return su.Result(self.on_rc, "on", "" if self.on_rc == 0 else "pool on refused")
         if args[:2] == ["pool", "status"]:
-            if self.broken_target and self.running() != INSTALLED:
+            if (self.broken_target and self.running() != INSTALLED) or \
+                    (self.broken_previous and self.running() == INSTALLED):
                 return ok(json.dumps({"state": "on", "participating": True,
                                       "fleet": {"managed": True, "fleet_ready": False,
                                                 "problems": ["broken"]}}))
@@ -641,6 +643,15 @@ class RollbackTests(Base):
         self.assertIn("ROLLBACK FAILED", last["error"])
         self.assertIn("host is on", last["error"])
         self.assertEqual(self.sys.pool_state, "on")
+
+    def test_rollback_verifies_the_previous_generation(self) -> None:
+        self.sys.broken_target = True
+        self.sys.broken_previous = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(last["status"], "failed")
+        self.assertIn("ROLLBACK FAILED", last["error"])
+        self.assertIn(f"verification of {INSTALLED[:12]}", last["error"])
 
     def test_pool_on_failure_is_recorded_as_host_off(self) -> None:
         self.sys.install_rcs = [1]
