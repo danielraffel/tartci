@@ -205,8 +205,10 @@ class VerdictTextTests(unittest.TestCase):
         for rc, expect, reject in (
                 ("3", "last serving host for a required label; --allow-last-serving-host overrides",
                  "does NOT override"),
-                ("4", "--allow-last-serving-host does NOT override this",
-                 "--allow-last-serving-host overrides")):
+                ("4", "capacity UNKNOWN", "--allow-last-serving-host overrides"),
+                ("127", "capacity floor could not run (exit 127): floor says no",
+                 "capacity UNKNOWN"),
+                ("2", "capacity floor could not run (exit 2)", "capacity UNKNOWN")):
             with self.subTest(rc=rc):
                 script = textwrap.dedent(f"""\
                     set -u

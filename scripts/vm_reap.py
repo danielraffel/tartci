@@ -327,16 +327,23 @@ def delete_runner(
     endpoint is only the fallback for a caller that has none.
     """
     target = endpoint or f"repos/{repo}/actions/runners"
-    run(
-        [
-            github_cli(),
-            "api",
-            "-X",
-            "DELETE",
-            f"{target}/{runner_id}",
-        ],
-        check=True,
-    )
+    # Same identity binding as the census read that found this registration:
+    # an App wrapper run from $HOME would otherwise mint for no repository (or
+    # the wrong one) and the delete of an org-scope registration would 403.
+    saved = runner_census.bind_identity(repo)
+    try:
+        run(
+            [
+                github_cli(),
+                "api",
+                "-X",
+                "DELETE",
+                f"{target}/{runner_id}",
+            ],
+            check=True,
+        )
+    finally:
+        runner_census.restore_identity(saved)
     return f"github_runner_deleted:{runner_name}:{runner_id}"
 
 

@@ -554,11 +554,14 @@ EOF
   case "$verdict" in
     0) echo "verdict: pool $sub would proceed" ;;
     11)
-      if [ "${TARTCI_POOL_FLOOR_EXIT:-}" = 3 ]; then
-        echo "verdict: pool $sub would REFUSE (last serving host for a required label; --allow-last-serving-host overrides)"
-      else
-        echo "verdict: pool $sub would REFUSE (capacity UNKNOWN: the runner census could not answer; --allow-last-serving-host does NOT override this — fix the census cause shown above, then re-run)"
-      fi
+      # capacity_floor.py exits 3 last serving host, 4 capacity unknown, 2
+      # usage; 127 is the no-tomllib interpreter probe. Only 3 and 4 are floor
+      # verdicts; anything else means the floor never ran to a verdict.
+      case "${TARTCI_POOL_FLOOR_EXIT:-}" in
+        3) echo "verdict: pool $sub would REFUSE (last serving host for a required label; --allow-last-serving-host overrides)" ;;
+        4) echo "verdict: pool $sub would REFUSE (capacity UNKNOWN: the runner census could not answer; --allow-last-serving-host does NOT override this — fix the census cause shown above, then re-run)" ;;
+        *) echo "verdict: pool $sub would REFUSE (capacity floor could not run (exit ${TARTCI_POOL_FLOOR_EXIT:-unknown}): ${floor_output:-no output}; --allow-last-serving-host does NOT override this)" ;;
+      esac
       ;;
     12) echo "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, or --now)" ;;
   esac
