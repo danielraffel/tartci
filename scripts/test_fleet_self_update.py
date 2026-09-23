@@ -357,6 +357,18 @@ class SkewTests(Base):
         (self.home / ".config/tartci/macos-fleet-install.json").write_text("{}")
         self.assertEqual(self.apply(), su.EXIT_UNKNOWN)
 
+    def test_profile_without_install_receipt_is_not_managed(self) -> None:
+        (self.home / ".config/tartci/macos-fleet-install.json").unlink()
+        self.assertEqual(self.plan(), su.EXIT_UNKNOWN)
+        skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
+        self.assertEqual(skew["state"], "not_applicable")
+        self.assertIsNone(su.summary(self.home)["problem"])
+        self.assertIn("skew n/a", su.render_skew(skew))
+        # Control: a receipt without a commit is a managed host, and unknown.
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text("{}")
+        self.assertEqual(self.plan(), su.EXIT_UNKNOWN)
+        self.assertIn("unknown", su.summary(self.home)["problem"])
+
     def test_stale_flag_and_render(self) -> None:
         self.sys.log_lines = f"{T_OLD} {int(NOW - 3 * 86400)}\n"
         skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW)
