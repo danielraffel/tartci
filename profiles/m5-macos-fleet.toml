@@ -3,6 +3,8 @@ name = "m5-macos-fleet"
 
 [host]
 id = "m5"
+# The SSH alias other fleet hosts reach this one by (self-update peers).
+ssh = "m5"
 home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"

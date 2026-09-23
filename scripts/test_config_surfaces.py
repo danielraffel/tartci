@@ -59,7 +59,7 @@ class ReadinessCarriesConfigTests(unittest.TestCase):
     def test_unreadable_profile_is_unknown(self) -> None:
         config = self._readiness(M3.read_text().replace('name = "m3-macos-fleet"\n', ""))["config"]
         self.assertEqual(config["profile_drift"]["state"], "unknown")
-        self.assertEqual(fleet.render_config_verdicts(None).splitlines(),
+        self.assertEqual(fleet.render_config_verdicts(None).splitlines()[:2],
                          ["profile drift: UNKNOWN (not checked from here)",
                           "supply: UNKNOWN (not checked from here)"])
 
@@ -126,7 +126,11 @@ class WatchdogWarnTests(unittest.TestCase):
         (bindir / "launchctl").chmod(0o755)
         agents = td / "agents"
         agents.mkdir(exist_ok=True)
-        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
+        # A clean HOME, as on CI: the watchdog's skew refresh must not read
+        # this machine's real install or update checkout.
+        home = td / "home"
+        home.mkdir(exist_ok=True)
+        env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(home),
                "TARTCI_HOME": str(td / "tartci-home"), "TARTCI_TART_CLI": "/nonexistent"}
         return subprocess.run(
             [sys.executable, str(WATCHDOG), "--launch-agents-dir", str(agents),
@@ -151,6 +155,23 @@ class WatchdogWarnTests(unittest.TestCase):
             calls = (td / "launchctl.log").read_text() if (td / "launchctl.log").exists() else ""
             self.assertFalse([line for line in calls.splitlines()
                               if line.split(" ", 1)[0] in MUTATIONS], calls)
+
+    def test_skew_problem_never_hides_drift(self) -> None:
+        import tartci_launchd_watchdog as wd
+        summary = wd.config_problem({
+            "profile_drift": {"state": "drift", "keys": ["host.ssh"]},
+            "supply": {"state": "match"},
+            "self_update": {"problem": "skew unknown: fetch failed"}})
+        self.assertTrue(summary.startswith("profile_drift=DRIFT (host.ssh)"), summary)
+        self.assertIn("self_update=skew unknown", summary)
+
+    def test_unmanaged_host_has_no_skew_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            td = Path(raw)
+            proc = self._run(td, M3.read_text())
+            self.assertNotIn("WARN config", proc.stdout)
+            skew = json.loads((td / "tartci-home/state/self-update/skew.json").read_text())
+            self.assertEqual(skew["state"], "not_applicable")
 
     def test_clean_profile_does_not_warn(self) -> None:
         with tempfile.TemporaryDirectory() as raw:

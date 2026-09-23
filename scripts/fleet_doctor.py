@@ -78,6 +78,9 @@ CODES: tuple[str, ...] = (
     "readiness_probe_failed",
     "readiness_verdict_depends_on_invocation",
     "sealed_launcher_bundle",
+    "self_update_current",
+    "self_update_problem",
+    "self_update_unmeasured",
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
@@ -618,6 +621,21 @@ def supply_probe(support_root: Path, installed: Path, python: str | None,
         return None, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
 
 
+def check_self_update(summary: dict | None) -> Finding:
+    """tartci's own skew against main and the last self-update attempt."""
+    if not isinstance(summary, dict) or summary.get("skew") is None:
+        return Finding("self_update", UNKNOWN, "self_update_unmeasured",
+                       "tartci's skew against main was never measured on this host "
+                       "(run `tartci fleet-macos self-update --plan`)")
+    lines = "; ".join(summary.get("lines") or [])
+    if summary.get("problem"):
+        return Finding("self_update", PROBLEM, "self_update_problem",
+                       f"{summary['problem']} ({lines})", {"skew": summary.get("skew"),
+                                                          "last": summary.get("last")})
+    return Finding("self_update", OK, "self_update_current", lines,
+                   {"skew": summary.get("skew"), "last": summary.get("last")})
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -831,6 +849,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             identity_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             probe: Callable[[Path], dict] | None = None,
             drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
+            self_update_summary: dict | None = None,
             supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
@@ -878,6 +897,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             supply_result, installed_present=True, error=supply_error))
     else:
         findings.append(check_supply(None, installed_present=False))
+    if self_update_summary is None:
+        try:
+            import fleet_self_update
+            self_update_summary = fleet_self_update.summary(home)
+        except Exception:  # noqa: BLE001 - reported as unmeasured
+            self_update_summary = None
+    findings.append(check_self_update(self_update_summary))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default

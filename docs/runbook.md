@@ -1438,6 +1438,113 @@ host-wide "no VM running" gate.
 fleet`), and check GitHub's job history against it with
 `scripts/supply_observed.py --repo OWNER/REPO`.
 
+### Keeping a host on main's tartci (`tartci fleet-macos self-update`)
+
+`tartci fleet-macos self-update [--plan|--apply] [--target REF]` is the
+2026-09-23 manual update procedure, codified, with verification and rollback.
+`--plan` (the default) is read-only for the host; `--apply` performs it.
+
+- **Target.** The installed commit is the executed cohort (the sealed
+  launcher's `bundle.json` source_commit on a `[launch_helper]` host, else the
+  installed generation's manifest). Main is read from a tartci-owned clean
+  clone at `~/.local/share/tartci/update-checkout`, created atomically. The
+  target is the newest **first-parent** main commit that is past the soak (30
+  min) **and whose check runs are all green**; a red commit is skipped for an
+  older green one, and with none green nothing happens (`unverified`). An
+  explicit `--target` must be on main's first-parent chain and meet both.
+- **Prepare** (changes nothing on the host): `support-manifest write`,
+  `fleet-macos validate`, install dry-run; on a sealed host the signing
+  identity is **extracted** from the live bundle's leaf certificate and proven
+  by a timestamped `codesign` probe with a 60 s bound (a keychain prompt would
+  hang an unattended run; the refusal says to run `pulp ship doctor`), then the
+  launcher is built under the reseal runbook's immutability preconditions and
+  verified.
+- **One host at a time.** Every other host in main's
+  `fleet/advertised-labels.json` must be `on` and not self-updating, read over
+  SSH. The marker's age is measured on the peer's own clock.
+- **Capacity floor.** `--allow-last-serving-host` only when every last-serving
+  label is idle by design (the pulp-release classes), logged in the receipt.
+- **Snapshot, update, verify.** Before draining, the running generation is
+  snapshotted under `~/.tartci/state/self-update/rollback/<time>-<commit>/`:
+  the installed profile, the approval pin and (sealed) a `ditto` copy of the
+  live launcher. Then drain, wait up to 90 min for no mid-job lane, `pool off`,
+  pin the new approval, install dry-run and `--apply` (retried), relay
+  reconcile, `pool on` through the installed shim, verify (pool on and fleet
+  ready, serving not blocked, executed commit == target, `launchd guard`
+  present).
+- **Rollback.** A failure before anything new is installed (the installer
+  rolls its own failure back) restores the pin and runs `pool on`. A failure
+  **after** a successful install (relay, pool on, verify) rolls back: wait for
+  idle, `pool off`, check out the previous commit, reinstall it from the
+  snapshot profile (sealed: the snapshot bundle, with the previous pin), `pool
+  on`, and **verify the previous generation**. The receipt says `rolled_back`
+  ("rolled back to X and verified"); if the rollback itself fails, the host is
+  put back on if possible and the receipt says `ROLLBACK FAILED` with what the
+  host now runs. `pool on` is retried; a host it could not bring back is
+  recorded as `HOST LEFT OFF`. SIGTERM (launchd stopping the agent) raises
+  inside the run: the host is put back on, the marker cleared and the receipt
+  finished (no full rollback in the stop window; the receipt names what runs).
+- **Receipts, rate limit, halt.** One receipt per attempt under
+  `attempts/`; `last.json` holds only real outcomes (succeeded, failed,
+  rolled_back), so a refusal never hides a failure. One attempt per target per
+  6 h. After 3 consecutive failed or rolled-back attempts automatic attempts
+  stop until `self-update --clear-halt`. Refusal receipts older than 7 days are
+  pruned.
+- **Always visible.** `pool status`, `doctor fleet` (`self_update`) and the
+  watchdog show the skew line, `STALE` after 24 h, a failed or rolled-back last
+  attempt, and a halt.
+- **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
+  every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
+  is not installed by default: `scripts/install_self_update_agent.sh` prints
+  the plan and the resolved peers, and `--install` loads it.
+
+- **Interruptions.** The installer runs in its own process group, and its
+  pgid and start time are recorded in `~/.tartci/state/self-update/installer.json`
+  while it runs. launchd gives the agent 120 s (ExitTimeOut) after SIGTERM
+  before SIGKILL, so a SIGTERM is deferred for at most 80 s while the
+  installer finishes; after that the installer group gets TERM and 10 s for
+  its restore trap, and recovery (re-pin to the live launcher, `pool on`,
+  finished receipt) runs inside the window. The trap is not guaranteed to
+  finish: an installer still running then is left recorded, and the next run
+  refuses ("installer is still running (pgid N)") until it has exited. An
+  install past 30 min gets TERM to its group and up to 120 s for its trap,
+  and is never retried on top of itself.
+- **Killed runs are recovered.** Every apply receipt is on disk from its
+  first step with the run's pid and start time. The next run that finds a
+  `running` receipt whose process is gone recovers it: re-pin to the live
+  launcher, `pool on`, finish the receipt as `failed` ("interrupted"),
+  write `last.json` (it counts toward the halt) and clear the stale
+  `active.json`; it then stops, and the following run proceeds. A run killed
+  before it announced changed nothing and is closed as refused. A receipt
+  whose process is alive refuses the new run. `tartci fleet-macos self-update
+  --verify` checks the running generation without changing anything; use it
+  after any interrupted run.
+- **Snapshots are verified up front.** On a sealed host the `ditto` copy of the
+  live launcher must verify against the current approval pin before the drain
+  (the copy rollback would reinstall), or the run refuses. The newest 5
+  snapshots and 3 builds are kept.
+- **Rolling back to a commit that predates self-update** (for example
+  `ee28821`) leaves a host whose installed tartci has no `fleet-macos
+  self-update`: the periodic agent then fails on every run (it fails closed;
+  nothing is changed) and the host no longer updates itself. Recover by hand
+  from a checkout of current main, with that checkout's own tartci: `./tartci
+  fleet-macos self-update --plan`, then `--apply` (or the manual install
+  procedure). After the fix that caused the rollback lands, the next scheduled
+  run on a host that still has self-update picks it up normally.
+
+#### Adding a machine
+
+1. Add `profiles/<host>-macos-fleet.toml` with `[host] ssh = "<alias>"`, the
+   SSH alias the other fleet hosts reach it by (for example `m3`). Without it
+   the convention `tartci-<host_id>` is used, so each host needs that alias in
+   `~/.ssh/config`.
+2. Regenerate `fleet/advertised-labels.json` (CI rejects a stale copy) and
+   merge. Every host's one-at-a-time check now includes the new machine; no
+   per-host file is edited. `~/.config/tartci/self-update.toml [peers]` exists
+   only to override a target.
+3. On the new machine: install, then `tartci fleet-macos self-update --peers`
+   to see every peer it will check and the target it resolves to.
+
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
 The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane

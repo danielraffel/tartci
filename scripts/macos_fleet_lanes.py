@@ -48,6 +48,7 @@ HOST_KEYS = {
     "github_api_timeout_seconds", "persistent_runner_labels",
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
+    "ssh",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -188,6 +189,10 @@ def load(path: Path) -> dict:
             fail(f"host.{key} must be a string")
         if not value.startswith("/"):
             fail(f"host.{key} must be an absolute path")
+    ssh = host.get("ssh")
+    if ssh is not None and (not isinstance(ssh, str)
+                            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._@-]{0,127}", ssh)):
+        fail("host.ssh must be an SSH host alias or user@host other fleet hosts use to reach this one")
     github_api_timeout = host.get("github_api_timeout_seconds")
     if github_api_timeout is not None and (
             type(github_api_timeout) is not int
@@ -2030,10 +2035,14 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
                                root: Path | None = None) -> dict:
     registrations: list[dict] = []
     persistent: list[dict] = []
+    hosts: list[dict] = []
     for path in paths:
         data = load(path)
         registrations.extend(advertised_registrations(data))
         persistent.extend(persistent_runners(data))
+        hosts.append({"profile": data.get("name") or data["host"]["id"],
+                      "host_id": data["host"]["id"],
+                      "ssh": data["host"].get("ssh")})
     return {
         "schema": ADVERTISED_LABELS_SCHEMA,
         "generated_from": {
@@ -2044,6 +2053,9 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         "registrations": registrations,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
+        # Additive to v1: how fleet hosts reach each other (self-update's
+        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        "hosts": hosts,
     }
 
 
@@ -2209,7 +2221,8 @@ def config_verdicts(config: Path, support_root: Path,
     """
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
-                "supply": {"state": "not_applicable", "reason": "no installed profile"}}
+                "supply": {"state": "not_applicable", "reason": "no installed profile"},
+                "self_update": self_update_summary()}
     value: dict = {}
     try:
         drift = profile_drift(config, support_root / "profiles")
@@ -2241,7 +2254,18 @@ def config_verdicts(config: Path, support_root: Path,
         }
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
+    value["self_update"] = self_update_summary()
     return value
+
+
+def self_update_summary() -> dict:
+    """Cached tartci skew and last self-update attempt. Never fetches."""
+    try:
+        import fleet_self_update
+        return fleet_self_update.summary()
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"tartci: skew UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
 
 
 def render_config_verdicts(value: dict | None) -> str:
@@ -2262,6 +2286,9 @@ def render_config_verdicts(value: dict | None) -> str:
         else:
             text = f"UNKNOWN ({row.get('reason') or 'not checked from here'})"
         lines.append(f"{name}: {text}")
+    self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
+    lines.extend(self_update.get("lines") or
+                 ["tartci: skew UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
     if supply.get("commits_differ"):
         lines.append(f"  supply published at {supply['published_commit'][:12]}, host generation "

@@ -147,6 +147,21 @@
       "remedy": "Deliver a re-signed launcher bundle built around the new cohort and install with --launch-helper-source, refreshing the pinned approval digest, then confirm the executed cohort matches the installed one.",
       "do_not": "Do not read a zero exit from fleet-macos install --apply on this host as evidence that the new generation is running."
     },
+    "self_update_current": {
+      "summary": "This host runs main's tartci, or its undeployed commits are recent and the last self-update did not fail.",
+      "why": "Hosts fell weeks behind main unnoticed; tartci's skew is measured against first-parent main and shown here even when the self-update agent is off."
+    },
+    "self_update_problem": {
+      "summary": "This host runs stale tartci code, its skew could not be measured, or the last self-update failed.",
+      "why": "A host behind main runs fixes the rest of the fleet has; a failed self-update leaves the host serving the previous generation, which is safe but must be seen.",
+      "remedy": "Read `tartci fleet-macos self-update --status` and the receipt under ~/.tartci/state/self-update/attempts, then run `tartci fleet-macos self-update --plan`.",
+      "do_not": "Do not hand-install from a shared working copy; the self-update path installs from its own clean checkout of main."
+    },
+    "self_update_unmeasured": {
+      "summary": "tartci's skew against main was never measured here.",
+      "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
+      "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
+    },
     "supply_match": {
       "summary": "Every registration this host's installed profile mints matches the published declared supply.",
       "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."
