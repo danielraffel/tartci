@@ -574,6 +574,29 @@ class RunnerCensusScopeTests(unittest.TestCase):
             mutate_run.call_args.args[0][-1], "orgs/danielraffel/actions/runners/2"
         )
 
+    def test_delete_runs_under_the_same_identity_binding_as_the_census(self) -> None:
+        """A fake gh records the repo binding it sees on the DELETE itself."""
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "calls.log"
+            fake = Path(td) / "fakegh"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f'printf "GH_REPO=%s SHIPYARD_GHAPP_REPO=%s args=%s\\n" '
+                f'"$GH_REPO" "$SHIPYARD_GHAPP_REPO" "$*" >> "{log}"\n'
+            )
+            fake.chmod(0o755)
+            env = {"TARTCI_GH_CLI": str(fake)}
+            with mock.patch.dict(os.environ, env):
+                os.environ.pop("GH_REPO", None)
+                os.environ.pop("SHIPYARD_GHAPP_REPO", None)
+                vm_reap.delete_runner("Generous-Corp/pulp", 7, "m5-pulp-gate-01-1-1",
+                                      "orgs/Generous-Corp/actions/runners")
+                # The binding does not outlive the call.
+                self.assertNotIn("GH_REPO", os.environ)
+            line = log.read_text()
+            self.assertIn("GH_REPO=Generous-Corp/pulp SHIPYARD_GHAPP_REPO=Generous-Corp/pulp", line)
+            self.assertIn("-X DELETE orgs/Generous-Corp/actions/runners/7", line)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

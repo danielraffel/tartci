@@ -12,6 +12,21 @@
       "summary": "Both registration scopes were read.",
       "why": "Runners register at repository scope or at organization scope, and the repository endpoint omits organization runners without saying so. Only a census that read both can be quoted as capacity."
     },
+    "census_identity_authenticated": {
+      "summary": "The capacity census CLI reaches GitHub as an authenticated identity.",
+      "why": "Only an authenticated identity can read runner registrations reliably; the check reads the free rate_limit endpoint with the census's own repository binding."
+    },
+    "census_identity_unauthenticated": {
+      "summary": "The capacity census CLI reaches GitHub anonymously (60/hour ceiling).",
+      "why": "An anonymous census shares one 60/hour allowance with every host behind the same IP, runs it out within minutes of a --plan loop, and then reports every required label as capacity unknown, which refuses pool drain/off.",
+      "remedy": "Run with TARTCI_GH_CLI=ghapp (the default when ghapp is installed), or repair the CLI's GitHub login.",
+      "do_not": "Do not change GitHub App permissions or org settings for this; the identity, not the permission, is wrong."
+    },
+    "census_identity_unknown": {
+      "summary": "The census CLI did not report a core rate-limit ceiling, so its identity is unproven.",
+      "why": "A CLI that will not answer the free rate_limit probe leaves the identity unproven; that is neither authenticated nor anonymous.",
+      "remedy": "Run `<cli> api rate_limit` by hand with GH_REPO=<repo> to see what it returns."
+    },
     "census_incomplete": {
       "summary": "A registration scope could not be read.",
       "why": "The scope that failed is exactly where a missing runner might live, so a label absent from an incomplete census is unknown, never unserved. A smaller number reads as a confident finding and is the more dangerous error.",

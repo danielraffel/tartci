@@ -286,11 +286,14 @@ class Decision:
     host: str = ""
     action: str = ""
     findings: tuple[Finding, ...] = field(default_factory=tuple)
+    # Why a census could not answer, when it names an identity fault.
+    census_reason: str = ""
 
     def as_dict(self) -> dict:
         return {
             "allowed": self.allowed,
             "reason": self.reason,
+            "census_reason": self.census_reason,
             "message": self.message,
             "overridden": self.overridden,
             "host": self.host,
@@ -380,13 +383,21 @@ def classify(
         last = last or finding
 
     if unknown is not None:
+        census_reason = next(
+            (code for code in (runner_census.CENSUS_UNAUTHENTICATED,
+                               runner_census.CENSUS_IDENTITY_LACKS_ACCESS)
+             if code in unknown.detail), "")
         return Decision(
             allowed=False,
             reason=REASON_CAPACITY_UNKNOWN,
+            census_reason=census_reason,
             message=(
                 f"refusing pool {action}: capacity for required label "
-                f"'{unknown.label}' ({unknown.repo}) could not be determined: "
-                f"{unknown.detail}"
+                f"'{unknown.label}' ({unknown.repo}) could not be determined"
+                f"{' [' + census_reason + ']' if census_reason else ''}: "
+                f"{unknown.detail}. --allow-last-serving-host does NOT override "
+                "an unknown answer: it accepts a known zero, not an unread one. "
+                "Fix the census (see the reason above) and re-run."
             ),
             host=host,
             action=action,

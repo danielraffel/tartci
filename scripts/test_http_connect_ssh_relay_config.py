@@ -36,8 +36,10 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
             set(suffixes),
             {
                 "api.vcvrack.com",
+                "files.pythonhosted.org",
                 "formulae.brew.sh",
                 "ghcr.io",
+                "pypi.org",
                 "registry.npmjs.org",
                 "storage.googleapis.com",
             },
