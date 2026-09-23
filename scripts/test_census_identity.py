@@ -92,6 +92,27 @@ class IdentityBindingTests(unittest.TestCase):
                 self.assertIn("GH_REPO=Generous-Corp/forge ", line)
 
 
+class BindingHygieneTests(unittest.TestCase):
+    def test_binding_is_scoped_to_the_call_and_argv_is_unchanged(self) -> None:
+        seen = []
+
+        def run_json(argv):
+            seen.append((list(argv), os.environ.get("GH_REPO"), os.environ.get("SHIPYARD_GHAPP_REPO")))
+            if "orgs/" in argv[2]:
+                raise RuntimeError(INTEGRATION_STDERR)
+            return {"runners": []}
+
+        with mock.patch.dict(os.environ, {"GH_REPO": "someone/else"}, clear=False):
+            os.environ.pop("SHIPYARD_GHAPP_REPO", None)
+            runner_census.collect(REPO, runner_census.cli_fetcher("ghapp", run_json=run_json))
+            # Restored after success AND after a raising call.
+            self.assertEqual(os.environ.get("GH_REPO"), "someone/else")
+            self.assertNotIn("SHIPYARD_GHAPP_REPO", os.environ)
+        for argv, gh_repo, ghapp_repo in seen:
+            self.assertEqual(argv[:2], ["ghapp", "api"])  # callers rely on this shape
+            self.assertEqual((gh_repo, ghapp_repo), (REPO, REPO))
+
+
 class CliResolutionTests(unittest.TestCase):
     def _bin(self, td: Path, name: str) -> Path:
         path = td / name

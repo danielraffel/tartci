@@ -68,6 +68,29 @@ def identity_env(repo: str) -> dict[str, str]:
     return {name: repo for name in IDENTITY_ENV_NAMES}
 
 
+def bind_identity(repo: str) -> dict[str, str | None]:
+    """Bind the GitHub identity env for one call; returns what to restore.
+
+    Callers supply their own runner (bounded, budgeted, argv-rewriting), so
+    the binding travels in the environment every child inherits rather than
+    in argv, whose shape several callers rely on. Pair with restore_identity
+    in a finally. A plain try/finally, not a generator context manager: the
+    bounded runner raises frozen exceptions that generator.throw cannot
+    annotate. Census calls are sequential; this is not for concurrent use.
+    """
+    saved = {name: os.environ.get(name) for name in IDENTITY_ENV_NAMES}
+    os.environ.update(identity_env(repo))
+    return saved
+
+
+def restore_identity(saved: dict[str, str | None]) -> None:
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
 def classify_census_failure(text: str, *, cli: str, repo: str) -> tuple[str, str] | None:
     """(reason, operator message) for an identity failure, else None."""
     message = (text or "").strip()
@@ -296,11 +319,7 @@ def cli_fetcher(cli: str, *, run_json: Callable[[list[str]], Any], per_page: int
     def fetcher_for(repo: str | None):
         def fetch(scope: str, endpoint: str) -> list[dict]:
             argv = [cli, "api", f"{endpoint}?per_page={per_page}", "--paginate", "--slurp"]
-            if repo is not None:
-                # `env` rather than a subprocess env= so every caller's own
-                # runner (bounded, budgeted) carries the binding unchanged.
-                argv = ["/usr/bin/env",
-                        *(f"{k}={v}" for k, v in identity_env(repo).items()), *argv]
+            saved = bind_identity(repo) if repo is not None else {}
             try:
                 payload = run_json(argv)
             except Exception as exc:  # noqa: BLE001
@@ -309,6 +328,8 @@ def cli_fetcher(cli: str, *, run_json: Callable[[list[str]], Any], per_page: int
                     raise CensusScopeError(scope, endpoint, named[0], named[1]) from exc
                 code = getattr(exc, "problem_code", "") or type(exc).__name__
                 raise CensusScopeError(scope, endpoint, str(code), str(exc)) from exc
+            finally:
+                restore_identity(saved)
             return extract_runners(payload)
 
         return fetch
