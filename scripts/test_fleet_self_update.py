@@ -61,6 +61,8 @@ class FakeSystem(su.System):
         self.on_rc = 0
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.critical: list[list[str]] = []
+        self.snapshot_verify_rc = 0
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
         self.relay = {"ok": True, "probe": "relay authenticated"}
@@ -75,6 +77,10 @@ class FakeSystem(su.System):
 
     def now(self) -> float:
         return self.clock
+
+    def run_critical(self, argv, *, cwd=None, env=None, timeout=900):
+        self.critical.append(list(argv))
+        return self.run(argv, cwd=cwd, env=env, timeout=timeout)
 
     def sleep(self, seconds: float) -> None:
         self.clock += seconds
@@ -142,6 +148,11 @@ class FakeSystem(su.System):
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
             return su.Result(0 if self.relay.get("ok") else 6, json.dumps(self.relay))
+        if a[:2] == ["python3", "-c"]:
+            return ok("f" * 64 + "\n")
+        if a[:2] == ["python3", "scripts/macos_launcher_identity.py"]:
+            return su.Result(self.snapshot_verify_rc, "{}", "" if self.snapshot_verify_rc == 0
+                             else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
             return self._render(a)
         if a[0] == "codesign" and "--extract-certificates" in joined:
@@ -549,6 +560,40 @@ class SealedTests(Base):
                 self.assertEqual(self.sys.mutations(), [])
                 self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
 
+    def test_same_sealed_target_can_be_planned_and_applied_again(self) -> None:
+        # A previous run's build is left read-only by build_macos_launcher.sh.
+        leftover = self.cfg.state_dir / "builds" / T_OLD / "TartCILauncher.app" / "Contents"
+        (leftover / "Resources" / "support").mkdir(parents=True)
+        (leftover / "Resources" / "support" / "x").write_text("x")
+        os.chmod(leftover / "Resources" / "support" / "x", 0o444)
+        for d in (leftover / "Resources" / "support", leftover / "Resources", leftover):
+            os.chmod(d, 0o555)
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+
+    def test_build_happens_only_after_the_gates(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
+                             for a, _ in self.sys.calls))
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertTrue(all(json.loads(p.read_text())["status"] != "running" for p in receipts))
+
+    def test_snapshot_that_does_not_verify_refuses_before_drain(self) -> None:
+        self.sys.snapshot_verify_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+
+    def test_failed_rollback_repins_to_the_live_bundle(self) -> None:
+        self.sys.broken_target = True
+        self.sys.rollback_install_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("ROLLBACK FAILED", self.last()["error"])
+        self.assertEqual(self.sys.running(), T_OLD)            # new bundle still live
+        self.assertEqual(self.pin().read_text(), "c" * 64 + "\n")  # pin matches it
+
     def test_plan_extracts_identity_read_only(self) -> None:
         self.assertEqual(self.plan(), su.EXIT_OK)
         self.assertEqual(self.sys.mutations(), [])
@@ -823,6 +868,98 @@ class AtomicCloneTests(Base):
         self.sys.clone_ok = True
         su.refresh_checkout(self.cfg, self.sys)
         self.assertTrue((self.cfg.checkout / ".git").is_dir())
+
+
+class InterruptedRecoveryTests(Base):
+    def test_second_sigterm_during_rollback_still_finishes_and_counts(self) -> None:
+        self.sys.broken_target = True
+
+        def terminate_in_rollback(argv):
+            if argv[:2] == ["./tartci", "support-manifest"] and self.sys.checked_out == INSTALLED:
+                self.sys.hook = None
+                raise su.Terminated("second SIGTERM")
+        self.sys.hook = terminate_in_rollback
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(last["status"], "failed")
+        self.assertIn("ROLLBACK FAILED", last["error"])
+        self.assertIn("Terminated", last["error"])
+        self.assertEqual(self.sys.pool_state, "on")
+        receipts = [json.loads(p.read_text()) for p in (self.cfg.state_dir / "attempts").glob("*.json")]
+        self.assertTrue(receipts and all(r["status"] != "running" for r in receipts))
+
+    def test_terminated_after_install_names_the_verify_command(self) -> None:
+        def terminate_at_pool_on(argv):
+            if argv[-2:] == ["pool", "on"]:
+                self.sys.hook = None
+                raise su.Terminated("SIGTERM")
+        self.sys.hook = terminate_at_pool_on
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("self-update --verify", self.last()["error"])
+
+    def test_install_runs_as_a_critical_section(self) -> None:
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertEqual(len(self.sys.critical), 1)
+        self.assertIn("--apply", self.sys.critical[0])
+
+    def test_install_timeout_is_not_retried(self) -> None:
+        self.sys.install_rcs = [su.EXIT_TIMED_OUT, 0]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(len(self.sys.critical), 1)
+        self.assertIn("timed out", self.last()["error"])
+
+    def test_successful_runs_prune_old_snapshots(self) -> None:
+        rollback = self.cfg.state_dir / "rollback"
+        for i in range(su.KEEP_SNAPSHOTS + 3):
+            (rollback / f"2026010{i}T000000Z-old").mkdir(parents=True)
+            os.utime(rollback / f"2026010{i}T000000Z-old", (i, i))
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertEqual(len(list(rollback.iterdir())), su.KEEP_SNAPSHOTS)
+
+
+class CriticalSectionTests(unittest.TestCase):
+    """The real System.run_critical, with real child processes."""
+
+    def test_sigterm_is_deferred_until_the_child_exits(self) -> None:
+        import signal
+        with tempfile.TemporaryDirectory() as td:
+            done = Path(td) / "done"
+            script = f"trap 'echo trapped >> {td}/trap' TERM; sleep 1; echo ok > {done}"
+            old = signal.signal(signal.SIGTERM, su._raise_terminated)
+            try:
+                import threading
+                threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+                with self.assertRaises(su.Terminated):
+                    su.System().run_critical(["bash", "-c", script], timeout=30)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+            self.assertEqual(done.read_text(), "ok\n")          # child finished
+            self.assertFalse((Path(td) / "trap").exists())      # and was never signalled
+
+    def test_timeout_terms_the_group_and_waits_for_its_trap(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            script = (f"trap 'echo restored > {td}/trap; exit 3' TERM; "
+                      "while :; do sleep 0.1; done")
+            original = su.INSTALL_TERM_GRACE
+            su.INSTALL_TERM_GRACE = 10
+            try:
+                result = su.System().run_critical(["bash", "-c", script], timeout=0.5)
+            finally:
+                su.INSTALL_TERM_GRACE = original
+            self.assertEqual(result.rc, su.EXIT_TIMED_OUT)
+            self.assertEqual((Path(td) / "trap").read_text(), "restored\n")
+            self.assertIn("timed out", result.err)
+
+    def test_clear_dir_removes_a_read_only_build(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tree = Path(td) / "b" / "c"
+            tree.mkdir(parents=True)
+            (tree / "f").write_text("x")
+            os.chmod(tree / "f", 0o444)
+            os.chmod(tree, 0o555)
+            os.chmod(tree.parent, 0o555)
+            su.clear_dir(Path(td) / "b")
+            self.assertFalse((Path(td) / "b").exists())
 
 
 if __name__ == "__main__":

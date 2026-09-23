@@ -1498,6 +1498,27 @@ fleet`), and check GitHub's job history against it with
   is not installed by default: `scripts/install_self_update_agent.sh` prints
   the plan and the resolved peers, and `--install` loads it.
 
+- **Interruptions.** The installer runs in its own process group. A SIGTERM
+  to self-update is deferred until the installer exits, so its restore trap
+  always completes; an install past 30 min gets TERM to its whole group and
+  up to 120 s for that trap, and is never retried on top of itself. A second
+  SIGTERM during recovery still finishes the receipt (counted toward the
+  halt), re-pins to whichever launcher is actually live, and runs `pool on`.
+  `tartci fleet-macos self-update --verify` checks the running generation
+  without changing anything; use it after any interrupted run.
+- **Snapshots are verified up front.** On a sealed host the `ditto` copy of the
+  live launcher must verify against the current approval pin before the drain
+  (the copy rollback would reinstall), or the run refuses. The newest 5
+  snapshots and 3 builds are kept.
+- **Rolling back to a commit that predates self-update** (for example
+  `ee28821`) leaves a host whose installed tartci has no `fleet-macos
+  self-update`: the periodic agent then fails on every run (it fails closed;
+  nothing is changed) and the host no longer updates itself. Recover by hand
+  from a checkout of current main, with that checkout's own tartci: `./tartci
+  fleet-macos self-update --plan`, then `--apply` (or the manual install
+  procedure). After the fix that caused the rollback lands, the next scheduled
+  run on a host that still has self-update picks it up normally.
+
 #### Adding a machine
 
 1. Add `profiles/<host>-macos-fleet.toml` with `[host] ssh = "<alias>"`, the

@@ -75,6 +75,11 @@ TARTCI_REPO = "danielraffel/tartci"
 # A peer with no `ssh` in its profile is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
+KEEP_BUILDS = 3
+KEEP_SNAPSHOTS = 5
+INSTALL_TIMEOUT = 1800
+INSTALL_TERM_GRACE = 120  # the installer's restore trap after TERM (matches ExitTimeOut)
+EXIT_TIMED_OUT = 124
 # Lanes whose only work is occasional by design: a host that is their last
 # server may still be taken down for an update, because an idle release lane
 # queues nothing while it is gone. Anything else that is last-serving refuses.
@@ -127,6 +132,52 @@ class System:
         except (OSError, subprocess.TimeoutExpired) as exc:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
+
+    def run_critical(self, argv: list[str], *, cwd: str | None = None,
+                     env: dict[str, str] | None = None,
+                     timeout: float = INSTALL_TIMEOUT) -> Result:
+        """Run a command that must never be killed half way (the installer).
+
+        It gets its own process group, so a signal to this process does not
+        reach it. SIGTERM to this process is DEFERRED until the child exits and
+        then raised, so the installer's own restore trap always finishes. On
+        timeout the whole group gets TERM, and its trap is waited for (bounded)
+        before anything else is decided; KILL only after that grace.
+        """
+        import signal
+        pending: list[int] = []
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: pending.append(signum))
+        try:
+            with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
+                try:
+                    proc = subprocess.Popen(argv, cwd=cwd, env={**os.environ, **(env or {})},
+                                            stdout=out, stderr=err, text=True,
+                                            start_new_session=True)
+                except OSError as exc:
+                    return Result(127, "", f"{type(exc).__name__}: {exc}")
+                try:
+                    rc = proc.wait(timeout=timeout)
+                    timed_out = False
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    os.killpg(proc.pid, signal.SIGTERM)
+                    try:
+                        proc.wait(timeout=INSTALL_TERM_GRACE)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.wait()
+                    rc = EXIT_TIMED_OUT
+                out.seek(0)
+                err.seek(0)
+                result = Result(rc, out.read(), err.read())
+                if timed_out:
+                    result.err = (f"timed out after {timeout}s; the installer was sent TERM and "
+                                  f"its restore trap given {INSTALL_TERM_GRACE}s\n" + result.err)
+                return result
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+            if pending:
+                raise Terminated(f"signal {pending[0]} (deferred until the installer exited)")
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
@@ -593,6 +644,33 @@ def set_immutable(root: Path, manifest: Path, sys_: System) -> None:
     os.chmod(root, 0o555)
 
 
+def clear_dir(path: Path) -> None:
+    """Remove a tree the launcher build left read-only (a-w files, 0555 dirs)."""
+    if not path.exists():
+        return
+    for current, dirs, files in os.walk(path):
+        os.chmod(current, 0o755)
+        for name in dirs:
+            target = Path(current) / name
+            if not target.is_symlink():
+                os.chmod(target, 0o755)
+        for name in files:
+            target = Path(current) / name
+            if not target.is_symlink():
+                os.chmod(target, (target.stat().st_mode & 0o7777) | 0o200)
+    shutil.rmtree(path)
+
+
+def prune_dirs(parent: Path, keep: int) -> None:
+    """Keep the newest `keep` entries (names sort by time), removing the rest."""
+    if not parent.is_dir():
+        return
+    entries = sorted((p for p in parent.iterdir() if p.is_dir()),
+                     key=lambda p: p.stat().st_mtime)
+    for old in entries[:-keep] if keep else entries:
+        clear_dir(old)
+
+
 def restore_writable(root: Path) -> None:
     os.chmod(root, 0o755)
     for current, dirs, files in os.walk(root):
@@ -819,23 +897,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step(name)
         helper = launch_helper(cfg)
         bundle = approval = None
-        if helper is not None and apply:
-            out_dir = cfg.state_dir / "builds" / target
-            shutil.rmtree(out_dir, ignore_errors=True)
-            out_dir.mkdir(parents=True)
-            bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
-            receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
-        elif helper is not None:
+        if helper is not None:
             with tempfile.TemporaryDirectory() as scratch:
                 identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
                 signing_probe(sys_, identity, Path(scratch))
-            receipt.step("launcher-build", f"would build and verify a sealed launcher signed by "
-                         f"{identity} (extracted from the live bundle's leaf certificate; a "
-                         "timestamped signing probe with it succeeded)")
+            receipt.step("signing", f"{'would build' if not apply else 'will build'} a sealed "
+                         f"launcher signed by {identity} (extracted from the live bundle's leaf "
+                         "certificate; a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
-        if bundle is not None:
-            install_args += ["--launch-helper-source", str(bundle)]
         if helper is None:
             dry = tartci(cfg, sys_, *install_args)
             if dry.rc != 0:
@@ -869,6 +939,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("capacity-floor", str(exc), ok=False)
         if refusals:
             raise Refused(" | ".join(refusals))
+        if helper is not None and apply:
+            # Built only once every cheap gate passed: a refused run must not
+            # have spent a signing build, and a rebuild must always be possible.
+            builds = cfg.state_dir / "builds"
+            out_dir = builds / target
+            clear_dir(out_dir)
+            out_dir.mkdir(parents=True)
+            bundle, approval = build_launcher(cfg, sys_, helper, profile, target, out_dir)
+            prune_dirs(builds, KEEP_BUILDS)
+            install_args += ["--launch-helper-source", str(bundle)]
+            receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
         if not apply:
             receipt.step("plan", "would snapshot the running generation, drain, wait for no "
                          "mid-job lane, pool off, " + ("pin approval, " if helper else "")
@@ -884,6 +965,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
+        return EXIT_REFUSED
+    except Exception as exc:  # noqa: BLE001 - nothing was mutated yet; never leave "running"
+        message = f"unexpected {type(exc).__name__} before any change: {exc}"
+        receipt.step("refused", message, ok=False)
+        receipt.finish("refused", message)
         return EXIT_REFUSED
 
 
@@ -925,14 +1011,16 @@ class Run:
             try:
                 self._update()
             except Refused as exc:
-                return self._recover(f"refused after drain: {exc}", refused=True)
+                return self._safe_recover(f"refused after drain: {exc}", refused=True)
             except Failed as exc:
-                return self._recover(str(exc))
+                return self._safe_recover(str(exc))
             except Terminated as exc:
-                return self._recover(f"terminated ({exc}) during {self.phase}", terminated=True)
+                return self._safe_recover(f"terminated ({exc}) during {self.phase}",
+                                          terminated=True)
             except Exception as exc:  # noqa: BLE001 - never leave the host out
-                return self._recover(f"{type(exc).__name__} during {self.phase}: {exc}")
+                return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
             self.receipt.finish("succeeded")
+            prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
         except Refused as exc:  # announce lost the race: nothing was touched
             self.receipt.step("refused", str(exc), ok=False)
@@ -956,10 +1044,31 @@ class Run:
                                    str(snap / "TartCILauncher.app")])
             if result.rc != 0:
                 raise Refused(f"cannot snapshot the live launcher: {result.text}")
+            self._verify_snapshot_bundle(snap)
         _write_json(snap / "snapshot.json", {"previous": self.previous, "at": _iso(self.sys.now())})
         self.snapshot = snap
         self.receipt.value["snapshot"] = str(snap)
         self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
+
+    def _verify_snapshot_bundle(self, snap: Path) -> None:
+        """The copy rollback would reinstall must verify against the current pin NOW."""
+        policy = self.sys.run(["python3", "-c",
+                               "import sys; sys.path.insert(0, 'scripts'); "
+                               "import macos_launcher_identity as m; "
+                               "print(m.profile_policy_digest(sys.argv[1]))",
+                               str(snap / "profile.toml")], cwd=str(self.cfg.checkout))
+        pin = (snap / "approved.sha256").read_text().strip()
+        check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
+                              str(snap / "TartCILauncher.app"),
+                              "--identifier", str(self.helper.get("identifier", "")),
+                              "--team-id", str(self.helper.get("team_id", "")),
+                              "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
+                             cwd=str(self.cfg.checkout))
+        if policy.rc != 0 or check.rc != 0:
+            raise Refused("the snapshot of the live launcher does not verify against the current "
+                          f"approval pin, so it could not be rolled back to: "
+                          f"{(check.text or policy.text)[:300]}")
+        self.receipt.step("snapshot-verify", "snapshot launcher verifies against the current pin")
 
     def _update(self) -> None:
         cfg, sys_ = self.cfg, self.sys
@@ -1010,10 +1119,16 @@ class Run:
 
     def _install(self, args: list[str]) -> None:
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
-            result = tartci(self.cfg, self.sys, *args, "--apply", timeout=1800)
+            result = self.sys.run_critical(["./tartci", *args, "--apply"],
+                                           cwd=str(self.cfg.checkout), env=census_env(),
+                                           timeout=INSTALL_TIMEOUT)
             if result.rc == 0:
                 return
             self.receipt.step("install", f"attempt {attempt} failed: {result.text[:300]}", ok=False)
+            if result.rc == EXIT_TIMED_OUT:
+                # Never install on top of an interrupted install: recovery reads
+                # what the installer's restore trap left and decides.
+                raise Failed(f"install --apply timed out: {result.text[:300]}")
             if attempt == INSTALL_ATTEMPTS:
                 raise Failed(f"install --apply failed {INSTALL_ATTEMPTS} times: {result.text}")
             self.sys.sleep(INSTALL_RETRY_SECONDS)
@@ -1050,6 +1165,38 @@ class Run:
         return False
 
     # ── recovery ────────────────────────────────────────────────────────
+    def _safe_recover(self, reason: str, **kwargs) -> int:
+        """Recovery that always ends with a finished receipt and a counted attempt.
+
+        A second SIGTERM (or anything else) during recovery must not leave the
+        receipt `running` with no last.json: that hides the host's state and
+        does not count toward the halt.
+        """
+        try:
+            return self._recover(reason, **kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            on = False
+            try:
+                self._repin_to_live()
+                on = self._pool_on()
+            except BaseException:  # noqa: BLE001
+                pass
+            return self._terminal("failed", f"{reason}; RECOVERY INTERRUPTED "
+                                  f"({type(exc).__name__}: {exc}); host is "
+                                  f"{'on' if on else 'possibly OFF'} running "
+                                  f"{str(self._running())[:12]}; run `tartci fleet-macos "
+                                  "self-update --verify`")
+
+    def _repin_to_live(self) -> None:
+        """Make the approval pin match whichever launcher bundle is actually live."""
+        if self.pin_path is None or self.snapshot is None:
+            return
+        running = self._running()
+        if running == self.target and self.approval is not None:
+            self._write_pin(self.approval.read_text())
+        elif running == self.previous:
+            self._write_pin((self.snapshot / "approved.sha256").read_text())
+
     def _running(self) -> str | None:
         try:
             return installed_commit(self.cfg)[0]
@@ -1076,10 +1223,11 @@ class Run:
         if terminated:
             # launchd will SIGKILL soon: no time for a full rollback. Get the
             # host serving and say exactly what it runs.
+            self._repin_to_live()
             on = self._pool_on()
             return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
                                   f"{'on' if on else 'OFF'} running {str(running)[:12]}; run "
-                                  "`tartci fleet-macos self-update --apply` to verify or retry")
+                                  "`tartci fleet-macos self-update --verify` to check it")
         return self._rollback(reason)
 
     def _rollback(self, reason: str) -> int:
@@ -1106,9 +1254,11 @@ class Run:
             if not self._pool_on():
                 raise Failed("pool on after rollback failed")
             verify(cfg, sys_, self.previous, self.receipt)
-        except (Failed, Refused, Exception) as exc:  # noqa: BLE001
+        except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
+            self._repin_to_live()
             on = self._pool_on()
-            return self._terminal("failed", f"{reason}; ROLLBACK FAILED: {exc}; host is "
+            return self._terminal("failed", f"{reason}; ROLLBACK FAILED: "
+                                  f"{type(exc).__name__}: {exc}; host is "
                                   f"{'on' if on else 'OFF'} running "
                                   f"{str(self._running())[:12]}")
         return self._terminal("rolled_back", f"{reason}; rolled back to {self.previous[:12]} "
@@ -1190,6 +1340,9 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--plan", action="store_true", help="read-only (default)")
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--status", action="store_true", help="print cached skew and last attempt")
+    mode.add_argument("--verify", action="store_true",
+                      help="verify the running generation (pool on and ready, executing what "
+                      "the installer says, guard present) without changing anything")
     mode.add_argument("--clear-halt", action="store_true",
                       help="resume automatic attempts after consecutive failures")
     mode.add_argument("--peers", action="store_true",
@@ -1208,6 +1361,14 @@ def main(argv: list[str] | None = None) -> int:
     sys_ = System()
     if args.status:
         print("\n".join(status_lines(cfg.state_dir)))
+        return 0
+    if args.verify:
+        try:
+            running, source = installed_commit(cfg)
+            verify(cfg, sys_, running, Receipt(cfg, sys_, running, "verify"))
+        except (Refused, Failed) as exc:
+            print(f"self-update: VERIFY FAILED: {exc}", file=sys.stderr)
+            return EXIT_FAILED
         return 0
     if args.clear_halt:
         _write_json(cfg.state_dir / "halt-cleared.json", {"at": _iso(sys_.now())})
