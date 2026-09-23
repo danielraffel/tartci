@@ -343,5 +343,22 @@
       "launchd_label": "actions.runner.danielraffel-pulp.pulp-preamble-m5",
       "runner_name": "pulp-preamble-m5"
     }
+  ],
+  "hosts": [
+    {
+      "profile": "m1-macos-fleet",
+      "host_id": "m1",
+      "ssh": "m1"
+    },
+    {
+      "profile": "m3-macos-fleet",
+      "host_id": "studio",
+      "ssh": "m3"
+    },
+    {
+      "profile": "m5-macos-fleet",
+      "host_id": "m5",
+      "ssh": "m5"
+    }
   ]
 }

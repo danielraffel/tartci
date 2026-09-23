@@ -67,6 +67,14 @@ DEFAULT_POLL_SECONDS = 45
 INSTALL_ATTEMPTS = 4
 INSTALL_RETRY_SECONDS = 30
 ACTIVE_MARKER_TTL = 3 * 3600
+MAX_CONSECUTIVE_FAILURES = 3
+REFUSAL_RECEIPT_TTL = 7 * 86400
+CHECK_CANDIDATES = 5
+SIGNING_PROBE_TIMEOUT = 60
+TARTCI_REPO = "danielraffel/tartci"
+# A peer with no `ssh` in its profile is reached through this alias.
+SSH_ALIAS_CONVENTION = "tartci-{host_id}"
+TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
 # Lanes whose only work is occasional by design: a host that is their last
 # server may still be taken down for an update, because an idle release lane
 # queues nothing while it is gone. Anything else that is last-serving refuses.
@@ -76,7 +84,7 @@ DEFAULT_IDLE_BY_DESIGN = ("pulp-release-tagged", "pulp-release-pr-gate")
 EXIT_OK = 0            # updated, already current, or plan says it would proceed
 EXIT_NOTHING = 0
 EXIT_REFUSED = 3       # a precondition refused; the host was not touched
-EXIT_FAILED = 4        # a mutation ran and failed; host restored to `on`
+EXIT_FAILED = 4        # a mutation ran and failed; see the receipt for what was restored
 EXIT_UNKNOWN = 5       # skew or installed state could not be determined
 
 
@@ -86,6 +94,14 @@ class Refused(Exception):
 
 class Failed(Exception):
     """A step failed after the host was taken out of service."""
+
+
+class Terminated(BaseException):
+    """SIGTERM (launchd stopping the agent) while the host is out of service."""
+
+
+def _raise_terminated(signum, frame):  # noqa: ARG001
+    raise Terminated(f"signal {signum}")
 
 
 @dataclasses.dataclass
@@ -176,9 +192,13 @@ def summary(home: Path | None = None) -> dict:
         problem = f"skew {skew.get('state')}: {skew.get('reason')}"
     elif skew.get("stale"):
         problem = f"{skew.get('behind')} commits behind main since {skew.get('oldest_undeployed')}"
-    if last and last.get("status") == "failed":
-        failed = f"last self-update FAILED for {str(last.get('target'))[:12]}: {last.get('error')}"
+    if last and last.get("status") in ("failed", "rolled_back"):
+        failed = (f"last self-update {last['status'].upper().replace('_', ' ')} for "
+                  f"{str(last.get('target'))[:12]}: {last.get('error')}")
         problem = f"{problem}; {failed}" if problem else failed
+    halted = halt_reason(state)
+    if halted:
+        problem = f"{problem}; {halted}" if problem else halted
     return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem}
 
 
@@ -260,13 +280,25 @@ def installed_commit(cfg: Config) -> tuple[str, str]:
 
 
 def refresh_checkout(cfg: Config, sys_: System) -> None:
-    """Fetch main into the tartci-owned checkout, creating it if needed."""
+    """Fetch main into the tartci-owned checkout, creating it atomically.
+
+    The clone lands in a temporary sibling and is renamed into place only
+    when complete, so a timeout or kill can never leave a half checkout that
+    later runs look at.
+    """
     path = cfg.checkout
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)
-        result = sys_.run(["git", "clone", "--quiet", "--no-checkout", REPO_URL, str(path)])
-        if result.rc != 0:
+        staging = Path(tempfile.mkdtemp(prefix=".update-checkout.", dir=path.parent))
+        result = sys_.run(["git", "clone", "--quiet", "--no-checkout", REPO_URL,
+                           str(staging / "clone")])
+        if result.rc != 0 or not (staging / "clone" / ".git").exists():
+            shutil.rmtree(staging, ignore_errors=True)
             raise Refused(f"cannot create the update checkout: {result.text}")
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)  # a leftover without .git
+        os.rename(staging / "clone", path)
+        shutil.rmtree(staging, ignore_errors=True)
     origin = sys_.run(["git", "-C", str(path), "remote", "get-url", "origin"])
     if origin.rc != 0 or origin.out.strip().rstrip("/").removesuffix(".git").lower() \
             != REPO_URL.removesuffix(".git").lower():
@@ -276,24 +308,66 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
+def gh_cli() -> str:
+    return os.environ.get("TARTCI_GH_CLI") or ("ghapp" if shutil.which("ghapp") else "gh")
+
+
+def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
+    """Every check run on main's commit completed successfully (and there is one).
+
+    Age alone is not evidence: a commit that broke main's CI soaks like any
+    other. An unreadable answer is not green.
+    """
+    binding = {"GH_REPO": TARTCI_REPO, "SHIPYARD_GHAPP_REPO": TARTCI_REPO,
+               "SHIPYARD_GH_APP_REPO": TARTCI_REPO}
+    result = sys_.run([gh_cli(), "api", f"repos/{TARTCI_REPO}/commits/{sha}/check-runs?per_page=100"],
+                      cwd=str(cfg.checkout), env=binding, timeout=60)
+    try:
+        runs = json.loads(result.out).get("check_runs")
+    except (json.JSONDecodeError, AttributeError):
+        runs = None
+    if not isinstance(runs, list):
+        return False, f"check runs unreadable (exit {result.rc}): {result.text[:160]}"
+    if not runs:
+        return False, "no check runs recorded"
+    bad = [f"{run.get('name')}={run.get('conclusion') or run.get('status')}" for run in runs
+           if run.get("status") != "completed"
+           or run.get("conclusion") not in ("success", "skipped", "neutral")]
+    return (not bad), ("all checks green" if not bad else "not green: " + ", ".join(bad))
+
+
 def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
-                 target_ref: str = "origin/main") -> dict:
-    """First-parent commits on main the host does not run, and the soak target."""
+                 target_ref: str = "origin/main", verify_checks: bool = True) -> dict:
+    """First-parent commits on main the host does not run, and the target.
+
+    The target is the newest first-parent main commit that is past the soak
+    AND whose check runs are green. An explicit --target must itself be on
+    main's first-parent chain and meet both.
+    """
     git = ["git", "-C", str(cfg.checkout)]
     skew: dict[str, Any] = {"installed": installed, "measured_at": _iso(now),
                             "state": "unknown", "behind": None, "oldest_undeployed": None,
                             "target": None, "soak_seconds": cfg.soak_seconds}
+    main = sys_.run([*git, "rev-parse", "--verify", "origin/main^{commit}"])
     head = sys_.run([*git, "rev-parse", "--verify", f"{target_ref}^{{commit}}"])
-    if head.rc != 0 or not SHA.fullmatch(head.out.strip()):
+    if head.rc != 0 or not SHA.fullmatch(head.out.strip()) or main.rc != 0:
         skew["reason"] = f"cannot resolve {target_ref}: {head.text}"
         return skew
-    skew["main"] = head.out.strip()
+    skew["main"] = main.out.strip()
+    head_sha = head.out.strip()
+    explicit = head_sha != skew["main"]
+    if explicit:
+        chain = sys_.run([*git, "rev-list", "--first-parent", skew["main"]])
+        if head_sha not in chain.out.split():
+            skew.update(state="unknown",
+                        reason=f"--target {target_ref} is not on origin/main's first-parent chain")
+            return skew
     if sys_.run([*git, "cat-file", "-e", f"{installed}^{{commit}}"]).rc != 0:
         skew["reason"] = f"installed commit {installed[:12]} is not in the tartci history"
         return skew
     if sys_.run([*git, "merge-base", "--is-ancestor", installed, skew["main"]]).rc != 0:
         skew.update(state="diverged",
-                    reason=f"installed {installed[:12]} is not an ancestor of {target_ref}")
+                    reason=f"installed {installed[:12]} is not an ancestor of origin/main")
         return skew
     log = sys_.run([*git, "log", "--first-parent", "--format=%H %ct",
                     f"{installed}..{skew['main']}"])
@@ -310,10 +384,30 @@ def measure_skew(cfg: Config, sys_: System, installed: str, now: float,
         skew["state"] = "current"
         return skew
     skew["oldest_undeployed"] = _iso(min(ts for _, ts in commits))
-    soaked = [(sha, ts) for sha, ts in commits if ts <= now - cfg.soak_seconds]
-    skew["target"] = soaked[0][0] if soaked else None
-    skew["state"] = "behind" if soaked else "soaking"
     skew["stale"] = min(ts for _, ts in commits) <= now - cfg.stale_hours * 3600
+    if explicit:
+        commits = [(sha, ts) for sha, ts in commits if sha == head_sha]
+        if not commits:
+            skew.update(state="unknown",
+                        reason=f"--target {head_sha[:12]} is not newer than the installed commit")
+            return skew
+    soaked = [(sha, ts) for sha, ts in commits if ts <= now - cfg.soak_seconds]
+    if not soaked:
+        skew["state"] = "soaking"
+        return skew
+    if not verify_checks:
+        skew.update(state="behind", target=None)
+        return skew
+    rejected = []
+    for sha, _ in soaked[:CHECK_CANDIDATES]:
+        green, detail = checks_green(cfg, sys_, sha)
+        if green:
+            skew.update(state="behind", target=sha)
+            if rejected:
+                skew["skipped"] = rejected
+            return skew
+        rejected.append(f"{sha[:12]}: {detail}")
+    skew.update(state="unverified", reason="; ".join(rejected))
     return skew
 
 
@@ -323,22 +417,25 @@ def render_skew(skew: dict | None) -> str:
     state = skew.get("state")
     if state == "current":
         return f"tartci: current with main (measured {skew.get('measured_at')})"
-    if state in ("behind", "soaking"):
+    if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
         return (f"tartci: {skew['behind']} commits behind main (oldest undeployed: "
                 f"{skew['oldest_undeployed']}){flag}"
-                + ("" if state == "behind" else " [all still soaking]")
+                + {"behind": "", "soaking": " [all still soaking]",
+                   "unverified": f" [no soaked commit has green checks: {skew.get('reason')}]"}[state]
                 + f" (measured {skew.get('measured_at')})")
     return f"tartci: skew {str(state).upper()} ({skew.get('reason') or 'no reason'})"
 
 
 # ── one host at a time ─────────────────────────────────────────────────────
 
-def published_hosts(cfg: Config, sys_: System) -> list[str]:
-    """Hosts in the CURRENT published supply (main's), not the target's copy.
+def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
+    """host_id -> SSH target for every host in the CURRENT published supply.
 
-    The target can predate a host being added, and one-at-a-time must see
-    every host that exists now.
+    Read from main's fleet/advertised-labels.json (the target can predate a
+    host being added). A profile's `host.ssh` is published there; without it
+    the alias convention `tartci-<host_id>` applies; [peers] only overrides.
+    Adding a machine therefore needs its profile and nothing on other hosts.
     """
     shown = sys_.run(["git", "-C", str(cfg.checkout), "show",
                       "origin/main:fleet/advertised-labels.json"])
@@ -348,8 +445,16 @@ def published_hosts(cfg: Config, sys_: System) -> list[str]:
         value = None
     if not isinstance(value, dict):
         raise Refused("published supply origin/main:fleet/advertised-labels.json is unreadable")
-    return sorted({row["host_id"] for row in value.get("registrations", [])
-                   if isinstance(row, dict) and isinstance(row.get("host_id"), str)})
+    ssh = {row["host_id"]: row.get("ssh") for row in value.get("hosts", [])
+           if isinstance(row, dict) and isinstance(row.get("host_id"), str)}
+    ids = {row["host_id"] for row in value.get("registrations", [])
+           if isinstance(row, dict) and isinstance(row.get("host_id"), str)} | set(ssh)
+    return {host_id: cfg.peers.get(host_id) or ssh.get(host_id)
+            or SSH_ALIAS_CONVENTION.format(host_id=host_id) for host_id in sorted(ids)}
+
+
+def published_hosts(cfg: Config, sys_: System) -> list[str]:
+    return list(published_peers(cfg, sys_))
 
 
 def self_host_id(cfg: Config) -> str:
@@ -359,37 +464,43 @@ def self_host_id(cfg: Config) -> str:
     return host["id"]
 
 
-def peer_state(cfg: Config, sys_: System, host_id: str, now: float) -> tuple[bool, str]:
-    """(busy, evidence). Unreachable or unmapped peers are busy: fail closed."""
-    target = cfg.peers.get(host_id)
-    if not target:
-        return True, f"no SSH target for peer {host_id} in {cfg.settings} [peers]"
+# Printed by the peer: its own clock, then its marker. Ages are computed on
+# the peer's clock so host clock skew cannot make a live marker look stale.
+_PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
+                '2>/dev/null || true')
+
+
+def peer_state(cfg: Config, sys_: System, host_id: str, target: str) -> tuple[bool, str]:
+    """(busy, evidence). Unreachable or unreadable peers are busy: fail closed."""
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target]
     status = sys_.run([*ssh, "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
     try:
         value = json.loads(status.out)
     except json.JSONDecodeError:
-        return True, f"peer {host_id} pool status unreadable (exit {status.rc}): {status.text[:160]}"
+        return True, (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
+                      f"{status.text[:160]}")
     if value.get("state") != "on" or value.get("participating") is not True:
         return True, f"peer {host_id} is {value.get('state')} (participating={value.get('participating')})"
-    marker = sys_.run([*ssh, "cat ~/.tartci/state/self-update/active.json 2>/dev/null || true"],
-                      timeout=60)
+    marker = sys_.run([*ssh, _PEER_MARKER], timeout=60)
+    first, _, rest = marker.out.partition("\n")
+    if marker.rc != 0 or not first.strip().isdigit():
+        return True, f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
     active = None
     try:
-        active = json.loads(marker.out) if marker.out.strip() else None
+        active = json.loads(rest) if rest.strip() else None
     except json.JSONDecodeError:
         return True, f"peer {host_id} self-update marker unreadable"
-    if isinstance(active, dict) and now - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
+    if isinstance(active, dict) and int(first) - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
         return True, f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}"
     return False, f"peer {host_id} on, not updating"
 
 
-def check_peers(cfg: Config, sys_: System, me: str, now: float) -> list[str]:
+def check_peers(cfg: Config, sys_: System, me: str) -> list[str]:
     busy = []
-    for peer in published_hosts(cfg, sys_):
+    for peer, target in published_peers(cfg, sys_).items():
         if peer == me:
             continue
-        is_busy, evidence = peer_state(cfg, sys_, peer, now)
+        is_busy, evidence = peer_state(cfg, sys_, peer, target)
         if is_busy:
             busy.append(evidence)
     return busy
@@ -446,6 +557,24 @@ def extract_signing_identity(sys_: System, bundle: Path, workdir: Path) -> str:
     return match.group(1).replace(":", "").upper()
 
 
+def signing_probe(sys_: System, identity: str, workdir: Path) -> None:
+    """Prove the identity signs unattended, with a timestamp, in bounded time.
+
+    The equivalent of pulp's ensure_signing_ready.sh probe: an unattended run
+    must never block on a keychain prompt, so a slow or failing probe refuses
+    before the host is touched.
+    """
+    probe = workdir / "signing-probe"
+    probe.write_bytes(b"tartci signing probe\n")
+    result = sys_.run(["codesign", "--force", "--timestamp", "--sign", identity, str(probe)],
+                      timeout=SIGNING_PROBE_TIMEOUT)
+    probe.unlink(missing_ok=True)
+    if result.rc != 0:
+        raise Refused(f"signing identity {identity} cannot sign unattended (exit {result.rc}: "
+                      f"{result.text[:200]}); run `pulp ship doctor` to prepare the dedicated "
+                      "signing keychain, and never answer a keychain password prompt")
+
+
 def set_immutable(root: Path, manifest: Path, sys_: System) -> None:
     """The build's `verify --immutable` preconditions (2026-09-21 reseal runbook)."""
     members = [m["path"] for m in json.loads(manifest.read_text())["members"]]
@@ -483,11 +612,7 @@ def build_launcher(cfg: Config, sys_: System, helper: dict, profile: Path, targe
                    out_dir: Path) -> tuple[Path, Path]:
     live = Path(helper["path"])
     identity = extract_signing_identity(sys_, live, out_dir)
-    identities = sys_.run(["security", "find-identity", "-v", "-p", "codesigning"])
-    if identity not in identities.out.upper():
-        raise Refused(f"signing identity {identity} (extracted from the live bundle) is not "
-                      "usable in a keychain; run `pulp ship doctor` first, never answer a "
-                      "keychain password prompt")
+    signing_probe(sys_, identity, out_dir)
     bundle = out_dir / "TartCILauncher.app"
     approval = out_dir / "approved.sha256"
     manifest = cfg.checkout / ".tartci-support-manifest.json"
@@ -553,27 +678,64 @@ class Receipt:
     def finish(self, status: str, error: str = "") -> None:
         self.value.update(status=status, error=error or None, finished_at=_iso(self.sys.now()))
         _write_json(self.path, self.value)
-        if self.value["mode"] != "apply":
-            return  # a plan never overwrites the record of the last real attempt
+        if self.value["mode"] != "apply" or status not in TERMINAL_STATUSES:
+            # A plan or a refusal changed nothing; it must never overwrite (and
+            # so hide) the record of the last real attempt.
+            return
         _write_json(self.cfg.state_dir / "last.json", {
             "status": status, "target": self.value["target"], "error": error or None,
             "at": self.value["finished_at"], "receipt": str(self.path)})
 
 
+def _attempts(state_dir: Path) -> list[tuple[Path, dict]]:
+    rows = []
+    for path in sorted((state_dir / "attempts").glob("*.json")):
+        value = _read_json(path)
+        if value is not None:
+            rows.append((path, value))
+    return rows
+
+
+def _ts(text: str | None) -> float:
+    try:
+        return dt.datetime.strptime(str(text), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return 0.0
+
+
 def recent_attempt(cfg: Config, target: str, now: float) -> str | None:
-    for path in sorted((cfg.state_dir / "attempts").glob(f"*-{target[:12]}.json")):
-        value = _read_json(path) or {}
+    for path, value in _attempts(cfg.state_dir):
         # A refusal changed nothing, so it does not spend the attempt.
-        if value.get("mode") != "apply" or value.get("status") == "refused":
+        if (value.get("mode") != "apply" or value.get("target") != target
+                or value.get("status") not in TERMINAL_STATUSES):
             continue
-        try:
-            started = dt.datetime.strptime(value["started_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
-                tzinfo=dt.timezone.utc).timestamp()
-        except (KeyError, ValueError):
-            continue
-        if now - started < cfg.rate_hours * 3600:
+        if now - _ts(value.get("started_at")) < cfg.rate_hours * 3600:
             return f"{path.name} ({value.get('status')})"
     return None
+
+
+def halt_reason(state_dir: Path) -> str | None:
+    """Stop automatic attempts after consecutive failures until a human clears it."""
+    cleared = _ts((_read_json(state_dir / "halt-cleared.json") or {}).get("at"))
+    streak = 0
+    for _, value in _attempts(state_dir):
+        if value.get("mode") != "apply" or value.get("status") not in TERMINAL_STATUSES:
+            continue
+        if _ts(value.get("started_at")) < cleared:
+            continue
+        streak = 0 if value.get("status") == "succeeded" else streak + 1
+    if streak >= MAX_CONSECUTIVE_FAILURES:
+        return (f"self-update HALTED after {streak} consecutive failed attempts; read the "
+                "receipts, fix the cause, then `tartci fleet-macos self-update --clear-halt`")
+    return None
+
+
+def prune_refusals(state_dir: Path, now: float) -> None:
+    for path, value in _attempts(state_dir):
+        if value.get("status") in ("refused", "planned") \
+                and now - _ts(value.get("started_at")) > REFUSAL_RECEIPT_TTL:
+            path.unlink(missing_ok=True)
 
 
 # ── the procedure ──────────────────────────────────────────────────────────
@@ -610,6 +772,7 @@ def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   scheduled: bool = False) -> int:
     now = sys_.now()
+    prune_refusals(cfg.state_dir, now)
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
@@ -626,22 +789,24 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_UNKNOWN
     target = skew.get("target")
     if not target:
-        print("self-update: nothing to do" + (" (undeployed commits are still soaking)"
-                                               if skew["state"] == "soaking" else ""))
+        print("self-update: nothing to do" + {
+            "soaking": " (undeployed commits are still soaking)",
+            "unverified": " (no soaked commit has green checks)"}.get(skew["state"], ""))
         return EXIT_NOTHING
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
+    receipt.value["previous"] = installed
     try:
         me = self_host_id(cfg)
         if apply:
+            halted = halt_reason(cfg.state_dir)
+            if halted:
+                raise Refused(halted)
             prior = recent_attempt(cfg, target, now)
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
         if apply and scheduled:
             sys_.sleep(stagger_seconds(me))
-        checkout = sys_.run(["git", "-C", str(cfg.checkout), "checkout", "--quiet",
-                             "--detach", "--force", target])
-        if checkout.rc != 0:
-            raise Refused(f"cannot check out {target[:12]}: {checkout.text}")
+        _checkout(cfg, sys_, target)
         receipt.step("checkout", f"{cfg.checkout} detached at {target}")
         profile = checked_in_profile(cfg)
         for name, args in (
@@ -663,14 +828,10 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         elif helper is not None:
             with tempfile.TemporaryDirectory() as scratch:
                 identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
-            usable = identity in sys_.run(["security", "find-identity", "-v", "-p",
-                                           "codesigning"]).out.upper()
+                signing_probe(sys_, identity, Path(scratch))
             receipt.step("launcher-build", f"would build and verify a sealed launcher signed by "
-                         f"{identity} (extracted from the live bundle's leaf certificate; "
-                         f"{'usable in a keychain' if usable else 'NOT usable: run pulp ship doctor'})",
-                         ok=usable)
-            if not usable:
-                raise Refused(f"signing identity {identity} is not usable in a keychain")
+                         f"{identity} (extracted from the live bundle's leaf certificate; a "
+                         "timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
         if bundle is not None:
@@ -688,7 +849,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # A plan evaluates every gate and reports all refusals; an apply stops
         # at the first.
         refusals = []
-        busy = check_peers(cfg, sys_, me, now)
+        busy = check_peers(cfg, sys_, me)
         if busy:
             refusal = "another fleet host is not serving normally: " + "; ".join(busy)
             if apply:
@@ -709,18 +870,255 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         if refusals:
             raise Refused(" | ".join(refusals))
         if not apply:
-            receipt.step("plan", "would drain, wait for no mid-job lane, pool off, "
-                         + ("pin approval, " if helper else "")
+            receipt.step("plan", "would snapshot the running generation, drain, wait for no "
+                         "mid-job lane, pool off, " + ("pin approval, " if helper else "")
                          + "install --apply, " + ("relay reconcile, " if relay_enabled(cfg) else "")
-                         + "pool on, verify")
+                         + "pool on, verify; on any failure after install, roll back to "
+                         f"{installed[:12]} and verify it")
             receipt.finish("planned")
             return EXIT_OK
-        return _apply(cfg, sys_, receipt, me, target, profile, install_args, allow,
-                      helper, approval)
+        run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
+                  profile=profile, install_args=install_args, allow=allow,
+                  helper=helper, approval=approval)
+        return run.execute()
     except Refused as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.finish("refused", str(exc))
         return EXIT_REFUSED
+
+
+def _checkout(cfg: Config, sys_: System, commit: str) -> None:
+    result = sys_.run(["git", "-C", str(cfg.checkout), "checkout", "--quiet",
+                       "--detach", "--force", commit])
+    if result.rc != 0:
+        raise Refused(f"cannot check out {commit[:12]}: {result.text}")
+
+
+class Run:
+    """One --apply after every precondition passed: take the host out, update,
+    verify, and on any failure put the previous generation back and verify it.
+    """
+
+    POOL_ON_ATTEMPTS = 3
+
+    def __init__(self, cfg: Config, sys_: System, receipt: Receipt, *, me: str, target: str,
+                 previous: str, profile: Path, install_args: list[str], allow: bool,
+                 helper: dict | None, approval: Path | None) -> None:
+        self.cfg, self.sys, self.receipt = cfg, sys_, receipt
+        self.me, self.target, self.previous = me, target, previous
+        self.profile, self.install_args, self.helper, self.approval = (
+            profile, install_args, helper, approval)
+        self.flag = ["--allow-last-serving-host"] if allow else []
+        self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
+        self.pin_moved = False
+        self.snapshot: Path | None = None
+        self.phase = "announce"
+
+    # ── entry ───────────────────────────────────────────────────────────
+    def execute(self) -> int:
+        import signal
+        previous_handler = signal.signal(signal.SIGTERM, _raise_terminated)
+        try:
+            _announce(self.cfg, self.sys, self.me, self.target)
+            self.receipt.step("announce", str(self.cfg.state_dir / "active.json"))
+            self._snapshot()
+            try:
+                self._update()
+            except Refused as exc:
+                return self._recover(f"refused after drain: {exc}", refused=True)
+            except Failed as exc:
+                return self._recover(str(exc))
+            except Terminated as exc:
+                return self._recover(f"terminated ({exc}) during {self.phase}", terminated=True)
+            except Exception as exc:  # noqa: BLE001 - never leave the host out
+                return self._recover(f"{type(exc).__name__} during {self.phase}: {exc}")
+            self.receipt.finish("succeeded")
+            return EXIT_OK
+        except Refused as exc:  # announce lost the race: nothing was touched
+            self.receipt.step("refused", str(exc), ok=False)
+            self.receipt.finish("refused", str(exc))
+            return EXIT_REFUSED
+        finally:
+            (self.cfg.state_dir / "active.json").unlink(missing_ok=True)
+            signal.signal(signal.SIGTERM, previous_handler)
+
+    # ── the update ──────────────────────────────────────────────────────
+    def _snapshot(self) -> None:
+        """What rollback reinstalls: the running profile, pin and sealed bundle."""
+        stamp = dt.datetime.fromtimestamp(self.sys.now(), dt.timezone.utc).strftime(
+            "%Y%m%dT%H%M%SZ")
+        snap = self.cfg.state_dir / "rollback" / f"{stamp}-{self.previous[:12]}"
+        snap.mkdir(parents=True)
+        shutil.copy2(self.cfg.installed_profile, snap / "profile.toml")
+        if self.helper is not None:
+            shutil.copy2(self.pin_path, snap / "approved.sha256")
+            result = self.sys.run(["/usr/bin/ditto", "--noqtn", self.helper["path"],
+                                   str(snap / "TartCILauncher.app")])
+            if result.rc != 0:
+                raise Refused(f"cannot snapshot the live launcher: {result.text}")
+        _write_json(snap / "snapshot.json", {"previous": self.previous, "at": _iso(self.sys.now())})
+        self.snapshot = snap
+        self.receipt.value["snapshot"] = str(snap)
+        self.receipt.step("snapshot", f"{snap} (previous generation {self.previous[:12]})")
+
+    def _update(self) -> None:
+        cfg, sys_ = self.cfg, self.sys
+        self.phase = "drain"
+        drain = tartci(cfg, sys_, "pool", "drain", *self.flag)
+        if drain.rc not in (0, 3):  # 3 = drain pending on a persistent runner
+            raise Refused(f"pool drain refused: {drain.text}")
+        self.receipt.step("drain", drain.text[:300])
+        self.phase = "wait-idle"
+        self._wait_idle()
+        self.phase = "off"
+        off = tartci(cfg, sys_, "pool", "off", *self.flag)
+        if off.rc != 0:
+            raise Failed(f"pool off failed: {off.text}")
+        self.receipt.step("off")
+        if self.pin_path is not None and self.approval is not None:
+            self.phase = "pin"
+            self._write_pin(self.approval.read_text())
+            self.pin_moved = True
+            self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
+            dry = tartci(cfg, sys_, *self.install_args)
+            if dry.rc != 0:
+                raise Failed(f"install dry-run failed against the new pin: {dry.text}")
+            self.receipt.step("install-dry-run", "ok against the new pin")
+        self.phase = "install"
+        self._install(self.install_args)
+        self.receipt.step("install", f"applied {self.target[:12]}")
+        self.phase = "relay"
+        self._relay()
+        self.phase = "pool-on"
+        if not self._pool_on():
+            raise Failed("pool on failed after install")
+        self.phase = "verify"
+        verify(cfg, sys_, self.target, self.receipt)
+
+    def _wait_idle(self, *, allow_now: bool = False) -> None:
+        deadline = self.sys.now() + self.cfg.wait_seconds
+        while True:
+            plan = tartci(self.cfg, self.sys, "pool", "off", "--plan", *self.flag)
+            if plan.rc == 0:
+                break
+            if plan.rc != 12:
+                raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
+            if self.sys.now() >= deadline:
+                raise Failed(f"a lane was still mid-job after {self.cfg.wait_seconds}s")
+            self.sys.sleep(self.cfg.poll_seconds)
+        self.receipt.step("wait-idle", "no owned lane mid-job")
+
+    def _install(self, args: list[str]) -> None:
+        for attempt in range(1, INSTALL_ATTEMPTS + 1):
+            result = tartci(self.cfg, self.sys, *args, "--apply", timeout=1800)
+            if result.rc == 0:
+                return
+            self.receipt.step("install", f"attempt {attempt} failed: {result.text[:300]}", ok=False)
+            if attempt == INSTALL_ATTEMPTS:
+                raise Failed(f"install --apply failed {INSTALL_ATTEMPTS} times: {result.text}")
+            self.sys.sleep(INSTALL_RETRY_SECONDS)
+
+    def _relay(self) -> None:
+        if not relay_enabled(self.cfg):
+            return
+        relay = self.sys.run(["python3", "scripts/network_profile.py", "reconcile", "--json"],
+                             cwd=str(self.cfg.checkout))
+        value = {}
+        try:
+            value = json.loads(relay.out)
+        except json.JSONDecodeError:
+            pass
+        if relay.rc != 0 or value.get("ok") is not True or not value.get("probe"):
+            raise Failed(f"relay reconcile/probe failed: {relay.text[:300]}")
+        self.receipt.step("relay", f"reconciled; probe: {value.get('probe')}")
+
+    def _write_pin(self, text: str) -> None:
+        tmp = self.pin_path.with_name(f".{self.pin_path.name}.new")
+        tmp.write_text(text)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, self.pin_path)
+
+    def _pool_on(self) -> bool:
+        for attempt in range(1, self.POOL_ON_ATTEMPTS + 1):
+            on = installed_tartci(self.cfg, self.sys, "pool", "on")
+            if on.rc == 0:
+                self.receipt.step("pool-on", "installed shim")
+                return True
+            self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
+                              ok=False)
+            self.sys.sleep(10)
+        return False
+
+    # ── recovery ────────────────────────────────────────────────────────
+    def _running(self) -> str | None:
+        try:
+            return installed_commit(self.cfg)[0]
+        except Refused:
+            return None
+
+    def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
+        self.receipt.step("failed", reason, ok=False)
+        running = self._running()
+        if running == self.previous:
+            # Nothing new is installed (the installer rolls its own failure
+            # back), so putting the host back is: pin, then pool on.
+            if self.pin_moved:
+                self._write_pin((self.snapshot / "approved.sha256").read_text())
+                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+            if not self._pool_on():
+                return self._terminal("failed", f"{reason}; HOST LEFT OFF: pool on failed "
+                                      f"(generation {self.previous[:12]} is installed)")
+            if refused:
+                self.receipt.finish("refused", reason)
+                return EXIT_REFUSED
+            return self._terminal("failed", f"{reason}; host left on the previous generation "
+                                  f"{self.previous[:12]}")
+        if terminated:
+            # launchd will SIGKILL soon: no time for a full rollback. Get the
+            # host serving and say exactly what it runs.
+            on = self._pool_on()
+            return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
+                                  f"{'on' if on else 'OFF'} running {str(running)[:12]}; run "
+                                  "`tartci fleet-macos self-update --apply` to verify or retry")
+        return self._rollback(reason)
+
+    def _rollback(self, reason: str) -> int:
+        cfg, sys_ = self.cfg, self.sys
+        self.receipt.step("rollback", f"reinstalling {self.previous[:12]} from {self.snapshot}")
+        try:
+            self._wait_idle()
+            off = tartci(cfg, sys_, "pool", "off", *self.flag)
+            if off.rc != 0:
+                raise Failed(f"pool off for rollback failed: {off.text}")
+            _checkout(cfg, sys_, self.previous)
+            result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
+                            "--output", ".tartci-support-manifest.json")
+            if result.rc != 0:
+                raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
+            args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
+                    "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
+            if self.helper is not None:
+                self._write_pin((self.snapshot / "approved.sha256").read_text())
+                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+                args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+            self._install(args)
+            self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
+            if not self._pool_on():
+                raise Failed("pool on after rollback failed")
+            verify(cfg, sys_, self.previous, self.receipt)
+        except (Failed, Refused, Exception) as exc:  # noqa: BLE001
+            on = self._pool_on()
+            return self._terminal("failed", f"{reason}; ROLLBACK FAILED: {exc}; host is "
+                                  f"{'on' if on else 'OFF'} running "
+                                  f"{str(self._running())[:12]}")
+        return self._terminal("rolled_back", f"{reason}; rolled back to {self.previous[:12]} "
+                              "and verified")
+
+    def _terminal(self, status: str, message: str) -> int:
+        self.receipt.step(status, message, ok=False)
+        self.receipt.finish(status, message)
+        print(f"self-update: {status.upper().replace('_', ' ')}: {message}", file=sys.stderr)
+        return EXIT_FAILED
 
 
 def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
@@ -728,109 +1126,16 @@ def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
     _write_json(marker, {"host_id": me, "target": target, "ts": sys_.now()})
     # Re-read peers AFTER announcing: two hosts that announce together both
     # see each other here, and only the lower host id proceeds.
-    now = sys_.now()
-    for peer in published_hosts(cfg, sys_):
+    for peer, ssh_target in published_peers(cfg, sys_).items():
         if peer == me:
             continue
-        busy, evidence = peer_state(cfg, sys_, peer, now)
+        busy, evidence = peer_state(cfg, sys_, peer, ssh_target)
         if busy and ("self-updating" not in evidence or peer < me):
             marker.unlink(missing_ok=True)
             raise Refused(f"peer changed after announcing: {evidence}")
 
 
-def _apply(cfg: Config, sys_: System, receipt: Receipt, me: str, target: str,
-           profile: Path, install_args: list[str], allow: bool, helper: dict | None,
-           approval: Path | None) -> int:
-    flag = ["--allow-last-serving-host"] if allow else []
-    pin_backup: Path | None = None
-    pin_path = Path(helper["approval_sha256_path"]) if helper else None
-    _announce(cfg, sys_, me, target)
-    receipt.step("announce", f"{cfg.state_dir / 'active.json'}")
-    try:
-        drain = tartci(cfg, sys_, "pool", "drain", *flag)
-        if drain.rc not in (0, 3):  # 3 = drain pending on a persistent runner
-            raise Refused(f"pool drain refused: {drain.text}")
-        receipt.step("drain", drain.text[:300])
-        try:
-            deadline = sys_.now() + cfg.wait_seconds
-            while True:
-                plan = tartci(cfg, sys_, "pool", "off", "--plan", *flag)
-                if plan.rc == 0:
-                    break
-                if plan.rc != 12:
-                    raise Failed(f"pool off --plan refused (exit {plan.rc}): {plan.text[:300]}")
-                if sys_.now() >= deadline:
-                    raise Failed(f"a lane was still mid-job after {cfg.wait_seconds}s")
-                sys_.sleep(cfg.poll_seconds)
-            receipt.step("wait-idle", "no owned lane mid-job")
-            off = tartci(cfg, sys_, "pool", "off", *flag)
-            if off.rc != 0:
-                raise Failed(f"pool off failed: {off.text}")
-            receipt.step("off")
-            if pin_path is not None and approval is not None:
-                stamp = dt.datetime.fromtimestamp(sys_.now(), dt.timezone.utc).strftime(
-                    "%Y%m%dT%H%M%SZ")
-                pin_backup = pin_path.with_name(f"{pin_path.name}.bak-{stamp}")
-                shutil.copy2(pin_path, pin_backup)
-                tmp = pin_path.with_name(f".{pin_path.name}.new")
-                tmp.write_text(approval.read_text())
-                os.chmod(tmp, 0o600)
-                os.replace(tmp, pin_path)
-                receipt.step("pin", f"approval pinned; previous saved as {pin_backup}")
-                dry = tartci(cfg, sys_, *install_args)
-                if dry.rc != 0:
-                    raise Failed(f"install dry-run failed against the new pin: {dry.text}")
-                receipt.step("install-dry-run", "ok against the new pin")
-            for attempt in range(1, INSTALL_ATTEMPTS + 1):
-                result = tartci(cfg, sys_, *install_args, "--apply", timeout=1800)
-                if result.rc == 0:
-                    break
-                receipt.step("install", f"attempt {attempt} failed: {result.text[:300]}", ok=False)
-                if attempt == INSTALL_ATTEMPTS:
-                    raise Failed(f"install --apply failed {INSTALL_ATTEMPTS} times: {result.text}")
-                sys_.sleep(INSTALL_RETRY_SECONDS)
-            receipt.step("install", f"applied {target[:12]}")
-            if relay_enabled(cfg):
-                relay = sys_.run(["python3", "scripts/network_profile.py", "reconcile",
-                                  "--json"], cwd=str(cfg.checkout))
-                value = {}
-                try:
-                    value = json.loads(relay.out)
-                except json.JSONDecodeError:
-                    pass
-                if relay.rc != 0 or value.get("ok") is not True or not value.get("probe"):
-                    raise Failed(f"relay reconcile/probe failed: {relay.text[:300]}")
-                receipt.step("relay", f"reconciled; probe: {value.get('probe')}")
-        except Failed:
-            if pin_backup is not None and pin_path is not None:
-                shutil.copy2(pin_backup, pin_path)
-                receipt.step("pin-restore", f"restored {pin_path} from {pin_backup}")
-            raise
-        finally:
-            on = installed_tartci(cfg, sys_, "pool", "on")
-            receipt.step("pool-on", "installed shim" if on.rc == 0 else on.text[:300],
-                         ok=on.rc == 0)
-        verify(cfg, sys_, target, helper, receipt)
-    except Failed as exc:
-        receipt.step("failed", str(exc), ok=False)
-        receipt.finish("failed", str(exc))
-        (cfg.state_dir / "active.json").unlink(missing_ok=True)
-        print(f"self-update: FAILED: {exc} (host left on the previous generation)",
-              file=sys.stderr)
-        return EXIT_FAILED
-    except Refused as exc:
-        receipt.step("refused", str(exc), ok=False)
-        receipt.finish("refused", str(exc))
-        (cfg.state_dir / "active.json").unlink(missing_ok=True)
-        installed_tartci(cfg, sys_, "pool", "on")
-        return EXIT_REFUSED
-    (cfg.state_dir / "active.json").unlink(missing_ok=True)
-    receipt.finish("succeeded")
-    return EXIT_OK
-
-
-def verify(cfg: Config, sys_: System, target: str, helper: dict | None,
-           receipt: Receipt) -> None:
+def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     problems = []
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
@@ -860,7 +1165,7 @@ def verify(cfg: Config, sys_: System, target: str, helper: dict | None,
         problems.append(f"installed `tartci launchd guard` missing or wrong "
                         f"(block={guard.rc}, allow={allow.rc})")
     if problems:
-        raise Failed("verification: " + "; ".join(problems))
+        raise Failed(f"verification of {target[:12]}: " + "; ".join(problems))
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
 
 
@@ -868,9 +1173,13 @@ def status_lines(state_dir: Path) -> list[str]:
     """For pool status / doctor / watchdog: skew and the last attempt."""
     lines = [render_skew(_read_json(state_dir / "skew.json"))]
     last = _read_json(state_dir / "last.json")
-    if last and last.get("status") == "failed":
-        lines.append(f"self-update: LAST ATTEMPT FAILED at {last.get('at')} for "
+    if last and last.get("status") in ("failed", "rolled_back"):
+        word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"
+        lines.append(f"self-update: LAST ATTEMPT {word} at {last.get('at')} for "
                      f"{str(last.get('target'))[:12]}: {last.get('error')}")
+    halted = halt_reason(state_dir)
+    if halted:
+        lines.append(halted)
     return lines
 
 
@@ -881,6 +1190,10 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--plan", action="store_true", help="read-only (default)")
     mode.add_argument("--apply", action="store_true")
     mode.add_argument("--status", action="store_true", help="print cached skew and last attempt")
+    mode.add_argument("--clear-halt", action="store_true",
+                      help="resume automatic attempts after consecutive failures")
+    mode.add_argument("--peers", action="store_true",
+                      help="print each published peer and the SSH target it resolves to")
     mode.add_argument("--refresh-skew", action="store_true",
                       help="fetch main and record skew only (no other checks)")
     parser.add_argument("--scheduled", action="store_true",
@@ -895,6 +1208,20 @@ def main(argv: list[str] | None = None) -> int:
     sys_ = System()
     if args.status:
         print("\n".join(status_lines(cfg.state_dir)))
+        return 0
+    if args.clear_halt:
+        _write_json(cfg.state_dir / "halt-cleared.json", {"at": _iso(sys_.now())})
+        print("self-update: halt cleared; automatic attempts resume")
+        return 0
+    if args.peers:
+        try:
+            refresh_checkout(cfg, sys_)
+            me = self_host_id(cfg)
+            for peer, target in published_peers(cfg, sys_).items():
+                print(f"{peer}\t{target}{'  (this host)' if peer == me else ''}")
+        except Refused as exc:
+            print(f"self-update: {exc}", file=sys.stderr)
+            return EXIT_REFUSED
         return 0
     if args.refresh_skew:
         cached = _read_json(cfg.state_dir / "skew.json")

@@ -8,7 +8,6 @@ LABEL="com.danielraffel.tartci.self-update"
 TEMPLATE="$HERE/launchd/$LABEL.plist.template"
 AGENTS_DIR="${TARTCI_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
 TARGET="$AGENTS_DIR/$LABEL.plist"
-SETTINGS="${TARTCI_SELF_UPDATE_SETTINGS:-$HOME/.config/tartci/self-update.toml}"
 APPLY=0
 case "${1:-}" in
   --install) APPLY=1 ;;
@@ -16,10 +15,17 @@ case "${1:-}" in
   -h|--help) echo "usage: install_self_update_agent.sh [--plan|--install]"; exit 0 ;;
   *) echo "usage: install_self_update_agent.sh [--plan|--install]" >&2; exit 2 ;;
 esac
-[ -f "$SETTINGS" ] || {
-  echo "refusing: $SETTINGS is missing; it must map every other published host_id to an SSH target under [peers]" >&2
-  exit 3
-}
+# Peers resolve from the published supply (each profile's host.ssh, else the
+# alias tartci-<host_id>); ~/.config/tartci/self-update.toml [peers] only
+# overrides. Show the resolution so a missing alias is visible before the
+# agent's first run refuses on it.
+if [ "${TARTCI_SELF_UPDATE_SKIP_PEERS:-0}" != 1 ]; then
+  echo "peers (host_id -> ssh target):"
+  "$HERE/tartci" fleet-macos self-update --peers | sed 's/^/  /' || {
+    echo "refusing: peers could not be resolved; see above" >&2
+    exit 3
+  }
+fi
 rendered="$(mktemp)"
 trap 'rm -f "$rendered"' EXIT
 python3 "$HERE/scripts/render_launchd_template.py" "$TEMPLATE" --set "HOME=$HOME" >"$rendered"

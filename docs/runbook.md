@@ -1441,55 +1441,75 @@ fleet`), and check GitHub's job history against it with
 ### Keeping a host on main's tartci (`tartci fleet-macos self-update`)
 
 `tartci fleet-macos self-update [--plan|--apply] [--target REF]` is the
-2026-09-23 manual update procedure, codified. `--plan` (the default) is
-read-only for the host; `--apply` performs it.
+2026-09-23 manual update procedure, codified, with verification and rollback.
+`--plan` (the default) is read-only for the host; `--apply` performs it.
 
-- **Skew.** The installed commit is the executed cohort: the sealed launcher's
-  `bundle.json` source_commit on a host with `[launch_helper]`, otherwise the
-  installed generation's manifest commit. Main is read from a tartci-owned
-  clean clone at `~/.local/share/tartci/update-checkout` (never a shared working
-  copy). The target is the newest **first-parent** main commit older than the
-  soak (30 min). Diverged or unreadable skew refuses (exit 5).
-- **Prepare** from the target checkout: `support-manifest write`,
-  `fleet-macos validate`, install dry-run, and on a sealed host the launcher
-  build signed by the identity **extracted** from the live bundle's leaf
-  certificate, with the reseal runbook's immutability preconditions, then
-  verified (lanes.json equals the rendered lane environment, `codesign
-  --verify --deep --strict`, bundle `source_commit` == target).
-- **One host at a time.** Every other host in `fleet/advertised-labels.json`
-  on main must be `on` and not self-updating, read over SSH from
-  `~/.config/tartci/self-update.toml` `[peers]` (host_id = ssh target). An
-  unmapped or unreachable peer refuses. The runner census is not used for this:
-  ephemeral lanes register nothing at idle, so a drained host and an idle one
-  look the same there. The host announces first and re-reads its peers; if two
-  announce together the lower host_id proceeds.
-- **Capacity floor.** `--allow-last-serving-host` is passed only when every
-  last-serving label is idle by design (`pulp-release-tagged`,
-  `pulp-release-pr-gate`, override with `idle_by_design_labels`); the rule is
-  written to the receipt. Capacity unknown refuses. The census runs with
-  `TARTCI_GH_CLI=ghapp` and per-call repo binding, from the update checkout.
-- **Apply.** drain, wait up to 90 min (poll 45 s) for `pool off --plan` to
-  show no mid-job lane, `pool off`, pin the new launcher approval (previous pin
-  backed up), install dry-run then `--apply` (retried while agents unload),
-  relay `network_profile.py reconcile` (which probes through the relay) when
-  the relay is enabled, `pool on` through the **installed** shim from `$HOME`,
-  then verify: pool `on` and fleet ready, serving not blocked, the executed
-  commit == target, and `tartci launchd guard` present. Any failure after the
-  drain restores the pin and runs `pool on`, leaving the host serving the
-  previous generation (exit 4).
-- **Receipts and rate limit.** Every attempt writes
-  `~/.tartci/state/self-update/attempts/<time>-<commit>.json`; the last real
-  attempt is `last.json`. One attempt per target commit per 6 h (a refusal does
-  not count).
-- **Always visible.** `tartci pool status`, `tartci doctor fleet`
-  (`self_update`) and the launchd watchdog print `tartci: N commits behind main
-  (oldest undeployed: T)`, `STALE` after 24 h, and any failed last attempt. The
-  watchdog re-measures skew at most every 30 min (a read-only fetch), so this
-  works with the periodic agent off.
+- **Target.** The installed commit is the executed cohort (the sealed
+  launcher's `bundle.json` source_commit on a `[launch_helper]` host, else the
+  installed generation's manifest). Main is read from a tartci-owned clean
+  clone at `~/.local/share/tartci/update-checkout`, created atomically. The
+  target is the newest **first-parent** main commit that is past the soak (30
+  min) **and whose check runs are all green**; a red commit is skipped for an
+  older green one, and with none green nothing happens (`unverified`). An
+  explicit `--target` must be on main's first-parent chain and meet both.
+- **Prepare** (changes nothing on the host): `support-manifest write`,
+  `fleet-macos validate`, install dry-run; on a sealed host the signing
+  identity is **extracted** from the live bundle's leaf certificate and proven
+  by a timestamped `codesign` probe with a 60 s bound (a keychain prompt would
+  hang an unattended run; the refusal says to run `pulp ship doctor`), then the
+  launcher is built under the reseal runbook's immutability preconditions and
+  verified.
+- **One host at a time.** Every other host in main's
+  `fleet/advertised-labels.json` must be `on` and not self-updating, read over
+  SSH. The marker's age is measured on the peer's own clock.
+- **Capacity floor.** `--allow-last-serving-host` only when every last-serving
+  label is idle by design (the pulp-release classes), logged in the receipt.
+- **Snapshot, update, verify.** Before draining, the running generation is
+  snapshotted under `~/.tartci/state/self-update/rollback/<time>-<commit>/`:
+  the installed profile, the approval pin and (sealed) a `ditto` copy of the
+  live launcher. Then drain, wait up to 90 min for no mid-job lane, `pool off`,
+  pin the new approval, install dry-run and `--apply` (retried), relay
+  reconcile, `pool on` through the installed shim, verify (pool on and fleet
+  ready, serving not blocked, executed commit == target, `launchd guard`
+  present).
+- **Rollback.** A failure before anything new is installed (the installer
+  rolls its own failure back) restores the pin and runs `pool on`. A failure
+  **after** a successful install (relay, pool on, verify) rolls back: wait for
+  idle, `pool off`, check out the previous commit, reinstall it from the
+  snapshot profile (sealed: the snapshot bundle, with the previous pin), `pool
+  on`, and **verify the previous generation**. The receipt says `rolled_back`
+  ("rolled back to X and verified"); if the rollback itself fails, the host is
+  put back on if possible and the receipt says `ROLLBACK FAILED` with what the
+  host now runs. `pool on` is retried; a host it could not bring back is
+  recorded as `HOST LEFT OFF`. SIGTERM (launchd stopping the agent) raises
+  inside the run: the host is put back on, the marker cleared and the receipt
+  finished (no full rollback in the stop window; the receipt names what runs).
+- **Receipts, rate limit, halt.** One receipt per attempt under
+  `attempts/`; `last.json` holds only real outcomes (succeeded, failed,
+  rolled_back), so a refusal never hides a failure. One attempt per target per
+  6 h. After 3 consecutive failed or rolled-back attempts automatic attempts
+  stop until `self-update --clear-halt`. Refusal receipts older than 7 days are
+  pruned.
+- **Always visible.** `pool status`, `doctor fleet` (`self_update`) and the
+  watchdog show the skew line, `STALE` after 24 h, a failed or rolled-back last
+  attempt, and a halt.
 - **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
-  every 30 min, `--apply --scheduled` with a per-host stagger) is not installed
-  by default: `scripts/install_self_update_agent.sh` prints the plan, and
-  `--install` loads it. The watchdog never interrupts it.
+  every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
+  is not installed by default: `scripts/install_self_update_agent.sh` prints
+  the plan and the resolved peers, and `--install` loads it.
+
+#### Adding a machine
+
+1. Add `profiles/<host>-macos-fleet.toml` with `[host] ssh = "<alias>"`, the
+   SSH alias the other fleet hosts reach it by (for example `m3`). Without it
+   the convention `tartci-<host_id>` is used, so each host needs that alias in
+   `~/.ssh/config`.
+2. Regenerate `fleet/advertised-labels.json` (CI rejects a stale copy) and
+   merge. Every host's one-at-a-time check now includes the new machine; no
+   per-host file is edited. `~/.config/tartci/self-update.toml [peers]` exists
+   only to override a target.
+3. On the new machine: install, then `tartci fleet-macos self-update --peers`
+   to see every peer it will check and the target it resolves to.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 

@@ -12,9 +12,10 @@
   together.
 
   NOT installed by default. Install with scripts/install_self_update_agent.sh
-  (prints the plan; --install writes and loads it). Requires
-  ~/.config/tartci/self-update.toml with a [peers] map of every other
-  published host_id to an SSH target; without it every run refuses.
+  (prints the plan; --install writes and loads it). Peers resolve from each
+  profile's host.ssh (published in fleet/advertised-labels.json), else the
+  alias tartci-<host_id>; ~/.config/tartci/self-update.toml [peers] overrides.
+  ExitTimeOut gives the SIGTERM handler time to put the host back on.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -41,6 +42,9 @@
 
     <key>StartInterval</key>
     <integer>1800</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>120</integer>
 
     <key>StandardOutPath</key>
     <string>$HOME/Library/Logs/tartci/tartci-self-update.log</string>

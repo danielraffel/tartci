@@ -5,6 +5,8 @@ name = "m1-macos-fleet"
 # changes the durable pool-off state nor loads a LaunchAgent.
 [host]
 id = "m1"
+# The SSH alias other fleet hosts reach this one by (self-update peers).
+ssh = "m1"
 home = "/Users/danielraffel"
 tart_home = "/Users/danielraffel/VMs"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"

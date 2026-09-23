@@ -32,6 +32,9 @@ tartci's code.
 ```
 
 `labels` is the exact set a registration passes to `generate-jitconfig`.
+`hosts` (additive) lists each profile's `host_id` and `ssh`, the alias other
+fleet hosts reach it by (null means the convention `tartci-<host_id>`); `tartci
+fleet-macos self-update` reads it to check its peers one host at a time.
 `persistent_runners` is additive to v1: host-owned Actions services whose
 labels are set at registration outside tartci, so only their name is declared.
 
