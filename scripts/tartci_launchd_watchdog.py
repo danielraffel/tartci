@@ -871,9 +871,6 @@ def refresh_skew(interval_s: int = 1800) -> None:
 def config_problem(value: dict) -> str | None:
     """One-line summary when anything is not ok, else None."""
     parts = []
-    self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
-    if self_update.get("problem"):
-        parts.append(f"self_update={self_update['problem']}")
     for key, good in (("profile_drift", "in_sync"), ("supply", "match")):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         state = row.get("state") or "unknown"
@@ -881,6 +878,12 @@ def config_problem(value: dict) -> str | None:
             continue
         detail = row.get("keys") or row.get("mismatched") or ([row["reason"]] if row.get("reason") else [])
         parts.append(f"{key}={state.upper()}" + (f" ({', '.join(detail)})" if detail else ""))
+    # tartci's own skew goes last: it must never push the profile/supply
+    # verdicts out of the WARN line. The WARN itself is rate-limited per
+    # distinct summary, so an unchanged skew is not repeated every pass.
+    self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
+    if self_update.get("problem"):
+        parts.append(f"self_update={self_update['problem']}")
     return "; ".join(parts) or None
 
 

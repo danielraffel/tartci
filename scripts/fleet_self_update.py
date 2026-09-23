@@ -108,6 +108,10 @@ class Failed(Exception):
     """A step failed after the host was taken out of service."""
 
 
+class NotManaged(Refused):
+    """This host has no installed fleet generation, so it has no skew to measure."""
+
+
 class Terminated(BaseException):
     """SIGTERM (launchd stopping the agent) while the host is out of service."""
 
@@ -371,8 +375,17 @@ def launch_helper(cfg: Config) -> dict | None:
 
 
 def installed_commit(cfg: Config) -> tuple[str, str]:
-    """(commit, source) of the cohort this host EXECUTES. Raises Refused."""
+    """(commit, source) of the cohort this host EXECUTES. Raises Refused.
+
+    NotManaged when there is no installed fleet profile, or (unsealed) no
+    install receipt: such a host has nothing self-update could measure, which
+    is not the same as a managed host whose installed commit is unreadable.
+    """
+    if not cfg.installed_profile.is_file():
+        raise NotManaged(f"no installed fleet profile at {cfg.installed_profile}")
     helper = launch_helper(cfg)
+    if helper is None and not cfg.install_receipt.is_file():
+        raise NotManaged(f"no install receipt at {cfg.install_receipt}")
     if helper is not None:
         path = Path(helper["path"]) / "Contents" / "Resources" / "bundle.json"
         value = _read_json(path)
@@ -526,6 +539,8 @@ def render_skew(skew: dict | None) -> str:
     state = skew.get("state")
     if state == "current":
         return f"tartci: current with main (measured {skew.get('measured_at')})"
+    if state == "not_applicable":
+        return f"tartci: skew n/a ({skew.get('reason')})"
     if state in ("behind", "soaking", "unverified"):
         flag = " STALE" if skew.get("stale") else ""
         return (f"tartci: {skew['behind']} commits behind main (oldest undeployed: "
@@ -1016,6 +1031,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
+    except NotManaged as exc:
+        print(f"self-update: not applicable: {exc}")
+        _write_json(cfg.state_dir / "skew.json", {"state": "not_applicable", "reason": str(exc),
+                                                  "measured_at": _iso(now)})
+        return EXIT_UNKNOWN
     except Refused as exc:
         print(f"self-update: UNKNOWN: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
@@ -1566,6 +1586,8 @@ def main(argv: list[str] | None = None) -> int:
             installed, _ = installed_commit(cfg)
             refresh_checkout(cfg, sys_)
             skew = measure_skew(cfg, sys_, installed, sys_.now(), args.target)
+        except NotManaged as exc:
+            skew = {"state": "not_applicable", "reason": str(exc), "measured_at": _iso(sys_.now())}
         except Refused as exc:
             skew = {"state": "unknown", "reason": str(exc), "measured_at": _iso(sys_.now())}
         _write_json(cfg.state_dir / "skew.json", skew)
