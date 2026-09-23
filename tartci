@@ -489,7 +489,9 @@ tartci_pool_config_verdicts() {
     || out="profile drift: UNKNOWN (config check failed: ${out:-no output})
 supply: UNKNOWN (config check failed)"
   printf '%s\n' "$out"
-  case "$out" in
+  # Only the drift and supply verdicts decide the disclaimer; the tartci
+  # skew line that follows them is informational.
+  case "$(printf '%s\n' "$out" | grep -E '^(profile drift|supply):' || true)" in
     *DRIFT*|*MISMATCH*|*UNKNOWN*)
       echo "(pool $1 does not refuse on this: drift is reported, not enforced, because refusing would turn a config difference into a capacity outage; see tartci fleet-macos verify-supply / profile-drift)" ;;
   esac

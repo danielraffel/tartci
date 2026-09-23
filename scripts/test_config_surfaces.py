@@ -59,7 +59,7 @@ class ReadinessCarriesConfigTests(unittest.TestCase):
     def test_unreadable_profile_is_unknown(self) -> None:
         config = self._readiness(M3.read_text().replace('name = "m3-macos-fleet"\n', ""))["config"]
         self.assertEqual(config["profile_drift"]["state"], "unknown")
-        self.assertEqual(fleet.render_config_verdicts(None).splitlines(),
+        self.assertEqual(fleet.render_config_verdicts(None).splitlines()[:2],
                          ["profile drift: UNKNOWN (not checked from here)",
                           "supply: UNKNOWN (not checked from here)"])
 
