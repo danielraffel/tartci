@@ -1686,6 +1686,27 @@ lanes change.
   (6) and the loaded-generation verification cannot run without acting, so they
   run only on the real `pool on`, and a `0` from `on --plan` does not promise
   that `on` succeeds.
+  **`--plan` is not free:** for `off`/`drain` it takes the same dual-scope
+  runner census the real transition takes (two paginated GitHub API calls per
+  protected repository). Do not run it in a tight loop; poll no faster than
+  once a minute, and never on a host whose census CLI is anonymous (see below).
+- **Capacity-floor refusals come in two kinds, and only one is overridable.**
+  `last serving host` (the floor's exit 3) means the census answered and no
+  other host serves the label; `--allow-last-serving-host` takes it to zero
+  deliberately. `capacity unknown` (exit 4) means the census could not answer;
+  `--allow-last-serving-host` does NOT override it, and the refusal names the
+  cause. `census_unauthenticated` (e.g. `API rate limit exceeded for <ip>`):
+  the census CLI reached GitHub anonymously and spent the per-IP 60/hour
+  allowance every host behind that IP shares; run with `TARTCI_GH_CLI=ghapp`
+  (the default whenever `ghapp` is on PATH or in `~/.local/bin`) or repair its
+  login. `census_identity_lacks_access` (`Resource not accessible by
+  integration`): the App token was minted for the wrong installation. The
+  census now binds every call to the queried repository through
+  `SHIPYARD_GHAPP_REPO`/`GH_REPO` (ghapp reads those, not the checkout it runs
+  from), so this should not recur; if it does, check which installation ghapp
+  minted for before touching GitHub App permissions. `tartci doctor fleet`
+  reports the census CLI's identity as `census_identity[<repo>]` (60/hour core
+  limit = anonymous).
 - `tartci pool on` — persist `pool-state=on`, participation=1, re-enable and
   bootstrap the installed runner agents. On a receipt-managed macOS fleet, both
   dynamic controllers and persistent `actions.runner.*` services must be named
