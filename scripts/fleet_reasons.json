@@ -146,6 +146,21 @@
       "why": "Agents exec a signed Developer ID app, and that app runs its own sealed copy of the support cohort from inside the bundle. Staging a newer generation beside it succeeds, writes a receipt and exits 0 while the bundle keeps executing the cohort it was sealed around. This is how a host silently misses every fix it appears to have received.",
       "remedy": "Deliver a re-signed launcher bundle built around the new cohort and install with --launch-helper-source, refreshing the pinned approval digest, then confirm the executed cohort matches the installed one.",
       "do_not": "Do not read a zero exit from fleet-macos install --apply on this host as evidence that the new generation is running."
+    },
+    "supply_match": {
+      "summary": "Every registration this host's installed profile mints matches the published declared supply.",
+      "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."
+    },
+    "supply_mismatch": {
+      "summary": "This host's installed registrations differ from the published declared supply.",
+      "why": "A lane the host registers that git does not publish is capacity no consumer can discover; a lane git publishes that the host does not register is capacity consumers will route to and wait on forever.",
+      "remedy": "Run `tartci fleet-macos verify-supply` for the per-lane verdicts. Reinstall from the checked-in profile (drain first), or commit the host's change and regenerate fleet/advertised-labels.json.",
+      "do_not": "Do not edit fleet/advertised-labels.json by hand; it is regenerated from profiles/ and CI rejects a hand edit."
+    },
+    "supply_unknown": {
+      "summary": "The installed registrations could not be compared with the published supply.",
+      "why": "An unreadable installed profile or published file, or a host_id the published file does not declare, leaves the comparison unanswered, which is not the same as a match.",
+      "remedy": "Run `tartci fleet-macos verify-supply` for the specific reason."
     }
   }
 }

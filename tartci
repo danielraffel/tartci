@@ -198,13 +198,13 @@ cmd_profile() {
 cmd_fleet_macos() {
   local sub="${1:-}"; shift || true
   case "$sub" in
-    validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift)
+    validate|render|write-receipt|verify-installed|verify-loaded|advertised-labels|profile-drift|verify-supply|config-verdicts)
       tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" "$sub" "$@"
       ;;
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift> ..."; return 2 ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts> ..."; return 2 ;;
   esac
 }
 
@@ -472,6 +472,27 @@ tartci_pool_capacity_floor_preflight() {
   esac
 }
 
+# Print the installed-vs-declared verdicts (profile drift, published supply)
+# before a transition. Reported, never enforced: refusing `pool on` over
+# configuration drift would turn a config difference into a capacity outage,
+# and the fix (reinstall or commit) is an operator decision, not a gate. Never
+# fails; an unreadable verdict prints UNKNOWN.
+tartci_pool_config_verdicts() {
+  local config="$HOME/.config/tartci/macos-fleet-profile.toml" out
+  [ -f "$config" ] || return 0
+  out="$(tartci_toml_python "$HERE/scripts/macos_fleet_lanes.py" config-verdicts \
+    --config "$config" --support-root "$HERE" \
+    --receipt "$HOME/.config/tartci/macos-fleet-install.json" 2>&1)" \
+    || out="profile drift: UNKNOWN (config check failed: ${out:-no output})
+supply: UNKNOWN (config check failed)"
+  printf '%s\n' "$out"
+  case "$out" in
+    *DRIFT*|*MISMATCH*|*UNKNOWN*)
+      echo "(pool $1 does not refuse on this: drift is reported, not enforced, because refusing would turn a config difference into a capacity outage; see tartci fleet-macos verify-supply / profile-drift)" ;;
+  esac
+  return 0
+}
+
 # `tartci pool <on|off|drain> --plan`: the transition, printed, with nothing
 # written — no participation/state record, no lock, no launchctl mutation.
 # off/drain run every precondition the real transition runs and exit with its
@@ -487,6 +508,7 @@ tartci_pool_plan() {
   case "$sub" in on) target_state=on target_part=1 ;; off) target_state=off target_part=0 ;;
     *) target_state=draining target_part=0 ;; esac
   echo "pool $sub --plan on $host: nothing will be changed"
+  [ "$sub" = on ] && tartci_pool_config_verdicts on | sed 's/^/  /'
   echo "  state: $state -> $target_state; participation: $part -> $target_part"
   local agents action
   if [ "$sub" = on ]; then
@@ -631,6 +653,7 @@ cmd_pool() {
         tartci_pool_write_participation 0
         tartci_pool_write_state off
       else
+        tartci_pool_config_verdicts on
         tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
         local fleet_receipt="$HOME/.config/tartci/macos-fleet-install.json"
         local loaded_receipt="$HOME/.config/tartci/macos-fleet-loaded.json"
@@ -1002,6 +1025,23 @@ if fleet["managed"]:
         if problem.get("detail"):
             line += f": {problem['detail']}"
         print(line)
+    # Installed-vs-declared configuration. Reported, never folded into
+    # `fleet ready`: gating on drift would turn it into an outage. A missing
+    # or unreadable verdict prints UNKNOWN, never ok.
+    config = fleet.get("config") if isinstance(fleet.get("config"), dict) else {}
+    for key, name, bad in (("profile_drift", "profile drift", "drift"),
+                           ("supply", "supply", "mismatch")):
+        row = config.get(key) if isinstance(config.get(key), dict) else {}
+        state = row.get("state")
+        if state in ("in_sync", "match"):
+            text = "ok"
+        elif state == "not_applicable":
+            text = "n/a (no installed fleet profile)"
+        elif state == bad:
+            text = f"{bad.upper()} ({', '.join(row.get('keys') or row.get('mismatched') or [])})"
+        else:
+            text = f"UNKNOWN ({row.get('reason') or 'not checked from here'})"
+        print(f"{name}: {text}")
 else:
     print("fleet ready: unknown (legacy/unmanaged)")
 PY

@@ -78,6 +78,9 @@ CODES: tuple[str, ...] = (
     "readiness_probe_failed",
     "readiness_verdict_depends_on_invocation",
     "sealed_launcher_bundle",
+    "supply_match",
+    "supply_mismatch",
+    "supply_unknown",
 )
 
 
@@ -576,6 +579,45 @@ def profile_drift_probe(support_root: Path, installed: Path,
         return None, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
 
 
+def check_supply(result: dict | None, *, installed_present: bool,
+                 error: str = "") -> Finding:
+    """This host's installed registrations vs the published declared supply."""
+    if not installed_present:
+        return Finding("supply", NOT_APPLICABLE, "no_installed_profile",
+                       "no installed macOS fleet profile on this host")
+    if result is None or result.get("state") not in ("match", "mismatch"):
+        reason = error or (result or {}).get("reason") or "supply check produced no verdict"
+        return Finding("supply", UNKNOWN, "supply_unknown", reason, {"result": result})
+    lanes = result.get("lanes", [])
+    if result["state"] == "match":
+        return Finding("supply", OK, "supply_match",
+                       f"{len(lanes)} installed registrations match the published "
+                       f"supply for host_id {result.get('host_id')}",
+                       {"lanes": lanes})
+    bad = [f"{row['lane']}{'[' + row['class_label'] + ']' if row.get('class_label') else ''}"
+           f"={row['verdict']}" for row in lanes if row.get("verdict") != "MATCH"]
+    return Finding("supply", PROBLEM, "supply_mismatch",
+                   "installed registrations differ from the published supply: "
+                   + ", ".join(bad), {"lanes": lanes})
+
+
+def supply_probe(support_root: Path, installed: Path, python: str | None,
+                 timeout: int = 30) -> tuple[dict | None, str]:
+    if python is None:
+        return None, "no Python 3.11+ interpreter with tomllib is available"
+    script = support_root / "scripts" / "macos_fleet_lanes.py"
+    try:
+        proc = subprocess.run(
+            [python, str(script), "verify-supply", "--installed", str(installed), "--json"],
+            capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"supply check did not complete: {exc}"
+    try:
+        return json.loads(proc.stdout), ""
+    except json.JSONDecodeError:
+        return None, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -789,6 +831,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             identity_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             probe: Callable[[Path], dict] | None = None,
             drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
+            supply_check: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
@@ -827,6 +870,14 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             drift_result, installed_present=True, error=drift_error))
     else:
         findings.append(check_profile_drift(None, installed_present=False))
+    if config.is_file():
+        supply_result, supply_error = (
+            supply_check(config) if supply_check is not None
+            else supply_probe(support_root, config, python or toml_python()))
+        findings.append(check_supply(
+            supply_result, installed_present=True, error=supply_error))
+    else:
+        findings.append(check_supply(None, installed_present=False))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default
