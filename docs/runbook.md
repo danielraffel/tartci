@@ -1498,14 +1498,27 @@ fleet`), and check GitHub's job history against it with
   is not installed by default: `scripts/install_self_update_agent.sh` prints
   the plan and the resolved peers, and `--install` loads it.
 
-- **Interruptions.** The installer runs in its own process group. A SIGTERM
-  to self-update is deferred until the installer exits, so its restore trap
-  always completes; an install past 30 min gets TERM to its whole group and
-  up to 120 s for that trap, and is never retried on top of itself. A second
-  SIGTERM during recovery still finishes the receipt (counted toward the
-  halt), re-pins to whichever launcher is actually live, and runs `pool on`.
-  `tartci fleet-macos self-update --verify` checks the running generation
-  without changing anything; use it after any interrupted run.
+- **Interruptions.** The installer runs in its own process group, and its
+  pgid and start time are recorded in `~/.tartci/state/self-update/installer.json`
+  while it runs. launchd gives the agent 120 s (ExitTimeOut) after SIGTERM
+  before SIGKILL, so a SIGTERM is deferred for at most 80 s while the
+  installer finishes; after that the installer group gets TERM and 10 s for
+  its restore trap, and recovery (re-pin to the live launcher, `pool on`,
+  finished receipt) runs inside the window. The trap is not guaranteed to
+  finish: an installer still running then is left recorded, and the next run
+  refuses ("installer is still running (pgid N)") until it has exited. An
+  install past 30 min gets TERM to its group and up to 120 s for its trap,
+  and is never retried on top of itself.
+- **Killed runs are recovered.** Every apply receipt is on disk from its
+  first step with the run's pid and start time. The next run that finds a
+  `running` receipt whose process is gone recovers it: re-pin to the live
+  launcher, `pool on`, finish the receipt as `failed` ("interrupted"),
+  write `last.json` (it counts toward the halt) and clear the stale
+  `active.json`; it then stops, and the following run proceeds. A run killed
+  before it announced changed nothing and is closed as refused. A receipt
+  whose process is alive refuses the new run. `tartci fleet-macos self-update
+  --verify` checks the running generation without changing anything; use it
+  after any interrupted run.
 - **Snapshots are verified up front.** On a sealed host the `ditto` copy of the
   live launcher must verify against the current approval pin before the drain
   (the copy rollback would reinstall), or the run refuses. The newest 5

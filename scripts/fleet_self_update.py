@@ -78,7 +78,14 @@ TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
 KEEP_BUILDS = 3
 KEEP_SNAPSHOTS = 5
 INSTALL_TIMEOUT = 1800
-INSTALL_TERM_GRACE = 120  # the installer's restore trap after TERM (matches ExitTimeOut)
+INSTALL_TERM_GRACE = 120  # the installer's restore trap after a TIMEOUT TERM
+# launchd SIGKILLs the agent ExitTimeOut (120 s) after SIGTERM. A deferred
+# SIGTERM therefore waits for the installer at most this long, then TERMs the
+# installer group and leaves TERM_WAIT for its trap, which keeps recovery (re-pin,
+# pool on, receipt) inside the window. Anything still running then is recorded
+# in installer.json and refused by the next run until it has exited.
+SIGTERM_DEFER_CAP = 80
+SIGTERM_TERM_WAIT = 10
 EXIT_TIMED_OUT = 124
 # Lanes whose only work is occasional by design: a host that is their last
 # server may still be taken down for an update, because an idle release lane
@@ -133,20 +140,45 @@ class System:
             return Result(127, "", f"{type(exc).__name__}: {exc}")
         return Result(proc.returncode, proc.stdout, proc.stderr)
 
+    def process_start(self, pid: int) -> str | None:
+        """The process's start time (identity across pid reuse), or None if gone."""
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except PermissionError:
+            pass
+        result = self.run(["ps", "-o", "lstart=", "-p", str(pid)], timeout=10)
+        return result.out.strip() or None if result.rc == 0 else None
+
+    def group_alive(self, pgid: int) -> bool:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
+
     def run_critical(self, argv: list[str], *, cwd: str | None = None,
                      env: dict[str, str] | None = None,
-                     timeout: float = INSTALL_TIMEOUT) -> Result:
-        """Run a command that must never be killed half way (the installer).
+                     timeout: float = INSTALL_TIMEOUT,
+                     record: Path | None = None) -> Result:
+        """Run a command that must not be killed half way (the installer).
 
         It gets its own process group, so a signal to this process does not
-        reach it. SIGTERM to this process is DEFERRED until the child exits and
-        then raised, so the installer's own restore trap always finishes. On
-        timeout the whole group gets TERM, and its trap is waited for (bounded)
-        before anything else is decided; KILL only after that grace.
+        reach it. Its pgid and start time go to `record` while it runs, so a
+        later run can see an installer that outlived us. A SIGTERM to this
+        process is deferred for at most SIGTERM_DEFER_CAP seconds (below
+        launchd's ExitTimeOut); then the group is sent TERM, given
+        SIGTERM_TERM_WAIT for its restore trap, and Terminated is raised so
+        recovery still runs before launchd's SIGKILL. A plain timeout sends
+        TERM and waits INSTALL_TERM_GRACE before KILL.
         """
         import signal
-        pending: list[int] = []
-        previous = signal.signal(signal.SIGTERM, lambda signum, frame: pending.append(signum))
+        pending: list[float] = []
+        previous = signal.signal(signal.SIGTERM, lambda signum, frame: pending.append(time.monotonic()))
+        still_running = False
         try:
             with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
                 try:
@@ -155,18 +187,38 @@ class System:
                                             start_new_session=True)
                 except OSError as exc:
                     return Result(127, "", f"{type(exc).__name__}: {exc}")
-                try:
-                    rc = proc.wait(timeout=timeout)
-                    timed_out = False
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-                    os.killpg(proc.pid, signal.SIGTERM)
+                if record is not None:
+                    _write_json(record, {"pgid": proc.pid, "start": self.process_start(proc.pid),
+                                         "argv": list(argv), "owner_pid": os.getpid()})
+                deadline = time.monotonic() + timeout
+                timed_out = False
+                while True:
                     try:
-                        proc.wait(timeout=INSTALL_TERM_GRACE)
+                        rc = proc.wait(timeout=0.2)
+                        break
                     except subprocess.TimeoutExpired:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.wait()
-                    rc = EXIT_TIMED_OUT
+                        pass
+                    now = time.monotonic()
+                    if pending and now - pending[0] >= SIGTERM_DEFER_CAP:
+                        _signal_group(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=SIGTERM_TERM_WAIT)
+                        except subprocess.TimeoutExpired:
+                            still_running = True
+                        raise Terminated(f"SIGTERM; the installer did not finish within "
+                                         f"{SIGTERM_DEFER_CAP}s and was sent TERM"
+                                         + (f"; it is STILL RUNNING as pgid {proc.pid}"
+                                            if still_running else ""))
+                    if now >= deadline:
+                        timed_out = True
+                        _signal_group(proc.pid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=INSTALL_TERM_GRACE)
+                        except subprocess.TimeoutExpired:
+                            _signal_group(proc.pid, signal.SIGKILL)
+                            proc.wait()
+                        rc = EXIT_TIMED_OUT
+                        break
                 out.seek(0)
                 err.seek(0)
                 result = Result(rc, out.read(), err.read())
@@ -176,8 +228,14 @@ class System:
                 return result
         finally:
             signal.signal(signal.SIGTERM, previous)
-            if pending:
-                raise Terminated(f"signal {pending[0]} (deferred until the installer exited)")
+            if record is not None and not still_running:
+                record.unlink(missing_ok=True)
+            if pending and not still_running:
+                # Deferred SIGTERM that arrived while the installer finished
+                # within the cap: raise it now that the installer is done.
+                import sys as _sys
+                if _sys.exc_info()[0] is None:
+                    raise Terminated("SIGTERM (deferred until the installer exited)")
 
     def sleep(self, seconds: float) -> None:
         time.sleep(seconds)
@@ -644,6 +702,14 @@ def set_immutable(root: Path, manifest: Path, sys_: System) -> None:
     os.chmod(root, 0o555)
 
 
+def _signal_group(pgid: int, sig: int) -> None:
+    """Signal a process group that may already have emptied."""
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
 def clear_dir(path: Path) -> None:
     """Remove a tree the launcher build left read-only (a-w files, 0555 dirs)."""
     if not path.exists():
@@ -743,7 +809,9 @@ class Receipt:
         self.cfg, self.sys = cfg, sys_
         now = sys_.now()
         self.value: dict[str, Any] = {"schema": SCHEMA, "mode": mode, "target": target,
-                                      "started_at": _iso(now), "steps": [], "status": "running"}
+                                      "started_at": _iso(now), "steps": [], "status": "running",
+                                      "pid": os.getpid(),
+                                      "pid_start": sys_.process_start(os.getpid())}
         stamp = dt.datetime.fromtimestamp(now, dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         self.path = cfg.state_dir / "attempts" / f"{stamp}-{(target or 'none')[:12]}.json"
 
@@ -752,6 +820,10 @@ class Receipt:
                                     "ok": ok, "detail": detail[:2000]})
         mark = "" if ok else ("REFUSED " if name == "refused" else "FAILED ")
         print(f"self-update: {mark}{name}{': ' + detail if detail else ''}", flush=True)
+        if self.value["mode"] == "apply" and self.value["status"] == "running":
+            # On disk from the first step, so a SIGKILL leaves a receipt the
+            # next run can find and recover instead of nothing at all.
+            _write_json(self.path, self.value)
 
     def finish(self, status: str, error: str = "") -> None:
         self.value.update(status=status, error=error or None, finished_at=_iso(self.sys.now()))
@@ -847,10 +919,100 @@ def installed_tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900
                     timeout=timeout)
 
 
+def _alive(sys_: System, pid: Any, start: Any) -> bool:
+    return isinstance(pid, int) and start is not None and sys_.process_start(pid) == start
+
+
+def previous_run_state(cfg: Config, sys_: System) -> tuple[str | None, list[Path]]:
+    """(refusal, interrupted receipts).
+
+    An installer that outlived its self-update (recorded in installer.json) or
+    a self-update that is still running refuses this run. A receipt still
+    "running" whose process is gone was killed (launchd SIGKILL after
+    ExitTimeOut) and must be recovered.
+    """
+    installer = _read_json(cfg.state_dir / "installer.json")
+    if installer and isinstance(installer.get("pgid"), int) and sys_.group_alive(installer["pgid"]) \
+            and _alive(sys_, installer["pgid"], installer.get("start")):
+        return (f"a previous self-update's installer is still running (pgid {installer['pgid']}, "
+                f"started {installer.get('start')}); wait for it to exit, then run "
+                "`tartci fleet-macos self-update --verify`"), []
+    interrupted = []
+    for path, value in _attempts(cfg.state_dir):
+        if value.get("mode") != "apply" or value.get("status") != "running":
+            continue
+        if _alive(sys_, value.get("pid"), value.get("pid_start")):
+            return (f"another self-update is running (pid {value.get('pid')}, receipt "
+                    f"{path.name})"), []
+        interrupted.append(path)
+    return None, interrupted
+
+
+def recover_interrupted(cfg: Config, sys_: System, paths: list[Path]) -> None:
+    """Finish receipts of runs that were killed: re-pin, pool on, record, count."""
+    for path in paths:
+        value = _read_json(path) or {}
+        target, previous = value.get("target"), value.get("previous")
+        if not any(step.get("step") == "announce" for step in value.get("steps", [])):
+            # Killed during the read-only gates: nothing on the host changed.
+            message = (f"interrupted before any change (pid {value.get('pid')} was killed); "
+                       "nothing to recover")
+            value.update(status="refused", error=message, finished_at=_iso(sys_.now()))
+            _write_json(path, value)
+            print(f"self-update: {message} ({path.name})")
+            continue
+        notes = []
+        try:
+            running = installed_commit(cfg)[0]
+        except Refused:
+            running = None
+        pin = Path(value["pin_path"]) if value.get("pin_path") else None
+        source = None
+        if pin is not None:
+            if running == target and value.get("approval"):
+                source = Path(value["approval"])
+            elif running == previous and value.get("snapshot"):
+                source = Path(value["snapshot"]) / "approved.sha256"
+            if source is not None and source.is_file():
+                tmp = pin.with_name(f".{pin.name}.new")
+                tmp.write_text(source.read_text())
+                os.chmod(tmp, 0o600)
+                os.replace(tmp, pin)
+                notes.append(f"pin re-matched to the live launcher ({str(running)[:12]})")
+        on = installed_tartci(cfg, sys_, "pool", "on")
+        notes.append("host is on" if on.rc == 0 else f"HOST LEFT OFF: pool on failed: {on.text[:200]}")
+        message = (f"interrupted: the self-update process (pid {value.get('pid')}) was killed "
+                   f"during {value['steps'][-1]['step'] if value.get('steps') else 'start'}; "
+                   f"host runs {str(running)[:12]}; " + "; ".join(notes)
+                   + "; run `tartci fleet-macos self-update --verify`")
+        value.setdefault("steps", []).append({"at": _iso(sys_.now()), "step": "interrupted",
+                                              "ok": False, "detail": message})
+        value.update(status="failed", error=message, finished_at=_iso(sys_.now()))
+        _write_json(path, value)
+        _write_json(cfg.state_dir / "last.json", {"status": "failed", "target": target,
+                                                  "error": message, "at": value["finished_at"],
+                                                  "receipt": str(path)})
+        print(f"self-update: FAILED (recovered interrupted run): {message}", file=sys.stderr)
+    marker = _read_json(cfg.state_dir / "active.json")
+    if marker is not None and not _alive(sys_, marker.get("pid"), marker.get("pid_start")):
+        (cfg.state_dir / "active.json").unlink(missing_ok=True)
+
+
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   scheduled: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
+    blocked, interrupted = previous_run_state(cfg, sys_)
+    if blocked:
+        print(f"self-update: REFUSED: {blocked}")
+        return EXIT_REFUSED
+    if interrupted:
+        if not apply:
+            print(f"self-update: {len(interrupted)} interrupted run(s) would be recovered first: "
+                  + ", ".join(p.name for p in interrupted))
+        else:
+            recover_interrupted(cfg, sys_, interrupted)
+            return EXIT_FAILED
     try:
         installed, source = installed_commit(cfg)
         refresh_checkout(cfg, sys_)
@@ -999,6 +1161,8 @@ class Run:
         self.pin_moved = False
         self.snapshot: Path | None = None
         self.phase = "announce"
+        receipt.value.update(approval=str(approval) if approval else None,
+                             pin_path=str(self.pin_path) if self.pin_path else None)
 
     # ── entry ───────────────────────────────────────────────────────────
     def execute(self) -> int:
@@ -1121,7 +1285,8 @@ class Run:
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical(["./tartci", *args, "--apply"],
                                            cwd=str(self.cfg.checkout), env=census_env(),
-                                           timeout=INSTALL_TIMEOUT)
+                                           timeout=INSTALL_TIMEOUT,
+                                           record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
                 return
             self.receipt.step("install", f"attempt {attempt} failed: {result.text[:300]}", ok=False)
@@ -1273,7 +1438,8 @@ class Run:
 
 def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
     marker = cfg.state_dir / "active.json"
-    _write_json(marker, {"host_id": me, "target": target, "ts": sys_.now()})
+    _write_json(marker, {"host_id": me, "target": target, "ts": sys_.now(),
+                         "pid": os.getpid(), "pid_start": sys_.process_start(os.getpid())})
     # Re-read peers AFTER announcing: two hosts that announce together both
     # see each other here, and only the lower host id proceeds.
     for peer, ssh_target in published_peers(cfg, sys_).items():

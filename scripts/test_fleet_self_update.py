@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -63,6 +64,7 @@ class FakeSystem(su.System):
         self.clone_ok = True
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
+        self.procs: dict[int, str] = {}     # other live processes: pid -> start
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
         self.relay = {"ok": True, "probe": "relay authenticated"}
@@ -78,9 +80,17 @@ class FakeSystem(su.System):
     def now(self) -> float:
         return self.clock
 
-    def run_critical(self, argv, *, cwd=None, env=None, timeout=900):
+    def run_critical(self, argv, *, cwd=None, env=None, timeout=900, record=None):
         self.critical.append(list(argv))
         return self.run(argv, cwd=cwd, env=env, timeout=timeout)
+
+    def process_start(self, pid):
+        if pid in self.procs:
+            return self.procs[pid]
+        return "self-start" if pid == os.getpid() else None
+
+    def group_alive(self, pgid):
+        return pgid in self.procs
 
     def sleep(self, seconds: float) -> None:
         self.clock += seconds
@@ -960,6 +970,135 @@ class CriticalSectionTests(unittest.TestCase):
             os.chmod(tree.parent, 0o555)
             su.clear_dir(Path(td) / "b")
             self.assertFalse((Path(td) / "b").exists())
+
+
+class InterruptedRunTests(Base):
+    """A self-update SIGKILLed by launchd (ExitTimeOut) is found and recovered."""
+
+    def _killed_receipt(self, *, announced=True, pid=424242, start="Mon Sep 21 00:00:00 2026"):
+        path = self.cfg.state_dir / "attempts" / "20260101T000000Z-aaaaaaaaaaaa.json"
+        steps = [{"step": "checkout"}] + ([{"step": "announce"}, {"step": "install"}] if announced else [])
+        su._write_json(path, {"schema": su.SCHEMA, "mode": "apply", "status": "running",
+                              "target": T_OLD, "previous": INSTALLED, "started_at": "2026-01-01T00:00:00Z",
+                              "pid": pid, "pid_start": start, "steps": steps,
+                              "approval": None, "pin_path": None})
+        su._write_json(self.cfg.state_dir / "active.json",
+                       {"host_id": "m1", "target": T_OLD, "ts": NOW, "pid": pid, "pid_start": start})
+        return path
+
+    def test_killed_run_is_recovered_counted_and_unblocks_peers(self) -> None:
+        path = self._killed_receipt()
+        self.sys.pool_state = "off"
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        value = json.loads(path.read_text())
+        self.assertEqual(value["status"], "failed")
+        self.assertIn("interrupted", value["error"])
+        self.assertIn("self-update --verify", value["error"])
+        self.assertEqual(self.last()["status"], "failed")
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertFalse((self.cfg.state_dir / "active.json").exists())
+        self.assertEqual(self.sys.mutations(), [f"{self.home}/.local/bin/tartci pool on"])
+        # It counts toward the halt like any failure.
+        self.assertIn("FAILED", su.summary(self.home)["problem"])
+
+    def test_killed_before_any_change_is_not_a_failure(self) -> None:
+        path = self._killed_receipt(announced=False)
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(json.loads(path.read_text())["status"], "refused")
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "last.json").exists())
+
+    def test_live_run_or_live_installer_refuses(self) -> None:
+        self._killed_receipt(pid=424242, start="S")
+        self.sys.procs[424242] = "S"
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.sys.procs.clear()
+        (self.cfg.state_dir / "attempts").mkdir(exist_ok=True)
+        for p in (self.cfg.state_dir / "attempts").glob("*.json"):
+            p.unlink()
+        su._write_json(self.cfg.state_dir / "installer.json", {"pgid": 777, "start": "T"})
+        self.sys.procs[777] = "T"
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        # Control: once the installer has exited (or its pid was reused), runs proceed.
+        self.sys.procs[777] = "a different process"
+        self.assertEqual(self.apply(), su.EXIT_OK)
+
+    def test_plan_reports_but_does_not_recover(self) -> None:
+        path = self._killed_receipt()
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.assertEqual(json.loads(path.read_text())["status"], "running")
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_receipt_is_on_disk_while_running(self) -> None:
+        seen = []
+
+        def peek(argv):
+            if argv[:3] == ["./tartci", "pool", "drain"]:
+                seen.extend(json.loads(p.read_text())["status"]
+                            for p in (self.cfg.state_dir / "attempts").glob("*.json"))
+        self.sys.hook = peek
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertIn("running", seen)
+
+
+class DeferralCapTests(unittest.TestCase):
+    def test_sigterm_deferral_is_capped_below_exit_timeout(self) -> None:
+        import signal
+        import threading
+        self.assertLess(su.SIGTERM_DEFER_CAP + su.SIGTERM_TERM_WAIT, 120)
+        with tempfile.TemporaryDirectory() as td:
+            record = Path(td) / "installer.json"
+            script = f"trap 'echo restored > {td}/trap; exit 3' TERM; while :; do sleep 0.1; done"
+            caps = (su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT)
+            su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT = 1, 5
+            old = signal.signal(signal.SIGTERM, su._raise_terminated)
+            started = time.monotonic()
+            try:
+                threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+                with self.assertRaises(su.Terminated):
+                    su.System().run_critical(["bash", "-c", script], timeout=60, record=record)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT = caps
+            self.assertLess(time.monotonic() - started, 10)
+            self.assertEqual((Path(td) / "trap").read_text(), "restored\n")  # trap ran
+            self.assertFalse(record.exists())  # it exited, so nothing is left to guard
+
+    def test_installer_that_ignores_term_is_recorded(self) -> None:
+        import signal
+        import threading
+        with tempfile.TemporaryDirectory() as td:
+            record = Path(td) / "installer.json"
+            caps = (su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT)
+            su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT = 1, 1
+            old = signal.signal(signal.SIGTERM, su._raise_terminated)
+            try:
+                threading.Timer(0.3, lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
+                with self.assertRaises(su.Terminated) as caught:
+                    su.System().run_critical(["bash", "-c", "trap '' TERM; sleep 4"],
+                                             timeout=60, record=record)
+            finally:
+                signal.signal(signal.SIGTERM, old)
+                su.SIGTERM_DEFER_CAP, su.SIGTERM_TERM_WAIT = caps
+            self.assertIn("STILL RUNNING", str(caught.exception))
+            value = json.loads(record.read_text())
+            self.assertTrue(su.System().group_alive(value["pgid"]))
+            os.killpg(value["pgid"], signal.SIGKILL)
+
+    def test_group_already_gone_at_timeout_is_not_an_error(self) -> None:
+        original = os.killpg
+
+        def vanished(pgid, sig):
+            raise ProcessLookupError
+        os.killpg = vanished
+        try:
+            result = su.System().run_critical(["bash", "-c", "sleep 1.5"], timeout=0.3)
+        finally:
+            os.killpg = original
+        self.assertEqual(result.rc, su.EXIT_TIMED_OUT)
 
 
 if __name__ == "__main__":
