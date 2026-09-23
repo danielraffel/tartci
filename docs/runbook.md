@@ -895,6 +895,15 @@ not depend on a mounted workspace:
   --apply
 ```
 
+Always run both commands with the **new checkout's own `./tartci`**, never an
+older installed `tartci` pointed at a newer checkout with `--support-source`.
+The support cohort's directory set is versioned with the code: a generation
+that ships `fleet/` writes a manifest an older verifier rejects ("member path
+is invalid: 'fleet/README.md'"). That refusal fails closed before any
+mutation, but it looks like a broken checkout rather than a version mismatch.
+A launcher re-seal (m3) likewise needs the launcher and the support cohort
+from the same commit, which the receipt already enforces.
+
 Generate the manifest only from the exact clean source commit being deployed.
 It requires and binds the canonical `danielraffel/tartci` GitHub repository key
 and every selected provider,
