@@ -215,7 +215,9 @@ class ShapeTests(unittest.TestCase):
         seen: list[str] = []
 
         def run_json(argv: list[str]) -> object:
-            seen.append(argv[2])
+            # The endpoint follows `api`; an identity-binding `env` prefix
+            # may precede the CLI.
+            seen.append(argv[argv.index("api") + 1])
             return {"runners": []}
 
         runner_census.collect(REPO, runner_census.cli_fetcher("ghapp", run_json=run_json))

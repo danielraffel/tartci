@@ -26,6 +26,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +41,55 @@ UNSERVED = "unserved"
 UNKNOWN = "unknown"
 
 _REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$")
+
+# Named census failures. A census that fails for an identity reason must say
+# so: both of these read as "capacity unknown" otherwise, and both have been
+# misdiagnosed as a missing GitHub permission.
+CENSUS_UNAUTHENTICATED = "census_unauthenticated"
+CENSUS_IDENTITY_LACKS_ACCESS = "census_identity_lacks_access"
+_ANONYMOUS_RATE_LIMIT = re.compile(
+    r"rate limit exceeded for \d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|authenticated requests get a higher rate limit", re.I)
+_UNAUTHENTICATED = re.compile(
+    r"bad credentials|requires authentication|http 401|401 unauthorized"
+    r"|must authenticate|gh auth login|not logged in", re.I)
+_INTEGRATION_FORBIDDEN = re.compile(r"resource not accessible by integration", re.I)
+
+# The environment a GitHub App wrapper binds its installation from. Shipyard's
+# ghapp reads SHIPYARD_GHAPP_REPO, then GH_REPO, and only then falls back to
+# the checkout it runs in; SHIPYARD_GH_APP_REPO is the name tartci's own lane
+# plists and runner.sh export. Setting all three pins the installation to the
+# queried repository wherever the census happens to be run from.
+IDENTITY_ENV_NAMES = ("SHIPYARD_GHAPP_REPO", "GH_REPO", "SHIPYARD_GH_APP_REPO")
+
+
+def identity_env(repo: str) -> dict[str, str]:
+    split_repo(repo)
+    return {name: repo for name in IDENTITY_ENV_NAMES}
+
+
+def classify_census_failure(text: str, *, cli: str, repo: str) -> tuple[str, str] | None:
+    """(reason, operator message) for an identity failure, else None."""
+    message = (text or "").strip()
+    excerpt = message[:300]
+    if _ANONYMOUS_RATE_LIMIT.search(message) or _UNAUTHENTICATED.search(message):
+        return CENSUS_UNAUTHENTICATED, (
+            f"`{cli}` reached GitHub without a valid credential while reading runners "
+            f"for {repo} (anonymous requests share one 60/hour allowance per IP "
+            f"across every host behind it). Fix: run with TARTCI_GH_CLI=ghapp, or "
+            f"repair `{cli}` authentication. This is not a capacity or permission "
+            f"problem. GitHub said: {excerpt}"
+        )
+    if _INTEGRATION_FORBIDDEN.search(message):
+        return CENSUS_IDENTITY_LACKS_ACCESS, (
+            f"the GitHub App identity `{cli}` used, requested for {repo}, cannot read "
+            f"that scope's runners. Check which installation `{cli}` minted a token "
+            f"for: the census binds it to {repo} through "
+            f"{'/'.join(IDENTITY_ENV_NAMES)}, and a token minted for another "
+            f"repository's installation is refused here even when {repo}'s "
+            f"installation holds org runner read. GitHub said: {excerpt}"
+        )
+    return None
 
 
 class CensusScopeError(RuntimeError):
@@ -206,6 +256,11 @@ Fetch = Callable[[str, str], Iterable[dict]]
 def collect(repo: str, fetch: Fetch, *, scopes: Sequence[str] = SCOPES) -> RunnerCensus:
     """Read every scope. One scope failing never aborts the others."""
     results: list[ScopeCensus] = []
+    # A fetcher that can bind its GitHub identity binds it to THIS repo, so an
+    # App wrapper never mints for whatever checkout the caller stands in.
+    bind = getattr(fetch, "bind_repo", None)
+    if callable(bind):
+        fetch = bind(repo)
     for scope in scopes:
         endpoint = scope_endpoint(scope, repo)
         try:
@@ -238,15 +293,28 @@ def cli_fetcher(cli: str, *, run_json: Callable[[list[str]], Any], per_page: int
     imposing one.
     """
 
-    def fetch(scope: str, endpoint: str) -> list[dict]:
-        argv = [cli, "api", f"{endpoint}?per_page={per_page}", "--paginate", "--slurp"]
-        try:
-            payload = run_json(argv)
-        except Exception as exc:  # noqa: BLE001
-            code = getattr(exc, "problem_code", "") or type(exc).__name__
-            raise CensusScopeError(scope, endpoint, str(code), str(exc)) from exc
-        return extract_runners(payload)
+    def fetcher_for(repo: str | None):
+        def fetch(scope: str, endpoint: str) -> list[dict]:
+            argv = [cli, "api", f"{endpoint}?per_page={per_page}", "--paginate", "--slurp"]
+            if repo is not None:
+                # `env` rather than a subprocess env= so every caller's own
+                # runner (bounded, budgeted) carries the binding unchanged.
+                argv = ["/usr/bin/env",
+                        *(f"{k}={v}" for k, v in identity_env(repo).items()), *argv]
+            try:
+                payload = run_json(argv)
+            except Exception as exc:  # noqa: BLE001
+                named = classify_census_failure(str(exc), cli=cli, repo=repo or "?")
+                if named is not None:
+                    raise CensusScopeError(scope, endpoint, named[0], named[1]) from exc
+                code = getattr(exc, "problem_code", "") or type(exc).__name__
+                raise CensusScopeError(scope, endpoint, str(code), str(exc)) from exc
+            return extract_runners(payload)
 
+        return fetch
+
+    fetch = fetcher_for(None)
+    fetch.bind_repo = fetcher_for  # type: ignore[attr-defined]
     return fetch
 
 
@@ -312,8 +380,25 @@ def _default_run_json(argv: list[str]) -> Any:
     return json.loads(proc.stdout or "null")
 
 
-def github_cli() -> str:
-    return os.environ.get("TARTCI_GH_CLI") or "gh"
+def github_cli(env: dict[str, str] | None = None) -> str:
+    """TARTCI_GH_CLI, else ghapp (PATH or ~/.local/bin), else gh.
+
+    Bare `gh` is the last resort, not the default: on a host whose gh login is
+    broken it silently goes anonymous and spends the fleet's shared 60/hour
+    allowance. The App wrapper is the identity the fleet actually runs as.
+    """
+    environ = os.environ if env is None else env
+    configured = (environ.get("TARTCI_GH_CLI") or "").strip()
+    if configured:
+        return configured
+    found = shutil.which("ghapp", path=environ.get("PATH"))
+    if found:
+        return found
+    home = environ.get("HOME") or os.path.expanduser("~")
+    local = os.path.join(home, ".local", "bin", "ghapp")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return "gh"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,7 +407,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repo", required=True, help="OWNER/REPO")
     parser.add_argument("--label", action="append", default=[], help="report this label's status")
-    parser.add_argument("--gh-cli", default="", help="GitHub CLI wrapper (default: $TARTCI_GH_CLI)")
+    parser.add_argument("--gh-cli", default="",
+                        help="GitHub CLI wrapper (default: $TARTCI_GH_CLI, else ghapp, else gh)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 

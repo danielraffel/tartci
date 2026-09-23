@@ -51,6 +51,9 @@ REASONS_PATH = Path(__file__).resolve().parent / "fleet_reasons.json"
 CODES: tuple[str, ...] = (
     "agents_dir_unreadable",
     "census_complete",
+    "census_identity_authenticated",
+    "census_identity_unauthenticated",
+    "census_identity_unknown",
     "census_incomplete",
     "census_module_unavailable",
     "census_repo_unknown",
@@ -717,6 +720,51 @@ def lane_registrations(agents_dir: Path) -> dict[str, dict]:
     return out
 
 
+def check_census_identity(cli: str, repo: str, run: Callable[[list[str]], tuple[int, str, str]]
+                          | None = None) -> Finding:
+    """Would the census CLI reach GitHub as an authenticated identity?
+
+    `<cli> api rate_limit` is free (it does not count against the allowance)
+    and its core ceiling names the identity: 60/hour is anonymous. An
+    anonymous census spends the fleet's shared per-IP allowance and then
+    reports every label as capacity-unknown.
+    """
+    check = f"census_identity[{repo}]"
+    try:
+        import runner_census
+        env = [f"{k}={v}" for k, v in runner_census.identity_env(repo).items()]
+    except Exception as exc:  # noqa: BLE001
+        return Finding(check, UNKNOWN, "census_identity_unknown", f"{type(exc).__name__}: {exc}")
+    argv = ["/usr/bin/env", *env, cli, "api", "rate_limit"]
+    if run is None:
+        def run(command: list[str]) -> tuple[int, str, str]:  # noqa: F811
+            try:
+                proc = subprocess.run(command, capture_output=True, text=True, timeout=20,
+                                      check=False)
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                return 127, "", str(exc)
+            return proc.returncode, proc.stdout, proc.stderr
+    rc, out, err = run(argv)
+    facts = {"cli": cli, "repo": repo}
+    try:
+        limit = json.loads(out)["resources"]["core"]["limit"]
+        if not isinstance(limit, int):
+            raise TypeError("limit is not an integer")
+    except Exception:  # noqa: BLE001 - no ceiling read means unproven
+        return Finding(check, UNKNOWN, "census_identity_unknown",
+                       f"`{cli} api rate_limit` gave no core ceiling (exit {rc}): "
+                       f"{(err or out).strip()[:200]}", facts)
+    facts["core_limit"] = limit
+    if limit <= 60:
+        return Finding(check, PROBLEM, "census_identity_unauthenticated",
+                       f"`{cli}` reaches GitHub ANONYMOUSLY (core limit {limit}/hour) for "
+                       f"{repo}: the capacity census would spend the shared per-IP "
+                       "allowance and report capacity unknown. Fix: TARTCI_GH_CLI=ghapp, "
+                       f"or repair `{cli}` authentication.", facts)
+    return Finding(check, OK, "census_identity_authenticated",
+                   f"`{cli}` is authenticated for {repo} (core limit {limit}/hour)", facts)
+
+
 def collect_census(repo: str, gh_cli: str | None) -> tuple[Any, str | None, str]:
     """Take a dual-scope census, consuming the census module when it is present."""
     try:
@@ -738,6 +786,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             config_dir: Path | None = None, support_root: Path = ROOT,
             repos: Sequence[str] | None = None, gh_cli: str | None = None,
             skip_census: bool = False,
+            identity_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             probe: Callable[[Path], dict] | None = None,
             drift_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
@@ -806,6 +855,12 @@ def collect(*, home: Path, agents_dir: Path | None = None,
                 "target could be derived",
                 {"idle_zero_is_normal": True, "note": IDLE_ZERO_NOTE}))
         for repo in wanted:
+            try:
+                import runner_census
+                cli = gh_cli or runner_census.github_cli()
+            except ImportError:
+                cli = gh_cli or "gh"
+            findings.append(check_census_identity(cli, repo, identity_run))
             census, code, detail = collect_census(repo, gh_cli)
             findings.append(check_runner_census(
                 census, repo=repo, error_code=code, error_detail=detail))
