@@ -113,12 +113,20 @@ DEFAULT_RESTART_GRACE_S = 60
 # alive-but-frozen heal for all of them, which is the watchdog's main job.
 UNINTERRUPTIBLE_AGENTS: frozenset[str] = frozenset({
     "com.danielraffel.tartci.reclaim",
+    # Quiet for up to 90 minutes while it waits for lanes to go idle, and
+    # mid-install after that: a bootout there strands the host drained.
+    "com.danielraffel.tartci.self-update",
 })
 APPLICATION_EXIT_CODES: dict[str, dict[int, str]] = {
     "com.danielraffel.tartci.reclaim": {
         2: "unusable scan root or bad arguments",
         3: "free space still below the floor after reclaiming",
         4: "process table unreadable, so no build directory could be proven idle",
+    },
+    "com.danielraffel.tartci.self-update": {
+        3: "a precondition refused (peer updating, capacity floor, rate limit); host untouched",
+        4: "an update failed and the host was restored to the previous generation",
+        5: "tartci skew could not be measured",
     },
 }
 # Rate limit: at most this many heals per label inside the window.
@@ -841,9 +849,31 @@ def config_verdicts(config: str, receipt: str, support_root: str | None = None) 
         return unknown(f"config check failed: {exc}")
 
 
+def refresh_skew(interval_s: int = 1800) -> None:
+    """Re-measure tartci's skew against main at most every interval_s.
+
+    Read-only (a git fetch into the tartci-owned update checkout). Keeps the
+    skew line in pool status, doctor and this log current even on a host
+    that never runs the self-update agent.
+    """
+    python = _toml_python()
+    if python is None:
+        return
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        subprocess.run([python, os.path.join(root, "scripts", "fleet_self_update.py"),
+                        "--refresh-skew", "--if-older", str(interval_s)],
+                       capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def config_problem(value: dict) -> str | None:
     """One-line summary when anything is not ok, else None."""
     parts = []
+    self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
+    if self_update.get("problem"):
+        parts.append(f"self_update={self_update['problem']}")
     for key, good in (("profile_drift", "in_sync"), ("supply", "match")):
         row = value.get(key) if isinstance(value.get(key), dict) else {}
         state = row.get("state") or "unknown"
@@ -1004,6 +1034,8 @@ def main(argv: list[str] | None = None) -> int:
 
     unhealthy = [r for r in results
                  if r["verdict"] in {"wedged", "broken", "attention"}]
+    if not args.status and not args.dry_run and os.path.isfile(args.fleet_config):
+        refresh_skew()
     config = config_verdicts(args.fleet_config, args.fleet_receipt)
     config_summary = config_problem(config)
     config["warned"] = False

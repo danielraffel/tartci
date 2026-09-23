@@ -2209,7 +2209,8 @@ def config_verdicts(config: Path, support_root: Path,
     """
     if not config.is_file():
         return {"profile_drift": {"state": "not_applicable", "reason": "no installed profile"},
-                "supply": {"state": "not_applicable", "reason": "no installed profile"}}
+                "supply": {"state": "not_applicable", "reason": "no installed profile"},
+                "self_update": self_update_summary()}
     value: dict = {}
     try:
         drift = profile_drift(config, support_root / "profiles")
@@ -2241,7 +2242,18 @@ def config_verdicts(config: Path, support_root: Path,
         }
     except Exception as exc:  # noqa: BLE001
         value["supply"] = {"state": "unknown", "reason": f"{type(exc).__name__}: {exc}"}
+    value["self_update"] = self_update_summary()
     return value
+
+
+def self_update_summary() -> dict:
+    """Cached tartci skew and last self-update attempt. Never fetches."""
+    try:
+        import fleet_self_update
+        return fleet_self_update.summary()
+    except Exception as exc:  # noqa: BLE001 - a status line must not break status
+        return {"lines": [f"tartci: skew UNKNOWN ({type(exc).__name__}: {exc})"],
+                "problem": None}
 
 
 def render_config_verdicts(value: dict | None) -> str:
@@ -2262,6 +2274,9 @@ def render_config_verdicts(value: dict | None) -> str:
         else:
             text = f"UNKNOWN ({row.get('reason') or 'not checked from here'})"
         lines.append(f"{name}: {text}")
+    self_update = value.get("self_update") if isinstance(value.get("self_update"), dict) else {}
+    lines.extend(self_update.get("lines") or
+                 ["tartci: skew UNKNOWN (not checked from here)"])
     supply = value.get("supply") if isinstance(value.get("supply"), dict) else {}
     if supply.get("commits_differ"):
         lines.append(f"  supply published at {supply['published_commit'][:12]}, host generation "

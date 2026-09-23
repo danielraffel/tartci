@@ -204,7 +204,10 @@ cmd_fleet_macos() {
     install)
       exec "$HERE/scripts/install_macos_fleet.sh" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts> ..."; return 2 ;;
+    self-update)
+      tartci_toml_python "$HERE/scripts/fleet_self_update.py" "$@"
+      ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update> ..."; return 2 ;;
   esac
 }
 
@@ -1042,6 +1045,11 @@ if fleet["managed"]:
         else:
             text = f"UNKNOWN ({row.get('reason') or 'not checked from here'})"
         print(f"{name}: {text}")
+    # tartci's own skew against main, from the self-update cache. Shown even
+    # when the periodic self-update agent is not installed.
+    self_update = config.get("self_update") if isinstance(config.get("self_update"), dict) else {}
+    for line in self_update.get("lines") or ["tartci: skew UNKNOWN (not checked from here)"]:
+        print(line)
 else:
     print("fleet ready: unknown (legacy/unmanaged)")
 PY

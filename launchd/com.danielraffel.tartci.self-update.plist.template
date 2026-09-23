@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Periodic tartci self-update (`tartci fleet-macos self-update --apply --scheduled`).
+
+  Every 30 minutes it measures this host's tartci skew against first-parent
+  main and, only when a commit older than the soak is undeployed, runs the
+  codified update: one fleet host at a time, capacity floor honoured, drain and
+  wait for no mid-job lane, install, pool on through the installed shim, verify.
+  A failure leaves the host serving the previous generation and is reported by
+  `tartci pool status`, `tartci doctor fleet`, and the launchd watchdog.
+  --scheduled adds this host's stable stagger offset so hosts do not start
+  together.
+
+  NOT installed by default. Install with scripts/install_self_update_agent.sh
+  (prints the plan; --install writes and loads it). Requires
+  ~/.config/tartci/self-update.toml with a [peers] map of every other
+  published host_id to an SSH target; without it every run refuses.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.self-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>fleet-macos</string>
+        <string>self-update</string>
+        <string>--apply</string>
+        <string>--scheduled</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-self-update.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-self-update.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+        <key>TARTCI_GH_CLI</key>
+        <string>ghapp</string>
+    </dict>
+</dict>
+</plist>

@@ -1438,6 +1438,59 @@ host-wide "no VM running" gate.
 fleet`), and check GitHub's job history against it with
 `scripts/supply_observed.py --repo OWNER/REPO`.
 
+### Keeping a host on main's tartci (`tartci fleet-macos self-update`)
+
+`tartci fleet-macos self-update [--plan|--apply] [--target REF]` is the
+2026-09-23 manual update procedure, codified. `--plan` (the default) is
+read-only for the host; `--apply` performs it.
+
+- **Skew.** The installed commit is the executed cohort: the sealed launcher's
+  `bundle.json` source_commit on a host with `[launch_helper]`, otherwise the
+  installed generation's manifest commit. Main is read from a tartci-owned
+  clean clone at `~/.local/share/tartci/update-checkout` (never a shared working
+  copy). The target is the newest **first-parent** main commit older than the
+  soak (30 min). Diverged or unreadable skew refuses (exit 5).
+- **Prepare** from the target checkout: `support-manifest write`,
+  `fleet-macos validate`, install dry-run, and on a sealed host the launcher
+  build signed by the identity **extracted** from the live bundle's leaf
+  certificate, with the reseal runbook's immutability preconditions, then
+  verified (lanes.json equals the rendered lane environment, `codesign
+  --verify --deep --strict`, bundle `source_commit` == target).
+- **One host at a time.** Every other host in `fleet/advertised-labels.json`
+  on main must be `on` and not self-updating, read over SSH from
+  `~/.config/tartci/self-update.toml` `[peers]` (host_id = ssh target). An
+  unmapped or unreachable peer refuses. The runner census is not used for this:
+  ephemeral lanes register nothing at idle, so a drained host and an idle one
+  look the same there. The host announces first and re-reads its peers; if two
+  announce together the lower host_id proceeds.
+- **Capacity floor.** `--allow-last-serving-host` is passed only when every
+  last-serving label is idle by design (`pulp-release-tagged`,
+  `pulp-release-pr-gate`, override with `idle_by_design_labels`); the rule is
+  written to the receipt. Capacity unknown refuses. The census runs with
+  `TARTCI_GH_CLI=ghapp` and per-call repo binding, from the update checkout.
+- **Apply.** drain, wait up to 90 min (poll 45 s) for `pool off --plan` to
+  show no mid-job lane, `pool off`, pin the new launcher approval (previous pin
+  backed up), install dry-run then `--apply` (retried while agents unload),
+  relay `network_profile.py reconcile` (which probes through the relay) when
+  the relay is enabled, `pool on` through the **installed** shim from `$HOME`,
+  then verify: pool `on` and fleet ready, serving not blocked, the executed
+  commit == target, and `tartci launchd guard` present. Any failure after the
+  drain restores the pin and runs `pool on`, leaving the host serving the
+  previous generation (exit 4).
+- **Receipts and rate limit.** Every attempt writes
+  `~/.tartci/state/self-update/attempts/<time>-<commit>.json`; the last real
+  attempt is `last.json`. One attempt per target commit per 6 h (a refusal does
+  not count).
+- **Always visible.** `tartci pool status`, `tartci doctor fleet`
+  (`self_update`) and the launchd watchdog print `tartci: N commits behind main
+  (oldest undeployed: T)`, `STALE` after 24 h, and any failed last attempt. The
+  watchdog re-measures skew at most every 30 min (a read-only fetch), so this
+  works with the periodic agent off.
+- **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
+  every 30 min, `--apply --scheduled` with a per-host stagger) is not installed
+  by default: `scripts/install_self_update_agent.sh` prints the plan, and
+  `--install` loads it. The watchdog never interrupts it.
+
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
 The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane
