@@ -453,6 +453,9 @@ tartci_pool_capacity_floor_preflight() {
   local -a floor_args=(check --action "$action")
   [ "$allow" = 1 ] && floor_args+=(--allow-last-serving-host)
   output="$(tartci_toml_python "$HERE/scripts/capacity_floor.py" "${floor_args[@]}" 2>&1)" || rc=$?
+  # The floor's own exit code (0 ok, 3 last serving host, 4 capacity unknown)
+  # survives the collapse to 11 so callers can say which refusal it was.
+  TARTCI_POOL_FLOOR_EXIT="$rc"
   case "$rc" in
     0)
       [ -n "$output" ] && printf '%s\n' "$output"
@@ -518,7 +521,12 @@ EOF
   [ "$sub" = on ] || tartci_pool_report_unowned "$sub" "$agents_dir" | sed 's/^/  /'
   if [ "$sub" != on ]; then
     local floor_output floor_rc=0
-    floor_output="$(tartci_pool_capacity_floor_preflight "$sub" "$allow_last" 2>&1)" || floor_rc=$?
+    TARTCI_POOL_FLOOR_EXIT=""
+    # Not in a subshell: the preflight records the floor's exit code for the
+    # verdict below. Output is captured through a temp file instead.
+    local floor_tmp; floor_tmp="$(mktemp)"
+    tartci_pool_capacity_floor_preflight "$sub" "$allow_last" >"$floor_tmp" 2>&1 || floor_rc=$?
+    floor_output="$(cat "$floor_tmp")"; rm -f "$floor_tmp"
     if [ "$floor_rc" = 0 ]; then
       echo "  capacity floor: ok${floor_output:+ ($floor_output)}"
     else
@@ -545,7 +553,16 @@ EOF
   fi
   case "$verdict" in
     0) echo "verdict: pool $sub would proceed" ;;
-    11) echo "verdict: pool $sub would REFUSE (capacity floor; --allow-last-serving-host overrides)" ;;
+    11)
+      # capacity_floor.py exits 3 last serving host, 4 capacity unknown, 2
+      # usage; 127 is the no-tomllib interpreter probe. Only 3 and 4 are floor
+      # verdicts; anything else means the floor never ran to a verdict.
+      case "${TARTCI_POOL_FLOOR_EXIT:-}" in
+        3) echo "verdict: pool $sub would REFUSE (last serving host for a required label; --allow-last-serving-host overrides)" ;;
+        4) echo "verdict: pool $sub would REFUSE (capacity UNKNOWN: the runner census could not answer; --allow-last-serving-host does NOT override this — fix the census cause shown above, then re-run)" ;;
+        *) echo "verdict: pool $sub would REFUSE (capacity floor could not run (exit ${TARTCI_POOL_FLOOR_EXIT:-unknown}): ${floor_output:-no output}; --allow-last-serving-host does NOT override this)" ;;
+      esac
+      ;;
     12) echo "verdict: pool off would REFUSE (an owned lane is mid-job or unknown; use pool drain, or --now)" ;;
   esac
   return "$verdict"
