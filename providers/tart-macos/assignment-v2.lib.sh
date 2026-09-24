@@ -22,6 +22,18 @@ tartci_assignment_v2_configure(){
     *) [ "${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}" -le 300 ] \
       || die "TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS must be at most 300" ;;
   esac
+  # Work-conserving idle retarget (opt-in; 0 = off). Bounded below so an idle
+  # runner is never re-observed faster than GitHub ordinarily assigns a job to
+  # a fresh registration, and never more often than one exhaustive scan per
+  # minute per idle slot against the host-global observation lock.
+  case "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" in
+    ''|*[!0-9]*) die "invalid TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS: expected 0 or 60-3600" ;;
+  esac
+  if [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -ne 0 ]; then
+    [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -ge 60 ] \
+      && [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 3600 ] \
+      || die "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS must be 0 or 60-3600"
+  fi
   [ -n "$WORKFLOW_TIERS" ] \
     || die "$ASSIGNMENT_MODE assignment mode requires TARTCI_RUNNER_WORKFLOW_TIERS"
   ASSIGNMENT_V2_BASE_LABELS="$(python3 - "$LABELS" "$ASSIGNMENT_V2_OMIT_LABELS" "$ASSIGNMENT_V2_CLASS_LABELS" <<'PY'
@@ -64,7 +76,8 @@ tartci_assignment_v2_tier_labels(){
 # admission decision only asks whether demand exists. Pass exhaustive=1 to buy
 # the true magnitude instead; only reporting needs it, and it costs a full scan.
 tartci_assignment_v2_tier_demand(){
-  local tier_label="$1" exhaustive="${2:-0}" workflow tier_args=() selected_labels
+  local tier_label="$1" exhaustive="${2:-0}" min_age="${3:-$MIN_QUEUED_AGE}"
+  local workflow tier_args=() selected_labels
   local error_file detail rc count_args=() evidence
   selected_labels="$(tartci_assignment_v2_tier_labels "$tier_label")"
   # bash 3.2 (the macOS system shell) treats an empty "${a[@]}" as an unbound
@@ -81,7 +94,7 @@ tartci_assignment_v2_tier_demand(){
     "${tier_args[@]}" \
     --labels "$selected_labels" \
     --require-label "$tier_label" \
-    --min-age-seconds "$MIN_QUEUED_AGE" \
+    --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \
     --gh-cli "$GH_CLI" 2>"$error_file"; then
     rc=0
@@ -100,7 +113,7 @@ tartci_assignment_v2_tier_demand(){
     event assignment_scan_error \
       "tier=$tier_label scanner_rc=$rc detail=${detail:-no scanner detail}"
     if [ "$exhaustive" != 1 ] \
-       && tartci_assignment_feed_rescue "$tier_label" "$selected_labels"; then
+       && tartci_assignment_feed_rescue "$tier_label" "$selected_labels" "$min_age"; then
       rm -f "$error_file"
       return 0
     fi
@@ -133,7 +146,8 @@ tartci_assignment_v2_tier_demand(){
 # Every outcome is announced. A feed that is failing must not look like a lane
 # that is merely quiet.
 tartci_assignment_feed_rescue(){
-  local tier_label="$1" selected_labels="$2" out err_file reason rc socket_arg=()
+  local tier_label="$1" selected_labels="$2" min_age="${3:-$MIN_QUEUED_AGE}"
+  local out err_file reason rc socket_arg=()
   [ "${TARTCI_ASSIGNMENT_FEED_RESCUE:-0}" = 1 ] || return 1
   if [ -n "${TARTCI_SHIPYARD_DAEMON_SOCKET:-}" ]; then
     socket_arg=(--socket "$TARTCI_SHIPYARD_DAEMON_SOCKET")
@@ -144,7 +158,7 @@ tartci_assignment_feed_rescue(){
     --repo "$REPO" \
     --require-label "$tier_label" \
     --labels "$selected_labels" \
-    --min-observed-age-seconds "$MIN_QUEUED_AGE" \
+    --min-observed-age-seconds "$min_age" \
     --ledger "$STATE_DIR/$RUNNER_NAME.feed-ledger.json" \
     ${socket_arg[@]+"${socket_arg[@]}"} 2>"$err_file")"; then
     rc=0
@@ -334,4 +348,71 @@ tartci_assignment_v2_pre_mint_admit(){
   fi
   tartci_assignment_v2_invalidate_selection
   return 1
+}
+
+# Work-conserving idle retarget. A registered JIT runner advertises exactly one
+# event class and can serve nothing else, so a runner that GitHub has not
+# assigned within the interval is either about to receive a job of its own
+# class or is holding a governed slot for a class nobody is waiting in. The
+# static split alone cannot tell those apart, and the observed cost is a slot
+# idle for the full idle timeout while the other class queues behind it.
+#
+# Succeed (retarget) only on POSITIVE evidence of both halves: the runner's own
+# class has NO queued job at all, and some other class has admissible demand.
+# The own-class probe is deliberately age-agnostic -- the lane's minimum queued
+# age is a boot-delay policy, not an assignment restriction, and GitHub will
+# hand a young job of the runner's class to this already-registered runner in
+# seconds, which is strictly better than discarding it. Any scan uncertainty
+# holds: a runner discarded on a blind reading could strand the very work it
+# was minted for, and a held runner still reaches the bounded idle timeout.
+#
+# Class preference is not decided here. Discarding returns the supervisor to
+# its ordered selection, so when both classes wait the top tier still wins.
+tartci_assignment_v2_idle_retarget(){
+  local selected_tier="$1" idle_elapsed="${2:-0}" tier_label q tier=0 own_label=""
+  local other_tier="" other_label="" other_q=""
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    if [ "$tier" -eq "$selected_tier" ]; then
+      own_label="$tier_label"
+      break
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  [ -n "$own_label" ] || return 1
+  if ! q="$(tartci_assignment_v2_tier_demand "$own_label" 0 0)" \
+     || ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+    event assignment_v2_idle_hold \
+      "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=own_class_uncertain"
+    return 1
+  fi
+  if [ "$q" -gt 0 ]; then
+    event assignment_v2_idle_hold \
+      "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=own_class_demand"
+    return 1
+  fi
+  tier=0
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    if [ "$tier" -ne "$selected_tier" ]; then
+      if ! q="$(tartci_assignment_v2_tier_demand "$tier_label")" \
+         || ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+        event assignment_v2_idle_hold \
+          "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=other_class_uncertain tier=$tier"
+        return 1
+      fi
+      if [ "$q" -gt 0 ] && [ -z "$other_label" ]; then
+        other_tier="$tier"; other_label="$tier_label"; other_q="$q"
+      fi
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  if [ -z "$other_label" ]; then
+    event assignment_v2_idle_hold \
+      "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=no_other_demand"
+    return 1
+  fi
+  event assignment_v2_idle_retarget \
+    "selected_tier=$selected_tier elapsed=${idle_elapsed}s to_tier=$other_tier to_label=$other_label queued=$other_q"
+  return 0
 }

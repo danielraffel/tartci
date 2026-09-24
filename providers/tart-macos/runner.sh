@@ -31,6 +31,14 @@
 # exactly one allowed class, requires that class on the queued job, consumes all
 # run/job pages fail closed, and freshly rechecks higher + selected demand at
 # the final pre-mint boundary. See docs/assignment-v2-rollout.md.
+# Work-conserving idle retarget (opt-in, V2 only): a registered runner serves
+# exactly one class. TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS=N (0 = off) makes
+# a runner that has sat unassigned for N seconds re-observe both classes; when
+# its own class has no queued job at all and another class has admissible
+# demand, the runner is discarded and the supervisor returns to its ordered
+# selection, so the slot serves the waiting class instead of idling to the
+# full idle timeout. Uncertainty holds; merge-group still wins when both wait.
+# `--print-idle-retarget <tier>` reports that decision as a safe preflight.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -108,6 +116,12 @@ ASSIGNMENT_V2_REQUIRED_OMIT_LABELS="${TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS:
 # shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
 ASSIGNMENT_V2_CLASS_LABELS="${TARTCI_ASSIGNMENT_V2_CLASS_LABELS:-pulp-build-merge-group,pulp-build-pr-head}"
 ASSIGNMENT_V2_BASE_LABELS=""
+# Work-conserving idle retarget (opt-in; see header). 0 = OFF. Validated by
+# tartci_assignment_v2_configure and consulted only by event-class-v2 lanes.
+ASSIGNMENT_V2_IDLE_RETARGET_SECS="${TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS:-0}"
+# run_runner_until_done's distinct exit for an idle runner discarded so the
+# slot can serve another class. Not 124: that is a timeout, this is a decision.
+IDLE_RETARGET_RC=125
 MIN_QUEUED_AGE="${TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0}"
 case "$MIN_QUEUED_AGE" in
   ''|*[!0-9]*) printf 'invalid TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS: %s\n' "$MIN_QUEUED_AGE" >&2; exit 1 ;;
@@ -154,6 +168,7 @@ PRINT_RUNNER_CONTRACT=""
 PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
+PRINT_IDLE_RETARGET=""
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_HOST_HEALTH=0
@@ -411,6 +426,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-selection) PRINT_SELECTION=1; shift;;
   --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
   --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
+  --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
@@ -446,6 +462,9 @@ esac
 configure_workflows
 configure_workflow_tier_groups
 tartci_assignment_v2_configure
+# The retarget is a V2 decision: a legacy or observe lane registers with the
+# tier labels but never consults it, so those lanes stay byte-for-byte unchanged.
+[ "$ASSIGNMENT_MODE" = event-class-v2 ] || ASSIGNMENT_V2_IDLE_RETARGET_SECS=0
 CURRENT_LABELS="$LABELS"
 [ -z "$PRINT_RUNNER_CONTRACT" ] || {
   contract_group="$(runner_group_id_for_tier "$PRINT_RUNNER_CONTRACT")" \
@@ -1305,10 +1324,11 @@ GUEST
 }
 
 run_runner_until_done(){
-  local vm="$1" ip="$2" jit="$3"
+  local vm="$1" ip="$2" jit="$3" selected_tier="${4:-0}"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
   local aqua_label="com.tartci.aqua.$vm"
   local ssh_pid start assigned_at=0 now idle_elapsed job_elapsed assigned=0 warned=0 rc=0
+  local retarget_next=0
   : >"$runner_log"
   # Claim the guest secret/service cleanup target before the first byte crosses
   # SSH, so a failed stream or pending signal cannot leave an unowned JIT file.
@@ -1347,6 +1367,8 @@ run_runner_until_done(){
     return 1
   fi
   start="$(date +%s)"
+  [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \
+    || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
@@ -1367,6 +1389,25 @@ run_runner_until_done(){
       wait "$ssh_pid" 2>/dev/null || true
       sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
       return 124
+    fi
+    if [ "$assigned" = 0 ] && [ "$retarget_next" -gt 0 ] && [ "$now" -ge "$retarget_next" ]; then
+      heartbeat idle-retarget-check
+      if tartci_assignment_v2_idle_retarget "$selected_tier" "$idle_elapsed"; then
+        # The observation took real time. A job assigned to this runner while
+        # it ran is exactly the work the retarget exists to protect, so the
+        # log is re-read at the last moment and an assigned runner is kept.
+        if grep -q 'Running job:' "$runner_log" 2>/dev/null; then
+          event assignment_v2_idle_retarget_overtaken "elapsed=${idle_elapsed}s"
+        else
+          kill "$ssh_pid" 2>/dev/null || true
+          wait "$ssh_pid" 2>/dev/null || true
+          sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+          return "$IDLE_RETARGET_RC"
+        fi
+      fi
+      # Rearmed from after the scan, never from before it, so a slow
+      # observation cannot make the next check due the instant this one ends.
+      retarget_next=$(( $(date +%s) + ASSIGNMENT_V2_IDLE_RETARGET_SECS ))
     fi
     if [ "$assigned" = 1 ]; then
       job_elapsed=$((now - assigned_at))
@@ -1739,14 +1780,19 @@ run_one(){
     cleanup
     return 1
   fi
-  note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s job_timeout=${JOB_TIMEOUT}s)"
+  note "[$i] vm $vm up at $ip — launching JIT runner (idle_timeout=${IDLE_TIMEOUT}s idle_retarget=${ASSIGNMENT_V2_IDLE_RETARGET_SECS}s job_timeout=${JOB_TIMEOUT}s)"
   event boot_ok "ip=$ip"
   heartbeat idle-wait
 
-  run_runner_until_done "$vm" "$ip" "$jit" || rc=$?
+  run_runner_until_done "$vm" "$ip" "$jit" "$selected_tier" || rc=$?
   tartci_pool_lock_release
   t_runner_done="$(now_epoch)"
-  if [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
+  if [ "$rc" -eq "$IDLE_RETARGET_RC" ]; then
+    # The cached selection is what booted this class; a fresh live selection
+    # is what lets the next pass serve the class that is actually waiting.
+    tartci_assignment_v2_invalidate_selection
+    note "[$i] idle tier-$selected_tier runner retargeted — discarding it so this slot can serve the waiting class"
+  elif [ "$rc" -ne 0 ]; then note "[$i] runner exited non-zero rc=$rc — VM will be discarded"; fi
 
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
@@ -1768,6 +1814,8 @@ run_one(){
       runtime_emit_complete pass unknown 0 "$logdir/timing.tsv" "$logdir"
     elif [ "$rc" -eq 124 ]; then
       runtime_emit_complete fail runner_timeout "$rc" "$logdir/timing.tsv" "$logdir"
+    elif [ "$rc" -eq "$IDLE_RETARGET_RC" ]; then
+      runtime_emit_complete fail idle_retarget "$rc" "$logdir/timing.tsv" "$logdir"
     else
       runtime_emit_complete fail source_failure "$rc" "$logdir/timing.tsv" "$logdir"
     fi
@@ -1795,6 +1843,19 @@ i=0
 }
 [ -n "$PRINT_PRE_MINT_SELECTION" ] && {
   if tartci_assignment_v2_pre_mint_admit "$PRINT_PRE_MINT_SELECTION"; then printf '1\n'; else printf '0\n'; fi
+  exit 0
+}
+[ -n "$PRINT_IDLE_RETARGET" ] && {
+  # The same decision the idle-wait loop makes, minus its interval gating: 1
+  # means an idle runner of this tier would be discarded to serve another
+  # class, 0 means it would be held. With the knob off it is 0 and makes no
+  # GitHub call, which is the control every enabled-path test compares against.
+  if [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -gt 0 ] \
+     && tartci_assignment_v2_idle_retarget "$PRINT_IDLE_RETARGET" "$ASSIGNMENT_V2_IDLE_RETARGET_SECS"; then
+    printf '1\n'
+  else
+    printf '0\n'
+  fi
   exit 0
 }
 [ -n "$PRINT_HIGHER_PRIORITY" ] && {
