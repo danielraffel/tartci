@@ -76,6 +76,11 @@ CCACHE_MAX_SIZE="${TARTCI_CCACHE_MAX_SIZE:-40G}"
 [[ "$CCACHE_MAX_SIZE" =~ ^[1-9][0-9]*[KMGT]$ ]] \
   || { printf 'invalid TARTCI_CCACHE_MAX_SIZE: expected a positive ccache size such as 40G\n' >&2; exit 1; }
 FETCHCONTENT_SOURCE_ROOT="${PULP_SHARED_FETCHCONTENT_SOURCE_DIR:-$HOME/Library/Caches/Pulp/fetchcontent-src}"
+# Optional read-only pip wheelhouse served to each guest. Opt-in by content: the
+# mount is added only while the directory holds at least one wheel, so a host
+# that never ran scripts/pip-wheelhouse.sh boots exactly as before.
+PIP_WHEELHOUSE_ROOT="${TARTCI_PIP_WHEELHOUSE_DIR:-$CACHE_ROOT/pip-wheelhouse}"
+GUEST_PIP_WHEELHOUSE="/Volumes/My Shared Files/pip-wheelhouse"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
@@ -181,6 +186,11 @@ CURRENT_IP=""
 CURRENT_REGISTERED_RUNNER=""
 CURRENT_RUNNER_API_ROOT=""
 CURRENT_AQUA_LABEL=""
+# The lease this guest booted with, declared to the job so an in-guest build
+# governor can size itself from the lease rather than infer it.
+CURRENT_GUEST_CORES=""
+CURRENT_GUEST_MEM_MB=""
+CURRENT_PIP_WHEELHOUSE=0
 CLEANED_UP=0
 # Set when a work entry ends without serving a job, cleared when a job is
 # actually assigned or when the queue drains. Carries the START of the blocked
@@ -336,6 +346,8 @@ source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
+# shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -1317,10 +1329,13 @@ run_runner_until_done(){
      for attempt in 1 2 3; do if rsync -a '/Volumes/My Shared Files/fetchcontent/' \"\$HOME/Library/Caches/Pulp/fetchcontent-src/\"; then fetchcontent_hydrated=true; break; fi; [ \"\$attempt\" -eq 3 ] || sleep 1; done && \
      if [ \"\$fetchcontent_hydrated\" != true ]; then echo 'tartci: FetchContent seed changed during three hydration attempts' >&2; exit 1; fi && \
      cd ~/actions-runner && touch .env && \
-     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy)$/' .env > .env.tartci && \
+     awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_MAXSIZE|PULP_SHARED_FETCHCONTENT_SOURCE_DIR|FETCHCONTENT_BASE_DIR|HTTP_PROXY|HTTPS_PROXY|NO_PROXY|http_proxy|https_proxy|no_proxy|TARTCI_GUEST_CORES|TARTCI_GUEST_MEM_MB|TARTCI_PIP_WHEELHOUSE)$/' .env > .env.tartci && \
      printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' 'CCACHE_MAXSIZE=$CCACHE_MAX_SIZE' >> .env.tartci && \
      printf 'PULP_SHARED_FETCHCONTENT_SOURCE_DIR=%s\n' \"\$HOME/Library/Caches/Pulp/fetchcontent-src\" >> .env.tartci && \
      if [ -n '$GUEST_HTTP_PROXY' ]; then printf '%s\n' 'HTTP_PROXY=$GUEST_HTTP_PROXY' 'HTTPS_PROXY=$GUEST_HTTP_PROXY' 'http_proxy=$GUEST_HTTP_PROXY' 'https_proxy=$GUEST_HTTP_PROXY' 'NO_PROXY=127.0.0.1,localhost,::1' 'no_proxy=127.0.0.1,localhost,::1' >> .env.tartci; fi && \
+     if [ -n '$CURRENT_GUEST_CORES' ]; then printf 'TARTCI_GUEST_CORES=%s\n' '$CURRENT_GUEST_CORES' >> .env.tartci; fi && \
+     if [ -n '$CURRENT_GUEST_MEM_MB' ]; then printf 'TARTCI_GUEST_MEM_MB=%s\n' '$CURRENT_GUEST_MEM_MB' >> .env.tartci; fi && \
+     if [ '$CURRENT_PIP_WHEELHOUSE' = 1 ]; then printf 'TARTCI_PIP_WHEELHOUSE=%s\n' '$GUEST_PIP_WHEELHOUSE' >> .env.tartci; fi && \
      mv .env.tartci .env && \
      export PULP_SHARED_FETCHCONTENT_SOURCE_DIR=\"\$HOME/Library/Caches/Pulp/fetchcontent-src\" && \
      \$HOME/.tartci/bin/guest-aqua-runner.sh run '$aqua_label'" \
@@ -1533,12 +1548,19 @@ run_one(){
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
+  CURRENT_GUEST_CORES="$lease_cores"
+  CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp -t "tart-run-$vm")"
   local tart_dirs=(
     --dir="ccache:$CACHE_ROOT/ccache"
     --dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"
   )
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
+  CURRENT_PIP_WHEELHOUSE=0
+  if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
+    tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
+    CURRENT_PIP_WHEELHOUSE=1
+  fi
   tartci_vm_lease_guard_exec tart run --no-graphics "${tart_dirs[@]}" \
     "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
