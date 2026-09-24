@@ -415,6 +415,45 @@ both commands.
 - **Mutable + growing → host-mounted virtio-fs** (ccache, FetchContent). Match
   guest/host uid so the shared cache is writable both ways.
 
+### What the JIT runner declares to each job
+
+The macOS JIT runner writes three optional keys into the guest runner's `.env`,
+after stripping any preserved copies so a golden cannot forge them:
+
+- `TARTCI_GUEST_CORES` / `TARTCI_GUEST_MEM_MB` — the VM lease the clone was
+  sized to (`tartci_set_tart_vm_size`). An in-guest build governor with no host
+  profile can read these instead of inferring its budget; Pulp's
+  `tools/ci/governed-build.sh` and its ctest step treat them as a ceiling that
+  can only narrow what the guest sees. They change no number on their own: the
+  guest's memory is already sized so its tier-0 bound is `-j(C-1)`. A faster
+  gate on a small host comes from a larger lease (`vm_pool_cores`, the
+  `TARTCI_VM_LEASE_MAX_MEM_MB` ceiling), not from these keys.
+- `TARTCI_PIP_WHEELHOUSE` — set only when a host wheelhouse was mounted (below).
+
+### Optional pip wheelhouse (no rebake)
+
+A job that pip-installs wheels otherwise reaches PyPI through the guest's
+egress relay, so an allowlist gap or an index outage fails a required gate. A
+host directory of pre-downloaded, hash-verified wheels removes that network
+dependency without touching the golden:
+
+```bash
+scripts/pip-wheelhouse.sh sync \
+  --lock /path/to/pulp/tools/motion/visual/requirements.lock \
+  --python-version 3.14 --platform macosx_14_0_arm64
+```
+
+This fills `${TARTCI_CI_CACHE:-~/.cache/pulp-ci}/pip-wheelhouse` (override
+with `TARTCI_PIP_WHEELHOUSE_DIR` or `--dir`). The next VM boot mounts it
+read-only as `pip-wheelhouse` and declares `TARTCI_PIP_WHEELHOUSE`; no service
+restart is needed, and an empty or absent directory leaves boots unchanged.
+`--python-version` is the guest interpreter the job installs into (Pulp's gate
+installs into the Homebrew Python CMake resolves, 3.14 on the current golden),
+not the host's. The sync refuses an unhashed lock, never rewrites a wheel in
+place (a guest may be reading it), and is additive: re-run it after the lock
+changes. The consuming job still installs with `--require-hashes`, so the
+wheelhouse decides where the bytes come from, never which bytes are accepted.
+
 **Ephemeral runner concept:** an ephemeral per-job GitHub Actions runner clones
 the golden, mounts the host caches, runs **one** job, and self-destructs. The
 golden is never mutated; all per-run state lives in the disposable clone.
