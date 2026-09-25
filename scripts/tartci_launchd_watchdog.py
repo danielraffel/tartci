@@ -753,7 +753,7 @@ RELOAD_FAILED = 1      # a mutation ran and failed its postcondition
 RELOAD_REFUSED = 3     # a precondition refused; nothing was changed
 
 
-def mid_job_refusal(label: str) -> str | None:
+def mid_job_refusal(label: str, launch_agents_dir: str | None = None) -> str | None:
     """Why an operator reload of LABEL must not proceed now, or None.
 
     Per label, not host-wide: a sibling lane building must not block reloading
@@ -761,7 +761,9 @@ def mid_job_refusal(label: str) -> str | None:
     """
     import lane_busy
 
-    row = lane_busy.probe([label], run=_run)[0]
+    from pathlib import Path
+    row = lane_busy.probe([label], run=_run, agents_dir=Path(launch_agents_dir)
+                          if launch_agents_dir else None)[0]
     if row.state == lane_busy.BUSY:
         return (f"lane {label} is mid-job ({row.detail}: {row.worker_command}); "
                 "a bootout would kill that work")
@@ -781,7 +783,7 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
               file=sys.stderr)
         return RELOAD_REFUSED if dry_run else RELOAD_FAILED
     if not allow_mid_job:
-        refusal = mid_job_refusal(label)
+        refusal = mid_job_refusal(label, launch_agents_dir)
         if refusal is not None:
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "

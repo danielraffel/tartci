@@ -111,8 +111,10 @@ class FakeHost:
         (self.prints / f"{name}.rc").write_text(str(rc))
 
     def env(self) -> dict[str, str]:
+        # Hermetic: never read this machine's lease store.
         return {**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
-                "TARTCI_POOL_UID": str(os.getuid())}
+                "TARTCI_POOL_UID": str(os.getuid()),
+                "TARTCI_LEASE_DIR": str(self.root / "leases")}
 
     def reload(self, label: str, *extra: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -133,7 +135,7 @@ class LaneBusyProbeTests(unittest.TestCase):
         old = os.environ["PATH"]
         os.environ["PATH"] = f"{host.bin}:{old}"
         try:
-            return lane_busy.probe(list(labels))
+            return lane_busy.probe(list(labels), agents_dir=host.agents, leases=[])
         finally:
             os.environ["PATH"] = old
 
