@@ -662,6 +662,143 @@ class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
         self.assertIn("retained required legacy selector", result.stderr)
 
 
+class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
+    """A per-slot class preference order (TARTCI_ASSIGNMENT_V2_TIER_ORDER).
+
+    The PR-first canary slot consults PR-head before merge-group. Every
+    reordered assertion sits beside its default-order control on the identical
+    queue, so a pass cannot come from a fixture that never distinguishes the
+    two orders. Tier numbers stay the configured index: 0 is merge-group and 1
+    is PR-head on both slots.
+    """
+
+    KNOB = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
+    PR_FIRST = "pulp-build-pr-head,pulp-build-merge-group"
+
+    def _select(self) -> list[str]:
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().split("\t")
+
+    def _pre_mint(self, tier: str) -> str:
+        result = self._runner("--print-pre-mint-selection", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _events(self, name: str) -> list[str]:
+        log = self.root / "state" / "events.jsonl"
+        if not log.exists():
+            return []
+        return [line for line in log.read_text(encoding="utf-8").splitlines()
+                if f'"event":"{name}"' in line]
+
+    def test_both_classes_queued_pr_first_slot_selects_pr_head(self) -> None:
+        self._state(merge=True, pr=True)
+        control = self._select()
+        self.assertEqual(control[2], "0", control)
+        self.assertIn("pulp-build-merge-group", control[1].split(","))
+
+        self.env[self.KNOB] = self.PR_FIRST
+        self._state(merge=True, pr=True)
+        fields = self._select()
+        self.assertEqual(fields[0], "1")
+        self.assertEqual(fields[2], "1", fields)
+        labels = fields[1].split(",")
+        self.assertIn("pulp-build-pr-head", labels)
+        self.assertNotIn("pulp-build-merge-group", labels)
+        self.assertNotIn("pulp-gate-fast", labels)
+
+    def test_pr_first_slot_falls_back_to_merge_group_when_no_pr_head_waits(self) -> None:
+        """Work-conserving: a preference is never a reservation."""
+        self.env[self.KNOB] = self.PR_FIRST
+        self._state(merge=True)
+        fields = self._select()
+        self.assertEqual(fields[0], "1")
+        self.assertEqual(fields[2], "0", fields)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+        self._state()
+        idle = self._select()
+        self.assertEqual(idle[0], "0", idle)
+
+    def test_pr_first_pre_mint_admits_pr_head_while_merge_group_waits(self) -> None:
+        """The observed thrash: a PR-head boot denied because merge-group demand
+        appeared. The default slot must still deny it (control); the PR-first
+        slot must admit it."""
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._pre_mint("1"), "0")
+        self.env[self.KNOB] = self.PR_FIRST
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._pre_mint("1"), "1")
+        self._state(merge=True)
+        self.assertEqual(self._pre_mint("1"), "0", "cancelled PR-head work still admitted")
+
+    def test_pr_first_merge_group_fallback_yields_to_pr_head_arrival(self) -> None:
+        self.env[self.KNOB] = self.PR_FIRST
+        self._state(merge=True)
+        self.assertEqual(self._pre_mint("0"), "1")
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._pre_mint("0"), "0")
+        # Control: the default slot keeps merge-group on the same queue.
+        self.env.pop(self.KNOB)
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._pre_mint("0"), "1")
+
+    def test_top_receipt_follows_the_slots_preferred_class(self) -> None:
+        self.env["TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS"] = "180"
+        self.env[self.KNOB] = self.PR_FIRST
+        self._state(pr=True)
+        self.assertEqual(self._select()[2], "1")
+        self.state.write_text("{}", encoding="utf-8")
+        self.assertEqual(self._pre_mint("1"), "1")
+        self.assertEqual(len(self._events("assignment_v2_pre_mint_receipt")), 1)
+        # Merge-group is the fallback on this slot, so it never rides a receipt.
+        self.assertEqual(self._pre_mint("0"), "0")
+        self.assertEqual(len(self._events("assignment_v2_pre_mint_receipt")), 1)
+
+    def test_idle_retarget_reports_configured_tier_numbers(self) -> None:
+        self.env[self.KNOB] = self.PR_FIRST
+        self.env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = "120"
+        self._state(merge=True)
+        result = self._runner("--print-idle-retarget", "1")
+        self.assertEqual(result.stdout.strip(), "1", result.stderr)
+        retarget = self._events("assignment_v2_idle_retarget")
+        self.assertEqual(len(retarget), 1, retarget)
+        self.assertIn("to_tier=0 to_label=pulp-build-merge-group", retarget[0])
+
+    def test_invalid_orders_fail_before_any_decision(self) -> None:
+        self._state(merge=True, pr=True)
+        cases = {
+            "pulp-build-pr-head": "every configured class",
+            "pulp-build-pr-head,pulp-build-pr-head": "repeats class",
+            "pulp-build-pr-head,pulp-other": "unconfigured class",
+            "pulp-build-pr-head,,pulp-build-merge-group": "empty class",
+        }
+        for value, message in cases.items():
+            with self.subTest(value=value):
+                self.env[self.KNOB] = value
+                result = self._runner("--print-selection")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(message, result.stderr)
+        for mode in ("legacy", "observe"):
+            with self.subTest(mode=mode):
+                self.env[self.KNOB] = self.PR_FIRST
+                self.env["TARTCI_RUNNER_ASSIGNMENT_MODE"] = mode
+                result = self._runner("--print-selection")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("requires event-class-v2", result.stderr)
+
+    def test_default_order_is_the_configured_order(self) -> None:
+        """Explicitly naming today's order is indistinguishable from omitting it."""
+        for state in ({"merge": True, "pr": True}, {"pr": True}, {"merge": True}, {}):
+            with self.subTest(state=state):
+                self.env.pop(self.KNOB, None)
+                self._state(**state)
+                absent = self._select()
+                self.env[self.KNOB] = "pulp-build-merge-group,pulp-build-pr-head"
+                self._state(**state)
+                self.assertEqual(self._select(), absent)
+
+
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):
     """Work-conserving idle retarget, driven through `--print-idle-retarget`.
 

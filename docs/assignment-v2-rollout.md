@@ -64,7 +64,8 @@ TARTCI_ASSIGNMENT_V2_CLASS_LABELS=pulp-build-merge-group,pulp-build-pr-head
 The shipped Pulp template remains `legacy`. Deploy those bytes first, then
 enable `observe` on one drained host at a time. Keep one dynamic macOS gate
 supervisor per governed slot; each supervisor's ordered tiers serve both
-classes, with merge-group first. A host may add only the canonical managed
+classes, with merge-group first unless the slot declares a preference order
+(see "Per-slot class preference" below). A host may add only the canonical managed
 slot-2 profile when its governor can admit two complete guests. Do not create a
 supervisor per event class or an ad-hoc duplicate process. Confirm from the rendered
 LaunchAgent environment (or set the same env explicitly):
@@ -184,6 +185,73 @@ merge-group at one runner per host even with two merge groups waiting, which
 inverts the stated preference on the class that lands code, and the observed
 starvation was an idle hold, not merge-group work consuming both slots. Both
 stay open until a measurement shows the retarget leaves either problem behind.
+
+## Per-slot class preference (opt-in, PR-first canary on m3)
+
+Every slot consults the classes in configured tier order, merge-group first.
+Under a continuous merge queue that starves PR-head work, and the idle retarget
+above cannot help because the slot is never idle. Measured 2026-09-25: a slot
+selects PR-head, merge-group demand appears during the two-to-four-minute boot,
+`assignment_v2_pre_mint_denied selected_tier=1` discards the VM, and the slot
+re-boots for merge-group. PR-head jobs waited 60-80 minutes.
+
+`assignment_slot_tier_order` on an event-class-v2 lane reorders the class
+preference for named supervisor slots:
+
+```toml
+assignment_slot_tier_order = { 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }
+```
+
+It renders `TARTCI_ASSIGNMENT_V2_TIER_ORDER=pulp-build-pr-head,pulp-build-merge-group`
+into that slot's LaunchAgent only; other slots render nothing and keep today's
+behaviour byte for byte. The order must name every tier class exactly once, so a
+preference can never become a reservation, and the slot key must be a supervisor
+number the lane actually runs. Validation rejects anything else, and the
+supervisor refuses the env var outside `event-class-v2`.
+
+The same order drives all three V2 decisions, so the slot never contradicts
+itself:
+
+| decision | PR-first slot | default slot |
+|---|---|---|
+| selection, both classes waiting | PR-head | merge-group |
+| selection, only merge-group waiting | merge-group (work-conserving) | merge-group |
+| pre-mint of a PR-head boot, merge-group arrived | **admit** | deny |
+| pre-mint of a merge-group boot, PR-head arrived | deny, re-select PR-head | admit |
+| top-tier receipt (`assignment_top_tier_receipt_max_age_seconds`) | PR-head may use it | merge-group may use it |
+| idle retarget (if enabled) | falls back in slot order | falls back in slot order |
+
+Tier numbers keep their configured meaning on every slot (0 is merge-group, 1
+is PR-head), so `selected_tier` in events, the per-tier runner group, and the
+class-derived lease priority (merge-group `110`, PR-head `100`) are unchanged.
+The advertised label set is unchanged too: both classes are still registered in
+configured order, so `fleet/advertised-labels.json` does not move. The startup
+`LOOP` line prints `tier_order=` so the effective order is visible in the slot
+log.
+
+A PR-first slot still yields a merge-group boot to a PR-head arrival: that is
+the same pre-mint recheck every slot runs, applied in this slot's order, and
+the merge-group job keeps every other slot in the fleet, all of which prefer it.
+
+Canary, per decisions contract row 1: only m3 (`profiles/m3-macos-fleet.toml`,
+`pulp-gate` slot 2) carries the key. m3 slot 1, m1 and m5 are unaffected by
+deploying these bytes. Enable through the ordinary path: validate and render
+with `tartci fleet-macos`, then reload the slot-2 supervisor at an idle boundary
+(a host self-update does this). Watch for at least a week:
+
+- PR-head queue age should fall; `mint_jit tier=1` on the m3 slot-2 log should
+  follow PR-head demand even while merge-group work waits.
+- `assignment_v2_pre_mint_denied selected_tier=1` should disappear from m3 slot
+  2 whenever PR-head work is still queued; any that remain should be genuine
+  cancellations or another host's claim.
+- Merge-group latency should not regress beyond the one slot now preferring
+  PR-head: the fleet still has five merge-group-first slots.
+- `assignment_v2_pre_mint_denied selected_tier=0` on m3 slot 2 counts the
+  merge-group boots it yielded to PR-head; a high rate says the fallback boots
+  are being wasted and the order should be revisited.
+
+Rollback is deleting the key, re-rendering, and reloading slot 2; nothing on disk
+outlives it.
 
 ## Rollback and offline rejoin
 

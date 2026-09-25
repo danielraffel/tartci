@@ -70,6 +70,11 @@ replaces_launchd_labels = [
 # per-call timeout rather than the 180s scan budget. Adaptive lets launchd
 # promote the supervisor out of the background band. Gate lanes only.
 process_type = "Adaptive"
+# PR-first canary (docs/assignment-v2-rollout.md, "Per-slot class preference").
+# Slot 2 consults PR-head before merge-group and falls back to merge-group when
+# no PR-head job waits; slot 1 keeps the configured merge-group-first order.
+# Rollback: delete this key, re-render, reload slot 2 at an idle boundary.
+assignment_slot_tier_order = { 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"

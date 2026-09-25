@@ -1741,6 +1741,86 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn(env_key, env)
                     self.assertEqual(pulp_slots, 2)
 
+    def test_slot_tier_order_renders_only_on_the_m3_pr_first_slot(self) -> None:
+        """Only m3 (host id studio) pulp-gate slot 2 prefers PR-head; its slot 1
+        and every m1/m5 slot keep the configured merge-group-first order."""
+        env_key = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
+        seen = 0
+        for host_id, config in HOST_CONFIGS.items():
+            rendered = fleet.rendered_plists(fleet.load(config))
+            for name, body in rendered.items():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                with self.subTest(plist=name):
+                    if name.endswith(".studio.pulp-gate.slot2.plist"):
+                        seen += 1
+                        self.assertEqual(
+                            env.get(env_key),
+                            "pulp-build-pr-head,pulp-build-merge-group",
+                        )
+                        # The slot still registers both classes in configured
+                        # order, so runner groups and tier numbers are unchanged.
+                        self.assertEqual(
+                            env["TARTCI_RUNNER_WORKFLOW_TIERS"].splitlines()[0],
+                            "pulp-build-merge-group|Build and Test",
+                        )
+                    else:
+                        self.assertNotIn(env_key, env)
+        self.assertEqual(seen, 1)
+
+    def test_slot_tier_order_is_a_complete_permutation_on_a_real_slot(self) -> None:
+        base = HOST_CONFIGS["studio"].read_text()
+        key = "assignment_slot_tier_order"
+        line = f'{key} = {{ 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }}'
+        self.assertEqual(base.count(line), 1)
+        rejected = {
+            "missing-class": f'{key} = {{ 2 = ["pulp-build-pr-head"] }}',
+            "duplicate": f'{key} = {{ 2 = ["pulp-build-pr-head", "pulp-build-pr-head"] }}',
+            "unknown-class": f'{key} = {{ 2 = ["pulp-build-pr-head", "pulp-other"] }}',
+            "no-such-slot": f'{key} = {{ 3 = ["pulp-build-pr-head", "pulp-build-merge-group"] }}',
+            "zero-slot": f'{key} = {{ 0 = ["pulp-build-pr-head", "pulp-build-merge-group"] }}',
+            "padded-slot": f'{key} = {{ 02 = ["pulp-build-pr-head", "pulp-build-merge-group"] }}',
+            "not-a-table": f'{key} = ["pulp-build-pr-head", "pulp-build-merge-group"]',
+            "wrong-type": f'{key} = {{ 2 = "pulp-build-pr-head" }}',
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, replacement in rejected.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(base.replace(line, replacement, 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(key, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            # A non-V2 lane (spectr) cannot carry a preference order.
+            non_v2 = base.replace(line + "\n", "", 1).replace(
+                'repo = "danielraffel/spectr"',
+                'repo = "danielraffel/spectr"\n' + line, 1,
+            )
+            path = Path(td) / "non-v2.toml"
+            path.write_text(non_v2)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                text=True, capture_output=True, check=False,
+            )
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn(key, result.stderr)
+            # Control: the shipped line and the configured order both validate.
+            for name, replacement in {
+                "shipped": line,
+                "configured": f'{key} = {{ 1 = ["pulp-build-merge-group", "pulp-build-pr-head"] }}',
+            }.items():
+                with self.subTest(accepted=name):
+                    path = Path(td) / f"ok-{name}.toml"
+                    path.write_text(base.replace(line, replacement, 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_process_type_accepts_only_documented_launchd_values(self) -> None:
         base = CONFIG.read_text()
         self.assertIn('process_type = "Adaptive"', base)

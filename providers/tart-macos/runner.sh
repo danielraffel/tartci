@@ -39,6 +39,12 @@
 # selection, so the slot serves the waiting class instead of idling to the
 # full idle timeout. Uncertainty holds; merge-group still wins when both wait.
 # `--print-idle-retarget <tier>` reports that decision as a safe preflight.
+# Per-slot class preference (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_TIER_ORDER
+# is a comma-separated permutation of the configured class labels. Selection,
+# pre-mint admission, and idle retarget consult classes in that order instead
+# of TARTCI_RUNNER_WORKFLOW_TIERS order; tier numbers stay the configured index,
+# so events, runner groups and lease priority keep one meaning per class. Empty
+# (the default) is the configured order, byte for byte.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -122,6 +128,12 @@ ASSIGNMENT_V2_IDLE_RETARGET_SECS="${TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS:-0}"
 # run_runner_until_done's distinct exit for an idle runner discarded so the
 # slot can serve another class. Not 124: that is a timeout, this is a decision.
 IDLE_RETARGET_RC=125
+# Per-slot class preference order (opt-in; see header). Empty = configured order.
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+ASSIGNMENT_V2_TIER_ORDER="${TARTCI_ASSIGNMENT_V2_TIER_ORDER:-}"
+# Newline-delimited class labels in preference order; set by configure.
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+ASSIGNMENT_V2_ORDER_LABELS=""
 MIN_QUEUED_AGE="${TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0}"
 case "$MIN_QUEUED_AGE" in
   ''|*[!0-9]*) printf 'invalid TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS: %s\n' "$MIN_QUEUED_AGE" >&2; exit 1 ;;
@@ -1874,7 +1886,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
