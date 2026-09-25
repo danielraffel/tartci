@@ -44,6 +44,16 @@ def is_vm_kind(value: Any) -> bool:
     return str(value or "").endswith("-vm")
 
 
+def is_floor(record: dict[str, Any]) -> bool:
+    """A floor lease is visible for accounting but charged to nobody else.
+
+    Gate, VM and ordinary build admission ignore it entirely, so it can never
+    shrink or delay them; it runs at background QoS so the scheduler, not the
+    store, arbitrates the CPU it oversubscribes.
+    """
+    return record.get("floor") is True
+
+
 def utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
@@ -383,8 +393,22 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         if total_mem > per_job_mem
         else 0
     )
+    floor_cores = (
+        int(args.agent_floor_cores)
+        if getattr(args, "agent_floor_cores", None) is not None
+        else int(profile.get("agent_floor_cores", 0))
+    )
+    floor_pool = (
+        int(args.agent_floor_pool_cores)
+        if getattr(args, "agent_floor_pool_cores", None) is not None
+        else int(profile.get("agent_floor_pool_cores", floor_cores))
+    )
+    floor_cores = max(0, floor_cores)
+    floor_pool = max(floor_cores, floor_pool) if floor_cores else 0
     return {
         "total": max(1, total),
+        "agent_floor_cores": floor_cores,
+        "agent_floor_pool_cores": floor_pool,
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
         "total_mem_mb": total_mem,
@@ -393,7 +417,11 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
     }
 
 
-def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
+def usage(all_records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
+    # Floor leases are reported separately and excluded from every figure other
+    # admissions read, which is what keeps them from taking gate or VM capacity.
+    records = [record for record in all_records if not is_floor(record)]
+    floor_records = [record for record in all_records if is_floor(record)]
     used = sum(record_int(record, "lease_size_cores") for record in records)
     non_gate_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
     non_gate_used = sum(
@@ -411,6 +439,17 @@ def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
         "non_gate_used_cores": non_gate_used,
         "non_gate_available_cores": max(0, non_gate_limit - non_gate_used),
     }
+    floor_pool = int(cfg.get("agent_floor_pool_cores", 0))
+    if floor_pool > 0 or floor_records:
+        floor_used = sum(record_int(record, "lease_size_cores") for record in floor_records)
+        result.update(
+            {
+                "agent_floor_cores": int(cfg.get("agent_floor_cores", 0)),
+                "agent_floor_pool_cores": floor_pool,
+                "floor_used_cores": floor_used,
+                "floor_available_cores": max(0, floor_pool - floor_used),
+            }
+        )
     total_mem = int(cfg.get("total_mem_mb", 0))
     if total_mem > 0:
         per_job_mem = int(cfg.get("per_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB))
@@ -436,7 +475,54 @@ def usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
                 "memory_accounting": "estimated_legacy" if legacy else "explicit",
             }
         )
+        if floor_records:
+            result["floor_used_mem_mb"] = sum(
+                record_mem_mb(record, per_job_mem) for record in floor_records
+            )
     return result
+
+
+def floor_grant(
+    args: argparse.Namespace,
+    cfg: dict[str, int],
+    active: list[dict[str, Any]],
+    priority: int,
+    lease_size: int,
+    req_mem: int,
+) -> tuple[int, int] | None:
+    """Size of a floor lease for a denied build request, or None.
+
+    Only an opted-in (--allow-floor), non-gate, non-VM request qualifies. The
+    size is bounded by the per-lease floor and by what is left of the host-wide
+    floor pool. Memory is not oversubscribed: counting every live lease,
+    including other floor leases, the grant must still fit the non-gate memory
+    limit, so the gate's memory reserve is never touched.
+    """
+    if not getattr(args, "allow_floor", False):
+        return None
+    if priority >= cfg["gate_priority"] or is_vm_kind(args.kind):
+        return None
+    floor_cores = int(cfg.get("agent_floor_cores", 0))
+    floor_pool = int(cfg.get("agent_floor_pool_cores", 0))
+    if floor_cores <= 0 or floor_pool <= 0:
+        return None
+    floor_used = sum(record_int(r, "lease_size_cores") for r in active if is_floor(r))
+    size = min(lease_size, floor_cores, floor_pool - floor_used)
+    if size < 1:
+        return None
+    mem = max(1, req_mem * size // lease_size)
+    if cfg["total_mem_mb"] > 0:
+        per_job = cfg["per_job_mem_mb"]
+        used_all = sum(record_mem_mb(r, per_job) for r in active)
+        non_gate_all = sum(
+            record_mem_mb(r, per_job)
+            for r in active
+            if record_int(r, "priority") < cfg["gate_priority"]
+        )
+        non_gate_limit = max(per_job, cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"])
+        if used_all + mem > cfg["total_mem_mb"] or non_gate_all + mem > non_gate_limit:
+            return None
+    return size, mem
 
 
 def sort_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -642,7 +728,13 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         disk_exceeded = bool(
             disk_state is not None and disk_state["free_bytes"] < disk_state["required_bytes"]
         )
-        if total_exceeded or class_exceeded or mem_exceeded or disk_exceeded:
+        floor = None
+        if (total_exceeded or class_exceeded) and not disk_exceeded:
+            floor = floor_grant(args, cfg, active, priority, lease_size, req_mem)
+        if floor is not None:
+            requested_cores = lease_size
+            lease_size, req_mem = floor
+        elif total_exceeded or class_exceeded or mem_exceeded or disk_exceeded:
             write_records(store_dir, active)
             core_axis = total_exceeded or class_exceeded
             reason = (
@@ -694,6 +786,10 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "created_at": now,
             "heartbeat_at": now,
         }
+        if floor is not None:
+            record.update(
+                {"floor": True, "qos": "background", "requested_cores": requested_cores}
+            )
         if disk is not None:
             record.update(
                 {
@@ -715,6 +811,8 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         write_records(store_dir, active)
         return {
             "ok": True,
+            "floor": floor is not None,
+            "qos": "background" if floor is not None else None,
             "lease": record,
             "capacity": usage(active, cfg),
             # Preserve the admission-time view: reserved is the pre-existing

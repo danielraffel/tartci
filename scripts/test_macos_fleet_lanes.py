@@ -1443,6 +1443,31 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("assignment_scan_timeout_seconds", result.stderr)
 
+    def test_host_agent_floor_is_validated(self) -> None:
+        base = CONFIG.read_text()
+        knob = "github_api_timeout_seconds = 30"
+        self.assertIn(knob, base)
+        cases = {
+            "valid": (f"{knob}\nagent_floor_cores = 6\nagent_floor_pool_cores = 6", 0),
+            "pool-below-floor": (
+                f"{knob}\nagent_floor_cores = 6\nagent_floor_pool_cores = 4", 2
+            ),
+            "wrong-type": (f'{knob}\nagent_floor_cores = "6"', 2),
+            "negative": (f"{knob}\nagent_floor_cores = -1", 2),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, (replacement, expected) in cases.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(base.replace(knob, replacement, 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+                    if expected:
+                        self.assertIn("host.agent_floor", result.stderr)
+
     def test_host_github_api_timeout_is_bounded(self) -> None:
         base = CONFIG.read_text()
         fixtures = {
