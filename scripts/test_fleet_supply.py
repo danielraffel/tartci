@@ -54,9 +54,8 @@ class PublishedSupplyTests(unittest.TestCase):
                          [f"profiles/{p.name}" for p in sorted(
                              (ROOT / "profiles").glob("*-macos-fleet.toml"))])
         self.assertGreaterEqual(len(value["generated_from"]["profiles"]), 3)
-        self.assertIn({"profile": "m5-macos-fleet", "host_id": "m5",
-                       "launchd_label": "actions.runner.danielraffel-pulp.pulp-preamble-m5",
-                       "runner_name": "pulp-preamble-m5"}, value["persistent_runners"])
+        # No host keeps a persistent runner: the preamble lane runs GitHub-hosted.
+        self.assertEqual(value["persistent_runners"], [])
 
     def test_a_new_fleet_profile_is_published_without_listing_it(self) -> None:
         with tempfile.TemporaryDirectory() as td:

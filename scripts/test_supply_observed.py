@@ -34,9 +34,17 @@ def verdict(result, host, lane, class_label):
                 if (row["host_id"], row["lane"], row.get("class_label")) == (host, lane, class_label))
 
 
+# The published fleet declares no persistent runner, so the persistent-runner
+# path is exercised against a synthetic one on top of the real registrations.
+SYNTHETIC_PERSISTENT = {"profile": "m5-macos-fleet", "host_id": "m5",
+                        "launchd_label": "actions.runner.example.pulp-preamble-m5",
+                        "runner_name": "pulp-preamble-m5"}
+WITH_PERSISTENT = {**PUBLISHED, "persistent_runners": [SYNTHETIC_PERSISTENT]}
+
+
 class RunnerNameTests(unittest.TestCase):
     regs = PUBLISHED["registrations"]
-    persistent = PUBLISHED["persistent_runners"]
+    persistent = WITH_PERSISTENT["persistent_runners"]
 
     def test_ephemeral_and_slot_names(self) -> None:
         self.assertEqual(so.attribute_runner("studio-pulp-gate-01-42272-1", self.regs, self.persistent),
@@ -119,7 +127,7 @@ class ClassifierTests(unittest.TestCase):
         self.assertIn("GitHub assigns by labels alone", result["undeclared"][0]["why"])
 
     def test_persistent_runner_is_reported_separately(self) -> None:
-        result = so.classify(PUBLISHED, REPO, [job("pulp-preamble-m5", ["self-hosted", "preamble"])])
+        result = so.classify(WITH_PERSISTENT, REPO, [job("pulp-preamble-m5", ["self-hosted", "preamble"])])
         self.assertEqual(result["persistent"][0]["verdict"], so.PERSISTENT_OBSERVED)
         self.assertEqual(result["undeclared"], [])
 

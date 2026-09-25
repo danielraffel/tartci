@@ -655,8 +655,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     data["host"].get("persistent_runner_labels", []),
-                    ["actions.runner.danielraffel-pulp.pulp-preamble-m5"]
-                    if host_id == "m5" else [],
+                    [],
+                    f"{host_id}: no host keeps a persistent runner; the preamble lane "
+                    "runs GitHub-hosted.",
                 )
                 self.assertEqual(
                     next(lane for lane in data["lane"] if lane["id"] == "vellum-gate")["labels"][-1],
