@@ -1453,13 +1453,36 @@ Release CLI proof has claimed `pulp-build-vm-release` and completed.
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
 only `bootout`+`bootstrap` re-reads the plist. `tartci launchd reload <label>`
 does that full cycle, and it refuses (exit 3, nothing changed) when the lane
-is **mid-job**: the process launchd started for that label owns a `tart run`
-or `qemu-system-*` descendant (the lane VM) or a `Runner.Worker` (a persistent Actions runner
-executing a job). A bootout then kills the job with it. The probe is per
-label (`scripts/lane_busy.py`), so a sibling lane building does not block
-reloading an idle one. An unreadable answer (a `launchctl print` error other
-than launchd's "Could not find service", or an unreadable process table) also
-refuses. Wait for the lane to go idle, or `tartci pool drain`; the explicit
+is **mid-job** (`scripts/lane_busy.py`, per label, so a sibling lane building
+does not block reloading an idle one). For the supervisor launchd runs now, a
+lane is busy when any of these hold:
+
+- a descendant is `tart run`, `tart clone`, `qemu-system-*` or a
+  `Runner.Worker` (a persistent Actions runner executing a job);
+- the supervisor (or a descendant) holds a VM lease in the host lease store
+  (`~/.tartci/state/leases/leases.json`, read without its lock). A supervisor
+  takes its lease and clones BEFORE `tart run` exists, so this is the only
+  signal during the clone;
+- its fresh heartbeat (`$TARTCI_STATE_DIR/<runner>.state.json`) names a phase
+  past waiting: `admission-precheck`, `booting`, `ensuring-runner`,
+  `aqua-preflight`, `chrome-preflight`, `admission-check`,
+  `admission-deferred`, `admission-error`, `minting-jit`, `idle-wait`,
+  `idle-retarget-check`, `job-running`, `cancel-pending-terminal`. The
+  waiting phases (`waiting`, `loop`, `yielding`, `draining`, `stopped`,
+  `scan_blind`, `scan_blind_escalated`, `jit-admission-denied`,
+  `vm-lease-denied`, `admission-precheck-deferred`,
+  `admission-precheck-error`) are idle.
+
+This closes the window the 2026-09-22 incident fell into: that lane held its
+lease and had logged "launching JIT runner" (phase `idle-wait`) with no job
+yet, and the process-tree check alone read it idle. A heartbeat older than
+max(600 s, 10 x the lane's `TARTCI_VM_POLL`) is stale and ignored, so a
+supervisor that died or wedged after a busy phase, holding no lease and no
+VM, reads idle rather than refusing forever. Unknown refuses: an unreadable
+`launchctl print` (other than "Could not find service"), process table or
+lease store, an unrecognised phase, or a lane whose plist declares a state dir
+with no heartbeat from the running supervisor. Wait for the lane to go idle,
+or `tartci pool drain`; the explicit
 override that accepts killing the job is `--allow-mid-job`.
 
 `--dry-run` runs every precondition, including the mid-job probe, and prints
