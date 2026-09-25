@@ -114,18 +114,29 @@ if parsed.path.startswith("/repos/") and "/git/ref/" in parsed.path:
     print("gh: Not Found (HTTP 404)", file=sys.stderr)
     raise SystemExit(1)
 
+now_stamp = dt.datetime.now(dt.timezone.utc).strftime("%%Y-%%m-%%dT%%H:%%M:%%SZ")
+old_stamp = "2026-08-25T00:00:00Z"
+timestamp = now_stamp if state.get("fresh") else old_stamp
+
+
+def stamp(key):
+    # `fresh` ages every job together; `fresh_merge` / `fresh_pr` age ONE
+    # class, so a test can put a young job in one class beside an old job in
+    # the other. A job's own created_at is what the scanner reads first.
+    return now_stamp if state.get("fresh") or state.get(key) else old_stamp
+
+
 jobs = []
 if state.get("merge"):
-    jobs.append({"id": 201, "status": "queued", "labels": %s + ["pulp-build-merge-group"]})
+    jobs.append({"id": 201, "status": "queued", "created_at": stamp("fresh_merge"),
+                 "labels": %s + ["pulp-build-merge-group"]})
 if state.get("pr"):
-    jobs.append({"id": 202, "status": "queued", "labels": %s + ["pulp-build-pr-head"]})
+    jobs.append({"id": 202, "status": "queued", "created_at": stamp("fresh_pr"),
+                 "labels": %s + ["pulp-build-pr-head"]})
 if state.get("legacy"):
     jobs.append({"id": 203, "status": "queued", "labels": %s + ["pulp-gate-fast"]})
 if state.get("malformed"):
     jobs.append({"id": 204, "status": "queued", "labels": %s + [{"bad": "label"}]})
-
-timestamp = (dt.datetime.now(dt.timezone.utc).strftime("%%Y-%%m-%%dT%%H:%%M:%%SZ")
-             if state.get("fresh") else "2026-08-25T00:00:00Z")
 
 
 def runs_page(run_id, name):
@@ -649,6 +660,271 @@ class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
         result = self._runner("--print-name")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("retained required legacy selector", result.stderr)
+
+
+class IdleRetargetTests(RunnerFixture, unittest.TestCase):
+    """Work-conserving idle retarget, driven through `--print-idle-retarget`.
+
+    The hook runs the exact decision function the idle-wait loop consults
+    (minus its interval gating) against the fixture queue, so each verdict here
+    is the one a registered-but-unassigned runner of that tier would get. `1`
+    means the runner is discarded so the slot can serve another class; `0`
+    means it is held. Every enabled-path assertion has the knob-off control
+    below it: same queue, same tier, `0`, and no GitHub call at all.
+    """
+
+    KNOB = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.calls = self.root / "calls.log"
+        self.env["ASSIGNMENT_CALLS"] = str(self.calls)
+
+    def _decide(self, tier: str) -> str:
+        result = self._runner("--print-idle-retarget", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _events(self, name: str) -> list:
+        log = self.root / "state" / "events.jsonl"
+        if not log.exists():
+            return []
+        return [
+            json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()
+            if f'"event":"{name}"' in line
+        ]
+
+    def _api_calls(self) -> int:
+        if not self.calls.exists():
+            return 0
+        return len(self.calls.read_text(encoding="utf-8").splitlines())
+
+    def test_only_pr_head_demand_retargets_an_idle_merge_group_runner(self) -> None:
+        """The 03:20Z shape: a merge-group runner idles while PR-head work waits."""
+        self.env[self.KNOB] = "120"
+        self._state(pr=True)
+        self.assertEqual(self._decide("0"), "1")
+        retargets = self._events("assignment_v2_idle_retarget")
+        self.assertEqual(len(retargets), 1, retargets)
+        self.assertIn("selected_tier=0", retargets[0]["detail"])
+        self.assertIn("to_tier=1", retargets[0]["detail"])
+        self.assertIn("to_label=pulp-build-pr-head", retargets[0]["detail"])
+        self.assertGreater(self._api_calls(), 0, "the enabled path made no observation")
+
+    def test_only_merge_group_demand_retargets_an_idle_pr_head_runner(self) -> None:
+        """Symmetric on purpose: an idle PR-head runner is just as useless to a
+        waiting merge group, and the fleet's idle timeouts split evenly between
+        the two classes. Discarding returns the slot to ordered selection, where
+        merge-group wins, so symmetry costs the merge-group preference nothing."""
+        self.env[self.KNOB] = "120"
+        self._state(merge=True)
+        self.assertEqual(self._decide("1"), "1")
+        retargets = self._events("assignment_v2_idle_retarget")
+        self.assertEqual(len(retargets), 1, retargets)
+        self.assertIn("selected_tier=1", retargets[0]["detail"])
+        self.assertIn("to_tier=0", retargets[0]["detail"])
+
+    def test_both_classes_queued_hold_either_runner_and_selection_prefers_merge_group(self) -> None:
+        """A runner whose own class still has demand is about to be assigned;
+        discarding it would thrash. And when both wait, the slot that does come
+        free elects merge-group -- the preference lives in selection, untouched."""
+        self.env[self.KNOB] = "120"
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._decide("0"), "0")
+        self.assertEqual(self._decide("1"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 2, holds)
+        for hold in holds:
+            self.assertIn("reason=own_class_demand", hold["detail"])
+        self.assertEqual(self._events("assignment_v2_idle_retarget"), [])
+        selection = self._runner("--print-selection")
+        self.assertEqual(selection.returncode, 0, selection.stderr)
+        fields = selection.stdout.strip().split("\t")
+        self.assertEqual(fields[2], "0", selection.stdout)
+        self.assertIn("pulp-build-merge-group", fields[1].split(","))
+
+    def test_knob_off_is_the_byte_for_byte_control(self) -> None:
+        """Same queues as the retarget cases above, knob absent: every verdict is
+        0, no GitHub call is made, no event is written, and `--print-selection`
+        is byte-identical with the knob on and off."""
+        for state, tier in (({"pr": True}, "0"), ({"merge": True}, "1")):
+            with self.subTest(state=state, tier=tier):
+                self.env.pop(self.KNOB, None)
+                self._state(**state)
+                self.calls.unlink(missing_ok=True)
+                self.assertEqual(self._decide(tier), "0")
+                self.assertEqual(self._api_calls(), 0, "the control observed the queue")
+                self.assertEqual(self._events("assignment_v2_idle_retarget"), [])
+                self.assertEqual(self._events("assignment_v2_idle_hold"), [])
+                off = self._runner("--print-selection")
+                self.env[self.KNOB] = "120"
+                self._state(**state)
+                on = self._runner("--print-selection")
+                self.assertEqual(off.returncode, 0, off.stderr)
+                self.assertEqual(on.returncode, 0, on.stderr)
+                self.assertEqual(off.stdout, on.stdout)
+                self.assertTrue(off.stdout.startswith("1\t"), off.stdout)
+
+    def test_legacy_and_observe_lanes_never_consult_the_retarget(self) -> None:
+        """The knob is a V2 decision; a lane still on the reversible earlier
+        modes registers with the same tier labels and is byte-for-byte unchanged
+        even when the environment carries the knob."""
+        for mode in ("legacy", "observe"):
+            with self.subTest(mode=mode):
+                self.env[self.KNOB] = "120"
+                self.env["TARTCI_RUNNER_ASSIGNMENT_MODE"] = mode
+                self._state(pr=True)
+                self.calls.unlink(missing_ok=True)
+                self.assertEqual(self._decide("0"), "0")
+                self.assertEqual(self._api_calls(), 0)
+                self.assertEqual(self._events("assignment_v2_idle_retarget"), [])
+
+    def test_no_demand_anywhere_holds(self) -> None:
+        self.env[self.KNOB] = "120"
+        self._state()
+        self.assertEqual(self._decide("0"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 1, holds)
+        self.assertIn("reason=no_other_demand", holds[0]["detail"])
+
+    def test_uncertainty_in_either_class_holds(self) -> None:
+        """Retarget needs positive evidence of both halves. A blind own-class
+        scan cannot prove the runner is surplus; a blind other-class scan cannot
+        prove anyone is waiting. Either way the runner is kept and the bounded
+        idle timeout remains the backstop."""
+        self.env[self.KNOB] = "120"
+        self._state(api_fail=True)
+        self.assertEqual(self._decide("0"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 1, holds)
+        self.assertIn("reason=own_class_uncertain", holds[0]["detail"])
+
+        # Split workflows so exactly the OTHER class can be blinded: tier 0
+        # (Merge Gate, workflow 98) observable and empty, tier 1 blind.
+        self.env["TARTCI_RUNNER_WORKFLOW_TIERS"] = self.SPLIT_TIERS
+        self._state(pr=True, fresh=True, blind_workflow=99)
+        self.assertEqual(self._decide("0"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 2, holds)
+        self.assertIn("reason=other_class_uncertain", holds[1]["detail"])
+        # Control: the same split config with nothing blind retargets.
+        self._state(pr=True, fresh=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    SPLIT_TIERS = AssignmentV2Tests.SPLIT_TIERS
+
+    def test_a_young_own_class_job_holds_regardless_of_the_lane_minimum_age(self) -> None:
+        """The lane's minimum queued age is a BOOT-delay policy (m1 waits 600s
+        so faster hosts take young work first). It is not an assignment
+        restriction: GitHub hands a young merge-group job to an already
+        registered merge-group runner in seconds. So the own-class probe is
+        age-agnostic -- discarding that runner to boot for PR-head would strand
+        the preferred class behind a 600s rule it was never subject to."""
+        self.env[self.KNOB] = "120"
+        self.env["TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS"] = "600"
+        self._state(merge=True, fresh_merge=True, pr=True)
+        self.assertEqual(self._decide("0"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 1, holds)
+        self.assertIn("reason=own_class_demand", holds[0]["detail"])
+        # Control: remove the young own-class job and the same runner retargets
+        # to the old PR-head job, so the hold above was the age rule, not the
+        # 600s minimum silencing every verdict.
+        self._state(pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_other_class_demand_must_be_admissible_under_the_lane_minimum_age(self) -> None:
+        """A young job in the other class is not yet this lane's to take; a
+        retarget for it would have this host boot for work its own boot policy
+        says to leave to faster hosts for another 600s."""
+        self.env[self.KNOB] = "120"
+        self.env["TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS"] = "600"
+        self._state(pr=True, fresh_pr=True)
+        self.assertEqual(self._decide("0"), "0")
+        holds = self._events("assignment_v2_idle_hold")
+        self.assertEqual(len(holds), 1, holds)
+        self.assertIn("reason=no_other_demand", holds[0]["detail"])
+        # Control: the same job once old enough is admissible and retargets.
+        self._state(pr=True)
+        self.assertEqual(self._decide("0"), "1")
+
+    def test_knob_is_validated_before_the_serve_loop(self) -> None:
+        self._state(pr=True)
+        for value in ("bad", "-1", "30", "59", "3601"):
+            with self.subTest(value=value):
+                self.env[self.KNOB] = value
+                result = self._runner("--print-idle-retarget", "0")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("IDLE_RETARGET_SECS", result.stderr)
+        for value in ("0", "60", "3600"):
+            with self.subTest(value=value):
+                self.env[self.KNOB] = value
+                result = self._runner("--print-idle-retarget", "0")
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class IdleRetargetWiringTests(unittest.TestCase):
+    """Pin the loop wiring the hook above cannot reach without a booted VM.
+
+    The behavioral tests prove the decision; these prove the idle-wait loop
+    actually asks for it, only while unassigned, and cannot kill a runner that
+    was assigned while the observation ran.
+    """
+
+    def setUp(self) -> None:
+        self.body = RUNNER.read_text(encoding="utf-8")
+
+    def test_the_loop_passes_the_selected_tier_and_consults_the_decision(self) -> None:
+        self.assertIn(
+            'run_runner_until_done "$vm" "$ip" "$jit" "$selected_tier"', self.body
+        )
+        self.assertIn(
+            'if [ "$assigned" = 0 ] && [ "$retarget_next" -gt 0 ] && [ "$now" -ge "$retarget_next" ]; then',
+            self.body,
+        )
+        self.assertIn(
+            'if tartci_assignment_v2_idle_retarget "$selected_tier" "$idle_elapsed"; then',
+            self.body,
+        )
+        self.assertIn('return "$IDLE_RETARGET_RC"', self.body)
+
+    def test_the_knob_is_off_by_default_and_zeroed_outside_v2(self) -> None:
+        self.assertIn(
+            'ASSIGNMENT_V2_IDLE_RETARGET_SECS="${TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS:-0}"',
+            self.body,
+        )
+        self.assertIn(
+            '[ "$ASSIGNMENT_MODE" = event-class-v2 ] || ASSIGNMENT_V2_IDLE_RETARGET_SECS=0',
+            self.body,
+        )
+        self.assertIn(
+            '[ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \\\n    || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))',
+            self.body,
+        )
+
+    def test_an_assignment_during_the_observation_is_kept(self) -> None:
+        decision = self.body.index(
+            'if tartci_assignment_v2_idle_retarget "$selected_tier" "$idle_elapsed"; then'
+        )
+        kill = self.body.index('return "$IDLE_RETARGET_RC"', decision)
+        window = self.body[decision:kill]
+        self.assertIn("grep -q 'Running job:' \"$runner_log\"", window)
+        self.assertIn("assignment_v2_idle_retarget_overtaken", window)
+
+    def test_a_retarget_invalidates_the_cached_selection(self) -> None:
+        after = self.body.index('run_runner_until_done "$vm" "$ip" "$jit" "$selected_tier"')
+        handled = self.body.index('if [ "$rc" -eq "$IDLE_RETARGET_RC" ]; then', after)
+        self.assertIn(
+            "tartci_assignment_v2_invalidate_selection",
+            self.body[handled:handled + 600],
+        )
+
+    def test_the_hook_reaches_the_same_function_as_the_loop(self) -> None:
+        self.assertIn('--print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;', self.body)
+        self.assertIn(
+            'tartci_assignment_v2_idle_retarget "$PRINT_IDLE_RETARGET" "$ASSIGNMENT_V2_IDLE_RETARGET_SECS"',
+            self.body,
+        )
 
 
 class AssignmentScannerPaginationTests(unittest.TestCase):

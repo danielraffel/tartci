@@ -27,6 +27,7 @@ FAILURE_CLASSES = {
     "source_failure",
     "runner_timeout",
     "idle_timeout",
+    "idle_retarget",
     "boot_failed",
     "cache_setup_failed",
     "ssh_failed",
