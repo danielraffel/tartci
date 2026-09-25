@@ -37,9 +37,11 @@ Staleness: a heartbeat is stale when older than max(600 s, 10 x the lane's
 TARTCI_VM_POLL). A stale heartbeat is ignored, so a supervisor that crashed or
 wedged after writing a busy phase does not refuse forever: with no work
 descendant and no lease it reads idle ("stale heartbeat"). A lane whose plist
-declares a state dir but has no heartbeat from the running supervisor (a
-supervisor that has not heartbeated yet, or a state dir that cannot be read)
-is unknown.
+declares a state dir but has no heartbeat from the running supervisor (one
+that has not heartbeated yet, crash-loops before it does, or cannot write its
+state file) reads idle, because this is only consulted after the process tree
+and the lease store showed no VM; a state dir that cannot be listed is
+unknown.
 
 Every indeterminate reading is `unknown`, never `idle`: a launchctl error other
 than launchd's own "Could not find service", an unreadable process table, an
@@ -84,7 +86,6 @@ WORK_PATTERNS = (
 # providers/tart-macos/runner.sh `heartbeat` phases. Past waiting: the
 # supervisor has admitted work and owns (or is about to own) a VM or a runner.
 BUSY_PHASES = frozenset({
-    "admission-precheck",          # immediately precedes the clone
     "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
@@ -95,6 +96,11 @@ IDLE_PHASES = frozenset({
     "waiting", "loop", "yielding", "draining", "stopped",
     "scan_blind", "scan_blind_escalated", "jit-admission-denied",
     "vm-lease-denied", "admission-precheck-deferred", "admission-precheck-error",
+    # Before the lease: no VM exists yet. The clone that follows is covered
+    # by the VM lease and the `tart clone` descendant.
+    "admission-precheck",
+    # run_one returned and its VM was torn down; the supervisor is sleeping.
+    "backoff",
 })
 STALE_FLOOR_SECONDS = 600
 STALE_POLL_MULTIPLE = 10
@@ -248,8 +254,13 @@ def heartbeat_state(env: dict, pids: "set[int]", now: float) -> "tuple[str, str]
         if pid.isdigit() and int(pid) in pids:
             current.append((path, value))
     if not current:
-        return UNKNOWN, (f"no heartbeat from the running supervisor in {state_dir} "
-                         "(not yet written, or unreadable)")
+        # Only reached once the process tree and the lease store show no work:
+        # without a VM lease and without a `tart clone`/`tart run` descendant,
+        # the supervisor owns no VM, whatever it last wrote. A supervisor that
+        # crash-loops before its first heartbeat (or cannot write its state
+        # file) must not block `pool off` or a reload indefinitely.
+        return IDLE, (f"no heartbeat from the running supervisor in {state_dir}, but no "
+                      "work descendant and no VM lease")
     path, value = max(current, key=lambda item: str(item[1].get("ts") or ""))
     phase = str(value.get("phase") or "")
     age = _age(str(value.get("ts") or ""), now)

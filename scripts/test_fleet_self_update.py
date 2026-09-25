@@ -65,6 +65,14 @@ class FakeSystem(su.System):
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
+        self.on_rcs: list[int] = []         # successive pool on exit codes, then on_rc
+        self.on_at: float | None = None
+        self.heartbeat_after = 0            # seconds after pool on until heartbeats
+        self.status_problems: list = []
+        # pool on refused at verify-installed, before any mutation (the
+        # OS-drift receipt): the pool keeps whatever state it was in.
+        self.refuse_keeps_state = False
+
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
         self.relay = {"ok": True, "probe": "relay authenticated"}
@@ -205,6 +213,12 @@ class FakeSystem(su.System):
             if rc == 0:
                 self._set_installed(self.installed_after or self.checked_out)
             return su.Result(rc, "", "" if rc == 0 else "agents still unloading")
+        if args[:2] == ["pool", "undrain"]:
+            if self.pool_state != "draining":
+                return su.Result(5, "", "not draining")
+            self.pool_state = "on"
+            self.on_at = self.clock
+            return ok("undrained")
         if args[:2] == ["pool", "drain"]:
             self.pool_state = "draining"
             return ok("draining")
@@ -225,10 +239,27 @@ class FakeSystem(su.System):
 
     def _shim(self, args):
         if args[:2] == ["pool", "on"]:
-            if self.on_rc == 0:
+            rc = self.on_rcs.pop(0) if self.on_rcs else self.on_rc
+            if rc == 0:
                 self.pool_state = "on"
-            return su.Result(self.on_rc, "on", "" if self.on_rc == 0 else "pool on refused")
+                self.on_at = self.clock
+            elif not self.refuse_keeps_state:
+                self.pool_state = "off"  # pool on's own rollback closes admission
+            return su.Result(rc, "on", "" if rc == 0 else
+                             "fleet-macos: loaded persistent LaunchAgent x is not running")
         if args[:2] == ["pool", "status"]:
+            if self.pool_state != "on":
+                return ok(json.dumps({"state": self.pool_state, "participating": False,
+                                      "fleet": {"managed": True, "fleet_ready": False,
+                                                "problems": self.status_problems}}))
+            if self.on_at is not None and self.clock - self.on_at < self.heartbeat_after:
+                return ok(json.dumps({"state": "on", "participating": True,
+                                      "fleet": {"managed": True, "fleet_ready": False,
+                                                "problems": [{"code": "heartbeat_missing"}]}}))
+            if self.status_problems:
+                return ok(json.dumps({"state": "on", "participating": True,
+                                      "fleet": {"managed": True, "fleet_ready": False,
+                                                "problems": self.status_problems}}))
             if (self.broken_target and self.running() != INSTALLED) or \
                     (self.broken_previous and self.running() == INSTALLED):
                 return ok(json.dumps({"state": "on", "participating": True,
@@ -1155,6 +1186,152 @@ class DeferralCapTests(unittest.TestCase):
         finally:
             os.killpg = original
         self.assertEqual(result.rc, su.EXIT_TIMED_OUT)
+
+
+class IncidentTests(Base):
+    """m5, 2026-09-25: verify read readiness once, before the first heartbeat."""
+
+    def test_heartbeats_after_pool_on_are_waited_for(self) -> None:
+        self.sys.heartbeat_after = 105   # measured on m5
+        self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        self.assertEqual(self.last()["status"], "succeeded")
+        self.assertEqual(self.sys.running(), T_OLD)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(s["step"] == "verify" for s in receipt["steps"]))
+        self.assertGreaterEqual(self.sys.clock - self.sys.on_at, 105)
+
+    def test_never_ready_times_out_rolls_back_and_ends_on(self) -> None:
+        self.sys.broken_target = True
+        self.sys.heartbeat_after = 105   # the previous generation also needs time
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.last()["status"], "rolled_back")
+        self.assertIn("verification of", self.last()["error"])
+        self.assertEqual(self.sys.running(), INSTALLED)
+        self.assertEqual(self.sys.pool_state, "on")
+
+    def test_refused_pool_on_after_rollback_reinstalls_and_ends_on(self) -> None:
+        # The incident's second half: pool on of the restored generation raced
+        # its persistent runner and refused three times, closing admission.
+        self.sys.broken_target = True
+        # new gen on; rollback pool on x3 refused; recovery pool on x3 refused
+        self.sys.on_rcs = [0, 10, 10, 7, 10, 10, 7]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertFalse(self.last()["host_off"])
+        self.assertIn("host is on", self.last()["error"])
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(s["step"] == "reinstall-for-pool-on" for s in receipt["steps"]))
+
+    def test_rollback_failed_verify_still_ends_on(self) -> None:
+        self.sys.broken_target = True
+        self.sys.broken_previous = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("ROLLBACK FAILED", self.last()["error"])
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertFalse(self.last()["host_off"])
+
+    def test_host_off_only_when_pool_on_is_impossible_and_loud(self) -> None:
+        self.sys.broken_target = True
+        self.sys.on_rcs = [0]
+        self.sys.on_rc = 7
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertTrue(self.last()["host_off"])
+        self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
+        self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
+
+
+class OsInterpreterRefreshTests(Base):
+    def test_current_host_with_os_changed_interpreter_reinstalls_same_generation(self) -> None:
+        self.sys.log_lines = ""   # current with main
+        self.sys.status_problems = [{"code": "interpreter_changed_by_os_update",
+                                     "detail": "macOS build 25A1 -> 26A1"}]
+        self.sys.pool_state = "on"
+
+        def refreshed(argv):
+            if "--apply" in argv:
+                self.sys.status_problems = []   # the reinstall rewrites the receipt
+        self.sys.hook = refreshed
+        self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        self.assertTrue(any("--apply" in a for a, _ in self.sys.calls))
+        self.assertEqual(self.last()["target"], INSTALLED)
+
+    def test_current_host_without_the_problem_does_nothing(self) -> None:
+        self.sys.log_lines = ""
+        self.sys.status_problems = [{"code": "receipt_mismatch", "detail": "x"}]
+        self.assertEqual(self.apply(), su.EXIT_NOTHING)
+        self.assertEqual(self.sys.mutations(), [])
+
+
+class RecoveryBranchTests(Base):
+    """_recover when nothing new was installed (the common pre-install failure)."""
+
+    def test_pre_install_failure_with_refused_pool_on_undrains_when_never_idle(self) -> None:
+        # OS-drift host: drain, lanes never idle (timeout), pool on refuses at
+        # verify-installed before mutation, so the pool stays draining.
+        self.sys.offplan = [12]
+        self.sys.on_rc = 7
+        self.sys.refuse_keeps_state = True
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(last["pool_state"], "undrained")
+        self.assertFalse(last["host_off"])
+        self.assertTrue(any(a[:3] == ["./tartci", "pool", "undrain"] for a, _ in self.sys.calls))
+        self.assertFalse(any("--apply" in a for a, _ in self.sys.calls))
+
+    def test_pre_install_failure_with_refused_pool_on_reinstalls_previous(self) -> None:
+        # Install fails 4x (the installer restores itself: previous still
+        # runs) and pool on refuses once: reinstall previous, then pool on.
+        self.sys.install_rcs = [1]
+        self.sys.on_rcs = [7, 7, 7]
+        self.sys.rollback_install_rc = 0
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.last()["pool_state"], "on")
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(s["step"] == "reinstall-for-pool-on" and s["ok"]
+                            for s in receipt["steps"]))
+
+    def test_left_draining_is_reported_as_draining_not_off(self) -> None:
+        self.sys.offplan = [12]
+        self.sys.on_rc = 7
+        self.sys.refuse_keeps_state = True
+
+        original = self.sys._tartci
+
+        def fake_tartci(args):
+            if args[:2] == ["pool", "undrain"]:
+                return su.Result(1, "", "undrain unavailable")
+            return original(args)
+        self.sys._tartci = fake_tartci
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        last = self.last()
+        self.assertEqual(last["pool_state"], "draining")
+        self.assertTrue(last["host_off"])
+        self.assertIn("LEFT DRAINING", last["error"])
+        self.assertIn("LEFT THIS HOST DRAINING", su.summary(self.home)["problem"])
+
+    def test_terminated_run_never_reinstalls(self) -> None:
+        self.sys.install_rcs = [1]
+        self.sys.on_rc = 7
+
+        def terminate_after_install(argv):
+            if "--apply" in argv:
+                self.sys.hook = None
+                raise su.Terminated("SIGTERM")
+        self.sys.hook = terminate_after_install
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertEqual(sum("--apply" in a for a, _ in self.sys.calls), 1)
+        self.assertIn("terminated", self.last()["error"])
+
+    def test_reinstalling_a_failed_target_says_so(self) -> None:
+        self.sys.broken_target = True
+        self.sys.rollback_install_rc = 1   # rollback fails: target still runs
+        self.sys.on_rcs = [0, 7, 7, 7]     # target on; then pool on refuses
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertTrue(any(s["step"] == "reinstall-for-pool-on"
+                            and "FAILED verification" in s["detail"] for s in receipt["steps"]))
 
 
 if __name__ == "__main__":

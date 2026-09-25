@@ -70,7 +70,7 @@ class PhaseTests(unittest.TestCase):
     def test_runner_heartbeat_phases_are_all_classified(self) -> None:
         """Every literal phase runner.sh writes is in exactly one set."""
         source = (ROOT / "providers/tart-macos/runner.sh").read_text()
-        phases = set(re.findall(r"heartbeat ([a-z_-]+)\s*$", source, re.M))
+        phases = set(re.findall(r"heartbeat ([a-z_-]+)\s*(?:;|$)", source, re.M))
         phases |= set(re.findall(r"printf ([a-z_-]+)", " ".join(
             line for line in source.splitlines() if "heartbeat \"$(" in line)))
         self.assertGreater(len(phases), 15)
@@ -163,14 +163,34 @@ class StalenessTests(unittest.TestCase):
             host.beat("booting", age=1300)
             self.assertEqual(host.probe().state, lane_busy.IDLE)
 
-    def test_missing_or_foreign_heartbeat_is_unknown(self) -> None:
+    def test_missing_or_foreign_heartbeat_with_no_work_is_idle(self) -> None:
+        # A supervisor crash-looping before its first heartbeat (or unable to
+        # write its state file) holds no VM; it must not block pool off.
         with tempfile.TemporaryDirectory() as td:
             host = Host(Path(td))
-            self.assertEqual(host.probe().state, lane_busy.UNKNOWN)       # none written
+            row = host.probe()
+            self.assertEqual(row.state, lane_busy.IDLE)                   # none written
+            self.assertIn("no heartbeat", row.detail)
             host.beat("job-running", pid=12345)                           # a previous supervisor
-            self.assertEqual(host.probe().state, lane_busy.UNKNOWN)
+            self.assertEqual(host.probe().state, lane_busy.IDLE)
             host.beat("job-running", pid=SUPERVISOR)                      # launchd pid itself counts
             self.assertEqual(host.probe().state, lane_busy.BUSY)
+
+    def test_missing_heartbeat_with_a_lease_or_clone_is_still_busy(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = Host(Path(td))
+            host.leases = [{"id": "vm-x", "command_kind": "tart-macos-vm", "pid": RUNNER_SH}]
+            self.assertEqual(host.probe().state, lane_busy.BUSY)
+        with tempfile.TemporaryDirectory() as td:
+            host = Host(Path(td), extra_ps=f"502 {RUNNER_SH} /opt/homebrew/bin/tart clone g vm1\n")
+            self.assertEqual(host.probe(leases=[]).state, lane_busy.BUSY)
+
+    def test_backoff_heartbeat_after_run_one(self) -> None:
+        source = (ROOT / "providers/tart-macos/runner.sh").read_text()
+        self.assertIn('if [ "$run_rc" = 0 ]; then heartbeat loop; else heartbeat backoff; '
+                      'sleep "$POLL"; fi', source)
+        self.assertIn("backoff", lane_busy.IDLE_PHASES)
+        self.assertIn("admission-precheck", lane_busy.IDLE_PHASES)
 
     def test_lane_without_a_state_dir_keeps_the_process_tree_answer(self) -> None:
         with tempfile.TemporaryDirectory() as td:

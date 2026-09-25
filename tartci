@@ -600,7 +600,7 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|off|status|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
@@ -873,6 +873,29 @@ EOF
       [ ! -d "$TARTCI_POOL_TRANSITION_LOCK" ] \
         || { echo "lock repair failed: $TARTCI_POOL_TRANSITION_LOCK remains" >&2; return 5; }
       echo "repaired orphaned pool transition lock"
+      ;;
+    undrain)
+      # The exact inverse of a drain that has not gone further: re-enable the
+      # receipt-owned agents drain disabled (they stayed loaded) and reopen
+      # admission. Unlike `pool on` it installs, loads and verifies nothing,
+      # so it works on a host whose receipt `pool on` currently rejects (for
+      # example after a macOS update) and returns it to exactly the service it
+      # had before the drain. Refused unless the pool is draining.
+      [ "$(tartci_pool_read_state)" = draining ] \
+        || { echo "pool undrain refused: pool is $(tartci_pool_read_state), not draining" >&2; return 5; }
+      tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+      local label launchd_target
+      while IFS= read -r label; do
+        [ -n "$label" ] || continue
+        launchd_target="$(tartci_pool_launchd_target "$label")"
+        launchctl enable "$launchd_target" >/dev/null 2>&1 || true
+      done <<EOF
+$(tartci_pool_owned_runner_agents "$agents_dir")
+EOF
+      tartci_pool_write_state on
+      tartci_pool_write_participation 1
+      tartci_pool_lock_release
+      echo "undrained: $host admits work again (agents were never unloaded)"
       ;;
     drain)
       tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
