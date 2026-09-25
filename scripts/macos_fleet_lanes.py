@@ -70,6 +70,7 @@ LANE_KEYS = {
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
+    "assignment_idle_retarget_seconds",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
@@ -459,6 +460,15 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_feed_rescue must be a boolean on "
                 "an event-class-v2 lane"
+            )
+        idle_retarget = lane.get("assignment_idle_retarget_seconds")
+        if idle_retarget is not None and (
+                assignment_mode != "event-class-v2"
+                or type(idle_retarget) is not int
+                or not (idle_retarget == 0 or 60 <= idle_retarget <= 3600)):
+            fail(
+                f"lane {lane_id}: assignment_idle_retarget_seconds must be 0 "
+                "or an integer from 60 through 3600 on an event-class-v2 lane"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -1827,6 +1837,10 @@ def lane_plist(
         )
     if lane.get("assignment_feed_rescue"):
         env["TARTCI_ASSIGNMENT_FEED_RESCUE"] = "1"
+    if lane.get("assignment_idle_retarget_seconds"):
+        env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
+            lane["assignment_idle_retarget_seconds"]
+        )
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]

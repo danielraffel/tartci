@@ -1629,6 +1629,77 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn(key, result.stderr)
 
+    def test_idle_retarget_is_bounded_and_v2_only(self) -> None:
+        base = CONFIG.read_text()
+        key = "assignment_idle_retarget_seconds"
+        anchor = "assignment_feed_rescue = true"
+        self.assertEqual(base.count(anchor), 1)
+        fixtures = {
+            "negative": base.replace(anchor, f"{anchor}\n{key} = -1", 1),
+            "below-floor": base.replace(anchor, f"{anchor}\n{key} = 59", 1),
+            "too-large": base.replace(anchor, f"{anchor}\n{key} = 3601", 1),
+            "wrong-type": base.replace(anchor, f'{anchor}\n{key} = "120"', 1),
+            "bool": base.replace(anchor, f"{anchor}\n{key} = true", 1),
+            # The spectr lane is not event-class-v2; the knob is meaningless there.
+            "non-v2": base.replace('priority = "vm"', f'priority = "vm"\n{key} = 120', 1),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(key, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            for value in (0, 60, 120, 3600):
+                with self.subTest(accepted=value):
+                    path = Path(td) / f"ok-{value}.toml"
+                    path.write_text(base.replace(anchor, f"{anchor}\n{key} = {value}", 1))
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_idle_retarget_renders_only_when_a_profile_opts_in(self) -> None:
+        """Shipped profiles carry no retarget, so the rollout's hosts are
+        unaffected; the canary is one host's profile declaring the knob."""
+        env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
+        for host_id, config in HOST_CONFIGS.items():
+            with self.subTest(shipped=host_id):
+                rendered = fleet.rendered_plists(fleet.load(config))
+                self.assertGreater(len(rendered), 0)
+                for body in rendered.values():
+                    env = plistlib.loads(body)["EnvironmentVariables"]
+                    self.assertNotIn(env_key, env)
+                    # Control: the V2 mode itself IS rendered on the pulp slots,
+                    # so an absent retarget key is a real absence.
+                    if env["TARTCI_QUEUE_LANE_ID"].startswith(f"{host_id}-pulp-gate"):
+                        self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
+        base = CONFIG.read_text()
+        anchor = "assignment_feed_rescue = true"
+        with tempfile.TemporaryDirectory() as td:
+            for value, expected in ((120, "120"), (0, None)):
+                with self.subTest(value=value):
+                    path = Path(td) / f"m1-{value}.toml"
+                    path.write_text(
+                        base.replace(anchor, f"{anchor}\nassignment_idle_retarget_seconds = {value}", 1)
+                    )
+                    rendered = fleet.rendered_plists(fleet.load(path))
+                    pulp_slots = 0
+                    for body in rendered.values():
+                        env = plistlib.loads(body)["EnvironmentVariables"]
+                        if env["TARTCI_QUEUE_LANE_ID"].startswith("m1-pulp-gate"):
+                            pulp_slots += 1
+                            self.assertEqual(env.get("TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"), expected)
+                        else:
+                            self.assertNotIn(env_key, env)
+                    self.assertEqual(pulp_slots, 2)
+
     def test_process_type_accepts_only_documented_launchd_values(self) -> None:
         base = CONFIG.read_text()
         self.assertIn('process_type = "Adaptive"', base)
