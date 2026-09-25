@@ -1534,6 +1534,24 @@ fleet`), and check GitHub's job history against it with
   reconcile, `pool on` through the installed shim, verify (pool on and fleet
   ready, serving not blocked, executed commit == target, `launchd guard`
   present).
+- **A failure never leaves the host off if `pool on` can work.** Every
+  failure path ends with `pool on` (three attempts, 15/45/90 s apart). If it
+  still refuses, the running generation is reinstalled from its own commit
+  (rewriting a receipt `pool on` rejects) and `pool on` is tried again. Only
+  if that also fails is the host left OFF, recorded as `host_off` in
+  `last.json` and shown by `pool status`, `doctor fleet` and the watchdog.
+  `pool on` itself now waits up to 45 s for a just-kickstarted persistent
+  Actions runner to reach `running` instead of failing on the first read.
+- **macOS updates.** A macOS update replaces `/usr/bin/python3`, so the
+  install receipt's interpreter hash stops matching. When the OS-managed
+  interpreter changed (still root-owned, same path and mode) and the OS build
+  differs from the one the receipt records (`support.os_build`; for older
+  receipts, SystemVersion.plist is newer than the receipt), `pool status`
+  reports `interpreter_changed_by_os_update` with its remedy instead of a
+  bare `receipt_mismatch`, and `self-update` reinstalls the same generation
+  at its next idle window even when current with main. Any other interpreter
+  difference is still an unexplained mismatch and fails closed. Until the
+  reinstall, `pool on` on that host still refuses.
 - **Rollback.** A failure before anything new is installed (the installer
   rolls its own failure back) restores the pin and runs `pool on`. A failure
   **after** a successful install (relay, pool on, verify) rolls back: wait for
