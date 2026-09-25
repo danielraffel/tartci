@@ -336,14 +336,7 @@
       ]
     }
   ],
-  "persistent_runners": [
-    {
-      "profile": "m5-macos-fleet",
-      "host_id": "m5",
-      "launchd_label": "actions.runner.danielraffel-pulp.pulp-preamble-m5",
-      "runner_name": "pulp-preamble-m5"
-    }
-  ],
+  "persistent_runners": [],
   "hosts": [
     {
       "profile": "m1-macos-fleet",
