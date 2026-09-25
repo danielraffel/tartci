@@ -6,6 +6,11 @@ tartci_assignment_v2_configure(){
     legacy|observe|event-class-v2) ;;
     *) die "invalid TARTCI_RUNNER_ASSIGNMENT_MODE: $ASSIGNMENT_MODE (expected legacy, observe, or event-class-v2)" ;;
   esac
+  # A preference order is an event-class-v2 decision. Refuse it elsewhere rather
+  # than silently ignoring it, so a mis-rendered slot cannot look configured.
+  [ -z "$ASSIGNMENT_V2_TIER_ORDER" ] || [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
+    || die "TARTCI_ASSIGNMENT_V2_TIER_ORDER requires event-class-v2 assignment mode"
+  ASSIGNMENT_V2_ORDER_LABELS="$TIER_LABELS_CONFIG"
   [ "$ASSIGNMENT_MODE" != legacy ] || return 0
   case "${TARTCI_ASSIGNMENT_V2_CACHE_TTL_SECS:-120}" in
     ''|*[!0-9]*) die "invalid TARTCI_ASSIGNMENT_V2_CACHE_TTL_SECS" ;;
@@ -62,6 +67,51 @@ PY
       *) die "V2 workflow tier is not an allowed assignment class: $tier_label" ;;
     esac
   done <<< "$TIER_LABELS_CONFIG"
+  tartci_assignment_v2_configure_order
+}
+
+# Resolve the slot's class preference order. Empty keeps the configured tier
+# order exactly. Otherwise it must name every configured class exactly once:
+# dropping a class would idle the slot while that class waits, which is the
+# opposite of the work-conserving contract this knob exists to keep.
+tartci_assignment_v2_configure_order(){
+  local item seen="" count=0 expected=0 tier_label
+  ASSIGNMENT_V2_ORDER_LABELS="$TIER_LABELS_CONFIG"
+  [ -n "$ASSIGNMENT_V2_TIER_ORDER" ] || return 0
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] && expected=$((expected + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  while IFS= read -r item; do
+    item="$(printf '%s' "$item" | tr -d '[:space:]')"
+    [ -n "$item" ] || die "TARTCI_ASSIGNMENT_V2_TIER_ORDER contains an empty class"
+    printf '%s\n' "$TIER_LABELS_CONFIG" | grep -Fxq "$item" \
+      || die "TARTCI_ASSIGNMENT_V2_TIER_ORDER names an unconfigured class: $item"
+    if [ -n "$seen" ] && printf '%s\n' "$seen" | grep -Fxq "$item"; then
+      die "TARTCI_ASSIGNMENT_V2_TIER_ORDER repeats class: $item"
+    fi
+    seen="${seen:+$seen
+}$item"
+    count=$((count + 1))
+  done < <(printf '%s\n' "$ASSIGNMENT_V2_TIER_ORDER" | tr ',' '\n')
+  [ "$count" -eq "$expected" ] \
+    || die "TARTCI_ASSIGNMENT_V2_TIER_ORDER must name every configured class exactly once"
+  ASSIGNMENT_V2_ORDER_LABELS="$seen"
+}
+
+# Configured (zero-based) tier index of a class label. Tier numbers keep this one
+# meaning whatever the slot's preference order, so events, runner groups and
+# lease priority never change meaning under a reordered slot.
+tartci_assignment_v2_tier_index(){
+  local wanted="$1" tier_label tier=0
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    if [ "$tier_label" = "$wanted" ]; then
+      printf '%s\n' "$tier"
+      return 0
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  return 1
 }
 
 tartci_assignment_v2_tier_labels(){
@@ -185,10 +235,17 @@ tartci_assignment_feed_rescue(){
 # cannot serve the blind one, and the numeric verdict would clear the
 # supervisor's scan-blind counter, disabling the very self-heal that recovers
 # the blind scan. `ERR` carries the uncertainty out intact instead.
+#
+# Classes are consulted in the slot's preference order (the configured order
+# unless TARTCI_ASSIGNMENT_V2_TIER_ORDER reorders it); the printed tier is always
+# the configured index. A preferred class with no demand falls through to the
+# next, so a reordered slot is still work-conserving.
 tartci_assignment_v2_select_live(){
-  local tier_label q tier=0
+  local tier_label q tier count=0
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
+    tier="$(tartci_assignment_v2_tier_index "$tier_label")" || tier="$count"
+    count=$((count + 1))
     if ! q="$(tartci_assignment_v2_tier_demand "$tier_label")"; then
       printf 'ERR|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
       return 0
@@ -202,9 +259,8 @@ tartci_assignment_v2_select_live(){
         "$q" "$(tartci_assignment_v2_tier_labels "$tier_label")" "$tier"
       return 0
     fi
-    tier=$((tier + 1))
-  done <<< "$TIER_LABELS_CONFIG"
-  printf '0|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$tier"
+  done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
+  printf '0|%s|%s\n' "$ASSIGNMENT_V2_BASE_LABELS" "$count"
 }
 
 tartci_assignment_v2_read_fresh_selection(){
@@ -297,43 +353,46 @@ tartci_assignment_v2_parity(){
   printf 'legacy=%s\tv2=%s\n' "$legacy" "$v2"
 }
 
-# Succeed only while the selected class still has demand and every higher class
-# is empty. Lower tiers always re-observe exhaustively and live. A profile may
-# let tier zero reuse its own bounded, exact-class exhaustive receipt because no
-# higher class can arrive above it; a stale/malformed receipt falls back to the
-# live fail-closed scan.
+# Succeed only while the selected class still has demand and every class the
+# slot PREFERS over it is empty. "Higher" is the slot's preference order, so a
+# PR-first slot's PR-head mint is never denied merely because merge-group work
+# exists, while its merge-group fallback still yields to PR-head arrival. Lower
+# classes always re-observe exhaustively and live. A profile may let the slot's
+# most-preferred class reuse its own bounded, exact-class exhaustive receipt
+# because nothing can arrive above it; a stale/malformed receipt falls back to
+# the live fail-closed scan.
 tartci_assignment_v2_pre_mint_valid(){
-  local selected_tier="$1" tier_label q tier=0 cached cached_q cached_labels
-  local cached_tier cached_extra top_label expected_labels max_age
+  local selected_tier="$1" tier_label q tier cached cached_q cached_labels
+  local cached_tier cached_extra top_label top_tier expected_labels max_age
   max_age="${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}"
-  if [ "$selected_tier" = 0 ] && [ "$max_age" -gt 0 ]; then
+  top_label="${ASSIGNMENT_V2_ORDER_LABELS%%$'\n'*}"
+  top_tier="$(tartci_assignment_v2_tier_index "$top_label")" || return 1
+  if [ "$selected_tier" = "$top_tier" ] && [ "$max_age" -gt 0 ]; then
     cached="$(tartci_assignment_v2_read_fresh_selection "$max_age")" || cached=""
     IFS='|' read -r cached_q cached_labels cached_tier cached_extra <<< "$cached"
-    top_label="${TIER_LABELS_CONFIG%%$'\n'*}"
     expected_labels="$(tartci_assignment_v2_tier_labels "$top_label")"
     case "$cached_q" in ''|*[!0-9]*) cached_q=0;; esac
     if [ "$cached_q" -gt 0 ] \
        && [ "$cached_labels" = "$expected_labels" ] \
-       && [ "$cached_tier" = 0 ] \
+       && [ "$cached_tier" = "$top_tier" ] \
        && [ -z "$cached_extra" ]; then
       event assignment_v2_pre_mint_receipt \
-        "selected_tier=0 max_age_seconds=$max_age"
+        "selected_tier=$selected_tier max_age_seconds=$max_age"
       return 0
     fi
   fi
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
-    [ "$tier" -le "$selected_tier" ] || break
+    tier="$(tartci_assignment_v2_tier_index "$tier_label")" || return 1
     q="$(tartci_assignment_v2_tier_demand "$tier_label")" || return 1
     printf '%s' "$q" | grep -qxE '[0-9]+' || return 1
-    if [ "$tier" -lt "$selected_tier" ]; then
-      [ "$q" -eq 0 ] || return 1
-    else
-      [ "$q" -gt 0 ] || return 1
+    if [ "$tier" = "$selected_tier" ]; then
+      [ "$q" -gt 0 ]
+      return
     fi
-    tier=$((tier + 1))
-  done <<< "$TIER_LABELS_CONFIG"
-  [ "$tier" -gt "$selected_tier" ]
+    [ "$q" -eq 0 ] || return 1
+  done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
+  return 1
 }
 
 # A denied pre-mint check proves the cached selection is no longer authority:
@@ -391,9 +450,9 @@ tartci_assignment_v2_idle_retarget(){
       "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=own_class_demand"
     return 1
   fi
-  tier=0
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
+    tier="$(tartci_assignment_v2_tier_index "$tier_label")" || return 1
     if [ "$tier" -ne "$selected_tier" ]; then
       if ! q="$(tartci_assignment_v2_tier_demand "$tier_label")" \
          || ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
@@ -405,8 +464,7 @@ tartci_assignment_v2_idle_retarget(){
         other_tier="$tier"; other_label="$tier_label"; other_q="$q"
       fi
     fi
-    tier=$((tier + 1))
-  done <<< "$TIER_LABELS_CONFIG"
+  done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
   if [ -z "$other_label" ]; then
     event assignment_v2_idle_hold \
       "selected_tier=$selected_tier elapsed=${idle_elapsed}s reason=no_other_demand"

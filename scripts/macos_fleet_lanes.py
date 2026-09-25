@@ -71,7 +71,7 @@ LANE_KEYS = {
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
-    "assignment_idle_retarget_seconds",
+    "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
@@ -725,6 +725,34 @@ def load(path: Path) -> dict:
                     f"lane {lane_id}: event-class-v2 requires repository-scoped "
                     "merge-group and PR-head registration"
                 )
+        slot_orders = lane.get("assignment_slot_tier_order")
+        if slot_orders is not None:
+            # A per-slot class PREFERENCE, never a reservation: each order must
+            # name every tier class exactly once so the slot still falls back to
+            # any class with demand. Slot keys are the supervisor numbers.
+            class_labels = list(dict.fromkeys(tier["label"] for tier in tiers))
+            if assignment_mode != "event-class-v2" or not isinstance(slot_orders, dict):
+                fail(
+                    f"lane {lane_id}: assignment_slot_tier_order must be a table "
+                    "of slot -> class order on an event-class-v2 lane"
+                )
+            for slot_key, order in slot_orders.items():
+                if (not isinstance(slot_key, str) or not slot_key.isdigit()
+                        or not 1 <= int(slot_key) <= supervisors
+                        or str(int(slot_key)) != slot_key):
+                    fail(
+                        f"lane {lane_id}: assignment_slot_tier_order slot "
+                        f"{slot_key!r} must be a supervisor number from 1 "
+                        f"through {supervisors}"
+                    )
+                if (not isinstance(order, list)
+                        or not all(isinstance(item, str) for item in order)
+                        or len(set(order)) != len(order)
+                        or sorted(order) != sorted(class_labels)):
+                    fail(
+                        f"lane {lane_id}: assignment_slot_tier_order slot {slot_key} "
+                        "must name every tier class exactly once"
+                    )
         release_tiers = [
             (tier["label"], tier["workflow"], tier.get("runner_group_id"))
             for tier in tiers
@@ -1985,6 +2013,9 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
         )
+    slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
+    if slot_order:
+        env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
