@@ -234,6 +234,94 @@ def resolve_role(
     return "dev-overflow", "default"
 
 
+# --- agent core floor --------------------------------------------------------
+#
+# When the non-gate core budget is exhausted, a build lease is denied and the
+# caller (Pulp's governed-build.sh) falls back to a leaseless -j2. On m3 on
+# 2026-09-24 a single 12-core governed build held the whole non-gate budget
+# while the 14-core gate reserve sat idle, so every other agent build on the
+# host ran at -j2. The floor is an OPT-IN, per-host knob that lets such a build
+# instead take a small "floor" lease that runs at background QoS and is NOT
+# charged against any other lease's admission: gate and VM leases admit
+# exactly as if it did not exist. CPU is the only oversubscribed axis, which is
+# what background QoS arbitrates. Memory cannot be arbitrated by QoS, so the
+# pool is clamped to the host's unleased memory headroom (OS headroom + the flat
+# link/LTO reserve) and each floor lease is still checked against the non-gate
+# memory limit. 0 (the default) keeps today's behaviour.
+FLEET_PROFILE_ENV = "TARTCI_FLEET_PROFILE"
+AGENT_FLOOR_KEYS = ("agent_floor_cores", "agent_floor_pool_cores")
+
+
+def fleet_profile_path(path: str | None = None) -> Path:
+    if path:
+        return Path(path).expanduser()
+    return Path(
+        os.environ.get(
+            FLEET_PROFILE_ENV,
+            str(Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"),
+        )
+    ).expanduser()
+
+
+def _parse_host_ints(text: str, keys: tuple[str, ...]) -> dict[str, int]:
+    """Read integer keys from the [host] table.
+
+    tomllib is used when present; the lease store is also launched by a stock
+    python3 (3.9 on these hosts), where a two-key scan of the [host] table is
+    enough. A malformed value is ignored rather than raised: this runs on every
+    lease admission, and a typo in an optional knob must never deny a lease.
+    """
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    values: dict[str, Any] = {}
+    if tomllib is not None:
+        try:
+            values = dict((tomllib.loads(text).get("host") or {}))
+        except (tomllib.TOMLDecodeError, AttributeError):
+            values = {}
+    else:
+        in_host = False
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line.startswith("["):
+                in_host = line == "[host]"
+                continue
+            if in_host and "=" in line:
+                key, _, value = line.partition("=")
+                if key.strip() in keys and value.strip().isdigit():
+                    values[key.strip()] = int(value.strip())
+    return {
+        key: values[key]
+        for key in keys
+        if type(values.get(key)) is int and values[key] >= 0
+    }
+
+
+def agent_floor_settings(fleet_profile: str | None = None) -> tuple[dict[str, int], str]:
+    """Return ({agent_floor_cores, agent_floor_pool_cores}, source).
+
+    Environment variables win over the installed fleet profile so an operator
+    can try the floor on one shell without reinstalling the fleet.
+    """
+    settings: dict[str, int] = {}
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        settings = _parse_host_ints(path.read_text(encoding="utf-8"), AGENT_FLOOR_KEYS)
+        if settings:
+            source = f"file:{path}"
+    except OSError:
+        settings = {}
+    for key in AGENT_FLOOR_KEYS:
+        raw = os.environ.get(f"TARTCI_{key.upper()}")
+        if raw is not None and raw.strip().isdigit():
+            settings[key] = int(raw.strip())
+            source = "environment"
+    return settings, source
+
+
 def _clamp_at_least(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), max(minimum, maximum))
 
@@ -245,6 +333,7 @@ def build_profile(
     model: str | None = None,
     role_file: str | None = None,
     memory_mb: int | None = None,
+    fleet_profile: str | None = None,
 ) -> dict[str, Any]:
     host_cores = cores if cores is not None else detect_cores()
     if host_cores <= 0:
@@ -301,6 +390,19 @@ def build_profile(
         reserved_gate_mem_mb = 0
     non_gate_capacity_mem_mb = max(0, lease_capacity_mem_mb - reserved_gate_mem_mb)
 
+    floor_settings, floor_source = agent_floor_settings(fleet_profile)
+    agent_floor = min(max(0, floor_settings.get("agent_floor_cores", 0)), lease_capacity)
+    agent_floor_pool = floor_settings.get("agent_floor_pool_cores", agent_floor)
+    agent_floor_pool = min(max(agent_floor, agent_floor_pool), lease_capacity)
+    if agent_floor and host_mem_mb > 0:
+        # Floor leases are invisible to other leases' admission, so their memory
+        # can only come out of what no lease is ever granted.
+        unleased_mem_mb = min(host_mem_mb, headroom_mem_mb + link_lto_reserve_mem_mb)
+        agent_floor_pool = min(agent_floor_pool, unleased_mem_mb // PER_COMPILE_JOB_MEM_MB)
+        agent_floor = min(agent_floor, agent_floor_pool)
+    if agent_floor <= 0:
+        agent_floor = agent_floor_pool = 0
+
     return {
         "schema": 2,
         "host": {
@@ -327,6 +429,10 @@ def build_profile(
         "per_compile_job_mem_mb": PER_COMPILE_JOB_MEM_MB,
         "pulp_build_mem_budget_mb": pulp_build_mem_budget_mb,
         "qos": defaults.qos,
+        "agent_floor_cores": agent_floor,
+        "agent_floor_pool_cores": agent_floor_pool,
+        "agent_floor_qos": "background",
+        "agent_floor_source": floor_source,
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
         "notes": [
@@ -351,6 +457,9 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "TARTCI_MACOS_VM_CAP": profile["macos_vm_cap"],
         "TARTCI_AGENT_QOS": profile["qos"],
         "PULP_BUILD_JOBS": profile["pulp_build_jobs"],
+        "TARTCI_AGENT_FLOOR_CORES": profile["agent_floor_cores"],
+        "TARTCI_AGENT_FLOOR_POOL_CORES": profile["agent_floor_pool_cores"],
+        "TARTCI_AGENT_FLOOR_QOS": profile["agent_floor_qos"],
         "TARTCI_HOST_MEM_MB": profile["mem_mb"],
         "TARTCI_LEASE_CAPACITY_MEM_MB": profile["lease_capacity_mem_mb"],
         "TARTCI_GATE_RESERVED_MEM_MB": profile["reserved_gate_mem_mb"],
