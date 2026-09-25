@@ -924,6 +924,37 @@ def write_receipt(
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
 
 
+def apple_signed(path: Path) -> bool:
+    """True when codesign verifies PATH against Apple's own anchor."""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--strict", "-R=anchor apple", str(path)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def interpreter_updated_by_os(
+    interpreter: Path, current: dict, recorded: object, signed=apple_signed
+) -> bool:
+    """A launch-interpreter digest change that a macOS update explains.
+
+    /usr/bin/python3 lives on the sealed system volume, so its bytes change on
+    every macOS update and at no other time. The digest pin would otherwise turn
+    each OS update into `fleet ready: NO` until someone reinstalls. The change
+    is accepted only when path, mode and owner are unchanged, the owner is
+    root, and the new bytes verify against Apple's anchor.
+    """
+    if not isinstance(recorded, dict):
+        return False
+    for key in ("path", "mode", "owner_uid"):
+        if current.get(key) != recorded.get(key):
+            return False
+    return current.get("owner_uid") == 0 and bool(signed(interpreter))
+
+
 def verify_receipt(
     path: Path, config: Path, agents_dir: Path, support_root: Path
 ) -> dict:
@@ -1009,9 +1040,18 @@ def verify_receipt(
         "sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
         "owner_uid": interpreter_info.st_uid,
     }
-    if interpreter.is_symlink() or not interpreter.is_file() \
-            or interpreter_record != support.get("interpreter"):
+    if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter does not match its receipt")
+    recorded_interpreter = support.get("interpreter")
+    if interpreter_record != recorded_interpreter:
+        if not interpreter_updated_by_os(interpreter, interpreter_record, recorded_interpreter):
+            fail("fleet launch interpreter does not match its receipt")
+        receipt["interpreter_note"] = (
+            f"{interpreter} changed since install (sha256 "
+            f"{str((recorded_interpreter or {}).get('sha256', ''))[:12]} -> "
+            f"{interpreter_record['sha256'][:12]}); accepted as an Apple-signed "
+            "macOS update, re-recorded by the next install or self-update"
+        )
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
     expected_persistent = persistent_plist_records(data, agents_dir)
@@ -1704,6 +1744,9 @@ def fleet_readiness(
             "blocked_seconds_threshold": blocked_serving_seconds,
         },
         "problems": problems,
+        # Accepted, self-healing deviations from the receipt (a macOS update
+        # replaced the launch interpreter). Reported, never gating.
+        "notes": [receipt["interpreter_note"]] if receipt.get("interpreter_note") else [],
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
         "config": config_verdicts(config, support_root),

@@ -411,6 +411,23 @@ class RunnerAgentLoadedTests(unittest.TestCase):
             'exec python3 "$HERE/scripts/macos_fleet_lanes.py"', source
         )
 
+    def test_no_toml_reading_helper_is_launched_with_a_bare_python3(self) -> None:
+        """A bare python3 under ssh/launchd is /usr/bin/python3 3.9: a helper
+        that reads the fleet profile then misreports it as absent (pool on
+        refused with "Tart store unavailable")."""
+        import re
+        source = (ROOT / "tartci").read_text()
+        readers = sorted(path.name for path in (ROOT / "scripts").glob("*.py")
+                         if not path.name.startswith("test_")
+                         and "tomllib" in path.read_text())
+        # Control: the fleet profile readers this guards are among them.
+        self.assertIn("network_profile.py", readers)
+        self.assertIn("tartci_launchd_watchdog.py", readers)
+        bare = [name for name in readers
+                if re.search(r'(?<![\w/-])python3 "\$HERE/scripts/' + re.escape(name), source)]
+        self.assertEqual(bare, [])
+        self.assertIn('tartci_toml_python "$HERE/scripts/network_profile.py" reconcile', source)
+
     def _fake_launchctl(self, td: str) -> Path:
         bindir = Path(td) / "bin"
         bindir.mkdir()
