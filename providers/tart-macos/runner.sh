@@ -1994,7 +1994,10 @@ if [ "$LOOP" = 1 ]; then
         event teardown_restart "vm=$CURRENT_VM rc=$run_rc"
         exit 75
       fi
-      [ "$run_rc" = 0 ] || sleep "$POLL"
+      # run_one returned and its VM is gone (checked above): say so before any
+      # backoff, or the last in-run phase (admission-deferred, minting-jit,
+      # job-running) reads as busy for the whole sleep.
+      if [ "$run_rc" = 0 ]; then heartbeat loop; else heartbeat backoff; sleep "$POLL"; fi
       CURRENT_LABELS="$LABELS"
       rm -f "$resv" 2>/dev/null || true; CURRENT_RESV=""
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then

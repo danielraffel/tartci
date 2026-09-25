@@ -1464,14 +1464,16 @@ lane is busy when any of these hold:
   takes its lease and clones BEFORE `tart run` exists, so this is the only
   signal during the clone;
 - its fresh heartbeat (`$TARTCI_STATE_DIR/<runner>.state.json`) names a phase
-  past waiting: `admission-precheck`, `booting`, `ensuring-runner`,
+  past waiting: `booting`, `ensuring-runner`,
   `aqua-preflight`, `chrome-preflight`, `admission-check`,
   `admission-deferred`, `admission-error`, `minting-jit`, `idle-wait`,
   `idle-retarget-check`, `job-running`, `cancel-pending-terminal`. The
   waiting phases (`waiting`, `loop`, `yielding`, `draining`, `stopped`,
   `scan_blind`, `scan_blind_escalated`, `jit-admission-denied`,
-  `vm-lease-denied`, `admission-precheck-deferred`,
-  `admission-precheck-error`) are idle.
+  `vm-lease-denied`, `admission-precheck`, `admission-precheck-deferred`,
+  `admission-precheck-error`, `backoff`) are idle. The supervisor writes
+  `loop` (or `backoff` before its retry sleep) as soon as a work entry
+  returns, so a finished or refused entry does not read busy through the sleep.
 
 This closes the window the 2026-09-22 incident fell into: that lane held its
 lease and had logged "launching JIT runner" (phase `idle-wait`) with no job
@@ -1480,8 +1482,10 @@ max(600 s, 10 x the lane's `TARTCI_VM_POLL`) is stale and ignored, so a
 supervisor that died or wedged after a busy phase, holding no lease and no
 VM, reads idle rather than refusing forever. Unknown refuses: an unreadable
 `launchctl print` (other than "Could not find service"), process table or
-lease store, an unrecognised phase, or a lane whose plist declares a state dir
-with no heartbeat from the running supervisor. Wait for the lane to go idle,
+lease store, or an unrecognised phase. A lane with no heartbeat from its
+running supervisor (one that crash-loops before its first heartbeat, or
+cannot write its state file) reads idle when the process tree and the lease
+store show no VM, so it never blocks `pool off` or a reload. Wait for the lane to go idle,
 or `tartci pool drain`; the explicit
 override that accepts killing the job is `--allow-mid-job`.
 
