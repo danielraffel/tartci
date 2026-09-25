@@ -53,13 +53,42 @@ class InterpreterClassificationTests(unittest.TestCase):
         self.write(build="26A1", current_build="26A1")
         self.assertIsNone(self.evidence())
 
-    def test_old_receipt_uses_system_version_age(self) -> None:
-        self.write(build=None, current_build="26A1")
-        os.utime(self.receipt, (1000, 1000))
-        os.utime(self.version, (2000, 2000))
-        self.assertIn("after the receipt", self.evidence())
-        os.utime(self.version, (500, 500))  # control: OS older than the receipt
-        self.assertIsNone(self.evidence())
+    def _history(self, *entries) -> Path:
+        path = Path(self.td.name) / "InstallHistory.plist"
+        path.write_bytes(plistlib.dumps([
+            {"displayName": name, "displayVersion": version, "date": when,
+             "processName": "softwareupdated"} for name, version, when in entries]))
+        return path
+
+    def test_old_receipt_on_m3_classifies_from_install_history(self) -> None:
+        # m3, 2026-09-25: receipt written Sep 24 19:19Z with no os_build; the
+        # sealed image's SystemVersion.plist is dated Sep 3 (BEFORE the
+        # receipt), and InstallHistory records macOS 27.0 at Sep 25 06:23Z.
+        import datetime as dt
+        self.write(build=None, current_build="26A428")
+        self.version.write_bytes(plistlib.dumps({"ProductBuildVersion": "26A428",
+                                                 "ProductVersion": "27.0"}))
+        receipt_time = dt.datetime(2026, 9, 24, 19, 19, tzinfo=dt.timezone.utc).timestamp()
+        image_time = dt.datetime(2026, 9, 3, 10, 34, tzinfo=dt.timezone.utc).timestamp()
+        os.utime(self.receipt, (receipt_time, receipt_time))
+        os.utime(self.version, (image_time, image_time))
+        history = self._history(
+            ("macOS 26.6.2", "26.6.2", dt.datetime(2026, 8, 21, 8, 31, 50)),
+            ("macOS 27.0", "27.0", dt.datetime(2026, 9, 25, 6, 23, 0)),
+            ("XProtectPayloads", "163", dt.datetime(2026, 9, 25, 7, 17, 20)))
+        with mock.patch.object(fleet, "INSTALL_HISTORY_PLIST", history):
+            evidence = self.evidence()
+        self.assertIn("macOS 27.0", evidence)
+        # Control: the last macOS install predates the receipt (only a data
+        # update came after), so nothing explains the change.
+        history = self._history(
+            ("macOS 27.0", "27.0", dt.datetime(2026, 9, 20, 6, 23, 0)),
+            ("XProtectPayloads", "163", dt.datetime(2026, 9, 25, 7, 17, 20)))
+        with mock.patch.object(fleet, "INSTALL_HISTORY_PLIST", history):
+            self.assertIsNone(self.evidence())
+        # Control: no install history at all.
+        with mock.patch.object(fleet, "INSTALL_HISTORY_PLIST", Path(self.td.name) / "none"):
+            self.assertIsNone(self.evidence())
 
     def test_non_os_interpreter_stays_an_ordinary_mismatch(self) -> None:
         self.write(build="25A1", current_build="26A1")

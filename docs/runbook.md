@@ -1540,17 +1540,28 @@ fleet`), and check GitHub's job history against it with
   present).
 - **A failure never leaves the host off if `pool on` can work.** Every
   failure path ends with `pool on` (three attempts, 15/45/90 s apart). If it
-  still refuses, the running generation is reinstalled from its own commit
-  (rewriting a receipt `pool on` rejects) and `pool on` is tried again. Only
-  if that also fails is the host left OFF, recorded as `host_off` in
-  `last.json` and shown by `pool status`, `doctor fleet` and the watchdog.
+  still refuses (for example a receipt it rejects after a macOS update), the
+  running generation is reinstalled from its own commit and `pool on` is tried
+  again. A reinstall needs the pool off, so a still-draining host is first
+  waited idle and taken off; if it never goes idle it is **undrained** instead
+  (`tartci pool undrain`: re-enables the owned agents drain disabled and
+  reopens admission, installing and verifying nothing), which restores exactly
+  the service it had. A terminated run (launchd SIGKILL pending) only tries
+  `pool on`. The receipt and `last.json` record the real resulting pool state
+  (`pool_state`); anything but on/undrained is `host_off` and is shown by
+  `pool status`, `doctor fleet` and the watchdog. Reinstalling a target that
+  failed verification (because the rollback also failed and it is what the
+  host runs) is written as such in the receipt.
   `pool on` itself now waits up to 45 s for a just-kickstarted persistent
   Actions runner to reach `running` instead of failing on the first read.
 - **macOS updates.** A macOS update replaces `/usr/bin/python3`, so the
   install receipt's interpreter hash stops matching. When the OS-managed
   interpreter changed (still root-owned, same path and mode) and the OS build
   differs from the one the receipt records (`support.os_build`; for older
-  receipts, SystemVersion.plist is newer than the receipt), `pool status`
+  receipts, `/Library/Receipts/InstallHistory.plist` records a "macOS
+  <version>" install of the running version after the receipt was written;
+  SystemVersion.plist's mtime is the sealed image's build date, not the
+  install date, so it cannot say), `pool status`
   reports `interpreter_changed_by_os_update` with its remedy instead of a
   bare `receipt_mismatch`, and `self-update` reinstalls the same generation
   at its next idle window even when current with main. Any other interpreter

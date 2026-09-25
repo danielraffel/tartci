@@ -96,6 +96,7 @@ PERSISTENT_START_GRACE_SECONDS = float(os.environ.get("TARTCI_PERSISTENT_START_G
 PERSISTENT_START_POLL_SECONDS = 2.0
 OS_INTERPRETER = Path("/usr/bin/python3")
 SYSTEM_VERSION_PLIST = Path("/System/Library/CoreServices/SystemVersion.plist")
+INSTALL_HISTORY_PLIST = Path("/Library/Receipts/InstallHistory.plist")
 INTERPRETER_CHANGED_BY_OS_UPDATE = "interpreter_changed_by_os_update"
 
 
@@ -107,6 +108,40 @@ class InterpreterChangedByOSUpdate(ValueError):
     refresh the receipt, which `fleet-macos self-update` does at its next
     idle window.
     """
+
+
+def os_product_version() -> str | None:
+    try:
+        value = plistlib.loads(SYSTEM_VERSION_PLIST.read_bytes()).get("ProductVersion")
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def last_macos_install() -> tuple[float, str] | None:
+    """(UTC time, version) of the newest macOS install in InstallHistory.
+
+    SystemVersion.plist cannot date an install: its mtime is the sealed OS
+    image's build time (m3: Sep 3 for a macOS 27.0 installed Sep 25). The
+    install history records when softwareupdated installed "macOS <version>".
+    Only those entries count; XProtect and other data updates also land there.
+    """
+    try:
+        entries = plistlib.loads(INSTALL_HISTORY_PLIST.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    best = None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name, when = entry.get("displayName"), entry.get("date")
+        if not (isinstance(name, str) and name.startswith("macOS ")
+                and isinstance(when, dt.datetime)):
+            continue
+        stamp = when.replace(tzinfo=dt.timezone.utc).timestamp()
+        if best is None or stamp > best[0]:
+            best = (stamp, str(entry.get("displayVersion") or name[6:]))
+    return best
 
 
 def os_build() -> str | None:
@@ -147,11 +182,17 @@ def interpreter_changed_by_os(receipt_path: Path, recorded: object, current: dic
         if current_build and current_build != recorded_build:
             return f"macOS build {recorded_build} -> {current_build}"
         return None
+    # Receipts written before the build was recorded: a macOS install after
+    # the receipt, of the version now running.
+    install = last_macos_install()
     try:
-        if SYSTEM_VERSION_PLIST.stat().st_mtime > receipt_path.stat().st_mtime:
-            return f"macOS updated to build {current_build or 'unknown'} after the receipt was written"
+        receipt_time = receipt_path.stat().st_mtime
     except OSError:
         return None
+    if install and install[0] > receipt_time and install[1] == os_product_version():
+        return (f"macOS {install[1]} (build {current_build or 'unknown'}) installed "
+                f"{dt.datetime.fromtimestamp(install[0], dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ}, "
+                "after the receipt was written")
     return None
 
 
