@@ -151,8 +151,9 @@ without booting anything; with the knob off it prints `0` and makes no GitHub
 call.
 
 Canary, per decisions contract row 1 (a staged-rollout gate stays conservative
-until graduated): the shipped profiles carry no retarget, so every host is
-unaffected by deploying these bytes. To enable on ONE host, add
+until graduated): only the canary host's profile carries the retarget. The
+canary is m1 (`profiles/m1-macos-fleet.toml`, `pulp-gate`, 120 s); m3 and m5
+carry none and are unaffected by deploying these bytes. To enable on ONE host, add
 `assignment_idle_retarget_seconds = 120` to its `pulp-gate` lane in that host's
 profile, validate and render through the normal `tartci fleet-macos` path, and
 reload its existing supervisors at an idle boundary. Then watch, over at least

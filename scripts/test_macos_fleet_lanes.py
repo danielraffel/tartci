@@ -5,6 +5,7 @@ import plistlib
 import json
 import datetime as dt
 import os
+import re
 import shutil
 import tomllib
 import subprocess
@@ -1654,8 +1655,18 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn(key, result.stderr)
 
+    @staticmethod
+    def _profile_without_idle_retarget() -> str:
+        """The m1 profile with its canary knob removed, so fixtures can inject
+        their own value without a duplicate TOML key."""
+        base, count = re.subn(
+            r"^assignment_idle_retarget_seconds = \d+\n", "", CONFIG.read_text(), flags=re.M
+        )
+        assert count <= 1, count
+        return base
+
     def test_idle_retarget_is_bounded_and_v2_only(self) -> None:
-        base = CONFIG.read_text()
+        base = self._profile_without_idle_retarget()
         key = "assignment_idle_retarget_seconds"
         anchor = "assignment_feed_rescue = true"
         self.assertEqual(base.count(anchor), 1)
@@ -1691,21 +1702,26 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_idle_retarget_renders_only_when_a_profile_opts_in(self) -> None:
-        """Shipped profiles carry no retarget, so the rollout's hosts are
-        unaffected; the canary is one host's profile declaring the knob."""
+        """Only the canary host's profile declares the retarget, and only on
+        its pulp-gate slots; every other shipped host is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
+        canary = {"m1": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))
                 self.assertGreater(len(rendered), 0)
                 for body in rendered.values():
                     env = plistlib.loads(body)["EnvironmentVariables"]
-                    self.assertNotIn(env_key, env)
+                    on_pulp_gate = env["TARTCI_QUEUE_LANE_ID"].startswith(f"{host_id}-pulp-gate")
+                    if host_id in canary and on_pulp_gate:
+                        self.assertEqual(env.get(env_key), canary[host_id])
+                    else:
+                        self.assertNotIn(env_key, env)
                     # Control: the V2 mode itself IS rendered on the pulp slots,
                     # so an absent retarget key is a real absence.
                     if env["TARTCI_QUEUE_LANE_ID"].startswith(f"{host_id}-pulp-gate"):
                         self.assertEqual(env["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
-        base = CONFIG.read_text()
+        base = self._profile_without_idle_retarget()
         anchor = "assignment_feed_rescue = true"
         with tempfile.TemporaryDirectory() as td:
             for value, expected in ((120, "120"), (0, None)):
