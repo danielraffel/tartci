@@ -66,6 +66,12 @@ DEFAULT_WAIT_SECONDS = 90 * 60
 DEFAULT_POLL_SECONDS = 45
 INSTALL_ATTEMPTS = 4
 INSTALL_RETRY_SECONDS = 30
+# Readiness problems that only mean a supervisor loaded by `pool on` has not yet
+# written its first heartbeat; verification re-reads them for a bounded window.
+SETTLING_PROBLEM_CODES = frozenset({"heartbeat_missing", "supervisor_not_running",
+                                    "supervisor_pid_missing"})
+VERIFY_SETTLE_SECONDS = 180
+VERIFY_SETTLE_POLL_SECONDS = 10
 ACTIVE_MARKER_TTL = 3 * 3600
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
@@ -137,6 +143,11 @@ class System:
     def run(self, argv: list[str], *, cwd: str | None = None,
             env: dict[str, str] | None = None, timeout: float = 900) -> Result:
         merged = {**os.environ, **(env or {})}
+        if argv and argv[0] == "python3":
+            # Helpers need tomllib (3.11+). This process was started by
+            # tartci_toml_python, so its interpreter qualifies; a bare python3
+            # on PATH is /usr/bin/python3 (3.9) under ssh and launchd.
+            argv = [sys.executable, *argv[1:]]
         try:
             proc = subprocess.run(argv, cwd=cwd, env=merged, capture_output=True,
                                   text=True, timeout=timeout, check=False)
@@ -1471,8 +1482,12 @@ def _announce(cfg: Config, sys_: System, me: str, target: str) -> None:
             raise Refused(f"peer changed after announcing: {evidence}")
 
 
-def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
+def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool]:
+    """(problems, settling). settling: every problem is a lane that has not yet
+    written its first heartbeat, which a freshly loaded supervisor needs a few
+    seconds to do."""
     problems = []
+    settling = False
     status = installed_tartci(cfg, sys_, "pool", "status", "--json")
     try:
         value = json.loads(status.out)
@@ -1484,7 +1499,11 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
         if value.get("state") != "on" or value.get("participating") is not True:
             problems.append(f"pool is {value.get('state')} after pool on")
         if fleet.get("managed") and fleet.get("fleet_ready") is not True:
-            problems.append(f"fleet not ready: {fleet.get('problems')}")
+            found = fleet.get("problems") or []
+            problems.append(f"fleet not ready: {found}")
+            settling = bool(found) and all(
+                isinstance(p, dict) and p.get("code") in SETTLING_PROBLEM_CODES
+                for p in found)
         if (fleet.get("serving") or {}).get("blocked") is True:
             problems.append("serving BLOCKED")
     try:
@@ -1500,8 +1519,24 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     if guard.rc != 2 or allow.rc != 0:
         problems.append(f"installed `tartci launchd guard` missing or wrong "
                         f"(block={guard.rc}, allow={allow.rc})")
-    if problems:
-        raise Failed(f"verification of {target[:12]}: " + "; ".join(problems))
+    return problems, settling and len(problems) == 1
+
+
+def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
+    """Pool on, fleet ready, executing `target`, guard present.
+
+    Verification runs seconds after `pool on`, before a just-loaded supervisor
+    has written its first heartbeat. A result whose only problem is that is
+    re-read until VERIFY_SETTLE_SECONDS elapse; anything else fails at once.
+    """
+    deadline = sys_.now() + VERIFY_SETTLE_SECONDS
+    while True:
+        problems, settling = _verify_once(cfg, sys_, target)
+        if not problems:
+            break
+        if not settling or sys_.now() >= deadline:
+            raise Failed(f"verification of {target[:12]}: " + "; ".join(problems))
+        sys_.sleep(VERIFY_SETTLE_POLL_SECONDS)
     receipt.step("verify", f"pool on and ready, executing {target[:12]}, guard present")
 
 

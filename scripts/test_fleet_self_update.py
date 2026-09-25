@@ -72,6 +72,8 @@ class FakeSystem(su.System):
                                 "fleet": {"managed": True, "fleet_ready": True,
                                           "serving": {"blocked": False}}}
         self.guard_rcs = (2, 0)
+        self.settling_reads = 0        # status reads that still miss a first heartbeat
+        self.settling_code = "heartbeat_missing"
         self.bundle_commit = None      # what the built bundle claims (default: target)
         self.codesign_verify_rc = 0
         self.installed_after = None    # commit the host executes after install
@@ -232,6 +234,12 @@ class FakeSystem(su.System):
                 return ok(json.dumps({"state": "on", "participating": True,
                                       "fleet": {"managed": True, "fleet_ready": False,
                                                 "problems": ["broken"]}}))
+            if self.settling_reads > 0:
+                self.settling_reads -= 1
+                return ok(json.dumps({"state": "on", "participating": True,
+                                      "fleet": {"managed": True, "fleet_ready": False,
+                                                "problems": [{"code": self.settling_code,
+                                                              "label": "lane"}]}}))
             return ok(json.dumps(self.status_after_on))
         if args[:2] == ["launchd", "guard"]:
             return su.Result(self.guard_rcs[0] if "kickstart" in args[-1] else self.guard_rcs[1])
@@ -684,6 +692,42 @@ class AgentTemplateTests(unittest.TestCase):
         import tartci_launchd_watchdog as wd
         self.assertIn("com.danielraffel.tartci.self-update", wd.UNINTERRUPTIBLE_AGENTS)
         self.assertIn(3, wd.APPLICATION_EXIT_CODES["com.danielraffel.tartci.self-update"])
+
+
+class VerifySettleTests(Base):
+    def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
+        self.sys.settling_reads = 3
+        start = self.sys.clock
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        self.assertEqual(self.last()["status"], "succeeded")
+        self.assertNotEqual(self.sys.running(), INSTALLED)
+        self.assertGreaterEqual(self.sys.clock - start, 3 * su.VERIFY_SETTLE_POLL_SECONDS)
+
+    def test_a_heartbeat_that_never_arrives_still_rolls_back(self) -> None:
+        self.sys.settling_reads = 10_000
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("heartbeat_missing", self.last()["error"])
+
+    def test_a_non_settling_problem_is_not_retried(self) -> None:
+        self.sys.settling_reads = 1
+        self.sys.settling_code = "loaded_receipt_mismatch"
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        reads = [a for a, _ in self.sys.calls if a[-3:] == ["pool", "status", "--json"]]
+        self.assertIn("loaded_receipt_mismatch", self.last()["error"])
+        self.assertLessEqual(len(reads), 3)
+
+
+class SystemRunTests(unittest.TestCase):
+    def test_bare_python3_runs_under_this_interpreter(self) -> None:
+        # A PATH whose python3 is not this interpreter, as under ssh/launchd.
+        with tempfile.TemporaryDirectory() as tmp:
+            shim = Path(tmp) / "python3"
+            shim.write_text("#!/bin/sh\necho path-python3\n")
+            shim.chmod(0o755)
+            result = su.System().run(["python3", "-c", "import sys; print(sys.executable)"],
+                                     env={"PATH": f"{tmp}:/usr/bin:/bin"})
+        self.assertEqual(result.rc, 0, result.err)
+        self.assertEqual(result.out.strip(), sys.executable)
 
 
 class RollbackTests(Base):
