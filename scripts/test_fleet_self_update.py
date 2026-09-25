@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 import time
 import unittest
 from pathlib import Path
@@ -759,6 +760,19 @@ class SystemRunTests(unittest.TestCase):
                                      env={"PATH": f"{tmp}:/usr/bin:/bin"})
         self.assertEqual(result.rc, 0, result.err)
         self.assertEqual(result.out.strip(), sys.executable)
+
+
+class CensusEnvTests(unittest.TestCase):
+    def test_tartci_calls_resolve_this_interpreter_even_from_a_minimal_path(self) -> None:
+        with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin"}, clear=False):
+            os.environ.pop("TARTCI_PYTHON", None)
+            env = su.census_env()
+        self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
+                              env={**os.environ, "PATH": "/usr/bin:/bin", **env},
+                              capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(os.path.realpath(proc.stdout.strip()), os.path.realpath(sys.executable))
 
 
 class RollbackTests(Base):

@@ -651,9 +651,33 @@ def stagger_seconds(host_id: str, window: int = 600) -> int:
 
 # ── capacity floor ─────────────────────────────────────────────────────────
 
+_PYTHON_SHIM_DIR: str | None = None
+
+
+def python_shim_dir() -> str:
+    """A private directory whose `python3` is this interpreter.
+
+    Prepended to PATH for every tartci call, so the installed generation AND an
+    older one being rolled back to (whose shell helpers may call a bare
+    `python3`) resolve the tomllib-capable interpreter this run already uses,
+    not /usr/bin/python3 3.9 from a minimal ssh or launchd PATH.
+    """
+    global _PYTHON_SHIM_DIR
+    if _PYTHON_SHIM_DIR is None or not os.path.isdir(_PYTHON_SHIM_DIR):
+        directory = tempfile.mkdtemp(prefix="tartci-self-update-python-")
+        os.symlink(sys.executable, os.path.join(directory, "python3"))
+        _PYTHON_SHIM_DIR = directory
+    return _PYTHON_SHIM_DIR
+
+
 def census_env() -> dict[str, str]:
-    # The census binds its identity per call (#227); this only pins the CLI.
-    return {"TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp"}
+    # The census binds its identity per call (#227); this also pins the CLI and
+    # the interpreter every tartci helper runs under, including on rollback.
+    return {
+        "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
+        "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
+    }
 
 
 def floor_decision(cfg: Config, sys_: System) -> tuple[bool, str]:
