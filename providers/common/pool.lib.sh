@@ -511,7 +511,7 @@ tartci_pool_mid_job() {
 $labels
 EOF
   [ "${#argv[@]}" -gt 0 ] || return 0
-  python3 "$TARTCI_POOL_LANE_BUSY" "${argv[@]}" || rc=$?
+  python3 "$TARTCI_POOL_LANE_BUSY" --agents-dir "$dir" "${argv[@]}" || rc=$?
   case "$rc" in
     0|1|2) return "$rc" ;;
     *) printf 'lane busy probe failed (exit %s)\n' "$rc"; return 2 ;;
