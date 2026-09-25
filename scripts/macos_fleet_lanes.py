@@ -49,6 +49,7 @@ HOST_KEYS = {
     "current_job_attempt_timeout_seconds",
     "current_job_lifecycle_budget_seconds",
     "ssh",
+    "agent_floor_cores", "agent_floor_pool_cores",
 }
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
@@ -226,6 +227,18 @@ def load(path: Path) -> dict:
             "host.current_job_lifecycle_budget_seconds must be at least "
             "host.current_job_attempt_timeout_seconds"
         )
+    # Opt-in agent core floor (see host_profile.agent_floor_settings). Validated
+    # here so a typo fails the install instead of silently leaving agents at -j2;
+    # the lease store itself treats an unreadable value as "off".
+    agent_floor = host.get("agent_floor_cores")
+    if agent_floor is not None and (type(agent_floor) is not int or not 0 <= agent_floor <= 32):
+        fail("host.agent_floor_cores must be an integer from 0 through 32")
+    agent_floor_pool = host.get("agent_floor_pool_cores")
+    if agent_floor_pool is not None:
+        if type(agent_floor_pool) is not int or not 0 <= agent_floor_pool <= 64:
+            fail("host.agent_floor_pool_cores must be an integer from 0 through 64")
+        if agent_floor_pool < (agent_floor or 0):
+            fail("host.agent_floor_pool_cores must be at least host.agent_floor_cores")
     persistent_labels = host.get("persistent_runner_labels", [])
     if (
         not isinstance(persistent_labels, list)

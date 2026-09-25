@@ -38,6 +38,16 @@ def parse_args(
             type=int,
             help="memory in MB withheld from non-gate leases",
         )
+        command_parser.add_argument(
+            "--agent-floor-cores",
+            type=int,
+            help="override the per-lease agent floor (0 disables floor leases)",
+        )
+        command_parser.add_argument(
+            "--agent-floor-pool-cores",
+            type=int,
+            help="override the host-wide cap on concurrent floor-lease cores",
+        )
         command_parser.add_argument("--gate-priority", type=int, default=priority_classes["gate"])
         command_parser.add_argument("--stale-secs", type=int, default=stale_secs)
         command_parser.add_argument("--role", choices=valid_roles)
@@ -61,6 +71,15 @@ def parse_args(
         help="memory this lease consumes in MB; omitted → cores * per-job estimate",
     )
     acquire_parser.add_argument("--priority", default="build")
+    acquire_parser.add_argument(
+        "--allow-floor",
+        action="store_true",
+        help=(
+            "when a non-gate, non-VM lease is denied on cores, accept a smaller "
+            "floor lease that runs at background QoS and is not charged against "
+            "other leases; the caller must honour the granted size and qos"
+        ),
+    )
     acquire_parser.add_argument("--pid", type=int)
     acquire_parser.add_argument("--id")
     acquire_parser.add_argument("--kind", default="unknown")

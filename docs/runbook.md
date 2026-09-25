@@ -1668,6 +1668,25 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `free_bytes`, `reserved_bytes`, `requested_bytes`, and `required_bytes` for
   diagnosis.
 
+- **Agent core floor (opt-in, default off)** — when the non-gate core budget
+  is full, a build lease is denied and Pulp's `governed-build.sh` falls back to
+  a leaseless `-j2`. Setting `agent_floor_cores` (and optionally
+  `agent_floor_pool_cores`, default equal to it) in a fleet profile's `[host]`
+  table lets a caller that passes `leases acquire --allow-floor` receive a
+  *floor lease* instead: `min(requested, agent_floor_cores, pool remaining)`
+  cores, marked `floor: true` and `qos: background`. Floor leases are excluded
+  from every figure other admissions read (`used_cores`, `non_gate_used_cores`,
+  and both memory totals), so gate, VM and ordinary build leases admit exactly
+  as if they did not exist; they are reported as `floor_used_cores` /
+  `floor_available_cores`. CPU is the only oversubscribed axis, arbitrated by
+  background QoS (the caller must run the build under `taskpolicy -b`). Memory
+  is not oversubscribed: a floor lease must still fit the non-gate memory limit
+  counting every live lease, and the pool is clamped to the host's unleased
+  memory (OS headroom + link/LTO reserve, e.g. 10 jobs on a dedicated builder).
+  Gate and VM requests never take a floor. `TARTCI_AGENT_FLOOR_CORES` /
+  `TARTCI_AGENT_FLOOR_POOL_CORES` override the profile for one shell; `tartci
+  host-profile` exports the effective values.
+
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with
   (`tart set --cpu C --memory M`). A clone otherwise inherits its golden's baked

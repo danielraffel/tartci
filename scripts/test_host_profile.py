@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import host_profile
 
@@ -103,6 +104,47 @@ class HostProfileRoleTests(unittest.TestCase):
         self.assertEqual(encoded["mem_mb"], 16384)
         self.assertEqual(encoded["lease_capacity_mem_mb"], 6144)
         self.assertEqual(encoded["pulp_build_mem_budget_mb"], 6144)
+
+    def test_agent_floor_defaults_off(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}, clear=False):
+            for key in ("TARTCI_AGENT_FLOOR_CORES", "TARTCI_AGENT_FLOOR_POOL_CORES"):
+                os.environ.pop(key, None)
+            profile = host_profile.build_profile(
+                role="dedicated-builder", cores=28, memory_mb=98304,
+                fleet_profile=str(Path(td) / "absent.toml"))
+        self.assertEqual(profile["agent_floor_cores"], 0)
+        self.assertEqual(profile["agent_floor_pool_cores"], 0)
+        self.assertIn("TARTCI_AGENT_FLOOR_CORES=0", host_profile.shell_exports(profile))
+
+    def test_agent_floor_reads_fleet_profile_host_table(self) -> None:
+        with tempfile.TemporaryDirectory() as td, mock.patch.dict(os.environ, {}, clear=False):
+            for key in ("TARTCI_AGENT_FLOOR_CORES", "TARTCI_AGENT_FLOOR_POOL_CORES"):
+                os.environ.pop(key, None)
+            path = Path(td) / "fleet.toml"
+            path.write_text('schema = 1\n[host]\nid = "studio"\nagent_floor_cores = 6\n'
+                            '[[lane]]\nagent_floor_cores = 99\n')
+            profile = host_profile.build_profile(
+                role="dedicated-builder", cores=28, memory_mb=98304, fleet_profile=str(path))
+        self.assertEqual(profile["agent_floor_cores"], 6)
+        self.assertEqual(profile["agent_floor_pool_cores"], 6)
+        self.assertEqual(profile["agent_floor_qos"], "background")
+
+    def test_agent_floor_pool_is_clamped_to_unleased_memory(self) -> None:
+        # dedicated-builder leaves 8 GiB OS headroom + 8 GiB link reserve
+        # unleased: 16384 // 1536 = 10 compile jobs, whatever the knob says.
+        with mock.patch.dict(os.environ, {"TARTCI_AGENT_FLOOR_CORES": "12",
+                                          "TARTCI_AGENT_FLOOR_POOL_CORES": "24"}):
+            profile = host_profile.build_profile(
+                role="dedicated-builder", cores=28, memory_mb=98304,
+                fleet_profile="/nonexistent/fleet.toml")
+        self.assertEqual(profile["agent_floor_pool_cores"], 10)
+        self.assertEqual(profile["agent_floor_cores"], 10)
+
+    def test_agent_floor_fallback_parser_matches_tomllib(self) -> None:
+        text = '[host]\nagent_floor_cores = 6 # six\n[lane]\nagent_floor_pool_cores = 9\n'
+        with mock.patch.dict(sys.modules, {"tomllib": None}):
+            parsed = host_profile._parse_host_ints(text, host_profile.AGENT_FLOOR_KEYS)
+        self.assertEqual(parsed, {"agent_floor_cores": 6})
 
     def test_memory_reserve_mirrors_the_core_reserve(self) -> None:
         """reserved_gate_mem_mb holds the gate's share on the memory axis too.
