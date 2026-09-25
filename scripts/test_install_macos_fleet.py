@@ -1059,6 +1059,17 @@ class InstallMacosFleetTests(unittest.TestCase):
         first_loaded = json.loads(
             (self.home / ".config/tartci/macos-fleet-loaded.json").read_text()
         )
+        # The fake launchctl reports pid 4242 for every loaded lane; give each
+        # lane an idle heartbeat from that supervisor so pool off's mid-job
+        # probe reads it idle, as a real waiting supervisor would.
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        agents_dir = self.home / "Library" / "LaunchAgents"
+        for plist in agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist"):
+            state_dir = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]["TARTCI_STATE_DIR"]
+            Path(state_dir).mkdir(parents=True, exist_ok=True)
+            (Path(state_dir) / "lane.state.json").write_text(json.dumps(
+                {"ts": now, "phase": "waiting", "supervisor_pid": "4242"}))
         stopped = subprocess.run(
             [str(self.bin / "tartci"), "pool", "off"], text=True,
             capture_output=True, check=False, env=self.env,
