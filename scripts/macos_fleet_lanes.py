@@ -159,7 +159,9 @@ def interpreter_changed_by_os(receipt_path: Path, recorded: object, current: dic
     Only the OS-managed /usr/bin/python3, still root-owned with the same mode
     and path, qualifies; and the OS must have changed since the receipt: a
     different build than the receipt recorded, or (receipts written before
-    the build was recorded) a SystemVersion.plist newer than the receipt.
+    the build was recorded) a "macOS <version>" InstallHistory.plist entry
+    dated after the receipt. SystemVersion.plist's mtime is the OS image's
+    build time, not its install time, so it cannot date an update.
     Any other difference stays an ordinary, unexplained mismatch.
     """
     if not isinstance(recorded, dict):
