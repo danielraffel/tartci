@@ -70,7 +70,7 @@ class PhaseTests(unittest.TestCase):
     def test_runner_heartbeat_phases_are_all_classified(self) -> None:
         """Every literal phase runner.sh writes is in exactly one set."""
         source = (ROOT / "providers/tart-macos/runner.sh").read_text()
-        phases = set(re.findall(r"heartbeat ([a-z_-]+)\s*$", source, re.M))
+        phases = set(re.findall(r"heartbeat ([a-z_-]+)\s*(?:;|$)", source, re.M))
         phases |= set(re.findall(r"printf ([a-z_-]+)", " ".join(
             line for line in source.splitlines() if "heartbeat \"$(" in line)))
         self.assertGreater(len(phases), 15)
