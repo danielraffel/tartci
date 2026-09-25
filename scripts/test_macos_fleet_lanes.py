@@ -9,7 +9,6 @@ import re
 import shutil
 import tomllib
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -458,18 +457,6 @@ class MacosFleetLaneTests(unittest.TestCase):
                 value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
             self.assertTrue(value["fleet_ready"])
             self.assertEqual(value["verified_running_supervisors"], 2)
-            self.assertEqual(value["notes"], [])
-            # An interpreter a macOS update replaced is reported, never gating.
-            noted = dict(receipt, interpreter_note="interpreter updated by macOS")
-            with mock.patch.object(fleet, "verify_receipt", return_value=noted), \
-                 mock.patch.object(
-                     fleet.subprocess, "run",
-                     side_effect=[running_one, running_two, process_table, domain],
-                 ), \
-                 mock.patch.object(fleet, "verify_loaded_snapshot", return_value={}):
-                value = fleet.fleet_readiness(*args, participating=True, pool_state="on")
-            self.assertTrue(value["fleet_ready"])
-            self.assertEqual(value["notes"], ["interpreter updated by macOS"])
             # The full readiness path reports config verdicts beside, not in,
             # problems; with no installed profile they are not applicable.
             self.assertEqual(value["config"]["profile_drift"]["state"], "not_applicable")
@@ -1677,32 +1664,6 @@ class MacosFleetLaneTests(unittest.TestCase):
         )
         assert count <= 1, count
         return base
-
-    def test_os_updated_interpreter_is_accepted_only_when_apple_signed(self) -> None:
-        recorded = {"path": "/usr/bin/python3", "mode": 0o755, "owner_uid": 0,
-                    "sha256": "a" * 64}
-        current = dict(recorded, sha256="b" * 64)
-        path = Path("/usr/bin/python3")
-        yes, no = (lambda _p: True), (lambda _p: False)
-        self.assertTrue(fleet.interpreter_updated_by_os(path, current, recorded, signed=yes))
-        # Not Apple-signed: the digest pin still refuses.
-        self.assertFalse(fleet.interpreter_updated_by_os(path, current, recorded, signed=no))
-        # Anything but the bytes changing is not an OS update.
-        for key, value in (("mode", 0o777), ("owner_uid", 501), ("path", "/tmp/python3")):
-            with self.subTest(changed=key):
-                self.assertFalse(fleet.interpreter_updated_by_os(
-                    path, dict(current, **{key: value}), recorded, signed=yes))
-        self.assertFalse(fleet.interpreter_updated_by_os(
-            path, dict(current, owner_uid=501), dict(recorded, owner_uid=501), signed=yes))
-        self.assertFalse(fleet.interpreter_updated_by_os(path, current, None, signed=yes))
-
-    @unittest.skipUnless(sys.platform == "darwin", "codesign is macOS-only")
-    def test_apple_signed_tells_system_binaries_from_others(self) -> None:
-        self.assertTrue(fleet.apple_signed(Path("/usr/bin/python3")))
-        with tempfile.TemporaryDirectory() as td:
-            copy = Path(td) / "python3"
-            copy.write_bytes(b"#!/bin/sh\n")
-            self.assertFalse(fleet.apple_signed(copy))
 
     def test_idle_retarget_is_bounded_and_v2_only(self) -> None:
         base = self._profile_without_idle_retarget()

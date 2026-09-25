@@ -316,6 +316,9 @@ def summary(home: Path | None = None) -> dict:
         problem = f"skew {skew.get('state')}: {skew.get('reason')}"
     elif skew.get("stale"):
         problem = f"{skew.get('behind')} commits behind main since {skew.get('oldest_undeployed')}"
+    if last and last.get("host_off"):
+        off = f"self-update LEFT THIS HOST {str(last.get('pool_state') or 'off').upper()}"
+        problem = f"{problem}; {off}" if problem else off
     if last and last.get("status") in ("failed", "rolled_back"):
         failed = (f"last self-update {last['status'].upper().replace('_', ' ')} for "
                   f"{str(last.get('target'))[:12]}: {last.get('error')}")
@@ -884,7 +887,9 @@ class Receipt:
             return
         _write_json(self.cfg.state_dir / "last.json", {
             "status": status, "target": self.value["target"], "error": error or None,
-            "at": self.value["finished_at"], "receipt": str(self.path)})
+            "at": self.value["finished_at"], "receipt": str(self.path),
+            "host_off": bool(self.value.get("host_off")),
+            "pool_state": self.value.get("pool_state")})
 
 
 def _attempts(state_dir: Path) -> list[tuple[Path, dict]]:
@@ -1083,6 +1088,13 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     if skew["state"] in ("unknown", "diverged"):
         return EXIT_UNKNOWN
     target = skew.get("target")
+    refresh = None
+    if not target and skew["state"] == "current":
+        refresh = refresh_reason(cfg, sys_)
+        if refresh:
+            # Same generation, reinstalled only to rewrite its receipt.
+            target = installed
+            print(f"self-update: same-generation reinstall needed: {refresh}")
     if not target:
         print("self-update: nothing to do" + {
             "soaking": " (undeployed commits are still soaking)",
@@ -1090,6 +1102,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         return EXIT_NOTHING
     receipt = Receipt(cfg, sys_, target, "apply" if apply else "plan")
     receipt.value["previous"] = installed
+    receipt.value["refresh"] = refresh
     try:
         me = self_host_id(cfg)
         if apply:
@@ -1114,7 +1127,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step(name)
         helper = launch_helper(cfg)
         bundle = approval = None
-        if helper is not None:
+        if helper is not None and not refresh:
             with tempfile.TemporaryDirectory() as scratch:
                 identity = extract_signing_identity(sys_, Path(helper["path"]), Path(scratch))
                 signing_probe(sys_, identity, Path(scratch))
@@ -1156,7 +1169,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("capacity-floor", str(exc), ok=False)
         if refusals:
             raise Refused(" | ".join(refusals))
-        if helper is not None and apply:
+        if helper is not None and apply and not refresh:
             # Built only once every cheap gate passed: a refused run must not
             # have spent a signing build, and a rebuild must always be possible.
             builds = cfg.state_dir / "builds"
@@ -1188,6 +1201,27 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.step("refused", message, ok=False)
         receipt.finish("refused", message)
         return EXIT_REFUSED
+
+
+def _state_words(state: str) -> str:
+    return {"on": "on", "undrained": "serving again (undrained)"}.get(state, state.upper())
+
+
+def refresh_reason(cfg: Config, sys_: System) -> str | None:
+    """Why a current host must reinstall its own generation, or None.
+
+    Today: its receipt no longer matches the OS-managed interpreter because
+    macOS was updated (interpreter_changed_by_os_update). Read-only.
+    """
+    status = installed_tartci(cfg, sys_, "pool", "status", "--json")
+    try:
+        problems = (json.loads(status.out).get("fleet") or {}).get("problems") or []
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    for problem in problems:
+        if isinstance(problem, dict) and problem.get("code") == "interpreter_changed_by_os_update":
+            return str(problem.get("detail") or problem["code"])
+    return None
 
 
 def _checkout(cfg: Config, sys_: System, commit: str) -> None:
@@ -1373,6 +1407,8 @@ class Run:
         os.chmod(tmp, 0o600)
         os.replace(tmp, self.pin_path)
 
+    POOL_ON_BACKOFF = (15, 45, 90)
+
     def _pool_on(self) -> bool:
         for attempt in range(1, self.POOL_ON_ATTEMPTS + 1):
             on = installed_tartci(self.cfg, self.sys, "pool", "on")
@@ -1381,8 +1417,94 @@ class Run:
                 return True
             self.receipt.step("pool-on", f"attempt {attempt} failed (exit {on.rc}): {on.text[:300]}",
                               ok=False)
-            self.sys.sleep(10)
+            if attempt < self.POOL_ON_ATTEMPTS:
+                self.sys.sleep(self.POOL_ON_BACKOFF[attempt - 1])
         return False
+
+    def _reinstall_previous(self) -> None:
+        """Reinstall the snapshot generation from its own commit (pin + bundle)."""
+        cfg, sys_ = self.cfg, self.sys
+        _checkout(cfg, sys_, self.previous)
+        result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
+                        "--output", ".tartci-support-manifest.json")
+        if result.rc != 0:
+            raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
+        args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
+                "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
+        if self.helper is not None:
+            self._write_pin((self.snapshot / "approved.sha256").read_text())
+            self.receipt.step("pin-restore", "previous approval restored from the snapshot")
+            args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
+        self._install(args)
+
+    def _pool_state(self) -> str:
+        status = installed_tartci(self.cfg, self.sys, "pool", "status", "--json")
+        try:
+            return str(json.loads(status.out).get("state") or "unknown")
+        except (json.JSONDecodeError, AttributeError):
+            return "unknown"
+
+    def _ensure_on(self, *, allow_reinstall: bool = True) -> str:
+        """Put the host back in service, whatever else failed. Returns the
+        resulting pool state: "on", "undrained", or what the host is left in.
+
+        `pool on` first. If it refuses (e.g. a receipt it rejects after a
+        macOS update), the running generation is reinstalled from its own
+        commit, which rewrites that receipt, and `pool on` is tried again. A
+        reinstall needs the pool off, so a draining host is first waited idle
+        and taken off; if it never goes idle, it is UNDRAINED instead (admission
+        reopened, agents re-enabled), which restores exactly the service it had
+        and never strands it drained. `allow_reinstall=False` (a terminated
+        run, with launchd's SIGKILL pending) tries `pool on` only.
+        """
+        if self._pool_on():
+            return "on"
+        state = self._pool_state()
+        if not allow_reinstall:
+            return self._undrain_or(state)
+        running = self._running()
+        if running not in (self.previous, self.target):
+            return self._undrain_or(state)
+        if state == "draining":
+            try:
+                self._wait_idle()
+                off = tartci(self.cfg, self.sys, "pool", "off", *self.flag)
+                if off.rc != 0:
+                    raise Failed(f"pool off before reinstall failed: {off.text[:200]}")
+            except Failed as exc:
+                self.receipt.step("reinstall-for-pool-on", f"not reinstalled: {exc}", ok=False)
+                return self._undrain_or(self._pool_state())
+        try:
+            if running == self.previous and self.snapshot is not None:
+                self.receipt.step("reinstall-for-pool-on",
+                                  f"pool on refused; reinstalling {self.previous[:12]}")
+                self._reinstall_previous()
+            else:
+                self.receipt.step(
+                    "reinstall-for-pool-on",
+                    f"pool on refused; reinstalling {self.target[:12]}, the generation that "
+                    "FAILED verification, only because it is what this host runs now and "
+                    "serving on it beats leaving the host off")
+                _checkout(self.cfg, self.sys, self.target)
+                manifest = tartci(self.cfg, self.sys, "support-manifest", "write", "--root", ".",
+                                  "--output", ".tartci-support-manifest.json")
+                if manifest.rc != 0:
+                    raise Failed(f"support-manifest for {self.target[:12]}: {manifest.text[:200]}")
+                self._install(self.install_args)
+        except Exception as exc:  # noqa: BLE001 - recorded; the host stays as it is
+            self.receipt.step("reinstall-for-pool-on", f"{type(exc).__name__}: {exc}", ok=False)
+            return self._pool_state()
+        return "on" if self._pool_on() else self._pool_state()
+
+    def _undrain_or(self, state: str) -> str:
+        if state != "draining":
+            return state
+        result = tartci(self.cfg, self.sys, "pool", "undrain")
+        if result.rc == 0:
+            self.receipt.step("undrain", "pool on refused; undrained back to serving")
+            return "undrained"
+        self.receipt.step("undrain", f"failed (exit {result.rc}): {result.text[:200]}", ok=False)
+        return self._pool_state()
 
     # ── recovery ────────────────────────────────────────────────────────
     def _safe_recover(self, reason: str, **kwargs) -> int:
@@ -1401,11 +1523,17 @@ class Run:
                 on = self._pool_on()
             except BaseException:  # noqa: BLE001
                 pass
-            return self._terminal("failed", f"{reason}; RECOVERY INTERRUPTED "
+            return self._terminal("failed", pool_state="on" if on else self._pool_state_quiet(), message=f"{reason}; RECOVERY INTERRUPTED "
                                   f"({type(exc).__name__}: {exc}); host is "
                                   f"{'on' if on else 'possibly OFF'} running "
                                   f"{str(self._running())[:12]}; run `tartci fleet-macos "
                                   "self-update --verify`")
+
+    def _pool_state_quiet(self) -> str:
+        try:
+            return self._pool_state()
+        except BaseException:  # noqa: BLE001
+            return "unknown"
 
     def _repin_to_live(self) -> None:
         """Make the approval pin match whichever launcher bundle is actually live."""
@@ -1426,28 +1554,32 @@ class Run:
     def _recover(self, reason: str, *, refused: bool = False, terminated: bool = False) -> int:
         self.receipt.step("failed", reason, ok=False)
         running = self._running()
+        if terminated:
+            # launchd will SIGKILL soon: no reinstall, no rollback. Get the
+            # host serving and say exactly what it runs.
+            self._repin_to_live()
+            state = self._ensure_on(allow_reinstall=False)
+            return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
+                                  f"{_state_words(state)} running {str(running)[:12]}; run "
+                                  "`tartci fleet-macos self-update --verify` to check it",
+                                  pool_state=state)
         if running == self.previous:
             # Nothing new is installed (the installer rolls its own failure
             # back), so putting the host back is: pin, then pool on.
             if self.pin_moved:
                 self._write_pin((self.snapshot / "approved.sha256").read_text())
                 self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-            if not self._pool_on():
-                return self._terminal("failed", f"{reason}; HOST LEFT OFF: pool on failed "
-                                      f"(generation {self.previous[:12]} is installed)")
+            state = self._ensure_on()
+            if state not in ("on", "undrained"):
+                return self._terminal("failed", f"{reason}; HOST LEFT {state.upper()}: pool on "
+                                      f"failed (generation {self.previous[:12]} is installed)",
+                                      pool_state=state)
             if refused:
+                self.receipt.value["pool_state"] = state
                 self.receipt.finish("refused", reason)
                 return EXIT_REFUSED
-            return self._terminal("failed", f"{reason}; host left on the previous generation "
-                                  f"{self.previous[:12]}")
-        if terminated:
-            # launchd will SIGKILL soon: no time for a full rollback. Get the
-            # host serving and say exactly what it runs.
-            self._repin_to_live()
-            on = self._pool_on()
-            return self._terminal("failed", f"{reason}; NOT rolled back (terminated); host is "
-                                  f"{'on' if on else 'OFF'} running {str(running)[:12]}; run "
-                                  "`tartci fleet-macos self-update --verify` to check it")
+            return self._terminal("failed", f"{reason}; host {_state_words(state)} on the "
+                                  f"previous generation {self.previous[:12]}", pool_state=state)
         return self._rollback(reason)
 
     def _rollback(self, reason: str) -> int:
@@ -1458,33 +1590,26 @@ class Run:
             off = tartci(cfg, sys_, "pool", "off", *self.flag)
             if off.rc != 0:
                 raise Failed(f"pool off for rollback failed: {off.text}")
-            _checkout(cfg, sys_, self.previous)
-            result = tartci(cfg, sys_, "support-manifest", "write", "--root", ".",
-                            "--output", ".tartci-support-manifest.json")
-            if result.rc != 0:
-                raise Failed(f"support-manifest for {self.previous[:12]}: {result.text}")
-            args = ["fleet-macos", "install", str(self.snapshot / "profile.toml"),
-                    "--support-source", ".", "--support-manifest", ".tartci-support-manifest.json"]
-            if self.helper is not None:
-                self._write_pin((self.snapshot / "approved.sha256").read_text())
-                self.receipt.step("pin-restore", "previous approval restored from the snapshot")
-                args += ["--launch-helper-source", str(self.snapshot / "TartCILauncher.app")]
-            self._install(args)
+            self._reinstall_previous()
             self.receipt.step("rollback-install", f"reinstalled {self.previous[:12]}")
             if not self._pool_on():
                 raise Failed("pool on after rollback failed")
             verify(cfg, sys_, self.previous, self.receipt)
         except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
+            # Whatever the rollback's own failure, capacity comes back: a
+            # failed verification is never a reason to leave the host out.
             self._repin_to_live()
-            on = self._pool_on()
+            state = self._ensure_on(allow_reinstall=not isinstance(exc, Terminated))
             return self._terminal("failed", f"{reason}; ROLLBACK FAILED: "
                                   f"{type(exc).__name__}: {exc}; host is "
-                                  f"{'on' if on else 'OFF'} running "
-                                  f"{str(self._running())[:12]}")
+                                  f"{_state_words(state)} running "
+                                  f"{str(self._running())[:12]}", pool_state=state)
         return self._terminal("rolled_back", f"{reason}; rolled back to {self.previous[:12]} "
                               "and verified")
 
-    def _terminal(self, status: str, message: str) -> int:
+    def _terminal(self, status: str, message: str, *, pool_state: str = "on") -> int:
+        self.receipt.value["pool_state"] = pool_state
+        self.receipt.value["host_off"] = pool_state not in ("on", "undrained")
         self.receipt.step(status, message, ok=False)
         self.receipt.finish(status, message)
         print(f"self-update: {status.upper().replace('_', ' ')}: {message}", file=sys.stderr)
@@ -1572,6 +1697,10 @@ def status_lines(state_dir: Path) -> list[str]:
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"
         lines.append(f"self-update: LAST ATTEMPT {word} at {last.get('at')} for "
                      f"{str(last.get('target'))[:12]}: {last.get('error')}")
+    if last and last.get("host_off"):
+        lines.append(f"self-update: THIS HOST WAS LEFT {str(last.get('pool_state') or 'off').upper()} "
+                     "(pool on failed after a failed update); check `tartci pool status`, "
+                     "then `tartci pool on`")
     halted = halt_reason(state_dir)
     if halted:
         lines.append(halted)

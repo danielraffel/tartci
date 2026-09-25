@@ -633,7 +633,7 @@ class PoolCommandHelpTests(unittest.TestCase):
         return proc, launchctl_log, nohup_log
 
     def test_help_is_read_only_for_every_pool_subcommand(self) -> None:
-        for subcommand in (None, "on", "drain", "off", "status", "repair-lock"):
+        for subcommand in (None, "on", "drain", "undrain", "off", "status", "repair-lock"):
             with self.subTest(
                 subcommand=subcommand
             ), tempfile.TemporaryDirectory() as td:
@@ -1113,6 +1113,28 @@ class TransitionOwnershipTests(unittest.TestCase):
             for label in (self.UNOWNED_PERSISTENT, self.UNOWNED_LEGACY):
                 self.assertNotIn(f"bootout gui/{os.getuid()}/{label}", calls)
                 self.assertNotIn(f"disable gui/{os.getuid()}/{label}", calls)
+
+    def test_undrain_reverses_only_a_drain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _, log, env = self._host(
+                root, receipt=self._receipt(self.FLEET_LABEL),
+                labels=(self.FLEET_LABEL, self.UNOWNED_PERSISTENT))
+            # Control: undrain refuses unless the pool is draining.
+            refused = self._pool(env, "undrain")
+            self.assertEqual(refused.returncode, 5)
+            self.assertFalse(log.exists() and "enable" in log.read_text())
+            (root / "state").write_text("draining\n")
+            (root / "participation").write_text("0\n")
+            proc = self._pool(env, "undrain")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual((root / "state").read_text(), "on\n")
+            self.assertEqual((root / "participation").read_text(), "1\n")
+            calls = log.read_text()
+            self.assertIn(f"enable gui/{os.getuid()}/{self.FLEET_LABEL}", calls)
+            self.assertNotIn(self.UNOWNED_PERSISTENT, calls)
+            for verb in ("bootstrap", "bootout", "kickstart"):
+                self.assertNotIn(verb, calls)
 
     def test_pool_off_names_every_runner_it_left_alone(self) -> None:
         # Leaving a lane running is only safe if it is said out loud: the 2026

@@ -92,6 +92,112 @@ NETWORK_PROXY_ENV = {
 }
 
 
+PERSISTENT_START_GRACE_SECONDS = float(os.environ.get("TARTCI_PERSISTENT_START_GRACE_SECS", "45"))
+PERSISTENT_START_POLL_SECONDS = 2.0
+OS_INTERPRETER = Path("/usr/bin/python3")
+SYSTEM_VERSION_PLIST = Path("/System/Library/CoreServices/SystemVersion.plist")
+INSTALL_HISTORY_PLIST = Path("/Library/Receipts/InstallHistory.plist")
+INTERPRETER_CHANGED_BY_OS_UPDATE = "interpreter_changed_by_os_update"
+
+
+class InterpreterChangedByOSUpdate(ValueError):
+    """The OS-managed launch interpreter changed because macOS was updated.
+
+    Kept a refusal (the receipt no longer describes what launchd runs) but
+    named, because the remedy is routine: reinstall the same generation to
+    refresh the receipt, which `fleet-macos self-update` does at its next
+    idle window.
+    """
+
+
+def os_product_version() -> str | None:
+    try:
+        value = plistlib.loads(SYSTEM_VERSION_PLIST.read_bytes()).get("ProductVersion")
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def last_macos_install() -> tuple[float, str] | None:
+    """(UTC time, version) of the newest macOS install in InstallHistory.
+
+    SystemVersion.plist cannot date an install: its mtime is the sealed OS
+    image's build time (m3: Sep 3 for a macOS 27.0 installed Sep 25). The
+    install history records when softwareupdated installed "macOS <version>".
+    Only those entries count; XProtect and other data updates also land there.
+    """
+    try:
+        entries = plistlib.loads(INSTALL_HISTORY_PLIST.read_bytes())
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    best = None
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name, when = entry.get("displayName"), entry.get("date")
+        if not (isinstance(name, str) and name.startswith("macOS ")
+                and isinstance(when, dt.datetime)):
+            continue
+        stamp = when.replace(tzinfo=dt.timezone.utc).timestamp()
+        if best is None or stamp > best[0]:
+            best = (stamp, str(entry.get("displayVersion") or name[6:]))
+    return best
+
+
+def os_build() -> str | None:
+    """This host's macOS build (sw_vers -buildVersion), or None off macOS."""
+    try:
+        value = plistlib.loads(SYSTEM_VERSION_PLIST.read_bytes()).get("ProductBuildVersion")
+    except (OSError, plistlib.InvalidFileException, ValueError):
+        return None
+    return value if isinstance(value, str) and value else None
+
+
+def interpreter_changed_by_os(receipt_path: Path, recorded: object, current: dict) -> str | None:
+    """Evidence that an interpreter mismatch is an OS update, or None.
+
+    Only the OS-managed /usr/bin/python3, still root-owned with the same mode
+    and path, qualifies; and the OS must have changed since the receipt: a
+    different build than the receipt recorded, or (receipts written before
+    the build was recorded) a "macOS <version>" InstallHistory.plist entry
+    dated after the receipt. SystemVersion.plist's mtime is the OS image's
+    build time, not its install time, so it cannot date an update.
+    Any other difference stays an ordinary, unexplained mismatch.
+    """
+    if not isinstance(recorded, dict):
+        return None
+    same_identity = (
+        recorded.get("path") == current.get("path") == str(OS_INTERPRETER)
+        and recorded.get("owner_uid") == current.get("owner_uid") == 0
+        and recorded.get("mode") == current.get("mode")
+        and recorded.get("sha256") != current.get("sha256")
+    )
+    if not same_identity:
+        return None
+    try:
+        receipt = json.loads(receipt_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    recorded_build = (receipt.get("support") or {}).get("os_build")
+    current_build = os_build()
+    if recorded_build:
+        if current_build and current_build != recorded_build:
+            return f"macOS build {recorded_build} -> {current_build}"
+        return None
+    # Receipts written before the build was recorded: a macOS install after
+    # the receipt, of the version now running.
+    install = last_macos_install()
+    try:
+        receipt_time = receipt_path.stat().st_mtime
+    except OSError:
+        return None
+    if install and install[0] > receipt_time and install[1] == os_product_version():
+        return (f"macOS {install[1]} (build {current_build or 'unknown'}) installed "
+                f"{dt.datetime.fromtimestamp(install[0], dt.timezone.utc):%Y-%m-%dT%H:%M:%SZ}, "
+                "after the receipt was written")
+    return None
+
+
 def fail(message: str) -> None:
     raise ValueError(message)
 
@@ -914,6 +1020,8 @@ def write_receipt(
             "entrypoint": wrapper,
             "launch_entrypoint": launch,
             "interpreter": interpreter_record,
+            # Lets a later interpreter mismatch be attributed to an OS update.
+            "os_build": os_build(),
             "source_authority": {
                 "kind": "github_app_commit_read",
                 "repository": support["repository"],
@@ -922,37 +1030,6 @@ def write_receipt(
         },
     }
     output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n")
-
-
-def apple_signed(path: Path) -> bool:
-    """True when codesign verifies PATH against Apple's own anchor."""
-    try:
-        result = subprocess.run(
-            ["/usr/bin/codesign", "--verify", "--strict", "-R=anchor apple", str(path)],
-            capture_output=True, text=True, timeout=30, check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    return result.returncode == 0
-
-
-def interpreter_updated_by_os(
-    interpreter: Path, current: dict, recorded: object, signed=apple_signed
-) -> bool:
-    """A launch-interpreter digest change that a macOS update explains.
-
-    /usr/bin/python3 lives on the sealed system volume, so its bytes change on
-    every macOS update and at no other time. The digest pin would otherwise turn
-    each OS update into `fleet ready: NO` until someone reinstalls. The change
-    is accepted only when path, mode and owner are unchanged, the owner is
-    root, and the new bytes verify against Apple's anchor.
-    """
-    if not isinstance(recorded, dict):
-        return False
-    for key in ("path", "mode", "owner_uid"):
-        if current.get(key) != recorded.get(key):
-            return False
-    return current.get("owner_uid") == 0 and bool(signed(interpreter))
 
 
 def verify_receipt(
@@ -980,11 +1057,13 @@ def verify_receipt(
     if not config.is_file() or not agents_dir.is_dir():
         fail("install receipt config_path and agents_dir must exist")
     support = receipt.get("support")
-    if not isinstance(support, dict) or set(support) != {
+    support_keys = {
         "root", "manifest_path", "manifest_sha256", "repository", "source_commit",
         "members", "entrypoint", "launch_entrypoint", "interpreter",
         "source_authority",
-    }:
+    }
+    if not isinstance(support, dict) or set(support) not in (
+            support_keys, support_keys | {"os_build"}):
         fail("install receipt support cohort is missing or malformed")
     if Path(str(support.get("root", ""))).resolve() != support_root:
         fail("install receipt support root does not match the active TartCI root")
@@ -1040,18 +1119,17 @@ def verify_receipt(
         "sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
         "owner_uid": interpreter_info.st_uid,
     }
-    if interpreter.is_symlink() or not interpreter.is_file():
+    if interpreter.is_symlink() or not interpreter.is_file() \
+            or interpreter_record != support.get("interpreter"):
+        evidence = None if interpreter.is_symlink() else interpreter_changed_by_os(
+            path, support.get("interpreter"), interpreter_record)
+        if evidence:
+            raise InterpreterChangedByOSUpdate(
+                f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
+                f"with a macOS update ({evidence}), so the receipt no longer describes it; "
+                "remedy: reinstall the same generation to refresh the receipt "
+                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
-    recorded_interpreter = support.get("interpreter")
-    if interpreter_record != recorded_interpreter:
-        if not interpreter_updated_by_os(interpreter, interpreter_record, recorded_interpreter):
-            fail("fleet launch interpreter does not match its receipt")
-        receipt["interpreter_note"] = (
-            f"{interpreter} changed since install (sha256 "
-            f"{str((recorded_interpreter or {}).get('sha256', ''))[:12]} -> "
-            f"{interpreter_record['sha256'][:12]}); accepted as an Apple-signed "
-            "macOS update, re-recorded by the next install or self-update"
-        )
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
     expected_persistent = persistent_plist_records(data, agents_dir)
@@ -1306,18 +1384,29 @@ def verify_loaded(
     persistent_loaded: dict[str, str] = {}
     for name in receipt.get("persistent_plists", {}):
         label = name.removesuffix(".plist")
-        try:
-            result = subprocess.run(
-                ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
-                text=True, capture_output=True, check=False, timeout=5,
-            )
-        except subprocess.TimeoutExpired as exc:
-            fail(f"timed out reading loaded persistent LaunchAgent {label}: {exc}")
-        if result.returncode != 0:
-            fail(
-                f"could not read loaded persistent LaunchAgent {label}: "
-                f"{result.stderr.strip() or result.stdout.strip()}"
-            )
+        # `pool on` kickstarts a persistent Actions service moments before
+        # this check; its listener takes seconds to reach `state = running`.
+        # Reading it once raced that start and failed `pool on` (m5,
+        # 2026-09-25), which then closed admission. Wait a bounded time for
+        # it to run; any other difference still fails on the last read.
+        deadline = time.monotonic() + PERSISTENT_START_GRACE_SECONDS
+        while True:
+            try:
+                result = subprocess.run(
+                    ["launchctl", "print", f"gui/{os.getuid()}/{label}"],
+                    text=True, capture_output=True, check=False, timeout=5,
+                )
+            except subprocess.TimeoutExpired as exc:
+                fail(f"timed out reading loaded persistent LaunchAgent {label}: {exc}")
+            if result.returncode != 0:
+                fail(
+                    f"could not read loaded persistent LaunchAgent {label}: "
+                    f"{result.stderr.strip() or result.stdout.strip()}"
+                )
+            if re.search(r"^\s*state = running\s*$", result.stdout, re.MULTILINE) \
+                    or time.monotonic() >= deadline:
+                break
+            time.sleep(PERSISTENT_START_POLL_SECONDS)
         persistent_loaded[name] = _verify_persistent_loaded_output(
             name, (agents_dir / name).read_bytes(), result.stdout, agents_dir
         )
@@ -1437,7 +1526,9 @@ def fleet_readiness(
                 "streak_threshold": blocked_serving_streak,
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
-            "problems": [{"code": "receipt_mismatch", "detail": str(exc)}],
+            "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
+                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }
 
@@ -1744,9 +1835,6 @@ def fleet_readiness(
             "blocked_seconds_threshold": blocked_serving_seconds,
         },
         "problems": problems,
-        # Accepted, self-healing deviations from the receipt (a macOS update
-        # replaced the launch interpreter). Reported, never gating.
-        "notes": [receipt["interpreter_note"]] if receipt.get("interpreter_note") else [],
         # Reported beside `problems`, not in it: fleet_ready gates callers,
         # and refusing on configuration drift would turn it into an outage.
         "config": config_verdicts(config, support_root),

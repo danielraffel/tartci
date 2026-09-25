@@ -1464,14 +1464,16 @@ lane is busy when any of these hold:
   takes its lease and clones BEFORE `tart run` exists, so this is the only
   signal during the clone;
 - its fresh heartbeat (`$TARTCI_STATE_DIR/<runner>.state.json`) names a phase
-  past waiting: `admission-precheck`, `booting`, `ensuring-runner`,
+  past waiting: `booting`, `ensuring-runner`,
   `aqua-preflight`, `chrome-preflight`, `admission-check`,
   `admission-deferred`, `admission-error`, `minting-jit`, `idle-wait`,
   `idle-retarget-check`, `job-running`, `cancel-pending-terminal`. The
   waiting phases (`waiting`, `loop`, `yielding`, `draining`, `stopped`,
   `scan_blind`, `scan_blind_escalated`, `jit-admission-denied`,
-  `vm-lease-denied`, `admission-precheck-deferred`,
-  `admission-precheck-error`) are idle.
+  `vm-lease-denied`, `admission-precheck`, `admission-precheck-deferred`,
+  `admission-precheck-error`, `backoff`) are idle. The supervisor writes
+  `loop` (or `backoff` before its retry sleep) as soon as a work entry
+  returns, so a finished or refused entry does not read busy through the sleep.
 
 This closes the window the 2026-09-22 incident fell into: that lane held its
 lease and had logged "launching JIT runner" (phase `idle-wait`) with no job
@@ -1480,8 +1482,10 @@ max(600 s, 10 x the lane's `TARTCI_VM_POLL`) is stale and ignored, so a
 supervisor that died or wedged after a busy phase, holding no lease and no
 VM, reads idle rather than refusing forever. Unknown refuses: an unreadable
 `launchctl print` (other than "Could not find service"), process table or
-lease store, an unrecognised phase, or a lane whose plist declares a state dir
-with no heartbeat from the running supervisor. Wait for the lane to go idle,
+lease store, or an unrecognised phase. A lane with no heartbeat from its
+running supervisor (one that crash-loops before its first heartbeat, or
+cannot write its state file) reads idle when the process tree and the lease
+store show no VM, so it never blocks `pool off` or a reload. Wait for the lane to go idle,
 or `tartci pool drain`; the explicit
 override that accepts killing the job is `--allow-mid-job`.
 
@@ -1534,6 +1538,35 @@ fleet`), and check GitHub's job history against it with
   reconcile, `pool on` through the installed shim, verify (pool on and fleet
   ready, serving not blocked, executed commit == target, `launchd guard`
   present).
+- **A failure never leaves the host off if `pool on` can work.** Every
+  failure path ends with `pool on` (three attempts, 15/45/90 s apart). If it
+  still refuses (for example a receipt it rejects after a macOS update), the
+  running generation is reinstalled from its own commit and `pool on` is tried
+  again. A reinstall needs the pool off, so a still-draining host is first
+  waited idle and taken off; if it never goes idle it is **undrained** instead
+  (`tartci pool undrain`: re-enables the owned agents drain disabled and
+  reopens admission, installing and verifying nothing), which restores exactly
+  the service it had. A terminated run (launchd SIGKILL pending) only tries
+  `pool on`. The receipt and `last.json` record the real resulting pool state
+  (`pool_state`); anything but on/undrained is `host_off` and is shown by
+  `pool status`, `doctor fleet` and the watchdog. Reinstalling a target that
+  failed verification (because the rollback also failed and it is what the
+  host runs) is written as such in the receipt.
+  `pool on` itself now waits up to 45 s for a just-kickstarted persistent
+  Actions runner to reach `running` instead of failing on the first read.
+- **macOS updates.** A macOS update replaces `/usr/bin/python3`, so the
+  install receipt's interpreter hash stops matching. When the OS-managed
+  interpreter changed (still root-owned, same path and mode) and the OS build
+  differs from the one the receipt records (`support.os_build`; for older
+  receipts, `/Library/Receipts/InstallHistory.plist` records a "macOS
+  <version>" install of the running version after the receipt was written;
+  SystemVersion.plist's mtime is the sealed image's build date, not the
+  install date, so it cannot say), `pool status`
+  reports `interpreter_changed_by_os_update` with its remedy instead of a
+  bare `receipt_mismatch`, and `self-update` reinstalls the same generation
+  at its next idle window even when current with main. Any other interpreter
+  difference is still an unexplained mismatch and fails closed. Until the
+  reinstall, `pool on` on that host still refuses.
 - **Rollback.** A failure before anything new is installed (the installer
   rolls its own failure back) restores the pin and runs `pool on`. A failure
   **after** a successful install (relay, pool on, verify) rolls back: wait for
