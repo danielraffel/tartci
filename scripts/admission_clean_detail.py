@@ -59,6 +59,11 @@ def detail(envelope: Any, limit: int) -> str:
     if not isinstance(reason, str) or not REASON_PATTERN.fullmatch(reason):
         reason = "unknown"
     rendered = f"reason={reason}"
+    waits = envelope.get("tartci_contention_waits")
+    if type(waits) is int and waits > 0:
+        # A refusal after waiting out another caller's observation reads very
+        # differently from an instant one; say which.
+        rendered = f"{rendered} contention_waits={waits}"
     error = bounded_error(envelope.get("error"), limit)
     if error:
         rendered = f"{rendered} error={error}"
