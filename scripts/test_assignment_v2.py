@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import plistlib
 import re
 import signal
 import socket
@@ -959,6 +960,117 @@ class ReleaseClassTests(RunnerFixture, unittest.TestCase):
         self._declare_release_classes()
         self._state(release=True)
         self.assertEqual(self._select()[2], "2")
+
+
+class M5ReleaseFirstIdleRetargetTests(RunnerFixture, unittest.TestCase):
+    """Idle retarget on the shipped m5 pulp-gate slots.
+
+    The class-shaping environment is taken from the rendered m5 profile, not
+    restated, so a change to the shipped order is a change to these verdicts.
+    Configured tiers are merge-group (0), PR-head (1), release-tagged (2) and
+    release PR gate (3). Slot 2's order puts tagged releases first; slot 1 keeps
+    the configured gate-first order and is the control on every identical queue.
+    """
+
+    PROFILE = ROOT / "profiles" / "m5-macos-fleet.toml"
+    FLEET = ROOT / "scripts" / "macos_fleet_lanes.py"
+    SHAPING = ("TARTCI_RUNNER_WORKFLOW_TIERS", "TARTCI_ASSIGNMENT_V2_CLASS_LABELS",
+               "TARTCI_ASSIGNMENT_V2_TIER_ORDER")
+
+    def setUp(self) -> None:
+        super().setUp()
+        spec = spec_from_file_location("macos_fleet_lanes_m5_retarget", self.FLEET)
+        assert spec is not None and spec.loader is not None
+        fleet = module_from_spec(spec)
+        spec.loader.exec_module(fleet)
+        self.slots = {}
+        for name, body in fleet.rendered_plists(fleet.load(self.PROFILE)).items():
+            for slot, suffix in ((1, ".m5.pulp-gate.plist"), (2, ".m5.pulp-gate.slot2.plist")):
+                if name.endswith(suffix):
+                    self.slots[slot] = plistlib.loads(body)["EnvironmentVariables"]
+        self.assertEqual(sorted(self.slots), [1, 2])
+        self.assertNotIn("TARTCI_ASSIGNMENT_V2_TIER_ORDER", self.slots[1])
+        self.assertTrue(self.slots[2]["TARTCI_ASSIGNMENT_V2_TIER_ORDER"]
+                        .startswith("pulp-release-tagged,"))
+        self.env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = "120"
+
+    def _on_slot(self, slot: int) -> None:
+        for key in self.SHAPING:
+            self.env.pop(key, None)
+            if key in self.slots[slot]:
+                self.env[key] = self.slots[slot][key]
+
+    def _retargets(self) -> list[str]:
+        log = self.root / "state" / "events.jsonl"
+        if not log.exists():
+            return []
+        return [line for line in log.read_text(encoding="utf-8").splitlines()
+                if '"event":"assignment_v2_idle_retarget"' in line]
+
+    def _decide(self, slot: int, tier: str, **queue: bool) -> tuple[str, str]:
+        """Verdict for an idle tier-`tier` runner on `slot`, plus the retarget
+        event's destination (empty when held)."""
+        self._on_slot(slot)
+        self._state(**queue)
+        before = len(self._retargets())
+        result = self._runner("--print-idle-retarget", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        events = self._retargets()[before:]
+        dest = ""
+        if events:
+            self.assertEqual(len(events), 1, events)
+            dest = re.search(r"to_label=(\S+)", events[0]).group(1)
+        return result.stdout.strip(), dest
+
+    def _selected_tier(self, slot: int, **queue: bool) -> str:
+        self._on_slot(slot)
+        self._state(**queue)
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = result.stdout.strip().split("\t")
+        self.assertEqual(fields[0], "1", fields)
+        return fields[2]
+
+    def test_idle_gate_runner_on_slot2_retargets_to_a_waiting_release_first(self) -> None:
+        """A parked gate runner whose own class emptied retargets to the tagged
+        release before the other gate class, and the slot then boots it. Slot 1,
+        on the identical queue, retargets to the other gate class instead."""
+        cases = (
+            ("0", {"release": True, "pr": True}, "pulp-build-pr-head"),
+            ("1", {"release": True, "merge": True}, "pulp-build-merge-group"),
+            ("0", {"release": True, "pr": True, "release_pr": True}, "pulp-build-pr-head"),
+        )
+        for tier, queue, slot1_dest in cases:
+            with self.subTest(tier=tier, queue=queue):
+                self.assertEqual(self._decide(2, tier, **queue),
+                                 ("1", "pulp-release-tagged"))
+                self.assertEqual(self._selected_tier(2, **queue), "2")
+                # Control: slot 1's gate-first order on the same queue.
+                self.assertEqual(self._decide(1, tier, **queue), ("1", slot1_dest))
+
+    def test_idle_release_runner_on_slot2_serves_gate_work_when_no_release_waits(self) -> None:
+        """The order is a preference, not a reservation: an idle release runner
+        with no release queued goes back to gate work in the slot's own order."""
+        cases = (
+            ("2", {"merge": True, "pr": True}, "pulp-build-merge-group", "0"),
+            ("2", {"pr": True}, "pulp-build-pr-head", "1"),
+            ("3", {"pr": True}, "pulp-build-pr-head", "1"),
+            ("3", {"merge": True, "pr": True}, "pulp-build-merge-group", "0"),
+        )
+        for tier, queue, dest, selected in cases:
+            with self.subTest(tier=tier, queue=queue):
+                self.assertEqual(self._decide(2, tier, **queue), ("1", dest))
+                self.assertEqual(self._selected_tier(2, **queue), selected)
+
+    def test_idle_release_runner_is_held_while_its_release_waits(self) -> None:
+        """A tagged-release runner is about to be assigned while a tagged
+        release waits, whatever gate work is also queued."""
+        for queue in ({"release": True}, {"release": True, "merge": True, "pr": True}):
+            with self.subTest(queue=queue):
+                self.assertEqual(self._decide(2, "2", **queue), ("0", ""))
+        # Control: the same runner once the release has been taken.
+        self.assertEqual(self._decide(2, "2", merge=True, pr=True),
+                         ("1", "pulp-build-merge-group"))
 
 
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):

@@ -326,6 +326,106 @@ class LeasePriorityTests(LeaseCliTestCase):
         self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
 
 
+
+class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):
+    """Release classes on m5's pulp-gate slots cannot evict or starve slot 1.
+
+    The lease priorities come from the shell helper applied to the labels the
+    rendered m5 profile registers, so this pins the shipped path end to end.
+    The host is sized for exactly two gate guests (the macOS guest cap is 2 and
+    each supervisor slot holds at most one lease). Admission is one-shot: there
+    is no waiter queue and no preemption, and a priority at or above the gate
+    class only lifts the non-gate budget. So a tagged release at 120 on slot 2
+    occupies exactly what a merge-group guest on slot 2 would, and the release
+    PR gate at 90 cannot reach the gate reserve at all.
+    """
+
+    ROOT = Path(__file__).resolve().parents[1]
+    HELPER = ROOT / "providers" / "common" / "vm-lease.lib.sh"
+    GUEST, CAPACITY, RESERVED = 12, 24, 12
+    CLASSES = ("pulp-build-merge-group", "pulp-build-pr-head",
+               "pulp-release-tagged", "pulp-release-pr-gate")
+
+    def setUp(self) -> None:
+        super().setUp()
+        import plistlib
+        import macos_fleet_lanes as fleet
+
+        rendered = fleet.rendered_plists(
+            fleet.load(self.ROOT / "profiles" / "m5-macos-fleet.toml"))
+        slot2 = [body for name, body in rendered.items()
+                 if name.endswith(".m5.pulp-gate.slot2.plist")]
+        self.assertEqual(len(slot2), 1)
+        env = plistlib.loads(slot2[0])["EnvironmentVariables"]
+        self.assertEqual(env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"], ",".join(self.CLASSES))
+        script = "set -euo pipefail\nsource \"$1\"\nshift\nfor l; do tartci_vm_lease_priority \"$l\"; echo; done\n"
+        proc = subprocess.run(
+            ["bash", "-c", script, "priority", str(self.HELPER),
+             *(f"{env['TARTCI_RUNNER_LABELS']},{cls}" for cls in self.CLASSES)],
+            text=True, capture_output=True, check=False,
+            env={k: v for k, v in os.environ.items() if k != "TARTCI_VM_LEASE_PRIORITY"},
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.prio = dict(zip(("merge", "pr", "tagged", "pr_gate"), proc.stdout.split()))
+        self.assertEqual(self.prio, {"merge": "110", "pr": "100", "tagged": "120", "pr_gate": "90"})
+
+    def _take(self, lease_id: str, klass: str, cores: int | None = None,
+              check: bool = True) -> subprocess.CompletedProcess[str]:
+        return self.acquire(lease_id, cores or self.GUEST, priority=self.prio[klass],
+                            capacity=self.CAPACITY, reserved=self.RESERVED, check=check)
+
+    def _held(self) -> list[str]:
+        return sorted(row["id"] for row in json.loads(self.run_cli("status").stdout)["leases"])
+
+    def test_tagged_release_admits_exactly_like_merge_group(self) -> None:
+        """120 vs 110 is indistinguishable to admission on every occupancy a
+        two-slot host can be in: the higher number buys status order only."""
+        occupancies = ((), ("merge",), ("pr",), ("tagged",), ("pr_gate",),
+                       ("merge", "pr"), ("tagged", "pr"), ("pr_gate", "merge"))
+        base = self.store
+        for n, held in enumerate(occupancies):
+            verdicts = {}
+            for klass in ("tagged", "merge"):
+                self.store = base.with_name(f"occ-{n}-{klass}")
+                for i, occupant in enumerate(held):
+                    self._take(f"held-{i}", occupant)
+                verdicts[klass] = self._take("probe", klass, check=False).returncode
+            with self.subTest(held=held):
+                self.assertEqual(verdicts["tagged"], verdicts["merge"])
+        self.store = base
+
+    def test_booting_release_on_slot2_leaves_slot1_its_gate_guest(self) -> None:
+        for gate in ("merge", "pr"):
+            with self.subTest(slot1=gate):
+                self.store = self.store.with_name(f"slot1-{gate}")
+                self._take("slot2-release", "tagged")
+                body = json.loads(self._take("slot1-gate", gate).stdout)
+                self.assertTrue(body["ok"])
+                self.assertEqual(body["capacity"]["used_cores"], self.CAPACITY)
+
+    def test_release_never_preempts_running_gate_guests(self) -> None:
+        """Both slots busy with gate work: a waiting release is refused and
+        both gate leases are untouched. Nothing a release does can take capacity
+        a running guest holds."""
+        self._take("slot1-gate", "pr")
+        self._take("slot2-gate", "merge")
+        denied = self._take("slot2-release", "tagged", check=False)
+        self.assertEqual(denied.returncode, 75)
+        self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
+        self.assertEqual(self._held(), ["slot1-gate", "slot2-gate"])
+
+    def test_release_pr_gate_cannot_reach_the_gate_reserve(self) -> None:
+        """The release PR gate is non-gate work: it draws only from the non-gate
+        budget, so slot 1 keeps the reserve even with it running on slot 2."""
+        self._take("slot2-release-pr", "pr_gate")
+        extra = self._take("extra-release-pr", "pr_gate", cores=1, check=False)
+        self.assertEqual(extra.returncode, 75)
+        self.assertEqual(json.loads(extra.stdout)["reason"], "capacity_exceeded")
+        body = json.loads(self._take("slot1-gate", "merge").stdout)
+        self.assertTrue(body["ok"])
+        self.assertEqual(self._held(), ["slot1-gate", "slot2-release-pr"])
+
+
 class LeaseStoreIntegrityTests(LeaseCliTestCase):
     def test_corrupt_store_fails_closed(self) -> None:
         self.store.mkdir(parents=True)
