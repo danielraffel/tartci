@@ -73,7 +73,8 @@ LANE_KEYS = {
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
-    "yield_max_wait_seconds",
+    "yield_max_wait_seconds", "fallback_preferred_hosts",
+    "fallback_peer_max_age_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -598,6 +599,30 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: assignment_idle_retarget_seconds must be 0 "
                 "or an integer from 60 through 3600 on an event-class-v2 lane"
+            )
+        fallback_hosts = lane.get("fallback_preferred_hosts")
+        if fallback_hosts is not None and (
+                assignment_mode != "event-class-v2"
+                or not isinstance(fallback_hosts, list)
+                or not fallback_hosts
+                or not all(isinstance(value, str) and SAFE_ID.fullmatch(value)
+                           for value in fallback_hosts)
+                or len(fallback_hosts) != len(set(fallback_hosts))
+                or host["id"] in fallback_hosts
+                or not lane.get("min_queued_age_seconds")):
+            fail(
+                f"lane {lane_id}: fallback_preferred_hosts must be a non-empty "
+                "list of other fleet host ids on an event-class-v2 lane with "
+                "min_queued_age_seconds > 0"
+            )
+        fallback_age = lane.get("fallback_peer_max_age_seconds")
+        if fallback_age is not None and (
+                fallback_hosts is None
+                or type(fallback_age) is not int
+                or not 30 <= fallback_age <= 300):
+            fail(
+                f"lane {lane_id}: fallback_peer_max_age_seconds must be an "
+                "integer from 30 through 300 beside fallback_preferred_hosts"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -1945,6 +1970,24 @@ def atomic_write_json(path: Path, value: dict) -> None:
         staged.unlink(missing_ok=True)
 
 
+def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
+    """The SSH target a fallback lane reaches a preferred host by.
+
+    The same rule self-update uses for its peers: the host's published
+    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    convention. Resolved at render time, so the LaunchAgent carries the exact
+    target and the supervisor never re-reads profiles.
+    """
+    for path in sorted((profiles_dir or DEFAULT_PROFILES_DIR).glob("*-macos-fleet.toml")):
+        try:
+            host = tomllib.loads(path.read_text(encoding="utf-8")).get("host") or {}
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        if host.get("id") == host_id and isinstance(host.get("ssh"), str):
+            return host["ssh"]
+    return f"tartci-{host_id}"
+
+
 def lane_plist(
     data: dict,
     lane: dict,
@@ -2074,6 +2117,15 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]
         )
+    if lane.get("fallback_preferred_hosts"):
+        env["TARTCI_FALLBACK_PEERS"] = ",".join(
+            f"{host_id}={fallback_peer_target(host_id)}"
+            for host_id in lane["fallback_preferred_hosts"]
+        )
+        if "fallback_peer_max_age_seconds" in lane:
+            env["TARTCI_FALLBACK_PEER_MAX_AGE_SECS"] = str(
+                lane["fallback_peer_max_age_seconds"]
+            )
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)

@@ -290,6 +290,133 @@ with `tartci fleet-macos`, then reload the slot-2 supervisor at an idle boundary
 Rollback is deleting the key, re-rendering, and reloading slot 2; nothing on disk
 outlives it.
 
+## Fallback lanes without a timer (opt-in, not enabled)
+
+m1's `pulp-gate` lane is the fleet's fallback: `min_queued_age_seconds = 600`
+leaves every job younger than ten minutes to m3 and m5. That rule is blind. The
+queue-wait breakdown of 2026-09-26 (151 required `macos` jobs, planning
+`2026-09-23-build-speed-plan.md`) found an m1 slot free for 4.2 min on average
+(PR 5.1, p90 10.0) during the first ten minutes of a job's wait, while the
+preferred hosts could not take it: m5's second lane can never lease a 12-core
+VM beside its first in a 14-core universe, m3 denies at 24/26 cores, and both
+were at the Apple 2-VM cap for long stretches. The fallback policy replaces
+"wait ten minutes" with "wait while a preferred host can actually take the
+job".
+
+### Designs compared
+
+| design | how it decides | why not / why |
+|---|---|---|
+| Shorter timer (0-120 s) | config only | Still blind in both directions: when m3/m5 are free, m1 races them and adds to the 72 pre-mint denials already measured; when they are full, m1 still waits the interval. |
+| GitHub-only inference | boot when no idle runner of the class is registered elsewhere | On an ephemeral JIT fleet a free host has no registration until it mints, so "no idle runner" cannot tell a free host from a full one. |
+| Peers push state to a shared store | peers publish free slots; m1 reads | Needs a new shared write location and credentials, and has the same freshness problem as reading. |
+| **Peers' live supply, read over SSH (chosen)** | m1 asks each preferred host `tartci pool supply` only while young demand exists | Reuses the SSH path fleet self-update already relies on, reads the same heartbeats, lease store and VM inventory the peer admits with, and keeps the age rule as the upper bound. |
+
+### What the lane does
+
+Nothing changes for demand the age rule already admits. For a class with no
+demand old enough, a fallback lane:
+
+1. counts that class's queued jobs at any age (one exhaustive scan);
+2. reads every preferred host's `tartci pool supply --repo R --class C --json`
+   in parallel (`scripts/gate_supply.py report`), and this host's own sibling
+   lanes;
+3. boots now only when demand exceeds what is already covered.
+
+| preferred hosts' report | verdict | lane does |
+|---|---|---|
+| every host `ok`, demand > free + in flight (peers) + covering siblings | `grant` | boots now for that class; event `fallback_grant` |
+| every host `ok`, demand covered | `hold` | waits; event `fallback_hold` |
+| any host unreachable, unreadable, `unknown`, or a report older than `fallback_peer_max_age_seconds` | `unknown` | keeps the age rule; event `fallback_unknown` |
+
+A preferred host's `free` is the number of its lanes that serve the class and
+whose fresh heartbeat is idle (`waiting`, `loop`, `backoff`), capped by its free
+macOS VM slots (GUI cap, Apple's 2-guest limit, live reservations) and by how
+many VM leases of that lane's size its lease store admits right now. m5's
+second lane beside a running 12-core VM, and m3 at 24/26 cores, therefore
+report `free=0`. `in_flight` counts lanes already between admission and
+assignment. A heartbeat older than max(120 s, 6 polls), an unrecognised phase
+or an unreadable lease store makes the whole report `unknown`, never zero. A
+Tart inventory that cannot be read (after the same retry the supervisor uses)
+is treated as the host's own slot claim treats it: the reservation files are
+the occupancy (`"inventory": "reservations"` in the report).
+
+The fail-safe is structural: `unknown` and `hold` both fall through to the age
+rule, so the fallback lane never boots later than it does today, and never
+boots early on a guess. A peer that reports free but does not take the job
+(an admission deferral, a lease race) is re-read at the next live selection
+(the V2 selection cache is 120 s), when it no longer reads as free; the age rule
+is the backstop behind that. Both hosts cannot sit idle behind each other.
+
+Stampede control:
+
+- A sibling lane on the fallback host that is in flight covers one job, and a
+  free sibling with a LOWER slot number covers one job before this lane may
+  take it, so m1's two slots never both boot for one young job.
+- Preferred hosts' in-flight lanes count as coverage.
+- The pre-mint recheck of the granted class runs at age 0 (the grant is
+  recorded in `$STATE_DIR/<runner>.fallback-grant`, valid 900 s, cleared by the
+  next live selection), so a booted VM is not discarded because the job that
+  justified it is still younger than 600 s. The peers are not re-read at
+  pre-mint: a VM already booted is kept while its job is queued.
+
+Cost while young demand exists: one extra exhaustive scan and one SSH per
+preferred host per live selection (at most every 120 s). No GitHub or SSH call
+is made when the knob is off or when there is no young demand.
+
+### Enabling it (not enabled on any host)
+
+Prerequisites, checked from the fallback host as the lane's user:
+
+```bash
+# every preferred host runs a tartci generation with `pool supply`
+ssh -o BatchMode=yes m3 'cd ~ && ~/.local/bin/tartci pool supply --repo Generous-Corp/pulp --class pulp-build-merge-group --json'
+ssh -o BatchMode=yes m5 'cd ~ && ~/.local/bin/tartci pool supply --repo Generous-Corp/pulp --class pulp-build-merge-group --json'
+```
+
+Both must print a `tartci.gate-supply/v1` report with `"verdict": "ok"`.
+
+The exact profile lines, added to m1's `pulp-gate` lane in
+`profiles/m1-macos-fleet.toml` (the lane keeps `min_queued_age_seconds = 600`,
+which becomes the upper bound):
+
+```toml
+fallback_preferred_hosts = ["studio", "m5"]
+# optional; how old a peer report may be before it counts as unknown (30-300, default 60)
+fallback_peer_max_age_seconds = 60
+```
+
+Host ids resolve to SSH targets from the peers' own profiles (`host.ssh`: m3 is
+`studio` reached as `m3`), else the `tartci-<host_id>` convention; the rendered
+LaunchAgent carries `TARTCI_FALLBACK_PEERS=studio=m3,m5=m5`. Validation refuses
+the key outside `event-class-v2`, with `min_queued_age_seconds = 0`, or naming
+the lane's own host. Render and reload through the normal `tartci fleet-macos`
+path at an idle boundary (a host self-update does this).
+
+Preflight without booting anything, with the lane's environment:
+
+```bash
+tartci serve macos --print-fallback-decision 0   # merge-group; 1 = PR-head
+# off | none no young demand | grant <detail> | hold <detail> | unknown <detail>
+```
+
+### Measuring it
+
+Use the queue-wait method of the plan (join `created_at`/`started_at` to the
+per-VM events). Compare a week before and after for:
+
+- the "policy" component (2b) and m1's free-slot minutes during the first ten
+  minutes of a job's wait: both should fall toward zero;
+- `fallback_grant` events on m1 each followed by `mint_jit` and `job_assigned`,
+  not by `assignment_v2_pre_mint_denied` (a thrash signature);
+- `fallback_unknown` rate: a steady stream names a peer that cannot be read
+  (`detail` says which) and means the lane is running on the age rule;
+- m3/m5 job counts: m3 (19.4 min gate p50) should not lose jobs it would have
+  won while free, because a free m3 slot holds the grant.
+
+Rollback: delete the two keys, re-render, reload. Nothing on disk outlives it
+(the grant file is ignored once the knob is gone).
+
 ## Rollback and offline rejoin
 
 Rollback the fleet side first: drain one host, restore `observe`, reload the same
