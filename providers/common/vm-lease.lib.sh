@@ -320,6 +320,28 @@ tartci_vm_lease_priority(){
       return 0
       ;;
   esac
+  # Release classes minted by an event-class-v2 gate lane, whose registrations
+  # carry the gate base label pulp-build-vm (the legacy pulp-release lane carries
+  # pulp-build-vm-release instead and keeps its gate/vm classes below). Tagged
+  # releases sort above merge-group (120 > 110) so a release boot is admitted
+  # from gate-reserved capacity ahead of queued gate work. The release-path PR
+  # gate stays non-gate VM work (90 < 100, as the legacy lane's `vm`) and so
+  # never outranks PR-head.
+  case ",$labels," in
+    *,pulp-release-tagged,*pulp-release-pr-gate,*|*,pulp-release-pr-gate,*pulp-release-tagged,*) ;;
+    *,pulp-build-vm,*)
+      case ",$labels," in
+        *,pulp-release-tagged,*)
+          printf '%s' 120
+          return 0
+          ;;
+        *,pulp-release-pr-gate,*)
+          printf '%s' 90
+          return 0
+          ;;
+      esac
+      ;;
+  esac
   case ",$labels," in
     *,pulp-release-pr-gate,*) printf '%s' vm ;;
     *,pulp-build,*|*,pulp-release-tagged,*) printf '%s' gate ;;

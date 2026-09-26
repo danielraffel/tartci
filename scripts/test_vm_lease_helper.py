@@ -814,6 +814,35 @@ PY
             ["tagged=gate", "pr-gate=vm", "conflict=vm", "override=vm"],
         )
 
+    def test_v2_release_classes_bracket_the_gate_classes(self) -> None:
+        # A v2 gate registration carries pulp-build-vm; the legacy release
+        # lane carries pulp-build-vm-release and keeps its gate/vm classes.
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            v2=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
+            printf 'tagged=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-tagged)"
+            printf 'merge=%s\n' "$(tartci_vm_lease_priority $v2,pulp-build-merge-group)"
+            printf 'pr=%s\n' "$(tartci_vm_lease_priority $v2,pulp-build-pr-head)"
+            printf 'pr-gate=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-pr-gate)"
+            printf 'legacy-tagged=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-tagged)"
+            printf 'legacy-pr-gate=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-pr-gate)"
+            printf 'conflict=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-tagged,pulp-release-pr-gate)"
+            printf 'explicit=%s\n' "$(TARTCI_VM_LEASE_PRIORITY=vm tartci_vm_lease_priority $v2,pulp-release-tagged)"
+            tartci_vm_lease_is_non_gate_priority 120 && echo 120-nongate || echo 120-gate
+            tartci_vm_lease_is_non_gate_priority 90 && echo 90-nongate || echo 90-gate
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["tagged=120", "merge=110", "pr=100", "pr-gate=90",
+             "legacy-tagged=gate", "legacy-pr-gate=vm", "conflict=vm", "explicit=vm",
+             "120-gate", "90-nongate"],
+        )
+
     def test_merge_group_lease_sorts_above_pr_head(self) -> None:
         script = textwrap.dedent(
             f"""
