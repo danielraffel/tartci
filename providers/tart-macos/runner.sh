@@ -174,6 +174,15 @@ case "$TEARDOWN_STEP_TIMEOUT" in
 esac
 [ "$TEARDOWN_STEP_TIMEOUT" -le 20 ] \
   || { printf 'invalid TARTCI_TEARDOWN_STEP_TIMEOUT_SECS: expected 1-20\n' >&2; exit 1; }
+# Total budget for proving a VM deleted. It sits inside launchd's 30 s
+# ExitTimeOut together with the aqua-stop and tart-stop steps, so a signalled
+# supervisor still finishes teardown before launchd escalates to SIGKILL.
+TEARDOWN_DELETE_DEADLINE="${TARTCI_TEARDOWN_DELETE_DEADLINE_SECS:-15}"
+case "$TEARDOWN_DELETE_DEADLINE" in
+  ''|*[!0-9]*|0) printf 'invalid TARTCI_TEARDOWN_DELETE_DEADLINE_SECS: expected 1-20\n' >&2; exit 1 ;;
+esac
+[ "$TEARDOWN_DELETE_DEADLINE" -le 20 ] \
+  || { printf 'invalid TARTCI_TEARDOWN_DELETE_DEADLINE_SECS: expected 1-20\n' >&2; exit 1; }
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
@@ -203,6 +212,8 @@ PRINT_HOST_HEALTH=0
 PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
 CURRENT_RPID=""
+TEARDOWN_DELETE_ATTEMPTS=0
+TEARDOWN_DELETE_LAST_ERROR=""
 CURRENT_RUN_ID=""
 # Set only by handle_supervisor_signal, and only when a run was still in flight
 # when the signal arrived. A signal is not proof the job is over: launchd
@@ -999,6 +1010,44 @@ bounded_teardown_command(){
     --timeout "$TEARDOWN_STEP_TIMEOUT" --operation "$operation" -- "$@"
 }
 
+# Proof that the VM directory is gone. The parent must exist: a missing or
+# misnamed TART_HOME would otherwise read every VM as absent.
+tart_vm_directory_absent(){
+  local vm="$1" vms_dir="${TART_HOME:-}/vms"
+  [ -n "$vm" ] && [ -n "${TART_HOME:-}" ] && [ -d "$vms_dir" ] || return 1
+  [ ! -e "$vms_dir/$vm" ]
+}
+
+# `tart delete` of a finished gate VM unlinks a large, heavily written CoW disk
+# image, and APFS routinely takes longer than one teardown step to free it. A
+# delete killed at the step bound still finishes that unlink in the kernel, so
+# it leaves a husk (config.json, nvram.bin) whose VM lock can stay held for a
+# moment by the dying process. One attempt was therefore almost never proof.
+# Retry inside a single bounded deadline, giving each attempt the remaining
+# budget rather than the short step bound, and accept either a clean delete or
+# the directory's proved absence. Anything else stays unproved (fail-closed).
+delete_current_vm_proved(){
+  local vm="$1" deadline remaining attempts=0 out rc
+  [ -n "$vm" ] || return 1
+  deadline=$(( $(now_epoch) + TEARDOWN_DELETE_DEADLINE ))
+  TEARDOWN_DELETE_ATTEMPTS=0
+  TEARDOWN_DELETE_LAST_ERROR=""
+  while :; do
+    remaining=$(( deadline - $(now_epoch) ))
+    [ "$remaining" -ge 1 ] || remaining=1
+    attempts=$((attempts + 1))
+    TEARDOWN_DELETE_ATTEMPTS="$attempts"
+    rc=0
+    out="$(python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
+      --timeout "$remaining" --operation tart-delete -- tart delete "$vm" 2>&1 >/dev/null)" || rc=$?
+    [ "$rc" -eq 0 ] && return 0
+    TEARDOWN_DELETE_LAST_ERROR="$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)"
+    tart_vm_directory_absent "$vm" && return 0
+    [ "$(now_epoch)" -lt "$deadline" ] || return 1
+    sleep 1
+  done
+}
+
 terminate_current_guardian(){
   local pid="${CURRENT_RPID:-}"
   [ -n "$pid" ] || return 0
@@ -1030,11 +1079,13 @@ discard_current_vm(){
   fi
   CURRENT_RPID=""
   bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1; then
-    note "teardown incomplete — guardian is terminal but VM deletion was not proved"
-    event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved"
+  if ! delete_current_vm_proved "$CURRENT_VM"; then
+    note "teardown incomplete: guardian is terminal but VM deletion was not proved after $TEARDOWN_DELETE_ATTEMPTS attempt(s) in ${TEARDOWN_DELETE_DEADLINE}s: ${TEARDOWN_DELETE_LAST_ERROR:-no detail}"
+    event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved attempts=$TEARDOWN_DELETE_ATTEMPTS error=${TEARDOWN_DELETE_LAST_ERROR:-none}"
     return 1
   fi
+  [ "${TEARDOWN_DELETE_ATTEMPTS:-1}" -le 1 ] \
+    || event teardown_delete_retried "vm=$CURRENT_VM attempts=$TEARDOWN_DELETE_ATTEMPTS"
   CURRENT_VM=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""

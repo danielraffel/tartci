@@ -15,6 +15,16 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 
 
+TEARDOWN_FUNCTIONS = (
+    "bounded_teardown_command",
+    "tart_vm_directory_absent",
+    "delete_current_vm_proved",
+    "terminate_current_guardian",
+    "stop_current_aqua_runner",
+    "discard_current_vm",
+)
+
+
 def function_body(source: str, name: str) -> str:
     match = re.search(rf"^{name}\(\)\{{\n(.*?)^\}}$", source, re.MULTILINE | re.DOTALL)
     if match is None:
@@ -27,7 +37,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
         body = function_body(RUNNER.read_text(), "discard_current_vm")
         guardian = body.index("terminate_current_guardian")
         stop = body.index("bounded_teardown_command tart-stop")
-        delete = body.index("bounded_teardown_command tart-delete")
+        delete = body.index("delete_current_vm_proved")
         self.assertLess(guardian, stop)
         self.assertLess(stop, delete)
         self.assertNotIn("tart stop", body.replace("bounded_teardown_command tart-stop tart stop", ""))
@@ -43,12 +53,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
         source = RUNNER.read_text()
         functions = "\n".join(
             f"{name}(){{\n{function_body(source, name)}}}"
-            for name in (
-                "bounded_teardown_command",
-                "terminate_current_guardian",
-                "stop_current_aqua_runner",
-                "discard_current_vm",
-            )
+            for name in TEARDOWN_FUNCTIONS
         )
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -69,7 +74,9 @@ class MacosTeardownOrderTests(unittest.TestCase):
                 "#!/bin/bash\nset -u\n"
                 f"export PATH={str(fakebin)!r}:$PATH\n"
                 f"TARTCI_ROOT={str(ROOT)!r}\n"
-                "TEARDOWN_STEP_TIMEOUT=1\n"
+                "TEARDOWN_STEP_TIMEOUT=1\nTEARDOWN_DELETE_DEADLINE=5\n"
+                f"TART_HOME={str(root)!r}\n"
+                "now_epoch(){ date +%s; }\n"
                 "CURRENT_VM=test-vm\nCURRENT_IP=\nCURRENT_AQUA_LABEL=\n"
                 "note(){ :; }\nevent(){ :; }\n"
                 f"{functions}\n"
@@ -88,6 +95,151 @@ class MacosTeardownOrderTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 3)
             self.assertTrue(delete_marker.exists(), "bounded delete was skipped")
 
+    def _delete_teardown(
+        self,
+        delete_script: str,
+        *,
+        step: int = 1,
+        deadline: int = 10,
+        tart_home_exists: bool = True,
+    ) -> tuple[subprocess.CompletedProcess[str], float, Path]:
+        """Run the shipped discard_current_vm against a scripted `tart delete`.
+
+        The VM directory is a real directory under a real TART_HOME, so the
+        absence proof is exercised against the filesystem, not a stub.
+        """
+        source = RUNNER.read_text()
+        functions = "\n".join(
+            f"{name}(){{\n{function_body(source, name)}}}" for name in TEARDOWN_FUNCTIONS
+        )
+        raw = tempfile.mkdtemp()
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", raw], check=False))
+        root = Path(raw)
+        fakebin = root / "bin"
+        fakebin.mkdir()
+        tart_home = root / "tart-home"
+        vm_dir = tart_home / "vms" / "test-vm"
+        if tart_home_exists:
+            vm_dir.mkdir(parents=True)
+            for name in ("config.json", "nvram.bin", "disk.img"):
+                (vm_dir / name).write_text("x")
+        tart = fakebin / "tart"
+        tart.write_text(
+            "#!/bin/bash\n"
+            f"VM_DIR={str(vm_dir)!r}\n"
+            f"CALLS={str(root / 'delete-calls')!r}\n"
+            "case \"$1\" in\n"
+            "  stop) exit 1 ;;\n"
+            "  delete) echo x >>\"$CALLS\"\n"
+            f"{delete_script}\n"
+            "  ;;\n"
+            "esac\n"
+        )
+        tart.chmod(0o755)
+        harness = root / "harness.sh"
+        harness.write_text(
+            "#!/bin/bash\nset -euo pipefail\n"
+            f"export PATH={str(fakebin)!r}:$PATH\n"
+            f"TARTCI_ROOT={str(ROOT)!r}\n"
+            f"TART_HOME={str(tart_home)!r}\n"
+            f"TEARDOWN_STEP_TIMEOUT={step}\nTEARDOWN_DELETE_DEADLINE={deadline}\n"
+            "TEARDOWN_DELETE_ATTEMPTS=0\nTEARDOWN_DELETE_LAST_ERROR=\n"
+            "CURRENT_VM=test-vm\nCURRENT_IP=\nCURRENT_AQUA_LABEL=\nCURRENT_RPID=\n"
+            "now_epoch(){ date +%s; }\n"
+            "note(){ printf 'note: %s\\n' \"$*\"; }\n"
+            "event(){ printf 'event: %s\\n' \"$*\"; }\n"
+            f"{functions}\n"
+            "rc=0; discard_current_vm || rc=$?\n"
+            "printf 'current_vm=%s\\n' \"$CURRENT_VM\"\n"
+            "exit \"$rc\"\n"
+        )
+        harness.chmod(0o755)
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(harness)], text=True, capture_output=True, check=False, timeout=60
+        )
+        return result, time.monotonic() - started, vm_dir
+
+    def test_delete_slower_than_one_step_is_given_the_whole_deadline(self) -> None:
+        # Freeing a finished gate VM's disk image routinely outlasts one teardown
+        # step. Killing that delete at the step bound is what left the proof
+        # unprovable on almost every gate teardown.
+        result, _, vm_dir = self._delete_teardown(
+            'sleep 2; rm -rf "$VM_DIR"; exit 0', step=1, deadline=10
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("current_vm=\n", result.stdout)
+        self.assertFalse(vm_dir.exists())
+        self.assertNotIn("delete_unproved", output)
+
+    def test_husk_left_by_an_interrupted_delete_is_retried_to_proof(self) -> None:
+        # The first delete frees the disk image and then fails the way a killed
+        # or lock-contended delete does; the retry removes the remaining husk.
+        result, _, vm_dir = self._delete_teardown(
+            'if [ -e "$VM_DIR/disk.img" ]; then rm -f "$VM_DIR/disk.img"; '
+            'echo "VM is running" >&2; exit 1; fi; rm -rf "$VM_DIR"; exit 0'
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("current_vm=\n", result.stdout)
+        self.assertFalse(vm_dir.exists())
+        self.assertIn("teardown_delete_retried vm=test-vm attempts=2", output)
+
+    def test_vm_directory_already_gone_is_proof_of_deletion(self) -> None:
+        # A delete whose predecessor already finished the removal reports the
+        # VM missing. The directory's absence under TART_HOME is the proof.
+        result, _, vm_dir = self._delete_teardown(
+            'rm -rf "$VM_DIR"; echo "VM does not exist" >&2; exit 1'
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 0, output)
+        self.assertIn("current_vm=\n", result.stdout)
+        self.assertFalse(vm_dir.exists())
+
+    def test_unprovable_delete_stays_fail_closed_within_its_deadline(self) -> None:
+        # Negative control for the retries above: a VM that really stays on disk
+        # must keep teardown nonterminal (the caller keeps the lease and exits
+        # 75), and the retry loop must not outlive its bounded budget.
+        result, elapsed, vm_dir = self._delete_teardown(
+            'echo "VM is running" >&2; exit 1', deadline=2
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("current_vm=test-vm\n", result.stdout)
+        self.assertTrue(vm_dir.exists())
+        self.assertIn("reason=delete_unproved", output)
+        self.assertIn("error=VM is running", output)
+        calls = (vm_dir.parents[2] / "delete-calls").read_text().count("x")
+        self.assertGreaterEqual(calls, 2, "the delete was never retried")
+        self.assertLess(elapsed, 2 + 4)
+
+    def test_missing_tart_home_is_not_read_as_absence(self) -> None:
+        # Control for the absence proof: a TART_HOME that does not exist would
+        # read every VM as absent. It must prove nothing.
+        result, _, _ = self._delete_teardown(
+            'echo "VM does not exist" >&2; exit 1', deadline=2, tart_home_exists=False
+        )
+        output = result.stdout + result.stderr
+        self.assertEqual(result.returncode, 1, output)
+        self.assertIn("current_vm=test-vm\n", result.stdout)
+        self.assertIn("reason=delete_unproved", output)
+
+    def test_default_teardown_budget_fits_inside_launchd_exit_timeout(self) -> None:
+        # A signalled supervisor runs this teardown in its TERM handler. launchd
+        # SIGKILLs the lane ExitTimeOut after SIGTERM, so at their defaults the
+        # aqua stop, the tart stop and the whole delete budget must fit inside it.
+        source = RUNNER.read_text()
+        step = int(re.search(r'TARTCI_TEARDOWN_STEP_TIMEOUT_SECS:-(\d+)', source).group(1))
+        deadline = int(
+            re.search(r'TARTCI_TEARDOWN_DELETE_DEADLINE_SECS:-(\d+)', source).group(1)
+        )
+        lanes = (ROOT / "scripts" / "macos_fleet_lanes.py").read_text()
+        exit_timeout = int(re.search(r'"ExitTimeOut": (\d+)', lanes).group(1))
+        self.assertLess(2 * step + deadline, exit_timeout)
+        # One step bound is what the budget replaces; it must be strictly larger.
+        self.assertGreater(deadline, step)
+
     def _signal_teardown(self, run_id: str) -> tuple[bool, str]:
         """Deliver INT/TERM to the supervisor and report (vm_deleted, output).
 
@@ -97,14 +249,7 @@ class MacosTeardownOrderTests(unittest.TestCase):
         source = RUNNER.read_text()
         functions = "\n".join(
             f"{name}(){{\n{function_body(source, name)}}}"
-            for name in (
-                "bounded_teardown_command",
-                "terminate_current_guardian",
-                "stop_current_aqua_runner",
-                "discard_current_vm",
-                "cleanup",
-                "handle_supervisor_signal",
-            )
+            for name in (*TEARDOWN_FUNCTIONS, "cleanup", "handle_supervisor_signal")
         )
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -128,7 +273,9 @@ class MacosTeardownOrderTests(unittest.TestCase):
                 f"TARTCI_ROOT={str(ROOT)!r}\n"
                 # Generous on purpose: the bounded-timeout contract is proved
                 # by the test above. This one must not fail for host load.
-                "TEARDOWN_STEP_TIMEOUT=20\n"
+                "TEARDOWN_STEP_TIMEOUT=20\nTEARDOWN_DELETE_DEADLINE=20\n"
+                f"TART_HOME={str(root)!r}\n"
+                "now_epoch(){ date +%s; }\n"
                 "CURRENT_VM=test-vm\nCURRENT_IP=\nCURRENT_AQUA_LABEL=\n"
                 "CURRENT_RPID=\nCURRENT_SCAN_PID=\nCURRENT_SCAN_TMP=\n"
                 "CURRENT_REGISTERED_RUNNER=\nCURRENT_RUNNER_API_ROOT=\n"
