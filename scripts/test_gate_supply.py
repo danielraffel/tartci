@@ -65,6 +65,19 @@ class ClassifyAndFitTests(unittest.TestCase):
                     [MERGE, PR], now)
                 self.assertEqual(state, expected)
 
+    def test_every_phase_the_supervisor_writes_is_classified(self) -> None:
+        """An unclassified phase makes a whole peer report unknown, which quietly
+        turns the policy off. So every phase runner.sh can write must be in a set."""
+        import re  # noqa: PLC0415
+        source = (ROOT / "providers/tart-macos/runner.sh").read_text()
+        phases = set(re.findall(r"^\s*heartbeat ([a-z][a-z_-]+)\s*$", source, re.M))
+        for line in re.findall(r'heartbeat "\$\((.*?)\)"', source):
+            phases.update(re.findall(r"printf ([a-z][a-z_-]+)", line))
+        self.assertIn("waiting", phases)  # the extraction saw the file
+        self.assertIn("admission-precheck-deferred", phases)
+        known = gate_supply.FREE_PHASES | gate_supply.IN_FLIGHT_PHASES | gate_supply.BLOCKED_PHASES
+        self.assertEqual(sorted(phases - known - {"stopped"} - {"loop"}), [])
+
     def test_a_stale_heartbeat_is_unknown_never_free(self) -> None:
         state, detail = gate_supply.classify_lane(
             lane_env(), {"ts": stamp(600), "phase": "waiting"}, MERGE, [MERGE, PR], time.time())

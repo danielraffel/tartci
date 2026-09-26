@@ -78,7 +78,7 @@ BLOCKED_PHASES = frozenset({
     "admission-error", "yielding", "draining", "stopped", "scan_blind",
     "scan_blind_escalated", "jit-admission-denied", "vm-lease-denied",
     "vm-lease-infeasible", "admission-precheck-deferred",
-    "admission-precheck-error",
+    "admission-precheck-error", "teardown-pending",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
