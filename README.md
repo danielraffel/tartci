@@ -491,7 +491,18 @@ requested labels are a subset of `TARTCI_YIELD_TO_LABELS`. Keep the secondary
 lane on the **same `TART_HOME`** as the gate so `running_macos_vms` stays a true
 host-wide 2-guest semaphore (a separate store would hide the secondary VM from
 the gate's count and let total guests exceed Apple's cap). Preview the current
-yield count with `serve macos --print-priority-demand` (returns 0 when OFF). install the same golden qcow2 and the same
+yield count with `serve macos --print-priority-demand` (returns 0 when OFF).
+
+Under steady priority load that demand may never reach zero, so an unbounded
+secondary lane can wait indefinitely. `TARTCI_YIELD_MAX_WAIT_SECONDS=N`
+(fleet lane key `yield_max_wait_seconds`; unset or `0` = unbounded) bounds it:
+while yielding, the lane rescans its own selected class with a minimum job age
+of `N` seconds (from each job's `created_at`), and when any job qualifies it
+takes a free slot anyway and logs `yield bound reached`. The host VM cap and
+host-health yield still apply, and a failed age scan keeps yielding. Tier and
+single-label lanes only. Preview with `serve macos --print-yield-bound`.
+
+Install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep
 Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave
 `PULP_LOCAL_WINDOWS_RUNS_ON_JSON` unset until a Windows-native workflow has

@@ -73,6 +73,7 @@ LANE_KEYS = {
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
+    "yield_max_wait_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
@@ -618,6 +619,21 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: yield_to_labels must be unique and include "
                 f"{sorted(REQUIRED_BASE_LABELS)}"
+            )
+        # Bounded yield: how long this lane's own oldest queued job may wait
+        # behind priority demand before the lane stops yielding. 0 keeps the
+        # unbounded behavior; the key means nothing without a yield target, and
+        # the runner implements it for tier and single-label lanes only.
+        yield_max_wait = lane.get("yield_max_wait_seconds")
+        if yield_max_wait is not None and (
+                type(yield_max_wait) is not int
+                or yield_max_wait < 0
+                or yield_workflow is None
+                or assignment_mode == "event-class-v2"):
+            fail(
+                f"lane {lane_id}: yield_max_wait_seconds must be a "
+                "non-negative integer on a lane with yield_to_workflow and "
+                "without event-class-v2"
             )
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
@@ -2023,6 +2039,8 @@ def lane_plist(
     if "yield_to_workflow" in lane:
         env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = lane["yield_to_workflow"]
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
+    if lane.get("yield_max_wait_seconds"):
+        env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
     launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")
     helper = data.get("launch_helper")
     program_arguments = (

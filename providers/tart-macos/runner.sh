@@ -54,6 +54,16 @@
 # primary gate runner and existing lanes are byte-for-byte unchanged.
 # `--print-priority-demand` reports that yield count (0 when the feature is off);
 # a safe preflight for the gate.
+# Bounded yield (opt-in): TARTCI_YIELD_MAX_WAIT_SECONDS=N (N>0) caps how long the
+# idle gate above may hold this lane back. Once one of THIS lane's own queued
+# jobs, in the class it selected, has been queued for at least N seconds (by the
+# job's created_at), the lane stops yielding and takes a free slot on the next
+# poll even while priority demand is non-zero. The host cap still applies: the
+# bound only lifts the priority yield, never the slot claim or host-health yield.
+# Unset/0 = unbounded yielding, byte-for-byte today's behavior. A failed age scan
+# fails CLOSED (keep yielding), matching priority_demand. Tier and single-label
+# lanes only; an event-class-v2 lane reports 0. `--print-yield-bound` reports how
+# many selected jobs have exceeded the bound (0 when off) as a safe preflight.
 # Host-health auto-yield (opt-in): set TARTCI_HOST_VITALS_YIELD=1 to make the
 # loop stop booting NEW VMs while the host is saturated (memory-pressure critical
 # / fresh jetsam), reading the shared `host_vitals.sh` signal. Off by default, so
@@ -146,6 +156,11 @@ TIER_GROUP_IDS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
+# Bounded yield (opt-in; see header). 0 = unbounded (today's behavior).
+YIELD_MAX_WAIT="${TARTCI_YIELD_MAX_WAIT_SECONDS:-0}"
+case "$YIELD_MAX_WAIT" in
+  ''|*[!0-9]*) printf 'invalid TARTCI_YIELD_MAX_WAIT_SECONDS: %s\n' "$YIELD_MAX_WAIT" >&2; exit 1 ;;
+esac
 # Host-health auto-yield (opt-in; see header): the decision lives in the shared
 # providers/common/host-health.lib.sh, reading TARTCI_HOST_VITALS_YIELD[_ON_WARN]
 # / TARTCI_HOST_VITALS_BIN directly. Empty/0 = OFF (no host_vitals call).
@@ -183,6 +198,7 @@ PRINT_PRE_MINT_SELECTION=""
 PRINT_IDLE_RETARGET=""
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
+PRINT_YIELD_BOUND=0
 PRINT_HOST_HEALTH=0
 PRINT_RUNNER_VERSION=0
 CURRENT_VM=""
@@ -441,6 +457,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
+  --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
@@ -879,6 +896,52 @@ priority_demand(){
     --max-age-seconds 0 \
     --match-labels 1 \
     || { printf '%s\n' 1; return 0; }
+}
+
+# yield_bound_reached <selected_labels> — how many of THIS lane's own queued
+# jobs, in the class the loop selected, have been queued for at least
+# YIELD_MAX_WAIT seconds. Non-zero lifts the priority yield for this poll.
+#
+# Prints 0 (and never scans) when the bound is off, so an unbounded lane is
+# unchanged. FAILS CLOSED: a scan error prints 0, so the lane keeps yielding
+# rather than preempting the priority lane blind -- the same direction as
+# priority_demand. Age comes from queue_scan's --min-age-seconds, which reads
+# each job's created_at. The scan uses its OWN state file: queue_scan records a
+# run with no qualifying job in a short negative cache, and sharing the plain
+# queued-work state would let a "not old enough yet" verdict hide that run from
+# the next ordinary poll.
+yield_bound_reached(){
+  local selected_labels="$1" min_age count tier_labels workflow scan_args=()
+  [ "$YIELD_MAX_WAIT" -gt 0 ] || { printf '%s\n' 0; return 0; }
+  [ "$ASSIGNMENT_MODE" != event-class-v2 ] || { printf '%s\n' 0; return 0; }
+  min_age="$YIELD_MAX_WAIT"
+  [ "$MIN_QUEUED_AGE" -le "$min_age" ] || min_age="$MIN_QUEUED_AGE"
+  if [ -n "$WORKFLOW_TIERS" ]; then
+    tier_labels="${selected_labels#"$LABELS",}"
+    [ -n "$tier_labels" ] && [ "$tier_labels" != "$selected_labels" ] \
+      || { printf '%s\n' 0; return 0; }
+    while IFS= read -r workflow; do
+      [ -n "$workflow" ] && scan_args+=(--workflow "$workflow")
+    done < <(tier_workflow_args "$tier_labels")
+    [ "${#scan_args[@]}" -gt 0 ] || { printf '%s\n' 0; return 0; }
+  else
+    scan_args=("${WORKFLOW_ARGS[@]}")
+  fi
+  if ! count="$(run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
+      --repo "$REPO" \
+      "${scan_args[@]}" \
+      --labels "$selected_labels" \
+      --provider tart-macos-yield-bound \
+      --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}-yield-bound" \
+      --state-file "$STATE_DIR/yield-bound-scan.json" \
+      --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
+      --max-age-seconds 0 \
+      --min-age-seconds "$min_age" \
+      --match-labels 1)"; then
+    printf '%s\n' 0; return 0
+  fi
+  printf '%s' "$count" | grep -qxE '[0-9]+' || { printf '%s\n' 0; return 0; }
+  printf '%s\n' "$count"
 }
 
 reclaim_runner_name(){
@@ -1875,6 +1938,12 @@ i=0
   exit 0
 }
 [ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
+[ "$PRINT_YIELD_BOUND" = 1 ] && {
+  selection="$(select_work)"
+  IFS='|' read -r _ selected_labels _ <<< "$selection"
+  yield_bound_reached "$selected_labels"
+  exit 0
+}
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
@@ -1886,7 +1955,7 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
 source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} yield_max_wait=${YIELD_MAX_WAIT}s host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
@@ -1973,6 +2042,16 @@ if [ "$LOOP" = 1 ]; then
     # when there's no work, and the feature is off entirely for the gate runner.
     p=0
     [ "${q:-0}" -gt 0 ] && p="$(priority_demand)"
+    # Bounded yield: only consulted when we would otherwise yield to priority
+    # demand, so it costs no scan on a lane with the bound off or no demand.
+    yb=0
+    if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && [ "$YIELD_MAX_WAIT" -gt 0 ]; then
+      yb="$(yield_bound_reached "$selected_labels")"
+      if [ "${yb:-0}" -gt 0 ]; then
+        note "yield bound reached: $yb job(s) of class $selected_labels queued >= ${YIELD_MAX_WAIT}s while priority lane '${YIELD_WORKFLOW}' demand=$p; taking the slot"
+        event yield_bound_reached "workflow=$YIELD_WORKFLOW aged=$yb bound=${YIELD_MAX_WAIT}s priority_demand=$p labels=$selected_labels"
+      fi
+    fi
     # Host-health yield: only worth probing when we actually have work to boot.
     # Cheap local check (no gh call), fail-open, and 0 when the feature is off.
     hh=0
@@ -1982,9 +2061,9 @@ if [ "$LOOP" = 1 ]; then
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -eq 0 ] && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
-      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
+      i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # Every cause of clone-without-serve returns through here, so the streak
@@ -2017,7 +2096,7 @@ if [ "$LOOP" = 1 ]; then
       event yielded_host_health "queued=$q host_health_yield=$hh running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
-    elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ]; then
+    elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && [ "${yb:-0}" -eq 0 ]; then
       note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$cap) — priority lane '${YIELD_WORKFLOW}' has the slot"
       event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$cap"
       heartbeat yielding
