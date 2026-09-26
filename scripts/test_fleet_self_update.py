@@ -497,6 +497,103 @@ class FloorTests(Base):
         self.assertEqual(self.sys.mutations(), [])
 
 
+def healthy_peer(**fleet_overrides) -> dict:
+    fleet = {"managed": True, "fleet_ready": True, "problems": [],
+             "expected_supervisors": 5, "verified_running_supervisors": 5,
+             "serving": {"blocked": False, "blocked_lanes": [], "unmeasurable_lanes": []},
+             "config": {"supply": {"state": "match"}}}
+    fleet.update(fleet_overrides)
+    return {"state": "on", "participating": True, "fleet": fleet}
+
+
+class OnDemandSupplyTests(Base):
+    """A JIT fleet registers runners only while they hold jobs, so being the
+    only host with a registered runner is the idle norm. A label another host
+    publishes and can mint on demand is still served."""
+
+    LABEL = "pulp-build-pr-head"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"repo": "Generous-Corp/pulp", "label": self.LABEL, "verdict": "last_serving_host"}]}
+        self.sys.published["registrations"] = [
+            {"host_id": "m1", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+            {"host_id": "m5", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+            {"host_id": "studio", "repo": "Generous-Corp/pulp", "labels": ["pulp-build"]},
+        ]
+        self.sys.peers["m5"] = healthy_peer()
+        self.sys.peers["m3"] = healthy_peer()
+
+    def test_healthy_peer_publishing_the_label_lets_the_update_proceed(self) -> None:
+        self.assertEqual(self.apply(), su.EXIT_OK)
+        drain = next(a for a, _ in self.sys.calls if a[:3] == ["./tartci", "pool", "drain"])
+        self.assertIn("--allow-last-serving-host", drain)
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        floor = next(s for s in receipt["steps"] if s["step"] == "capacity-floor")
+        self.assertIn("on-demand supply", floor["detail"])
+        self.assertIn(f"{self.LABEL} by m5", floor["detail"])
+
+    def assertRefusedWithoutMutation(self, fragment: str) -> None:
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        newest = max((self.cfg.state_dir / "attempts").glob("*.json"),
+                     key=lambda path: path.stat().st_mtime_ns)
+        self.assertIn(fragment, json.loads(newest.read_text()).get("error") or "")
+
+    def test_no_other_host_publishes_the_label(self) -> None:
+        self.sys.published["registrations"] = [
+            r for r in self.sys.published["registrations"] if r["host_id"] != "m5"]
+        self.assertRefusedWithoutMutation("no other host publishes")
+
+    def test_peer_publishing_it_for_another_repo_does_not_count(self) -> None:
+        self.sys.published["registrations"][1]["repo"] = "Generous-Corp/forge"
+        self.assertRefusedWithoutMutation("no other host publishes")
+
+    def test_peer_not_fleet_ready(self) -> None:
+        self.sys.peers["m5"] = healthy_peer(fleet_ready=False)
+        self.assertRefusedWithoutMutation("fleet not ready")
+
+    def test_peer_missing_a_supervisor(self) -> None:
+        self.sys.peers["m5"] = healthy_peer(verified_running_supervisors=4)
+        self.assertRefusedWithoutMutation("supervisors 4/5")
+
+    def test_peer_serving_blocked(self) -> None:
+        self.sys.peers["m5"] = healthy_peer(serving={"blocked": True})
+        self.assertRefusedWithoutMutation("serving blocked")
+
+    def test_peer_supply_mismatch(self) -> None:
+        self.sys.peers["m5"] = healthy_peer(config={"supply": {"state": "mismatch"}})
+        self.assertRefusedWithoutMutation("does not match the published supply")
+
+    def test_peer_with_problems(self) -> None:
+        self.sys.peers["m5"] = healthy_peer(problems=["lane pulp-gate heartbeat_missing"])
+        self.assertRefusedWithoutMutation("fleet problems")
+
+    def test_peer_status_without_fleet_section_fails_closed(self) -> None:
+        # An older tartci, or a status the probe cannot read, is not capability.
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertRefusedWithoutMutation("no fleet section")
+
+    def test_capacity_unknown_still_refuses(self) -> None:
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_every_blocked_label_needs_its_own_server(self) -> None:
+        self.sys.floor["findings"].append(
+            {"repo": "Generous-Corp/pulp", "label": "pulp-build-merge-group",
+             "verdict": "last_serving_host"})
+        self.assertRefusedWithoutMutation("pulp-build-merge-group")
+        self.sys.published["registrations"][1]["labels"].append("pulp-build-merge-group")
+        self.assertEqual(self.apply(), su.EXIT_OK)
+
+    def test_plan_reports_the_same_decision(self) -> None:
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.sys.peers["m5"] = healthy_peer(fleet_ready=False)
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+
+
 class MidJobWaitTests(Base):
     def test_waits_while_mid_job_then_proceeds(self) -> None:
         self.sys.offplan = [12, 12, 0]
