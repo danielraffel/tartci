@@ -901,7 +901,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                         )
 
     def _m5_with_release_yield_bound(self, td: str, value: str) -> Path:
-        body = HOST_CONFIGS["m5"].read_text()
+        body = re.sub(r"(?m)^yield_max_wait_seconds = .*\n", "",
+                      HOST_CONFIGS["m5"].read_text())
         marker = 'yield_to_workflow = "Build and Test"\n'
         self.assertEqual(body.count(marker), 1)
         path = Path(td) / "m5.toml"
@@ -916,13 +917,24 @@ class MacosFleetLaneTests(unittest.TestCase):
             "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"
         ])["EnvironmentVariables"]
 
-    def test_yield_bound_is_off_in_every_shipped_profile(self) -> None:
-        # The bound is enabled deliberately per host, never by an upgrade.
+    def test_yield_bound_is_enabled_only_on_m5_release_lane(self) -> None:
+        # The bound is enabled deliberately per host, never by an upgrade:
+        # only m5's pulp-release lane carries it.
+        release_plist = (
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"
+        )
+        seen = 0
         for host, profile in HOST_CONFIGS.items():
-            with self.subTest(host=host):
-                for body in fleet.rendered_plists(fleet.load(profile)).values():
+            for name, body in fleet.rendered_plists(fleet.load(profile)).items():
+                with self.subTest(host=host, plist=name):
                     env = plistlib.loads(body)["EnvironmentVariables"]
-                    self.assertNotIn("TARTCI_YIELD_MAX_WAIT_SECONDS", env)
+                    if host == "m5" and name == release_plist:
+                        seen += 1
+                        self.assertEqual(env["TARTCI_YIELD_MAX_WAIT_SECONDS"], "2700")
+                    else:
+                        self.assertNotIn("TARTCI_YIELD_MAX_WAIT_SECONDS", env)
+        # Control: the instrument actually rendered the m5 release lane.
+        self.assertEqual(seen, 1)
 
     def test_yield_bound_exports_only_a_positive_value(self) -> None:
         with tempfile.TemporaryDirectory() as td:

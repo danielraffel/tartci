@@ -80,6 +80,9 @@ supervisors = 1
 runner_idle_timeout_seconds = 60
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build-vm-release"]
 yield_to_workflow = "Build and Test"
+# Stop yielding once a release job has been queued 45 min (about 1.5x the gate
+# job's upper median), so a steady PR queue cannot starve a release forever.
+yield_max_wait_seconds = 2700
 yield_to_labels = [
   "self-hosted",
   "macOS",
