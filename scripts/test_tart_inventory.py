@@ -111,5 +111,45 @@ fi
             self.assertLess(elapsed, 1.5)
 
 
+class TartVmAbsentTests(unittest.TestCase):
+    """--vm-absent is the deletion proof for a pending-delete teardown."""
+
+    def _run(self, body: str, name: str = "gone-vm") -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as td:
+            fake = Path(td) / "tart"
+            write_fake(fake, body)
+            return subprocess.run(
+                [str(INVENTORY), "--tart", str(fake), "--timeout-seconds", "0.5",
+                 "--vm-absent", name],
+                text=True,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+
+    def test_readable_listing_without_the_vm_proves_absence(self) -> None:
+        result = self._run(
+            """
+[ "$1 $2 $3 $4 $5" = "list --format json --source local" ] || exit 2
+printf '%s\\n' '[{"Name":"other","State":"stopped"}]'
+"""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "absent")
+
+    def test_listed_vm_is_present_even_when_stopped(self) -> None:
+        result = self._run(
+            "printf '%s\\n' '[{\"Name\":\"gone-vm\",\"State\":\"stopped\"}]'\n"
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.strip(), "present")
+
+    def test_unreadable_inventory_never_proves_absence(self) -> None:
+        for body in ("sleep 60\n", "exit 9\n", "printf '{bad'\n", "printf '[null]'\n"):
+            result = self._run(body)
+            self.assertEqual(result.returncode, 75, (body, result.stdout, result.stderr))
+            self.assertNotIn("absent", result.stdout)
+
+
 if __name__ == "__main__":
     unittest.main()
