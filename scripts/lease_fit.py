@@ -153,6 +153,11 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         store_dir = pathlib.Path(lease_args.store_dir).expanduser()
         records = leases.load_records(store_dir)
         active, _, _ = leases.reclaim(records, int(lease_args.stale_secs))
+        # A parked warm VM's memory-only lease yields to real demand (the lane
+        # that cannot get memory asks it to; providers/tart-macos/warm-vm.lib.sh),
+        # so it must not make a lane skip the very poll that would ask. Its own
+        # lane is served by upgrading that lease in place, not by a second one.
+        active = [record for record in active if not record.get("memory_only")]
     best: dict[str, Any] | None = None
     for raw in ours.priority or ["vm"]:
         priority, _ = leases.parse_priority(raw)

@@ -140,6 +140,7 @@ class RunOneHarness:
             else source_override
         )
         body = function_body(source, "run_one")
+        boot = function_body(source, "boot_vm_to_ssh")
         harness = self.tmp / "harness.sh"
         harness.write_text(
             "#!/bin/bash\n"
@@ -199,6 +200,9 @@ class RunOneHarness:
             "CURRENT_RUNNER_API_ROOT=''\n"
             "SERVING_BLOCKED_SINCE=''\n"
             "RUNNER_VERSION='2.336.0'\n"
+            "WARM_VM=''\n"
+            "BOOT_LEASE_DENIED=0\n"
+            f"boot_vm_to_ssh(){{\n{boot}}}\n"
             f"run_one(){{\n{body}}}\n"
             f"run_one 1 {LABELS!r} 0\n"
             "exit $?\n",
@@ -300,7 +304,9 @@ class PrecheckSkipsTheCloneTests(unittest.TestCase):
         source = MACOS_RUNNER.read_text(encoding="utf-8")
         body = function_body(source, "run_one")
         probe = body.index('precheck_json="$(tartci_admission_clean')
-        clone = body.index("event clone_start")
+        # The clone lives in boot_vm_to_ssh (shared with the warm-VM park).
+        self.assertIn("event clone_start", function_body(source, "boot_vm_to_ssh"))
+        clone = body.index('boot_vm_to_ssh "$i"')
         booted = body.index("t_booted=")
         gate = body.index('admission_json="$(tartci_admission_clean')
         mint = body.index("generate-jitconfig")

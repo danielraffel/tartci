@@ -337,8 +337,8 @@ class ProviderWiringTests(unittest.TestCase):
         start = source.index("run_one(){")
         claim = source.index("tartci_job_claim_acquire", start)
         precheck = source.index('precheck_json="$(tartci_admission_clean', start)
-        lease = source.index("tartci_acquire_vm_lease", start)
-        clone = source.index("event clone_start", start)
+        # run_one leases, clones and boots through boot_vm_to_ssh.
+        lease = clone = source.index('boot_vm_to_ssh "$i"', start)
         self.assertLess(claim, precheck)
         self.assertLess(claim, lease)
         self.assertLess(claim, clone)

@@ -80,6 +80,14 @@ def parse_args(
             "other leases; the caller must honour the granted size and qos"
         ),
     )
+    acquire_parser.add_argument(
+        "--memory-only",
+        action="store_true",
+        help=(
+            "hold memory (and disk) but no cores, for a parked pre-booted VM; "
+            "requires --cores 0 and --mem-mb; upgrade later with `resize`"
+        ),
+    )
     acquire_parser.add_argument("--pid", type=int)
     acquire_parser.add_argument("--id")
     acquire_parser.add_argument("--kind", default="unknown")
@@ -117,6 +125,17 @@ def parse_args(
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)
     release_parser.add_argument("--id", required=True)
+
+    resize_parser = sub.add_parser(
+        "resize",
+        help="atomically change an existing lease's cores/memory/priority (denied: unchanged)",
+    )
+    add_common(resize_parser)
+    resize_parser.add_argument("--id", required=True)
+    resize_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    resize_parser.add_argument("--mem-mb", type=int)
+    resize_parser.add_argument("--priority")
+    resize_parser.add_argument("--label", default="")
 
     heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
     add_common(heartbeat_parser)

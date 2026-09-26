@@ -93,6 +93,8 @@ BUSY_PHASES = frozenset({
     # A torn-down VM whose deletion is not yet proved; the lane still holds
     # its lease and reservation (reconcile_pending_delete).
     "teardown-pending",
+    # A warm VM being booted to park, or being handed a job.
+    "warm-parking", "warm-handoff",
 })
 # Waiting for work, backing off, or refused before any VM exists.
 IDLE_PHASES = frozenset({
@@ -107,6 +109,9 @@ IDLE_PHASES = frozenset({
     # No VM will be booted: the lease cannot be granted now or ever
     # (lease-fit.lib.sh), or another lane covers the queued job (job-claim.lib.sh).
     "lease-wait", "lease-never-fits", "job-claim-covered",
+    # A parked warm VM: booted, holding no job and no cores. Stopping the lane
+    # discards it and loses nothing (see parked_warm_vm below).
+    "warm-parked",
 })
 STALE_FLOOR_SECONDS = 600
 STALE_POLL_MULTIPLE = 10
@@ -281,6 +286,19 @@ def heartbeat_state(env: dict, pids: "set[int]", now: float) -> "tuple[str, str]
     return UNKNOWN, f"unrecognised heartbeat phase {phase!r}"
 
 
+def parked_warm_vm(env: dict, pids: "set[int]", now: float) -> bool:
+    """The running supervisor's fresh heartbeat says its VM is a parked warm VM.
+
+    Only that exact phase, fresh, from the supervisor launchd runs now: a
+    parked VM carries no job, so a stop that discards it destroys nothing. Any
+    other phase keeps the process-tree verdict (busy).
+    """
+    beat = heartbeat_state(env, pids, now)
+    if beat is None or beat[0] != IDLE:
+        return False
+    return beat[1].startswith("supervisor heartbeat phase warm-parked")
+
+
 def probe(labels: "list[str]", run: Runner = _run, *, agents_dir: "Path | None" = None,
           leases: "list[dict] | None | bool" = True,
           now: "float | None" = None) -> "list[LaneBusy]":
@@ -311,6 +329,12 @@ def probe(labels: "list[str]", run: Runner = _run, *, agents_dir: "Path | None" 
             results.append(LaneBusy(label, UNKNOWN, "process table unreadable", pid))
             continue
         worker = find_worker(pid, table)
+        if worker is not None and worker[1] == "tart run" and parked_warm_vm(
+                lane_environment(label, agents_dir), tree(pid, table), now):
+            results.append(LaneBusy(
+                label, IDLE, f"supervisor pid {pid} holds only a parked warm VM "
+                f"(tart run pid {worker[0]}, no job); stopping the lane discards it", pid))
+            continue
         if worker is not None:
             worker_pid, kind, command = worker
             results.append(LaneBusy(
