@@ -944,8 +944,24 @@ EOF
       tartci_pool_capacity_floor_preflight drain "$allow_last_serving_host" || return $?
       # Close both native and provider admission before waiting for a provider
       # already inside the serialized JIT-start boundary.
+      local prior_participation drain_wait_until
+      prior_participation="$(tartci_pool_read_participation)"
       tartci_pool_write_participation 0
-      tartci_pool_lock_acquire || { echo "pool transition busy" >&2; return 4; }
+      # A supervisor minting a JIT runner holds the transition lock until its
+      # listener starts, which can outlast one 10 s acquire. participation=0
+      # already keeps any new mint out of that boundary, so the wait is bounded
+      # by the one in flight. If it still never frees, put participation back:
+      # a refused drain must leave the host exactly as it found it, never
+      # "on" with admission closed (which no later `pool on` can repair while
+      # a VM is running).
+      drain_wait_until=$(( $(date +%s) + ${TARTCI_POOL_DRAIN_LOCK_WAIT_SECS:-180} ))
+      until tartci_pool_lock_acquire; do
+        if [ "$(date +%s)" -ge "$drain_wait_until" ]; then
+          tartci_pool_write_participation "$prior_participation"
+          echo "pool transition busy (drain refused; participation restored to $prior_participation)" >&2
+          return 4
+        fi
+      done
       # Persist no-new-admission before touching any process. Native leases see
       # participation=0; cooperative providers observe pool-state=draining.
       tartci_pool_write_state draining

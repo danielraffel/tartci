@@ -274,5 +274,49 @@ class PoolPlanTests(unittest.TestCase):
             self.assertIn("--now", proc.stdout)
 
 
+
+class PoolDrainLockTests(unittest.TestCase):
+    """`pool drain` closes admission, then takes the transition lock that a
+    supervisor holds while it mints a JIT runner. A mint in flight must not
+    turn the drain into a host that is "on" with admission closed."""
+
+    def hold_lock(self, host: FakePoolHost) -> None:
+        host.lock.mkdir()
+        (host.lock / "pid").write_text("99999\n")
+
+    def test_drain_waits_for_an_in_flight_mint_to_release_the_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            self.hold_lock(host)
+            releaser = subprocess.Popen(
+                ["/bin/sh", "-c", f"sleep 12; rm -rf '{host.lock}'"])
+            try:
+                proc = host.pool("drain")
+            finally:
+                releaser.wait(timeout=30)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(host.records(), ("0\n", "draining\n"))
+
+    def test_drain_that_never_gets_the_lock_restores_participation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            host.env["TARTCI_POOL_DRAIN_LOCK_WAIT_SECS"] = "1"
+            self.hold_lock(host)
+            proc = host.pool("drain")
+            self.assertEqual(proc.returncode, 4, proc.stdout + proc.stderr)
+            self.assertIn("pool transition busy", proc.stderr)
+            self.assertEqual(host.records(), ("1\n", "on\n"))
+            self.assertEqual(host.mutations(), [])
+
+    def test_restore_keeps_a_host_that_was_already_opted_out(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            host = FakePoolHost(Path(td), busy=False)
+            host.env["TARTCI_POOL_DRAIN_LOCK_WAIT_SECS"] = "1"
+            host.participation.write_text("0\n")
+            self.hold_lock(host)
+            self.assertEqual(host.pool("drain").returncode, 4)
+            self.assertEqual(host.records(), ("0\n", "on\n"))
+
+
 if __name__ == "__main__":
     unittest.main()
