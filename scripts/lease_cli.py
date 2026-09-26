@@ -114,6 +114,19 @@ def parse_args(
         help="optional expected mounted filesystem root for --disk-path",
     )
 
+    probe_parser = sub.add_parser(
+        "probe",
+        help="report whether a lease would fit on cores and memory now, without acquiring",
+    )
+    add_common(probe_parser)
+    probe_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    probe_parser.add_argument(
+        "--mem-mb",
+        type=int,
+        help="memory the lease would consume in MB; omitted → cores * per-job estimate",
+    )
+    probe_parser.add_argument("--priority", default="build")
+
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)
     release_parser.add_argument("--id", required=True)

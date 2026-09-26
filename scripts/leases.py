@@ -590,6 +590,104 @@ def status_digest(args: argparse.Namespace | None = None) -> dict[str, Any]:
         }
 
 
+def core_and_memory_verdict(
+    cfg: dict[str, int],
+    current_usage: dict[str, Any],
+    priority: int,
+    lease_size: int,
+    req_mem: int,
+) -> dict[str, Any]:
+    """Whether a lease of this size and priority exceeds the core or memory axis.
+
+    The single definition of core and memory admission, shared by `acquire`
+    (which commits) and `probe` (which only asks), so a probe can never answer
+    under a different policy than the acquisition it predicts.
+    """
+    limit = cfg["total"]
+    used_for_limit = current_usage["used_cores"]
+    if priority < cfg["gate_priority"]:
+        limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+        used_for_limit = current_usage["non_gate_used_cores"]
+    total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
+    class_exceeded = used_for_limit + lease_size > limit
+    # Two memory checks, mirroring the two core checks above: the host-wide
+    # budget binds every lease, and a non-gate lease is additionally held to
+    # total - reserved_gate_mem_mb so it cannot spend the gate's reserve. The
+    # axis is skipped entirely when total_mem_mb is 0 (RAM unknown / old
+    # profile), which keeps admission core-only and fail-open.
+    mem_axis_on = cfg["total_mem_mb"] > 0
+    mem_limit = cfg["total_mem_mb"]
+    used_mem_for_limit = current_usage.get("used_mem_mb", 0)
+    if priority < cfg["gate_priority"]:
+        mem_limit = max(
+            cfg["per_job_mem_mb"],
+            cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
+        )
+        used_mem_for_limit = current_usage.get("non_gate_used_mem_mb", 0)
+    total_mem_exceeded = (
+        mem_axis_on
+        and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
+    )
+    class_mem_exceeded = mem_axis_on and used_mem_for_limit + req_mem > mem_limit
+    return {
+        "total_exceeded": total_exceeded,
+        "class_exceeded": class_exceeded,
+        "mem_exceeded": total_mem_exceeded or class_mem_exceeded,
+        "mem_axis_on": mem_axis_on,
+        "mem_limit": mem_limit,
+    }
+
+
+def probe(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Would a VM lease of this size be admitted on cores and memory right now?
+
+    Read-only: nothing is committed and reaped records are not persisted, so a
+    supervisor can ask before spending remote admission calls on a boot the
+    lease store would refuse anyway. The answer is advisory; `acquire` stays
+    the only authority and re-decides under the same lock it commits in.
+
+    Disk is deliberately not probed. A disk denial at `acquire` is what triggers
+    the bounded worktree cleanup, and a probe that answered for disk would stop
+    lanes from ever reaching that remedy. Floor leases are not considered
+    either: they are never granted to VM kinds.
+    """
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    cfg = capacity_config(args)
+    priority, priority_class = parse_priority(args.priority)
+    lease_size = int(args.cores_requested)
+    if lease_size <= 0:
+        raise ValueError("lease cores must be positive")
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        active, _reaped, problems = reclaim(records, int(args.stale_secs))
+    current_usage = usage(active, cfg)
+    req_mem = (
+        int(args.mem_mb)
+        if getattr(args, "mem_mb", None) is not None
+        else lease_size * cfg["per_job_mem_mb"]
+    )
+    verdict = core_and_memory_verdict(cfg, current_usage, priority, lease_size, req_mem)
+    core_axis = verdict["total_exceeded"] or verdict["class_exceeded"]
+    fits = not core_axis and not verdict["mem_exceeded"]
+    return {
+        "ok": fits,
+        "reason": (
+            "fits"
+            if fits
+            else "capacity_exceeded"
+            if core_axis
+            else "memory_exceeded"
+        ),
+        "exceeded_axis": {"cores": core_axis, "memory": verdict["mem_exceeded"]},
+        "requested_cores": lease_size,
+        "requested_mem_mb": req_mem,
+        "priority": priority,
+        "priority_class": priority_class,
+        "capacity": current_usage,
+        "problems": problem_summary(problems),
+    }, 0 if fits else 75
+
+
 def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     cfg = capacity_config(args)
@@ -686,40 +784,20 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 "problems": problem_summary(problems),
             }, 75
         current_usage = usage(active, cfg)
-        limit = cfg["total"]
-        used_for_limit = current_usage["used_cores"]
-        if priority < cfg["gate_priority"]:
-            limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
-            used_for_limit = current_usage["non_gate_used_cores"]
-        total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
-        class_exceeded = used_for_limit + lease_size > limit
         # Memory is the second admission axis. A build lease that omits --mem-mb
         # is charged its cores * per-job estimate so the axis engages even before
-        # every caller passes memory explicitly. The axis is skipped entirely when
-        # total_mem_mb is 0 (RAM unknown / old profile) → core-only, fail-open.
+        # every caller passes memory explicitly.
         req_mem = (
             int(args.mem_mb)
             if getattr(args, "mem_mb", None) is not None
             else lease_size * cfg["per_job_mem_mb"]
         )
-        # Two memory checks, mirroring the two core checks above: the host-wide
-        # budget binds every lease, and a non-gate lease is additionally held to
-        # total - reserved_gate_mem_mb so it cannot spend the gate's reserve.
-        mem_axis_on = cfg["total_mem_mb"] > 0
-        mem_limit = cfg["total_mem_mb"]
-        used_mem_for_limit = current_usage.get("used_mem_mb", 0)
-        if priority < cfg["gate_priority"]:
-            mem_limit = max(
-                cfg["per_job_mem_mb"],
-                cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
-            )
-            used_mem_for_limit = current_usage.get("non_gate_used_mem_mb", 0)
-        total_mem_exceeded = (
-            mem_axis_on
-            and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
-        )
-        class_mem_exceeded = mem_axis_on and used_mem_for_limit + req_mem > mem_limit
-        mem_exceeded = total_mem_exceeded or class_mem_exceeded
+        verdict = core_and_memory_verdict(cfg, current_usage, priority, lease_size, req_mem)
+        total_exceeded = verdict["total_exceeded"]
+        class_exceeded = verdict["class_exceeded"]
+        mem_exceeded = verdict["mem_exceeded"]
+        mem_axis_on = verdict["mem_axis_on"]
+        mem_limit = verdict["mem_limit"]
         disk_state = (
             disk_capacity(active, disk, requested_disk_bytes, disk_floor_bytes)
             if disk is not None
@@ -1097,6 +1175,8 @@ def main(argv: list[str] | None = None) -> int:
             rc = 0 if not result["problems"] else 1
         elif args.command == "acquire":
             result, rc = acquire(args)
+        elif args.command == "probe":
+            result, rc = probe(args)
         elif args.command == "release":
             result, rc = release(args)
         elif args.command == "heartbeat":

@@ -95,7 +95,8 @@ BUSY_PHASES = frozenset({
 IDLE_PHASES = frozenset({
     "waiting", "loop", "yielding", "draining", "stopped",
     "scan_blind", "scan_blind_escalated", "jit-admission-denied",
-    "vm-lease-denied", "admission-precheck-deferred", "admission-precheck-error",
+    "vm-lease-denied", "vm-lease-infeasible",
+    "admission-precheck-deferred", "admission-precheck-error",
     # Before the lease: no VM exists yet. The clone that follows is covered
     # by the VM lease and the `tart clone` descendant.
     "admission-precheck",

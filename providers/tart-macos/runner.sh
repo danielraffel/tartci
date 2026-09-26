@@ -253,6 +253,9 @@ SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
+# 1 while the lane is in a stretch where its VM lease cannot fit, so that
+# stretch is reported once rather than on every poll.
+VM_LEASE_INFEASIBLE_REPORTED=0
 LAST_HEARTBEAT_PHASE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -1555,6 +1558,33 @@ run_one(){
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
   fi
+  # Ask the lease store first, because it is local and cheap. A lane whose VM
+  # lease cannot be admitted right now (the host's other holders leave fewer
+  # cores or less memory than this lane's VM needs) would pay for the Shipyard
+  # precheck, the ghost-runner sweep and the disk probes below only to be
+  # denied at acquisition, and on a host whose lease universe fits one gate VM
+  # its second lane does that every poll. Bail before any remote call instead.
+  # The probe is advisory and fails open; acquisition below stays the authority.
+  lease_cores="$(tartci_vm_lease_cores tart-macos)"
+  lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
+  lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
+  lease_rc=0
+  tartci_vm_lease_fits "$lease_cores" "$lease_priority" "$lease_mem" || lease_rc=$?
+  if [ "$lease_rc" -ne 0 ]; then
+    [ -n "$SERVING_BLOCKED_SINCE" ] \
+      || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+    heartbeat vm-lease-infeasible
+    # One event per blocked stretch, not per poll: the stretch is the fact, and
+    # a per-minute event would recreate the log noise this bail removes.
+    if [ "$VM_LEASE_INFEASIBLE_REPORTED" != 1 ]; then
+      event vm_lease_infeasible \
+        "pre_clone=true labels=$selected_labels $TARTCI_VM_LEASE_FIT_DETAIL"
+      VM_LEASE_INFEASIBLE_REPORTED=1
+    fi
+    note "[$i] VM lease cannot fit on this host right now — skipping admission and boot; backing off ($TARTCI_VM_LEASE_FIT_DETAIL)"
+    return "$lease_rc"
+  fi
+  VM_LEASE_INFEASIBLE_REPORTED=0
   # The verdict is a function of (repo, labels) alone — see
   # providers/common/admission-clean.lib.sh, which forwards exactly those two
   # plus the lane's static base branch — so it can be asked BEFORE the CoW
@@ -1616,9 +1646,6 @@ run_one(){
   CURRENT_LABELS="$selected_labels"
   reclaim_runner_name "$vm" "$selected_runner_api_root"
   sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
-  lease_cores="$(tartci_vm_lease_cores tart-macos)"
-  lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
-  lease_priority="$(tartci_vm_lease_priority "$selected_labels")"
   lease_rc=0
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$selected_labels" "$lease_mem" "$TART_HOME" \
     tart-macos "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || lease_rc=$?

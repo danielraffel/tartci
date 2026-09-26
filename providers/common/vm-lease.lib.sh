@@ -435,6 +435,62 @@ tartci_stop_vm_lease_heartbeat(){
   fi
 }
 
+# Cores a VM lease request is actually granted: a non-gate request is clamped to
+# the host's non-gate core budget (see tartci_acquire_vm_lease); a gate request
+# is never clamped. Shared by acquisition and the pre-boot fit probe so both ask
+# the lease store about the same size.
+tartci_vm_lease_granted_cores(){
+  local cores="$1" priority="$2" _ngc
+  tartci_positive_int_or_empty "$cores" || cores=1
+  _ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || _ngc=""
+  if tartci_vm_lease_is_non_gate_priority "$priority" \
+     && tartci_positive_int_or_empty "$_ngc" && [ "$cores" -gt "$_ngc" ]; then
+    cores="$_ngc"
+  fi
+  printf '%s' "$cores"
+}
+
+# Cheap pre-boot question: could this lane's VM lease be admitted on the core
+# and memory axes right now? Returns 75 ONLY when the lease store positively
+# reports that it would not fit, leaving a one-line reason in
+# TARTCI_VM_LEASE_FIT_DETAIL. Every other outcome returns 0, so a disabled
+# lease store, a probe error or unreadable output keeps today's behaviour: the
+# lane goes on and the authoritative acquisition decides.
+#
+# The answer is advisory and point-in-time. It lets a lane that cannot hold a
+# VM (for example the second gate lane on a host whose lease universe fits one
+# gate VM) skip remote admission calls and back off, instead of paying for them
+# only to be denied at acquisition. It never grants anything.
+# TARTCI_VM_LEASE_FIT_PROBE=0 turns the probe off without a code change.
+tartci_vm_lease_fits(){
+  local cores="$1" priority="$2" mem_mb="${3:-}" out rc=0 mem_args=()
+  TARTCI_VM_LEASE_FIT_DETAIL=""
+  tartci_vm_leases_enabled || return 0
+  case "${TARTCI_VM_LEASE_FIT_PROBE:-1}" in
+    0|false|FALSE|off|OFF|no|NO) return 0 ;;
+  esac
+  cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  tartci_positive_int_or_empty "$mem_mb" \
+    || mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  tartci_positive_int_or_empty "$mem_mb" && mem_args=(--mem-mb "$mem_mb")
+  out="$(python3 "$TARTCI_ROOT/scripts/leases.py" probe \
+    --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
+    --priority "$priority" --json 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 75 ] || return 0
+  TARTCI_VM_LEASE_FIT_DETAIL="$(printf '%s' "$out" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+if d.get("ok") is not False or d.get("reason") not in ("capacity_exceeded", "memory_exceeded"):
+    raise SystemExit(1)
+c = d.get("capacity") or {}
+print("reason=%s requested_cores=%s requested_mem_mb=%s used_cores=%s total_cores=%s available_cores=%s" % (
+    d["reason"], d.get("requested_cores"), d.get("requested_mem_mb"),
+    c.get("used_cores"), c.get("total_cores"), c.get("available_cores")))
+' 2>/dev/null)" || { TARTCI_VM_LEASE_FIT_DETAIL=""; return 0; }
+  [ -n "$TARTCI_VM_LEASE_FIT_DETAIL" ] || return 0
+  return 75
+}
+
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
   local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
@@ -473,12 +529,11 @@ tartci_acquire_vm_lease(){
   # Clamping here makes any over-sized request safe by construction, so no
   # override is load-bearing and no VM lane can encroach on the gate reserve.
   # The gate lane runs at gate priority and is intentionally NOT clamped.
-  local _ngc
-  _ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)"
-  if tartci_vm_lease_is_non_gate_priority "$priority" \
-     && tartci_positive_int_or_empty "$_ngc" && [ "$cores" -gt "$_ngc" ]; then
-    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_ngc (non-gate budget)"
-    cores="$_ngc"
+  local _granted
+  _granted="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  if [ "$_granted" != "$cores" ]; then
+    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_granted (non-gate budget)"
+    cores="$_granted"
   fi
   # Size the guest from the cores this lease will actually be granted — i.e.
   # AFTER the clamp above. Deriving from the requested count would charge a

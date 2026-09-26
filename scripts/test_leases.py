@@ -326,6 +326,77 @@ class LeasePriorityTests(LeaseCliTestCase):
         self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
 
 
+class LeaseProbeTests(LeaseCliTestCase):
+    """`probe` answers the acquisition question without committing anything."""
+
+    def probe(
+        self,
+        cores: int,
+        *,
+        priority: str = "gate",
+        capacity: int = 14,
+        reserved: int = 0,
+        mem_mb: int | None = None,
+        capacity_mem_mb: int = 0,
+    ) -> subprocess.CompletedProcess[str]:
+        extra = ["--capacity-mem-mb", str(capacity_mem_mb)]
+        if mem_mb is not None:
+            extra += ["--mem-mb", str(mem_mb)]
+        return self.run_cli(
+            "probe",
+            "--cores",
+            str(cores),
+            "--capacity",
+            str(capacity),
+            "--reserved-gate-cores",
+            str(reserved),
+            "--priority",
+            priority,
+            *extra,
+            check=False,
+        )
+
+    def test_second_gate_vm_on_a_one_vm_host_does_not_fit(self) -> None:
+        # m5: a 14-core lease universe and 12-core gate VMs.
+        self.acquire("slot1", 12, capacity=14, priority="100")
+        probed = self.probe(12, capacity=14, priority="100")
+        self.assertEqual(probed.returncode, 75, probed.stdout)
+        body = json.loads(probed.stdout)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["reason"], "capacity_exceeded")
+        self.assertEqual(body["capacity"]["available_cores"], 2)
+        # The probe and the acquisition agree.
+        denied = self.acquire("slot2", 12, capacity=14, priority="100", check=False)
+        self.assertEqual(denied.returncode, 75)
+
+    def test_probe_fits_when_the_lease_would_be_granted(self) -> None:
+        probed = self.probe(12, capacity=14, priority="100")
+        self.assertEqual(probed.returncode, 0, probed.stdout)
+        self.assertEqual(json.loads(probed.stdout)["reason"], "fits")
+        self.assertTrue(json.loads(self.acquire("slot1", 12, capacity=14, priority="100").stdout)["ok"])
+
+    def test_probe_commits_nothing(self) -> None:
+        self.probe(4, capacity=14)
+        self.probe(4, capacity=14)
+        status = json.loads(self.run_cli("status", "--capacity", "14").stdout)
+        self.assertEqual(status["leases"], [])
+        self.assertEqual(status["capacity"]["used_cores"], 0)
+
+    def test_probe_honours_the_non_gate_core_reserve(self) -> None:
+        # 6 non-gate cores exist; a 4-core vm lease holds 4, so a second does not fit.
+        self.acquire("first", 4, capacity=14, reserved=8, priority="vm")
+        probed = self.probe(4, capacity=14, reserved=8, priority="vm")
+        self.assertEqual(probed.returncode, 75, probed.stdout)
+        # The same request at gate priority may use the reserve.
+        self.assertEqual(self.probe(4, capacity=14, reserved=8).returncode, 0)
+
+    def test_probe_reports_the_memory_axis(self) -> None:
+        self.acquire("first", 2, capacity=14, mem_mb=12000, capacity_mem_mb=16000, priority="gate")
+        probed = self.probe(2, capacity=14, mem_mb=8000, capacity_mem_mb=16000)
+        self.assertEqual(probed.returncode, 75, probed.stdout)
+        self.assertEqual(json.loads(probed.stdout)["reason"], "memory_exceeded")
+
+
 class LeaseStoreIntegrityTests(LeaseCliTestCase):
     def test_corrupt_store_fails_closed(self) -> None:
         self.store.mkdir(parents=True)

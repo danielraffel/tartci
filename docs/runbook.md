@@ -1375,6 +1375,18 @@ macOS serve loop treats the cap as already full and waits. Disable the lease
 consumer with `TARTCI_VM_LEASES=0` only during operator-controlled break-glass
 debugging.
 
+Before its Shipyard admission precheck, a macOS lane asks the lease store
+whether its VM lease would fit right now (`leases.py probe`, cores and memory
+only, nothing committed). When the store says it would not, as for the second
+gate lane on a host whose lease universe fits one gate VM, the lane skips the
+admission precheck, the ghost-runner sweep and the boot, heartbeats
+`vm-lease-infeasible`, emits one `vm_lease_infeasible` event per blocked
+stretch, and backs off for one poll. The probe is advisory and fails open: a
+disabled lease store, a probe error or unreadable output lets the lane
+continue to the authoritative acquisition exactly as before. Disk is not
+probed, so a disk denial still reaches acquisition and its bounded worktree
+cleanup. `TARTCI_VM_LEASE_FIT_PROBE=0` turns the probe off.
+
 A lane may also declare `process_type`, which sets the rendered LaunchAgent's
 `ProcessType`. The accepted values are the four `launchd.plist(5)` documents:
 `Background`, `Standard`, `Adaptive`, `Interactive`. A lane that omits the key
