@@ -59,6 +59,9 @@ def detail(envelope: Any, limit: int) -> str:
     if not isinstance(reason, str) or not REASON_PATTERN.fullmatch(reason):
         reason = "unknown"
     rendered = f"reason={reason}"
+    rechecks = envelope.get("tartci_in_progress_rechecks")
+    if type(rechecks) is int and rechecks > 0:
+        rendered = f"{rendered} in_progress_rechecks={rechecks}"
     error = bounded_error(envelope.get("error"), limit)
     if error:
         rendered = f"{rendered} error={error}"

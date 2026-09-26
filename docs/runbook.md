@@ -1228,6 +1228,21 @@ mode fails closed: a typed `admit` is the only path to JIT registration.
 `defer` or any operational/contract error tears down the still-unregistered VM,
 releases its lease, and lets `--loop` back off by `TARTCI_VM_POLL`.
 
+Two deferrals report lock contention rather than the queue:
+`observation_in_progress` and `stewardship_in_progress`. Shipyard holds one
+observation lock per exact `(repo, base, labels)` key, so they mean a sibling
+lane on the same host is observing this very target. The macOS provider's
+post-boot check therefore re-asks Shipyard every
+`TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS` (default 5, range 1..60) for up
+to `TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS` (default 60, range 0..300;
+0 disables) before discarding the booted VM. Each re-check is a fresh Shipyard
+invocation, never a stored verdict, and it must carry an `observed_at` no
+earlier than the contention deferral it replaces; an older one is rejected as
+a contract error and the VM is discarded. Any other verdict ends the wait at
+once, and contention that outlasts the budget defers as before, with
+`in_progress_rechecks=N` in the `admission_deferred` event detail. The
+pre-clone precheck does not wait, since bailing there costs no VM.
+
 An `error` verdict is not one thing, and the difference decides whether the
 fleet can stop. `mutation_failed` and `invalid_labels` are conclusive: Shipyard
 either saw a superseded run it could not cancel, or the lane is misconfigured.

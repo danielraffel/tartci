@@ -432,6 +432,140 @@ class RefusalReportsItsReasonTests(unittest.TestCase):
                 )
 
 
+def sequenced_stub(tmp: Path, steps: list[tuple[dict[str, object], int]]) -> Path:
+    """A stub `shipyard` that replays one verdict per call and counts calls."""
+    for index, (value, exit_code) in enumerate(steps):
+        (tmp / f"step{index}.json").write_text(
+            json.dumps(value, separators=(",", ":")), encoding="utf-8"
+        )
+        (tmp / f"step{index}.rc").write_text(str(exit_code), encoding="utf-8")
+    (tmp / "calls").write_text("0", encoding="utf-8")
+    stub = tmp / "stub-shipyard"
+    stub.write_text(
+        "#!/bin/bash\n"
+        f"d={str(tmp)!r}\n"
+        'n=$(cat "$d/calls")\n'
+        'echo $((n + 1)) >"$d/calls"\n'
+        f'[ "$n" -gt {len(steps) - 1} ] && n={len(steps) - 1}\n'
+        'cat "$d/step$n.json"\n'
+        "printf '\\n'\n"
+        'exit "$(cat "$d/step$n.rc")"\n',
+        encoding="utf-8",
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+CONTENDED_THEN_ADMIT = [
+    (
+        {
+            **make_envelope("defer", "observation_in_progress"),
+            "observed_at": "2026-09-26T04:22:40Z",
+        },
+        3,
+    ),
+    (
+        {**make_envelope("admit", "clean"), "observed_at": "2026-09-26T04:22:41Z"},
+        0,
+    ),
+]
+
+
+class BoundaryWaitsOutContentionTests(unittest.TestCase):
+    """A booted VM must not be discarded because a sibling lane is observing."""
+
+    def run_boundary(
+        self, tmp: Path, env_extra: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess:
+        events = tmp / "events.tsv"
+        block = boundary_gate_block(MACOS_RUNNER.read_text(encoding="utf-8"))
+        harness = tmp / "boundary.sh"
+        harness.write_text(
+            "#!/bin/bash\nset -euo pipefail\n"
+            f"TARTCI_ROOT={str(ROOT)!r}\n"
+            f"source {str(LIB)!r}\n"
+            "note(){ :; }\n"
+            "heartbeat(){ :; }\n"
+            f"event(){{ printf '%s\\t%s\\n' \"$1\" \"${{2:-}}\" >>{str(events)!r}; }}\n"
+            f"discard_current_vm(){{ echo discarded >>{str(tmp / 'discards')!r}; }}\n"
+            "tartci_release_vm_lease(){ :; }\n"
+            f"REPO={REPO!r}\n"
+            "i=1\n"
+            "vm='lane-vm-1'\n"
+            f"selected_labels={LABELS!r}\n"
+            f"STATE_DIR={str(tmp)!r}\n"
+            f"boundary(){{\n{block}}}\n"
+            "boundary\n"
+            "exit $?\n",
+            encoding="utf-8",
+        )
+        harness.chmod(0o755)
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": os.pathsep.join([str(tmp), env.get("PATH", "/usr/bin:/bin")]),
+                "TARTCI_ROOT": str(ROOT),
+                "TARTCI_ADMISSION_CLEAN_MODE": "required",
+                "TARTCI_SHIPYARD_CLI": "stub-shipyard",
+                "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(tmp / "breaker"),
+                "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS": "1",
+                **(env_extra or {}),
+            }
+        )
+        return subprocess.run(
+            ["/bin/bash", str(harness)],
+            env=env,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=120,
+        )
+
+    def test_boundary_rechecks_contention_instead_of_discarding(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            sequenced_stub(tmp, CONTENDED_THEN_ADMIT)
+            result = self.run_boundary(tmp)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual((tmp / "calls").read_text().strip(), "2")
+            self.assertFalse(
+                (tmp / "discards").exists(),
+                "a booted VM was discarded over a sibling lane's observation",
+            )
+            envelope = json.loads((tmp / "lane-vm-1.admission-clean.json").read_text())
+            self.assertEqual(envelope["verdict"], "admit")
+            self.assertEqual(envelope["tartci_in_progress_rechecks"], 1)
+
+    def test_boundary_still_discards_when_contention_outlasts_the_wait(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            sequenced_stub(tmp, CONTENDED_THEN_ADMIT[:1])
+            result = self.run_boundary(
+                tmp, {"TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS": "1"}
+            )
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertTrue((tmp / "discards").exists())
+            detail = dict(
+                line.split("\t", 1)
+                for line in (tmp / "events.tsv").read_text().splitlines()
+            )["admission_deferred"]
+            self.assertIn("reason=observation_in_progress", detail)
+            self.assertIn("in_progress_rechecks=", detail)
+
+    def test_precheck_does_not_wait(self) -> None:
+        # Bailing before the clone costs nothing, so the precheck keeps its
+        # single call rather than holding the lane.
+        with tempfile.TemporaryDirectory() as raw:
+            harness = RunOneHarness(Path(raw))
+            sequenced_stub(harness.bin, CONTENDED_THEN_ADMIT)
+            result = harness.run()
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual((harness.bin / "calls").read_text().strip(), "1")
+            self.assertNotIn("clone_start", harness.event_names())
+
+
 class DetailRendererTests(unittest.TestCase):
     """The renderer classifies on the typed reason, never on the message."""
 
@@ -497,6 +631,26 @@ class DetailRendererTests(unittest.TestCase):
             json.dumps(make_envelope("defer", "cancellation_pending"))
         )
         self.assertEqual(rendered, "reason=cancellation_pending")
+
+    def test_recheck_count_is_rendered_only_when_positive(self) -> None:
+        self.assertEqual(
+            self.render(
+                '{"reason":"observation_in_progress","tartci_in_progress_rechecks":4}'
+            ),
+            "reason=observation_in_progress in_progress_rechecks=4",
+        )
+        self.assertEqual(
+            self.render(
+                '{"reason":"observation_in_progress","tartci_in_progress_rechecks":0}'
+            ),
+            "reason=observation_in_progress",
+        )
+        self.assertEqual(
+            self.render(
+                '{"reason":"clean","tartci_in_progress_rechecks":"4"}'
+            ),
+            "reason=clean",
+        )
 
     def test_malformed_input_renders_rather_than_fails(self) -> None:
         self.assertEqual(self.render(""), "reason=missing")

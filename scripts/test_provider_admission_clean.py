@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import provider_admission_clean as admission
@@ -531,6 +534,300 @@ class InconclusiveBreakerTests(unittest.TestCase):
                 result = self._run(Path(state), "admit", "some_future_reason", 0)
                 self.assertEqual(result.returncode, 1)
                 self.assertNotIn("tartci_degraded", result.stdout)
+
+
+class InProgressRecheckTests(unittest.TestCase):
+    """A contention deferral must not cost a booted VM, and must not admit stale.
+
+    The stub replays a scripted sequence of verdicts, one per invocation, and
+    records how many times it was called, so each test sees exactly which
+    answers the adapter asked for.
+    """
+
+    LABELS = "self-hosted,Linux,ARM64,pulp-build-linux"
+
+    def _script(
+        self, root: Path, steps: list[tuple[dict[str, object], int]]
+    ) -> Path:
+        for index, (value, exit_code) in enumerate(steps):
+            (root / f"step{index}.json").write_text(
+                json.dumps(value), encoding="utf-8"
+            )
+            (root / f"step{index}.rc").write_text(str(exit_code), encoding="utf-8")
+        calls = root / "calls"
+        calls.write_text("0", encoding="utf-8")
+        last = len(steps) - 1
+        fake = root / "shipyard"
+        # Past the end of the script the last step repeats, so "always
+        # contended" is a one-step script.
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"d={str(root)!r}\n"
+            'n=$(cat "$d/calls")\n'
+            'echo $((n + 1)) >"$d/calls"\n'
+            f'[ "$n" -gt {last} ] && n={last}\n'
+            'cat "$d/step$n.json"\n'
+            "printf '\\n'\n"
+            'exit "$(cat "$d/step$n.rc")"\n',
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        return fake
+
+    @staticmethod
+    def _at(value: dict[str, object], observed_at: str) -> dict[str, object]:
+        return {**value, "observed_at": observed_at}
+
+    def _run(
+        self,
+        root: Path,
+        steps: list[tuple[dict[str, object], int]],
+        *,
+        wait: bool = True,
+        env_extra: dict[str, str] | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], int]:
+        fake = self._script(root, steps)
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(root / "state"),
+            "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS": "30",
+            "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS": "1",
+        }
+        env.update(env_extra or {})
+        argv = [
+            sys.executable,
+            "-B",
+            str(Path(admission.__file__)),
+            "--shipyard",
+            str(fake),
+            "--repo",
+            "Generous-Corp/pulp",
+            "--base",
+            "main",
+            "--labels",
+            self.LABELS,
+        ]
+        if wait:
+            argv.append("--wait-in-progress")
+        result = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=120,
+        )
+        return result, int((root / "calls").read_text(encoding="utf-8"))
+
+    def test_observation_in_progress_is_waited_out_then_admits(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result, calls = self._run(
+                Path(raw),
+                [
+                    (self._at(envelope("defer", "observation_in_progress"),
+                              "2026-07-26T23:00:00Z"), 3),
+                    (self._at(envelope("defer", "observation_in_progress"),
+                              "2026-07-26T23:00:01Z"), 3),
+                    (self._at(envelope("admit"), "2026-07-26T23:00:02Z"), 0),
+                ],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, 3)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["verdict"], "admit")
+            self.assertEqual(payload["tartci_in_progress_rechecks"], 2)
+
+    def test_stewardship_in_progress_is_waited_out_too(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result, calls = self._run(
+                Path(raw),
+                [
+                    (self._at(envelope("defer", "stewardship_in_progress"),
+                              "2026-07-26T23:00:00Z"), 3),
+                    (self._at(envelope("admit"), "2026-07-26T23:00:01Z"), 0),
+                ],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls, 2)
+
+    def test_the_wait_is_bounded_and_still_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            started = time.monotonic()
+            result, calls = self._run(
+                Path(raw),
+                [(envelope("defer", "observation_in_progress"), 3)],
+                env_extra={"TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS": "2"},
+            )
+            elapsed = time.monotonic() - started
+            self.assertEqual(result.returncode, 3, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["reason"], "observation_in_progress")
+            self.assertGreaterEqual(payload["tartci_in_progress_rechecks"], 1)
+            # 2 s budget at a 1 s poll: a handful of checks, never unbounded.
+            self.assertGreaterEqual(calls, 2)
+            self.assertLessEqual(calls, 4)
+            self.assertLess(elapsed, 15)
+
+    def test_without_the_flag_contention_defers_immediately(self) -> None:
+        # The pre-clone precheck calls without --wait-in-progress: bailing
+        # there costs no VM, so it must not hold the lane.
+        with tempfile.TemporaryDirectory() as raw:
+            result, calls = self._run(
+                Path(raw),
+                [
+                    (envelope("defer", "observation_in_progress"), 3),
+                    (envelope("admit"), 0),
+                ],
+                wait=False,
+            )
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(calls, 1)
+            self.assertNotIn("tartci_in_progress_rechecks", result.stdout)
+
+    def test_zero_budget_disables_the_wait(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result, calls = self._run(
+                Path(raw),
+                [
+                    (envelope("defer", "observation_in_progress"), 3),
+                    (envelope("admit"), 0),
+                ],
+                env_extra={"TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS": "0"},
+            )
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(calls, 1)
+
+    def test_only_contention_is_rechecked(self) -> None:
+        # A real deferral or a conclusive error after the wait ends it at
+        # once, with the typed exit the provider already handles.
+        for value, exit_code in (
+            (envelope("defer", "stale_compatible_runs"), 3),
+            (envelope("defer", "cancellation_pending"), 3),
+            (envelope("error", "mutation_failed"), 1),
+        ):
+            with self.subTest(reason=value["reason"]):
+                with tempfile.TemporaryDirectory() as raw:
+                    result, calls = self._run(
+                        Path(raw),
+                        [
+                            (envelope("defer", "observation_in_progress"), 3),
+                            (value, exit_code),
+                            (envelope("admit"), 0),
+                        ],
+                    )
+                    self.assertEqual(result.returncode, exit_code)
+                    self.assertEqual(calls, 2)
+                    self.assertEqual(json.loads(result.stdout)["reason"],
+                                     value["reason"])
+
+    def test_a_recheck_older_than_its_deferral_never_admits(self) -> None:
+        # Freshness: an admit stamped before the contention it replaced is a
+        # replayed answer from before the in-flight observation began.
+        with tempfile.TemporaryDirectory() as raw:
+            result, calls = self._run(
+                Path(raw),
+                [
+                    (self._at(envelope("defer", "observation_in_progress"),
+                              "2026-07-26T23:00:05.500000+00:00"), 3),
+                    (self._at(envelope("admit"),
+                              "2026-07-26T23:00:05.499999999Z"), 0),
+                ],
+            )
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertEqual(calls, 2)
+            self.assertNotIn('"verdict":"admit"', result.stdout)
+            self.assertIn("older than the deferral", result.stderr)
+
+    def test_a_same_instant_recheck_is_fresh(self) -> None:
+        # The control for the freshness test: equal stamps (and a different
+        # zone spelling of the same instant) are not stale.
+        with tempfile.TemporaryDirectory() as raw:
+            result, _ = self._run(
+                Path(raw),
+                [
+                    (self._at(envelope("defer", "observation_in_progress"),
+                              "2026-07-26T23:00:05Z"), 3),
+                    (self._at(envelope("admit"),
+                              "2026-07-27T01:00:05+02:00"), 0),
+                ],
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_recheck_for_another_target_never_admits(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            result, _ = self._run(
+                Path(raw),
+                [
+                    (envelope("defer", "observation_in_progress"), 3),
+                    ({**envelope("admit"), "labels": ["linux", "self-hosted"]}, 0),
+                ],
+            )
+            self.assertEqual(result.returncode, 1)
+
+    def test_contention_resets_the_breaker_as_a_lone_defer_would(self) -> None:
+        # Two prior inconclusive errors, then contention, then another error.
+        # Called one at a time the contention defer would reset the count, so
+        # the error is the first of a new run and must still fail closed.
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            state = root / "state/admission-clean"
+            state.mkdir(parents=True)
+            with mock.patch.dict(
+                os.environ,
+                {"TARTCI_ADMISSION_CLEAN_STATE_DIR": str(root / "state")},
+            ):
+                path = admission._counter_path(
+                    "Generous-Corp/pulp",
+                    "main",
+                    admission.parse_labels(self.LABELS),
+                )
+            path.write_text(json.dumps({"consecutive": 2}), encoding="utf-8")
+            result, calls = self._run(
+                root,
+                [
+                    (envelope("defer", "observation_in_progress"), 3),
+                    (envelope("error", "observation_failed"), 1),
+                ],
+            )
+            self.assertEqual(calls, 2)
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_wait_configuration_is_validated(self) -> None:
+        for name, value in (
+            ("TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS", "301"),
+            ("TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS", "-1"),
+            ("TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS", "0"),
+            ("TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS", "x"),
+        ):
+            with self.subTest(name=name, value=value):
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-B",
+                        str(Path(admission.__file__)),
+                        "--repo",
+                        "Generous-Corp/pulp",
+                        "--labels",
+                        self.LABELS,
+                        "--validate-only",
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={"PATH": "/usr/bin:/bin", name: value},
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_parse_rfc3339_accepts_what_shipyard_emits(self) -> None:
+        self.assertEqual(
+            admission.parse_rfc3339("2026-09-21T05:34:56.027586+00:00"),
+            admission.parse_rfc3339("2026-09-21T05:34:56.027586Z"),
+        )
+        self.assertLess(
+            admission.parse_rfc3339("2026-09-21T05:34:56Z"),
+            admission.parse_rfc3339("2026-09-21T05:34:56.000001Z"),
+        )
 
 
 if __name__ == "__main__":

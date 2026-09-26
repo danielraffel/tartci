@@ -44,13 +44,20 @@ tartci_admission_clean_enabled() {
 # Returns Shipyard's typed mapping: 0 admit, 3 defer, 1 operational/contract
 # error. Stdout is the validated JSON envelope and may be persisted in provider
 # diagnostics; stderr carries only bounded adapter errors.
+#
+# Extra arguments are forwarded to the adapter. A caller holding a booted VM
+# passes --wait-in-progress so a sibling lane's in-flight observation of the
+# same target is waited out (bounded by
+# TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS) instead of discarding the VM.
 tartci_admission_clean() {
   local repo="$1" labels="$2"
+  shift 2
   python3 "$TARTCI_ROOT/scripts/provider_admission_clean.py" \
     --shipyard "$TARTCI_SHIPYARD_CLI" \
     --repo "$repo" \
     --base "$TARTCI_ADMISSION_CLEAN_BASE" \
-    --labels "$labels"
+    --labels "$labels" \
+    "$@"
 }
 
 # Render an admission envelope as a bounded single-line detail for a provider

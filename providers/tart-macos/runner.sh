@@ -1752,7 +1752,12 @@ run_one(){
     local admission_json="" admission_rc=0
     heartbeat admission-check
     event admission_check "repo=$REPO labels=$selected_labels"
-    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+    # The VM is already booted, so a contention deferral (a sibling lane is
+    # observing this same repo and label set) is waited out with fresh
+    # re-checks rather than paid for with a discarded VM. Every other verdict,
+    # and a contention that outlasts the bounded wait, is handled below as
+    # before. The pre-clone precheck does not wait: bailing there costs nothing.
+    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels" --wait-in-progress)"; then
       admission_rc=0
     else
       admission_rc=$?

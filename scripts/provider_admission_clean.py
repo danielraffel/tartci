@@ -17,6 +17,7 @@ import hashlib
 import pathlib
 import subprocess
 import sys
+import time
 from typing import Any, Sequence
 
 
@@ -73,6 +74,12 @@ INCONCLUSIVE_ERROR_REASONS = {
     "authority_failed",
     "revalidation_failed",
 }
+# Deferrals that report lock contention, not the queue.  Shipyard holds one
+# observation lock per exact (repo, base, labels) key, so these mean a sibling
+# lane on this host is observing the very same target right now; its answer is
+# the answer this lane would get.  Only these two may be re-checked, and only
+# by a caller that opted in with --wait-in-progress.
+IN_PROGRESS_REASONS = {"observation_in_progress", "stewardship_in_progress"}
 # `mutation_failed` is a positive observation of a superseded run that Shipyard
 # failed to cancel; `invalid_labels` is local misconfiguration.  Never degrade.
 CONCLUSIVE_ERROR_REASONS = {"invalid_labels", "mutation_failed"}
@@ -239,6 +246,40 @@ def bounded_timeout() -> int:
     return int(raw)
 
 
+def in_progress_wait() -> tuple[int, int]:
+    """(budget, poll) seconds for re-checking a contention deferral.
+
+    The budget bounds how long a caller keeps STARTING fresh checks; each check
+    is still bounded by TARTCI_ADMISSION_CLEAN_TIMEOUT_SECS.  Zero disables it.
+    """
+    budget = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS", 60, 0, 300
+    )
+    poll = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_POLL_SECS", 5, 1, 60
+    )
+    return budget, poll
+
+
+def parse_rfc3339(value: str) -> datetime.datetime:
+    """Parse an `observed_at` already matched by RFC3339_PATTERN.
+
+    Hand-rolled because the provider's `python3` may predate fromisoformat's
+    support for `Z` and for nanosecond fractions, both of which Shipyard emits.
+    """
+    match = re.fullmatch(
+        r"([0-9T:-]{19})(?:\.([0-9]{1,9}))?(Z|[+-][0-9]{2}:[0-9]{2})", value
+    )
+    if match is None:
+        raise ValueError("admission verdict requires RFC3339 observed_at")
+    stamp, fraction, zone = match.groups()
+    micros = (fraction or "").ljust(6, "0")[:6]
+    offset = "+00:00" if zone == "Z" else zone
+    return datetime.datetime.strptime(
+        f"{stamp}.{micros}{offset.replace(':', '')}", "%Y-%m-%dT%H:%M:%S.%f%z"
+    )
+
+
 def validate_configuration(args: argparse.Namespace) -> list[str]:
     if not REPO_PATTERN.fullmatch(args.repo):
         raise ConfigurationError("repo must be a canonical owner/name slug")
@@ -246,6 +287,7 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         raise ConfigurationError("base must be a branch name")
     labels = parse_labels(args.labels)
     bounded_timeout()
+    in_progress_wait()
     return labels
 
 
@@ -253,6 +295,47 @@ def run(args: argparse.Namespace) -> int:
     labels = validate_configuration(args)
     if args.validate_only:
         return 0
+    budget, poll = in_progress_wait() if args.wait_in_progress else (0, 1)
+    deadline = time.monotonic() + budget
+    rechecks = 0
+    previous_observed_at: datetime.datetime | None = None
+    while True:
+        value, unknown_reason = _observe(args, labels)
+        observed_at = parse_rfc3339(value["observed_at"])
+        if previous_observed_at is not None and observed_at < previous_observed_at:
+            # Freshness: every re-check must report an observation no older
+            # than the contention deferral that caused it.  Shipyard stamps
+            # observed_at when it emits, so an earlier stamp means a replayed
+            # or cached answer, and admitting on it would admit on a queue
+            # state from before the in-flight observation began.
+            _persist_rejected(args, json.dumps(value))
+            raise ValueError(
+                "re-checked admission verdict is older than the deferral "
+                "it replaced"
+            )
+        if (
+            value["verdict"] == "defer"
+            and value["reason"] in IN_PROGRESS_REASONS
+            and time.monotonic() < deadline
+        ):
+            # A contention deferral is a real defer: it proves Shipyard can
+            # observe, exactly as it would if returned on its own.
+            _clear_counter(_counter_path(args.repo, args.base, labels))
+            previous_observed_at = observed_at
+            rechecks += 1
+            time.sleep(max(0.0, min(poll, deadline - time.monotonic())))
+            continue
+        break
+    if rechecks:
+        value = dict(value)
+        value["tartci_in_progress_rechecks"] = rechecks
+    return _apply_breaker(args, labels, value, unknown_reason)
+
+
+def _observe(
+    args: argparse.Namespace, labels: Sequence[str]
+) -> tuple[dict[str, Any], bool]:
+    """One fresh Shipyard invocation, validated against the request."""
     completed = subprocess.run(
         [
             args.shipyard,
@@ -301,7 +384,7 @@ def run(args: argparse.Namespace) -> int:
         # diagnosed by reading Shipyard's source.
         _persist_rejected(args, completed.stdout)
         raise
-    return _apply_breaker(args, labels, value, bool(unknown_reason))
+    return value, bool(unknown_reason)
 
 
 def _persist_rejected(args: argparse.Namespace, stdout: str) -> None:
@@ -365,6 +448,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base", default="main")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--validate-only", action="store_true")
+    parser.add_argument(
+        "--wait-in-progress",
+        action="store_true",
+        help=(
+            "re-check a contention deferral (observation_in_progress or "
+            "stewardship_in_progress) until it resolves or "
+            "TARTCI_ADMISSION_CLEAN_IN_PROGRESS_WAIT_SECS elapses"
+        ),
+    )
     return parser
 
 
