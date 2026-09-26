@@ -1772,10 +1772,10 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_idle_retarget_renders_only_when_a_profile_opts_in(self) -> None:
-        """Only the canary host's profile declares the retarget, and only on
-        its pulp-gate slots; every other shipped host is unaffected."""
+        """Only the trial hosts' profiles declare the retarget, and only on
+        their pulp-gate slots; every other shipped host and lane is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
-        canary = {"m1": "120"}
+        canary = {"m1": "120", "studio": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))

@@ -765,6 +765,42 @@ class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(len(retarget), 1, retarget)
         self.assertIn("to_tier=0 to_label=pulp-build-merge-group", retarget[0])
 
+    def test_idle_retarget_on_pr_first_slot_holds_its_own_class(self) -> None:
+        """A PR-head runner on the PR-first slot is held while PR-head waits,
+        even with merge-group queued: the retarget must resolve the runner's
+        own class by configured tier index, not by its position in the slot's
+        order (where PR-head is first)."""
+        self.env[self.KNOB] = self.PR_FIRST
+        self.env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = "120"
+        for n, state in enumerate(({"pr": True}, {"merge": True, "pr": True}), start=1):
+            with self.subTest(state=state):
+                self._state(**state)
+                result = self._runner("--print-idle-retarget", "1")
+                self.assertEqual(result.stdout.strip(), "0", result.stderr)
+                holds = self._events("assignment_v2_idle_hold")
+                self.assertEqual(len(holds), n, holds)
+                self.assertIn("reason=own_class_demand", holds[-1])
+        self.assertEqual(self._events("assignment_v2_idle_retarget"), [])
+
+    def test_idle_retarget_returns_a_fallback_runner_to_the_slots_order(self) -> None:
+        """A merge-group runner the PR-first slot minted as its fallback is
+        discarded once merge-group empties and PR-head waits, and the slot's
+        next selection is its own first class."""
+        self.env[self.KNOB] = self.PR_FIRST
+        self.env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = "120"
+        self._state(merge=True, pr=True)
+        held = self._runner("--print-idle-retarget", "0")
+        self.assertEqual(held.stdout.strip(), "0", held.stderr)
+        self._state(pr=True)
+        result = self._runner("--print-idle-retarget", "0")
+        self.assertEqual(result.stdout.strip(), "1", result.stderr)
+        retarget = self._events("assignment_v2_idle_retarget")
+        self.assertEqual(len(retarget), 1, retarget)
+        self.assertIn("selected_tier=0", retarget[0])
+        self.assertIn("to_tier=1 to_label=pulp-build-pr-head", retarget[0])
+        self._state(merge=True, pr=True)
+        self.assertEqual(self._select()[2], "1")
+
     def test_invalid_orders_fail_before_any_decision(self) -> None:
         self._state(merge=True, pr=True)
         cases = {

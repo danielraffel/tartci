@@ -77,6 +77,13 @@ replaces_launchd_labels = [
 # per-call timeout rather than the 180s scan budget. Adaptive lets launchd
 # promote the supervisor out of the background band. Gate lanes only.
 process_type = "Adaptive"
+# Work-conserving idle retarget (trial, both slots): a runner unassigned for
+# 120 s re-observes both classes and is discarded only when its own class has
+# no queued job and the other class has admissible demand. It composes with the
+# slot-2 order below: the runner's own class is resolved by configured tier
+# index, and after a discard the supervisor re-selects in that slot's order.
+# Rollback is removing this key. See docs/assignment-v2-rollout.md.
+assignment_idle_retarget_seconds = 120
 # PR-first canary (docs/assignment-v2-rollout.md, "Per-slot class preference").
 # Slot 2 consults PR-head before merge-group and falls back to merge-group when
 # no PR-head job waits; slot 1 keeps the configured merge-group-first order.
