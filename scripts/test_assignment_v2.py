@@ -137,6 +137,13 @@ if state.get("legacy"):
     jobs.append({"id": 203, "status": "queued", "labels": %s + ["pulp-gate-fast"]})
 if state.get("malformed"):
     jobs.append({"id": 204, "status": "queued", "labels": %s + [{"bad": "label"}]})
+# Pulp release classes: the class label appended to the same gate base labels.
+if state.get("release"):
+    jobs.append({"id": 205, "status": "queued", "created_at": stamp("fresh_release"),
+                 "labels": %s + ["pulp-release-tagged"]})
+if state.get("release_pr"):
+    jobs.append({"id": 206, "status": "queued", "created_at": stamp("fresh_release"),
+                 "labels": %s + ["pulp-release-pr-gate"]})
 
 
 def runs_page(run_id, name):
@@ -163,14 +170,21 @@ blind = state.get("blind_workflow")
 if blind and "/actions/workflows/" + str(blind) + "/runs" in parsed.path:
     raise SystemExit(9)
 
+RELEASE_WORKFLOWS = {97: (104, "Release CLI"), 96: (105, "Sign and Release"),
+                     95: (106, "Release-path PR gate")}
+release_runs = next((value for wid, value in RELEASE_WORKFLOWS.items()
+                     if "/actions/workflows/%%d/runs" %% wid in parsed.path), None)
 if parsed.path.endswith("/actions/workflows"):
-    print(json.dumps({"total_count": 2, "workflows": [
-        {"id": 99, "name": "Build and Test"},
-        {"id": 98, "name": "Merge Gate"}]}))
+    workflows = [{"id": 99, "name": "Build and Test"}, {"id": 98, "name": "Merge Gate"}]
+    workflows += [{"id": wid, "name": name}
+                  for wid, (_run, name) in RELEASE_WORKFLOWS.items()]
+    print(json.dumps({"total_count": len(workflows), "workflows": workflows}))
 elif "/actions/workflows/99/runs" in parsed.path or parsed.path.endswith("/actions/runs"):
     print(runs_page(101, "Build and Test"))
 elif "/actions/workflows/98/runs" in parsed.path:
     print(runs_page(102, "Merge Gate"))
+elif release_runs is not None:
+    print(runs_page(*release_runs))
 elif "/actions/runs/103/jobs" in parsed.path:
     ghost_jobs = []
     if state.get("ghost_job"):
@@ -178,11 +192,11 @@ elif "/actions/runs/103/jobs" in parsed.path:
                            "labels": %s + ["pulp-build-merge-group"]})
     print(json.dumps({"total_count": len(ghost_jobs),
                       "jobs": ghost_jobs if page == 1 else []}))
-elif "/actions/runs/101/jobs" in parsed.path or "/actions/runs/102/jobs" in parsed.path:
+elif any("/actions/runs/%%d/jobs" %% run in parsed.path for run in (101, 102, 104, 105, 106)):
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
-''' % (repr(BASE), repr(BASE), repr(BASE), repr(BASE), repr(BASE))
+''' % ((repr(BASE),) * 7)
 
 
 class RunnerFixture:
@@ -833,6 +847,118 @@ class SlotTierOrderTests(RunnerFixture, unittest.TestCase):
                 self.env[self.KNOB] = "pulp-build-merge-group,pulp-build-pr-head"
                 self._state(**state)
                 self.assertEqual(self._select(), absent)
+
+
+class ReleaseClassTests(RunnerFixture, unittest.TestCase):
+    """Pulp release classes declared on an event-class-v2 lane.
+
+    Configured tiers are merge-group (0), PR-head (1), release-tagged (2, two
+    workflows) and release PR gate (3). The release-first slot prefers tagged
+    releases; every reordered assertion sits beside a control on the identical
+    queue. A lane that does not declare the release classes is the two-tier
+    fixture and must never select release demand.
+    """
+
+    KNOB = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
+    RELEASE_FIRST = ("pulp-release-tagged,pulp-build-merge-group,"
+                     "pulp-build-pr-head,pulp-release-pr-gate")
+    CLASSES = ("pulp-build-merge-group", "pulp-build-pr-head",
+               "pulp-release-tagged", "pulp-release-pr-gate")
+
+    def _declare_release_classes(self) -> None:
+        self.env["TARTCI_RUNNER_WORKFLOW_TIERS"] = (
+            "pulp-build-merge-group|Build and Test\n"
+            "pulp-build-pr-head|Build and Test\n"
+            "pulp-release-tagged|Release CLI\n"
+            "pulp-release-tagged|Sign and Release\n"
+            "pulp-release-pr-gate|Release-path PR gate"
+        )
+        self.env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"] = ",".join(self.CLASSES)
+
+    def _select(self) -> list[str]:
+        result = self._runner("--print-selection")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip().split("\t")
+
+    def _pre_mint(self, tier: str) -> str:
+        result = self._runner("--print-pre-mint-selection", tier)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout.strip()
+
+    def _only_class(self, labels: str) -> str:
+        present = [label for label in labels.split(",") if label in self.CLASSES]
+        self.assertEqual(len(present), 1, labels)
+        return present[0]
+
+    def test_release_first_slot_picks_a_queued_release_over_gate_work(self) -> None:
+        self._declare_release_classes()
+        queue = {"merge": True, "pr": True, "release": True}
+        self._state(**queue)
+        control = self._select()
+        self.assertEqual(control[2], "0", control)
+        self.assertEqual(self._only_class(control[1]), "pulp-build-merge-group")
+
+        self.env[self.KNOB] = self.RELEASE_FIRST
+        self._state(**queue)
+        fields = self._select()
+        self.assertEqual(fields[0], "1")
+        self.assertEqual(fields[2], "2", fields)
+        self.assertEqual(self._only_class(fields[1]), "pulp-release-tagged")
+        self.assertNotIn("pulp-gate-fast", fields[1].split(","))
+        # The release boot is admitted while gate work waits; the default
+        # slot's release fallback is not.
+        self.assertEqual(self._pre_mint("2"), "1")
+        self.env.pop(self.KNOB)
+        self._state(**queue)
+        self.assertEqual(self._pre_mint("2"), "0")
+
+    def test_release_first_slot_serves_gate_work_when_no_release_waits(self) -> None:
+        """Work-conserving: with no release queued the release-first slot
+        selects exactly what the default slot selects."""
+        self._declare_release_classes()
+        for queue in ({"merge": True, "pr": True}, {"pr": True}, {"merge": True}, {}):
+            with self.subTest(queue=queue):
+                self.env.pop(self.KNOB, None)
+                self._state(**queue)
+                default = self._select()
+                self.env[self.KNOB] = self.RELEASE_FIRST
+                self._state(**queue)
+                self.assertEqual(self._select(), default)
+        self._state(pr=True)
+        fields = self._select()
+        self.assertEqual((fields[0], fields[2]), ("1", "1"), fields)
+        self.assertEqual(self._only_class(fields[1]), "pulp-build-pr-head")
+        self.assertEqual(self._pre_mint("1"), "1")
+
+    def test_release_pr_gate_is_served_last_on_the_release_first_slot(self) -> None:
+        self._declare_release_classes()
+        self.env[self.KNOB] = self.RELEASE_FIRST
+        self._state(release_pr=True)
+        fields = self._select()
+        self.assertEqual((fields[0], fields[2]), ("1", "3"), fields)
+        self.assertEqual(self._only_class(fields[1]), "pulp-release-pr-gate")
+        self._state(pr=True, release_pr=True)
+        self.assertEqual(self._select()[2], "1")
+
+    def test_lane_without_release_classes_never_picks_a_release_job(self) -> None:
+        """The two-tier fixture is every non-m5 slot: release demand is not
+        its demand, whatever else is queued."""
+        for queue in ({"release": True}, {"release_pr": True},
+                      {"release": True, "release_pr": True}):
+            with self.subTest(queue=queue):
+                self._state(**queue)
+                fields = self._select()
+                self.assertEqual(fields[0], "0", fields)
+                self.assertFalse(
+                    set(fields[1].split(",")) & set(self.CLASSES), fields)
+        self._state(release=True, pr=True)
+        fields = self._select()
+        self.assertEqual(fields[2], "1", fields)
+        self.assertEqual(self._only_class(fields[1]), "pulp-build-pr-head")
+        # Control: the identical queue on a lane that declares the class.
+        self._declare_release_classes()
+        self._state(release=True)
+        self.assertEqual(self._select()[2], "2")
 
 
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):

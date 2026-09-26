@@ -2465,6 +2465,200 @@ replaces_launchd_labels=REPLACEMENT
                     self.assertIn("replaces_launchd_labels", result.stderr)
 
 
+    # The m5 pulp-gate lane with the Pulp release classes declared after the two
+    # gate tiers and slot 2 preferring tagged releases. This is the enable
+    # change, applied to the shipped m5 profile in memory only.
+    RELEASE_TIERS = (
+        '\n[[lane.tier]]\nlabel = "pulp-release-tagged"\nworkflow = "Release CLI"\nrunner_group_id = 1\n'
+        '\n[[lane.tier]]\nlabel = "pulp-release-tagged"\nworkflow = "Sign and Release"\nrunner_group_id = 1\n'
+        '\n[[lane.tier]]\nlabel = "pulp-release-pr-gate"\nworkflow = "Release-path PR gate"\nrunner_group_id = 1\n'
+    )
+    RELEASE_FIRST = (
+        'assignment_slot_tier_order = { 2 = ["pulp-release-tagged", '
+        '"pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }'
+    )
+    M5_PR_HEAD_TIER = (
+        '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n'
+    )
+
+    def _m5_release_enabled(self, tiers: str | None = None, order: str | None = None) -> str:
+        base = HOST_CONFIGS["m5"].read_text()
+        # The first pr-head tier in m5 is the pulp-gate lane's; the release
+        # tiers ride directly after it, ahead of the legacy pulp-release lane.
+        self.assertEqual(base.index(self.M5_PR_HEAD_TIER),
+                         base.find(self.M5_PR_HEAD_TIER))
+        body = base.replace(
+            self.M5_PR_HEAD_TIER,
+            self.M5_PR_HEAD_TIER + (self.RELEASE_TIERS if tiers is None else tiers),
+            1,
+        )
+        anchor = 'process_type = "Adaptive"\n\n[[lane.tier]]\nlabel = "pulp-build-merge-group"'
+        self.assertEqual(body.count(anchor), 1)
+        return body.replace(
+            anchor,
+            anchor.replace(
+                'process_type = "Adaptive"\n',
+                'process_type = "Adaptive"\n'
+                + (self.RELEASE_FIRST if order is None else order) + "\n",
+                1,
+            ),
+            1,
+        )
+
+    def _validate_text(self, td: str, name: str, body: str) -> subprocess.CompletedProcess[str]:
+        path = Path(td) / f"{name}.toml"
+        path.write_text(body)
+        return subprocess.run(
+            [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+            text=True, capture_output=True, check=False,
+        )
+
+    def test_shipped_v2_lanes_keep_exactly_the_two_gate_classes(self) -> None:
+        """Release classes are OFF in every shipped profile: no v2 lane renders
+        them, so shipped slots render exactly the two-class contract and the
+        legacy m5 pulp-release lane remains the only release registration."""
+        seen = 0
+        for host_id, config in HOST_CONFIGS.items():
+            for name, body in fleet.rendered_plists(fleet.load(config)).items():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                if env.get("TARTCI_RUNNER_ASSIGNMENT_MODE") != "event-class-v2":
+                    continue
+                seen += 1
+                with self.subTest(plist=name):
+                    self.assertEqual(
+                        env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
+                        "pulp-build-merge-group,pulp-build-pr-head",
+                    )
+                    self.assertNotIn("pulp-release", env["TARTCI_RUNNER_WORKFLOW_TIERS"])
+        self.assertEqual(seen, 6)
+        published = json.loads((ROOT / "fleet" / "advertised-labels.json").read_text())
+        rows = json.dumps(published)
+        self.assertIn("pulp-release-tagged", rows)
+        for row in fleet.advertised_labels_snapshot(
+                list(HOST_CONFIGS.values()), None)["registrations"]:
+            if row["class_label"] and row["class_label"].startswith("pulp-release-"):
+                self.assertEqual((row["profile"], row["lane"]),
+                                 ("m5-macos-fleet", "pulp-release"), row)
+
+    def test_v2_lane_accepts_declared_release_classes(self) -> None:
+        body = self._m5_release_enabled()
+        with tempfile.TemporaryDirectory() as td:
+            result = self._validate_text(td, "enabled", body)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            path = Path(td) / "enabled.toml"
+            rendered = fleet.rendered_plists(fleet.load(path))
+            slot1 = plistlib.loads(
+                rendered["com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-gate.plist"]
+            )["EnvironmentVariables"]
+            slot2 = plistlib.loads(
+                rendered["com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-gate.slot2.plist"]
+            )["EnvironmentVariables"]
+            classes = ("pulp-build-merge-group,pulp-build-pr-head,"
+                       "pulp-release-tagged,pulp-release-pr-gate")
+            for env in (slot1, slot2):
+                self.assertEqual(env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"], classes)
+                self.assertEqual(env["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"].splitlines(), [
+                    "pulp-build-merge-group|1", "pulp-build-pr-head|1",
+                    "pulp-release-tagged|1", "pulp-release-pr-gate|1",
+                ])
+            self.assertNotIn("TARTCI_ASSIGNMENT_V2_TIER_ORDER", slot1)
+            self.assertEqual(
+                slot2["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
+                "pulp-release-tagged,pulp-build-merge-group,"
+                "pulp-build-pr-head,pulp-release-pr-gate",
+            )
+            regs = [
+                row for row in fleet.advertised_labels_snapshot([path], None)["registrations"]
+                if row["lane"] == "pulp-gate"
+            ]
+            self.assertEqual(
+                [(row["class_label"], row["workflows"]) for row in regs],
+                [
+                    ("pulp-build-merge-group", ["Build and Test"]),
+                    ("pulp-build-pr-head", ["Build and Test"]),
+                    ("pulp-release-tagged", ["Release CLI", "Sign and Release"]),
+                    ("pulp-release-pr-gate", ["Release-path PR gate"]),
+                ],
+            )
+            for row in regs:
+                # One class per registration: a release runner cannot take a
+                # gate job and a gate runner cannot take a release job.
+                self.assertEqual(
+                    row["labels"],
+                    ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm",
+                     row["class_label"]],
+                )
+            # Either extra class alone is also a valid declaration.
+            only_pr_gate = self._m5_release_enabled(
+                tiers='\n[[lane.tier]]\nlabel = "pulp-release-pr-gate"\n'
+                      'workflow = "Release-path PR gate"\nrunner_group_id = 1\n',
+                order="",
+            )
+            result = self._validate_text(td, "only-pr-gate", only_pr_gate)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_v2_lane_rejects_malformed_release_classes(self) -> None:
+        tagged_cli = ('\n[[lane.tier]]\nlabel = "pulp-release-tagged"\n'
+                      'workflow = "Release CLI"\nrunner_group_id = 1\n')
+        tagged_sign = ('\n[[lane.tier]]\nlabel = "pulp-release-tagged"\n'
+                       'workflow = "Sign and Release"\nrunner_group_id = 1\n')
+        pr_gate = ('\n[[lane.tier]]\nlabel = "pulp-release-pr-gate"\n'
+                   'workflow = "Release-path PR gate"\nrunner_group_id = 1\n')
+        fixtures = {
+            "unknown-class": self._m5_release_enabled(
+                tiers=self.RELEASE_TIERS + '\n[[lane.tier]]\nlabel = "pulp-release-nightly"\n'
+                      'workflow = "Nightly"\nrunner_group_id = 1\n',
+                order=""),
+            "duplicate-class": self._m5_release_enabled(
+                tiers=self.RELEASE_TIERS + pr_gate, order=""),
+            "non-contiguous-class": self._m5_release_enabled(
+                tiers=tagged_cli + pr_gate + tagged_sign, order=""),
+            "partial-workflows": self._m5_release_enabled(tiers=tagged_cli, order=""),
+            "wrong-workflow": self._m5_release_enabled(
+                tiers=pr_gate.replace("Release-path PR gate", "Build and Test"), order=""),
+            "gate-class-repeated": self._m5_release_enabled(
+                tiers=self.M5_PR_HEAD_TIER, order=""),
+            "org-scoped-release": self._m5_release_enabled(
+                tiers=self.RELEASE_TIERS.replace(
+                    'workflow = "Release-path PR gate"\nrunner_group_id = 1',
+                    'workflow = "Release-path PR gate"\nrunner_group_id = 3'),
+                order=""),
+            "order-omits-release-class": self._m5_release_enabled(
+                order='assignment_slot_tier_order = { 2 = ["pulp-release-tagged", '
+                      '"pulp-build-merge-group", "pulp-build-pr-head"] }'),
+        }
+        # Each fixture must fail for its own reason, not an incidental one.
+        reasons = {
+            "unknown-class": "unknown event-class-v2 class pulp-release-nightly",
+            "duplicate-class": "pulp-release-pr-gate must declare exactly",
+            "non-contiguous-class": "must be contiguous and unique",
+            "partial-workflows": "pulp-release-tagged must declare exactly",
+            "wrong-workflow": "pulp-release-pr-gate must declare exactly",
+            "gate-class-repeated": "merge-group then PR-head",
+            "org-scoped-release": "repository-scoped registration for every event class",
+            "order-omits-release-class": "must name every tier class exactly once",
+        }
+        self.assertEqual(set(reasons), set(fixtures))
+        with tempfile.TemporaryDirectory() as td:
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    result = self._validate_text(td, name, body)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn(reasons[name], result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+            # Release rows ahead of the gate tiers break the gate-first contract.
+            base = HOST_CONFIGS["m5"].read_text()
+            first_gate = ('\n[[lane.tier]]\nlabel = "pulp-build-merge-group"\n'
+                          'workflow = "Build and Test"\nrunner_group_id = 1\n')
+            self.assertEqual(base.count(first_gate), 1)
+            leading = base.replace(first_gate, pr_gate + first_gate, 1)
+            result = self._validate_text(td, "release-before-gate", leading)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("merge-group then PR-head", result.stderr)
+            # Control: the enabled form itself validates on the same base.
+            result = self._validate_text(td, "control", self._m5_release_enabled())
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
 
 class ServingBlockedTests(unittest.TestCase):
     """A fresh heartbeat proves a supervisor is alive, never that it serves.
