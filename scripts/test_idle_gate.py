@@ -177,6 +177,130 @@ esac
         )
 
 
+class BoundedYieldTests(unittest.TestCase):
+    """TARTCI_YIELD_MAX_WAIT_SECONDS lifts the priority yield once one of this
+    lane's OWN queued jobs has waited at least that long.
+
+    Driven through the real `--print-yield-bound` hook, which runs the loop's
+    own `select_work` then `yield_bound_reached`, against a stub GitHub that
+    serves one queued release job whose created_at is set per case. The release
+    lane's workflow-tier shape is used because that is the lane the bound exists
+    for (the M5 release lane that never won a slot under steady PR load).
+    """
+
+    RELEASE_LABELS = "self-hosted,macOS,ARM64,pulp-build-vm-release"
+
+    def _run(
+        self,
+        *,
+        queued_seconds_ago: int,
+        bound: str | None,
+        gh_fails: bool = False,
+    ) -> subprocess.CompletedProcess:
+        import json
+        import stat
+        import tempfile
+        from datetime import datetime, timedelta, timezone
+
+        created = (
+            datetime.now(timezone.utc) - timedelta(seconds=queued_seconds_ago)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        run = {"id": 101, "name": "Release CLI",
+               "created_at": created, "updated_at": created}
+        jobs = {"jobs": [{
+            "id": 201, "status": "queued", "created_at": created,
+            "labels": self.RELEASE_LABELS.split(",") + ["pulp-release-tagged"],
+        }]}
+        stub = f"""#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) printf '%s\\n' '{{"resources":{{"core":{{"limit":15000,"remaining":14999}}}}}}' ;;
+  *actions/workflows?per_page=100*) printf '%s\\n' '{json.dumps({"workflows": [{"id": 77, "name": "Release CLI"}, {"id": 78, "name": "Release-path PR gate"}]})}' ;;
+  *actions/workflows/77/runs*status=queued*) printf '%s\\n' '{json.dumps({"workflow_runs": [run]})}' ;;
+  *actions/workflows/*/runs*) printf '%s\\n' '{{"workflow_runs":[]}}' ;;
+  *actions/runs/101/jobs*) printf '%s\\n' '{json.dumps(jobs)}' ;;
+  *) exit 1 ;;
+esac
+"""
+        if gh_fails:
+            stub = "#!/usr/bin/env bash\nexit 1\n"
+        tmp = Path(tempfile.mkdtemp())
+        for name, body in (("tart", "#!/usr/bin/env bash\nexit 0\n"),
+                           ("stubgh", stub)):
+            path = tmp / name
+            path.write_text(body, encoding="utf-8")
+            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
+                if Path(b).exists()]
+        env = {
+            "HOME": str(tmp),
+            "PATH": os.pathsep.join([str(tmp), *base]),
+            "TART_HOME": str(tmp / "vms"),
+            "TARTCI_STATE_DIR": str(tmp / "state"),
+            "TARTCI_GH_CLI": "stubgh",
+            "TARTCI_QUEUE_STAGGER_MAX_SECS": "0",
+            "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS": "0",
+            "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+            "TARTCI_RUNNER_LABELS": self.RELEASE_LABELS,
+            "TARTCI_RUNNER_WORKFLOW_TIERS":
+                "pulp-release-tagged|Release CLI\n"
+                "pulp-release-pr-gate|Release-path PR gate",
+            "TARTCI_YIELD_TO_WORKFLOW_NAME": "Build and Test",
+            "TARTCI_YIELD_TO_LABELS":
+                "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+        }
+        if bound is not None:
+            env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = bound
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--print-yield-bound"],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def test_a_job_under_the_bound_still_yields(self) -> None:
+        r = self._run(queued_seconds_ago=600, bound="2700")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_a_job_over_the_bound_takes_the_slot(self) -> None:
+        # Also the control for every "0" above and below: the fixture does
+        # produce a matching, selectable release job.
+        r = self._run(queued_seconds_ago=3600, bound="2700")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+    def test_unset_bound_never_lifts_the_yield(self) -> None:
+        # The same ten-hour-old job that the bounded lane would serve.
+        for bound in (None, "0"):
+            with self.subTest(bound=bound):
+                r = self._run(queued_seconds_ago=36000, bound=bound)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.strip(), "0")
+
+    def test_a_failed_age_scan_keeps_yielding(self) -> None:
+        r = self._run(queued_seconds_ago=36000, bound="2700", gh_fails=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0")
+
+    def test_an_invalid_bound_refuses_to_start(self) -> None:
+        for bound in ("-5", "45m", "1.5"):
+            with self.subTest(bound=bound):
+                r = self._run(queued_seconds_ago=0, bound=bound)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("TARTCI_YIELD_MAX_WAIT_SECONDS", r.stderr)
+
+    def test_loop_gate_consults_the_bound_only_when_yielding(self) -> None:
+        body = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn(
+            'if [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && '
+            '[ "$YIELD_MAX_WAIT" -gt 0 ]; then',
+            body,
+        )
+        self.assertIn('yb="$(yield_bound_reached "$selected_labels")"', body)
+        self.assertIn(
+            '{ [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; }', body
+        )
+        self.assertIn('note "yield bound reached:', body)
+
+
 class HostHealthYieldTests(unittest.TestCase):
     """host_health_yield must FAIL OPEN (the deliberate opposite of
     priority_demand): a missing/broken host_vitals probe → boot (0), never a
