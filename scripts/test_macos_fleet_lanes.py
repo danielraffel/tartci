@@ -1775,7 +1775,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         """Only the trial hosts' profiles declare the retarget, and only on
         their pulp-gate slots; every other shipped host and lane is unaffected."""
         env_key = "TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"
-        canary = {"m1": "120", "studio": "120"}
+        canary = {"m1": "120", "studio": "120", "m5": "120"}
         for host_id, config in HOST_CONFIGS.items():
             with self.subTest(shipped=host_id):
                 rendered = fleet.rendered_plists(fleet.load(config))
