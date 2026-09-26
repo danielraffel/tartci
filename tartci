@@ -164,6 +164,27 @@ cmd_doctor() {
   # vncdotool + UTM are optional helpers.
   command -v vncdo >/dev/null 2>&1 && c_ok "vncdo (VNC drive)" || c_warn "vncdo (optional: headless VNC drive — pip install vncdotool)"
   [ -d /Applications/UTM.app ] && c_ok "UTM.app (GUI bench)" || c_warn "UTM.app (optional: GUI/DAW bench)"
+  # Two janitors, two different failures: the disk reclaimer keeps the lease's
+  # disk axis servable, the VM janitor removes stale VMs and overlays. Report
+  # both by name — a host can carry either, both or neither, and a missing one
+  # is silent until its volume or its VM store fills.
+  echo "janitors:"
+  # Name only a remedy that exists: the reclaimer has an installer, the VM
+  # janitor is still rendered by hand from its template, and a message pointing
+  # at a script that is not there costs the reader the trip.
+  for _j in "reclaim:disk reclaimer:scripts/install_reclaim_agent.sh --install" \
+            "reap:VM janitor:render launchd/com.danielraffel.tartci.reap.plist.template"; do
+    _label="com.danielraffel.tartci.${_j%%:*}"
+    _rest="${_j#*:}"; _desc="${_rest%%:*}"; _fix="${_rest#*:}"
+    if launchctl print "gui/$(id -u)/$_label" >/dev/null 2>&1; then
+      c_ok "$_desc ($_label loaded)"
+    elif [ -f "${TARTCI_AGENTS_DIR:-$HOME/Library/LaunchAgents}/$_label.plist" ]; then
+      c_warn "$_desc ($_label installed but NOT loaded — launchctl bootstrap it)"
+    else
+      c_warn "$_desc (not installed; $_fix)"
+    fi
+  done
+  unset _j _label _rest _desc _fix
   echo "stores under $TARTCI_HOME:"
   for d in "$TARTCI_GOLDENS" "$TARTCI_BENCH" "$TARTCI_WIN"; do
     [ -d "$d" ] && c_ok "$d" || c_warn "$d (will be created by 'setup')"
@@ -297,6 +318,13 @@ cmd_setup() {
   . "$HERE/providers/common/onboard.lib.sh"
   tartci_onboard_role "$HERE" || true
   tartci_onboard_verify "$HERE" || echo "setup: host not fully onboarded (see verify above)"
+  # The disk reclaimer is part of being a governed host, not an extra. The lease
+  # has a disk axis, so a full data volume denies every lease and the host stops
+  # serving rather than serving slowly. Idempotent: an unchanged, loaded agent is
+  # left alone. Non-fatal, because a host that cannot install a janitor is still
+  # a usable host and `doctor` reports the gap.
+  "$HERE/scripts/install_reclaim_agent.sh" --install ||
+    echo "setup: could not install the disk reclaimer; 'tartci doctor' will keep reporting it" >&2
   cmd_doctor
 }
 
