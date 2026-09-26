@@ -1891,6 +1891,56 @@ shadow configuration remains installed on a host. During an upgrade, run
 user plists, and verify they are absent. Do not start its controller or workers
 and do not route any profile lane through it.
 
+### Boot decisions: per-job claims and lease fit (macOS)
+
+Two local checks run before a macOS lane spends a queue scan, a Shipyard
+admission call, a lease or a clone. Both fail open: if either cannot answer,
+the lane does exactly what it did before they existed.
+
+**Lease fit** (`providers/tart-macos/lease-fit.lib.sh`, `scripts/lease_fit.py`).
+Each poll, before scanning the queue, the lane asks the lease store, read-only
+and with the same capacity model `leases.py acquire` uses, whether its VM lease
+could be granted.
+- *Not now* (another VM or agent build holds the cores): the lane waits a poll
+  with heartbeat `lease-wait`. It does not scan the queue or ask Shipyard.
+- *Never* (the VM is larger than the budget it is admitted against): the lane
+  stops polling, logs a `CONFIGURATION` line, and reports heartbeat
+  `lease-never-fits` and event `lease_never_fits`.
+- Each lane writes its verdict to `$TARTCI_STATE_DIR/<lane>.lease-fit.json`.
+  `tartci doctor fleet` (`lease_fit` check) and `tartci pool status` (text line
+  and `lease_fit` JSON key) read it. They report a lane that can never lease
+  (`lane_lease_never_fits`) and more identical lanes than the budget runs at
+  once (`lanes_exceed_lease_capacity`), for example two 12-core gate lanes in
+  m5's 14-core universe.
+- `TARTCI_LEASE_FIT_GATE=0` disables the check.
+
+**Per-job claim** (`providers/tart-macos/job-claim.lib.sh`, `scripts/job_claim.py`).
+Before cloning, a lane claims one queued job of its selected class (repo +
+runner labels) in a host-wide store (`TARTCI_JOB_CLAIM_DIR`, default
+`~/.tartci/state/job-claims`). The claim is granted only while the queued count
+is larger than the claims already standing against that class. Two kinds of
+claim stand:
+- live claims of other lanes on this host;
+- online, idle runners anywhere in the fleet whose labels cover the class, that
+  is, lanes that have already minted and are waiting for GitHub to assign them
+  a job. One runner listing per boot attempt; `TARTCI_JOB_CLAIM_FLEET=0` makes
+  claims host-local.
+
+If every queued job is covered, the lane does not boot (event
+`job_claim_contended`, heartbeat `job-claim-covered`). Such a pass does not
+count toward the serving-blocked streak.
+
+An event-class V2 count is only "at least one", so the lane buys an exhaustive
+count only when a sibling already holds a claim.
+
+A claim is released when the runner is assigned its job, when `run_one`
+returns, and in cleanup. A crashed supervisor's claim dies with it (pid +
+start time) or at `TARTCI_JOB_CLAIM_TTL_SECS` (default 1800).
+
+A lane on another host that is still booting and has not minted yet is not
+visible to any state tartci publishes. That race remains, and the pre-mint
+recheck still resolves it. `TARTCI_JOB_CLAIM=0` disables claims.
+
 ## Onboarding a new host
 
 `tartci setup` is the one command to bring a fresh Mac into the pool. Beyond

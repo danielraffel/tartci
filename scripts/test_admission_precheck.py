@@ -150,6 +150,7 @@ class RunOneHarness:
             f"TARTCI_ROOT={str(ROOT)!r}\n"
             f"source {str(LIB)!r}\n"
             f"source {str(PROOF_LIB)!r}\n"
+            f"source {str(ROOT / 'providers/tart-macos/job-claim.lib.sh')!r}\n"
             # Stubs for everything `run_one` touches before the clone. The
             # admission chain itself is NOT stubbed: the real library, the real
             # adapter and the real renderer run against a stub `shipyard`.

@@ -262,6 +262,8 @@ SERVING_BLOCKED_STREAK=0
 SERVING_BLOCKED_LAST_PHASE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
+# The queued count the loop selected with; the per-job claim reads it.
+CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
@@ -398,6 +400,10 @@ source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
 # shellcheck source=providers/tart-macos/boundary-proof.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
+# shellcheck source=providers/tart-macos/job-claim.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
+# shellcheck source=providers/tart-macos/lease-fit.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/lease-fit.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
@@ -1110,6 +1116,7 @@ reconcile_pending_delete(){
 cleanup(){
   tartci_pool_lock_release
   tartci_boundary_proof_abandon
+  tartci_job_claim_release
   [ "$CLEANED_UP" = 1 ] && return 0
   [ -z "$CURRENT_SCAN_PID" ] || kill "$CURRENT_SCAN_PID" 2>/dev/null || true
   [ -z "$CURRENT_SCAN_TMP" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
@@ -1524,6 +1531,8 @@ run_runner_until_done(){
       done
       CURRENT_SERVED=1
       event job_assigned "$(grep 'Running job:' "$runner_log" | tail -1)"
+      # The queued job this claim stood for is gone from the queue now.
+      tartci_job_claim_release
       heartbeat job-running
     fi
     if [ "$assigned" = 0 ] && [ "$idle_elapsed" -ge "$IDLE_TIMEOUT" ]; then
@@ -1605,6 +1614,7 @@ run_one(){
   # Before the first early return, not beside the other CURRENT_* resets: the
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
+  JOB_CLAIM_CONTENDED=0
   vm="$(ephemeral_boot_name "$i")"
   local jit="" label_args=() labels_split=() l boot_log rpid ip="" rc=0
   local selected_group_id selected_runner_api_root access_json access_rc access_error
@@ -1621,6 +1631,18 @@ run_one(){
   fi
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
+    return 75
+  fi
+  # One booting VM per queued job: a lane whose class's queued jobs are all
+  # covered by another lane (on this host, or already minted in the fleet)
+  # does not clone. See providers/tart-macos/job-claim.lib.sh.
+  # Only the explicit "covered" answer (75) stops the boot; anything else,
+  # including a failure of the claim machinery itself, boots as before.
+  local claim_rc=0
+  tartci_job_claim_acquire "$vm" "$selected_labels" "$selected_tier" \
+    "${CURRENT_SELECTED_QUEUED:-}" "$selected_runner_api_root" || claim_rc=$?
+  if [ "$claim_rc" -eq 75 ]; then
+    heartbeat job-claim-covered
     return 75
   fi
   # The verdict is a function of (repo, labels) alone — see
@@ -2034,6 +2056,8 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 tartci_boundary_proof_validate \
   || die "invalid parallel boundary-proof configuration"
+tartci_job_claim_validate || die "invalid job-claim configuration"
+tartci_lease_fit_validate || die "invalid lease-fit configuration"
 
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
@@ -2075,6 +2099,13 @@ if [ "$LOOP" = 1 ]; then
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
+      sleep "$POLL"
+      continue
+    fi
+    # A lane whose VM lease cannot be granted right now (or ever) has nothing
+    # to boot, so it neither scans the queue nor asks Shipyard. Local and
+    # read-only; fails open. See providers/tart-macos/lease-fit.lib.sh.
+    if ! tartci_lease_fit_gate; then
       sleep "$POLL"
       continue
     fi
@@ -2170,12 +2201,14 @@ if [ "$LOOP" = 1 ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
+      CURRENT_SELECTED_QUEUED="$q"
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # Every cause of clone-without-serve returns through here, so the streak
       # is counted here rather than at each cause. Counted per work ENTRY, not
       # per error: a lane that alternates a failure with a served job never
       # accumulates, while a lane that only fails accumulates every cycle.
-      if [ "$CURRENT_SERVED" = 1 ]; then
+      # Demand another lane already covers is not demand this lane failed.
+      if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
@@ -2188,6 +2221,7 @@ if [ "$LOOP" = 1 ]; then
       # Early returns (boot failure, yield, admission refusal) leave a proof
       # that nobody will consume.
       tartci_boundary_proof_abandon
+      tartci_job_claim_release
       if [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ]; then
         PENDING_DELETE_ATTEMPTS=0
         note "teardown of $CURRENT_VM left deletion unproved — keeping it as pending-delete with its lease and reservation; reconciling in-loop instead of restarting"
