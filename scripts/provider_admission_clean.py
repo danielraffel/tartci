@@ -17,7 +17,8 @@ import hashlib
 import pathlib
 import subprocess
 import sys
-from typing import Any, Sequence
+import time
+from typing import Any, Callable, Sequence
 
 
 COMMAND = "runner:admission-clean"
@@ -76,6 +77,13 @@ INCONCLUSIVE_ERROR_REASONS = {
 # `mutation_failed` is a positive observation of a superseded run that Shipyard
 # failed to cancel; `invalid_labels` is local misconfiguration.  Never degrade.
 CONCLUSIVE_ERROR_REASONS = {"invalid_labels", "mutation_failed"}
+# A `defer` for one of these reasons says nothing about the queue: another
+# caller holds Shipyard's exact-key observation (or stewardship) lock and is
+# computing the same (repo, base, labels) verdict right now.  Shipyard answers
+# with a try-lock, so the refusal is instant.  Re-asking after a short pause
+# gets the real verdict; giving up discards a VM that is already booted.  Every
+# other `defer` is a statement about the queue and is returned at once.
+CONTENTION_DEFER_REASONS = {"observation_in_progress", "stewardship_in_progress"}
 
 
 class ConfigurationError(ValueError):
@@ -239,6 +247,20 @@ def bounded_timeout() -> int:
     return int(raw)
 
 
+def contention_wait() -> tuple[int, int]:
+    """Bound on re-asking a contention defer: (total seconds, poll seconds).
+
+    0 total disables the wait and restores the single-shot behaviour.
+    """
+    total = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_CONTENTION_WAIT_SECS", 90, 0, 600
+    )
+    poll = _bounded_env_int(
+        "TARTCI_ADMISSION_CLEAN_CONTENTION_POLL_SECS", 5, 1, 60
+    )
+    return total, poll
+
+
 def validate_configuration(args: argparse.Namespace) -> list[str]:
     if not REPO_PATTERN.fullmatch(args.repo):
         raise ConfigurationError("repo must be a canonical owner/name slug")
@@ -246,13 +268,47 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
         raise ConfigurationError("base must be a branch name")
     labels = parse_labels(args.labels)
     bounded_timeout()
+    contention_wait()
     return labels
 
 
-def run(args: argparse.Namespace) -> int:
+def run(
+    args: argparse.Namespace,
+    *,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> int:
     labels = validate_configuration(args)
     if args.validate_only:
         return 0
+    wait_total, wait_poll = contention_wait()
+    started = clock()
+    waits = 0
+    while True:
+        value, unknown_reason = _ask_shipyard(args, labels)
+        if (
+            value["verdict"] != "defer"
+            or value["reason"] not in CONTENTION_DEFER_REASONS
+        ):
+            break
+        # Only the wait is bounded here; the verdict that ends it is always a
+        # fresh Shipyard answer.  Running out of budget returns the contention
+        # defer itself, exactly as a single-shot call would have.
+        remaining = wait_total - (clock() - started)
+        if remaining <= 0:
+            break
+        sleep(min(wait_poll, remaining))
+        waits += 1
+    if waits:
+        value = dict(value)
+        value["tartci_contention_waits"] = waits
+        value["tartci_contention_wait_secs"] = round(clock() - started, 1)
+    return _apply_breaker(args, labels, value, unknown_reason)
+
+
+def _ask_shipyard(
+    args: argparse.Namespace, labels: Sequence[str]
+) -> tuple[dict[str, Any], bool]:
     completed = subprocess.run(
         [
             args.shipyard,
@@ -301,7 +357,7 @@ def run(args: argparse.Namespace) -> int:
         # diagnosed by reading Shipyard's source.
         _persist_rejected(args, completed.stdout)
         raise
-    return _apply_breaker(args, labels, value, bool(unknown_reason))
+    return value, bool(unknown_reason)
 
 
 def _persist_rejected(args: argparse.Namespace, stdout: str) -> None:

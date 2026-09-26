@@ -1251,6 +1251,33 @@ Counters live per `(repo, base, labels)` under
 A rejected envelope is written to `rejected-envelope.json` in that directory,
 so a Shipyard contract skew is diagnosable without reading Shipyard's source.
 
+A `defer` for `observation_in_progress` or `stewardship_in_progress` is not a
+verdict about the queue: another caller on the host holds Shipyard's exact-key
+observation (or stewardship) lock for the same `(repo, base, labels)`, and
+Shipyard answers with a try-lock. Returning it discarded a booted VM for no
+reason (130 of them in one day on the Pulp gate, when both lanes of a host asked
+at once). The adapter now re-asks for up to
+`TARTCI_ADMISSION_CLEAN_CONTENTION_WAIT_SECS` (default 90, range 0..600; 0 is
+single-shot) at `TARTCI_ADMISSION_CLEAN_CONTENTION_POLL_SECS` intervals
+(default 5, range 1..60). Every verdict that ends the wait is a fresh Shipyard
+answer, so the gate stays fail-closed; when the budget runs out the contention
+`defer` is returned exactly as before. Every other `defer` reason is a statement
+about the queue and is returned at once. A verdict that waited carries
+`tartci_contention_waits`, and the provider event renders it as
+`contention_waits=N`.
+
+On macOS the boundary's two network proofs, the admission verdict and the
+runner group's repository-access proof, start in the background as soon as the
+VM lease is held, beside the clone and boot, and the boundary consumes their
+results (`boundary-proof.lib.sh`). This takes their duration off every job's
+critical path without changing what they decide: a refusal still discards the
+booted VM with the same code and events, and an admission verdict older than
+`TARTCI_BOUNDARY_PROOF_MAX_AGE_SECS` (default 120, range 0..600) when the
+boundary reads it, or any missing or partial result, is replaced by the
+synchronous call the boundary always made. The `admission_check` event says
+which answer was used (`source=parallel age=Ns` or `source=boundary`).
+`TARTCI_BOUNDARY_PROOF_PARALLEL=0` restores the fully sequential boundary.
+
 Degrading trades one ephemeral single-job VM that a superseded run may claim --
 bounded, non-corrupting, and unable to satisfy the current head's required
 checks -- against an unbounded fleet stop. Never widen this to `admit`
@@ -1528,18 +1555,6 @@ fleet`), and check GitHub's job history against it with
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
-- **Quiet windows only.** Run `--apply`, and any manual `pool drain`, `pool
-  off`, `pool on` or `gate-slot2 install`, when the host's lanes have no queued
-  demand, not during a burst. A drain takes the host's gate slots out of
-  admission for the whole mid-job wait (up to 90 min) plus the install, and
-  every job that queues meanwhile waits for another host. Measured on the Pulp
-  gate fleet (2026-09-25/26): pool off or draining was 6.3% of all `macos` gate
-  queue wait, about 1.9 min per job on average. Before an apply, check that the
-  lane logs show `queued=0` (or that no gate job is waiting in the repository's
-  Actions queue) and that the other hosts are serving; prefer nights and
-  weekends for fleet-wide rollouts, and do one host at a time. The periodic
-  agent is not installed by default for this reason: a 30-minute schedule does
-  not know when the queue is busy.
 - **Capacity floor.** `--allow-last-serving-host` only when every last-serving
   label is either idle by design (the pulp-release classes) or **minted on
   demand by another host**, logged in the receipt. On an ephemeral JIT fleet a

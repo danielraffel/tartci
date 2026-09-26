@@ -410,6 +410,8 @@ source "$TARTCI_ROOT/providers/common/host-health.lib.sh"
 source "$TARTCI_ROOT/providers/common/admission-clean.lib.sh"
 # shellcheck source=providers/tart-macos/assignment-v2.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/assignment-v2.lib.sh"
+# shellcheck source=providers/tart-macos/boundary-proof.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
@@ -1122,6 +1124,7 @@ reconcile_pending_delete(){
 
 cleanup(){
   tartci_pool_lock_release
+  tartci_boundary_proof_abandon
   [ "$CLEANED_UP" = 1 ] && return 0
   [ -z "$CURRENT_SCAN_PID" ] || kill "$CURRENT_SCAN_PID" 2>/dev/null || true
   [ -z "$CURRENT_SCAN_TMP" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
@@ -1713,6 +1716,11 @@ run_one(){
   fi
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
   lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
+  # The admission verdict and the repository-access proof do not read the VM,
+  # so they run beside the clone and boot and are consumed at the boundary.
+  # See providers/tart-macos/boundary-proof.lib.sh for why this cannot admit
+  # anything the sequential boundary would have refused.
+  tartci_boundary_proof_start "$vm" "$selected_labels" "$selected_group_id"
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
@@ -1831,11 +1839,17 @@ run_one(){
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
     heartbeat admission-check
-    event admission_check "repo=$REPO labels=$selected_labels"
-    if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
-      admission_rc=0
+    if tartci_boundary_proof_take_admission; then
+      admission_json="$BOUNDARY_ADMISSION_JSON"
+      admission_rc="$BOUNDARY_ADMISSION_RC"
+      event admission_check "repo=$REPO labels=$selected_labels source=parallel age=${BOUNDARY_ADMISSION_AGE}s"
     else
-      admission_rc=$?
+      event admission_check "repo=$REPO labels=$selected_labels source=boundary"
+      if admission_json="$(tartci_admission_clean "$REPO" "$selected_labels")"; then
+        admission_rc=0
+      else
+        admission_rc=$?
+      fi
     fi
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
@@ -1855,7 +1869,10 @@ run_one(){
 
   access_error="$STATE_DIR/$vm.repository-access-error"
   access_rc=0
-  if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+  if tartci_boundary_proof_take_access "$access_error"; then
+    access_json="$BOUNDARY_ACCESS_JSON"
+    access_rc="$BOUNDARY_ACCESS_RC"
+  elif access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
       python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
       --repo "$REPO" --runner-group-id "$selected_group_id" \
       --gh-cli "$JIT_GH_CLI" 2>"$access_error")"; then
@@ -1863,6 +1880,7 @@ run_one(){
   else
     access_rc=$?
   fi
+  tartci_boundary_proof_abandon
   [ -z "$access_json" ] \
     || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
   if [ "$access_rc" -ne 0 ]; then
@@ -2036,6 +2054,8 @@ trap 'handle_supervisor_signal' INT TERM
 trap 'cleanup' EXIT
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
+tartci_boundary_proof_validate \
+  || die "invalid parallel boundary-proof configuration"
 
 # Part F — host-wide macOS VM cap (live, GUI-adjustable) + cross-lane mutex.
 # shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
@@ -2187,6 +2207,9 @@ if [ "$LOOP" = 1 ]; then
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
+      # Early returns (boot failure, yield, admission refusal) leave a proof
+      # that nobody will consume.
+      tartci_boundary_proof_abandon
       if [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ]; then
         PENDING_DELETE_ATTEMPTS=0
         note "teardown of $CURRENT_VM left deletion unproved — keeping it as pending-delete with its lease and reservation; reconciling in-loop instead of restarting"
