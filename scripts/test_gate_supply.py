@@ -69,12 +69,15 @@ class ClassifyAndFitTests(unittest.TestCase):
         """An unclassified phase makes a whole peer report unknown, which quietly
         turns the policy off. So every phase runner.sh can write must be in a set."""
         import re  # noqa: PLC0415
-        source = (ROOT / "providers/tart-macos/runner.sh").read_text()
-        phases = set(re.findall(r"^\s*heartbeat ([a-z][a-z_-]+)\s*$", source, re.M))
+        source = "\n".join(path.read_text() for path in sorted(
+            (ROOT / "providers/tart-macos").glob("*.sh")))
+        phases = set(re.findall(r"(?<![\w$-])heartbeat ([a-z][a-z_-]+)\s*(?:;|$)", source, re.M))
         for line in re.findall(r'heartbeat "\$\((.*?)\)"', source):
             phases.update(re.findall(r"printf ([a-z][a-z_-]+)", line))
         self.assertIn("waiting", phases)  # the extraction saw the file
         self.assertIn("admission-precheck-deferred", phases)
+        self.assertIn("lease-wait", phases)  # and the provider libraries
+        self.assertIn("backoff", phases)  # and `then/else heartbeat x;` forms
         known = gate_supply.FREE_PHASES | gate_supply.IN_FLIGHT_PHASES | gate_supply.BLOCKED_PHASES
         self.assertEqual(sorted(phases - known - {"stopped"} - {"loop"}), [])
 

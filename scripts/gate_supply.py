@@ -64,8 +64,11 @@ import lane_busy  # noqa: E402
 SCHEMA = "tartci.gate-supply/v1"
 
 # runner.sh heartbeat phases, split by what they mean for serving a NEW job.
-# Idle and able to boot on its next poll.
-FREE_PHASES = frozenset({"waiting", "loop", "backoff", "warm-parking", "warm-parked"})
+# Idle and able to boot on its next poll. `job-claim-covered` is idle too: it
+# stood down because another lane already covers the job it saw, and that lane
+# is counted as in flight.
+FREE_PHASES = frozenset({"waiting", "loop", "backoff", "warm-parking", "warm-parked",
+                         "job-claim-covered"})
 # Past admission, not yet assigned: this lane is already reaching for a job.
 IN_FLIGHT_PHASES = frozenset({
     "admission-precheck", "booting", "ensuring-runner", "aqua-preflight",
@@ -79,6 +82,8 @@ BLOCKED_PHASES = frozenset({
     "scan_blind_escalated", "jit-admission-denied", "vm-lease-denied",
     "vm-lease-infeasible", "admission-precheck-deferred",
     "admission-precheck-error", "teardown-pending",
+    # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
+    "lease-wait", "lease-never-fits",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
