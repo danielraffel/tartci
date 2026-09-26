@@ -76,6 +76,15 @@ LANE_KEYS = {
     "yield_max_wait_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
+# An event-class-v2 lane always serves the two Pulp gate classes, in this order,
+# as its first tiers. It may then declare extra event classes from this closed
+# set, each with exactly its workflows. A class is served only by a lane that
+# declares it, so an extra class changes nothing on a profile that omits it.
+V2_GATE_CLASSES = ("pulp-build-merge-group", "pulp-build-pr-head")
+V2_EXTRA_CLASS_WORKFLOWS = {
+    "pulp-release-tagged": ("Release CLI", "Sign and Release"),
+    "pulp-release-pr-gate": ("Release-path PR gate",),
+}
 LABEL = re.compile(r"^[A-Za-z0-9_.:-]+$")
 REPLACED_AGENT = re.compile(
     r"^com[.]danielraffel[.](?:pulp[.]tart-runner|"
@@ -729,17 +738,13 @@ def load(path: Path) -> dict:
                 )
             tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
-            class_labels = [tier["label"] for tier in tiers]
-            if class_labels != ["pulp-build-merge-group", "pulp-build-pr-head"]:
-                fail(
-                    f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-                )
+            validate_v2_tiers(lane_id, lane["repo"], tiers)
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
-            if tier_groups != [1, 1]:
+            if any(group_id != 1 for group_id in tier_groups):
                 fail(
                     f"lane {lane_id}: event-class-v2 requires repository-scoped "
-                    "merge-group and PR-head registration"
+                    "registration for every event class"
                 )
         slot_orders = lane.get("assignment_slot_tier_order")
         if slot_orders is not None:
@@ -808,9 +813,49 @@ def load(path: Path) -> dict:
                     "lane pulp-release must preserve the repository-scoped "
                     "group-1 M5 release controller contract"
                 )
-        elif release_tiers:
-            fail("pulp release workflow tiers are reserved for lane pulp-release")
+        elif release_tiers and assignment_mode != "event-class-v2":
+            # An event-class-v2 lane's release classes were checked above.
+            fail(
+                "pulp release workflow tiers are reserved for lane pulp-release "
+                "or an event-class-v2 lane"
+            )
     return data
+
+
+def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict]) -> None:
+    """The event-class-v2 tier contract: gate classes first, then extras.
+
+    The two gate classes lead, one workflow row each. Any further rows belong to
+    declared extra classes: each must be a known class, listed contiguously,
+    with exactly that class's workflows in order and never twice.
+    """
+    labels = [tier["label"] for tier in tiers]
+    if labels[:2] != list(V2_GATE_CLASSES) or len(set(labels[:2])) != 2:
+        fail(
+            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
+        )
+    if any(label in V2_GATE_CLASSES for label in labels[2:]):
+        fail(
+            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
+        )
+    extras = list(dict.fromkeys(labels[2:]))
+    if not extras:
+        return
+    if repo != "Generous-Corp/pulp":
+        fail(f"lane {lane_id}: extra event classes are Pulp classes")
+    grouped = [label for label in extras for _ in range(labels[2:].count(label))]
+    if grouped != labels[2:]:
+        fail(f"lane {lane_id}: event class {labels[2:]} rows must be contiguous and unique")
+    for label in extras:
+        expected = V2_EXTRA_CLASS_WORKFLOWS.get(label)
+        if expected is None:
+            fail(f"lane {lane_id}: unknown event-class-v2 class {label}")
+        workflows = tuple(tier["workflow"] for tier in tiers if tier["label"] == label)
+        if workflows != expected:
+            fail(
+                f"lane {lane_id}: event class {label} must declare exactly the "
+                f"workflows {list(expected)}"
+            )
 
 
 def rendered_plists(
@@ -2006,7 +2051,7 @@ def lane_plist(
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
     if "assignment_mode" in lane:
         omit = ",".join(lane.get("assignment_omit_labels", []))
-        class_labels = ",".join(row["label"] for row in lane["tier"])
+        class_labels = ",".join(dict.fromkeys(row["label"] for row in lane["tier"]))
         env["TARTCI_RUNNER_ASSIGNMENT_MODE"] = lane["assignment_mode"]
         env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"] = omit
         env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"] = omit

@@ -233,6 +233,43 @@ A PR-first slot still yields a merge-group boot to a PR-head arrival: that is
 the same pre-mint recheck every slot runs, applied in this slot's order, and
 the merge-group job keeps every other slot in the fleet, all of which prefer it.
 
+## Release event classes (declared per lane, off in every shipped profile)
+
+An event-class-v2 lane may declare the Pulp release classes after its two gate
+tiers. The validator accepts exactly these extras, each with exactly its
+workflows, listed contiguously and at most once:
+
+| class | workflows | lease priority |
+|---|---|---|
+| `pulp-release-tagged` | `Release CLI`, `Sign and Release` | `120` (gate) |
+| `pulp-release-pr-gate` | `Release-path PR gate` | `90` (non-gate) |
+
+Gate tiers stay first, so a default slot keeps gate-first order and only takes
+release work when no gate work waits. Each class is its own JIT registration
+(base labels plus that one class label), so a release runner cannot take a gate
+job and a gate runner cannot take a release job. A lane that does not declare a
+class never scans for it, so hosts without the declaration never pick a release
+job. Tagged releases lease at `120`, above merge-group, so a release boot is
+admitted from gate-reserved capacity; the release PR gate stays non-gate at
+`90`, below PR-head, as the legacy release lane's `vm` class. The numeric
+values apply only to registrations carrying the gate base label
+`pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
+`gate`/`vm`.
+
+The enable change declares the classes on m5's `pulp-gate` lane and makes one
+slot release-first:
+
+```toml
+assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }
+```
+
+Because the order names every class, it is a preference: with no release
+queued the slot selects exactly what a default slot selects. Pulp opts in
+separately (`PULP_RELEASE_CLASS_TOKENS=1` appends the class label to the
+release selectors); until both sides are live, release jobs keep riding idle
+gate runners. Rollback is unsetting the Pulp variable; host-side, delete the
+extra tiers and slot order, re-render, and reload slot 2 at an idle boundary.
+
 Canary, per decisions contract row 1: only m3 (`profiles/m3-macos-fleet.toml`,
 `pulp-gate` slot 2) carries the key. m3 slot 1, m1 and m5 are unaffected by
 deploying these bytes. Enable through the ordinary path: validate and render
