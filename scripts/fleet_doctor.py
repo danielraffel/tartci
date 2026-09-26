@@ -66,6 +66,10 @@ CODES: tuple[str, ...] = (
     "hold_receipt_malformed",
     "hold_receipt_present",
     "installed_generation_unknown",
+    "lane_lease_never_fits",
+    "lanes_exceed_lease_capacity",
+    "lease_fit_ok",
+    "lease_fit_unmeasured",
     "no_managed_launchagents",
     "no_installed_profile",
     "no_persistent_runners",
@@ -621,6 +625,48 @@ def supply_probe(support_root: Path, installed: Path, python: str | None,
         return None, (proc.stderr or proc.stdout).strip() or f"exit {proc.returncode}"
 
 
+def check_lease_fit(records: list[dict], missing: list[str], *,
+                    managed: bool) -> Finding:
+    """Can every managed lane lease its VM, and can identical lanes run together?
+
+    Read from each lane's own last lease-fit verdict (lease-fit.lib.sh), so the
+    answer uses the capacity model acquisition uses instead of a re-derivation.
+    """
+    import lease_fit
+
+    check = "lease_fit"
+    if not managed:
+        return Finding(check, NOT_APPLICABLE, "no_managed_launchagents",
+                       "no managed macOS fleet lanes are installed")
+    findings = lease_fit.configuration_findings(records)
+    facts = {"lanes_measured": len(records), "lanes_unmeasured": missing,
+             **findings}
+    if findings["never"]:
+        names = ", ".join(
+            f"{row.get('lane') or row.get('label')} ({row.get('requested_cores')} cores "
+            f"> budget {row.get('core_budget')})" for row in findings["never"])
+        return Finding(check, PROBLEM, "lane_lease_never_fits",
+                       f"these lanes' VM leases can never be granted here: {names}",
+                       facts)
+    if findings["oversubscribed"]:
+        parts = []
+        for group in findings["oversubscribed"]:
+            parts.append(
+                f"{len(group['lanes'])} lanes of {group['vm_cores']}-core VMs "
+                f"({', '.join(group['lanes'])}) but the {group['core_budget']}-core "
+                f"budget fits {group['max_concurrent']} at once")
+        return Finding(check, PROBLEM, "lanes_exceed_lease_capacity",
+                       "; ".join(parts), facts)
+    if missing and not records:
+        return Finding(check, UNKNOWN, "lease_fit_unmeasured",
+                       "no lane has recorded a lease-fit verdict yet: "
+                       + ", ".join(missing), facts)
+    return Finding(check, OK, "lease_fit_ok",
+                   f"{len(records)} lanes can lease their VMs"
+                   + (f" ({len(missing)} not yet measured)" if missing else ""),
+                   facts)
+
+
 def check_self_update(summary: dict | None) -> Finding:
     """tartci's own skew against main and the last self-update attempt."""
     if not isinstance(summary, dict) or summary.get("skew") is None:
@@ -904,6 +950,14 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception:  # noqa: BLE001 - reported as unmeasured
             self_update_summary = None
     findings.append(check_self_update(self_update_summary))
+    import lease_fit
+    if readable:
+        fit_records, fit_missing = lease_fit.lane_records(
+            agents_dir, host_profile.FLEET_LABEL_PREFIX)
+        managed = bool(fit_records or fit_missing)
+    else:
+        fit_records, fit_missing, managed = [], [], False
+    findings.append(check_lease_fit(fit_records, fit_missing, managed=managed))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default

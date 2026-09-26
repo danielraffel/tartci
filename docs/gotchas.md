@@ -480,7 +480,9 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   visibility and the complete selected-repository list. Unknown/inaccessible
   policy records a contract-keyed denial and boots no further VM for that class.
   The final order is required Shipyard admission-clean → repository-access proof
-  → pool lock and assignment/admission rechecks → JIT mint. Do not use an online org row or
+  → pool lock and assignment/admission rechecks → JIT mint. On macOS the first
+  two are *started* beside the clone and boot and *consumed* in that order at
+  the boundary; a stale or missing parallel result is re-asked synchronously. Do not use an online org row or
   `busy=false` as repository capacity evidence.
 
 - **Each queue query works alone, but several healthy lanes become scan-blind together.**

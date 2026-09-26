@@ -1251,6 +1251,33 @@ Counters live per `(repo, base, labels)` under
 A rejected envelope is written to `rejected-envelope.json` in that directory,
 so a Shipyard contract skew is diagnosable without reading Shipyard's source.
 
+A `defer` for `observation_in_progress` or `stewardship_in_progress` is not a
+verdict about the queue: another caller on the host holds Shipyard's exact-key
+observation (or stewardship) lock for the same `(repo, base, labels)`, and
+Shipyard answers with a try-lock. Returning it discarded a booted VM for no
+reason (130 of them in one day on the Pulp gate, when both lanes of a host asked
+at once). The adapter now re-asks for up to
+`TARTCI_ADMISSION_CLEAN_CONTENTION_WAIT_SECS` (default 90, range 0..600; 0 is
+single-shot) at `TARTCI_ADMISSION_CLEAN_CONTENTION_POLL_SECS` intervals
+(default 5, range 1..60). Every verdict that ends the wait is a fresh Shipyard
+answer, so the gate stays fail-closed; when the budget runs out the contention
+`defer` is returned exactly as before. Every other `defer` reason is a statement
+about the queue and is returned at once. A verdict that waited carries
+`tartci_contention_waits`, and the provider event renders it as
+`contention_waits=N`.
+
+On macOS the boundary's two network proofs, the admission verdict and the
+runner group's repository-access proof, start in the background as soon as the
+VM lease is held, beside the clone and boot, and the boundary consumes their
+results (`boundary-proof.lib.sh`). This takes their duration off every job's
+critical path without changing what they decide: a refusal still discards the
+booted VM with the same code and events, and an admission verdict older than
+`TARTCI_BOUNDARY_PROOF_MAX_AGE_SECS` (default 120, range 0..600) when the
+boundary reads it, or any missing or partial result, is replaced by the
+synchronous call the boundary always made. The `admission_check` event says
+which answer was used (`source=parallel age=Ns` or `source=boundary`).
+`TARTCI_BOUNDARY_PROOF_PARALLEL=0` restores the fully sequential boundary.
+
 Degrading trades one ephemeral single-job VM that a superseded run may claim --
 bounded, non-corrupting, and unable to satisfy the current head's required
 checks -- against an unbounded fleet stop. Never widen this to `admit`
@@ -1528,18 +1555,6 @@ fleet`), and check GitHub's job history against it with
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
-- **Quiet windows only.** Run `--apply`, and any manual `pool drain`, `pool
-  off`, `pool on` or `gate-slot2 install`, when the host's lanes have no queued
-  demand, not during a burst. A drain takes the host's gate slots out of
-  admission for the whole mid-job wait (up to 90 min) plus the install, and
-  every job that queues meanwhile waits for another host. Measured on the Pulp
-  gate fleet (2026-09-25/26): pool off or draining was 6.3% of all `macos` gate
-  queue wait, about 1.9 min per job on average. Before an apply, check that the
-  lane logs show `queued=0` (or that no gate job is waiting in the repository's
-  Actions queue) and that the other hosts are serving; prefer nights and
-  weekends for fleet-wide rollouts, and do one host at a time. The periodic
-  agent is not installed by default for this reason: a 30-minute schedule does
-  not know when the queue is busy.
 - **Capacity floor.** `--allow-last-serving-host` only when every last-serving
   label is either idle by design (the pulp-release classes) or **minted on
   demand by another host**, logged in the receipt. On an ephemeral JIT fleet a
@@ -1875,6 +1890,56 @@ shadow configuration remains installed on a host. During an upgrade, run
 `scripts/disable_orchard.sh --apply` to boot them out, remove their installed
 user plists, and verify they are absent. Do not start its controller or workers
 and do not route any profile lane through it.
+
+### Boot decisions: per-job claims and lease fit (macOS)
+
+Two local checks run before a macOS lane spends a queue scan, a Shipyard
+admission call, a lease or a clone. Both fail open: if either cannot answer,
+the lane does exactly what it did before they existed.
+
+**Lease fit** (`providers/tart-macos/lease-fit.lib.sh`, `scripts/lease_fit.py`).
+Each poll, before scanning the queue, the lane asks the lease store, read-only
+and with the same capacity model `leases.py acquire` uses, whether its VM lease
+could be granted.
+- *Not now* (another VM or agent build holds the cores): the lane waits a poll
+  with heartbeat `lease-wait`. It does not scan the queue or ask Shipyard.
+- *Never* (the VM is larger than the budget it is admitted against): the lane
+  stops polling, logs a `CONFIGURATION` line, and reports heartbeat
+  `lease-never-fits` and event `lease_never_fits`.
+- Each lane writes its verdict to `$TARTCI_STATE_DIR/<lane>.lease-fit.json`.
+  `tartci doctor fleet` (`lease_fit` check) and `tartci pool status` (text line
+  and `lease_fit` JSON key) read it. They report a lane that can never lease
+  (`lane_lease_never_fits`) and more identical lanes than the budget runs at
+  once (`lanes_exceed_lease_capacity`), for example two 12-core gate lanes in
+  m5's 14-core universe.
+- `TARTCI_LEASE_FIT_GATE=0` disables the check.
+
+**Per-job claim** (`providers/tart-macos/job-claim.lib.sh`, `scripts/job_claim.py`).
+Before cloning, a lane claims one queued job of its selected class (repo +
+runner labels) in a host-wide store (`TARTCI_JOB_CLAIM_DIR`, default
+`~/.tartci/state/job-claims`). The claim is granted only while the queued count
+is larger than the claims already standing against that class. Two kinds of
+claim stand:
+- live claims of other lanes on this host;
+- online, idle runners anywhere in the fleet whose labels cover the class, that
+  is, lanes that have already minted and are waiting for GitHub to assign them
+  a job. One runner listing per boot attempt; `TARTCI_JOB_CLAIM_FLEET=0` makes
+  claims host-local.
+
+If every queued job is covered, the lane does not boot (event
+`job_claim_contended`, heartbeat `job-claim-covered`). Such a pass does not
+count toward the serving-blocked streak.
+
+An event-class V2 count is only "at least one", so the lane buys an exhaustive
+count only when a sibling already holds a claim.
+
+A claim is released when the runner is assigned its job, when `run_one`
+returns, and in cleanup. A crashed supervisor's claim dies with it (pid +
+start time) or at `TARTCI_JOB_CLAIM_TTL_SECS` (default 1800).
+
+A lane on another host that is still booting and has not minted yet is not
+visible to any state tartci publishes. That race remains, and the pre-mint
+recheck still resolves it. `TARTCI_JOB_CLAIM=0` disables claims.
 
 ## Onboarding a new host
 

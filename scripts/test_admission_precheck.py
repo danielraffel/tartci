@@ -34,6 +34,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 MACOS_RUNNER = ROOT / "providers/tart-macos/runner.sh"
 LIB = ROOT / "providers/common/admission-clean.lib.sh"
+PROOF_LIB = ROOT / "providers/tart-macos/boundary-proof.lib.sh"
 DETAIL = ROOT / "scripts/admission_clean_detail.py"
 
 # `run_one` reaching this event means a VM clone was about to start.
@@ -148,6 +149,8 @@ class RunOneHarness:
             "set -euo pipefail\n"
             f"TARTCI_ROOT={str(ROOT)!r}\n"
             f"source {str(LIB)!r}\n"
+            f"source {str(PROOF_LIB)!r}\n"
+            f"source {str(ROOT / 'providers/tart-macos/job-claim.lib.sh')!r}\n"
             # Stubs for everything `run_one` touches before the clone. The
             # admission chain itself is NOT stubbed: the real library, the real
             # adapter and the real renderer run against a stub `shipyard`.
@@ -212,6 +215,10 @@ class RunOneHarness:
                 # Isolate the inconclusive breaker's counter: a shared one would
                 # let an earlier test degrade a later test into an admit.
                 "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(self.tmp / "breaker"),
+                # This harness stops at the clone; a parallel boundary proof
+                # started beside it would outlive the harness. The parallel
+                # path has its own tests in test_boundary_proof_parallel.py.
+                "TARTCI_BOUNDARY_PROOF_PARALLEL": "0",
             }
         )
         return subprocess.run(
@@ -367,6 +374,7 @@ class RefusalReportsItsReasonTests(unittest.TestCase):
                 "#!/bin/bash\nset -euo pipefail\n"
                 f"TARTCI_ROOT={str(ROOT)!r}\n"
                 f"source {str(LIB)!r}\n"
+                f"source {str(PROOF_LIB)!r}\n"
                 f"note(){{ printf '%s\\n' \"$*\" >>{str(notes)!r}; }}\n"
                 "heartbeat(){ :; }\n"
                 f"event(){{ printf '%s\\t%s\\n' \"$1\" \"${{2:-}}\" >>{str(events)!r}; }}\n"
@@ -497,6 +505,19 @@ class DetailRendererTests(unittest.TestCase):
             json.dumps(make_envelope("defer", "cancellation_pending"))
         )
         self.assertEqual(rendered, "reason=cancellation_pending")
+
+    def test_contention_waits_are_reported(self) -> None:
+        envelope = make_envelope("defer", "observation_in_progress")
+        envelope["tartci_contention_waits"] = 4
+        self.assertEqual(
+            self.render(json.dumps(envelope)),
+            "reason=observation_in_progress contention_waits=4",
+        )
+        # The control: an envelope that never waited renders no field.
+        self.assertEqual(
+            self.render(json.dumps(make_envelope("defer", "observation_in_progress"))),
+            "reason=observation_in_progress",
+        )
 
     def test_malformed_input_renders_rather_than_fails(self) -> None:
         self.assertEqual(self.render(""), "reason=missing")

@@ -46,6 +46,11 @@ assignment_omit_labels = ["pulp-gate-fast"]
 # bounded M1 margin rather than treating healthy serialized traffic as blind.
 assignment_scan_timeout_seconds = 180
 assignment_scan_max_workers = 4
+# Work-conserving idle retarget (trial, after m1 and m3): a runner unassigned
+# for 120 s re-observes both classes and is discarded only when its own class
+# has no queued job and the other class has admissible demand. Rollback is
+# removing this key. See docs/assignment-v2-rollout.md.
+assignment_idle_retarget_seconds = 120
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = [
