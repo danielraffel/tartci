@@ -900,6 +900,64 @@ class MacosFleetLaneTests(unittest.TestCase):
                             "pulp-build-merge-group|1\npulp-build-pr-head|1",
                         )
 
+    def _m5_with_release_yield_bound(self, td: str, value: str) -> Path:
+        body = HOST_CONFIGS["m5"].read_text()
+        marker = 'yield_to_workflow = "Build and Test"\n'
+        self.assertEqual(body.count(marker), 1)
+        path = Path(td) / "m5.toml"
+        path.write_text(body.replace(
+            marker, marker + f"yield_max_wait_seconds = {value}\n"
+        ))
+        return path
+
+    def _release_env(self, data: dict) -> dict:
+        rendered = fleet.rendered_plists(data)
+        return plistlib.loads(rendered[
+            "com.danielraffel.tartci.tart-runner-macos-fleet.m5.pulp-release.plist"
+        ])["EnvironmentVariables"]
+
+    def test_yield_bound_is_off_in_every_shipped_profile(self) -> None:
+        # The bound is enabled deliberately per host, never by an upgrade.
+        for host, profile in HOST_CONFIGS.items():
+            with self.subTest(host=host):
+                for body in fleet.rendered_plists(fleet.load(profile)).values():
+                    env = plistlib.loads(body)["EnvironmentVariables"]
+                    self.assertNotIn("TARTCI_YIELD_MAX_WAIT_SECONDS", env)
+
+    def test_yield_bound_exports_only_a_positive_value(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            env = self._release_env(fleet.load(
+                self._m5_with_release_yield_bound(td, "2700")
+            ))
+            self.assertEqual(env["TARTCI_YIELD_MAX_WAIT_SECONDS"], "2700")
+            # Control for the absence assertions: the same lane still yields.
+            self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+        with tempfile.TemporaryDirectory() as td:
+            env = self._release_env(fleet.load(
+                self._m5_with_release_yield_bound(td, "0")
+            ))
+            self.assertNotIn("TARTCI_YIELD_MAX_WAIT_SECONDS", env)
+            self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+
+    def test_yield_bound_rejects_invalid_values(self) -> None:
+        for value in ("-1", "45.5", '"2700"', "true"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                path = self._m5_with_release_yield_bound(td, value)
+                with self.assertRaisesRegex(ValueError, "yield_max_wait_seconds"):
+                    fleet.load(path)
+
+    def test_yield_bound_requires_a_yield_target(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        marker = 'id = "spectr-gate"\n'
+        self.assertEqual(body.count(marker), 1)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                marker, marker + "yield_max_wait_seconds = 2700\n"
+            ))
+            with self.assertRaisesRegex(ValueError, "yield_max_wait_seconds"):
+                fleet.load(path)
+
     def test_m5_generated_release_lane_preserves_exact_contract(self) -> None:
         data = fleet.load(HOST_CONFIGS["m5"])
         release = next(lane for lane in data["lane"] if lane["id"] == "pulp-release")
