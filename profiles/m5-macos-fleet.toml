@@ -58,6 +58,13 @@ replaces_launchd_labels = [
 # per-call timeout rather than the 180s scan budget. Adaptive lets launchd
 # promote the supervisor out of the background band. Gate lanes only.
 process_type = "Adaptive"
+# Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
+# Slot 2 consults tagged releases before the gate classes and falls back to
+# gate work whenever no release waits; slot 1 keeps gate-first order. The
+# release tiers below serve only jobs carrying a release class label, which
+# Pulp appends when PULP_RELEASE_CLASS_TOKENS=1. Rollback: delete this key and
+# the release tiers, re-render, reload slot 2 at an idle boundary.
+assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
@@ -67,6 +74,21 @@ runner_group_id = 1
 [[lane.tier]]
 label = "pulp-build-pr-head"
 workflow = "Build and Test"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Release CLI"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-tagged"
+workflow = "Sign and Release"
+runner_group_id = 1
+
+[[lane.tier]]
+label = "pulp-release-pr-gate"
+workflow = "Release-path PR gate"
 runner_group_id = 1
 
 [[lane]]

@@ -233,7 +233,7 @@ A PR-first slot still yields a merge-group boot to a PR-head arrival: that is
 the same pre-mint recheck every slot runs, applied in this slot's order, and
 the merge-group job keeps every other slot in the fleet, all of which prefer it.
 
-## Release event classes (declared per lane, off in every shipped profile)
+## Release event classes (declared per lane, m5 only)
 
 An event-class-v2 lane may declare the Pulp release classes after its two gate
 tiers. The validator accepts exactly these extras, each with exactly its
@@ -256,8 +256,7 @@ values apply only to registrations carrying the gate base label
 `pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
 `gate`/`vm`.
 
-The enable change declares the classes on m5's `pulp-gate` lane and makes one
-slot release-first:
+Only m5's `pulp-gate` lane declares the classes, and one slot is release-first:
 
 ```toml
 assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }

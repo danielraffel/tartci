@@ -243,6 +243,45 @@
     {
       "profile": "m5-macos-fleet",
       "host_id": "m5",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-tagged",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-tagged"
+      ],
+      "workflows": [
+        "Release CLI",
+        "Sign and Release"
+      ]
+    },
+    {
+      "profile": "m5-macos-fleet",
+      "host_id": "m5",
+      "lane": "pulp-gate",
+      "repo": "Generous-Corp/pulp",
+      "assignment_mode": "event-class-v2",
+      "class_label": "pulp-release-pr-gate",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-release-pr-gate"
+      ],
+      "workflows": [
+        "Release-path PR gate"
+      ]
+    },
+    {
+      "profile": "m5-macos-fleet",
+      "host_id": "m5",
       "lane": "pulp-release",
       "repo": "Generous-Corp/pulp",
       "assignment_mode": "legacy",
