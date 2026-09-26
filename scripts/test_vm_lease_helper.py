@@ -1274,7 +1274,9 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
-class RunningMacosVmsFailClosedTests(unittest.TestCase):
+class RunningMacosVmsInventoryTests(unittest.TestCase):
+    """A slow or failed `tart list` reads as `unknown`, never as a full host."""
+
     @classmethod
     def setUpClass(cls) -> None:
         body = MACOS_RUNNER.read_text(encoding="utf-8")
@@ -1283,31 +1285,55 @@ class RunningMacosVmsFailClosedTests(unittest.TestCase):
             raise AssertionError("running_macos_vms function not found")
         cls.function = match.group(1)
 
-    def _run_with_tart_stub(self, stub: str) -> subprocess.CompletedProcess[str]:
+    def _run_with_tart_stub(
+        self, stub: str, *, timeout: str = "5", retry_timeout: str = "15"
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            _write_exec(tmp / "tart", stub)
+            _write_exec(tmp / "tart", stub.replace("@TMP@", str(tmp)))
             script = textwrap.dedent(
                 f"""
                 set -euo pipefail
                 export PATH={tmp}:$PATH
                 export TARTCI_ROOT={ROOT}
                 export TARTCI_MACOS_HARD_MAX=2
+                export TARTCI_TART_INVENTORY_TIMEOUT_SECS={timeout}
+                export TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS={retry_timeout}
                 {self.function}
                 running_macos_vms
                 """
             )
             return _run_bash(script)
 
-    def test_tart_list_error_counts_as_full_hard_cap(self) -> None:
+    def test_tart_list_error_is_unknown_not_the_hard_cap(self) -> None:
         proc = self._run_with_tart_stub("#!/usr/bin/env bash\nexit 9\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "2")
+        self.assertEqual(proc.stdout.strip(), "unknown")
 
-    def test_malformed_tart_list_json_counts_as_full_hard_cap(self) -> None:
+    def test_malformed_tart_list_json_is_unknown(self) -> None:
         proc = self._run_with_tart_stub("#!/usr/bin/env bash\nprintf '{bad-json'\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "2")
+        self.assertEqual(proc.stdout.strip(), "unknown")
+
+    def test_timed_out_listing_is_unknown(self) -> None:
+        proc = self._run_with_tart_stub(
+            "#!/usr/bin/env bash\nsleep 30\n", timeout="0.2", retry_timeout="0.3"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "unknown")
+
+    def test_slow_first_listing_is_retried_with_the_longer_budget(self) -> None:
+        # The first `tart list` outlives the short budget; the retry answers.
+        stub = """#!/usr/bin/env bash
+if [ ! -e @TMP@/first ]; then
+  : > @TMP@/first
+  sleep 30
+fi
+printf '[{"Name":"idle","State":"stopped"}]'
+"""
+        proc = self._run_with_tart_stub(stub, timeout="0.3", retry_timeout="5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0")
 
     def test_valid_tart_list_counts_only_running_macos_guests(self) -> None:
         stub = """#!/usr/bin/env bash
@@ -1324,6 +1350,54 @@ fi
         proc = self._run_with_tart_stub(stub)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "1")
+
+
+class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
+    """With inventory unknown, the reservation files decide occupancy."""
+
+    CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
+
+    def _claim(self, live_reservations: int, *, inventory: str, via_arg: bool) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            resv_dir = tmp / "resv"
+            resv_dir.mkdir()
+            claim = 'tartci_claim_macos_slot 2 "$INV"' if via_arg else "tartci_claim_macos_slot 2"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={resv_dir}
+                export TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/no-cap-file
+                INV={inventory}
+                running_macos_vms(){{ printf '%s\\n' "$INV"; }}
+                source {self.CAP_LIB}
+                n=0
+                while [ "$n" -lt {live_reservations} ]; do
+                  n=$((n + 1))
+                  printf '%s %s' "$$" "$(date +%s)" > "$TARTCI_MACOS_RESV_DIR/resv.held$n"
+                done
+                {claim}
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+    def test_unknown_inventory_with_free_reservations_boots(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertIn("resv.", self._claim(0, inventory="unknown", via_arg=via_arg))
+                self.assertIn("resv.", self._claim(1, inventory="unknown", via_arg=via_arg))
+
+    def test_unknown_inventory_with_full_reservations_waits(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertEqual(self._claim(2, inventory="unknown", via_arg=via_arg), "")
+
+    def test_a_readable_full_inventory_still_blocks(self) -> None:
+        self.assertEqual(self._claim(0, inventory="2", via_arg=True), "")
+        self.assertEqual(self._claim(0, inventory="2", via_arg=False), "")
 
 
 if __name__ == "__main__":

@@ -162,7 +162,23 @@ size through `-smp`.
 macOS admission inventory is bounded by one shared
 five-second budget so a wedged `tart list` or `tart get` cannot freeze every
 supervisor on a host; override it with `TARTCI_TART_INVENTORY_TIMEOUT_SECS`.
-Inventory failure remains fail-closed at the configured macOS hard cap.
+A failed or timed-out listing gets one retry with a longer budget
+(`TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS`, default 15) and then reads as
+`unknown`, never as a full host: the slot claim then counts occupancy from the
+macOS-slot reservation files, which every lane writes before it boots and keeps
+until its VM is proved deleted, and emits an `inventory_unknown` event. (Treating
+a timeout as the hard cap once made an empty host report `2/2` for ~85 minutes.)
+
+A teardown whose guardian is terminal but whose `tart delete` was not proved
+(`teardown_incomplete reason=delete_unproved`) no longer restarts the
+supervisor. The lane keeps the VM as pending-delete with its lease and
+reservation, so capacity stays occupied, and retries the delete (or a readable
+`tart list --source local` that no longer names the VM) at the top of each loop
+(`teardown_pending_delete` → `teardown_reconciled`). Only after
+`TARTCI_PENDING_DELETE_MAX_ATTEMPTS` (default 5) failed retries,
+`TARTCI_PENDING_DELETE_RETRY_SECS` (default 10) apart, does it fall back to the
+fail-closed `exit 75` restart. A live guardian or a refused teardown still
+restarts immediately.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke]

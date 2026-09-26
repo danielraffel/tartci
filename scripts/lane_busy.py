@@ -90,6 +90,9 @@ BUSY_PHASES = frozenset({
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
     "job-running", "cancel-pending-terminal",
+    # A torn-down VM whose deletion is not yet proved; the lane still holds
+    # its lease and reservation (reconcile_pending_delete).
+    "teardown-pending",
 })
 # Waiting for work, backing off, or refused before any VM exists.
 IDLE_PHASES = frozenset({
