@@ -567,14 +567,8 @@ def render_skew(skew: dict | None) -> str:
 
 # ── one host at a time ─────────────────────────────────────────────────────
 
-def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
-    """host_id -> SSH target for every host in the CURRENT published supply.
-
-    Read from main's fleet/advertised-labels.json (the target can predate a
-    host being added). A profile's `host.ssh` is published there; without it
-    the alias convention `tartci-<host_id>` applies; [peers] only overrides.
-    Adding a machine therefore needs its profile and nothing on other hosts.
-    """
+def published_supply(cfg: Config, sys_: System) -> dict[str, Any]:
+    """main's fleet/advertised-labels.json (the target can predate a host)."""
     shown = sys_.run(["git", "-C", str(cfg.checkout), "show",
                       "origin/main:fleet/advertised-labels.json"])
     try:
@@ -583,6 +577,17 @@ def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
         value = None
     if not isinstance(value, dict):
         raise Refused("published supply origin/main:fleet/advertised-labels.json is unreadable")
+    return value
+
+
+def published_peers(cfg: Config, sys_: System) -> dict[str, str]:
+    """host_id -> SSH target for every host in the CURRENT published supply.
+
+    A profile's `host.ssh` is published there; without it the alias
+    convention `tartci-<host_id>` applies; [peers] only overrides. Adding a
+    machine therefore needs its profile and nothing on other hosts.
+    """
+    value = published_supply(cfg, sys_)
     ssh = {row["host_id"]: row.get("ssh") for row in value.get("hosts", [])
            if isinstance(row, dict) and isinstance(row.get("host_id"), str)}
     ids = {row["host_id"] for row in value.get("registrations", [])
@@ -680,7 +685,91 @@ def census_env() -> dict[str, str]:
     }
 
 
-def floor_decision(cfg: Config, sys_: System) -> tuple[bool, str]:
+def peer_mints_on_demand(value: Any) -> str | None:
+    """None when a peer's `pool status --json` proves it can mint on demand.
+
+    Otherwise the reason it cannot be counted. Every field is required, so a
+    peer whose tartci predates one of them, or whose status is unreadable,
+    is not counted: capability that cannot be read is not capability.
+    """
+    if not isinstance(value, dict):
+        return "pool status unreadable"
+    if value.get("state") != "on" or value.get("participating") is not True:
+        return f"pool is {value.get('state')} (participating={value.get('participating')})"
+    fleet = value.get("fleet")
+    if not isinstance(fleet, dict):
+        return "pool status reports no fleet section"
+    if fleet.get("managed") is not True or fleet.get("fleet_ready") is not True:
+        return (f"fleet not ready (managed={fleet.get('managed')}, "
+                f"fleet_ready={fleet.get('fleet_ready')})")
+    if fleet.get("problems"):
+        return f"fleet problems: {fleet.get('problems')}"
+    expected, running = fleet.get("expected_supervisors"), fleet.get("verified_running_supervisors")
+    if not (isinstance(expected, int) and isinstance(running, int)
+            and expected >= 1 and running >= expected):
+        return f"supervisors {running}/{expected} verified running"
+    serving = fleet.get("serving")
+    if not isinstance(serving, dict) or serving.get("blocked") is not False:
+        return f"serving blocked or unmeasured: {serving}"
+    supply = (fleet.get("config") or {}).get("supply") if isinstance(fleet.get("config"), dict) else None
+    if not isinstance(supply, dict) or supply.get("state") != "match":
+        return ("installed supply does not match the published supply "
+                f"({supply.get('state') if isinstance(supply, dict) else 'unreported'})")
+    return None
+
+
+def on_demand_supply(cfg: Config, sys_: System, me: str,
+                     wanted: list[tuple[str, str | None]]) -> tuple[dict[str, list[str]], list[str]]:
+    """Which wanted labels another host can serve by minting a runner on demand.
+
+    On an ephemeral JIT fleet a runner exists only while it holds a job, so
+    "no other host has a runner registered right now" is the normal idle state,
+    not a missing server. A label still has a server when another host
+    PUBLISHES a registration for it (main's advertised-labels.json) and that
+    host's supervisors are all verified running, fleet-ready and not blocked.
+    Returns ({label: [evidence]}, [why each uncovered label is uncovered]).
+    """
+    registrations = [r for r in published_supply(cfg, sys_).get("registrations", [])
+                     if isinstance(r, dict) and isinstance(r.get("host_id"), str)
+                     and r["host_id"] != me]
+    peers = published_peers(cfg, sys_)
+    health: dict[str, str | None] = {}
+
+    def healthy(host_id: str) -> str | None:
+        if host_id not in health:
+            target = peers.get(host_id) or SSH_ALIAS_CONVENTION.format(host_id=host_id)
+            status = sys_.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", target,
+                               "cd ~ && ~/.local/bin/tartci pool status --json"], timeout=60)
+            try:
+                value = json.loads(status.out)
+            except json.JSONDecodeError:
+                value = None
+            health[host_id] = (peer_mints_on_demand(value) if value is not None
+                               else f"pool status unreadable (exit {status.rc})")
+        return health[host_id]
+
+    covered: dict[str, list[str]] = {}
+    missing: list[str] = []
+    for label, repo in wanted:
+        hosts = sorted({r["host_id"] for r in registrations
+                        if (label in (r.get("labels") or []) or r.get("class_label") == label)
+                        and (repo is None or r.get("repo") == repo)})
+        if not hosts:
+            missing.append(f"{label}: no other host publishes a registration for it")
+            continue
+        reasons = []
+        for host_id in hosts:
+            why = healthy(host_id)
+            if why is None:
+                covered.setdefault(label, []).append(host_id)
+            else:
+                reasons.append(f"{host_id} {why}")
+        if label not in covered:
+            missing.append(f"{label}: " + "; ".join(reasons))
+    return covered, missing
+
+
+def floor_decision(cfg: Config, sys_: System, me: str = "") -> tuple[bool, str]:
     """(allow_last_serving_host, rule). Refuses unless the floor allows it."""
     result = sys_.run(["python3", "scripts/capacity_floor.py", "check", "--action", "drain",
                        "--json"], cwd=str(cfg.checkout), env=census_env(), timeout=180)
@@ -694,10 +783,21 @@ def floor_decision(cfg: Config, sys_: System) -> tuple[bool, str]:
         raise Refused(f"capacity floor refused ({decision.get('reason')}): "
                       f"{decision.get('message')}")
     last = [f for f in decision.get("findings", []) if f.get("verdict") == "last_serving_host"]
-    blocked = [f["label"] for f in last if f.get("label") not in cfg.idle_by_design]
+    blocked = [f for f in last if f.get("label") not in cfg.idle_by_design]
     if blocked:
-        raise Refused(f"this host is the last server of {', '.join(blocked)}, which is not "
-                      "idle by design; refusing to take it down for an update")
+        wanted = list(dict.fromkeys((f["label"], f.get("repo") or None) for f in blocked))
+        covered, missing = on_demand_supply(cfg, sys_, me, wanted) if me else ({}, [])
+        if missing or not covered:
+            detail = ("; ".join(missing) if missing
+                      else "this host's identity is unknown, so peers cannot be told apart")
+            raise Refused(f"this host is the last server of "
+                          f"{', '.join(label for label, _ in wanted)}, which is not idle by "
+                          f"design, and no other host can mint it on demand ({detail}); "
+                          "refusing to take it down for an update")
+        served = "; ".join(f"{label} by {', '.join(hosts)}" for label, hosts in covered.items())
+        return True, (f"--allow-last-serving-host: no runner of this host's label(s) is "
+                      f"registered elsewhere right now, but published supply is minted on "
+                      f"demand by fully verified peers ({served}) (rule: on-demand supply)")
     labels = ", ".join(sorted({f["label"] for f in last}))
     return True, (f"--allow-last-serving-host: last server only of idle-by-design "
                   f"label(s) {labels} (rule: idle_by_design_labels)")
@@ -1160,7 +1260,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.step("peers", "every other published host is on and not updating")
         allow = False
         try:
-            allow, rule = floor_decision(cfg, sys_)
+            allow, rule = floor_decision(cfg, sys_, me)
             receipt.step("capacity-floor", rule)
         except Refused as exc:
             if apply:

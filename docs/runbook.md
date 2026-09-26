@@ -1529,7 +1529,18 @@ fleet`), and check GitHub's job history against it with
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
 - **Capacity floor.** `--allow-last-serving-host` only when every last-serving
-  label is idle by design (the pulp-release classes), logged in the receipt.
+  label is either idle by design (the pulp-release classes) or **minted on
+  demand by another host**, logged in the receipt. On an ephemeral JIT fleet a
+  runner is registered only while it holds a job, so "no other host has a
+  runner registered right now" is the idle norm, not a missing server. A label
+  counts as served when another host publishes a registration carrying it (for
+  the same repository) in main's `fleet/advertised-labels.json` and that host's
+  `pool status --json`, read over SSH, proves it can mint: pool `on` and
+  participating, `managed` and `fleet_ready`, no `problems`, every expected
+  supervisor verified running, `serving.blocked` false, and installed supply
+  `match`ing the published supply. Any field missing or unreadable (including
+  an older peer tartci) does not count, and a `capacity_unknown` census still
+  refuses.
 - **Snapshot, update, verify.** Before draining, the running generation is
   snapshotted under `~/.tartci/state/self-update/rollback/<time>-<commit>/`:
   the installed profile, the approval pin and (sealed) a `ditto` copy of the
