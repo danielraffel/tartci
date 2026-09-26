@@ -643,13 +643,18 @@ cmd_pool() {
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   local sub="${1:-status}"; shift || true
-  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
+  local pool_usage="usage: tartci pool <on|drain|undrain|off|status|supply|repair-lock> [--plan] [--now] [--json] [--require-ready] [--require-serving] [--allow-last-serving-host]
   --plan   on|off|drain: print what the transition would do and write nothing
            (off/drain: every precondition; on: the receipt check only)
   --now    off: stop immediately even though an owned lane is mid-job (kills it)
+  supply --repo OWNER/REPO --class LABEL [--json]: free, leasable gate slots
+           for one event class on this host (read-only; see gate_supply.py)
   exit 11 capacity floor refused; 12 off refused because a lane is mid-job"
   case "$sub" in
     -h|--help|help) echo "$pool_usage"; return 0 ;;
+    # Read-only: this host's free, leasable gate slots for one event class,
+    # which a fallback lane on another host reads over SSH before booting.
+    supply) tartci_toml_exec "$HERE/scripts/gate_supply.py" report "$@" ;;
   esac
   local arg allow_last_serving_host=0 plan=0 now=0
   for arg in "$@"; do

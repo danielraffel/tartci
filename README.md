@@ -456,6 +456,12 @@ does not sleep a supervisor or reserve capacity. GitHub still assigns the job
 once, and any later JIT registration that loses the claim follows normal
 bounded idle teardown. Do not use this for required checks that already have a
 pre-queue host resolver and host-specific labels.
+An event-class-V2 fallback lane may also declare `fallback_preferred_hosts`
+(`TARTCI_FALLBACK_PEERS`): it then boots for a job the age rule still hides
+when the preferred hosts report no free, leasable gate slot for it, and keeps
+the age rule whenever their state is unknown. See
+[docs/assignment-v2-rollout.md](docs/assignment-v2-rollout.md), "Fallback lanes
+without a timer".
 
 Pulp event-class-V2 supervisors must not advertise a fixed
 `TARTCI_VM_LEASE_PRIORITY`: merge-group derives priority `110` and PR-head

@@ -45,6 +45,14 @@
 # of TARTCI_RUNNER_WORKFLOW_TIERS order; tier numbers stay the configured index,
 # so events, runner groups and lease priority keep one meaning per class. Empty
 # (the default) is the configured order, byte for byte.
+# Fallback lane (opt-in, V2 only): TARTCI_FALLBACK_PEERS names the preferred
+# hosts (`host_id=ssh-target`, comma or newline separated). While a class has
+# queued work younger than TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS, the lane asks
+# each preferred host for its free, leasable gate slots (`tartci pool supply`)
+# and boots now only when queued demand exceeds what they and this host's
+# sibling lanes already cover. Unknown or stale peer state keeps the minimum
+# age rule, which stays the upper bound on the delay. Empty = off.
+# `--print-fallback-decision <tier>` prints that decision as a safe preflight.
 # Priority-aware idle gate (opt-in): set TARTCI_YIELD_TO_WORKFLOW_NAME +
 # TARTCI_YIELD_TO_LABELS to make a SECONDARY lane yield its VM slot to a
 # higher-priority lane. When set, the loop boots only when that priority lane
@@ -148,6 +156,11 @@ MIN_QUEUED_AGE="${TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS:-0}"
 case "$MIN_QUEUED_AGE" in
   ''|*[!0-9]*) printf 'invalid TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS: %s\n' "$MIN_QUEUED_AGE" >&2; exit 1 ;;
 esac
+# Fallback lane (opt-in; see header). Validated by tartci_assignment_v2_configure.
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+FALLBACK_PEERS="${TARTCI_FALLBACK_PEERS:-}"
+# shellcheck disable=SC2034 # consumed by sourced assignment-v2.lib.sh
+FALLBACK_PEER_MAX_AGE="${TARTCI_FALLBACK_PEER_MAX_AGE_SECS:-60}"
 WORKFLOW_ARGS=()
 WORKFLOW_DISPLAY=""
 WORKFLOW_CONFIG=""
@@ -205,6 +218,7 @@ PRINT_CHROME_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
 PRINT_IDLE_RETARGET=""
+PRINT_FALLBACK_DECISION=""
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_YIELD_BOUND=0
@@ -472,6 +486,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-assignment-parity) PRINT_ASSIGNMENT_PARITY=1; shift;;
   --print-pre-mint-selection) PRINT_PRE_MINT_SELECTION="$2"; shift 2;;
   --print-idle-retarget) PRINT_IDLE_RETARGET="$2"; shift 2;;
+  --print-fallback-decision) PRINT_FALLBACK_DECISION="$2"; shift 2;;
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
@@ -2036,6 +2051,13 @@ i=0
   else
     printf '0\n'
   fi
+  exit 0
+}
+[ -n "$PRINT_FALLBACK_DECISION" ] && {
+  # The decision a selection pass would make for this zero-based tier's young
+  # demand: `grant`, `hold` or `unknown`, then its detail. Off prints `off`
+  # and makes no GitHub or SSH call.
+  tartci_fallback_decision_for_tier "$PRINT_FALLBACK_DECISION"
   exit 0
 }
 [ -n "$PRINT_HIGHER_PRIORITY" ] && {

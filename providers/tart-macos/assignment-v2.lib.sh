@@ -10,6 +10,7 @@ tartci_assignment_v2_configure(){
   # than silently ignoring it, so a mis-rendered slot cannot look configured.
   [ -z "$ASSIGNMENT_V2_TIER_ORDER" ] || [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
     || die "TARTCI_ASSIGNMENT_V2_TIER_ORDER requires event-class-v2 assignment mode"
+  tartci_fallback_configure
   ASSIGNMENT_V2_ORDER_LABELS="$TIER_LABELS_CONFIG"
   [ "$ASSIGNMENT_MODE" != legacy ] || return 0
   case "${TARTCI_ASSIGNMENT_V2_CACHE_TTL_SECS:-120}" in
@@ -242,6 +243,9 @@ tartci_assignment_feed_rescue(){
 # next, so a reordered slot is still work-conserving.
 tartci_assignment_v2_select_live(){
   local tier_label q tier count=0
+  # A fallback grant is authority for exactly the live selection that made
+  # it. Drop the previous one before observing again.
+  tartci_fallback_clear_grant
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
     tier="$(tartci_assignment_v2_tier_index "$tier_label")" || tier="$count"
@@ -257,6 +261,13 @@ tartci_assignment_v2_select_live(){
     if [ "$q" -gt 0 ]; then
       printf '%s|%s|%s\n' \
         "$q" "$(tartci_assignment_v2_tier_labels "$tier_label")" "$tier"
+      return 0
+    fi
+    # No demand old enough for this lane's minimum age. A fallback lane may
+    # still take young demand the preferred hosts cannot cover right now.
+    if tartci_fallback_grant "$tier_label" "$tier"; then
+      printf '%s|%s|%s\n' \
+        "$FALLBACK_DEMAND" "$(tartci_assignment_v2_tier_labels "$tier_label")" "$tier"
       return 0
     fi
   done <<< "$ASSIGNMENT_V2_ORDER_LABELS"
@@ -363,7 +374,7 @@ tartci_assignment_v2_parity(){
 # the live fail-closed scan.
 tartci_assignment_v2_pre_mint_valid(){
   local selected_tier="$1" tier_label q tier cached cached_q cached_labels
-  local cached_tier cached_extra top_label top_tier expected_labels max_age
+  local cached_tier cached_extra top_label top_tier expected_labels max_age min_age
   max_age="${TARTCI_ASSIGNMENT_V2_TOP_TIER_RECEIPT_MAX_AGE_SECS:-0}"
   top_label="${ASSIGNMENT_V2_ORDER_LABELS%%$'\n'*}"
   top_tier="$(tartci_assignment_v2_tier_index "$top_label")" || return 1
@@ -384,7 +395,11 @@ tartci_assignment_v2_pre_mint_valid(){
   while IFS= read -r tier_label; do
     [ -n "$tier_label" ] || continue
     tier="$(tartci_assignment_v2_tier_index "$tier_label")" || return 1
-    q="$(tartci_assignment_v2_tier_demand "$tier_label")" || return 1
+    # A class booted on a fallback grant is re-observed at the age the grant
+    # was made at (0), so the job that justified the boot is still visible.
+    min_age="$MIN_QUEUED_AGE"
+    [ "$tier" != "$selected_tier" ] || min_age="$(tartci_fallback_min_age "$tier")"
+    q="$(tartci_assignment_v2_tier_demand "$tier_label" 0 "$min_age")" || return 1
     printf '%s' "$q" | grep -qxE '[0-9]+' || return 1
     if [ "$tier" = "$selected_tier" ]; then
       [ "$q" -gt 0 ]
@@ -473,4 +488,127 @@ tartci_assignment_v2_idle_retarget(){
   event assignment_v2_idle_retarget \
     "selected_tier=$selected_tier elapsed=${idle_elapsed}s to_tier=$other_tier to_label=$other_label queued=$other_q"
   return 0
+}
+
+# ── Fallback lane (opt-in) ──────────────────────────────────────────────────
+#
+# A fallback lane leaves young work to its preferred hosts. Its minimum queued
+# age says how long it waits; the fallback says whether it needs to wait at
+# all. For demand the age rule still hides, the lane asks every preferred host
+# (`tartci pool supply` over SSH, see scripts/gate_supply.py) how many free,
+# leasable gate slots it has for that class, and boots now only when queued
+# demand exceeds what the preferred hosts and this host's sibling lanes already
+# cover. Every uncertainty (a failed scan, an unreachable or stale peer, an
+# unreadable sibling) keeps the age rule, so the lane never boots LATER than
+# it would without the fallback, and never boots early on a guess.
+FALLBACK_DEMAND=0
+FALLBACK_GRANT_TTL=900
+
+tartci_fallback_configure(){
+  [ -n "$FALLBACK_PEERS" ] || return 0
+  [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
+    || die "TARTCI_FALLBACK_PEERS requires event-class-v2 assignment mode"
+  [ "$MIN_QUEUED_AGE" -gt 0 ] \
+    || die "TARTCI_FALLBACK_PEERS requires TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS > 0 (it only shortens that wait)"
+  case "$FALLBACK_PEER_MAX_AGE" in
+    ''|*[!0-9]*) die "invalid TARTCI_FALLBACK_PEER_MAX_AGE_SECS: expected 30-300" ;;
+  esac
+  [ "$FALLBACK_PEER_MAX_AGE" -ge 30 ] && [ "$FALLBACK_PEER_MAX_AGE" -le 300 ] \
+    || die "TARTCI_FALLBACK_PEER_MAX_AGE_SECS must be 30-300"
+}
+
+tartci_fallback_enabled(){
+  [ -n "$FALLBACK_PEERS" ] && [ "$ASSIGNMENT_MODE" = event-class-v2 ] \
+    && [ "$MIN_QUEUED_AGE" -gt 0 ]
+}
+
+tartci_fallback_grant_file(){
+  printf '%s/%s.fallback-grant\n' "$STATE_DIR" "$RUNNER_NAME"
+}
+
+tartci_fallback_clear_grant(){
+  rm -f "$(tartci_fallback_grant_file)"
+}
+
+# Minimum queued age for the pre-mint recheck of <tier>: 0 while a fresh
+# fallback grant for exactly that tier stands, else the lane's own minimum.
+tartci_fallback_min_age(){
+  local tier="$1" file granted_tier granted_at now
+  file="$(tartci_fallback_grant_file)"
+  if tartci_fallback_enabled && [ -r "$file" ] \
+     && read -r granted_tier granted_at < "$file"; then
+    now="$(date +%s)"
+    case "$granted_at" in ''|*[!0-9]*) granted_at=0 ;; esac
+    if [ "$granted_tier" = "$tier" ] && [ $((now - granted_at)) -le "$FALLBACK_GRANT_TTL" ]; then
+      printf '0\n'
+      return 0
+    fi
+  fi
+  printf '%s\n' "$MIN_QUEUED_AGE"
+}
+
+# Print `<verdict> <detail>` for young demand of one class, where verdict is
+# grant, hold or unknown; `none` when there is no young demand and `off` when
+# the policy is disabled. Sets FALLBACK_DEMAND to the young demand count.
+tartci_fallback_decision(){
+  local tier_label="$1" young line
+  FALLBACK_DEMAND=0
+  tartci_fallback_enabled || { printf 'off\n'; return 0; }
+  # Exhaustive and age-agnostic: the decision compares a MAGNITUDE of demand
+  # with the peers' free slots, which the early-stopping scan cannot supply.
+  if ! young="$(tartci_assignment_v2_tier_demand "$tier_label" 1 0)" \
+     || ! printf '%s' "$young" | grep -qxE '[0-9]+'; then
+    printf 'unknown young-demand scan failed\n'
+    return 0
+  fi
+  [ "$young" -gt 0 ] || { printf 'none no young demand\n'; return 0; }
+  FALLBACK_DEMAND="$young"
+  line="$(python3 "$TARTCI_ROOT/scripts/gate_supply.py" decide \
+    --repo "$REPO" --class "$tier_label" --demand "$young" \
+    --peers "$FALLBACK_PEERS" --slot "$SLOT" --state-dir "$STATE_DIR" \
+    --max-age-seconds "$FALLBACK_PEER_MAX_AGE" 2>/dev/null)" || line=""
+  case "$line" in
+    grant\ *|hold\ *|unknown\ *) printf '%s\n' "$line" ;;
+    *) printf 'unknown decision helper failed\n' ;;
+  esac
+}
+
+tartci_fallback_decision_for_tier(){
+  local wanted="$1" tier_label tier=0
+  while IFS= read -r tier_label; do
+    [ -n "$tier_label" ] || continue
+    if [ "$tier" = "$wanted" ]; then
+      tartci_fallback_decision "$tier_label"
+      return 0
+    fi
+    tier=$((tier + 1))
+  done <<< "$TIER_LABELS_CONFIG"
+  printf 'unknown no tier %s\n' "$wanted"
+}
+
+# Succeed (and record the grant) when this lane should boot now for young
+# demand of <tier_label>. Every non-grant keeps the minimum-age rule.
+tartci_fallback_grant(){
+  local tier_label="$1" tier="$2" line verdict detail tmp file
+  tartci_fallback_enabled || return 1
+  line="$(tartci_fallback_decision "$tier_label")"
+  verdict="${line%% *}"
+  detail="${line#* }"
+  case "$verdict" in
+    grant)
+      file="$(tartci_fallback_grant_file)"
+      mkdir -p "$STATE_DIR"
+      if tmp="$(mktemp "$file.tmp.XXXXXX")"; then
+        printf '%s %s\n' "$tier" "$(date +%s)" > "$tmp"
+        mv -f "$tmp" "$file"
+      fi
+      FALLBACK_DEMAND="$(printf '%s' "$detail" | sed -n 's/.*demand=\([0-9][0-9]*\).*/\1/p')"
+      case "$FALLBACK_DEMAND" in ''|*[!0-9]*|0) FALLBACK_DEMAND=1 ;; esac
+      event fallback_grant "tier=$tier label=$tier_label min_queued_age=${MIN_QUEUED_AGE}s $detail"
+      return 0
+      ;;
+    hold) event fallback_hold "tier=$tier label=$tier_label $detail" ;;
+    unknown) event fallback_unknown "tier=$tier label=$tier_label $detail" ;;
+  esac
+  return 1
 }
