@@ -174,6 +174,15 @@ case "$TEARDOWN_STEP_TIMEOUT" in
 esac
 [ "$TEARDOWN_STEP_TIMEOUT" -le 20 ] \
   || { printf 'invalid TARTCI_TEARDOWN_STEP_TIMEOUT_SECS: expected 1-20\n' >&2; exit 1; }
+# Pending-delete reconciliation (reconcile_pending_delete): how many in-loop
+# delete retries, and how long to wait between them, before a teardown whose
+# deletion stays unproved falls back to the fail-closed supervisor restart.
+PENDING_DELETE_MAX_ATTEMPTS="${TARTCI_PENDING_DELETE_MAX_ATTEMPTS:-5}"
+case "$PENDING_DELETE_MAX_ATTEMPTS" in ''|*[!0-9]*|0) PENDING_DELETE_MAX_ATTEMPTS=5 ;; esac
+PENDING_DELETE_RETRY_SECS="${TARTCI_PENDING_DELETE_RETRY_SECS:-10}"
+case "$PENDING_DELETE_RETRY_SECS" in ''|*[!0-9]*|0) PENDING_DELETE_RETRY_SECS=10 ;; esac
+PENDING_DELETE_ATTEMPTS=0
+CURRENT_TEARDOWN_PENDING=""
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
@@ -715,16 +724,25 @@ runtime_emit_complete(){
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
 
+# Running macOS guests per `tart list`, or `unknown` when the inventory cannot
+# be read. A slow or failed listing is NOT a full host: reporting the hard cap
+# here once made an empty host look 2/2 busy for as long as `tart list` stayed
+# slow. One bounded retry with a longer timeout rides out a transient stall;
+# after that the caller must treat occupancy as unknown and fall back to the
+# reservation files (tartci_claim_macos_slot), which every lane writes before
+# it boots and keeps until its VM is proved gone.
 running_macos_vms(){
-  local count fail_closed inventory_timeout
-  fail_closed="${TARTCI_MACOS_HARD_MAX:-2}"
+  local count inventory_timeout retry_timeout
   inventory_timeout="${TARTCI_TART_INVENTORY_TIMEOUT_SECS:-5}"
-  if ! count="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
-      --timeout-seconds "$inventory_timeout" 2>/dev/null)"; then
-    printf '%s\n' "$fail_closed"
+  retry_timeout="${TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS:-15}"
+  if count="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+      --timeout-seconds "$inventory_timeout" 2>/dev/null)" \
+    || count="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+      --timeout-seconds "$retry_timeout" 2>/dev/null)"; then
+    printf '%s\n' "$count"
     return 0
   fi
-  printf '%s\n' "$count"
+  printf 'unknown\n'
 }
 
 queued_work(){
@@ -1021,6 +1039,7 @@ discard_current_vm(){
     event teardown_refused "vm=$CURRENT_VM reason=live_assignment run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}"
     return 1
   fi
+  CURRENT_TEARDOWN_PENDING=""
   note "stopping — tearing down in-flight VM $CURRENT_VM"
   stop_current_aqua_runner
   if ! terminate_current_guardian; then
@@ -1030,14 +1049,60 @@ discard_current_vm(){
   fi
   CURRENT_RPID=""
   bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
-  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1; then
+  if ! bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+    && ! tart_vm_proved_absent "$CURRENT_VM"; then
     note "teardown incomplete — guardian is terminal but VM deletion was not proved"
     event teardown_incomplete "vm=$CURRENT_VM reason=delete_unproved"
+    # The guardian is terminal, so the guest is not running; only its disk
+    # remains unproved. The loop may keep that VM as pending-delete instead of
+    # restarting the supervisor (see reconcile_pending_delete).
+    CURRENT_TEARDOWN_PENDING=delete
     return 1
   fi
   CURRENT_VM=""
   CURRENT_IP=""
   CURRENT_AQUA_LABEL=""
+}
+
+# A timed-out `tart delete` is killed with its process group, so it is no
+# longer mutating anything; a readable local inventory that no longer lists the
+# VM is then proof it is gone. An unreadable inventory proves nothing.
+tart_vm_proved_absent(){
+  python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+    --timeout-seconds "$TEARDOWN_STEP_TIMEOUT" --vm-absent "$1" >/dev/null 2>&1
+}
+
+# Pending-delete: a teardown whose guardian is terminal but whose deletion was
+# not proved. The lane keeps CURRENT_VM, its VM lease and its macOS-slot
+# reservation, so host capacity (tartci_active_reservations and the lease
+# store) keeps counting the VM as occupied until deletion is proved. The loop
+# retries the delete on its next pass instead of paying a full supervisor
+# restart. Only when the bound is exhausted does it fall back to the
+# fail-closed restart, which is where the launchd process-group cleanup and the
+# janitor take over exactly as before.
+reconcile_pending_delete(){
+  [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 2
+  PENDING_DELETE_ATTEMPTS=$((PENDING_DELETE_ATTEMPTS + 1))
+  if bounded_teardown_command tart-delete tart delete "$CURRENT_VM" >/dev/null 2>&1 \
+    || tart_vm_proved_absent "$CURRENT_VM"; then
+    note "pending-delete VM $CURRENT_VM proved gone (attempt $PENDING_DELETE_ATTEMPTS) — releasing its capacity"
+    event teardown_reconciled "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS"
+    CURRENT_VM=""
+    CURRENT_IP=""
+    CURRENT_AQUA_LABEL=""
+    CURRENT_TEARDOWN_PENDING=""
+    PENDING_DELETE_ATTEMPTS=0
+    tartci_release_vm_lease
+    [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+    CURRENT_RESV=""
+    return 0
+  fi
+  if [ "$PENDING_DELETE_ATTEMPTS" -ge "$PENDING_DELETE_MAX_ATTEMPTS" ]; then
+    note "pending-delete VM $CURRENT_VM still unproved after $PENDING_DELETE_ATTEMPTS attempts — falling back to a fail-closed restart"
+    return 2
+  fi
+  note "pending-delete VM $CURRENT_VM still unproved (attempt $PENDING_DELETE_ATTEMPTS/$PENDING_DELETE_MAX_ATTEMPTS); capacity stays held"
+  return 1
 }
 
 cleanup(){
@@ -1872,7 +1937,7 @@ run_one(){
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
   if ! discard_current_vm; then
-    note "[$i] teardown ownership could not be proved — supervisor will exit fail-closed"
+    note "[$i] teardown ownership could not be proved — capacity stays held (pending-delete when the guardian is terminal, fail-closed restart otherwise)"
     return 75
   fi
   tartci_release_vm_lease
@@ -1970,6 +2035,23 @@ if [ "$LOOP" = 1 ]; then
   BLIND_ESCALATION_FILE="$STATE_DIR/$RUNNER_NAME.scan-blind-escalated"
   heartbeat loop
   while true; do
+    if [ -n "$CURRENT_VM" ]; then
+      # Only a pending-delete VM can survive to the loop top (anything else
+      # exits below). Reconcile it before any new admission; while it is
+      # pending, this lane's lease and reservation keep the capacity occupied.
+      pending_rc=0
+      reconcile_pending_delete || pending_rc=$?
+      if [ "$pending_rc" -eq 2 ]; then
+        event teardown_restart "vm=$CURRENT_VM rc=75 pending_delete_attempts=$PENDING_DELETE_ATTEMPTS"
+        exit 75
+      fi
+      if [ "$pending_rc" -ne 0 ]; then
+        heartbeat teardown-pending
+        sleep "$PENDING_DELETE_RETRY_SECS"
+        continue
+      fi
+      heartbeat loop
+    fi
     if ! tartci_pool_admission_open; then
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
@@ -1990,6 +2072,9 @@ if [ "$LOOP" = 1 ]; then
       fi
     fi
     cap="$(tartci_effective_cap)"; r="$(running_macos_vms)"
+    if [ "$r" = unknown ]; then
+      event inventory_unknown "reservations=$(tartci_active_reservations) cap=$cap"
+    fi
     # Blind-aware: a non-numeric `q` (ERR) means the gh queue scan FAILED — do NOT treat it as an
     # empty queue. Count consecutive blind polls; after a sustained window, self-restart for fresh
     # gh auth (the supervisor is idle at the loop top — run_one blocks — so cleanup discards no live
@@ -2061,7 +2146,7 @@ if [ "$LOOP" = 1 ]; then
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && resv="$(tartci_claim_macos_slot "$cap" "$r")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
@@ -2079,6 +2164,13 @@ if [ "$LOOP" = 1 ]; then
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+      fi
+      if [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ]; then
+        PENDING_DELETE_ATTEMPTS=0
+        note "teardown of $CURRENT_VM left deletion unproved — keeping it as pending-delete with its lease and reservation; reconciling in-loop instead of restarting"
+        event teardown_pending_delete "vm=$CURRENT_VM rc=$run_rc"
+        CURRENT_LABELS="$LABELS"
+        continue
       fi
       if [ -n "$CURRENT_VM" ]; then
         note "teardown remained nonterminal — exiting for launchd process-group cleanup"

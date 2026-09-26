@@ -1528,6 +1528,18 @@ fleet`), and check GitHub's job history against it with
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
   SSH. The marker's age is measured on the peer's own clock.
+- **Quiet windows only.** Run `--apply`, and any manual `pool drain`, `pool
+  off`, `pool on` or `gate-slot2 install`, when the host's lanes have no queued
+  demand, not during a burst. A drain takes the host's gate slots out of
+  admission for the whole mid-job wait (up to 90 min) plus the install, and
+  every job that queues meanwhile waits for another host. Measured on the Pulp
+  gate fleet (2026-09-25/26): pool off or draining was 6.3% of all `macos` gate
+  queue wait, about 1.9 min per job on average. Before an apply, check that the
+  lane logs show `queued=0` (or that no gate job is waiting in the repository's
+  Actions queue) and that the other hosts are serving; prefer nights and
+  weekends for fleet-wide rollouts, and do one host at a time. The periodic
+  agent is not installed by default for this reason: a 30-minute schedule does
+  not know when the queue is busy.
 - **Capacity floor.** `--allow-last-serving-host` only when every last-serving
   label is either idle by design (the pulp-release classes) or **minted on
   demand by another host**, logged in the receipt. On an ephemeral JIT fleet a

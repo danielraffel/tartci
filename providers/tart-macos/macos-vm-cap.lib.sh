@@ -75,13 +75,24 @@ tartci_unlock(){ rm -rf "$TARTCI_MACOS_LOCKDIR" 2>/dev/null || true; }
 # Claim a macOS VM slot if the host is under the effective cap. Echoes a
 # reservation file path on success (caller MUST rm it when the job ends); echoes
 # nothing when full. Uses max(running VMs, outstanding reservations) so a VM
-# that's booting-but-not-yet-listed still counts. `running_macos_vms` must be
-# defined by the caller (runner.sh provides it); falls back to 0 if absent.
+# that's booting-but-not-yet-listed still counts.
+#
+# The running count comes from the optional second argument (the caller's
+# inventory reading, taken before the lock so a slow `tart list` never holds the
+# host-wide mutex), else from `running_macos_vms` (runner.sh provides it), else
+# 0. A reading of `unknown` (inventory timed out or failed) is not "full": the
+# reservation files are the occupancy source then. Every lane reserves before
+# it boots and keeps the reservation until its VM is proved gone, so an empty
+# host with an unreadable inventory can still boot, and Apple's 2-guest limit
+# still backstops any VM booted outside this protocol.
 tartci_claim_macos_slot(){
-  local cap="$1" running reserv resv locked=0
+  local cap="$1" running="${2:-}" reserv resv locked=0
   mkdir -p "$TARTCI_MACOS_RESV_DIR" 2>/dev/null || true
+  if [ -z "$running" ]; then
+    if command -v running_macos_vms >/dev/null 2>&1; then running="$(running_macos_vms)"; else running=0; fi
+  fi
+  case "$running" in ''|*[!0-9]*) running=0 ;; esac
   tartci_lock && locked=1
-  if command -v running_macos_vms >/dev/null 2>&1; then running="$(running_macos_vms)"; else running=0; fi
   reserv="$(tartci_active_reservations)"
   [ "${reserv:-0}" -gt "${running:-0}" ] && running="$reserv"
   if [ "${running:-0}" -lt "$cap" ]; then
