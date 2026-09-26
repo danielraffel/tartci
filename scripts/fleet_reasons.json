@@ -87,6 +87,27 @@
       "why": "Without an installed identity there is nothing to compare the executed cohort against, so the comparison is unknown rather than passing by default.",
       "remedy": "Restore or re-write the install receipt before judging what this host runs."
     },
+    "lane_lease_never_fits": {
+      "summary": "A lane's VM is larger than the lease budget it is admitted against.",
+      "why": "The lease store would deny this VM even on an idle host, so the lane can never boot. It stops polling for work and says so instead of scanning the queue and asking Shipyard every minute for a VM it cannot start.",
+      "remedy": "Shrink the lane's VM (TARTCI_MACOS_VM_CORES / vm_pool_cores) to fit the budget, or give the host a larger lease universe. The finding names the requested cores and the budget.",
+      "do_not": "Do not disable the lease store or raise the gate reserve to make the lane boot; the budget exists to keep agent cores."
+    },
+    "lanes_exceed_lease_capacity": {
+      "summary": "More identical lanes are installed than the lease budget can run at once.",
+      "why": "A lane beyond the budget's capacity can only boot while a sibling is idle, and then the sibling would have served. It adds queue polling and admission calls but no concurrent capacity (m5: two 12-core gate lanes in a 14-core universe). While a sibling holds a VM the extra lane waits locally without scanning or asking Shipyard.",
+      "remedy": "Remove the extra lane from the host's fleet profile, or size the VMs so the budget holds every lane at once.",
+      "do_not": "Do not treat the extra lane as spare capacity when planning the fleet."
+    },
+    "lease_fit_ok": {
+      "summary": "Every measured lane can lease its VM, and identical lanes can run together.",
+      "why": "Each lane records its own lease-fit verdict against the lease store's capacity model."
+    },
+    "lease_fit_unmeasured": {
+      "summary": "No lane has recorded a lease-fit verdict yet.",
+      "why": "Lanes write the verdict each poll; a host whose supervisors predate lease-fit, or that has not polled since install, has none.",
+      "remedy": "Wait one poll after the lanes start, or update the host's tartci."
+    },
     "no_installed_profile": {
       "summary": "This host has no installed macOS fleet profile.",
       "why": "Only a host that installed a fleet profile can drift from its checked-in source; the check has nothing to compare here."

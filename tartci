@@ -1049,8 +1049,12 @@ EOF
       local pool_owned_labels
       pool_owned_labels="$(tartci_pool_owned_runner_agents "$agents_dir")"
       if [ "$status_json" = 1 ]; then
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness"
+        local lease_fit_json
+        lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
+          || lease_fit_json='{"managed":null}'
+        [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1076,6 +1080,9 @@ if value.get("present"):
     print(f"  owner pid: {value.get('owner_pid') or 'unknown'}")
     print(f"  identity: inode={value.get('inode')} mtime_ns={value.get('mtime_ns')}")
 PY
+        # A lane that can never lease its VM, or identical lanes the lease
+        # budget cannot run together, is configuration and not load.
+        python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" --text 2>/dev/null || true
         python3 - "$fleet_readiness" <<'PY'
 import json, sys
 fleet = json.loads(sys.argv[1])
