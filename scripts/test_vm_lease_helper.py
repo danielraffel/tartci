@@ -1323,12 +1323,14 @@ class RunningMacosVmsInventoryTests(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "unknown")
 
     def test_slow_first_listing_is_retried_with_the_longer_budget(self) -> None:
-        # The first `tart list` outlives the short budget; the retry answers.
+        # The first `tart list` outlives the short budget. The retry answers
+        # after 1 s, which only the longer retry budget can wait out.
         stub = """#!/usr/bin/env bash
 if [ ! -e @TMP@/first ]; then
   : > @TMP@/first
   sleep 30
 fi
+sleep 1
 printf '[{"Name":"idle","State":"stopped"}]'
 """
         proc = self._run_with_tart_stub(stub, timeout="0.3", retry_timeout="5")
