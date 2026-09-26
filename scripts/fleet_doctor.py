@@ -88,6 +88,11 @@ CODES: tuple[str, ...] = (
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
+    "warm_vm_none",
+    "warm_vm_overdue",
+    "warm_vm_parked",
+    "warm_vm_stale",
+    "warm_vm_unreadable",
 )
 
 
@@ -682,6 +687,28 @@ def check_self_update(summary: dict | None) -> Finding:
                    {"skew": summary.get("skew"), "last": summary.get("last")})
 
 
+def check_warm_vm(value: dict | None) -> Finding:
+    """The host's parked warm gate VM (opt-in; scripts/warm_vm_status.py)."""
+    state = (value or {}).get("state")
+    facts = {"warm_vm": value}
+    if state == "none":
+        return Finding("warm_vm", NOT_APPLICABLE, "warm_vm_none", "no warm VM parked", facts)
+    if state == "parked":
+        return Finding("warm_vm", OK, "warm_vm_parked",
+                       f"{value.get('vm')} parked {value.get('parked_seconds')}s of "
+                       f"{value.get('max_park_seconds')}s, 0 cores reserved", facts)
+    if state == "stale":
+        return Finding("warm_vm", PROBLEM, "warm_vm_stale",
+                       f"record for {value.get('vm')} is not being refreshed by supervisor "
+                       f"pid {value.get('supervisor_pid')}", facts)
+    if state == "overdue":
+        return Finding("warm_vm", PROBLEM, "warm_vm_overdue",
+                       f"{value.get('vm')} parked {value.get('parked_seconds')}s, past its "
+                       f"{value.get('max_park_seconds')}s max", facts)
+    return Finding("warm_vm", UNKNOWN, "warm_vm_unreadable",
+                   f"warm VM record unreadable: {(value or {}).get('error')}", facts)
+
+
 def render(diagnosis: Diagnosis) -> str:
     glyph = {OK: "ok      ", PROBLEM: "PROBLEM ", UNKNOWN: "UNKNOWN ",
              NOT_APPLICABLE: "n/a     "}
@@ -958,6 +985,12 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     else:
         fit_records, fit_missing, managed = [], [], False
     findings.append(check_lease_fit(fit_records, fit_missing, managed=managed))
+    try:
+        import warm_vm_status
+        warm_value = warm_vm_status.status(home / ".tartci/state/warm-vm")
+    except Exception as exc:  # noqa: BLE001 - reported as unreadable
+        warm_value = {"state": "unreadable", "error": str(exc)}
+    findings.append(check_warm_vm(warm_value))
     if probe is None:
 
         def probe(root: Path) -> dict:  # noqa: F811 — the host-reading default

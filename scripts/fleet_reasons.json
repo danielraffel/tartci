@@ -197,6 +197,33 @@
       "summary": "The installed registrations could not be compared with the published supply.",
       "why": "An unreadable installed profile or published file, or a host_id the published file does not declare, leaves the comparison unanswered, which is not the same as a match.",
       "remedy": "Run `tartci fleet-macos verify-supply` for the specific reason."
+    },
+    "warm_vm_none": {
+      "summary": "No warm gate VM is parked on this host.",
+      "why": "A warm VM is opt-in (lane key warm_vm) and off by default; when on, none is parked while the lane is serving, cooling down, or yielding to other demand.",
+      "remedy": "Nothing to do."
+    },
+    "warm_vm_parked": {
+      "summary": "A warm gate VM is parked under a memory-only lease.",
+      "why": "The opted-in lane pre-booted one VM to VM-up so the next job skips lease, clone and boot. It reserves memory and one macOS VM slot, no cores, and yields to other demand.",
+      "remedy": "Nothing to do. To stop it, remove the lane's warm_vm key and reload, or drain the pool."
+    },
+    "warm_vm_stale": {
+      "summary": "The warm VM record is not being refreshed by a live supervisor.",
+      "why": "The supervisor that parked the VM exited or wedged without tearing it down. The VM and its lease may remain until the reaper or lease reclaim removes them.",
+      "remedy": "Run `tartci doctor --reap --json` under its ownership rules, confirm no parked VM remains in `tart list`, then delete ~/.tartci/state/warm-vm/parked.json.",
+      "do_not": "Do not delete a VM whose supervisor is still alive; check the pid first."
+    },
+    "warm_vm_overdue": {
+      "summary": "The warm VM has been parked past its maximum park age.",
+      "why": "The supervisor tears a parked VM down at TARTCI_WARM_VM_MAX_PARK_SECS on its next loop pass. Overdue means the loop is not passing, usually because the supervisor is stuck.",
+      "remedy": "Inspect the lane log for the supervisor named in the record; reload the lane at an idle boundary if it is stuck."
+    },
+    "warm_vm_unreadable": {
+      "summary": "The warm VM record could not be read.",
+      "why": "The record is malformed or unreadable, so whether a VM is parked is unknown.",
+      "remedy": "Inspect ~/.tartci/state/warm-vm/parked.json and `tart list`.",
+      "do_not": "Do not read an unreadable record as no warm VM."
     }
   }
 }

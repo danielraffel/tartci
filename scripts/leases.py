@@ -596,7 +596,13 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     priority, priority_class = parse_priority(args.priority)
     pid = int(args.pid) if args.pid else os.getpid()
     lease_size = int(args.cores_requested)
-    if lease_size <= 0:
+    memory_only = bool(getattr(args, "memory_only", False))
+    if memory_only:
+        # A parked (pre-booted, not yet serving) VM holds its guest memory and
+        # its VM slot but no cores. `resize` upgrades it to a full lease.
+        if lease_size != 0 or getattr(args, "mem_mb", None) is None or int(args.mem_mb) <= 0:
+            raise ValueError("a memory-only lease takes --cores 0 and a positive --mem-mb")
+    elif lease_size <= 0:
         raise ValueError("lease cores must be positive")
     lease_id = args.id or str(uuid.uuid4())
     now = iso(utcnow())
@@ -790,6 +796,8 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             record.update(
                 {"floor": True, "qos": "background", "requested_cores": requested_cores}
             )
+        if memory_only:
+            record["memory_only"] = True
         if disk is not None:
             record.update(
                 {
@@ -1002,6 +1010,124 @@ def guard_run(args: argparse.Namespace) -> int:
     return 1
 
 
+def core_and_memory_verdict(
+    cfg: dict[str, int],
+    current_usage: dict[str, Any],
+    priority: int,
+    lease_size: int,
+    req_mem: int,
+) -> dict[str, Any]:
+    """Whether a lease of this size and priority exceeds the core or memory axis.
+
+    The same two-axis rule `acquire` applies: the host-wide totals bind every
+    lease, and a non-gate lease is additionally held to the non-gate budget.
+    """
+    limit = cfg["total"]
+    used_for_limit = current_usage["used_cores"]
+    if priority < cfg["gate_priority"]:
+        limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
+        used_for_limit = current_usage["non_gate_used_cores"]
+    total_exceeded = current_usage["used_cores"] + lease_size > cfg["total"]
+    class_exceeded = used_for_limit + lease_size > limit
+    mem_axis_on = cfg["total_mem_mb"] > 0
+    mem_limit = cfg["total_mem_mb"]
+    used_mem_for_limit = current_usage.get("used_mem_mb", 0)
+    if priority < cfg["gate_priority"]:
+        mem_limit = max(
+            cfg["per_job_mem_mb"],
+            cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],
+        )
+        used_mem_for_limit = current_usage.get("non_gate_used_mem_mb", 0)
+    total_mem_exceeded = (
+        mem_axis_on
+        and current_usage.get("used_mem_mb", 0) + req_mem > cfg["total_mem_mb"]
+    )
+    class_mem_exceeded = mem_axis_on and used_mem_for_limit + req_mem > mem_limit
+    return {
+        "total_exceeded": total_exceeded,
+        "class_exceeded": class_exceeded,
+        "mem_exceeded": total_mem_exceeded or class_mem_exceeded,
+        "mem_axis_on": mem_axis_on,
+        "mem_limit": mem_limit,
+    }
+
+
+def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
+    """Change an existing lease's size in place, atomically.
+
+    The upgrade path of a parked warm VM: its memory-only lease becomes a full
+    core lease at hand-off. Admission is decided under the same store lock the
+    record is rewritten in, against every OTHER lease, so there is no window in
+    which the lease is released and a competing acquisition takes its memory,
+    and the lease's guardian, disk reservation and identity are untouched. A
+    denial leaves the record exactly as it was (the VM stays parked).
+    """
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    cfg = capacity_config(args)
+    lease_size = int(args.cores_requested)
+    if lease_size <= 0:
+        raise ValueError("resize takes positive --cores")
+    with locked_store(store_dir):
+        records = load_records(store_dir)
+        active, reaped, problems = reclaim(records, int(args.stale_secs))
+        record = next((row for row in active if row.get("id") == args.id), None)
+        if record is None:
+            write_records(store_dir, active)
+            return {"ok": False, "reason": "unknown_lease", "id": args.id,
+                    "reaped": reaped_summary(reaped),
+                    "problems": problem_summary(problems)}, 1
+        if getattr(args, "priority", None) is not None:
+            priority, priority_class = parse_priority(args.priority)
+        else:
+            priority = record_int(record, "priority")
+            priority_class = str(record.get("priority_class") or priority)
+        req_mem = (
+            int(args.mem_mb)
+            if getattr(args, "mem_mb", None) is not None
+            else record_mem_mb(record, cfg["per_job_mem_mb"])
+        )
+        others = [row for row in active if row.get("id") != args.id]
+        current_usage = usage(others, cfg)
+        verdict = core_and_memory_verdict(cfg, current_usage, priority, lease_size, req_mem)
+        core_axis = verdict["total_exceeded"] or verdict["class_exceeded"]
+        if core_axis or verdict["mem_exceeded"]:
+            write_records(store_dir, active)
+            return {
+                "ok": False,
+                "reason": "capacity_exceeded" if core_axis else "memory_exceeded",
+                "exceeded_axis": {"cores": core_axis, "memory": verdict["mem_exceeded"],
+                                  "disk": False},
+                "id": args.id,
+                "requested_cores": lease_size,
+                "requested_mem_mb": req_mem,
+                "priority": priority,
+                "capacity": current_usage,
+                "reaped": reaped_summary(reaped),
+                "problems": problem_summary(problems),
+            }, 75
+        previous = {"cores": record_int(record, "lease_size_cores"),
+                    "mem_mb": record_mem_mb(record, cfg["per_job_mem_mb"])}
+        record.update({
+            "lease_size_cores": lease_size,
+            "lease_size_mem_mb": req_mem,
+            "priority": priority,
+            "priority_class": priority_class,
+            "heartbeat_at": iso(utcnow()),
+        })
+        record.pop("memory_only", None)
+        if getattr(args, "label", None):
+            record["label"] = args.label
+        write_records(store_dir, active)
+        return {
+            "ok": True,
+            "lease": record,
+            "previous": previous,
+            "capacity": usage(active, cfg),
+            "reaped": reaped_summary(reaped),
+            "problems": problem_summary(problems),
+        }, 0
+
+
 def release(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     cfg = capacity_config(args)
@@ -1099,6 +1225,8 @@ def main(argv: list[str] | None = None) -> int:
             result, rc = acquire(args)
         elif args.command == "release":
             result, rc = release(args)
+        elif args.command == "resize":
+            result, rc = resize(args)
         elif args.command == "heartbeat":
             result, rc = heartbeat(args)
         elif args.command == "guard-exec":

@@ -1043,13 +1043,17 @@ EOF
       # that silently stops draining.
       local pool_owned_labels
       pool_owned_labels="$(tartci_pool_owned_runner_agents "$agents_dir")"
+      # The parked warm gate VM, if this host opted into one (report-only).
+      local warm_vm_json
+      warm_vm_json="$(python3 "$HERE/scripts/warm_vm_status.py" --json 2>/dev/null)" \
+        || warm_vm_json='{"state":"unreadable"}'
       if [ "$status_json" = 1 ]; then
         local lease_fit_json
         lease_fit_json="$(python3 "$HERE/scripts/lease_fit.py" report --agents-dir "$agents_dir" 2>/dev/null)" \
           || lease_fit_json='{"managed":null}'
         [ -n "$lease_fit_json" ] || lease_fit_json='{"managed":null}'
-        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"runners":[' \
-          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json"
+        printf '{"host":"%s","state":"%s","participating":%s,"pool_transition_lock":%s,"fleet":%s,"lease_fit":%s,"warm_vm":%s,"runners":[' \
+          "$host" "$state" "$([ "$part" = 1 ] && echo true || echo false)" "$lock_health_json" "$fleet_readiness" "$lease_fit_json" "$warm_vm_json"
         local first=1 label loaded owned
         while IFS= read -r label; do
           [ -n "$label" ] || continue
@@ -1065,6 +1069,7 @@ EOF
         echo "host: $host"
         echo "state: $state"
         echo "participating: $([ "$part" = 1 ] && echo yes || echo 'NO (opted out)')"
+        python3 "$HERE/scripts/warm_vm_status.py" 2>/dev/null || echo "warm vm: UNREADABLE"
         # The readiness payload is already computed above; JSON formatting does
         # not require tomllib, so legacy/unmanaged hosts can still report status.
         python3 - "$lock_health_json" <<'PY'

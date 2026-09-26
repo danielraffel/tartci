@@ -35,16 +35,29 @@ def function_body(source: str, name: str) -> str:
     return match.group(1)
 
 
+# run_one reaches the lease through boot_vm_to_ssh (shared with the warm-VM
+# park), which reports a lease-store refusal as BOOT_LEASE_DENIED=1.
+BOOT_CALL = 'boot_vm_to_ssh "$i"'
+
+
 class LeaseDeniedHeartbeatTests(unittest.TestCase):
     def setUp(self) -> None:
         self.source = RUNNER.read_text()
 
+    def test_the_boot_helper_owns_the_acquisition_and_flags_a_denial(self) -> None:
+        body = function_body(self.source, "boot_vm_to_ssh")
+        tail = body[body.index("tartci_acquire_vm_lease"):]
+        self.assertIn("|| lease_rc=$?", tail)
+        denial = tail[tail.index('if [ "$lease_rc" -ne 0 ]; then'):]
+        self.assertIn("BOOT_LEASE_DENIED=1", denial[:denial.index("\n  fi")])
+        self.assertIn('return "$lease_rc"', denial)
+
     def test_a_denied_vm_lease_heartbeats_before_returning(self) -> None:
         body = function_body(self.source, "run_one")
-        acquire = body.index("tartci_acquire_vm_lease")
+        acquire = body.index(BOOT_CALL)
         tail = body[acquire:]
-        denial = tail.index('if [ "$lease_rc" -ne 0 ]; then')
-        close = tail.index("\n  fi", denial)
+        denial = tail.index('if [ "$lease_rc" -ne 0 ] && [ "$BOOT_LEASE_DENIED" = 1 ]; then')
+        close = tail.index("\n    fi", denial)
         self.assertIn(
             "heartbeat vm-lease-denied", tail[denial:close],
             "the lease-denial path must report itself; without a heartbeat a "
@@ -55,7 +68,7 @@ class LeaseDeniedHeartbeatTests(unittest.TestCase):
         """`if ! cmd; then` would make `$?` the negation, silently turning a
         denial into success, so the status is captured before the branch."""
         body = function_body(self.source, "run_one")
-        tail = body[body.index("tartci_acquire_vm_lease"):]
+        tail = body[body.index(BOOT_CALL):]
         self.assertIn("|| lease_rc=$?", tail)
         self.assertIn('return "$lease_rc"', tail)
 
@@ -63,7 +76,7 @@ class LeaseDeniedHeartbeatTests(unittest.TestCase):
         """A blocked supervisor cycles through other phases between denials, so
         a marker rewritten on every denial would never appear to age."""
         body = function_body(self.source, "run_one")
-        tail = body[body.index("tartci_acquire_vm_lease"):]
+        tail = body[body.index(BOOT_CALL):]
         guard = re.search(
             r'\[ -n "\$SERVING_BLOCKED_SINCE" \]\s*\\?\s*\n?\s*\|\| SERVING_BLOCKED_SINCE=',
             tail,
@@ -83,7 +96,7 @@ class LeaseDeniedHeartbeatTests(unittest.TestCase):
         denial path here sets the marker and nothing here unsets it.
         """
         body = function_body(self.source, "run_one")
-        tail = body[body.index("tartci_acquire_vm_lease"):]
+        tail = body[body.index(BOOT_CALL):]
         denial_end = tail.index('return "$lease_rc"')
         self.assertNotIn('SERVING_BLOCKED_SINCE=""', tail[denial_end:])
 

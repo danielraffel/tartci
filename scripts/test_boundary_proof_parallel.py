@@ -394,10 +394,20 @@ class ProviderWiringTests(unittest.TestCase):
     """Where the proofs start and where every exit path drops them."""
 
     def test_proofs_start_after_the_lease_and_before_the_clone(self) -> None:
-        body = function_body(RUNNER.read_text(encoding="utf-8"), "run_one")
-        lease = body.index("tartci_acquire_vm_lease")
-        start = body.index("tartci_boundary_proof_start")
-        clone = body.index("event clone_start")
+        source = RUNNER.read_text(encoding="utf-8")
+        # A job boot leases, starts the proofs, clones and boots inside
+        # boot_vm_to_ssh (shared with the warm-VM park, which starts none).
+        boot = function_body(source, "boot_vm_to_ssh")
+        lease = boot.index("tartci_acquire_vm_lease")
+        start = boot.index("tartci_boundary_proof_start")
+        clone = boot.index("event clone_start")
+        self.assertIn('[ -z "$proof_group" ] ||', boot[start - 40:start])
+        body = function_body(source, "run_one")
+        self.assertIn('"$selected_group_id" || lease_rc=$?',
+                      body[body.index('boot_vm_to_ssh "$i"'):])
+        # A warm hand-off has nothing to overlap with and starts them itself.
+        handoff = body.index("tartci_warm_handoff")
+        self.assertIn("tartci_boundary_proof_start", body[handoff:body.index('boot_vm_to_ssh "$i"')])
         booted = body.index("t_booted=")
         consume = body.index("tartci_boundary_proof_take_admission")
         mint = body.index("generate-jitconfig")

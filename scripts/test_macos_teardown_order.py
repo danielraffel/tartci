@@ -357,8 +357,10 @@ class PendingDeleteLoopWiringTests(unittest.TestCase):
         body = loop[loop.index("while true; do"):]
         self.assertLess(body.index("reconcile_pending_delete"),
                         body.index("tartci_pool_admission_open"))
+        # The slot claim (tartci_warm_or_claim_slot, which falls through to
+        # tartci_claim_macos_slot unless a warm VM is parked).
         self.assertLess(body.index("reconcile_pending_delete"),
-                        body.index("tartci_claim_macos_slot"))
+                        body.index('resv="$('))
 
     def test_pending_delete_continues_instead_of_restarting(self) -> None:
         loop = self._loop()

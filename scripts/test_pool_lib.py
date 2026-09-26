@@ -884,7 +884,8 @@ class ProviderAdmissionContractTests(unittest.TestCase):
 
     def test_every_provider_refuses_existing_transition_lock_before_allocation(self) -> None:
         cases = {
-            "providers/tart-macos/runner.sh": "tartci_acquire_vm_lease",
+            # The macOS lease is taken inside boot_vm_to_ssh, which run_one calls.
+            "providers/tart-macos/runner.sh": 'boot_vm_to_ssh "$i"',
             "providers/tart-linux/runner.sh": "tartci_acquire_vm_lease",
             "providers/qemu-windows/runner.sh": "allocate_ssh_port",
         }
