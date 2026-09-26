@@ -17,6 +17,13 @@ log_root = "/Users/danielraffel/Library/Logs/tartci"
 # shows the inverse split. The calls are not slow in isolation; they exceed 15s
 # under concurrent supervisors, which is exactly the case this knob exists for.
 github_api_timeout_seconds = 30
+# Agent core floor (canary). On 2026-09-24/25 about two thirds of this host's
+# tartci-governed builds (63 of 95) were denied and fell to a leaseless -j2
+# while the gate reserve sat idle. A denied non-gate build that asks with
+# `leases acquire --allow-floor` now gets up to 6 cores at background QoS; the
+# floor lease is not charged against gate, VM or other build admission, and
+# the pool is clamped to unleased memory. Remove this line to go back.
+agent_floor_cores = 6
 
 # Daniel-only external-volume execution. The stable Developer-ID identity is
 # the TCC responsible process; public/home-backed profiles do not inherit it.
