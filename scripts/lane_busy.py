@@ -104,6 +104,9 @@ IDLE_PHASES = frozenset({
     "admission-precheck",
     # run_one returned and its VM was torn down; the supervisor is sleeping.
     "backoff",
+    # No VM will be booted: the lease cannot be granted now or ever
+    # (lease-fit.lib.sh), or another lane covers the queued job (job-claim.lib.sh).
+    "lease-wait", "lease-never-fits", "job-claim-covered",
 })
 STALE_FLOOR_SECONDS = 600
 STALE_POLL_MULTIPLE = 10
