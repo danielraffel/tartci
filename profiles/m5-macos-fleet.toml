@@ -51,6 +51,11 @@ assignment_scan_max_workers = 4
 # has no queued job and the other class has admissible demand. Rollback is
 # removing this key. See docs/assignment-v2-rollout.md.
 assignment_idle_retarget_seconds = 120
+# Per-job ccache write layers (canary): each gate job reads the shared store
+# read-only and writes only its own layer, promoted on a green job alone. See
+# docs/runbook.md, "Optional per-job ccache write isolation". Rollback: delete
+# this key, re-render, reload both pulp-gate slots at an idle boundary.
+ccache_write_isolation = true
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = [

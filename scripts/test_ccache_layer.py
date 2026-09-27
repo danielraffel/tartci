@@ -384,17 +384,26 @@ class ShellLibTests(unittest.TestCase):
 
 
 class ProfileTests(unittest.TestCase):
-    def test_no_shipped_profile_enables_isolation(self) -> None:
+    # The canary: the only shipped lane that enables isolation.
+    ENABLED = {("m5-macos-fleet.toml", "pulp-gate")}
+
+    def test_only_the_canary_lane_enables_isolation(self) -> None:
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
             with self.subTest(profile=path.name):
                 data = fleet.load(path)
                 for lane in data["lane"]:
-                    self.assertNotIn("ccache_write_isolation", lane)
+                    if (path.name, lane["id"]) in self.ENABLED:
+                        self.assertIs(lane.get("ccache_write_isolation"), True)
+                    else:
+                        self.assertNotIn("ccache_write_isolation", lane)
                 for name, body in fleet.rendered_plists(data).items():
-                    self.assertNotIn(b"TARTCI_CCACHE_WRITE_ISOLATION", body, name)
+                    enabled = any(f".{lane_id}." in name or name.endswith(f".{lane_id}.plist")
+                                  for profile, lane_id in self.ENABLED if profile == path.name)
+                    self.assertEqual(b"TARTCI_CCACHE_WRITE_ISOLATION" in body, enabled, name)
 
     def profile_with(self, value: str) -> Path:
         base = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+        base = base.replace("ccache_write_isolation = true\n", "")
         marker = 'id = "pulp-gate"\n'
         text = base.replace(marker, marker + f"ccache_write_isolation = {value}\n", 1)
         tomllib.loads(text)
