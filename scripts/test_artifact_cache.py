@@ -191,19 +191,51 @@ class GitSyncTests(unittest.TestCase):
         mirror = self.cache / "git/owner/repo.git"
         first = _git("rev-parse", "refs/heads/main", cwd=mirror)
         self.assertEqual(_git("config", "gc.auto", cwd=mirror), "0")
+        self.assertEqual(_git("config", "maintenance.auto", cwd=mirror), "false")
         second = self._commit("two")
         self.assertEqual(self._sync().returncode, 0)
         self.assertNotEqual(first, second)
         self.assertEqual(_git("rev-parse", "refs/heads/main", cwd=mirror), second)
         self.assertEqual(list((self.cache / "git/owner").glob(".staging*")), [])
 
-    def test_many_syncs_fold_their_packs(self) -> None:
+    def _packs(self) -> list[Path]:
+        return list((self.cache / "git/owner/repo.git/objects/pack").glob("*.pack"))
+
+    def _compact(self, running: int) -> subprocess.CompletedProcess:
+        tart = self.tmp / "tart"
+        vms = ", ".join('{"Name": "v%d", "State": "running"}' % i for i in range(running))
+        tart.write_text(f"#!/bin/bash\necho '[{vms}]'\n")
+        tart.chmod(0o755)
+        return subprocess.run(
+            ["bash", str(SYNC), "compact", "--repo", "owner/repo", "--dir", str(self.cache)],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "TARTCI_TART_BIN": str(tart)},
+        )
+
+    def test_sync_never_deletes_a_pack(self) -> None:
         self.assertEqual(self._sync().returncode, 0)
-        for n in range(20):
+        seen = set(self._packs())
+        for n in range(18):
             self._commit(f"c{n}")
             self.assertEqual(self._sync().returncode, 0)
-        packs = list((self.cache / "git/owner/repo.git/objects/pack").glob("*.pack"))
-        self.assertLessEqual(len(packs), 17)
+            now = set(self._packs())
+            self.assertTrue(seen <= now, "a sync removed a pack a guest may be reading")
+            seen = now
+        self.assertEqual(len(seen), 19)
+
+    def test_compact_refuses_while_a_vm_runs_and_folds_when_idle(self) -> None:
+        self.assertEqual(self._sync().returncode, 0)
+        for n in range(3):
+            self._commit(f"c{n}")
+            self.assertEqual(self._sync().returncode, 0)
+        before = len(self._packs())
+        proc = self._compact(running=1)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("refusing to compact", proc.stderr)
+        self.assertEqual(len(self._packs()), before)
+        proc = self._compact(running=0)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(len(self._packs()), 1)
         self.assertEqual(_git("fsck", "--connectivity-only", "--no-dangling",
                               cwd=self.cache / "git/owner/repo.git"), "")
 

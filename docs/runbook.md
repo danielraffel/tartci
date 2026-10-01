@@ -480,7 +480,10 @@ needed, and an empty or absent directory leaves boots unchanged.
   `objects` directory as a Git alternate before fetching, so the server sends
   only what the mirror lacks. A stale mirror still saves every byte it holds;
   re-run `git-sync` to keep the saving near total. The mirror never collects
-  garbage on its own, and folds its packs once more than 16 accumulate.
+  garbage on its own and `git-sync` only adds packs; fold them with
+  `compact --repo ...`, which refuses while any Tart VM is running because a
+  guest reads the packs through the share for its whole job. Never delete a
+  mirror while VMs are running.
 - `sha256/<hex>` holds a file whose SHA-256 is `<hex>`. `add` takes the digest
   the consuming job already pins and refuses bytes that do not match it, and a
   consuming job must re-verify the digest and fall back to its own download

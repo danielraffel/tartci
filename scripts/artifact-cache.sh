@@ -4,6 +4,7 @@
 #   scripts/artifact-cache.sh add --url <url> --sha256 <hex> [--dir DIR]
 #   scripts/artifact-cache.sh git-sync --repo <owner/repo> [--branch main] [--dir DIR]
 #   scripts/artifact-cache.sh prune --older-than-days <N> [--dir DIR]
+#   scripts/artifact-cache.sh compact --repo <owner/repo> [--dir DIR]
 #   scripts/artifact-cache.sh status [--dir DIR]
 #
 # add      downloads <url>, checks it against <hex> and stores it as
@@ -15,13 +16,15 @@
 #          byte it holds and the job fetches only what is newer.
 # prune    removes blobs not added or re-added in the last <N> days. Mirrors
 #          are bounded by their repository and are never pruned.
+# compact  folds a mirror's packs into one. A guest reads packs through the
+#          share for its whole job and a deleted pack may not be rediscovered
+#          there, so this refuses while any Tart VM is running.
 #
 # A running guest may have the directory mounted, so nothing is ever rewritten
 # in place: a blob lands in a private staging file on the same filesystem and
-# is renamed into place, which is atomic, and a mirror only ever gains packs
-# (a repack replaces packs the way `git gc` does in a live repository, which
-# concurrent readers survive). Runners pick the cache up at the next VM boot;
-# no service restart is needed.
+# is renamed into place, which is atomic, and `git-sync` only ever adds packs.
+# Never delete a mirror or a blob a running VM may be reading. Runners pick the
+# cache up at the next VM boot; no service restart is needed.
 set -euo pipefail
 
 usage(){
@@ -33,7 +36,7 @@ die(){ printf 'artifact-cache: %s\n' "$*" >&2; exit 1; }
 
 cmd="${1:-}"
 case "$cmd" in
-  add|git-sync|prune|status) shift;;
+  add|git-sync|prune|compact|status) shift;;
   -h|--help) usage 0;;
   *) usage 2;;
 esac
@@ -63,6 +66,18 @@ esac
 case "$dir" in
   *:*|*$'\n'*|*$'\r'*) die "--dir contains a character Tart cannot share: $dir";;
 esac
+
+# A guest reads the mirror's packs for its whole job, so nothing may delete or
+# rewrite one behind its back: no gc, no background maintenance (newer git runs
+# a detached `maintenance run --auto` after every fetch, which can repack
+# without consulting gc.auto), and every fetch kept as a pack rather than loose
+# objects that a later repack would fold away. Applied on every sync so an
+# older mirror picks up the same settings.
+mirror_config(){
+  git -C "$1" config gc.auto 0
+  git -C "$1" config maintenance.auto false
+  git -C "$1" config transfer.unpackLimit 1
+}
 
 sha256_of(){ shasum -a 256 "$1" | awk '{print $1}'; }
 
@@ -126,30 +141,39 @@ case "$cmd" in
       staging="$(mktemp -d "${mirror%/*}/.staging.XXXXXX")"
       git init --quiet --bare "$staging"
       git -C "$staging" remote add origin "$git_base/$repo.git"
-      # Never collect garbage on its own: a guest may be reading any pack.
-      git -C "$staging" config gc.auto 0
-      # Keep every fetch as a pack; loose objects would make a repack prune
-      # the very files a guest is reading.
-      git -C "$staging" config transfer.unpackLimit 1
+      mirror_config "$staging"
       git -C "$staging" fetch --quiet --no-tags origin \
         "+refs/heads/$branch:refs/heads/$branch" \
         || die "initial fetch of $repo failed"
       mv "$staging" "$mirror"
       staging=""
     else
+      mirror_config "$mirror"
       git -C "$mirror" fetch --quiet --no-tags origin \
         "+refs/heads/$branch:refs/heads/$branch" \
         || die "fetch of $repo failed"
     fi
-    # Each sync adds one pack. Fold them once they pile up; -d drops the old
-    # packs only after the new one is complete, as `git gc` does.
     packs="$(find "$mirror/objects/pack" -name '*.pack' | wc -l | tr -d ' ')"
-    if [ "$packs" -gt 16 ]; then
-      git -C "$mirror" repack -a -d -q
-    fi
-    printf 'artifact-cache: %s at %s (%s)\n' "$repo" \
+    printf 'artifact-cache: %s at %s (%s, %s packs)\n' "$repo" \
       "$(git -C "$mirror" rev-parse --short "refs/heads/$branch")" \
-      "$(du -sh "$mirror" | awk '{print $1}')"
+      "$(du -sh "$mirror" | awk '{print $1}')" "$packs"
+    [ "$packs" -le 32 ] \
+      || printf 'artifact-cache: run `compact --repo %s` while no VM is running\n' "$repo"
+    ;;
+
+  compact)
+    [[ "$repo" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || die "--repo must look like owner/name"
+    mirror="$dir/git/$repo.git"
+    [ -d "$mirror" ] || die "no mirror at $mirror"
+    running="$(${TARTCI_TART_BIN:-tart} list --format json 2>/dev/null \
+      | python3 -c 'import json,sys; print(sum(1 for v in json.load(sys.stdin) if v.get("State") == "running" or v.get("Running")))' \
+      2>/dev/null)" || running=""
+    [ "$running" = 0 ] \
+      || die "refusing to compact while Tart reports running VMs (${running:-unknown}); a guest may be reading these packs"
+    lock_cache
+    git -C "$mirror" repack -a -d -q
+    printf 'artifact-cache: compacted %s to %s pack(s)\n' "$repo" \
+      "$(find "$mirror/objects/pack" -name '*.pack' | wc -l | tr -d ' ')"
     ;;
 
   prune)
