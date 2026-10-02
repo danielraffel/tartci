@@ -231,7 +231,13 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
                 continue
             try:
                 entries = bounded_scandir(current)
-            except OSError:
+            except OSError as error:
+                if error.errno in (errno.EPERM, errno.EACCES):
+                    # A refusal is "could not look", never "empty": name it, so
+                    # a directory that would prompt or is protected is visible.
+                    SCAN_REFUSED.append(str(current))
+                    print(f"disk_reclaim: skipped {current}: "
+                          f"{os.strerror(error.errno)}", file=sys.stderr)
                 continue
             for entry in entries:
                 if not entry.is_dir(follow_symlinks=False):
@@ -260,6 +266,7 @@ UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELO
 # is "could not look", never "empty", so nothing under it is deleted.
 SCANDIR_TIMEOUT_S = 120.0
 SCAN_TIMEOUTS: list[str] = []
+SCAN_REFUSED: list[str] = []
 
 
 # Other apps' data containers. Opening one from a process without Full Disk
@@ -565,14 +572,17 @@ def refused_root(path: pathlib.Path) -> str | None:
 
     A root at or above the home directory reaches ~/Library, where listing
     another app's data asks the logged-in user and, under launchd, waits
-    forever. `/`, `/Users`, `/Volumes` and $HOME are refused outright, as is
-    any root that contains or lies inside ~/Library.
+    forever. `/`, `/Users`, `/Volumes`, a whole volume (`/Volumes/<name>`) and
+    $HOME are refused outright, as is any root that contains or lies inside
+    ~/Library.
     """
     resolved = pathlib.Path(os.path.realpath(path))
     home = pathlib.Path(os.path.realpath(os.path.expanduser("~")))
     library = home / "Library"
     if resolved in (pathlib.Path("/"), pathlib.Path("/Users"), pathlib.Path("/Volumes"), home):
         return f"{resolved} is a whole-system or home directory"
+    if resolved.parent == pathlib.Path("/Volumes"):
+        return f"{resolved} is a whole volume"
     if resolved == library or library in resolved.parents:
         return f"{resolved} is inside {library}"
     if resolved in library.parents:
@@ -1278,6 +1288,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         # was judged or removed.
         "scan_timeouts": list(SCAN_TIMEOUTS),
         "app_containers_skipped": list(APP_CONTAINERS_SKIPPED),
+        "scan_refused": list(SCAN_REFUSED),
     }
     receipt["report"] = report
 

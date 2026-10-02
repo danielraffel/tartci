@@ -1542,6 +1542,49 @@ class HomeRootGuardTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("refused", err.getvalue())
 
+    def test_every_fleet_profile_yields_its_code_directory(self) -> None:
+        # The four [reclaim] tables as deployed on 2026-10-02 (home and the
+        # external volumes stand in under this test's temporary directory).
+        base = pathlib.Path(self.tmp.name).resolve()
+        workshop, atelier = base / "Workshop" / "Code", base / "Atelier" / "Code"
+        for code in (workshop, atelier):
+            (code / "agent-worktrees").mkdir(parents=True)
+        home_code = self.home / "Code"
+        cases = {
+            "m3": (f"{workshop}/pulp", f"{workshop}/agent-worktrees", [workshop]),
+            "m5studio": (f"{atelier}/pulp", f"{atelier}/agent-worktrees", [atelier]),
+            "m1": (f"{home_code}/pulp", str(home_code), [home_code]),
+            "m5": (f"{home_code}/pulp", str(home_code), [home_code]),
+        }
+        for host, (repo, worktrees_root, expected) in cases.items():
+            with self.subTest(host=host):
+                roots, err = self.roots(repo, worktrees_root)
+                self.assertEqual(roots, expected)
+                self.assertNotIn("REFUSED", err)
+
+    def test_a_whole_volume_root_is_refused(self) -> None:
+        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Workshop")))
+
+    def test_a_refused_listing_is_named_never_silent(self) -> None:
+        code = self.home / "Code"
+        locked = code / "locked"
+        locked.mkdir()
+        (code / "proj" / "build").mkdir(parents=True)
+        real = os.scandir
+
+        def scandir(path):
+            if pathlib.Path(path) == locked:
+                raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+            return real(path)
+        with unittest.mock.patch.object(dr.os, "scandir", scandir), \
+                unittest.mock.patch.object(dr, "SCAN_REFUSED", []):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                found = dr.find_candidates([code], maxdepth=4)
+            self.assertEqual(found, [code / "proj" / "build"])
+            self.assertEqual(dr.SCAN_REFUSED, [str(locked)])
+            self.assertIn(f"skipped {locked}", err.getvalue())
+
     def test_a_root_nested_in_another_is_walked_once(self) -> None:
         # m3 and m5studio: worktrees_root (…/Code/agent-worktrees) sits inside
         # repo's parent (…/Code).
