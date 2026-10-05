@@ -135,7 +135,9 @@ class ReplayTests(Fleet):
     def test_the_fleet_moves_once_m5_has_been_dark_for_the_bound(self) -> None:
         outcomes = self.replay_until_m5studio_goes()
         for line in outcomes[:7]:
-            self.assertRegex(line, r"m5 is draining|m5 \(m5\) pool status unreadable", line)
+            self.assertRegex(line,
+                             r"m5 is draining|m5 \(m5\) (?:pool status unreadable|SSH (?:transport|authentication) failed)",
+                             line)
         self.assertIn("yielding the update turn to a host that has waited longer: m5studio",
                       outcomes[7])
         self.assertEqual(self.sys.mutations(), [], "m1 never went out ahead of m5studio")
@@ -165,7 +167,8 @@ class ReplayTests(Fleet):
             for hhmm in ("14:44", "16:14", "18:14", "20:14"):
                 self.corroborate("m5", at("11:12"))
                 self.attempt(hhmm)
-                self.assertIn("m5 (m5) pool status unreadable", self.reason())
+                self.assertRegex(self.reason(),
+                                 r"m5 \(m5\) (?:pool status unreadable|SSH (?:transport|authentication) failed)")
         self.assertEqual(self.sys.mutations(), [])
         self.assertEqual(self.events("peer_unreachable_excluded"), [])
 

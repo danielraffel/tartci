@@ -727,6 +727,21 @@ _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/
                 + '" 2>/dev/null || true')
 
 
+def _ssh_failure_kind(result: Result) -> str:
+    """Classify a failed peer SSH probe for an actionable operator receipt."""
+    text = f"{result.text}\n{result.out}".lower()
+    if any(token in text for token in (
+            "permission denied", "publickey", "authentication failed",
+            "host key verification failed", "no supported authentication methods")):
+        return "authentication"
+    if any(token in text for token in (
+            "timed out", "timeout", "connection refused", "connection reset",
+            "network is unreachable", "no route to host", "could not resolve hostname",
+            "ssh: unreachable")):
+        return "transport"
+    return "command"
+
+
 def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str, Any]:
     """One peer's pool state, update marker and waiting ticket.
 
@@ -753,7 +768,13 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     try:
         value = json.loads(status.out)
     except json.JSONDecodeError:
-        out["evidence"] = (f"peer {host_id} ({target}) pool status unreadable (exit {status.rc}): "
+        kind = _ssh_failure_kind(status)
+        label = {
+            "authentication": "SSH authentication failed",
+            "transport": "SSH transport failed",
+            "command": "pool status unreadable",
+        }[kind]
+        out["evidence"] = (f"peer {host_id} ({target}) {label} (exit {status.rc}): "
                            f"{status.text[:160]}")
         return out
     out["readable"] = True

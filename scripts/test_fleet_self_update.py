@@ -54,6 +54,7 @@ class FakeSystem(su.System):
         self.peers = {"m1": {"state": "on", "participating": True},
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
+        self.peer_status_errors: dict[str, str] = {}
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
@@ -192,6 +193,8 @@ class FakeSystem(su.System):
                 i += 2 if a[i] in ("-o", "-i", "-p") else 1
             peer = a[i]
             if "pool status" in a[-1]:
+                if peer in self.peer_status_errors:
+                    return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
             marker = self.peer_markers.get(peer)
@@ -603,6 +606,13 @@ class HappyPathTests(Base):
 
 
 class OneAtATimeTests(Base):
+    def test_peer_authentication_failure_is_named_separately(self) -> None:
+        self.sys.peer_status_errors["m5"] = "Permission denied (publickey)."
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["readable"])
+        self.assertIn("SSH authentication failed", peer["evidence"])
+        self.assertNotIn("unreachable", peer["evidence"])
+
     def test_peer_draining_refuses_before_any_mutation(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.assertDeferred(self.apply())
