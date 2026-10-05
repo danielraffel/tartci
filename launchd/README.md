@@ -416,19 +416,22 @@ reports busy or returns unknown state, stop; do not replace the registration.
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
 `scripts/gh_queue_saturation.py` (as `tartci queue-saturation`, from the
-installed generation) on a `StartInterval` (default 300s) to catch the
-inverse of a wedge: the required self-hosted gate sits **online and idle** while
-its GitHub-hosted routing preamble is starved behind a saturated shared pool, so
-the required check reads `pending` for reasons that have nothing to do with the
-code or the runners. A runner-health check sees green runners and reports "fine";
-this detector sees the triad — deep repo-wide queue **and** an idle required-gate
-runner **and** a required check pending past a grace window — and says
-"GitHub-hosted starvation." It runs here, on the always-on Mac, precisely because
-a scheduled workflow on `ubuntu-latest` would queue behind the saturation it is
-meant to report. Dry-run by default (`PULP_SAT_APPLY=0`, logs the verdict); set
-`PULP_SAT_APPLY=1` to open/update a single tracking issue once the log has baked.
+installed generation) on a `StartInterval` (default 300s). It catches both
+queue starvation and the earlier routing-preamble failure: queued
+`resolve-provider` or `classify` jobs in a Build and Test run are sampled and a
+job older than the grace window is reported as `preamble_starved`, even when
+the Tart macOS census is empty. This prevents a supervisor's `queued=0` from
+being mistaken for end-to-end health while the preamble is still pinned to a
+hosted label. The original triad remains: deep repo-wide queue **and** idle
+required-gate capacity **and** a required check pending past grace reports
+GitHub-hosted starvation. The detector runs on the always-on Mac because a
+scheduled workflow on `ubuntu-latest` would queue behind the saturation it is
+meant to report. Dry-run is the default (`PULP_SAT_APPLY=0`); set
+`PULP_SAT_APPLY=1` to open/update a tracking issue for either condition.
 Decision logic is covered hermetically by `scripts/test_gh_queue_saturation.py`
-(no network, no `gh`, no clock). Design:
+(no network, no `gh`, no clock); live sampling is bounded to eight queued Build
+and Test runs, uses at most four concurrent API calls, and ignores API failures
+fail-closed. Design:
 `planning/2026-07-06-ci-queue-saturation-watchdog.md` in the pulp repo. Install:
 
 ```
