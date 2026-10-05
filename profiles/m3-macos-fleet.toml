@@ -15,7 +15,10 @@ id = "studio"
 ssh = "m3"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Workshop/VMs"
-cache_root = "/Users/danielraffel/.cache/pulp-ci"
+# The CI cache (gate ccache, artifact cache, pip wheelhouse) lives on Workshop
+# with the Tart store, not on the boot volume, which held 10 GiB of it. The
+# old ~/.cache/pulp-ci is a symlink here, for tools that default to it.
+cache_root = "/Volumes/Workshop/ci/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 # Measured 2026-09-21: of 209 assignment-scan failures on this host in 24h,
 # 184 (88%) were a single GitHub call exceeding the generic 15-second default,
