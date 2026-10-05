@@ -102,3 +102,17 @@ jobs:
         run: |
           python --version
           git ls-files -z '*.py' | xargs -0 python -m py_compile
+
+  probe-macos15:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: sw_vers; /usr/bin/python3 --version; echo "TMPDIR=$TMPDIR"
+      - run: /usr/bin/python3 scripts/probe_rename_macos15.py
+      - run: /usr/bin/python3 -m unittest -v test_tartci_support_manifest.TartciSupportManifestTests.test_stage_install_is_immutable_reusable_and_refuses_dirty_source test_disk_reclaim.ClassifyTests.test_empty_pgrep_result_is_an_answer_not_a_failure
+        working-directory: scripts
+        continue-on-error: true
+      - run: TMPDIR=$RUNNER_TEMP /usr/bin/python3 scripts/probe_rename_macos15.py
+      - run: TMPDIR=$RUNNER_TEMP /usr/bin/python3 -m unittest -v test_tartci_support_manifest.TartciSupportManifestTests.test_stage_install_is_immutable_reusable_and_refuses_dirty_source
+        working-directory: scripts
+        continue-on-error: true
