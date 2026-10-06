@@ -202,6 +202,68 @@ class LaneRefusalTests(unittest.TestCase):
         self.assertIn("refusing to boot an untrusted guest on default NAT", runner)
 
 
+class LaunchSourceTests(unittest.TestCase):
+    """The hand-sed launchd template must not be able to start the lint lane."""
+
+    TEMPLATE = ROOT / "launchd" / "com.danielraffel.pulp.tart-runner-linux.plist.template"
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        key = self.home / ".config" / "tartci" / "keys" / "lint-vm_ed25519"
+        key.parent.mkdir(parents=True)
+        key.write_text("k")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def rendered_template_env(self) -> tuple[str, dict]:
+        """Render the template the way its own header says, then add the lint switch."""
+        import plistlib
+        text = self.TEMPLATE.read_text()
+        start = text.index("<?xml") if "<?xml" in text else text.index("<!DOCTYPE")
+        body = text[start:].replace("$HOME", str(self.home)).replace(
+            "$TARTCI_HOST_LABEL", "pulp-host-test").replace("$TART_HOME", str(self.home / "VMs"))
+        plist = plistlib.loads(body.encode())
+        env = dict(plist["EnvironmentVariables"])
+        env["TARTCI_LINUX_LANE"] = "lint"
+        env["TARTCI_LINUX_GOLDEN"] = "pulp-lint-linux:2026-10-06"
+        return plist["Label"], env
+
+    def configure_as_launchd(self, label: str, env: dict) -> subprocess.CompletedProcess[str]:
+        return lane_shell("tartci_lint_lane_configure && echo CONFIGURED",
+                          HOME=str(self.home), XPC_SERVICE_NAME=label,
+                          **{k: v for k, v in env.items() if k not in ("PATH", "HOME")})
+
+    def test_hand_template_with_the_lint_switch_refuses_to_start(self) -> None:
+        label, env = self.rendered_template_env()
+        out = self.configure_as_launchd(label, env).stdout
+        self.assertNotIn("CONFIGURED", out)
+        self.assertIn("refuses the hand-rendered tart-runner-linux template", out)
+
+    def test_any_launchd_job_without_a_render_receipt_refuses(self) -> None:
+        _, env = self.rendered_template_env()
+        out = self.configure_as_launchd("com.example.renamed-copy", env).stdout
+        self.assertNotIn("CONFIGURED", out)
+        self.assertIn("needs a fleet-macos render receipt", out)
+
+    def test_a_fleet_render_receipt_admits_the_launchd_job(self) -> None:
+        _, env = self.rendered_template_env()
+        receipt = self.home / "render.json"
+        receipt.write_text(json.dumps({"renderer": "fleet-macos", "lane_kind": "tart-linux",
+                                       "lane_profile": "lint"}))
+        env["TARTCI_LANE_RENDER_RECEIPT"] = str(receipt)
+        out = self.configure_as_launchd("com.danielraffel.tartci.lane.lint", env).stdout
+        self.assertIn("CONFIGURED", out)
+
+    def test_an_interactive_one_shot_is_allowed(self) -> None:
+        for xpc in ("", "0"):
+            with self.subTest(xpc=xpc):
+                out = lane_shell("tartci_lint_lane_configure && echo CONFIGURED", HOME=str(self.home),
+                                 XPC_SERVICE_NAME=xpc, TARTCI_LINUX_GOLDEN="pulp-lint-linux:x").stdout
+                self.assertIn("CONFIGURED", out)
+
+
 class GuestProbeVerdictTests(unittest.TestCase):
     GOOD = ("boot_id=x\nipv6_disabled=1\nipv6_global_addrs=0\nhost_shares=0\nhost_share_devices=0\n"
             "credential_files=0\ntoken_strings=0")

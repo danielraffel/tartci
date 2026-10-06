@@ -20,7 +20,30 @@ tartci_lint_lane_enabled(){ [ "${TARTCI_LINUX_LANE:-build}" = lint ]; }
 
 # Apply lane defaults. An explicit TARTCI_* value still wins, except the build
 # labels, which a lint VM must never advertise.
+# Under launchd the lane must come from the reviewed renderer (fleet-macos
+# render), never from the hand-sed template, whose values drift per host. A
+# launchd job is recognised by XPC_SERVICE_NAME (launchd sets it to the job's
+# Label; ssh and Terminal sessions leave it unset or "0"). The renderer writes a
+# render receipt and points TARTCI_LANE_RENDER_RECEIPT at it; until that renderer
+# learns the tart-linux kind, no launchd job can start this lane.
+TARTCI_LINUX_HAND_TEMPLATE_LABEL="com.danielraffel.pulp.tart-runner-linux"
+tartci_lint_launch_source_ok(){
+  local job="${XPC_SERVICE_NAME:-}" receipt="${TARTCI_LANE_RENDER_RECEIPT:-}"
+  case "$job" in ''|0) return 0 ;; esac
+  if [ "$job" = "$TARTCI_LINUX_HAND_TEMPLATE_LABEL" ]; then
+    die "lint lane refuses the hand-rendered tart-runner-linux template ($job); render it with fleet-macos render"
+  fi
+  [ -n "$receipt" ] && [ -r "$receipt" ] \
+    && python3 - "$receipt" <<'PY' || die "lint lane under launchd ($job) needs a fleet-macos render receipt for a tart-linux lint lane"
+import json, sys
+r = json.load(open(sys.argv[1]))
+ok = r.get("renderer") == "fleet-macos" and r.get("lane_kind") == "tart-linux" and r.get("lane_profile") == "lint"
+raise SystemExit(0 if ok else 1)
+PY
+}
+
 tartci_lint_lane_configure(){
+  tartci_lint_launch_source_ok
   LABELS="${TARTCI_RUNNER_LABELS:-$TARTCI_LINT_DEFAULT_LABELS}"
   case ",$LABELS," in
     *,pulp-build-linux,*|*,pulp-trusted-build,*|*,pulp-build,*)
