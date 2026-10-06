@@ -832,6 +832,121 @@ fails closed.
 
 ---
 
+### 3.10 Linux lint lane: untrusted, tiny, egress-restricted
+
+A second profile of `providers/tart-linux/runner.sh` serves jobs that compile
+nothing:
+
+- the merge-queue preamble (`classify`, `resolve-provider`);
+- later, "Enforce version & skill sync" and "Vellum freeze".
+
+Those jobs run pull-request or merge-queue content, so each VM is treated as
+hostile.
+
+```sh
+TARTCI_LINUX_LANE=lint TARTCI_LINUX_GOLDEN=pulp-lint-linux:<date> \
+  providers/tart-linux/runner.sh --once
+```
+
+| | Build lane | Lint lane |
+|---|---|---|
+| Golden | `pulp-linux-build` (toolchain, Skia) | `pulp-lint-linux:<date>`, baked by `provision-lint.sh` from `manifests/pulp.lint-linux.toml` |
+| Size | `TARTCI_LINUX_VM_*` / profile | profile only: `lint_vm_cores`, `lint_vm_mem_mb`, `lint_vm_slots` from the non-gate share |
+| Host share | host ccache mounted (virtiofs) | none |
+| Network | tart NAT (LAN and tailnet reachable) | Softnet `--net-softnet-block=0.0.0.0/0` plus GitHub's published self-hosted-runner egress set |
+| Guest key | `TARTCI_VM_SSH_KEY` | tartci-owned `~/.config/tartci/keys/lint-vm_ed25519`; a `~/.ssh/` key is refused |
+| Runner name | `linux-ephr-<pid>-<i>` | `pulp-lint-ephemeral-<host>-<pid>-<i>` |
+| Labels | `pulp-build-linux` | `self-hosted,Linux,ARM64,pulp-lint-linux-arm64`; build labels are refused |
+
+**Golden.** The manifest pins every input:
+
+- the base image by digest;
+- the actions-runner tarball by sha256;
+- the Python 3.12 tarball, which the bake lays out in the runner's tool cache,
+  so `actions/setup-python` resolves locally;
+- the pip packages the jobs install, PyYAML.
+
+The bake masks the apt timers and removes `unattended-upgrades`, disables IPv6,
+authorizes only the tartci lint key, and locks the default password. It runs
+under a lease and writes `$TART_HOME/goldens/<name>.json` with the disk sha256.
+
+**Egress.** `scripts/egress_allowlist.py` derives the allow rules from two
+sources, both read on the host at mint time and both recorded in the receipt:
+
+- `GET /meta`: the `web`, `api`, `git` and `actions` ranges (IPv4, collapsed);
+- the /32s of the hostnames GitHub documents for self-hosted runners
+  ("Accessible domains by function").
+
+The host resolves those hostnames three times and unions the answers. The
+second source exists because meta's ranges do not cover the Front Door hosts,
+such as `pipelines.actions.githubusercontent.com`, that the runner's job
+long-poll uses.
+
+The rules are cached for 24 h with a content hash. Any non-global range is
+refused, so a default route, RFC1918 or the tailnet's 100.64.0.0/10 can never
+enter the set. A documented hostname that does not resolve stops the
+derivation. Adding a hostname is a reviewed change.
+
+This is GitHub's published self-hosted-runner egress set, not "GitHub only":
+`actions` carries the Azure ranges the runner uploads logs and results to,
+about 3,800 CIDRs. `check` compares the cache with a fresh read.
+
+Softnet filters IPv4 only, which is why the guest boots with IPv6 off.
+
+DNS goes to the vmnet gateway's resolver and answers any name. That is a
+recorded residual, equal to GitHub-hosted runners. The hostile-job fixture
+prints it as `ALLOWED(residual: DNS)`, never silently.
+
+**Softnet needs root once per host** to create its vmnet interface. It drops
+privileges afterwards. Grant it with a SUID bit on the real binary, or with a
+NOPASSWD sudoers line for it. Without that grant the lane refuses to start;
+it never falls back to NAT. `brew upgrade softnet` installs a binary without
+the bit, so re-grant after upgrading.
+
+**Before any runner is registered**, the supervisor probes the guest:
+
+- IPv6 is off, with no global IPv6 address;
+- no virtiofs or 9p mount;
+- no credential file;
+- no token-shaped string in `$HOME` or `/etc`.
+
+It writes `<logdir>/receipt.json` with the golden digest, the egress set's
+sha256 and fetch time, the lease grant, the guest boot_id and the probe. A
+failed probe discards the VM unregistered.
+
+**Proving isolation.** `TARTCI_LINT_TEST_FIXTURE=providers/tart-linux/fixtures/lint-hostile-job.sh`
+runs the fixture in the guest where a job would run, under a wall cap
+(`TARTCI_LINT_FIXTURE_WALL_SECS`, default 300). No runner is registered.
+
+The fixture behaves like a hostile pull request:
+
+- probes the LAN, the tailnet, the gateway's ports, public addresses, UDP and
+  IPv6, once as the user and again as root after flushing the guest firewall;
+- scans for credentials;
+- plants persistence markers for the next job to find;
+- burns CPU and memory;
+- ends with a fork bomb.
+
+Every line it prints is a verdict.
+
+**Controls for the instruments.** `scripts/lint_lane_controls.sh <golden>`
+runs three controls, each of which must report the failure it exists to catch:
+
+- a clone with a planted fake token and an `AKIA…` string must FAIL the probe;
+- a clone booted with a `--dir` share must FAIL the probe, even unmounted,
+  because the probe looks for the virtio-fs device and not just a mount;
+- the fixture's network probes under tart's default NAT must REACH the LAN and
+  public targets, so a BLOCK under Softnet proves Softnet and not a dead
+  network.
+
+Lint VMs queue behind gate leases. On a host whose gate VMs hold the whole
+lease capacity, the lease refuses with `capacity_exceeded` on the cores axis,
+and the VM waits.
+
+Cold start, lease to first SSH: `scripts/measure_linux_cold_start.sh <golden> 10`.
+On m1 (1 vCPU, 2048 MB) the median was 7.5 s and p90 7.8 s, and the golden's
+sha256 was unchanged after all ten runs.
+
 ## 4. Windows lane (QEMU) — the hard-won recipe
 
 AVF can't install Windows (no inbox virtio-blk driver → 0 bytes written; black

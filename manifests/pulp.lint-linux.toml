@@ -1,0 +1,38 @@
+# Pulp — Linux lint lane golden (Tart, arm64 guest). One small VM per job for
+# jobs that compile nothing: the merge-queue preamble (classify,
+# resolve-provider), "Enforce version & skill sync" and "Vellum freeze".
+# Baked by providers/tart-linux/provision-lint.sh. Everything below is pinned so
+# a re-bake reproduces the same image; bump a pin deliberately.
+
+schema   = 2
+name     = "pulp-lint-linux"
+provider = "tart"
+strategy = "bake"
+os       = "linux"
+arch     = "arm64"
+
+base    = "ghcr.io/cirruslabs/ubuntu@sha256:e004f7f4f6765e2b3ae2738a95040c5d03867b667eb21a57ea0c3729aad640b6"  # 24.04
+disk_gb = 20
+
+[runner]
+version = "2.337.0"
+url     = "https://github.com/actions/runner/releases/download/v2.337.0/actions-runner-linux-arm64-2.337.0.tar.gz"
+sha256  = "9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393"
+
+[python]
+# Pre-baked into the runner's tool cache, so actions/setup-python with
+# python-version "3.12" resolves locally and never downloads.
+version  = "3.12.15"
+url      = "https://github.com/actions/python-versions/releases/download/3.12.15-36805895057/python-3.12.15-linux-24.04-arm64.tar.gz"
+packages = ["PyYAML==6.0.2"]
+tool_cache = "/opt/hostedtoolcache"
+
+[apt]
+packages = ["git", "ca-certificates", "curl", "jq"]
+
+[guest]
+user = "admin"
+# The only authorized key is the public half of this tartci-owned key; the
+# image's default password is locked.
+ssh_key = "~/.config/tartci/keys/lint-vm_ed25519"
+ipv6 = false
