@@ -41,6 +41,12 @@ probe_set(){ # who
   if timeout 5 bash -c '</dev/tcp/2606:4700:4700::1111/443' 2>/dev/null; then echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 REACH"; else echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 BLOCK"; fi
 }
 
+# Probe-only mode: the network probes alone, for the NAT baseline control.
+if [ "${TARTCI_FIXTURE_MODE:-full}" = probe-only ]; then
+  probe_set "${TARTCI_FIXTURE_WHO:-user}"
+  exit 0
+fi
+
 # Persistence: a previous job's markers must be gone.
 for m in "$HOME/.tartci-d-marker" /tmp/.tartci-d-marker /var/tmp/.tartci-d-marker "$HOME/actions-runner/_work/.tartci-d-marker"; do
   [ -e "$m" ] && echo "PERSIST $m PRESENT" || echo "PERSIST $m ABSENT"
@@ -79,20 +85,23 @@ echo "INFO markers planted"
 
 # Resource abuse, bounded so the harness can observe the host meanwhile.
 ( timeout 20 bash -c 'for i in $(seq 1 4); do (while :; do :; done) & done; wait' ) >/dev/null 2>&1 &
-# Ask for twice the guest's memory: the lease's guest size must bound it.
+# Ask for twice the guest's memory: the lease's guest size must bound it. The
+# kernel OOM-kills the hog rather than raising MemoryError, so it runs as a child
+# and the verdict is its exit status (137 = killed), printed either way.
 guest_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
 echo "INFO guest_mem_mb=$guest_mb"
-python3 - "$guest_mb" <<'PY' 2>&1 | tail -1
+python3 -c '
 import sys
-want = 2 * int(sys.argv[1])
 blocks = []
-try:
-    for _ in range(want):
-        blocks.append(bytearray(1 << 20))
-    print(f"ABUSE memory-hog allocated-{want}MiB")
-except MemoryError:
-    print(f"ABUSE memory-hog capped-at-{len(blocks)}MiB-of-{want}MiB")
-PY
+for _ in range(2 * int(sys.argv[1])):
+    blocks.append(bytearray(1 << 20))
+' "$guest_mb" >/dev/null 2>&1
+hog_rc=$?
+case "$hog_rc" in
+  137) echo "ABUSE memory-hog killed rc=137 (guest memory bound held)" ;;
+  0)   echo "ABUSE memory-hog allocated-$((2 * guest_mb))MiB rc=0 (NOT bounded)" ;;
+  *)   echo "ABUSE memory-hog failed rc=$hog_rc" ;;
+esac
 wait
 echo "ABUSE cpu-burn finished"
 echo "DONE"

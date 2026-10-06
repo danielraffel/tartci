@@ -887,6 +887,12 @@ refused, so a default route, RFC1918 or the tailnet's 100.64.0.0/10 can never
 enter the set. A documented hostname that does not resolve stops the
 derivation. Adding a hostname is a reviewed change.
 
+A filtering resolver can trip this guard on purpose. NextDNS answers a blocked
+name with `0.0.0.0`, which is not a global address, so the derivation refuses
+it and the lane refuses to boot. That is the intended failure. The fix is to
+allow the documented runner hostname in the resolver's allowlist, not to relax
+the guard.
+
 This is GitHub's published self-hosted-runner egress set, not "GitHub only":
 `actions` carries the Azure ranges the runner uploads logs and results to,
 about 3,800 CIDRs. `check` compares the cache with a fresh read.

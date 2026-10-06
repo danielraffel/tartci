@@ -63,9 +63,9 @@ probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"
 echo "CONTROL probe-share expect=FAIL got=$(verdict "$probe") $(grep -E '^host_share' <<<"$probe" | tr '\n' ' ')"
 
 vm="lint-ctl-nat-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
-out="$(TARTCI_FIXTURE_FORK_BOMB=0 ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-  'bash -s' < <(sed -n '/^GATEWAY=/,/^}$/p;/^probe_tcp(){/,/^}$/p' "$ROOT/providers/tart-linux/fixtures/lint-hostile-job.sh"; \
-                sed -n '/^probe_set(){/,/^}$/p' "$ROOT/providers/tart-linux/fixtures/lint-hostile-job.sh"; echo 'probe_set nat') 2>&1)"
+out="$({ echo 'TARTCI_FIXTURE_MODE=probe-only TARTCI_FIXTURE_WHO=nat'; echo 'export TARTCI_FIXTURE_MODE TARTCI_FIXTURE_WHO'; \
+        cat "$ROOT/providers/tart-linux/fixtures/lint-hostile-job.sh"; } \
+      | ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" 'bash -s' 2>&1)"
 discard "$vm"
 printf '%s\n' "$out" | sed 's/^/CONTROL egress-baseline /'
 reach=$(grep -cE 'PROBE nat (192\.168\.86\.|1\.1\.1\.1|example\.com).* REACH' <<<"$out")

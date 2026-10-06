@@ -106,8 +106,10 @@ printf "host_shares=%s\n" "$(grep -cE " (virtiofs|9p|fuse\.vmhgfs) " /proc/mount
 # A share the job could mount itself: any virtio-fs device (virtio id 0x001a).
 printf "host_share_devices=%s\n" "$(cat /sys/bus/virtio/devices/*/device 2>/dev/null | grep -cx 0x001a)"
 # Redaction proof: no credential-shaped file and no token-shaped string in the
-# places a host secret could have been left. The tool cache is not scanned: the
-# Python test suite ships sample keys.
+# places a host secret could have been left. /opt/hostedtoolcache is deliberately
+# outside the scan: the CPython test suite ships sample private keys there, so
+# widening the scan to /opt would fail every boot. No host secret is ever written
+# into the tool cache; the golden bake is the only writer.
 hits=0
 for f in "$HOME/.ssh/id_"* "$HOME/.config/gh/hosts.yml" "$HOME/.git-credentials" \
          "$HOME/.netrc" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.runner" \
