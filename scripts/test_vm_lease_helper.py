@@ -863,6 +863,50 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["12", "5", "6"])
 
+    def test_macos_cores_from_the_gate_reserve_share(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            tartci_profile_value(){{ printf 6; }}
+            tartci_gate_reserve_share_cores(){{ printf '%s' "$(( 8 / $1 ))"; }}
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf 'share=%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            printf 'explicit=%s\\n' "$(TARTCI_MACOS_VM_CORES=5 tartci_vm_lease_cores tart-macos)"
+            printf 'unset=%s\\n' "$(TARTCI_MACOS_VM_CORES_FROM= tartci_vm_lease_cores tart-macos)"
+            tartci_gate_reserve_share_cores(){{ return 1; }}
+            printf 'failed=%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(),
+                         ["share=4", "explicit=5", "unset=6", "failed=6"])
+        self.assertIn("gate-reserve VM size unavailable; using vm_pool_cores", proc.stderr)
+
+    def test_macos_share_matches_the_python_derivation(self) -> None:
+        # The real path: the shell asks gate_reserve_fit.py, so both sides read
+        # the same live host profile on whatever machine runs this.
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf '%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots 2
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shell, python = proc.stdout.split()
+        self.assertEqual(shell, python)
+
     def test_is_non_gate_priority_helper(self) -> None:
         script = textwrap.dedent(
             f"""

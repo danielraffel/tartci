@@ -215,11 +215,13 @@ class derives merge-group `110` or PR-head `100`, preserving merge ordering and
 allowing either class to use reserved gate cores. Fleet validation rejects an
 explicit priority on a V2 lane.
 
-M3 alone renders `TARTCI_MACOS_VM_CORES=12` for Pulp. Its 26-core host budget can
-therefore admit two Pulp guests (`12 + 12`) or one Pulp guest alongside a
-14-core Forge/Vellum guest (`12 + 14`). M1 and M5 retain their host-profile VM
-sizes of 3 and 6 cores. The per-lane override does not resize other repositories'
-guests, reserve a slot while idle, or change Tart's two-macOS-guest hard cap.
+M3 renders `TARTCI_MACOS_VM_CORES=7` for Pulp, so its two Pulp slots fit the
+14-core gate reserve together (`7 + 7`). M5 sizes its Pulp slots from its own
+gate reserve (`vm_cores_from = "gate-reserve"`, rendered as
+`TARTCI_MACOS_VM_CORES_FROM`), which gives `4 + 4` against an 8-core reserve. M1
+retains its host-profile VM size of 3 cores. Neither per-lane setting resizes
+other repositories' guests, reserves a slot while idle, or changes Tart's
+two-macOS-guest hard cap.
 
 The GitHub App wrapper requires explicit repository authority even when the API
 endpoint is organization-scoped for a protected runner group. JIT minting

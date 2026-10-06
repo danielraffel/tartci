@@ -1787,8 +1787,9 @@ fleet`), and check GitHub's job history against it with
 - **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
   --check-reserve`, which fits each gate lane (no explicit priority, or
   `priority = "gate"`) into THIS host's gate reserve from its live
-  host-profile, per axis: `supervisors x vm_cores` (default `vm_pool_cores`)
-  against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  host-profile, per axis: `supervisors x` the lane's VM cores (an explicit
+  `vm_cores`, else the reserve share for `vm_cores_from = "gate-reserve"`, else
+  `vm_pool_cores`) against `reserved_gate_cores`, and `supervisors x` the derived VM memory
   against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
   overcommitted pair is printed as `gate_reserve_overcommitted lane=...
   axis=... demand=... reserve=...` on every update, and `tartci pool status`
@@ -1796,12 +1797,21 @@ fleet`), and check GitHub's job history against it with
   the installed profile. The update is refused only when the target profile's
   overcommit on some (lane, axis) is strictly greater than the installed
   profile's, both against the same live reserve (`gate_reserve_worse`). This is
-  a ratchet because two hosts overcommit today (m1: 2 x 3 against 3; m5:
-  2 x 6 against 8), and refusing them would leave both unable to update; a
-  check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
-  against 14 lease-denied the second Pulp slot while jobs queued, #373).
-  Resizing is a profile decision with the host's owner and must not take
-  agent cores. A host that reserves no gate cores (a CI runner, or a role
+  a ratchet because a host whose installed profile overcommits (m1: 2 x 3
+  against 3) must still be able to update; a check that let the overcommit
+  grow would be no check (m3, 2026-10-04: 2 x 12 against 14 lease-denied the
+  second Pulp slot while jobs queued, #373). Resizing is a profile decision
+  with the host's owner and must not take agent cores. The resize that keeps
+  the reserve and the agent cores as they are is `vm_cores_from =
+  "gate-reserve"` on the lane: each slot's VM gets the largest core count, at
+  most `vm_pool_cores`, at which all of the lane's slots fit the reserve on
+  cores and on derived memory (`gate_reserve_fit.share_cores`; `python3
+  scripts/gate_reserve_fit.py share-cores --slots N` prints it for this host).
+  The plist carries the rule (`TARTCI_MACOS_VM_CORES_FROM`,
+  `TARTCI_MACOS_VM_CORES_SLOTS`), not a number, and the lease helper, `tartci
+  gate-supply` and this fit all compute the size the same way. m5 sizes its two
+  Pulp slots this way (2 x 4 against 8); on m3's facts the rule gives the 7 that
+  #373 chose by hand. A host that reserves no gate cores (a CI runner, or a role
   that keeps none for gates) has no reserve to fit lanes into, so the check
   reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
   `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
