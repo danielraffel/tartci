@@ -38,7 +38,10 @@ probe_set(){ # who
   # DNS through the gateway resolver is the recorded residual; say so, never silently.
   if getent hosts example.com >/dev/null 2>&1; then echo "PROBE $who dns:example.com ALLOWED(residual: DNS)"; else echo "PROBE $who dns:example.com BLOCK"; fi
   # IPv6 egress.
-  if timeout 5 bash -c '</dev/tcp/2606:4700:4700::1111/443' 2>/dev/null; then echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 REACH"; else echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 BLOCK"; fi
+  # A BLOCK here proves nothing on a host without an IPv6 route; the IPv6 claim
+  # rests on the guest facts printed beside it (and asserted by the lane's probe).
+  if timeout 5 bash -c '</dev/tcp/2606:4700:4700::1111/443' 2>/dev/null; then v6=REACH; else v6="BLOCK (uninformative on a host without IPv6)"; fi
+  echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 $v6 disable_ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) global_v6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)"
 }
 
 # Probe-only mode: the network probes alone, for the NAT baseline control.

@@ -51,12 +51,18 @@ discard(){ tart stop "$1" >/dev/null 2>&1; tart delete "$1" >/dev/null 2>&1; tar
 # An empty probe is an unreadable guest, not a FAIL of the property under test.
 verdict(){ [ -n "$1" ] || { echo NO-PROBE; return; }; if tartci_lint_probe_ok "$1"; then echo PASS; else echo FAIL; fi; }
 
+# 0. Baseline: an untouched clone of the golden must PASS, or every later FAIL
+#    could be the golden itself rather than the planted defect.
+vm="lint-ctl-base-$$"; boot "$vm" || { discard "$vm"; exit 1; }
+probe="$(tartci_lint_guest_probe "$IP")"; discard "$vm"
+echo "CONTROL probe-baseline expect=PASS got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths|host_share|ipv6)' <<<"$probe" | tr '\n' ' ')"
+
 vm="lint-ctl-cred-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
 ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
   'mkdir -p ~/.config/gh && printf "github.com:\n  oauth_token: ghp_%s\n" 0123456789abcdefghijABCDEFGHIJ01234567 > ~/.config/gh/hosts.yml
    printf "aws_access_key_id = AKIA%s\n" ABCDEFGHIJKLMNOP > ~/notes.txt'
 probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"
-echo "CONTROL probe-credentials expect=FAIL got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings)=' <<<"$probe" | tr '\n' ' ')"
+echo "CONTROL probe-credentials expect=FAIL got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths)=' <<<"$probe" | tr '\n' ' ')"
 
 vm="lint-ctl-share-$$"; boot "$vm" --dir="ctl:$share_dir" || { discard "$vm"; exit 1; }; ip="$IP"
 probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"

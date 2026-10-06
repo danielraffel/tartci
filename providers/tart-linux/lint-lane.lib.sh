@@ -114,10 +114,13 @@ hits=0
 for f in "$HOME/.ssh/id_"* "$HOME/.config/gh/hosts.yml" "$HOME/.git-credentials" \
          "$HOME/.netrc" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.runner" \
          "$HOME/jit.cfg"; do [ -e "$f" ] && hits=$((hits + 1)); done
-tok=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----" \
-      "$HOME" /etc 2>/dev/null | wc -l)
+tok_paths=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----" \
+      "$HOME" /etc 2>/dev/null)
+tok=$(printf "%s" "$tok_paths" | grep -c .)
 printf "credential_files=%s\n" "$hits"
 printf "token_strings=%s\n" "$tok"
+# Paths only, never contents, so a FAIL names what tripped it.
+printf "token_paths=%s\n" "$(printf "%s" "$tok_paths" | head -20 | paste -sd, -)"
 '
 
 tartci_lint_guest_probe(){ # $1 = ip ; prints key=value lines
