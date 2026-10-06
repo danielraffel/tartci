@@ -54,7 +54,15 @@ verdict(){ [ -n "$1" ] || { echo NO-PROBE; return; }; if tartci_lint_probe_ok "$
 # 0. Baseline: an untouched clone of the golden must PASS, or every later FAIL
 #    could be the golden itself rather than the planted defect.
 vm="lint-ctl-base-$$"; boot "$vm" || { discard "$vm"; exit 1; }
-probe="$(tartci_lint_guest_probe "$IP")"; discard "$vm"
+probe="$(tartci_lint_guest_probe "$IP")"
+# Tie any token paths to the pinned inputs: the runner version inside the guest
+# and the golden's recorded disk digest.
+runner_version="$(ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
+  'cat ~/actions-runner/bin/Runner.Listener.deps.json 2>/dev/null | grep -o "\"Runner.Listener/[0-9.]*\"" | head -1' 2>/dev/null)"
+golden_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("disk_sha256"))' \
+  "$TART_HOME/goldens/${GOLDEN//[:\/]/_}.json" 2>/dev/null || echo unknown)"
+discard "$vm"
+echo "CONTROL probe-baseline golden=$GOLDEN golden_disk_sha256=$golden_digest runner=${runner_version:-unknown}"
 echo "CONTROL probe-baseline expect=PASS got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths|host_share|ipv6)' <<<"$probe" | tr '\n' ' ')"
 
 vm="lint-ctl-cred-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
