@@ -119,7 +119,12 @@ printf 'RUNNER_TOOL_CACHE=%s\nAGENT_TOOLSDIRECTORY=%s\n' "$TOOL_CACHE" "$TOOL_CA
   > "$home/actions-runner/.env"
 chown "$GUEST_USER:$GUEST_USER" "$home/actions-runner/.env"
 
-# IPv4 only: Softnet does not filter IPv6.
+# IPv4 only: Softnet does not filter IPv6. The kernel command line removes the
+# IPv6 stack outright. The sysctl alone raced a router advertisement on the
+# vmnet: the interface took a global address after a boot probe had passed.
+# The sysctl stays as a second layer.
+printf 'GRUB_CMDLINE_LINUX="$GRUB_CMDLINE_LINUX ipv6.disable=1"\n' > /etc/default/grub.d/99-tartci-no-ipv6.cfg
+update-grub >/dev/null 2>&1
 printf 'net.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 1\n' \
   > /etc/sysctl.d/99-tartci-no-ipv6.conf
 
@@ -131,10 +136,27 @@ printf 'PasswordAuthentication no\nKbdInteractiveAuthentication no\n' > /etc/ssh
 passwd -l "$GUEST_USER" >/dev/null
 
 apt-get clean; rm -rf /var/lib/apt/lists/*
-truncate -s 0 /etc/machine-id
-rm -f "$home/.bash_history" /root/.bash_history
 sync
 GUEST
+
+# Reboot once to prove the IPv6 stack is gone, then finish the image. The bake
+# stamp is the very last write: the lane's token scan covers only files newer
+# than it, because the bytes before it are fixed by the golden's disk digest.
+note "reboot to verify the kernel command line"
+tart stop "$BUILDER" >/dev/null
+tart run --no-graphics "$BUILDER" >/dev/null 2>&1 &
+for _ in $(seq 1 150); do tart exec "$BUILDER" true >/dev/null 2>&1 && break; sleep 1; done
+tart exec "$BUILDER" sh -c 'grep -qw ipv6.disable=1 /proc/cmdline && [ ! -e /proc/sys/net/ipv6 ]' \
+  || die "the IPv6 stack is still present after reboot; refusing to template"
+tart exec -i "$BUILDER" sudo env GUEST_USER="$GUEST_USER" bash -s <<'FINAL'
+set -euo pipefail
+truncate -s 0 /etc/machine-id
+rm -f "/home/$GUEST_USER/.bash_history" /root/.bash_history
+install -d -m 755 /etc/tartci
+date -u +%Y-%m-%dT%H:%M:%SZ > /etc/tartci/bake-stamp
+sync
+FINAL
+stamp_mtime="$(tart exec "$BUILDER" stat -c %Y /etc/tartci/bake-stamp)"
 
 note "shut down and template"
 tart stop "$BUILDER" >/dev/null
@@ -152,6 +174,8 @@ json.dump({
   "runner_version": "$RUNNER_VERSION", "runner_sha256": "$RUNNER_SHA256",
   "python": "$PY_VERSION", "python_packages": "$PY_PACKAGES".split(),
   "ssh_key_fingerprint": "$(ssh-keygen -lf "$SSH_KEY.pub" | awk '{print $2}')",
+  "bake_stamp": "/etc/tartci/bake-stamp", "bake_stamp_mtime": int("$stamp_mtime"),
+  "ipv6": "absent (kernel cmdline ipv6.disable=1)",
 }, open(sys.argv[1], "w"), indent=1)
 PY
 cat "$receipt"

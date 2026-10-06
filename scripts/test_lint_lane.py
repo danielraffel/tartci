@@ -265,8 +265,8 @@ class LaunchSourceTests(unittest.TestCase):
 
 
 class GuestProbeVerdictTests(unittest.TestCase):
-    GOOD = ("boot_id=x\nipv6_disabled=1\nipv6_global_addrs=0\nhost_shares=0\nhost_share_devices=0\n"
-            "credential_files=0\ntoken_strings=0")
+    GOOD = ("boot_id=x\nipv6_stack=absent\nipv6_global_addrs=0\nbake_stamp=ok\nhost_shares=0\n"
+            "host_share_devices=0\ncredential_files=0\ntoken_strings=0")
 
     def verdict(self, probe: str) -> bool:
         return lane_shell('tartci_lint_probe_ok "$P"', P=probe).returncode == 0
@@ -275,7 +275,8 @@ class GuestProbeVerdictTests(unittest.TestCase):
         self.assertTrue(self.verdict(self.GOOD))
 
     def test_each_property_is_required(self) -> None:
-        for key, bad in (("ipv6_disabled", "0"), ("ipv6_global_addrs", "1"), ("host_shares", "1"),
+        for key, bad in (("ipv6_stack", "present"), ("bake_stamp", "bad"), ("ipv6_global_addrs", "1"),
+                         ("host_shares", "1"),
                          ("host_share_devices", "1"),
                          ("credential_files", "2"), ("token_strings", "1")):
             with self.subTest(key=key):
@@ -312,6 +313,20 @@ class FixtureContractTests(unittest.TestCase):
         self.assertRegex(m["runner"]["sha256"], r"^[0-9a-f]{64}$")
         self.assertFalse(m["guest"]["ipv6"])
         self.assertFalse(m["guest"]["ssh_key"].startswith("~/.ssh/"))
+        bake = (ROOT / "providers" / "tart-linux" / "provision-lint.sh").read_text()
+        self.assertIn("ipv6.disable=1", bake)
+        # The stamp is the last write before templating.
+        self.assertLess(bake.index("/etc/tartci/bake-stamp"), bake.index('note "shut down and template"'))
+        self.assertLess(bake.index("grep -qw ipv6.disable=1 /proc/cmdline"), bake.index("/etc/tartci/bake-stamp"))
+
+    def test_token_scan_is_bounded_by_the_bake_stamp_with_every_pattern(self) -> None:
+        lib = LANE_LIB.read_text()
+        self.assertIn('-newer "$stamp"', lib)
+        for pattern in ("gh[pousr]_", "github_pat_", "AKIA[0-9A-Z]{16}", "PRIVATE KEY"):
+            self.assertIn(pattern, lib)
+        probe = lib[lib.index("TARTCI_LINT_GUEST_PROBE='"):lib.index("tartci_lint_guest_probe(){")]
+        # The probe body is one single-quoted string: an apostrophe inside it ends it early.
+        self.assertEqual(probe.count("'"), 2, "an apostrophe inside the probe body breaks the quoting")
 
 
 if __name__ == "__main__":

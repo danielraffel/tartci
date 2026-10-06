@@ -63,7 +63,7 @@ golden_digest="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))
   "$TART_HOME/goldens/${GOLDEN//[:\/]/_}.json" 2>/dev/null || echo unknown)"
 discard "$vm"
 echo "CONTROL probe-baseline golden=$GOLDEN golden_disk_sha256=$golden_digest runner=${runner_version:-unknown}"
-echo "CONTROL probe-baseline expect=PASS got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths|host_share|ipv6)' <<<"$probe" | tr '\n' ' ')"
+echo "CONTROL probe-baseline expect=PASS got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths|host_share|ipv6|bake_stamp)' <<<"$probe" | tr '\n' ' ')"
 
 vm="lint-ctl-cred-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
 ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
@@ -71,6 +71,29 @@ ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
    printf "aws_access_key_id = AKIA%s\n" ABCDEFGHIJKLMNOP > ~/notes.txt'
 probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"
 echo "CONTROL probe-credentials expect=FAIL got=$(verdict "$probe") $(grep -E '^(credential_files|token_strings|token_paths)=' <<<"$probe" | tr '\n' ' ')"
+
+# 1b. Scan boundary: a key file dated before the bake stamp is the golden's
+#     territory (covered by its digest), so the scan must NOT report it, while
+#     the same content dated now must be reported.
+vm="lint-ctl-stamp-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
+ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  'k="-----BEGIN OPENSSH PRIVATE KEY-----"; printf "%s\n" "$k" > ~/old-key.txt; touch -d 2000-01-01 ~/old-key.txt'
+probe_old="$(tartci_lint_guest_probe "$ip")"
+ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" 'cp -p ~/old-key.txt ~/new-key.txt; touch ~/new-key.txt'
+probe_new="$(tartci_lint_guest_probe "$ip")"; discard "$vm"
+echo "CONTROL scan-boundary-prestamp expect=PASS got=$(verdict "$probe_old") $(grep -E '^(token_strings|token_paths|bake_stamp)=' <<<"$probe_old" | tr '\n' ' ')"
+echo "CONTROL scan-boundary-poststamp expect=FAIL got=$(verdict "$probe_new") $(grep -E '^(token_strings|token_paths)=' <<<"$probe_new" | tr '\n' ' ')"
+
+# 1c. IPv6: the same golden with the kernel command-line flag removed and the
+#     guest rebooted must FAIL the probe's ipv6_stack check.
+vm="lint-ctl-ipv6-$$"; boot "$vm" || { discard "$vm"; exit 1; }; ip="$IP"
+ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  'sudo rm -f /etc/default/grub.d/99-tartci-no-ipv6.cfg && sudo update-grub >/dev/null 2>&1 && (sudo systemctl reboot >/dev/null 2>&1 &)' || true
+sleep 15
+for _ in $(seq 1 300); do ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && break; sleep 0.5; done
+sleep 20  # give a router advertisement time to land, the race the flag closes
+probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"
+echo "CONTROL ipv6-without-cmdline expect=FAIL got=$(verdict "$probe") $(grep -E '^ipv6' <<<"$probe" | tr '\n' ' ')"
 
 vm="lint-ctl-share-$$"; boot "$vm" --dir="ctl:$share_dir" || { discard "$vm"; exit 1; }; ip="$IP"
 probe="$(tartci_lint_guest_probe "$ip")"; discard "$vm"

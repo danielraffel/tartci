@@ -41,7 +41,7 @@ probe_set(){ # who
   # A BLOCK here proves nothing on a host without an IPv6 route; the IPv6 claim
   # rests on the guest facts printed beside it (and asserted by the lane's probe).
   if timeout 5 bash -c '</dev/tcp/2606:4700:4700::1111/443' 2>/dev/null; then v6=REACH; else v6="BLOCK (uninformative on a host without IPv6)"; fi
-  echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 $v6 disable_ipv6=$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null) global_v6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)"
+  echo "PROBE $who ipv6:[2606:4700:4700::1111]:443 $v6 ipv6_stack=$([ -e /proc/sys/net/ipv6 ] && echo present || echo absent) global_v6_addrs=$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)"
 }
 
 # Probe-only mode: the network probes alone, for the NAT baseline control.
@@ -75,7 +75,7 @@ probe_tcp escape "${GATEWAY%.*}.3" 22   # a sibling VM on the same vmnet
 
 probe_set user
 # As root, with the guest's own filtering and routing torn down.
-sudo bash -c 'iptables -F 2>/dev/null; iptables -P OUTPUT ACCEPT 2>/dev/null; nft flush ruleset 2>/dev/null; ip route replace default via '"$GATEWAY"' 2>/dev/null; sysctl -qw net.ipv6.conf.all.disable_ipv6=0' 
+sudo bash -c 'iptables -F 2>/dev/null; iptables -P OUTPUT ACCEPT 2>/dev/null; nft flush ruleset 2>/dev/null; ip route replace default via '"$GATEWAY"' 2>/dev/null; sysctl -qw net.ipv6.conf.all.disable_ipv6=0 2>/dev/null; modprobe ipv6 2>/dev/null' 
 probe_set root
 
 # Plant markers for the next job to look for.

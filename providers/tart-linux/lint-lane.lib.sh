@@ -100,22 +100,31 @@ tartci_lint_softnet_args(){
 TARTCI_LINT_GUEST_PROBE='
 set -u
 printf "boot_id=%s\n" "$(cat /proc/sys/kernel/random/boot_id)"
-printf "ipv6_disabled=%s\n" "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null || echo missing)"
+# No IPv6 stack at all (kernel cmdline ipv6.disable=1). A sysctl-only disable
+# raced a router advertisement: an address appeared after the probe passed.
+printf "ipv6_stack=%s\n" "$([ -e /proc/sys/net/ipv6 ] && echo present || echo absent)"
 printf "ipv6_global_addrs=%s\n" "$(ip -6 addr show scope global 2>/dev/null | grep -c inet6)"
 printf "host_shares=%s\n" "$(grep -cE " (virtiofs|9p|fuse\.vmhgfs) " /proc/mounts)"
 # A share the job could mount itself: any virtio-fs device (virtio id 0x001a).
 printf "host_share_devices=%s\n" "$(cat /sys/bus/virtio/devices/*/device 2>/dev/null | grep -cx 0x001a)"
-# Redaction proof: no credential-shaped file and no token-shaped string in the
-# places a host secret could have been left. /opt/hostedtoolcache is deliberately
-# outside the scan: the CPython test suite ships sample private keys there, so
-# widening the scan to /opt would fail every boot. No host secret is ever written
-# into the tool cache; the golden bake is the only writer.
+# Redaction proof. Bytes older than the bake stamp belong to the golden, fixed by
+# its disk digest (and they include npm docs with example private keys), so the
+# token scan covers what boot and the supervisor added: files under $HOME and
+# /etc newer than /etc/tartci/bake-stamp, with every pattern kept. A missing
+# stamp, or one newer than this boot, is a FAIL: that is not a lint golden.
+stamp=/etc/tartci/bake-stamp
+btime=$(awk "/^btime/ {print \$2}" /proc/stat)
+if [ -f "$stamp" ] && [ "$(stat -c %Y "$stamp")" -lt "$btime" ]; then
+  printf "bake_stamp=ok\n"
+else
+  printf "bake_stamp=bad\n"
+fi
 hits=0
 for f in "$HOME/.ssh/id_"* "$HOME/.config/gh/hosts.yml" "$HOME/.git-credentials" \
          "$HOME/.netrc" "$HOME/actions-runner/.credentials" "$HOME/actions-runner/.runner" \
          "$HOME/jit.cfg"; do [ -e "$f" ] && hits=$((hits + 1)); done
-tok_paths=$(grep -rIlE "gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----" \
-      "$HOME" /etc 2>/dev/null)
+tok_paths=$(find "$HOME" /etc -type f -newer "$stamp" -readable -print0 2>/dev/null \
+  | xargs -0 -r grep -IlE "gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----" 2>/dev/null)
 tok=$(printf "%s" "$tok_paths" | grep -c .)
 printf "credential_files=%s\n" "$hits"
 printf "token_strings=%s\n" "$tok"
@@ -131,7 +140,8 @@ tartci_lint_guest_probe(){ # $1 = ip ; prints key=value lines
 # properties.
 tartci_lint_probe_ok(){ # $1 = probe output
   local p="$1"
-  grep -qx 'ipv6_disabled=1' <<<"$p" \
+  grep -qx 'ipv6_stack=absent' <<<"$p" \
+    && grep -qx 'bake_stamp=ok' <<<"$p" \
     && grep -qx 'ipv6_global_addrs=0' <<<"$p" \
     && grep -qx 'host_shares=0' <<<"$p" \
     && grep -qx 'host_share_devices=0' <<<"$p" \
