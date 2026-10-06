@@ -1764,7 +1764,10 @@ boot_vm_to_ssh(){
   local proof_group="${7:-}"
   local lease_cores lease_mem lease_rc boot_log rpid ip=""
   BOOT_LEASE_DENIED=0
-  lease_cores="$(tartci_vm_lease_cores tart-macos)"
+  if ! lease_cores="$(tartci_vm_lease_cores tart-macos)"; then
+    note "[$i] VM size unavailable (gate-reserve rule could not be computed) — not booting"
+    return 1
+  fi
   lease_mem="$(tartci_vm_lease_mem_mb tart-macos)"
   lease_rc=0
   tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-macos-vm" "$lease_priority" "$labels" "$lease_mem" "$TART_HOME" \
