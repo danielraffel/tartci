@@ -217,6 +217,72 @@ def _ghapp(args: list[str], cwd: str | None) -> tuple[int, str]:
     return proc.returncode, (proc.stdout or proc.stderr).strip()
 
 
+def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None,
+                  raise_event: Callable[[], None], render: Callable[[], tuple[str, str]],
+                  issue: Callable[[str, str], tuple[int, str]] | None = None,
+                  close: Callable[[str], tuple[int, str]] | None = None,
+                  issues_enabled: bool = True) -> dict:
+    """Once per episode: an event and a GitHub issue while `active`; the issue
+    closes and the state goes once `resolved`.
+
+    A different `since` is a new episode, and the previous episode's issue is
+    closed rather than forgotten. A failed issue open is kept as
+    `issue_error` in the state at `path` and retried on the next pass; a
+    failed close is kept in `stale_issues` and retried every pass, and the
+    state is not removed while one remains, so no issue is ever orphaned.
+    `render()` builds the issue's (title, body) only when one is opened.
+    `issue(title, body)` and `close(number)` default to ghapp.
+    """
+    state = _read_json(path) or {}
+    out = {"evented": False, "issue": state.get("issue")}
+    closer = close or _close_issue
+
+    def close_all(numbers: list[str]) -> list[str]:
+        """Close each; return the ones that failed, to retry next pass."""
+        return [n for n in numbers if closer(n)[0] != 0]
+
+    stale = close_all([str(n) for n in state.get("stale_issues") or []])
+    if active:
+        if state.get("since") != since:
+            # A new episode: the previous one's issue is closed, never orphaned.
+            if state.get("issue"):
+                stale += close_all([str(state["issue"])])
+            state = {"since": since}
+        if stale:
+            state["stale_issues"] = stale
+        else:
+            state.pop("stale_issues", None)
+        if not state.get("evented"):
+            raise_event()
+            state["evented"] = True
+            out["evented"] = True
+        if not state.get("issue") and issues_enabled:
+            rc, text = (issue or _open_issue)(*render())
+            if rc == 0 and text.strip().isdigit():
+                state["issue"] = text.strip()
+                state.pop("issue_error", None)
+                out["issue"] = state["issue"]
+            else:
+                state["issue_error"] = text[:300]
+        _write_json(path, state)
+    elif state.get("since") and resolved:
+        if state.get("issue"):
+            stale += close_all([str(state["issue"])])
+        if stale:
+            # The episode is over; only the closes are left to retry.
+            _write_json(path, {"stale_issues": stale})
+        else:
+            path.unlink(missing_ok=True)
+        out["closed"] = True
+    elif state.get("stale_issues") is not None and stale != state.get("stale_issues"):
+        if stale:
+            state["stale_issues"] = stale
+            _write_json(path, state)
+        else:
+            path.unlink(missing_ok=True)
+    return out
+
+
 def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
           issue: Callable[[str, str], tuple[int, str]] | None = None,
           close: Callable[[str], tuple[int, str]] | None = None) -> dict:
@@ -227,36 +293,22 @@ def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
     """
     now = time.time() if now is None else now
     current = status(sdir, pool_file, now)
-    path = sdir / "host-off-alert.json"
-    state = _read_json(path) or {}
-    out = {"loud": current["loud"], "evented": False, "issue": state.get("issue")}
-    if current["loud"]:
-        if state.get("since") != current["since"]:
-            state = {"since": current["since"]}
-        if not state.get("evented"):
-            event(sdir, "host_off_unexpected", current["detail"],
-                  {"since": current["since"], "minutes": current["minutes"],
-                   "target": current.get("target")}, now)
-            state["evented"] = True
-            out["evented"] = True
-        if not state.get("issue") and os.environ.get("TARTCI_HOST_OFF_ISSUE", "1") != "0":
-            title = f"[tartci] {host} left OFF by a failed self-update since {current['since']}"
-            body = (f"{current['detail']}\n\nThe host's launchd watchdog and self-update agent "
-                    "retry `pool on` every 5 min; this issue closes itself when the pool is on "
-                    "again. Check `tartci pool status` and "
-                    "`~/.tartci/state/self-update/last.json` on the host.")
-            rc, text = (issue or _open_issue)(title, body)
-            if rc == 0 and text.strip().isdigit():
-                state["issue"] = text.strip()
-                out["issue"] = state["issue"]
-            else:
-                state["issue_error"] = text[:300]
-        _write_json(path, state)
-    elif state.get("since") and not current["unexpected"]:
-        if state.get("issue"):
-            (close or _close_issue)(str(state["issue"]))
-        path.unlink(missing_ok=True)
-    return out
+    out = episode_alert(
+        sdir / "host-off-alert.json", active=current["loud"],
+        resolved=not current["unexpected"], since=current.get("since"),
+        raise_event=lambda: event(sdir, "host_off_unexpected", current["detail"],
+                                  {"since": current["since"], "minutes": current["minutes"],
+                                   "target": current.get("target")}, now),
+        render=lambda: (
+            f"[tartci] {host} left OFF by a failed self-update since {current['since']}",
+            f"{current['detail']}\n\nThe host's launchd watchdog and self-update agent "
+            "retry `pool on` every 5 min; this issue closes itself when the pool is on "
+            "again. Check `tartci pool status` and "
+            "`~/.tartci/state/self-update/last.json` on the host."),
+        issue=issue, close=close,
+        issues_enabled=os.environ.get("TARTCI_HOST_OFF_ISSUE", "1") != "0")
+    out.pop("closed", None)
+    return {"loud": current["loud"], **out}
 
 
 def _update_checkout() -> str | None:

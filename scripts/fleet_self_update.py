@@ -1995,6 +1995,7 @@ class Run:
         verify(cfg, sys_, self.target, self.receipt)
         self.phase = "support-agents"
         self._support_agents()
+        self._vm_dhcp_verify()
 
     def _support_agents(self) -> None:
         """Converge the declared support agents with the installed generation.
@@ -2011,6 +2012,20 @@ class Run:
             self.receipt.step("support-agents", f"{type(exc).__name__}: {exc}", ok=False)
             return
         self.receipt.step("support-agents", result.text.strip()[-1500:], ok=result.rc == 0)
+
+    def _vm_dhcp_verify(self) -> None:
+        """Prove the VM network with one probe before the lanes clone freely.
+
+        Non-fatal: the lanes are already verified and serving, and the
+        breaker fails open if this cannot be written.
+        """
+        try:
+            result = installed_tartci(self.cfg, self.sys, "vm-dhcp", "verify",
+                                      "--reason", "self_update", timeout=60)
+        except Exception as exc:  # noqa: BLE001 - never fails the lane update
+            self.receipt.step("vm-dhcp-verify", f"{type(exc).__name__}: {exc}", ok=False)
+            return
+        self.receipt.step("vm-dhcp-verify", result.text.strip()[-500:], ok=result.rc == 0)
 
     def _wait_idle(self, *, allow_now: bool = False) -> None:
         deadline = self.sys.now() + self.cfg.wait_seconds

@@ -150,9 +150,14 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_dhcp_bootpd_not_loaded",
+    "vm_dhcp_config_disabled",
     "vm_dhcp_ok",
+    "vm_dhcp_pfd_crash_loop",
     "vm_dhcp_unanswered",
     "vm_dhcp_unreadable",
+    "vm_dhcp_verifying",
+    "vm_dhcp_vm_network_missing",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -1121,19 +1126,12 @@ def check_lane_python(value: dict | None) -> Finding:
 
 
 def check_vm_dhcp(value: dict | None) -> Finding:
-    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py)."""
+    """The host's VM-DHCP breaker (scripts/vm_dhcp_breaker.py owns its codes)."""
+    import vm_dhcp_breaker  # noqa: PLC0415 - sibling module; owns the codes
     value = value or {"state": "unreadable", "error": "no status"}
-    facts = {"vm_dhcp": value}
-    if value.get("state") == "open":
-        opened = value.get("opened_at")
-        return Finding("vm_dhcp", PROBLEM, "vm_dhcp_unanswered",
-                       "VM DHCP is not answering on this host: no lane clones except one probe "
-                       f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
-                       f"{value.get('probes')} probes)", facts)
-    if value.get("state") == "closed":
-        return Finding("vm_dhcp", OK, "vm_dhcp_ok", "VM DHCP breaker closed", facts)
-    return Finding("vm_dhcp", UNKNOWN, "vm_dhcp_unreadable",
-                   f"VM DHCP breaker unreadable: {value.get('error')}", facts)
+    state, code, detail = vm_dhcp_breaker.doctor_code(value)
+    return Finding("vm_dhcp", {"ok": OK, "problem": PROBLEM}.get(state, UNKNOWN), code, detail,
+                   {"vm_dhcp": value})
 
 
 def check_peer_reachability(value: dict | None) -> Finding:

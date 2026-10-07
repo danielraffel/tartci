@@ -1252,6 +1252,32 @@ def _pool_on() -> tuple[int, str]:
     return proc.returncode, (proc.stderr or proc.stdout).strip()
 
 
+def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | None:
+    """Tell someone, once per outage, that this host cannot boot VMs.
+
+    The VM-DHCP breaker stops the lanes cloning; this raises a GitHub issue
+    naming the host, the doctor command and the remedy, and closes it when a
+    VM gets an address (scripts/vm_boot_alert.py). Prints a WARN
+    every pass while the outage is due. Never raises.
+    """
+    try:
+        import vm_boot_alert  # noqa: PLC0415 - sibling module
+        import vm_dhcp_breaker  # noqa: PLC0415 - sibling module
+        now = utcnow() if now is None else now
+        if status_only:
+            due, why = vm_dhcp_breaker.alert_due(vm_dhcp_breaker.status(), now)
+        else:
+            out = vm_boot_alert.alert_pass(now=now)
+            due, why = out["due"], out["why"]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN vm-boot check FAILED "
+                f"({type(exc).__name__}: {exc}); no alert was raised for a host that "
+                "cannot boot VMs")
+    if due:
+        return f"{_iso(now)} launchd-watchdog: WARN vm-boot: this host cannot boot VMs ({why})"
+    return None
+
+
 def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
     """Recover and alert for a host a failed self-update left OFF.
 
@@ -1376,6 +1402,9 @@ def main(argv: list[str] | None = None) -> int:
     host_off_line = host_off_pass(status_only=args.status or args.dry_run)
     if host_off_line:
         print(host_off_line)
+    vm_boot_line = vm_boot_pass(status_only=args.status or args.dry_run)
+    if vm_boot_line:
+        print(vm_boot_line)
 
     agents = discover_agents(args.launch_agents_dir)
     # Compute the VM-running guard ONCE per pass. It is host-wide on purpose and

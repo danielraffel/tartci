@@ -5,16 +5,15 @@
 # a CoW overlay off the golden qcow2, a fresh efivars, and a dynamically-chosen
 # free SSH port — so multiple jobs run concurrently without collisions (tartci#3).
 #
-# The golden is GPU-off (no prebuilt Windows Skia yet) and carries the baked
-# MSVC/CMake/Ninja/Git/Python toolchain but NO repo checkout — run.sh clones Pulp
-# into the clone at job time. Proven golden recipe: Release build green, ctest
-# 99% (runbook §4.8).
+# The golden carries the baked MSVC/CMake/Ninja/Git/Python toolchain but NO repo
+# checkout — run.sh clones Pulp into the clone at job time. GPU/Skia is selected
+# explicitly with --gpu now that immutable Windows ARM64 and x64 slices exist.
 #
 # Flow:
 #   qemu-img create -b <golden> overlay.qcow2     # CoW, instant
 #   seed per-job efivars; pick a free host SSH port
 #   qemu ... nvme=overlay, hostfwd <port>->22      # boot headless
-#   ssh admin@127.0.0.1:<port> → clone + build + ctest (GPU off)
+#   ssh admin@127.0.0.1:<port> → clone + build + ctest
 #   kill qemu; rm overlay + efivars                # discard
 #
 # Usage:
@@ -30,13 +29,15 @@ WUSER="${TARTCI_WIN_SSH_USER:-admin}"
 SRC_REPO="${TARTCI_WIN_SRC_REPO:-https://github.com/Generous-Corp/pulp}"
 WORKROOT="${TARTCI_WIN_WORK:-${TMPDIR:-/tmp}/tartci-win}"
 REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
-# Default excludes the `validation`-labeled tests — the primary source of the
-# Windows golden's known env/CLI ctest failures (7287/7303), matching what
-# build.yml's Windows leg excludes — so the default run gates green instead of
-# red on those. Single label (no `|`) keeps it safe inside the cmd /c chain;
+GPU="${TARTCI_WIN_GPU:-${PULP_WIN_GPU:-off}}"
+# Default excludes the `validation`-labeled tests, matching the Windows CI leg.
+# This is a scope selection, not a green claim: the command still fails closed
+# on any selected test failure. Single label (no `|`) keeps it safe inside the
+# cmd /c chain;
 # pass a fuller exclude (e.g. the CI `validation|slow` + an --exclude-regex) via
 # PULP_CTEST_ARGS/--ctest-args, quoting the regex so cmd.exe doesn't pipe on `|`.
 CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude validation}"
+CTEST_JOBS="${TARTCI_WIN_CTEST_JOBS:-${PULP_CTEST_JOBS:-4}}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -48,6 +49,8 @@ while [ $# -gt 0 ]; do case "$1" in
   --golden) GOLDEN="$2"; shift 2;;
   --ref) REF="$2"; shift 2;;
   --build-type) BUILD_TYPE="$2"; shift 2;;
+  --gpu) GPU="on"; shift;;
+  --no-gpu) GPU="off"; shift;;
   --ctest-args) CTEST_ARGS="$2"; shift 2;;
   --key) KEY="$2"; shift 2;;
   --smoke) SMOKE=1; shift;;
@@ -55,6 +58,16 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+case "$CTEST_JOBS" in
+  ''|*[!0-9]*) die "invalid TARTCI_WIN_CTEST_JOBS='$CTEST_JOBS'";;
+esac
+[ "$CTEST_JOBS" -gt 0 ] || die "TARTCI_WIN_CTEST_JOBS must be greater than zero"
+case "$GPU" in
+  on|ON|true|TRUE|1) GPU=ON;;
+  off|OFF|false|FALSE|0) GPU=OFF;;
+  *) die "invalid TARTCI_WIN_GPU='$GPU' (on|off)";;
+esac
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
 
@@ -114,12 +127,35 @@ note "vm $JOB up — $(wsh 'cmd /c ver' 2>/dev/null | tr -d "\r")"
 
 if [ "$SMOKE" = 1 ]; then
   note "smoke: toolchain probe"
-  wsh 'where cmake & where ninja & where git & where python' 2>&1 | tr -d '\r'
-  note "smoke OK (overlay boot + SSH + toolchain reachable)"
+  # A Windows `where a & where b` chain returns the status of the final
+  # command, so the old probe could report success with missing tools.  Probe
+  # every required tool and the architecture-specific MSVC environment, then
+  # fail closed if any component is absent.
+  PS_SMOKE='$ErrorActionPreference = "Stop"
+$required = @("cmake", "ninja", "git", "python")
+foreach ($name in $required) {
+  $cmd = Get-Command $name -ErrorAction SilentlyContinue
+  if (-not $cmd) { throw "required tool missing: $name" }
+  Write-Output ("{0}: {1}" -f $name, $cmd.Source)
+}
+$vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
+if (-not $vcv) { throw "no vcvarsall.bat under BuildTools" }
+$probe = cmd /c "`"$vcv`" arm64 && where cl && cl 2>&1"
+if ($LASTEXITCODE -ne 0) { throw "MSVC arm64 probe failed (exit $LASTEXITCODE)" }
+$probe | ForEach-Object { Write-Output $_ }
+Write-Output "vcvarsall: $vcv"
+Write-Output "smoke: required Windows ARM64 toolchain is present"'
+  ENC="$(printf '%s' "$PS_SMOKE" | iconv -t UTF-16LE | base64)"
+  set +e
+  wsh "powershell -NoProfile -EncodedCommand $ENC" 2>&1 | tr -d '\r'
+  RC=${PIPESTATUS[0]}
+  set -e
+  [ "$RC" -eq 0 ] || die "smoke toolchain probe failed (exit $RC)"
+  note "smoke OK (overlay boot + complete ARM64 toolchain probe)"
   exit 0
 fi
 
-# Build + test (GPU off — no Windows Skia). Mirrors runbook §4.8. cmd.exe is the
+# Build + test. Mirrors runbook §4.8. cmd.exe is the
 # default OpenSSH shell on Windows; C:\tmp is required (tests map POSIX /tmp).
 wsh 'cmd /c "if not exist C:\tmp mkdir C:\tmp"' >/dev/null 2>&1
 
@@ -138,12 +174,32 @@ wsh "cmd /c \"cd C:\\pulp && git rev-parse --short HEAD\"" 2>&1 | tr -d '\r'
 # for a BuildTools-only install — so PowerShell discovers vcvarsall via
 # Get-ChildItem and `call`s it inside one cmd chain (cl.exe is only on PATH after
 # `vcvarsall arm64`). base64 is opaque to bash, dodging all the quoting hazards.
-note "build + ctest (Release, GPU off) via MSVC arm64 — the long step"
+note "build + ctest (Release, GPU=$GPU) via MSVC arm64 — the long step"
 PS_BUILD='$ProgressPreference = "SilentlyContinue"
 $vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
 if (-not $vcv) { Write-Error "no vcvarsall.bat under BuildTools"; exit 1 }
-cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU=OFF && cmake --build build && ctest --test-dir build '"$CTEST_ARGS"'"
-exit $LASTEXITCODE'
+cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU='"$GPU"' && cmake --build build && ctest --test-dir build --parallel '"$CTEST_JOBS"' '"$CTEST_ARGS"' > C:\tmp\tartci-ctest.log 2>&1"
+$rc = $LASTEXITCODE
+if (Test-Path "C:\tmp\tartci-ctest.log") {
+  Write-Output "--- ctest tail (C:\\tmp\\tartci-ctest.log) ---"
+  Get-Content "C:\tmp\tartci-ctest.log" -Tail 240
+}
+if ($rc -eq 0) {
+  $scanner = "C:\pulp\build\tools\scan-worker\Release\pulp-scan-worker.exe"
+  $clap = Get-ChildItem "C:\pulp\build\CLAP\Release" -Filter "*Allpass.clap" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  $vst3 = Get-ChildItem "C:\pulp\build\VST3" -Recurse -Filter "*Allpass.vst3" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ((Test-Path $scanner) -and $clap -and $vst3) {
+    Write-Output "--- plugin scan evidence ---"
+    & $scanner $clap.FullName
+    if ($LASTEXITCODE -ne 0) { Write-Error "CLAP scan failed"; exit 1 }
+    & $scanner $vst3.FullName
+    if ($LASTEXITCODE -ne 0) { Write-Error "VST3 scan failed"; exit 1 }
+    Write-Output "plugin scan: PASS (CLAP + VST3)"
+  } else {
+    Write-Output "plugin scan: SKIP (this checkout did not produce both Allpass formats)"
+  }
+}
+exit $rc'
 ENC="$(printf '%s' "$PS_BUILD" | iconv -t UTF-16LE | base64)"
 set +e
 wsh "powershell -NoProfile -EncodedCommand $ENC"

@@ -1787,6 +1787,7 @@ boot_vm_to_ssh(){
 
   note "[$i] clone $GOLDEN → $vm (CoW) + boot with host ccache mounted"
   event clone_start "golden=$GOLDEN"
+  CLONE_STARTED_AT="$(date +%s)"
   # Own the unique per-boot name before the foreground clone so signal cleanup
   # cannot miss a clone completed immediately before the trap is delivered.
   CURRENT_VM="$vm"
@@ -1861,6 +1862,10 @@ boot_vm_to_ssh(){
     return 1
   fi
   CURRENT_IP="$ip"
+  # The moment the VM network answered: clone_start -> boot_ip is the time a
+  # VM-DHCP probe takes to report success.
+  local clone_to_ip_s=$(( $(date +%s) - ${CLONE_STARTED_AT:-$(date +%s)} ))
+  event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
   local sshok=0

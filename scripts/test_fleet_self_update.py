@@ -97,6 +97,8 @@ class FakeSystem(su.System):
         self.agents_check_rc = 0
         self.agents_rc = 0
         self.agents_raises = False
+        self.vm_verify_rc = 0
+        self.vm_verify_calls: list[list[str]] = []
         self.installed_after = None    # commit the host executes after install
         self.checked_out = None
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
@@ -334,6 +336,10 @@ class FakeSystem(su.System):
                 raise OSError("shim vanished")
             return su.Result(self.agents_rc, "support agents: ok" if self.agents_rc == 0
                              else "support agents: drift")
+        if args[:2] == ["vm-dhcp", "verify"]:
+            self.vm_verify_calls.append(list(args))
+            return su.Result(self.vm_verify_rc, '{"action": "verifying"}' if self.vm_verify_rc == 0
+                             else "breaker unreadable")
         raise AssertionError(f"unexpected shim {args}")
 
     def _set_installed(self, commit):
@@ -1374,6 +1380,27 @@ class SurfaceTests(Base):
         self.assertIn("self_update=", wd.config_problem(
             {**clean, "self_update": {"problem": "last self-update FAILED"}}))
         self.assertIsNone(wd.config_problem({**clean, "self_update": {"problem": None}}))
+
+
+class VmDhcpVerifyTests(Base):
+    """After the new generation serves, one probe proves the VM network."""
+
+    def test_an_update_asks_the_breaker_to_verify(self):
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.sys.vm_verify_calls, [["vm-dhcp", "verify", "--reason", "self_update"]])
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertTrue(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_failed_verify_never_fails_the_update(self):
+        self.sys.vm_verify_rc = 1
+        self.assertUpdated(self.apply())
+        steps = {s["step"]: s for s in json.loads(Path(self.last()["receipt"]).read_text())["steps"]}
+        self.assertFalse(steps["vm-dhcp-verify"]["ok"])
+
+    def test_a_refused_update_never_verifies(self):
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.apply()
+        self.assertEqual(self.sys.vm_verify_calls, [])
 
 
 class AgentTemplateTests(unittest.TestCase):

@@ -976,9 +976,10 @@ Install the toolchain over SSH:
 # Git bash: fetch deps only
 ssh pulp-win 'C:\path\to\bash setup.sh --ci --deps-only'
 
-# Configure under the MSVC env, GPU off (no Windows Skia yet)
+# Configure under the MSVC env. Use GPU=ON for the published Windows Skia
+# slice; use GPU=OFF only for a deliberately CPU-only smoke.
 ssh pulp-win 'vcvarsall arm64 && cmake -S pulp -B pulp\build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=OFF'
+  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=ON'
 
 ssh pulp-win 'cmake --build pulp\build'
 ssh pulp-win 'ctest --test-dir pulp\build'   # apply the CI exclude set (gpu/visual labels)
@@ -1533,7 +1534,8 @@ ordered exclusive workflow classes), `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`
 `TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
-`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_GPU` (`on`/`off`, default `off` for the on-demand lane),
+`TARTCI_WIN_CTEST_JOBS`, `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
 `TARTCI_WIN_LOGS`. Defaults target `Generous-Corp/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
@@ -1658,33 +1660,134 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **While open,** no lane clones. Each pass is idle, not blocked, and takes no
   job claim: the breaker is the first pre-boot check, before the job claim and
   the pre-clone demand check. One lane probes with a single VM every 300 s, or
-  at once when bootpd's run count moves (`vm_dhcp_probe result=ip|no_ip`).
-- **Closes** on the first address any VM on the host gets, or when the host
-  rebooted after the breaker opened. `vm_dhcp_recovered` reports `reason`,
+  at once when the VM-network chain changes (bootpd loaded or its run count,
+  `/etc/bootpd.plist`'s mtime, or InternetSharing's pid, all readable without
+  root), or at once after `tartci vm-dhcp probe-now`
+  (`vm_dhcp_probe result=ip|no_ip cause=…`).
+- **Closes** on the first address any VM on the host gets.
+  `vm_dhcp_recovered` reports `reason`,
   `open_s`, `vms_spent`, `probes`, and `latency_s` (time since the last probe,
-  or since bootpd's run count moved).
+  or since the chain last changed).
 - **The trade:** an outage costs about one VM per 300 s instead of one per lane
   every 2 to 4 min. Recovery is noticed within 300 s plus a boot instead of
   within minutes. `latency_s` above 300 s plus boot p99 means the cadence is
   wrong.
-- **Fails open:** an unreadable breaker reads as closed. Writes are atomic
-  under a lock.
+- **Verifies after a boot** (`verifying`, doctor `vm_dhcp_verifying`): when
+  kern.boottime differs from the one recorded, when no boot time is recorded
+  (first run, or a breaker file from before this state), and after a
+  self-update's `pool on` (receipt step `vm-dhcp-verify`, which runs
+  `tartci vm-dhcp verify --reason self_update`), exactly one lane probes and
+  the others idle. Its address closes the breaker (`vm_dhcp_verified`); its
+  `no_ip` opens it at once with the failing layer
+  (`streak=1 trigger=post_boot alert=now`). A probe that reports nothing within
+  960 s opens it with `cause=probe_unreported` and frees the slot; a later
+  address still closes it. A reboot used to close the breaker outright, and on
+  m5 on 2026-10-07 every lane cloned again into a broken VM network (about 56
+  VMs). The cost is one serialised boot, about 3 min, per reboot or
+  self-update. **On first deploy every host verifies once** (no boot time is
+  recorded yet). The self-update trigger runs from the installed
+  orchestrator, so it takes effect one update after deploy.
+- **The 960 s bound** is twice the slowest probe report on current lane code
+  (clone_start to `boot_failed no_ip`, which ends the 120 s address wait),
+  rounded up to the minute. `TARTCI_VM_DHCP_VERIFY_SECS` overrides it. Measured
+  2026-10-07 from every lane's `events.jsonl`:
+
+  | Host | n | p50 | p90 | p99 | max (s) |
+  |---|---|---|---|---|---|
+  | m3 | 6 | 197 | 200 | 200 | 200 |
+  | m1 | 298 | 199 | 353 | 392 | 1129 (one 2026-07-09 event in the retired pre-fleet `macos` lane; next 400) |
+  | m5 | 303 | 205 | 220 | 316 | 464 |
+  | m5s | 0 | — | — | — | — (1032 clones, never a `no_ip`) |
+
+  The success report comes earlier. `boot_ip clone_to_ip_s=` (logged at the
+  address since this change) gives clone_start to address directly; before
+  it, clone_start to `boot_ok`, which also counts SSH and the JIT mint,
+  passed 960 s in 5 of 5215 boots over 30 days. **Re-derive the 960 s default
+  once 30 days of `boot_ip` exist**: on each host,
+  `tartci vm-dhcp boot-times --days 30` reads every lane log (at any depth:
+  m5studio nests them under `macos-fleet/<lane>/`) and prints both report
+  distributions and `suggested_verify_secs`; take the fleet-wide maximum.
+- **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
+  `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
+  the same once-per-episode path as a host left OFF, closed when a VM gets an
+  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
+  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
+  fleet_reasons, so it is usable from a phone notification. It is raised when
+  the breaker is open and:
+  - a post-boot probe got no address (`alert=now`): within one pass, at most
+    300 s;
+  - it has been open 300 s and a probe failed since, or no lane has probed at
+    all (an idle host would otherwise stay silent): about 14 min after it
+    opens;
+  - two consecutive probes never reported, whatever opened it. A probe is
+    unreported once the next is granted before it reported, so this holds at
+    the third grant: about 10 to 15 min after the breaker opens. One unreported
+    probe is a slow boot and raises nothing; neither does a closed or
+    `verifying` breaker.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
+  breaker's `events.jsonl`. A close that fails (a new outage replacing one
+  whose issue is still open, or recovery) is kept as `stale_issues` in the
+  alert state and retried every pass, so no issue is left open.
+  `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
+  opens no issue.
+- **Fails open:** an unreadable breaker reads as closed and never verifies.
+  Writes are atomic under a lock.
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
-  it for one host.
+  it for one host, including the post-boot verification.
 
-Recovery needs root, and tartci never runs it:
+Recovery needs root, and tartci never runs it. Each `no_ip` records which
+layer failed (`cause`), read while that VM is still up, and `tartci doctor
+fleet` names the most fundamental one. Fix the layers in this order; a lower
+one cannot help until the one above it works.
 
-1. `sudo launchctl print system/com.apple.bootpd` and
-   `/usr/bin/log show --last 30m --predicate 'process == "bootpd"'` (expect
-   silence).
-2. `sudo launchctl kickstart -k system/com.apple.bootpd`.
-3. If no address arrives within 2 min, run
-   `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd`,
-   then if needed `sudo launchctl kickstart -k system/com.apple.NetworkSharing`.
-   A reboot also clears it.
+**Never kickstart the `com.apple.NetworkSharing` job.** System Integrity
+Protection refuses it ("150: Operation not permitted while System Integrity
+Protection is engaged", m5, 2026-10-07).
 
-The probe fires at once when step 2 or 3 moves bootpd's run count. `tartci
-doctor fleet` shows the open breaker as `vm_dhcp_unanswered`.
+**Never move `/etc/bootpd.plist` or
+`/Library/Preferences/SystemConfiguration/com.apple.vmnet.plist` aside.**
+`dhcp_enabled = false` there is the normal state while no VM runs: an idle
+healthy host (m3) reads exactly that, and InternetSharing rewrites the file
+with `dhcp_enabled = [bridge100]` and a `Subnets` entry when a VM's network
+comes up. It is not stale configuration.
+
+1. **pfd crash-looping** (`vm_dhcp_pfd_crash_loop`): no `bridge100`, and
+   `launchctl print system/com.apple.pfd` (no root) shows it not running with a
+   non-zero last exit and a climbing run count. InternetSharing waits on pfd
+   before it creates the VM network. On m5 on 2026-10-07 pfd exited 3 every
+   10 s from boot, logging only "no pf starter references held"; a healthy
+   pfd stays up and never logs that line. No verified remedy yet: compare
+   `sudo pfctl -s info` and `sudo pfctl -s References` with a healthy host,
+   record what brings pfd to `running`, and run `tartci vm-dhcp probe-now`
+   after any change. Never `pfctl -d`: it drops every holder's references.
+2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
+   existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
+   shared mode, which InternetSharing creates per VM. Restarting the
+   InternetSharing process did not bring it back on m5. No verified remedy
+   yet: run `tartci vm-dhcp probe-now` after any change and capture
+   `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the
+   InternetSharing pid. The Internet Sharing toggle in System Settings and a
+   reboot are the known resets.
+3. **bootpd not loaded** (`vm_dhcp_bootpd_not_loaded`): `launchctl print
+   system/com.apple.bootpd` exits 113 ("Could not find service"; no root
+   needed to check). bootpd's plist ships Disabled and Internet Sharing
+   normally loads it. `sudo launchctl bootstrap system
+   /System/Library/LaunchDaemons/bootps.plist` (proven on m5 with SIP on). A
+   bootpd kickstart, or disable/enable, cannot load a job launchd does not
+   have.
+4. **DHCP not enabled on the VM network** (`vm_dhcp_config_disabled`):
+   `bridge100` exists but `/etc/bootpd.plist` does not list it in
+   `dhcp_enabled`. InternetSharing did not finish configuring it: same capture
+   as layer 2, no verified remedy yet.
+5. **bootpd loaded but silent** (`vm_dhcp_unanswered`):
+   `sudo launchctl kickstart -k system/com.apple.bootpd`; if no address within
+   2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl
+   enable system/com.apple.bootpd`; a reboot also clears it.
+
+After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
+instead of waiting out the 300 s cadence; a fix that changes the chain usually
+triggers it on its own.
 
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
@@ -2167,8 +2270,9 @@ authoritative gate.
 
 - **Linux:** done — green build + 99% ctest + 99.93% warm ccache, golden tagged.
 - **Windows:** 24H2-ARM golden boots headless + auto-boots; toolchain installs;
-  non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
-  (needs Windows skia-builder slices + the Windows GPU-host product work).
+  the published ARM64 and x64 Skia slices now support a GPU-linked build. A
+  headless compile and scan prove the binary path; headed UTM plus a DAW is
+  still required for UI/audio acceptance.
 - **macOS:** the proven lane this toolkit generalizes from.
 - **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent

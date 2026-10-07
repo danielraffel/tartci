@@ -63,6 +63,11 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_vm_boot_alert.py",
+     "Alert.test_the_host_and_ssh_target_come_from_the_profile"):
+        ("3.11-only: vm_boot_alert._alert_host() reads the host id and ssh target from the "
+         "fleet profile with tomllib; without it the alert still runs and names the host by "
+         "its node name (test_without_a_profile_the_node_name_names_it)"),
     ("test_boot_usage.py",
      "Run.test_profile_thresholds_apply"):
         reads_profile("boot_usage.run()"),
