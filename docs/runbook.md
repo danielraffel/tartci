@@ -1718,11 +1718,17 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   - it has been open 300 s and a probe failed since, or no lane has probed at
     all (an idle host would otherwise stay silent): about 14 min after it
     opens;
-  - two consecutive probes never reported. One unreported probe is a slow
-    boot and raises nothing; neither does a closed or `verifying` breaker.
+  - two consecutive probes never reported, whatever opened it. A probe is
+    unreported once the next is granted before it reported, so this holds at
+    the third grant: about 10 to 15 min after the breaker opens. One unreported
+    probe is a slow boot and raises nothing; neither does a closed or
+    `verifying` breaker.
   Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
-  breaker's `events.jsonl`. `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the
-  watchdog's WARN line but opens no issue.
+  breaker's `events.jsonl`. A close that fails (a new outage replacing one
+  whose issue is still open, or recovery) is kept as `stale_issues` in the
+  alert state and retried every pass, so no issue is left open.
+  `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
+  opens no issue.
 - **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
   boot to its UTC hour (kept 14 days), and every outage that ends is appended
   to a history of the last 50 (`opened_at`, `closed_at`, `duration_s`,

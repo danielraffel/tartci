@@ -730,7 +730,9 @@ def alert_due(value: dict[str, Any], now: float,
           probe still in flight is waited for; or
       (c) two consecutive probes have gone unreported, whatever opened it:
           a probe counts as unreported when the next one is granted before it
-          reported. One unreported probe alone is a slow boot.
+          reported, so the third grant is the earliest this can hold. With
+          PROBE_SECS at 300 that alerts about 10-15 min after the breaker
+          opens. One unreported probe alone is a slow boot.
     Closed and verifying never are.
     """
     if value.get("state") != "open":

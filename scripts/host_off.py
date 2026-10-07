@@ -227,18 +227,31 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
 
     A different `since` is a new episode, and the previous episode's issue is
     closed rather than forgotten. A failed issue open is kept as
-    `issue_error` in the state at `path` and retried on the next pass.
+    `issue_error` in the state at `path` and retried on the next pass; a
+    failed close is kept in `stale_issues` and retried every pass, and the
+    state is not removed while one remains, so no issue is ever orphaned.
     `render()` builds the issue's (title, body) only when one is opened.
     `issue(title, body)` and `close(number)` default to ghapp.
     """
     state = _read_json(path) or {}
     out = {"evented": False, "issue": state.get("issue")}
+    closer = close or _close_issue
+
+    def close_all(numbers: list[str]) -> list[str]:
+        """Close each; return the ones that failed, to retry next pass."""
+        return [n for n in numbers if closer(n)[0] != 0]
+
+    stale = close_all([str(n) for n in state.get("stale_issues") or []])
     if active:
         if state.get("since") != since:
             # A new episode: the previous one's issue is closed, never orphaned.
             if state.get("issue"):
-                (close or _close_issue)(str(state["issue"]))
+                stale += close_all([str(state["issue"])])
             state = {"since": since}
+        if stale:
+            state["stale_issues"] = stale
+        else:
+            state.pop("stale_issues", None)
         if not state.get("evented"):
             raise_event()
             state["evented"] = True
@@ -254,9 +267,19 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
         _write_json(path, state)
     elif state.get("since") and resolved:
         if state.get("issue"):
-            (close or _close_issue)(str(state["issue"]))
-        path.unlink(missing_ok=True)
+            stale += close_all([str(state["issue"])])
+        if stale:
+            # The episode is over; only the closes are left to retry.
+            _write_json(path, {"stale_issues": stale})
+        else:
+            path.unlink(missing_ok=True)
         out["closed"] = True
+    elif state.get("stale_issues") is not None and stale != state.get("stale_issues"):
+        if stale:
+            state["stale_issues"] = stale
+            _write_json(path, state)
+        else:
+            path.unlink(missing_ok=True)
     return out
 
 

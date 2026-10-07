@@ -29,12 +29,16 @@ class Alert(Case):
         self.opened: list[tuple[str, str]] = []
         self.closed: list[str] = []
         self.issue_rc = 0
+        self.close_fails = 0
 
     def issue(self, title: str, body: str) -> tuple[int, str]:
         self.opened.append((title, body))
         return (0, str(76 + len(self.opened))) if self.issue_rc == 0 else (1, "rate limited")
 
     def close(self, number: str) -> tuple[int, str]:
+        if self.close_fails:
+            self.close_fails -= 1
+            return 1, "rate limited"
         self.closed.append(number)
         return 0, "closed"
 
@@ -130,6 +134,36 @@ class Alert(Case):
         self.record("ip", T0 + 1500, lane="b")
         self.watch(T0 + 1600)
         self.assertEqual(self.closed, ["77", "78"])
+
+    def state_file(self) -> dict:
+        path = self.tmp / "vm-dhcp" / "alert.json"
+        return json.loads(path.read_text()) if path.exists() else {}
+
+    def test_a_failed_close_on_a_new_episode_is_retried(self):
+        self.open_at(T0)
+        self.watch(T0 + 200 + vb.PROBE_SECS)                 # issue 77
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
+        self.check(T0 + 1100, lane="a")
+        self.record("no_ip", T0 + 1300, lane="a")            # new episode
+        self.close_fails = 1
+        self.watch(T0 + 1310)
+        self.assertEqual(self.state_file()["stale_issues"], ["77"])
+        self.assertEqual(self.state_file()["issue"], "78")
+        self.watch(T0 + 1610)                                 # retried
+        self.assertEqual(self.closed, ["77"])
+        self.assertNotIn("stale_issues", self.state_file())
+
+    def test_a_failed_close_at_recovery_is_retried_without_a_second_up_event(self):
+        self.open_at(T0)
+        self.watch(T0 + 200 + vb.PROBE_SECS)                 # issue 77
+        self.record("ip", T0 + 800, lane="q")
+        self.close_fails = 1
+        self.watch(T0 + 900)
+        self.assertEqual(self.state_file(), {"stale_issues": ["77"]})
+        self.watch(T0 + 1200)
+        self.assertEqual(self.closed, ["77"])
+        self.assertFalse((self.tmp / "vm-dhcp" / "alert.json").exists())
+        self.assertEqual(self.names().count("host_vm_boot_up"), 1)
 
     def test_a_verifying_breaker_raises_nothing(self):
         os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
