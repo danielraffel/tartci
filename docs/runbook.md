@@ -882,10 +882,29 @@ second source exists because meta's ranges do not cover the Front Door hosts,
 such as `pipelines.actions.githubusercontent.com`, that the runner's job
 long-poll uses.
 
-The rules are cached for 24 h with a content hash. Any non-global range is
-refused, so a default route, RFC1918 or the tailnet's 100.64.0.0/10 can never
-enter the set. A documented hostname that does not resolve stops the
-derivation. Adding a hostname is a reviewed change.
+The rules are cached with a content hash over the ranges and over the copy of
+/meta they came from. Any non-global range is refused, so a default route,
+RFC1918 or the tailnet's 100.64.0.0/10 can never enter the set. Adding a
+hostname is a reviewed change.
+
+Reading /meta does not depend on anyone's GitHub login:
+
+- A cache younger than 24 h is used without any request.
+- After that, `fetch` reads /meta through `TARTCI_META_GH_CLI` when the host
+  sets it to a credentialed GitHub CLI. Otherwise, or if that fails, it makes
+  an anonymous request that carries the cached ETag. An unchanged /meta comes
+  back as a 304 and renews the cache without a download.
+- If every read fails (the anonymous 60-per-hour allowance that every host
+  behind one IP shares, a revoked credential, no network), or a documented
+  hostname does not resolve, the lane boots on the verified cache. It prints
+  `WARN egress allowlist: …` with the cache's age, and the receipt records
+  `stale`, `age_hours` and `refresh_error`.
+- Past 7 days (`--hard-limit-hours`), or with no valid cache, it prints
+  `ALERT egress allowlist: … refuses to boot` with the fix and the lane does
+  not start.
+- A /meta answer that the derivation refuses is not a transport failure, and
+  it still stops the lane at once. Examples are a missing key or a non-public
+  range.
 
 A filtering resolver can trip this guard on purpose. NextDNS answers a blocked
 name with `0.0.0.0`, which is not a global address, so the derivation refuses

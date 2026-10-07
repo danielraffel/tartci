@@ -330,7 +330,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     net_args=()
     while IFS= read -r net_line; do [ -z "$net_line" ] || net_args+=("$net_line"); done <<<"$net_lines"
     if [ "${#net_args[@]}" -ne 2 ]; then
-      note "[$i] cannot derive the egress allowlist — refusing to boot"
+      note "[$i] cannot derive the egress allowlist — refusing to boot (the ALERT line above names the cause and fix)"
       discard_current_linux_vm
       return 1
     fi

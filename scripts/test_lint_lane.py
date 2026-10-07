@@ -9,15 +9,20 @@ VM size, the lane's refusals, and the guest-probe verdict.
 
 from __future__ import annotations
 
+import contextlib
+import http.server
+import io
 import ipaddress
 import json
 import os
+import threading
 import re
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import egress_allowlist
 import host_profile
@@ -112,6 +117,147 @@ class EgressAllowlistTests(unittest.TestCase):
             egress_allowlist.save(cache, recent)
             rc = egress_allowlist.main(argv)
             self.assertEqual(rc, 0, "a withdrawal inside the lead window is not drift yet")
+
+
+class MetaRefreshTests(unittest.TestCase):
+    """A rate limit or a lost credential must not stop the lane while the
+    verified cache is inside its hard limit, and must stop it past that."""
+
+    HOSTS = {"github.com": ["140.82.112.3"]}
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.cache = self.tmp / "allow.json"
+        self.env = mock.patch.dict(os.environ, {}, clear=False)
+        self.env.start()
+        os.environ.pop("TARTCI_META_GH_CLI", None)
+        self.resolve = mock.patch.object(egress_allowlist, "resolve_hostnames", return_value=self.HOSTS)
+        self.resolve.start()
+
+    def tearDown(self) -> None:
+        self.resolve.stop()
+        self.env.stop()
+        self._tmp.cleanup()
+
+    def _cli(self, stderr: str) -> None:
+        cli = self.tmp / "gh-fake"
+        cli.write_text(f"#!/bin/sh\necho '{stderr}' >&2\nexit 1\n")
+        cli.chmod(0o755)
+        os.environ["TARTCI_META_GH_CLI"] = str(cli)
+
+    def _cache_aged(self, hours: float) -> dict:
+        record = egress_allowlist.build_record(META, time.time() - hours * 3600, self.HOSTS,
+                                               etag='"v1"', meta_source="anonymous")
+        egress_allowlist.save(self.cache, record)
+        return record
+
+    def _fetch(self, url: str) -> tuple[int, str, str]:
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(egress_allowlist, "META_URL", url), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = egress_allowlist.main(["fetch", "--cache", str(self.cache)])
+        return rc, out.getvalue(), err.getvalue()
+
+    def _server(self, handler_status: int, body: dict | None = None):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                seen.append(self.headers.get("If-None-Match"))
+                status = handler_status
+                if status == 200 and self.headers.get("If-None-Match") == '"v2"':
+                    status = 304
+                self.send_response(status)
+                self.send_header("ETag", '"v2"')
+                self.end_headers()
+                if status == 200:
+                    self.wfile.write(json.dumps(body).encode())
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.shutdown)
+        return f"http://127.0.0.1:{server.server_port}/meta", seen
+
+    def test_rate_limited_and_unauthenticated_boots_on_a_cache_inside_the_limit(self) -> None:
+        old = self._cache_aged(30)
+        self._cli("HTTP 401: Bad credentials (https://api.github.com/meta)")
+        url, _ = self._server(403)
+        rc, out, err = self._fetch(url)
+        self.assertEqual(rc, 0, err)
+        report = json.loads(out)
+        self.assertTrue(report["stale"])
+        self.assertEqual(report["sha256"], old["sha256"])
+        self.assertIn("Bad credentials", report["refresh_error"])
+        self.assertIn("HTTP 403", report["refresh_error"])
+        self.assertTrue(err.startswith("WARN egress allowlist:"), err)
+        self.assertIn("refused after 168h", err)
+
+    def test_network_failure_past_the_hard_limit_refuses_with_the_fix(self) -> None:
+        self._cache_aged(169)
+        self._cli("HTTP 403: API rate limit exceeded for 73.189.56.227")
+        rc, out, err = self._fetch("http://127.0.0.1:9/meta")
+        self.assertEqual(rc, 3)
+        self.assertEqual(out, "")
+        self.assertTrue(err.startswith("ALERT egress allowlist:"), err)
+        self.assertIn("169h old (limit 168h)", err)
+        self.assertIn("refuses to boot", err)
+        self.assertIn("TARTCI_META_GH_CLI", err)
+
+    def test_no_cache_and_no_meta_refuses(self) -> None:
+        rc, _, err = self._fetch("http://127.0.0.1:9/meta")
+        self.assertEqual(rc, 3)
+        self.assertIn("no verified cache", err)
+
+    def test_a_tampered_cache_is_not_a_fallback(self) -> None:
+        self._cache_aged(30)
+        record = json.loads(self.cache.read_text())
+        record["meta"]["actions"].append("10.0.0.0/8")
+        self.cache.write_text(json.dumps(record))
+        rc, _, err = self._fetch("http://127.0.0.1:9/meta")
+        self.assertEqual(rc, 3, err)
+
+    def test_unchanged_meta_is_confirmed_by_etag_without_a_download(self) -> None:
+        url, seen = self._server(200, META)
+        self._cache_aged(30)
+        record = json.loads(self.cache.read_text())
+        record["etag"] = '"v2"'
+        egress_allowlist.save(self.cache, record)
+        before = record["fetched_at"]
+        rc, out, err = self._fetch(url)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seen, ['"v2"'])
+        after = json.loads(self.cache.read_text())
+        self.assertEqual(after["meta_source"], "anonymous-304")
+        self.assertEqual(after["sha256"], record["sha256"])
+        self.assertGreater(after["fetched_at"], before + 29 * 3600)
+        self.assertNotIn("stale", json.loads(out))
+
+    def test_changed_meta_replaces_the_cache_and_records_the_etag(self) -> None:
+        url, seen = self._server(200, dict(META, actions=["20.85.130.105/32"]))
+        old = self._cache_aged(30)
+        rc, out, err = self._fetch(url)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(seen, ['"v1"'])
+        after = json.loads(self.cache.read_text())
+        self.assertNotEqual(after["sha256"], old["sha256"])
+        self.assertEqual(after["etag"], '"v2"')
+        self.assertEqual(after["meta_source"], "anonymous")
+
+    def test_a_refused_derivation_is_not_masked_by_the_cache(self) -> None:
+        self._cache_aged(30)
+        url, _ = self._server(200, dict(META, actions=["192.168.0.0/16"]))
+        with self.assertRaises(ValueError):
+            self._fetch(url)
+
+    def test_a_fresh_cache_makes_no_request(self) -> None:
+        self._cache_aged(1)
+        url, seen = self._server(200, META)
+        rc, _, _ = self._fetch(url)
+        self.assertEqual((rc, seen), (0, []))
 
 
 class LintVmSizeTests(unittest.TestCase):
