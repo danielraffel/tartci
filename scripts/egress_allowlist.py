@@ -202,8 +202,18 @@ def load(cache: Path) -> dict | None:
     joined = ",".join(record.get("cidrs", []))
     if hashlib.sha256(joined.encode()).hexdigest() != record.get("sha256"):
         return None  # a hand-edited or truncated cache is not an allowlist
-    if "meta" in record and meta_digest(record["meta"]) != record.get("meta_sha256"):
-        return None
+    if record.get("schema", 2) >= 3:
+        # The ranges must be exactly what the kept /meta copy and hostnames
+        # derive, so neither can be edited alone, and a 304 never rebuilds from
+        # an altered copy.
+        meta = record.get("meta")
+        if not isinstance(meta, dict) or meta_digest(meta) != record.get("meta_sha256"):
+            return None
+        try:
+            if derive(meta, record.get("hostnames") or {}) != record["cidrs"]:
+                return None
+        except (ValueError, TypeError):
+            return None
     return record
 
 

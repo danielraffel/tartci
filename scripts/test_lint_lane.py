@@ -220,6 +220,34 @@ class MetaRefreshTests(unittest.TestCase):
         rc, _, err = self._fetch("http://127.0.0.1:9/meta")
         self.assertEqual(rc, 3, err)
 
+    def test_an_edited_meta_copy_with_its_digest_recomputed_is_refused(self) -> None:
+        # The ETag still matches, so a 304 would rebuild from this copy if
+        # the cache were trusted on its digests alone.
+        url, seen = self._server(200, META)
+        self._cache_aged(30)
+        record = json.loads(self.cache.read_text())
+        record["etag"] = '"v2"'
+        record["meta"]["actions"].append("8.8.8.0/24")
+        record["meta_sha256"] = egress_allowlist.meta_digest(record["meta"])
+        self.cache.write_text(json.dumps(record))
+        self.assertIsNone(egress_allowlist.load(self.cache))
+        argv = ["check", "--cache", str(self.cache), "--fresh-meta", "/dev/null"]
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(egress_allowlist.main(argv), 1)
+        self.assertIn("no valid cache", out.getvalue())
+        rc, _, _ = self._fetch(url)
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, [None], "an untrusted cache must not send its ETag")
+        self.assertNotIn("8.8.8.0/24", json.loads(self.cache.read_text())["cidrs"])
+
+    def test_any_edit_to_the_kept_meta_copy_breaks_its_digest(self) -> None:
+        # An IPv6 entry never reaches the rules, so only the digest sees it.
+        self._cache_aged(30)
+        record = json.loads(self.cache.read_text())
+        record["meta"]["web"].append("2001:db8::/32")
+        self.cache.write_text(json.dumps(record))
+        self.assertIsNone(egress_allowlist.load(self.cache))
+
     def test_unchanged_meta_is_confirmed_by_etag_without_a_download(self) -> None:
         url, seen = self._server(200, META)
         self._cache_aged(30)
