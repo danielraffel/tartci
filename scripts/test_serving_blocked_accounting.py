@@ -65,6 +65,7 @@ class ShippedAccounting:
     """Runs the real blocks out of runner.sh against a scripted work sequence."""
 
     def __init__(self) -> None:
+        self.clock_paths: list[str] = []
         self.source = RUNNER.read_text()
         accounting = ACCOUNTING_RE.search(self.source)
         assert accounting is not None, (
@@ -88,8 +89,20 @@ class ShippedAccounting:
                 'run_rc=0\n'
                 + self.accounting
             )
+        # A stepping clock in place of `date`: call N returns second N, so
+        # every stamp the accounting takes is distinct and known in advance,
+        # and the result never depends on where the real second boundary
+        # falls. `$(date ...)` runs in a subshell, so the count lives in a file.
+        clock = tempfile.NamedTemporaryFile("w", suffix=".clock", delete=False)
+        clock.write("0")
+        clock.close()
+        self.clock_paths.append(clock.name)
         script = (
             "set -euo pipefail\n"
+            f"CLOCK_FILE='{clock.name}'\n"
+            'date(){ local n; n=$(( $(cat "$CLOCK_FILE") + 1 )); '
+            'printf \'%s\' "$n" > "$CLOCK_FILE"; '
+            'printf \'2026-01-01T00:00:%02dZ\\n\' "$n"; }\n'
             'SERVING_BLOCKED_SINCE=""\n'
             "SERVING_BLOCKED_STREAK=0\n"
             'SERVING_BLOCKED_LAST_PHASE=""\n'
@@ -117,6 +130,11 @@ class ServeLessStreakTests(unittest.TestCase):
     def setUp(self) -> None:
         self.accounting = ShippedAccounting()
         self.source = self.accounting.source
+        self.addCleanup(self._remove_clocks)
+
+    def _remove_clocks(self) -> None:
+        for path in self.accounting.clock_paths:
+            Path(path).unlink(missing_ok=True)
 
     # -- counting ------------------------------------------------------------
 
@@ -134,10 +152,12 @@ class ServeLessStreakTests(unittest.TestCase):
     def test_the_streak_start_is_the_first_failure_not_the_latest(self) -> None:
         """A marker rewritten on every failure would never appear to age, so a
         three-hour outage would read as a one-cycle blip forever."""
-        first = self.accounting.run(["unserved"])["since"]
-        later = self.accounting.run(["unserved"] * 8)["since"]
-        # Same harness start, so an un-rewritten marker is byte-identical.
-        self.assertEqual(first, later)
+        value = self.accounting.run(["unserved"] * 8)
+        self.assertEqual(value["streak"], 8)
+        # The stepping clock gives the first failure second 01 and the eighth
+        # second 08, so only a marker kept from the first entry
+        # reads 01.
+        self.assertEqual(value["since"], "2026-01-01T00:00:01Z")
 
     def test_the_last_phase_travels_with_the_streak(self) -> None:
         value = self.accounting.run(["unserved"])
