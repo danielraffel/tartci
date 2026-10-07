@@ -976,9 +976,10 @@ Install the toolchain over SSH:
 # Git bash: fetch deps only
 ssh pulp-win 'C:\path\to\bash setup.sh --ci --deps-only'
 
-# Configure under the MSVC env, GPU off (no Windows Skia yet)
+# Configure under the MSVC env. Use GPU=ON for the published Windows Skia
+# slice; use GPU=OFF only for a deliberately CPU-only smoke.
 ssh pulp-win 'vcvarsall arm64 && cmake -S pulp -B pulp\build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=OFF'
+  -DCMAKE_BUILD_TYPE=Release -DPULP_ENABLE_GPU=ON'
 
 ssh pulp-win 'cmake --build pulp\build'
 ssh pulp-win 'ctest --test-dir pulp\build'   # apply the CI exclude set (gpu/visual labels)
@@ -1533,7 +1534,8 @@ ordered exclusive workflow classes), `TARTCI_RUNNER_WORKFLOW_TIER_GROUPS`
 `TARTCI_RUNNER_SHA256` (required with a non-default runner version),
 `TARTCI_WIN_VCVARS_ARCH` (Windows MSVC environment, default `arm64`),
 `TARTCI_WIN_PREFLIGHT_MODE` (`fast` by default, `full` for diagnostics),
-`TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
+`TARTCI_WIN_GPU` (`on`/`off`, default `off` for the on-demand lane),
+`TARTCI_WIN_CTEST_JOBS`, `TARTCI_WIN_CPUS`, `TARTCI_WIN_MEMORY_MB`, `TARTCI_WIN_WORK`, and
 `TARTCI_WIN_LOGS`. Defaults target `Generous-Corp/pulp`
 (the first consumer). When multiple macOS hosts serve the same selector, keep
 the workflow selector shared and make the runner name unique by adding an extra
@@ -2282,8 +2284,9 @@ authoritative gate.
 
 - **Linux:** done — green build + 99% ctest + 99.93% warm ccache, golden tagged.
 - **Windows:** 24H2-ARM golden boots headless + auto-boots; toolchain installs;
-  non-GPU build/test is the MVP target. GPU/Skia lane is a tracked follow-up
-  (needs Windows skia-builder slices + the Windows GPU-host product work).
+  the published ARM64 and x64 Skia slices now support a GPU-linked build. A
+  headless compile and scan prove the binary path; headed UTM plus a DAW is
+  still required for UI/audio acceptance.
 - **macOS:** the proven lane this toolkit generalizes from.
 - **Pool serving:** `tartci serve macos|linux|windows` wired (ported from Pulp's
   proven `tools/ci` supervisors and the macOS tartci provider); LaunchAgent

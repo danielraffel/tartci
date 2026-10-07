@@ -1,6 +1,7 @@
-# Pulp — Windows build lane (standalone QEMU, ARM64 guest, Win11 24H2). PROVEN:
-# Release build green (~7 min ninja, GPU-off, MSVC arm64) + ctest 99%
-# (7287/7303) (2026-06). Apple Virtualization can't install Windows (no inbox
+# Pulp — Windows build lane (standalone QEMU, ARM64 guest, Win11 24H2). The
+# immutable Windows ARM64 Skia slice is now available for GPU-linked builds;
+# headless compile/scan proof is separate from headed DAW acceptance. Apple
+# Virtualization can't install Windows (no inbox
 # virtio-blk driver), so Windows is first-class on QEMU with an NVMe disk +
 # ramfb display. x86_64 plugins run under Prism; GitHub-hosted windows-latest
 # stays the authoritative x64 gate.
@@ -47,8 +48,12 @@ python = "3.12"
 [choco]
 packages = ["git", "cmake", "ninja", "python3"]
 
-# No [skia] — there is no prebuilt Windows Skia archive yet, so Pulp builds
-# GPU-off on Windows (PULP_ENABLE_GPU=OFF) until a windows-* archive exists.
+[skia]
+platforms = ["windows-arm64", "windows-x64"]
+release_line = "chrome/m153"
+source = "Generous-Corp/pulp dependency manifest"
+gpu_default = "off"
+gpu_opt_in = "--gpu"
 
 [caches]
 sccache_max = "30G"       # sccache, not ccache (ccache+MSVC is unreliable)
