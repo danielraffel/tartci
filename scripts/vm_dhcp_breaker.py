@@ -583,11 +583,17 @@ def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
         pfd = value.get("pfd") or {}
         if cause == "pfd_crash_loop" or (cause == "vm_network_missing"
                                          and pfd_crash_looping(pfd)):
+            # pfd exits 3 when pf holds no enable reference ("no pf starter
+            # references held"), which is what a reboot leaves behind.
+            why = ("pf holds no enable reference, so pfd exits 3 ('no pf starter "
+                   "references held')" if str(pfd.get("last_exit")) == "3"
+                   else "pfd keeps exiting")
+            after = (f"; found by the post-boot probe after {value.get('verify_reason')}"
+                     if value.get("verify_reason") else "")
             return ("problem", "vm_dhcp_pfd_crash_loop",
-                    "VM DHCP is not answering because pfd keeps exiting (state "
-                    f"{pfd.get('state')}, last exit {pfd.get('last_exit')}, "
-                    f"{pfd.get('runs')} runs), so InternetSharing never creates the VM "
-                    "network: " + spent)
+                    f"VM DHCP is not answering because {why} (state {pfd.get('state')}, "
+                    f"last exit {pfd.get('last_exit')}, {pfd.get('runs')} runs), so "
+                    f"InternetSharing never creates the VM network{after}: " + spent)
         if cause == "vm_network_missing":
             return ("problem", "vm_dhcp_vm_network_missing",
                     "VM DHCP is not answering because the VM network was never created "
