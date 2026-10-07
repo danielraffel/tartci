@@ -37,6 +37,7 @@ REF=""; BUILD_TYPE="Release"; SMOKE=0; KEEP=0
 # pass a fuller exclude (e.g. the CI `validation|slow` + an --exclude-regex) via
 # PULP_CTEST_ARGS/--ctest-args, quoting the regex so cmd.exe doesn't pipe on `|`.
 CTEST_ARGS="${PULP_CTEST_ARGS:---output-on-failure --label-exclude validation}"
+CTEST_JOBS="${TARTCI_WIN_CTEST_JOBS:-${PULP_CTEST_JOBS:-4}}"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
@@ -55,6 +56,11 @@ while [ $# -gt 0 ]; do case "$1" in
   -h|--help) sed -n '2,30p' "$0"; exit 0;;
   *) die "unknown arg: $1";;
 esac; done
+
+case "$CTEST_JOBS" in
+  ''|*[!0-9]*) die "invalid TARTCI_WIN_CTEST_JOBS='$CTEST_JOBS'";;
+esac
+[ "$CTEST_JOBS" -gt 0 ] || die "TARTCI_WIN_CTEST_JOBS must be greater than zero"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN or --golden)"
 
@@ -165,8 +171,13 @@ note "build + ctest (Release, GPU off) via MSVC arm64 — the long step"
 PS_BUILD='$ProgressPreference = "SilentlyContinue"
 $vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
 if (-not $vcv) { Write-Error "no vcvarsall.bat under BuildTools"; exit 1 }
-cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU=OFF && cmake --build build && ctest --test-dir build '"$CTEST_ARGS"'"
-exit $LASTEXITCODE'
+cmd /c "`"$vcv`" arm64 && cd C:\pulp && cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE='"$BUILD_TYPE"' -DPULP_ENABLE_GPU=OFF && cmake --build build && ctest --test-dir build --parallel '"$CTEST_JOBS"' '"$CTEST_ARGS"' > C:\tmp\tartci-ctest.log 2>&1"
+$rc = $LASTEXITCODE
+if (Test-Path "C:\tmp\tartci-ctest.log") {
+  Write-Output "--- ctest tail (C:\\tmp\\tartci-ctest.log) ---"
+  Get-Content "C:\tmp\tartci-ctest.log" -Tail 240
+}
+exit $rc'
 ENC="$(printf '%s' "$PS_BUILD" | iconv -t UTF-16LE | base64)"
 set +e
 wsh "powershell -NoProfile -EncodedCommand $ENC"
