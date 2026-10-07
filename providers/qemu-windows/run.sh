@@ -114,8 +114,31 @@ note "vm $JOB up — $(wsh 'cmd /c ver' 2>/dev/null | tr -d "\r")"
 
 if [ "$SMOKE" = 1 ]; then
   note "smoke: toolchain probe"
-  wsh 'where cmake & where ninja & where git & where python' 2>&1 | tr -d '\r'
-  note "smoke OK (overlay boot + SSH + toolchain reachable)"
+  # A Windows `where a & where b` chain returns the status of the final
+  # command, so the old probe could report success with missing tools.  Probe
+  # every required tool and the architecture-specific MSVC environment, then
+  # fail closed if any component is absent.
+  PS_SMOKE='$ErrorActionPreference = "Stop"
+$required = @("cmake", "ninja", "git", "python")
+foreach ($name in $required) {
+  $cmd = Get-Command $name -ErrorAction SilentlyContinue
+  if (-not $cmd) { throw "required tool missing: $name" }
+  Write-Output ("{0}: {1}" -f $name, $cmd.Source)
+}
+$vcv = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object {$_.FullName -match "BuildTools"} | Select-Object -First 1).FullName
+if (-not $vcv) { throw "no vcvarsall.bat under BuildTools" }
+$probe = cmd /c "`"$vcv`" arm64 && where cl && cl 2>&1"
+if ($LASTEXITCODE -ne 0) { throw "MSVC arm64 probe failed (exit $LASTEXITCODE)" }
+$probe | ForEach-Object { Write-Output $_ }
+Write-Output "vcvarsall: $vcv"
+Write-Output "smoke: required Windows ARM64 toolchain is present"'
+  ENC="$(printf '%s' "$PS_SMOKE" | iconv -t UTF-16LE | base64)"
+  set +e
+  wsh "powershell -NoProfile -EncodedCommand $ENC" 2>&1 | tr -d '\r'
+  RC=${PIPESTATUS[0]}
+  set -e
+  [ "$RC" -eq 0 ] || die "smoke toolchain probe failed (exit $RC)"
+  note "smoke OK (overlay boot + complete ARM64 toolchain probe)"
   exit 0
 fi
 
