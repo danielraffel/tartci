@@ -183,7 +183,9 @@ other agents to answer where CI should run from machine-readable config.
 Pool-serving VM runners acquire host-core leases before booting guests. The
 lease size defaults to the host profile's `vm_pool_cores`; override per host
 with `TARTCI_MACOS_VM_CORES`, `TARTCI_LINUX_VM_CORES`, or
-`TARTCI_WIN_VM_CORES`. Set `TARTCI_VM_LEASES=0` only for operator-controlled
+`TARTCI_WIN_VM_CORES`. A fleet-macos lane can instead set `vm_cores_from =
+"gate-reserve"` to size its VMs so all of its slots fit the host's gate
+reserve. Set `TARTCI_VM_LEASES=0` only for operator-controlled
 break-glass debugging. Tart-backed macOS/Linux runners apply the lease size with
 `tart set --cpu` after cloning and before boot; QEMU Windows passes the leased
 size through `-smp`.

@@ -863,6 +863,80 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["12", "5", "6"])
 
+    def test_macos_cores_from_the_gate_reserve_share(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            tartci_profile_value(){{ printf 6; }}
+            tartci_gate_reserve_share_cores(){{ printf '%s' "$(( 8 / $1 ))"; }}
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf 'share=%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            printf 'explicit=%s\\n' "$(TARTCI_MACOS_VM_CORES=5 tartci_vm_lease_cores tart-macos)"
+            printf 'unset=%s\\n' "$(TARTCI_MACOS_VM_CORES_FROM= tartci_vm_lease_cores tart-macos)"
+            tartci_gate_reserve_share_cores(){{ return 1; }}
+            rc=0; failed="$(tartci_vm_lease_cores tart-macos)" || rc=$?
+            printf 'failed=%s rc=%s\\n' "$failed" "$rc"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # A failed derivation never falls back to vm_pool_cores (6 here): that
+        # is the overcommitted size the gate-reserve rule replaces.
+        self.assertEqual(proc.stdout.strip().splitlines(),
+                         ["share=4", "explicit=5", "unset=6", "failed= rc=1"])
+        self.assertIn("gate-reserve VM size unavailable; refusing to size the VM", proc.stderr)
+
+    def test_an_unsized_gate_reserve_lane_boots_nothing_and_probes_unknown(self) -> None:
+        # The boot path: no lease, no clone, when the size cannot be computed.
+        body = MACOS_RUNNER.read_text(encoding="utf-8")
+        boot = body[body.index("boot_vm_to_ssh(){"):body.index("tartci_acquire_vm_lease", body.index("boot_vm_to_ssh(){"))]
+        self.assertIn('if ! lease_cores="$(tartci_vm_lease_cores tart-macos)"; then', boot)
+        self.assertIn("return 1", boot)
+        # The lease-fit probe: unknown (1), and lease_fit.py is never asked.
+        lease_fit = ROOT / "providers" / "tart-macos" / "lease-fit.lib.sh"
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            source {lease_fit}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            tartci_gate_reserve_share_cores(){{ return 1; }}
+            python3(){{ echo "python3 called: $*"; }}
+            rc=0; tartci_lease_fit_probe || rc=$?
+            echo "rc=$rc"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["rc=1"])
+
+    def test_macos_share_matches_the_python_derivation(self) -> None:
+        # The real path: the shell asks gate_reserve_fit.py, so both sides read
+        # the same live host profile on whatever machine runs this.
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf '%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots 2
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shell, python = proc.stdout.split()
+        self.assertEqual(shell, python)
+
     def test_is_non_gate_priority_helper(self) -> None:
         script = textwrap.dedent(
             f"""

@@ -56,7 +56,7 @@ tartci_lease_fit_candidate_labels(){
 # 4 never, 1 unknown).
 tartci_lease_fit_probe(){
   local cores mem ngc labels priority_args=() cap_args=() rc=0
-  cores="$(tartci_vm_lease_cores tart-macos)"
+  cores="$(tartci_vm_lease_cores tart-macos)" || return 1
   mem="$(tartci_vm_lease_mem_mb tart-macos)"
   while IFS= read -r labels; do
     [ -n "$labels" ] || continue

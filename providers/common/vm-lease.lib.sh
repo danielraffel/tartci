@@ -150,11 +150,27 @@ tartci_positive_int_or_empty(){
   esac
 }
 
+# Per-slot VM cores for a lane sized from this host's gate reserve
+# (vm_cores_from = "gate-reserve"): gate_reserve_fit.share_cores is the one
+# derivation, shared with the gate-supply and gate-reserve checks. When it
+# cannot be computed tartci_vm_lease_cores fails rather than fall back to
+# vm_pool_cores, which is the overcommitted size the rule exists to avoid.
+tartci_gate_reserve_share_cores(){
+  python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots "${1:-1}"
+}
+
 tartci_vm_lease_cores(){
   local provider="$1" fallback="${2:-}" value="" key="vm_pool_cores"
   case "$provider" in
     tart-macos)
       value="${TARTCI_MACOS_VM_CORES:-${PULP_MACOS_VM_CORES:-}}"
+      if [ -z "$value" ] && [ "${TARTCI_MACOS_VM_CORES_FROM:-}" = "gate-reserve" ]; then
+        value="$(tartci_gate_reserve_share_cores "${TARTCI_MACOS_VM_CORES_SLOTS:-1}" 2>/dev/null || true)"
+        if ! tartci_positive_int_or_empty "$value"; then
+          echo "tartci: gate-reserve VM size unavailable; refusing to size the VM" >&2
+          return 1
+        fi
+      fi
       ;;
     tart-linux)
       value="${TARTCI_LINUX_VM_CORES:-${PULP_LINUX_VM_CORES:-}}"

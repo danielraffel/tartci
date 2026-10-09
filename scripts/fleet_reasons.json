@@ -567,6 +567,21 @@
     "undeclared_fleet_agents_none": {
       "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     },
+    "vm_boot_degraded": {
+      "summary": "At least max(2, lanes) VM boots on this host got no address in the last 24 h: one failed boot per lane in a day.",
+      "why": "On 30 days of the fleet's own lane logs (2026-10-07), m3, m1 and m5studio had no day with any boot that got no address, and m5's outage days had 13, 10, 172 and 122 while its one isolated day had 2 in 53 boots. A count rather than a rate: at these volumes one failure moves the rate, so the rate is reported and never judged. The VM-DHCP breaker stops most of the cloning during an outage; this finding is the record that it happened and how often.",
+      "remedy": "Read the vm_dhcp finding for the failing layer and its remedy, and the outage history in `tartci vm-dhcp status`. If the breaker is closed again the outage is over; the finding clears once the 24 h window passes."
+    },
+    "vm_boot_ok": {
+      "summary": "This host's VMs are getting addresses: the 24 h and 7 d boot counts and the outages of the last week are reported, and none crosses the threshold."
+    },
+    "vm_boot_unmeasured": {
+      "summary": "No VM boot has been counted on this host yet: there is no breaker record, or it holds no boots."
+    },
+    "vm_boot_unreadable": {
+      "summary": "The VM-DHCP breaker record could not be read, so the boot counts and outages are unknown.",
+      "remedy": "The vm_dhcp finding reports the same unreadable record; the next lane boot rewrites it."
+    },
     "vm_dhcp_bootpd_not_loaded": {
       "summary": "VMs on this host stopped getting an address, and launchd has no bootpd job loaded at all, so lanes have stopped cloning except one probe every 300 s.",
       "why": "bootpd's plist (/System/Library/LaunchDaemons/bootps.plist) ships Disabled, and only Internet Sharing (com.apple.NetworkSharing) loads it. When it is not loaded, `launchctl print system/com.apple.bootpd` exits 113 (\"Could not find service\"), a kickstart of bootpd fails the same way, and disable/enable only changes the override without loading anything. On m5 on 2026-10-07 the job was absent after a reboot while NetworkSharing itself was running; bootstrapping bootps.plist loaded it under SIP.",

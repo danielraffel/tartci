@@ -912,6 +912,18 @@ class MacosFleetLaneTests(unittest.TestCase):
                             env.get("TARTCI_MACOS_VM_CORES"),
                             expected_vm_cores,
                         )
+                        # m5's Pulp slots carry the sizing rule, not a size.
+                        sized_from_reserve = (
+                            host_id == "m5"
+                            and env["TARTCI_RUNNER_REPO"] == "Generous-Corp/pulp"
+                            and env.get("TARTCI_RUNNER_WORKFLOW_TIERS", "").startswith(
+                                "pulp-build-merge-group")
+                        )
+                        self.assertEqual(
+                            (env.get("TARTCI_MACOS_VM_CORES_FROM"),
+                             env.get("TARTCI_MACOS_VM_CORES_SLOTS")),
+                            ("gate-reserve", "2") if sized_from_reserve else (None, None),
+                        )
                     chrome_routes = {
                         value["EnvironmentVariables"]["TARTCI_RUNNER_REPO"]:
                         value["EnvironmentVariables"].get("TARTCI_RUNNER_CHROME_APP_DIR")
@@ -2496,6 +2508,34 @@ workflows=["Product acceptance"]
                     )
                     self.assertEqual(result.returncode, 2, result.stdout)
                     self.assertIn("vm_cores must be a positive integer", result.stderr)
+
+    def test_vm_cores_from_names_one_rule_and_excludes_vm_cores(self) -> None:
+        base = CONFIG.read_text()
+        fixtures = {
+            "unknown-rule": ('vm_cores_from = "pool"', 'vm_cores_from must be "gate-reserve"'),
+            "not-a-string": ("vm_cores_from = 4", 'vm_cores_from must be "gate-reserve"'),
+            "both": ('vm_cores_from = "gate-reserve"\nvm_cores = 4',
+                     "set vm_cores or vm_cores_from, not both"),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            for name, (lines, message) in fixtures.items():
+                with self.subTest(name=name):
+                    body = base.replace(
+                        'golden = "pulp-build-runner:latest"',
+                        f'golden = "pulp-build-runner:latest"\n{lines}',
+                        1,
+                    )
+                    self.assertNotEqual(body, base)
+                    bad = Path(td) / f"vm-cores-from-{name}.toml"
+                    bad.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2, result.stdout)
+                    self.assertIn(message, result.stderr)
 
     def test_scalar_types_fail_closed_without_traceback(self) -> None:
         fixtures = [

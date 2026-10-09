@@ -150,6 +150,10 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_boot_degraded",
+    "vm_boot_ok",
+    "vm_boot_unmeasured",
+    "vm_boot_unreadable",
     "vm_dhcp_bootpd_not_loaded",
     "vm_dhcp_config_disabled",
     "vm_dhcp_ok",
@@ -1134,6 +1138,18 @@ def check_vm_dhcp(value: dict | None) -> Finding:
                    {"vm_dhcp": value})
 
 
+def check_vm_boot(value: dict | None, *, lanes: int, now: float | None = None) -> Finding:
+    """The host's VM boot success and outage record (vm_dhcp_breaker.boot_health)."""
+    import vm_dhcp_breaker  # noqa: PLC0415 - sibling module; owns the codes
+    value = value or {"state": "unreadable", "error": "no status"}
+    state, code, detail = vm_dhcp_breaker.boot_health(
+        value, time.time() if now is None else now, lanes)
+    return Finding("vm_boot", {"ok": OK, "problem": PROBLEM,
+                               "not_applicable": NOT_APPLICABLE}.get(state, UNKNOWN),
+                   code, detail, {"lanes": lanes, "hourly_hours": len(value.get("hourly") or {}),
+                                  "outages": (value.get("outages") or [])[-5:]})
+
+
 def check_peer_reachability(value: dict | None) -> Finding:
     """Peers this host could not read at its last self-update survey."""
     value = value or {"state": "unreadable", "error": "no status", "peers": {}}
@@ -1557,6 +1573,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             vm_dhcp_value = {"state": "unreadable", "error": str(exc)}
     findings.append(check_vm_dhcp(vm_dhcp_value))
+    findings.append(check_vm_boot(vm_dhcp_value, lanes=len(fit_records)))
     if peer_reachability_value is None:
         try:
             import fleet_self_update

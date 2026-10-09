@@ -123,10 +123,22 @@ def derived_vm_mem_mb(cores: int, per_job_mb: int = 1536,
     return min(value, max(ceiling, floor))
 
 
-def lane_request(env: dict, default_cores: int) -> tuple[int, int]:
-    """(cores, mem_mb) one VM of this lane leases."""
+def lane_request(env: dict, default_cores: int,
+                 share_cores: Callable[[int], int] | None = None) -> tuple[int, int]:
+    """(cores, mem_mb) one VM of this lane leases.
+
+    Resolved as tartci_vm_lease_cores does: explicit cores, else the gate-reserve
+    share for a lane rendered with TARTCI_MACOS_VM_CORES_FROM=gate-reserve, else
+    the host's default.
+    """
     cores_text = str(env.get("TARTCI_MACOS_VM_CORES") or "")
-    cores = int(cores_text) if cores_text.isdigit() and int(cores_text) > 0 else default_cores
+    slots_text = str(env.get("TARTCI_MACOS_VM_CORES_SLOTS") or "1")
+    if cores_text.isdigit() and int(cores_text) > 0:
+        cores = int(cores_text)
+    elif env.get("TARTCI_MACOS_VM_CORES_FROM") == "gate-reserve" and share_cores is not None:
+        cores = share_cores(int(slots_text) if slots_text.isdigit() else 1)
+    else:
+        cores = default_cores
     mem_text = str(env.get("TARTCI_MACOS_VM_MEM_MB") or "")
     mem = int(mem_text) if mem_text.isdigit() and int(mem_text) > 0 else derived_vm_mem_mb(cores)
     return cores, mem
@@ -257,6 +269,7 @@ def build_report(
     capacity_reader: Callable[[], dict[str, Any]] | None = None,
     running_reader: Callable[[], int | None] | None = None,
     default_cores_reader: Callable[[], int] | None = None,
+    share_cores_reader: Callable[[int], int] | None = None,
     pool_reader: Callable[[], str] | None = None,
     cap_reader: Callable[[], int] | None = None,
     reservations_reader: Callable[[], int] | None = None,
@@ -300,7 +313,7 @@ def build_report(
             report["in_flight"] += 1
         elif state == "free":
             default_cores = (default_cores_reader or (lambda: 1))()
-            free_lanes.append(lane_request(env, default_cores))
+            free_lanes.append(lane_request(env, default_cores, share_cores_reader))
     if pool != "on":
         report["reason"] = f"pool {pool}"
         return report
@@ -385,11 +398,17 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
         import host_profile  # noqa: PLC0415
         return int(host_profile.build_profile()["vm_pool_cores"])
 
+    def share_cores(slots: int) -> int:
+        import gate_reserve_fit  # noqa: PLC0415
+        import host_profile  # noqa: PLC0415
+        return gate_reserve_fit.share_cores(host_profile.build_profile(), slots)
+
     return build_report(
         repo, class_label, lanes=lanes, lane_problems=problems,
         env_reader=lambda label: lane_busy.lane_environment(label, agents_dir),
         capacity_reader=capacity, running_reader=running,
         default_cores_reader=default_cores,
+        share_cores_reader=share_cores,
         pool_reader=lambda: pool_state(
             Path(os.environ.get("TARTCI_POOL_STATE_FILE") or config / "pool-state"),
             Path(os.environ.get("TARTCI_POOL_PARTICIPATION_FILE")

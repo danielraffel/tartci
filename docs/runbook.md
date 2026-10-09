@@ -1731,6 +1731,30 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   alert state and retried every pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
+- **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
+  boot to its UTC hour (kept 14 days), and every outage that ends is appended
+  to a history of the last 50 (`opened_at`, `closed_at`, `duration_s`,
+  `vms_spent`, `cause`, `closed_by`: `probe`, `boot_ok`, `verified` or `late`).
+  An outage that runs across a reboot is one outage, from its first opening.
+  The breaker keeps these through every change of state (`CARRIED_KEYS`).
+  `vm_boot_ok` reports the 24 h and 7 d boots that got an address, with the
+  rate, and the outages of the last week; `vm_boot_degraded` means at least
+  `max(2, lanes)` boots got no address in the last 24 h, where `lanes` is the
+  host's installed lane agents (the same count the home-volume floor uses).
+  The threshold is a count, not a rate, from 30 days of the fleet's lane logs
+  (2026-10-07):
+
+  | Host | days | days with any no_ip | worst days (ok/no_ip) |
+  |---|---|---|---|
+  | m3 | 31 | 0 | — |
+  | m1 | 29 | 0 | — |
+  | m5s | 9 | 0 | — |
+  | m5 | 31 | 8 | 0/172, 0/122 (2026-10-06/07), 63/13 (09-23), 53/10 (10-04), 51/2 (09-22) |
+
+  One failed boot per lane in a day trips every m5 outage day and leaves its
+  isolated 2-in-53 day OK; `max(2, …)` keeps a one- or two-lane host from
+  reading degraded on one isolated failure. The rate is reported and never
+  judged: at these volumes one failure moves it.
 - **Fails open:** an unreadable breaker reads as closed and never verifies.
   Writes are atomic under a lock.
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
@@ -1897,8 +1921,9 @@ fleet`), and check GitHub's job history against it with
 - **Gate-reserve ratchet.** Prepare runs `fleet-macos validate <profile>
   --check-reserve`, which fits each gate lane (no explicit priority, or
   `priority = "gate"`) into THIS host's gate reserve from its live
-  host-profile, per axis: `supervisors x vm_cores` (default `vm_pool_cores`)
-  against `reserved_gate_cores`, and `supervisors x` the derived VM memory
+  host-profile, per axis: `supervisors x` the lane's VM cores (an explicit
+  `vm_cores`, else the reserve share for `vm_cores_from = "gate-reserve"`, else
+  `vm_pool_cores`) against `reserved_gate_cores`, and `supervisors x` the derived VM memory
   against `reserved_gate_mem_mb` (`scripts/gate_reserve_fit.py`). Every
   overcommitted pair is printed as `gate_reserve_overcommitted lane=...
   axis=... demand=... reserve=...` on every update, and `tartci pool status`
@@ -1906,12 +1931,21 @@ fleet`), and check GitHub's job history against it with
   the installed profile. The update is refused only when the target profile's
   overcommit on some (lane, axis) is strictly greater than the installed
   profile's, both against the same live reserve (`gate_reserve_worse`). This is
-  a ratchet because two hosts overcommit today (m1: 2 x 3 against 3; m5:
-  2 x 6 against 8), and refusing them would leave both unable to update; a
-  check that let the overcommit grow would be no check (m3, 2026-10-04: 2 x 12
-  against 14 lease-denied the second Pulp slot while jobs queued, #373).
-  Resizing is a profile decision with the host's owner and must not take
-  agent cores. A host that reserves no gate cores (a CI runner, or a role
+  a ratchet because a host whose installed profile overcommits (m1: 2 x 3
+  against 3) must still be able to update; a check that let the overcommit
+  grow would be no check (m3, 2026-10-04: 2 x 12 against 14 lease-denied the
+  second Pulp slot while jobs queued, #373). Resizing is a profile decision
+  with the host's owner and must not take agent cores. The resize that keeps
+  the reserve and the agent cores as they are is `vm_cores_from =
+  "gate-reserve"` on the lane: each slot's VM gets the largest core count, at
+  most `vm_pool_cores`, at which all of the lane's slots fit the reserve on
+  cores and on derived memory (`gate_reserve_fit.share_cores`; `python3
+  scripts/gate_reserve_fit.py share-cores --slots N` prints it for this host).
+  The plist carries the rule (`TARTCI_MACOS_VM_CORES_FROM`,
+  `TARTCI_MACOS_VM_CORES_SLOTS`), not a number, and the lease helper, `tartci
+  gate-supply` and this fit all compute the size the same way. m5 sizes its two
+  Pulp slots this way (2 x 4 against 8); on m3's facts the rule gives the 7 that
+  #373 chose by hand. A host that reserves no gate cores (a CI runner, or a role
   that keeps none for gates) has no reserve to fit lanes into, so the check
   reads `gate reserve: n/a (this host reserves no gate cores)` and the doctor
   `gate_reserve_not_applicable`, never "fits"; a missing memory reserve beside
