@@ -494,6 +494,29 @@ class PfdLayer(Case):
         finding = fleet_doctor.check_vm_dhcp(self.state())
         self.assertEqual(finding.code, "vm_dhcp_pfd_crash_loop")
         self.assertIn("last exit 3", finding.detail)
+        self.assertIn("pf holds no enable reference", finding.detail)
+
+    def test_another_pfd_exit_is_not_read_as_no_reference(self):
+        detail = vb.doctor_code({"state": "open", "cause": "pfd_crash_loop",
+                                 "pfd": {"state": "spawn scheduled", "last_exit": "1"}})[2]
+        self.assertIn("pfd keeps exiting", detail)
+        self.assertNotIn("no enable reference", detail)
+
+    def test_an_ordinary_pfd_failure_does_not_claim_a_reboot(self):
+        detail = vb.doctor_code({"state": "open", "cause": "pfd_crash_loop",
+                                 "pfd": {"state": "spawn scheduled", "last_exit": "3"}})[2]
+        self.assertIn("pf holds no enable reference", detail)
+        self.assertNotIn("found by the post-boot probe", detail)
+
+    def test_a_post_boot_pfd_failure_says_it_followed_a_reboot(self):
+        self.ifaces.write_text("lo0 en0")
+        self.pfd.write_text(self.CRASHING)
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 100)
+        self.check(T0 + 200, lane="a")
+        self.record("no_ip", T0 + 400, lane="a")
+        detail = fleet_doctor.check_vm_dhcp(self.state()).detail
+        self.assertIn("pf holds no enable reference", detail)
+        self.assertIn("found by the post-boot probe after host_reboot", detail)
 
     def test_pfd_not_loaded_reads_as_unknown_not_crash_looping(self):
         # launchctl print exits 113 for a job launchd does not have: the pfd
@@ -948,11 +971,18 @@ class Doctor(unittest.TestCase):
         remedy = reasons["vm_dhcp_unanswered"]["remedy"]
         self.assertIn("sudo launchctl kickstart -k system/com.apple.bootpd", remedy)
         self.assertIn("tartci never runs it", remedy)
+        # Only the pfd layer has a verified remedy (m5, 2026-10-07).
+        for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled"):
+            self.assertIn("no verified remedy yet", reasons[code]["remedy"].lower())
         for code in ("vm_dhcp_vm_network_missing", "vm_dhcp_config_disabled",
                      "vm_dhcp_pfd_crash_loop"):
-            self.assertIn("no verified remedy yet", reasons[code]["remedy"].lower())
             self.assertIn("tartci vm-dhcp probe-now", reasons[code]["remedy"])
             self.assertIn(code, fleet_doctor.CODES)
+        pfd = reasons["vm_dhcp_pfd_crash_loop"]["remedy"]
+        self.assertTrue(pfd.startswith("On the host (tartci never runs it): `sudo pfctl -E`."), pfd)
+        self.assertIn("`sudo pfctl -X <token>`", pfd)
+        self.assertIn("does not survive a reboot", pfd)
+        self.assertNotIn("no verified remedy", pfd.lower())
         not_loaded = reasons["vm_dhcp_bootpd_not_loaded"]
         self.assertEqual(fleet_doctor.check_vm_dhcp(
             {"state": "open", "bootpd": {"loaded": False}}).code, "vm_dhcp_bootpd_not_loaded")
@@ -967,6 +997,15 @@ class Doctor(unittest.TestCase):
         for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md",
                      ROOT / "scripts" / "fleet_doctor.py", ROOT / "scripts" / "vm_dhcp_breaker.py"):
             self.assertIsNone(blocked.search(path.read_text()), path.name)
+
+    def test_pfctl_d_is_only_ever_named_as_never(self):
+        # Disabling pf drops every holder's references; the undo for one's own
+        # `pfctl -E` is `pfctl -X <token>`.
+        for path in (ROOT / "scripts" / "fleet_reasons.json", ROOT / "docs" / "runbook.md"):
+            text = path.read_text()
+            for found in re.finditer(r"pfctl -d", text):
+                self.assertIn("Never", text[max(0, found.start() - 12):found.start()],
+                              f"{path.name}: {text[found.start() - 40:found.end() + 20]!r}")
 
     def test_no_remedy_names_the_restart_that_did_not_help(self):
         # m5, 2026-10-07: InternetSharing relaunched (pid 51580) and the next

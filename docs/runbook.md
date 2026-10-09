@@ -1779,12 +1779,19 @@ comes up. It is not stale configuration.
 1. **pfd crash-looping** (`vm_dhcp_pfd_crash_loop`): no `bridge100`, and
    `launchctl print system/com.apple.pfd` (no root) shows it not running with a
    non-zero last exit and a climbing run count. InternetSharing waits on pfd
-   before it creates the VM network. On m5 on 2026-10-07 pfd exited 3 every
-   10 s from boot, logging only "no pf starter references held"; a healthy
-   pfd stays up and never logs that line. No verified remedy yet: compare
-   `sudo pfctl -s info` and `sudo pfctl -s References` with a healthy host,
-   record what brings pfd to `running`, and run `tartci vm-dhcp probe-now`
-   after any change. Never `pfctl -d`: it drops every holder's references.
+   before it creates the VM network, and pfd exits 3 when pf holds no enable
+   reference, logging "no pf starter references held". A healthy pfd serves
+   its requests and then idle-exits with last exit 0. On m5 on 2026-10-07,
+   after a reboot, `sudo pfctl -s info` read "Status: Disabled" with no
+   starter references, and pfd exited 3 every 10 s. **Fix: `sudo pfctl -E`.**
+   It takes one ref-counted enable reference and prints a token; keep the
+   token, which is the undo key (`sudo pfctl -X <token>`). On m5 pfd then ran
+   and idle-exited 0, bridge100 came up on the next VM, and the breaker closed
+   on its probe's address; `tartci vm-dhcp probe-now` makes that probe
+   immediate. The reference does not survive a reboot: a recurrence after a
+   reboot is caught by the post-boot verification and the alert, and
+   `sudo pfctl -E` is run again. Never `pfctl -d`: it drops every holder's
+   references.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the
