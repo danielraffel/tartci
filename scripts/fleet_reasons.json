@@ -440,7 +440,7 @@
     "self_update_paused": {
       "summary": "tartci's self-update has not run since a launchd timer stall began: launchd starts no timer job on its own and the interval guard deliberately does not kick self-update, so the host stays behind main and self-update writes no attempt or log line of its own.",
       "why": "During a stall (launchd_timers_stalled) an update would stop every supervisor, so no guard would run and any lane restart left to launchd would pend unattended; the guard therefore holds self-update for the episode. On m3 from 2026-10-05 that left self-update silent for days, 44 commits behind, while its finding read like a failed update: there was no receipt to read because it never ran.",
-      "remedy": "Reboot the host when its lanes are idle (or let the pending macOS install finish); the stall clears, launchd starts self-update on its next interval, and it updates from its own clean checkout. Afterwards `launchctl print gui/$(id -u)/com.danielraffel.tartci.self-update` shows the run count moving and no `pended nondemand spawn` line.",
+      "remedy": "The operator reboots the host when its lanes are idle (or lets the pending macOS install finish); tartci never does. The stall clears, launchd starts self-update on its next interval, and it updates from its own clean checkout. Afterwards `launchctl print gui/$(id -u)/com.danielraffel.tartci.self-update` shows the run count moving and no `pended nondemand spawn` line.",
       "do_not": "Do not kickstart self-update by hand during the stall: its pool off and on re-bootstrap every lane, and on a stalled launchd a re-bootstrapped agent pends with no guard alive to kick it."
     },
     "self_update_problem": {

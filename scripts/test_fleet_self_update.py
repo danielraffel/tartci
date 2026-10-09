@@ -1408,15 +1408,16 @@ class PausedByStallTests(Base):
 
     STARTED = NOW - 4 * 86400
 
-    def guard(self, *, paused=True, active=True, age=60, directory=None):
+    SELF = "com.danielraffel.tartci.self-update"
+
+    def guard(self, *, paused=(SELF,), active=True, age=60, directory=None):
         directory = directory or self.cfg.state_dir.parent / "launchd-interval-guard"
         directory.mkdir(parents=True, exist_ok=True)
-        label = "com.danielraffel.tartci.self-update"
         (directory / "status.json").write_text(json.dumps({
             "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
-            "stalled": [{"label": label, "interval": 1800}],
-            "paused": [{"label": label, "interval": 1800}] if paused else [],
-            "episode": {"active": active, "labels": [label], "started_ts": self.STARTED}}))
+            "stalled": [{"label": self.SELF, "interval": 1800}],
+            "paused": [{"label": label, "interval": 1800} for label in paused],
+            "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
 
     def stale_skew(self):
         su._write_json(self.cfg.state_dir / "skew.json", {
@@ -1450,7 +1451,9 @@ class PausedByStallTests(Base):
     def test_not_paused_unless_the_guard_holds_self_update_in_a_live_stall(self):
         import fleet_doctor
         self.stale_skew()
-        for name, kwargs in (("other agents only", {"paused": False}),
+        for name, kwargs in (("another agent paused, not self-update",
+                              {"paused": ("com.danielraffel.tartci.launchd-watchdog",)}),
+                             ("nothing paused", {"paused": ()}),
                              ("no active episode", {"active": False}),
                              ("stale guard receipt", {"age": 10 * 3600})):
             with self.subTest(case=name):
