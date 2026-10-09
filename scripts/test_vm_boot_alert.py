@@ -2,9 +2,11 @@
 """One GitHub issue per outage when a host cannot boot VMs (vm_boot_alert.py)."""
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import sys
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -119,7 +121,7 @@ class Alert(Case):
         out = self.watch(T0 + 1110)
         self.assertEqual((out["due"], out["why"]), (True, "two consecutive probes never reported"))
 
-    def test_an_outage_across_a_reboot_never_orphans_its_issue(self):
+    def test_an_outage_across_a_reboot_keeps_one_issue(self):
         self.open_at(T0)
         self.watch(T0 + 200 + vb.PROBE_SECS)               # issue 77
         self.assertEqual(len(self.opened), 1)
@@ -127,31 +129,135 @@ class Alert(Case):
         self.check(T0 + 1100, lane="a")                    # verifying: 77 stays open
         self.assertFalse(self.watch(T0 + 1150)["due"])
         self.assertEqual(self.closed, [])
-        self.record("no_ip", T0 + 1300, lane="a")          # a new outage, a new since
+        self.record("no_ip", T0 + 1300, lane="a")          # reopened with a fresh opened_at
         self.watch(T0 + 1310)
-        self.assertEqual(self.closed, ["77"], "the first issue is closed, not forgotten")
-        self.assertEqual(len(self.opened), 2)              # issue 78 is the open one
+        self.assertEqual(self.closed, [], "a reopened breaker is the same outage")
+        self.assertEqual(len(self.opened), 1)
+        self.assertEqual(self.state_file()["since"], vb.iso(T0 + 200))
         self.record("ip", T0 + 1500, lane="b")
         self.watch(T0 + 1600)
-        self.assertEqual(self.closed, ["77", "78"])
+        self.assertEqual(self.closed, ["77"])
+        self.assertEqual(self.names(), ["host_vm_boot_down", "host_vm_boot_up"])
 
     def state_file(self) -> dict:
         path = self.tmp / "vm-dhcp" / "alert.json"
         return json.loads(path.read_text()) if path.exists() else {}
 
-    def test_a_failed_close_on_a_new_episode_is_retried(self):
+    def comment(self, number: str, body: str) -> tuple[int, str]:
+        if getattr(self, "comment_fails", 0):
+            self.comment_fails -= 1
+            return 1, "rate limited"
+        self.comments.append((number, body))
+        return 0, "1"
+
+    def replay(self, at: float) -> dict:
+        return vba.alert_pass(now=at, directory=self.tmp / "vm-dhcp", issue=self.issue,
+                              close=self.close, comment=self.comment, host="m5", target="m5")
+
+    def test_m5_on_2026_10_09_is_one_issue(self):
+        """m5's outage of 2026-10-09 (UTC), event for event from its lane
+        logs, became issues #427, #428 and #430. It is one episode: a
+        reclassified cause, a reboot and a self-update re-verify in between,
+        and recovery at 06:18:30 when a probe got an address."""
+        def t(hms: str) -> float:
+            return float(calendar.timegm(
+                time.strptime(f"2026-10-09T{hms}Z", "%Y-%m-%dT%H:%M:%SZ")))
+        self.comments: list[tuple[str, str]] = []
+        no_bridge = "lo0 en0 bridge0"
+        crashing = "\tstate = spawn scheduled\n\truns = 751\n\tlast exit code = 3\n"
+        passes: list[float] = []
+
+        def watch_until(end: float) -> None:
+            at = (passes[-1] if passes else t("01:20:00")) + 300
+            while at <= end:
+                self.replay(at)
+                passes.append(at)
+                at += 300
+
+        # 01:29-01:33: two no_ips with a healthy-looking chain open it (dhcp_silent).
+        self.record("no_ip", t("01:29:10"), lane="m5-pulp-gate-slot2")
+        self.record("no_ip", t("01:33:48"), lane="m5-pulp-gate-slot2")
+        self.assertEqual(self.state()["cause"], "dhcp_silent")
+        # 01:34-02:01: bootpd moves (chain_changed) and probes read a missing
+        # VM network; the first probe, on slot2, never reports.
+        self.ifaces.write_text(no_bridge)
+        self.runs.write_text("4")
+        self.check(t("01:34:51"), lane="m5-pulp-gate-slot2")
+        self.runs.write_text("5")
+        self.check(t("01:37:36"), lane="m5-pulp-gate")
+        watch_until(t("01:40:00"))
+        self.record("no_ip", t("01:41:36"), lane="m5-pulp-gate")
+        watch_until(t("02:02:00"))
+        self.assertEqual(len(self.opened), 1, "#427 opens")
+        self.assertEqual(self.state_file()["cause"], "vm_dhcp_vm_network_missing")
+        # 03:57 reboot; 04:10 post-boot probe; pfd now crash-loops (exit 3).
+        self.pfd.write_text(crashing)
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(t("03:57:21"))
+        passes.append(t("04:05:00"))           # the host was down: no passes
+        self.check(t("04:10:11"), lane="m5-forge-gate")
+        self.assertEqual(self.state()["state"], "verifying")
+        watch_until(t("04:14:00"))
+        self.record("no_ip", t("04:14:16"), lane="m5-forge-gate")
+        watch_until(t("05:35:00"))
+        # 05:36 a self-update re-verifies; 05:41 its probe gets no address.
+        vb.verify("self_update", now=t("05:36:00"))
+        self.check(t("05:36:01"), lane="m5-pulp-gate")
+        watch_until(t("05:40:00"))
+        self.record("no_ip", t("05:41:09"), lane="m5-pulp-gate")
+        watch_until(t("06:17:00"))
+        # 06:16 the pf reference is held; 06:18:30 a probe gets an address.
+        self.pfd.write_text("\tstate = running\n\truns = 752\n\tlast exit code = (never exited)\n")
+        self.ifaces.write_text("lo0 en0 bridge0 bridge100 vmenet0")
+        self.check(t("06:16:58"), lane="m5-pulp-gate")
+        self.record("ip", t("06:18:30"), lane="m5-pulp-gate")
+        watch_until(t("06:30:00"))
+
+        self.assertEqual(len(self.opened), 1, "exactly one issue for the whole outage")
+        self.assertEqual(self.closed, ["77"], "closed once, on recovery")
+        self.assertTrue(self.opened[0][0].startswith(
+            "[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z"), self.opened[0][0])
+        self.assertEqual([body.splitlines()[0] for _, body in self.comments],
+                         ["Cause changed: vm_dhcp_vm_network_missing -> vm_dhcp_pfd_crash_loop."])
+        self.assertEqual(self.names(), ["host_vm_boot_down", "host_vm_boot_up"])
+        up = [json.loads(l) for l in
+              (self.tmp / "vm-dhcp" / "events.jsonl").read_text().splitlines()][-1]
+        self.assertEqual(up["fields"]["down_s"], int(t("06:20:00") - t("01:33:48")))
+        self.assertFalse((self.tmp / "vm-dhcp" / "alert.json").exists())
+
+    def test_a_cause_change_is_one_comment_and_a_failed_one_is_retried(self):
+        self.comments = []
+        self.open_at(T0)                                    # dhcp_silent
+        self.replay(T0 + 200 + vb.PROBE_SECS)               # issue 77
+        self.assertEqual(self.state_file()["cause"], "vm_dhcp_unanswered")
+        self.ifaces.write_text("lo0 en0")
+        self.check(T0 + 800, lane="p")
+        self.record("no_ip", T0 + 900, lane="p")            # vm_network_missing
+        self.comment_fails = 1
+        out = self.replay(T0 + 1000)
+        self.assertFalse(out["commented"])
+        self.assertEqual(self.state_file()["comment_error"], "rate limited")
+        out = self.replay(T0 + 1300)
+        self.assertTrue(out["commented"])
+        self.replay(T0 + 1600)
+        self.assertEqual(len(self.comments), 1, "one comment per change")
+        self.assertEqual(self.comments[0][0], "77")
+        self.assertIn("vm_dhcp_unanswered -> vm_dhcp_vm_network_missing", self.comments[0][1])
+        self.assertNotIn("comment_error", self.state_file())
+
+    def test_a_closed_breaker_without_an_address_does_not_close_the_issue(self):
         self.open_at(T0)
         self.watch(T0 + 200 + vb.PROBE_SECS)                 # issue 77
-        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
-        self.check(T0 + 1100, lane="a")
-        self.record("no_ip", T0 + 1300, lane="a")            # new episode
-        self.close_fails = 1
-        self.watch(T0 + 1310)
-        self.assertEqual(self.state_file()["stale_issues"], ["77"])
-        self.assertEqual(self.state_file()["issue"], "78")
-        self.watch(T0 + 1610)                                 # retried
+        # The breaker file is replaced by a closed one that never saw an address.
+        (self.tmp / "vm-dhcp" / "breaker.json").write_text(json.dumps(
+            {"state": "closed", "streak": [], "boot_time": T0 - 86400,
+             "last_ip_at": T0 - 100}))
+        self.watch(T0 + 900)
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.state_file()["issue"], "77")
+        # Control: an address after the episode began closes it.
+        self.record("ip", T0 + 1000, lane="q")
+        self.watch(T0 + 1100)
         self.assertEqual(self.closed, ["77"])
-        self.assertNotIn("stale_issues", self.state_file())
 
     def test_a_failed_close_at_recovery_is_retried_without_a_second_up_event(self):
         self.open_at(T0)
@@ -177,7 +283,8 @@ class Alert(Case):
         self.watch(T0 + 200 + vb.PROBE_SECS)
         title, body = self.opened[0]
         self.assertTrue(title.startswith("[tartci] m5: cannot boot VMs since "), title)
-        self.assertIn("(vm_dhcp_vm_network_missing)", title)
+        self.assertNotIn("vm_dhcp", title, "the cause can change; the title cannot")
+        self.assertIn("Cause: vm_dhcp_vm_network_missing", body)
         first = body.splitlines()[:3]
         self.assertTrue(first[0].startswith("m5 has booted no VM since "), first[0])
         self.assertEqual(first[1], "Run: ssh m5 'tartci doctor fleet'")
