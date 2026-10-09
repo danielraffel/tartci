@@ -110,6 +110,13 @@ assignment_scan_max_workers = 4
 # removing this key. See docs/assignment-v2-rollout.md.
 assignment_idle_retarget_seconds = 120
 supervisors = 2
+# Each slot's VM is sized from m5's live gate reserve: the largest core count,
+# at most vm_pool_cores, at which both slots fit the reserve on cores and
+# memory. The vm_pool_cores default (2 x 6 against an 8-core reserve) could
+# never run both slots beside agent builds, and the doctor reported
+# gate_reserve_overcommitted. The reserve itself is untouched; agent cores are
+# not taken. See the "Gate-reserve ratchet" entry in docs/runbook.md.
+vm_cores_from = "gate-reserve"
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = [
   "com.danielraffel.pulp.tart-runner-macos-gate",

@@ -90,7 +90,7 @@ WORKTREE_CLEANUP_KEYS = {
     "apply", "max_trees", "max_gib", "timeout_seconds", "cooldown_seconds",
 }
 LANE_KEYS = {
-    "id", "repo", "golden", "priority", "vm_cores", "labels", "workflows", "tier",
+    "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode",
     "ccache_write_isolation",
@@ -648,6 +648,12 @@ def load(path: Path) -> dict:
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
+        vm_cores_from = lane.get("vm_cores_from")
+        if vm_cores_from is not None:
+            if vm_cores_from != "gate-reserve":
+                fail(f"lane {lane_id}: vm_cores_from must be \"gate-reserve\"")
+            if vm_cores is not None:
+                fail(f"lane {lane_id}: set vm_cores or vm_cores_from, not both")
         priority = lane.get("priority")
         if priority is not None and (
                 not isinstance(priority, str) or priority not in LEASE_PRIORITIES):
@@ -2382,6 +2388,12 @@ def lane_plist(
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
+    if "vm_cores_from" in lane:
+        # Derived at lease time from this host's live gate reserve
+        # (gate_reserve_fit.share_cores), so the rendered plist names the rule
+        # and the slot count, never a size measured on another machine.
+        env["TARTCI_MACOS_VM_CORES_FROM"] = lane["vm_cores_from"]
+        env["TARTCI_MACOS_VM_CORES_SLOTS"] = str(lane.get("supervisors", 1))
     if lane.get("tier"):
         env["TARTCI_RUNNER_WORKFLOW_TIERS"] = "\n".join(
             f"{row['label']}|{row['workflow']}" for row in lane["tier"]

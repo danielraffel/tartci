@@ -123,8 +123,17 @@ ALLOWED = {
      "Run"):
         reads_profile("gate_ccache_trim.load_settings()"),
     ("test_gate_reserve_fit.py",
-     "FitTests.test_m3_and_m5studio_fit_and_m1_and_m5_overcommit_cores"):
+     "FitTests.test_m3_m5studio_and_m5_fit_and_m1_overcommits_cores"):
         SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "FitTests.test_control_m5_without_the_reserve_share_overcommits_cores"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "FitTests.test_m5_slots_are_four_cores_each"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "M5DoctorTests"):
+        LANES,
     ("test_gate_reserve_fit.py",
      "NoReserveTests.test_summary_and_doctor_say_not_applicable_not_fits"):
         LANES,
@@ -138,7 +147,10 @@ ALLOWED = {
      "RatchetTests.test_a_smaller_overcommit_passes_and_reports_smaller"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
-     "RatchetTests.test_m1_and_m5_report_on_every_update_and_never_block"):
+     "RatchetTests.test_m1_and_the_old_m5_report_on_every_update_and_never_block"):
+        SHIPPED,
+    ("test_gate_reserve_fit.py",
+     "RatchetTests.test_m5_moving_to_the_reserve_share_is_accepted_and_fits"):
         SHIPPED,
     ("test_gate_reserve_fit.py",
      "RatchetTests.test_the_373_sizing_is_refused_against_the_installed_profile"):

@@ -50,15 +50,41 @@ def pulp_gate(data: dict) -> dict:
     return next(lane for lane in data["lane"] if lane["id"] == "pulp-gate")
 
 
+SHARE_LINE = 'vm_cores_from = "gate-reserve"\n'
+
+
+def old_m5_text() -> str:
+    """m5's profile as it was before its Pulp lane sized from the gate reserve."""
+    text = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+    if text.count(SHARE_LINE) != 1:
+        raise AssertionError("m5's pulp-gate lane no longer sets vm_cores_from once")
+    return text.replace(SHARE_LINE, "")
+
+
+def old_m5() -> dict:
+    return tomllib.loads(old_m5_text())
+
+
 class FitTests(unittest.TestCase):
     @requires_tomllib
-    def test_m3_and_m5studio_fit_and_m1_and_m5_overcommit_cores(self) -> None:
-        expected = {"m3": [], "m5studio": [],
-                    "m1": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3"],
-                    "m5": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=12 reserve=8"]}
+    def test_m3_m5studio_and_m5_fit_and_m1_overcommits_cores(self) -> None:
+        expected = {"m3": [], "m5studio": [], "m5": [],
+                    "m1": ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3"]}
         for host, lines in expected.items():
             with self.subTest(host=host):
                 self.assertEqual(grf.finding_lines(grf.fit(profile(host), HOSTS[host])), lines)
+
+    @requires_tomllib
+    def test_control_m5_without_the_reserve_share_overcommits_cores(self) -> None:
+        self.assertEqual(grf.finding_lines(grf.fit(old_m5(), HOSTS["m5"])),
+                         ["gate_reserve_overcommitted lane=pulp-gate axis=cores "
+                          "demand=12 reserve=8"])
+
+    @requires_tomllib
+    def test_m5_slots_are_four_cores_each(self) -> None:
+        rows = [r for r in grf.fit(profile("m5"), HOSTS["m5"]) if r["lane"] == "pulp-gate"]
+        self.assertEqual({r["axis"]: (r["demand"], r["reserve"]) for r in rows},
+                         {"cores": (8, 8), "memory": (2 * grf.vm_mem_mb(4), 67876)})
 
     def test_an_explicit_vm_lane_is_not_a_gate_lane(self) -> None:
         data = {"lane": [{"id": "a", "priority": "vm", "supervisors": 2},
@@ -72,6 +98,43 @@ class FitTests(unittest.TestCase):
         out = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                              timeout=30).stdout.split()
         self.assertEqual([int(v) for v in out], [grf.vm_mem_mb(c) for c in (1, 3, 6, 7, 8, 14)])
+
+
+class ShareCoresTests(unittest.TestCase):
+    """share_cores: the largest per-slot size whose slots fit the reserve on both axes."""
+
+    def test_each_hosts_share(self) -> None:
+        # m3's facts give the 7 that #373 chose by hand; m5studio's reserve is
+        # larger than its pool, so the pool stays the size.
+        self.assertEqual({host: grf.share_cores(facts, 2) for host, facts in HOSTS.items()},
+                         {"m3": 7, "m5studio": 6, "m1": 1, "m5": 4})
+        self.assertEqual(grf.share_cores(HOSTS["m5"], 1), 6)
+
+    def test_memory_can_bind_before_cores(self) -> None:
+        # 7 cores fit 14 by cores, but 2 x 12288 MB does not fit 20000 MB;
+        # 6 cores need 2 x 10240 = 20480, still too much; 5 cores 2 x 8192 fit.
+        host = {"reserved_gate_cores": 14, "vm_pool_cores": 14, "reserved_gate_mem_mb": 20000}
+        self.assertEqual(grf.share_cores(host, 2), 5)
+        lanes = {"lane": [{"id": "g", "supervisors": 2, "vm_cores_from": "gate-reserve"}]}
+        self.assertEqual(grf.finding_lines(grf.fit(lanes, host)), [])
+
+    def test_no_reserve_keeps_the_pool_and_a_tiny_reserve_never_goes_below_one(self) -> None:
+        self.assertEqual(grf.share_cores({"reserved_gate_cores": 0, "vm_pool_cores": 6}, 2), 6)
+        self.assertEqual(grf.share_cores({"reserved_gate_cores": 1, "vm_pool_cores": 6}, 2), 1)
+
+    def test_an_explicit_vm_cores_wins(self) -> None:
+        lane = {"vm_cores": 5, "vm_cores_from": "gate-reserve", "supervisors": 2}
+        self.assertEqual(grf.lane_vm_cores(lane, HOSTS["m5"]), 5)
+        self.assertEqual(grf.lane_vm_cores({"supervisors": 2}, HOSTS["m5"]), 6)
+
+    def test_share_cores_cli_reads_a_host_json(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            facts = Path(td) / "host.json"
+            facts.write_text(json.dumps(HOSTS["m5"]))
+            res = subprocess.run([sys.executable, "scripts/gate_reserve_fit.py", "share-cores",
+                                  "--slots", "2", "--host-json", str(facts)],
+                                 cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual((res.returncode, res.stdout.strip()), (0, "4"), res.stderr)
 
 
 class MemoryAxisTests(unittest.TestCase):
@@ -167,18 +230,23 @@ class RatchetTests(unittest.TestCase):
                                     "installed_over=0 target_over=10 reserve=14"])
 
     @requires_tomllib
-    def test_m1_and_m5_report_on_every_update_and_never_block(self) -> None:
-        for host in ("m1", "m5"):
+    def test_m1_and_the_old_m5_report_on_every_update_and_never_block(self) -> None:
+        for host, data in (("m1", profile("m1")), ("m5", old_m5())):
             with self.subTest(host=host):
-                rows, refusals = grf.ratchet(profile(host), profile(host), HOSTS[host])
+                rows, refusals = grf.ratchet(data, data, HOSTS[host])
                 self.assertEqual(refusals, [])
                 self.assertEqual(len(grf.finding_lines(rows)), 1)
 
     @requires_tomllib
+    def test_m5_moving_to_the_reserve_share_is_accepted_and_fits(self) -> None:
+        rows, refusals = grf.ratchet(old_m5(), profile("m5"), HOSTS["m5"])
+        self.assertEqual((grf.finding_lines(rows), refusals), ([], []))
+
+    @requires_tomllib
     def test_a_smaller_overcommit_passes_and_reports_smaller(self) -> None:
-        target = profile("m5")
+        target = old_m5()
         pulp_gate(target)["vm_cores"] = 5
-        rows, refusals = grf.ratchet(profile("m5"), target, HOSTS["m5"])
+        rows, refusals = grf.ratchet(old_m5(), target, HOSTS["m5"])
         self.assertEqual(refusals, [])
         self.assertEqual(grf.finding_lines(rows),
                          ["gate_reserve_overcommitted lane=pulp-gate axis=cores demand=10 reserve=8"])
@@ -216,12 +284,49 @@ class ValidateCliTests(unittest.TestCase):
         self.assertIn("gate_reserve_overcommitted lane=pulp-gate axis=cores demand=6 reserve=3",
                       res.stdout)
 
+    def test_validate_accepts_m5_moving_from_the_old_sizing(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            installed = Path(td) / "installed.toml"
+            installed.write_text(old_m5_text())
+            target = ROOT / "profiles" / "m5-macos-fleet.toml"
+            facts = Path(td) / "host.json"
+            facts.write_text(json.dumps(HOSTS["m5"]))
+            res = subprocess.run(
+                [sys.executable, "scripts/macos_fleet_lanes.py", "validate", str(target),
+                 "--check-reserve", "--installed", str(installed),
+                 "--host-profile-json", str(facts)],
+                cwd=ROOT, capture_output=True, text=True, timeout=60)
+        self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+        self.assertNotIn("gate_reserve", res.stdout + res.stderr)
+
     def test_plain_validate_is_unchanged(self) -> None:
         res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
                               str(ROOT / "profiles" / "m1-macos-fleet.toml")],
                              cwd=ROOT, capture_output=True, text=True, timeout=60)
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertNotIn("gate_reserve", res.stdout)
+
+
+@requires_tomllib
+class M5DoctorTests(unittest.TestCase):
+    """The doctor's gate_reserve check on m5, through the summary it reads."""
+
+    def finding(self, text: str):
+        import macos_fleet_lanes
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(macos_fleet_lanes, "live_host_profile",
+                                  return_value=HOSTS["m5"]):
+            config = Path(td) / "profile.toml"
+            config.write_text(text)
+            value = macos_fleet_lanes.gate_reserve_summary(config)
+        return fd.check_gate_reserve(value, installed_present=True)
+
+    def test_old_sizing_is_a_problem_and_the_reserve_share_fits(self) -> None:
+        before = self.finding(old_m5_text())
+        self.assertEqual((before.state, before.code), (fd.PROBLEM, "gate_reserve_overcommitted"))
+        self.assertIn("lane=pulp-gate axis=cores demand=12 reserve=8", before.detail)
+        after = self.finding((ROOT / "profiles" / "m5-macos-fleet.toml").read_text())
+        self.assertEqual((after.state, after.code), (fd.OK, "gate_reserve_fits"))
 
 
 class DoctorTests(unittest.TestCase):
