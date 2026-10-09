@@ -277,6 +277,28 @@
       "remedy": "Bring the peer back: it needs someone at the machine if ssh times out. Nothing on this host needs to change; the exclusion ends by itself when the peer answers.",
       "do_not": "Do not treat the excluded peer as serving: its lanes take no jobs while it is dark."
     },
+    "pf_not_applicable": {
+      "summary": "This host has no VM lanes, so there is no VM network for pf to hold up."
+    },
+    "pf_pfd_exiting": {
+      "summary": "pfd keeps exiting with a code other than 3 on a host that shares its network with VMs.",
+      "why": "InternetSharing waits on pfd before it creates the VM network. Exit 3 is the known no-reference fault; any other non-zero exit with pfd not running is a pfd failure this check has not seen before.",
+      "remedy": "Read `launchctl print system/com.apple.pfd` and `log show --last 10m --predicate 'process == \"pfd\"'` on the host, and compare with the VM DHCP breaker (`tartci doctor fleet`, vm_dhcp)."
+    },
+    "pf_reference_missing": {
+      "summary": "pf holds no enable reference on a host that shares its network with VMs, so pfd exits 3 and InternetSharing never creates the VM network.",
+      "why": "InternetSharing asks pfd for packet-filter state before it creates bridge100; with no pf enable reference pfd logs \"no pf starter references held\" and exits 3, so every VM boots without an address. pf's state needs root to read, but pfd's launchd record does not: healthy is running or an idle exit 0, this fault is exit 3 with a climbing run count. A reboot drops every reference, which is how m5 lost its VM network on 2026-10-07 and 2026-10-09.",
+      "remedy": "On the host (tartci never runs it): `sudo pfctl -E` takes one ref-counted pf enable reference now (keep the printed token; `sudo pfctl -X <token>` is the undo), then `tartci vm-dhcp probe-now`. To hold it across reboots, install the boot-time holder m5 runs since 2026-10-09: /Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist, RunAtLoad, running `/sbin/pfctl -E` and saving the token to /var/run/pf-enable-ref.token (docs/runbook.md, VM DHCP breaker, 'pf enable reference'); load it with `sudo launchctl bootstrap system <plist>`.",
+      "do_not": "Never `pfctl -d`: it drops every holder's references. Never kickstart com.apple.NetworkSharing: System Integrity Protection refuses it (error 150)."
+    },
+    "pf_reference_ok": {
+      "summary": "pfd is healthy (running, or idle-exited 0), so pf holds an enable reference and InternetSharing can create the VM network."
+    },
+    "pf_reference_unknown": {
+      "summary": "pfd's launchd record could not be read.",
+      "why": "An unreadable pfd record is not evidence that pf holds a reference.",
+      "remedy": "Run `launchctl print system/com.apple.pfd` on the host."
+    },
     "persistent_runners_without_hold_receipt": {
       "summary": "Drain will refuse, and it refuses after the host is already opted out.",
       "why": "A stock persistent Actions listener has no safe local drain primitive: worker absence misses the interval between a job being accepted and its worker spawning, so stopping on that evidence can kill a running job. Draining safely requires removing the host from routing and publishing a held-idle receipt only once the scheduler reports every persistent runner idle. No supported producer ships that receipt today. Drain writes participation=0 and pool-state=draining before it discovers this, so a refusal leaves the host opted out with its agents still loaded.",
@@ -606,7 +628,7 @@
     "vm_dhcp_pfd_crash_loop": {
       "summary": "VMs on this host stopped getting an address because pfd, the packet-filter daemon InternetSharing waits on, keeps exiting, so the VM network is never created.",
       "why": "InternetSharing asks pfd for packet-filter state before it creates bridge100, and pfd exits 3 when pf holds no enable reference: it logs \"no pf starter references held\" and exits, so InternetSharing's request is never served and no VM network appears. On m5 on 2026-10-07, after a reboot, `sudo pfctl -s info` read \"Status: Disabled\" and `sudo pfctl -s References` read \"No pf starter references held\"; pfd exited 3 every 10 s (state \"spawn scheduled\", runs climbing by thousands). A healthy pfd serves its requests and then idle-exits with last exit 0; exit 3 with a climbing run count is this fault. `launchctl print system/com.apple.pfd` (no root) shows the state, runs and last exit code.",
-      "remedy": "On the host (tartci never runs it): `sudo pfctl -E`. It takes one ref-counted pf enable reference and prints a token; keep the token, which is the undo key (`sudo pfctl -X <token>`). On m5 on 2026-10-07 this brought pfd to running and then an idle exit 0, bridge100 came up at 192.168.64.1 on the next VM, and the breaker closed on its probe's address. Then run `tartci vm-dhcp probe-now` so the next lane probes at once. The reference does not survive a reboot: a recurrence after a reboot is caught by the post-boot verification and the alert, and `sudo pfctl -E` is run again. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150). Never `pfctl -d`: it drops every holder's pf references.",
+      "remedy": "On the host (tartci never runs it): `sudo pfctl -E`. It takes one ref-counted pf enable reference and prints a token; keep the token, which is the undo key (`sudo pfctl -X <token>`). On m5 on 2026-10-07 this brought pfd to running and then an idle exit 0, bridge100 came up at 192.168.64.1 on the next VM, and the breaker closed on its probe's address. Then run `tartci vm-dhcp probe-now` so the next lane probes at once. The reference does not survive a reboot unless a LaunchDaemon takes it at boot: install the boot-time holder described under the doctor's pf_reference_missing (docs/runbook.md, 'pf enable reference'). Without it a recurrence after a reboot is caught by the post-boot verification and the alert, and `sudo pfctl -E` is run again. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150). Never `pfctl -d`: it drops every holder's pf references.",
       "do_not": "Do not move /etc/bootpd.plist or /Library/Preferences/SystemConfiguration/com.apple.vmnet.plist aside, and do not restart bootpd for this: neither is the failing layer."
     },
     "vm_dhcp_unanswered": {
