@@ -403,6 +403,31 @@ def peer_reachability(home: Path | None = None) -> dict:
     return {"state": "dark" if peers else "ok", "peers": peers}
 
 
+def paused_line(state_dir: Path, now: float | None = None) -> str | None:
+    """Why self-update has not run, when the launchd interval guard is holding
+    it: during a launchd timer stall launchd starts nothing on its own and the
+    guard deliberately does not kick self-update, so self-update writes no log
+    line and no attempt of its own. Read-only; None when not paused or when the
+    guard's receipt cannot be read."""
+    try:
+        import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
+        directory = (Path(os.environ["TARTCI_INTERVAL_GUARD_DIR"])
+                     if os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+                     else state_dir.parent / "launchd-interval-guard")
+        value = guard.status(directory, now=now)
+    except Exception:  # noqa: BLE001 - a status surface never raises
+        return None
+    paused = [row for row in value.get("paused") or []
+              if isinstance(row, dict) and "self-update" in str(row.get("label"))]
+    if value.get("state") != "stalled" or not paused:
+        return None
+    started = (value.get("episode") or {}).get("started_ts")
+    since = _iso(float(started)) if isinstance(started, (int, float)) else "an unknown time"
+    return (f"self-update PAUSED by the launchd timer stall since {since}: launchd has not "
+            "started it and the interval guard does not kick it during the stall, so it "
+            "has written no attempt since; a reboot resumes it")
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -434,7 +459,8 @@ def summary(home: Path | None = None) -> dict:
     aged = skew_stale_note(skew)
     if aged:
         problem = f"{problem}; skew {aged}" if problem else f"skew {aged}"
-    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem}
+    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem,
+            "paused": paused_line(state)}
 
 
 def load_config(home: Path, settings: Path | None = None) -> Config:
@@ -2418,6 +2444,9 @@ def status_lines(state_dir: Path) -> list[str]:
     skew = _read_json(state_dir / "skew.json")
     aged = skew_stale_note(skew)
     lines = [render_skew(skew) + (f" {aged}" if aged else "")]
+    paused = paused_line(state_dir)
+    if paused:
+        lines.append(paused)
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"

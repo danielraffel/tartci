@@ -1403,6 +1403,69 @@ class VmDhcpVerifyTests(Base):
         self.assertEqual(self.sys.vm_verify_calls, [])
 
 
+class PausedByStallTests(Base):
+    """A self-update the launchd guard holds for a timer stall says so itself."""
+
+    STARTED = NOW - 4 * 86400
+
+    SELF = "com.danielraffel.tartci.self-update"
+
+    def guard(self, *, paused=(SELF,), active=True, age=60, directory=None):
+        directory = directory or self.cfg.state_dir.parent / "launchd-interval-guard"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "status.json").write_text(json.dumps({
+            "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
+            "stalled": [{"label": self.SELF, "interval": 1800}],
+            "paused": [{"label": label, "interval": 1800} for label in paused],
+            "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
+
+    def stale_skew(self):
+        su._write_json(self.cfg.state_dir / "skew.json", {
+            "state": "behind", "behind": 44, "stale": True, "installed": INSTALLED,
+            "target": T_OLD, "oldest_undeployed": "2026-10-05T05:21:21Z",
+            "measured_at": su._iso(time.time())})
+
+    def test_a_paused_self_update_says_why_everywhere(self):
+        # m3 from 2026-10-05: behind and stale, no attempt since, the guard
+        # holding it. Its status and doctor read like a failed update.
+        import fleet_doctor
+        self.stale_skew()
+        self.guard()
+        since = su._iso(self.STARTED)
+        lines = su.status_lines(self.cfg.state_dir)
+        self.assertTrue(any(l.startswith(f"self-update PAUSED by the launchd timer stall since {since}")
+                            for l in lines), lines)
+        summary = su.summary(self.home)
+        self.assertIn("a reboot resumes it", summary["paused"])
+        finding = fleet_doctor.check_self_update(summary)
+        self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
+        self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+
+    def test_the_guard_dir_override_is_honoured(self):
+        other = self.home / "guard-elsewhere"
+        self.guard(directory=other)
+        with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
+            self.assertIsNotNone(su.paused_line(self.cfg.state_dir))
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
+
+    def test_not_paused_unless_the_guard_holds_self_update_in_a_live_stall(self):
+        import fleet_doctor
+        self.stale_skew()
+        for name, kwargs in (("another agent paused, not self-update",
+                              {"paused": ("com.danielraffel.tartci.launchd-watchdog",)}),
+                             ("nothing paused", {"paused": ()}),
+                             ("no active episode", {"active": False}),
+                             ("stale guard receipt", {"age": 10 * 3600})):
+            with self.subTest(case=name):
+                self.guard(**kwargs)
+                self.assertIsNone(su.paused_line(self.cfg.state_dir))
+                self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
+                                 "self_update_problem")
+
+    def test_no_guard_receipt_is_not_paused(self):
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
+
+
 class AgentTemplateTests(unittest.TestCase):
     def test_template_renders_and_installer_only_plans_by_default(self) -> None:
         with tempfile.TemporaryDirectory() as td:
