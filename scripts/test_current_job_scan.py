@@ -23,7 +23,8 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 FAKE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
+time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 from urllib.parse import parse_qs, urlparse
 p = urlparse("https://x/" + sys.argv[-1]); path = p.path; page = int(parse_qs(p.query).get("page", ["1"])[0])
 kind = os.environ.get("FAKE_KIND", "active")
@@ -56,8 +57,17 @@ else: raise SystemExit(4)
 '''
 
 
+# A scan here makes about 107 fake API calls, each a new python3 process:
+# 5-7 s on a quiet host against the scanner's 10 s default budget, and past it
+# under a loaded full-suite run, where the receipt read observation_error.
+# These tests are about classification, so they give the scan budgets far
+# beyond any load; the deadline itself is pinned by its own test.
+BUDGETS = ("--scan-timeout", "600", "--gh-timeout", "120")
+
+
 class CurrentJobScanTests(unittest.TestCase):
-    def _scan(self, kind: str = "active", *extra: str) -> subprocess.CompletedProcess[str]:
+    def _scan(self, kind: str = "active", *extra: str, budgets: tuple[str, ...] = BUDGETS,
+              delay: float = 0) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             fake = Path(directory) / "fake-gh"
             _write_exec(fake, FAKE)
@@ -66,8 +76,9 @@ class CurrentJobScanTests(unittest.TestCase):
                  "--runner", RUNNER_NAME, "--workflow", "Build and Test",
                  "--gh-cli", str(fake),
                  "--observation-lock-file", str(Path(directory) / "observation.lock"),
-                 *extra],
-                env={**os.environ, "FAKE_KIND": kind}, text=True, capture_output=True, check=False,
+                 *budgets, *extra],
+                env={**os.environ, "FAKE_KIND": kind, "FAKE_DELAY": str(delay)},
+                text=True, capture_output=True, check=False,
             )
 
     def test_assignment_beyond_first_repository_run_page_is_exactly_confirmed(self) -> None:
@@ -80,6 +91,21 @@ class CurrentJobScanTests(unittest.TestCase):
         receipt = json.loads(self._scan("unexpected").stdout)
         self.assertEqual(receipt["kind"], "unexpected_assignment")
         self.assertEqual(receipt["workflow_name"], "Surprise")
+
+    def test_classification_survives_a_slow_api(self) -> None:
+        # 50 ms more per call stands in for a loaded host: under the 10 s
+        # default this read observation_error.
+        receipt = json.loads(self._scan("unexpected", delay=0.05).stdout)
+        self.assertEqual(receipt["kind"], "unexpected_assignment")
+
+    def test_a_scan_past_its_deadline_is_an_observation_error(self) -> None:
+        # The deadline is a wall-clock budget by design; 0.3 s cannot cover
+        # the scan's ~107 process spawns on any host.
+        result = self._scan("unexpected", budgets=("--scan-timeout", "0.3"))
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["kind"], "observation_error")
+        # Either the overall deadline or the call it cut short reports it.
+        self.assertRegex(receipt["detail"], r"overall deadline|timed out after")
 
     def test_ambiguous_assignment_is_typed(self) -> None:
         receipt = json.loads(self._scan("ambiguous").stdout)
