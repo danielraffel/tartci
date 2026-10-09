@@ -501,6 +501,12 @@ class PfdLayer(Case):
         self.assertIn("pfd keeps exiting", detail)
         self.assertNotIn("no enable reference", detail)
 
+    def test_an_ordinary_pfd_failure_does_not_claim_a_reboot(self):
+        detail = vb.doctor_code({"state": "open", "cause": "pfd_crash_loop",
+                                 "pfd": {"state": "spawn scheduled", "last_exit": "3"}})[2]
+        self.assertIn("pf holds no enable reference", detail)
+        self.assertNotIn("found by the post-boot probe", detail)
+
     def test_a_post_boot_pfd_failure_says_it_followed_a_reboot(self):
         self.ifaces.write_text("lo0 en0")
         self.pfd.write_text(self.CRASHING)
