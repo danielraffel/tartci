@@ -114,6 +114,12 @@ except ImportError:  # pragma: no cover - tartci hosts are POSIX.
 K = 2
 WINDOW_S = 15 * 60
 PROBE_SECS = 300
+# Boot counts per UTC hour, kept this long; outages kept, newest last.
+HOURLY_KEEP_SECS = 14 * 86400
+OUTAGES_KEEP = 50
+# What survives a change of state: the boot clock, the measurements, and an
+# outage that is still running across a reboot.
+CARRIED_KEYS = ("boot_time", "hourly", "outages", "outage")
 VERIFY_REPORT_SECS = 960
 STATES = ("open", "closed", "verifying")
 MAX_STREAK = 50
@@ -358,6 +364,42 @@ def iso(ts: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
 
 
+def carried(value: dict[str, Any]) -> dict[str, Any]:
+    """The keys every state change keeps (CARRIED_KEYS). close(), verified()
+    and enter_verifying() all rebuild the breaker from this, never from a
+    hand-copied list."""
+    return {key: value[key] for key in CARRIED_KEYS if key in value}
+
+
+def count_boot(value: dict[str, Any], outcome: str, now: float) -> None:
+    """One boot per record() call, probe or lane, in its UTC hour."""
+    hour = time.strftime("%Y-%m-%dT%H", time.gmtime(now))
+    cutoff = time.strftime("%Y-%m-%dT%H", time.gmtime(now - HOURLY_KEEP_SECS))
+    hourly = {h: c for h, c in (value.get("hourly") or {}).items()
+              if isinstance(c, dict) and h > cutoff}
+    bucket = hourly.setdefault(hour, {"ip": 0, "no_ip": 0})
+    bucket[outcome] = int(bucket.get(outcome) or 0) + 1
+    value["hourly"] = hourly
+
+
+def outage_so_far(value: dict[str, Any], now: float) -> dict[str, Any]:
+    """The running outage: begun at the earliest open, across any reboot."""
+    earlier = value.get("outage") or {}
+    opened = earlier.get("opened_at") or value.get("opened_at") or now
+    return {"opened_at": opened,
+            "vms_spent": int(earlier.get("vms_spent") or 0) + int(value.get("vms_spent") or 0),
+            "cause": value.get("cause") or earlier.get("cause")}
+
+
+def end_outage(value: dict[str, Any], now: float, closed_by: str) -> None:
+    """Append the outage that just ended to the bounded history."""
+    outage = outage_so_far(value, now)
+    outage.update({"closed_at": now, "duration_s": int(now - float(outage["opened_at"])),
+                   "closed_by": closed_by})
+    value["outages"] = (list(value.get("outages") or []) + [outage])[-OUTAGES_KEEP:]
+    value.pop("outage", None)
+
+
 def close(value: dict[str, Any], now: float, reason: str) -> list[list[str]]:
     opened = float(value.get("opened_at") or now)
     possible = max(float(value.get("last_probe_at") or opened),
@@ -368,9 +410,10 @@ def close(value: dict[str, Any], now: float, reason: str) -> list[list[str]]:
         "probes": int(value.get("probes") or 0),
         "latency_s": int(now - possible) if reason != "host_reboot" else None,
     })]
-    booted = value.get("boot_time")
+    end_outage(value, now, reason)
+    kept = carried(value)
     value.clear()
-    value.update({"state": "closed", "streak": [], "last_ip_at": now, "boot_time": booted})
+    value.update({"state": "closed", "streak": [], "last_ip_at": now, **kept})
     return [event]
 
 
@@ -378,8 +421,12 @@ def enter_verifying(value: dict[str, Any], now: float, reason: str,
                     booted: float | None) -> list[list[str]]:
     """Prove the VM network with one probe before lanes clone freely."""
     previous = value.get("cause") if value.get("state") == "open" else None
+    if value.get("state") == "open":
+        # The outage runs on through the reboot until a VM gets an address.
+        value["outage"] = outage_so_far(value, now)
+    kept = carried(value)
     value.clear()
-    value.update({"state": "verifying", "streak": [], "verify_reason": reason,
+    value.update({**kept, "state": "verifying", "streak": [], "verify_reason": reason,
                   "verifying_since": now, "boot_time": booted, "previous_cause": previous,
                   "probe_lane": None, "probe_started_at": None})
     return [["vm_dhcp_verifying", fmt({"reason": reason, "previous_cause": previous})]]
@@ -390,9 +437,11 @@ def verified(value: dict[str, Any], now: float, lane: str, *, late: bool) -> lis
     event = ["vm_dhcp_verified", fmt({
         "reason": value.get("verify_reason"), "lane": lane, "late": "true" if late else None,
         "latency_s": int(now - float(value.get("verifying_since") or now))})]
-    booted = value.get("boot_time")
+    if late or value.get("outage"):
+        end_outage(value, now, "late" if late else "verified")
+    kept = carried(value)
     value.clear()
-    value.update({"state": "closed", "streak": [], "last_ip_at": now, "boot_time": booted})
+    value.update({"state": "closed", "streak": [], "last_ip_at": now, **kept})
     return event
 
 
@@ -492,6 +541,7 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
     with locked(breaker_dir()) as path:
         value = load(path)
         events: list[list[str]] = []
+        count_boot(value, args.outcome, now)
         verifying = value.get("state") == "verifying"
         probe = (value.get("state") in ("open", "verifying")
                  and value.get("probe_lane") == args.lane)
@@ -620,6 +670,52 @@ def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
         return ("ok", "vm_dhcp_ok", "VM DHCP breaker closed")
     return ("unknown", "vm_dhcp_unreadable",
             f"VM DHCP breaker unreadable: {value.get('error')}")
+
+
+def boot_health(value: dict[str, Any], now: float, lanes: int) -> tuple[str, str, str]:
+    """(state, code, detail) for the host's VM boot record, from the hourly
+    counts and the outage history.
+
+    Degraded when the last 24 h hold at least max(2, lanes) boots that got no
+    address: one failed boot per lane in a day. On 30 days of the fleet's own
+    lane logs (2026-10-07) m3, m1 and m5studio had no day with any no_ip;
+    m5's outage days had 13, 10, 172 and 122, and its one isolated day had 2
+    in 53 boots. A count, not a rate: at these volumes a single failure moves
+    the rate, so the rate is reported and never judged. The max(2, ...) keeps
+    a one- or two-lane host from reading degraded on one isolated failure.
+    """
+    if value.get("state") == "unreadable":
+        return ("unknown", "vm_boot_unreadable",
+                f"VM boot record unreadable: {value.get('error')}")
+    hourly = value.get("hourly") or {}
+    if not hourly:
+        return ("not_applicable", "vm_boot_unmeasured",
+                "no VM boot has been counted on this host yet")
+
+    def window(secs: float) -> tuple[int, int]:
+        since = time.strftime("%Y-%m-%dT%H", time.gmtime(now - secs))
+        rows = [c for h, c in hourly.items() if h >= since and isinstance(c, dict)]
+        return (sum(int(c.get("ip") or 0) for c in rows),
+                sum(int(c.get("no_ip") or 0) for c in rows))
+
+    def line(label: str, ip: int, no_ip: int) -> str:
+        total = ip + no_ip
+        rate = f" ({100 * ip / total:.1f}%)" if total else ""
+        return f"{label}: {ip}/{total} boots got an address{rate}"
+
+    day_ip, day_no = window(86400)
+    week_ip, week_no = window(7 * 86400)
+    recent = [o for o in value.get("outages") or []
+              if isinstance(o, dict) and float(o.get("closed_at") or 0) >= now - 7 * 86400]
+    down = sum(int(o.get("duration_s") or 0) for o in recent)
+    detail = (f"{line('24 h', day_ip, day_no)}; {line('7 d', week_ip, week_no)}; "
+              f"outages in 7 d: {len(recent)}, {down // 3600}h{down % 3600 // 60:02d}m down")
+    threshold = max(2, int(lanes))
+    if day_no >= threshold:
+        return ("problem", "vm_boot_degraded",
+                f"{day_no} boots got no address in 24 h (threshold {threshold}, "
+                f"one per lane): {detail}")
+    return ("ok", "vm_boot_ok", detail)
 
 
 def alert_due(value: dict[str, Any], now: float,

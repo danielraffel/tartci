@@ -1731,6 +1731,30 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   alert state and retried every pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
+- **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
+  boot to its UTC hour (kept 14 days), and every outage that ends is appended
+  to a history of the last 50 (`opened_at`, `closed_at`, `duration_s`,
+  `vms_spent`, `cause`, `closed_by`: `probe`, `boot_ok`, `verified` or `late`).
+  An outage that runs across a reboot is one outage, from its first opening.
+  The breaker keeps these through every change of state (`CARRIED_KEYS`).
+  `vm_boot_ok` reports the 24 h and 7 d boots that got an address, with the
+  rate, and the outages of the last week; `vm_boot_degraded` means at least
+  `max(2, lanes)` boots got no address in the last 24 h, where `lanes` is the
+  host's installed lane agents (the same count the home-volume floor uses).
+  The threshold is a count, not a rate, from 30 days of the fleet's lane logs
+  (2026-10-07):
+
+  | Host | days | days with any no_ip | worst days (ok/no_ip) |
+  |---|---|---|---|
+  | m3 | 31 | 0 | — |
+  | m1 | 29 | 0 | — |
+  | m5s | 9 | 0 | — |
+  | m5 | 31 | 8 | 0/172, 0/122 (2026-10-06/07), 63/13 (09-23), 53/10 (10-04), 51/2 (09-22) |
+
+  One failed boot per lane in a day trips every m5 outage day and leaves its
+  isolated 2-in-53 day OK; `max(2, …)` keeps a one- or two-lane host from
+  reading degraded on one isolated failure. The rate is reported and never
+  judged: at these volumes one failure moves it.
 - **Fails open:** an unreadable breaker reads as closed and never verifies.
   Writes are atomic under a lock.
 - **Turning it off:** set `vm_dhcp_breaker = false` under `[host]` to disable
