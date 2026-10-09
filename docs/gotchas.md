@@ -80,6 +80,15 @@ it heals on its own. To spot it, compare the age of the newest entry in
 `~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
 not the exit code.
 
+The one agent the guard does not kick is self-update, for as long as the stall
+lasts (`PAUSE_DURING_STALL`): an update stops every supervisor, so no guard
+would run and any lane restart left to launchd would pend. Self-update then
+writes no log line and no attempt for days (m3 from 2026-10-05, 44 commits
+behind). `tartci fleet-macos self-update --status` and `tartci doctor fleet`
+say so (`self_update_paused`, with the stall's start) rather than reading like
+a failed update. The remedy is the stall's: reboot when the lanes are idle.
+Do not kickstart self-update during the stall.
+
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 

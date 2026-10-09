@@ -131,6 +131,7 @@ CODES: tuple[str, ...] = (
     "reuse_canary_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
+    "self_update_paused",
     "self_update_problem",
     "self_update_unmeasured",
     "signing_prompts_not_applicable",
@@ -758,6 +759,12 @@ def check_self_update(summary: dict | None) -> Finding:
                        "tartci's skew against main was never measured on this host "
                        "(run `tartci fleet-macos self-update --plan`)")
     lines = "; ".join(summary.get("lines") or [])
+    if summary.get("paused"):
+        # Not a failed update: launchd is not starting it and the interval
+        # guard holds it for the stall, so "read the receipt" finds nothing.
+        return Finding("self_update", PROBLEM, "self_update_paused",
+                       f"{summary['paused']} ({lines})", {"skew": summary.get("skew"),
+                                                          "last": summary.get("last")})
     if summary.get("problem"):
         return Finding("self_update", PROBLEM, "self_update_problem",
                        f"{summary['problem']} ({lines})", {"skew": summary.get("skew"),
