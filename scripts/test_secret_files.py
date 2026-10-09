@@ -32,8 +32,10 @@ import keychain_unlock  # noqa: E402
 import secret_files  # noqa: E402
 import signing_prompt_guard as guard  # noqa: E402
 
-SECRET = "FAKEsecret-Zq9x7Wv"
-NOTARY_SECRET = "notaryFAKE-Kp4m2Rt"
+SECRET = "Zq9X!7wV%kP4mR2t"
+NOTARY_SECRET = "Nt7!Qp2W%xK9vB4s"
+# Every window of this many characters of either secret has an uppercase
+# letter and a digit or punctuation, so no temp path or digest can hold one.
 FRAGMENT = 6
 
 
@@ -90,8 +92,8 @@ class NoSecretAnywhere(unittest.TestCase):
         text = text if isinstance(text, str) else json.dumps(text, default=str)
         for secret in (SECRET, NOTARY_SECRET):
             for i in range(len(secret) - FRAGMENT + 1):
-                self.assertNotIn(secret[i:i + FRAGMENT], text,
-                                 f"{label}: a fragment of a secret leaked")
+                window = secret[i:i + FRAGMENT]
+                self.assertNotIn(window, text, f"{label}: a fragment of a secret leaked")  # needle-ok: windows of a mixed-case punctuated secret
 
     def echo(self, script_or_argv: object) -> tuple[int, str]:
         return 1, f"security: failed {script_or_argv} {SECRET} {NOTARY_SECRET}"
@@ -170,7 +172,7 @@ class NoSecretAnywhere(unittest.TestCase):
     def test_the_assertion_sees_a_leak(self) -> None:
         # Control for assertClean: a fragment of the secret is caught.
         with self.assertRaises(AssertionError):
-            self.assertClean("control", f"tail ...{SECRET[3:12]}")
+            self.assertClean("control", "tail ..." + SECRET[3:12])
 
     def test_redact_removes_values_and_shell_quoted_forms(self) -> None:
         (self.secrets / "keychain.env").write_text(f"PULP_SIGN_KEYCHAIN_PW='{SECRET}'\n")
