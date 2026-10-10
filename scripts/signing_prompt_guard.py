@@ -41,6 +41,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_self_update as su  # noqa: E402
 import keychain_unlock  # noqa: E402
+import secret_files  # noqa: E402
 
 # The agent runs every 15 minutes; two missed runs is a stopped agent.
 UNLOCK_STALE_SECS = 2 * keychain_unlock.INTERVAL_SECS + 300
@@ -87,10 +88,34 @@ def status(home: Path | None = None, run: Runner = _run,
     secrets = su.signing_secrets(home)
     dedicated = su.signing_keychain(home)
     password = secrets.get("PULP_SIGN_KEYCHAIN_PW")
+    problem = su.signing_secrets_problem(home)
+    if problem and (not dedicated or not password):
+        return {"state": "risk", "risks": [problem]}
     if not dedicated or not password:
         return {"state": "not_applicable", "risks": [],
                 "detail": "no dedicated signing keychain in keychain.env"}
-    rc, out = run(["security", "list-keychains", "-d", "user"])
+    return _redacted(_status(home, run, now, dedicated, password), home)
+
+
+def _redacted(value: Any, home: Path) -> Any:
+    """`value` with every secrets-file value removed from its strings."""
+    if isinstance(value, str):
+        return secret_files.redact(value, home)
+    if isinstance(value, list):
+        return [_redacted(v, home) for v in value]
+    if isinstance(value, dict):
+        return {k: _redacted(v, home) for k, v in value.items()}
+    return value
+
+
+def _status(home: Path, run: Runner, now: float | None, dedicated: str,
+            password: str) -> dict[str, Any]:
+    def call(argv: list[str]) -> tuple[int, str]:
+        # Redact before any slicing: a truncated secret no longer matches.
+        rc, out = run(argv)
+        return rc, secret_files.redact(out, home)
+
+    rc, out = call(["security", "list-keychains", "-d", "user"])
     if rc != 0:
         return {"state": "unknown", "risks": [], "detail": f"search list unreadable: {out[:200]}"}
     risks = []
@@ -100,12 +125,12 @@ def status(home: Path | None = None, run: Runner = _run,
         risks.append(f"{path} is on the user search list beside the dedicated "
                      f"{Path(dedicated).name}; an unpinned codesign that walks into it while "
                      "it is locked raises a password dialog")
-    rc, out = run(["security", "unlock-keychain", "-p", password, dedicated])
+    rc, out = call(["security", "unlock-keychain", "-p", password, dedicated])
     if rc != 0:
         risks.append(f"{dedicated} does not unlock with keychain.env's password "
                      f"({out.strip()[:120]}); run `pulp ship doctor`")
     else:
-        rc, out = run(["security", "show-keychain-info", dedicated])
+        rc, out = call(["security", "show-keychain-info", dedicated])
         if rc == 0 and (re.search(r"timeout=\d+", out) or "lock-on-sleep" in out):
             risks.append(f"{dedicated} re-locks on its own ({out.strip()[:120]}); "
                          "`pulp ship doctor` sets it to no-timeout")
