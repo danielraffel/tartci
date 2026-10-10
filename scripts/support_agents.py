@@ -100,6 +100,20 @@ def _tart_home(profile: Dict[str, Any]) -> Dict[str, str]:
     return {"TART_HOME": tart_home} if isinstance(tart_home, str) and tart_home else {}
 
 
+def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The frozen-lane threshold from `[launchd_watchdog] stale_log_seconds`.
+
+    It used to live only on hand-edited plists (m1, m5 and m5studio carried
+    `--stale-log-seconds 4500`; the template rendered the 1800 default), so a
+    re-render brought back the kills it was set to stop. Absent, the watchdog
+    keeps its own default.
+    """
+    table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
+    stale = table.get("stale_log_seconds")
+    return ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
+            if type(stale) is int else {})
+
+
 def _backstop_env(profile: Dict[str, Any]) -> Dict[str, str]:
     mode, _ = schedule_backstop_mode.mode_of(profile)
     return dict(schedule_backstop_mode.ENVIRONMENT.get(mode or "", {}))
@@ -141,7 +155,8 @@ REGISTRY: Dict[str, Agent] = {
     # launchd/README.md, so a host could be brought up without them: m5studio
     # served gate VMs with no watchdog and its freshness was never measured.
     "launchd-watchdog": Agent("com.danielraffel.tartci.launchd-watchdog", None,
-                              kickstart=True, settings=_tart_home),
+                              kickstart=True, settings=_tart_home,
+                              environment=_watchdog_env),
     "reap": Agent("com.danielraffel.tartci.reap", None, kickstart=True, settings=_tart_home),
 }
 
