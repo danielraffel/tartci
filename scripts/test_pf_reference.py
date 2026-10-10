@@ -8,6 +8,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -17,6 +18,10 @@ import pf_reference as pr  # noqa: E402
 
 HEALTHY = "\tstate = not running\n\truns = 765\n\tlast exit code = 0\n"
 NO_REFERENCE = "\tstate = spawn scheduled\n\truns = 2621\n\tlast exit code = 3\n"
+# pfd between requests on a host with no reference: launchd has stopped
+# respawning it until the next request, so it reads "not running" with the
+# last exit still 3. This is the shape the doctor most often reads.
+BETWEEN_JOBS = "\tstate = not running\n\truns = 2622\n\tlast exit code = 3\n"
 OTHER_EXIT = "\tstate = spawn scheduled\n\truns = 40\n\tlast exit code = 1\n"
 # The holder Daniel installed on m5 on 2026-10-09, as read from the host.
 M5_HOLDER = {"Label": "com.danielraffel.pf-enable-ref",
@@ -65,6 +70,14 @@ class PfReference(unittest.TestCase):
         self.assertEqual((found.state, found.code), (fd.PROBLEM, "pf_reference_missing"))
         self.assertIn("pfd exits 3", found.detail)
         self.assertIn("no LaunchDaemon takes a pf reference at boot", found.detail)
+
+    def test_between_jobs_a_not_running_pfd_with_exit_3_is_a_missing_reference(self):
+        self.pfd.write_text(BETWEEN_JOBS)
+        found = self.finding()
+        self.assertEqual((found.state, found.code), (fd.PROBLEM, "pf_reference_missing"))
+        # Control: the same record with a clean idle exit is healthy.
+        self.pfd.write_text(HEALTHY)
+        self.assertEqual(self.finding().code, "pf_reference_ok")
 
     def test_a_healthy_pfd_is_ok_and_names_the_boot_holder(self):
         self.holder("com.danielraffel.pf-enable-ref", M5_HOLDER)
@@ -132,6 +145,15 @@ class PfReference(unittest.TestCase):
                             pf_value={"state": "garbage"})
         self.assertEqual([f.code for f in broken if f.check == "pf_reference"],
                          ["pf_reference_unknown"])
+        # A reader that raises is an unknown finding, and the rest of the
+        # doctor still runs.
+        with mock.patch.object(pr, "status", side_effect=OSError("launchctl hung")):
+            raised = fd.collect(home=self.tmp, skip_census=True)
+        found = [f for f in raised if f.check == "pf_reference"]
+        self.assertEqual([f.code for f in found], ["pf_reference_unknown"])
+        self.assertEqual(found[0].facts["pf_reference"]["error"],
+                         "launchctl hung")
+        self.assertIn("signing_prompts", [f.check for f in raised])
 
 
 if __name__ == "__main__":
