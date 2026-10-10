@@ -103,6 +103,12 @@ CODES: tuple[str, ...] = (
     "peer_reachability_unreadable",
     "peer_unreachable",
     "peer_unreachable_excluded",
+    "pf_not_applicable",
+    "pf_boot_holder_missing",
+    "pf_pfd_exiting",
+    "pf_reference_missing",
+    "pf_reference_ok",
+    "pf_reference_unknown",
     "persistent_runners_without_hold_receipt",
     "power_ok",
     "power_sleeps",
@@ -131,6 +137,7 @@ CODES: tuple[str, ...] = (
     "reuse_canary_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
+    "self_update_paused",
     "self_update_problem",
     "self_update_unmeasured",
     "signing_prompts_not_applicable",
@@ -150,6 +157,9 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_janitor_loaded",
+    "vm_janitor_missing",
+    "vm_janitor_unknown",
     "vm_boot_degraded",
     "vm_boot_ok",
     "vm_boot_unmeasured",
@@ -758,6 +768,12 @@ def check_self_update(summary: dict | None) -> Finding:
                        "tartci's skew against main was never measured on this host "
                        "(run `tartci fleet-macos self-update --plan`)")
     lines = "; ".join(summary.get("lines") or [])
+    if summary.get("paused"):
+        # Not a failed update: launchd is not starting it and the interval
+        # guard holds it for the stall, so "read the receipt" finds nothing.
+        return Finding("self_update", PROBLEM, "self_update_paused",
+                       f"{summary['paused']} ({lines})", {"skew": summary.get("skew"),
+                                                          "last": summary.get("last")})
     if summary.get("problem"):
         return Finding("self_update", PROBLEM, "self_update_problem",
                        f"{summary['problem']} ({lines})", {"skew": summary.get("skew"),
@@ -1064,6 +1080,36 @@ def check_support_agents(value: dict | None) -> list[Finding]:
     return [found, extra]
 
 
+VM_JANITOR = "reap"
+
+
+def check_vm_janitor(value: dict | None) -> Finding:
+    """Whether the VM janitor (com.danielraffel.tartci.reap) is installed and loaded.
+
+    Without it a stale VM or overlay stays until someone notices: on
+    2026-10-09 it was loaded on m3 only, while every profile declared it,
+    because `bootstrap = false` kept the support-agents step to a plan.
+    """
+    value = value or {"state": "unreadable"}
+    facts = {"vm_janitor": (value.get("agents") or {}).get(VM_JANITOR)}
+    if value.get("state") in (None, "unreadable", "never"):
+        return Finding("vm_janitor", UNKNOWN, "vm_janitor_unknown",
+                       "no readable support-agents receipt to say whether the VM janitor "
+                       "is installed", facts)
+    if VM_JANITOR not in (value.get("declared") or []):
+        return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                       "the VM janitor (reap) is not declared in this host's profile", facts)
+    entry = (value.get("agents") or {}).get(VM_JANITOR) or {}
+    # `changes` is support_agents.status's verdict, which accounts for what an
+    # apply pass installed; the per-agent state is what the pass found before.
+    if VM_JANITOR not in (value.get("changes") or []):
+        return Finding("vm_janitor", OK, "vm_janitor_loaded",
+                       "the VM janitor (reap) is installed and loaded", facts)
+    return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                   f"the VM janitor (reap) is declared but {entry.get('state') or 'unknown'}"
+                   f"{'' if entry.get('loaded') else ', not loaded'}", facts)
+
+
 def check_reuse_canary(value: dict | None) -> Finding:
     """Whether the reuse canary keeps a bindable record (scripts/reuse_canary.py)."""
     value = value or {"state": "unreadable", "error": "no status"}
@@ -1192,6 +1238,27 @@ def check_power(value: dict | None) -> Finding:
     return Finding("power", UNKNOWN, "power_unknown", detail, facts)
 
 
+def check_pf_reference(value: dict | None) -> Finding:
+    """Whether pf holds an enable reference for the VM network (scripts/pf_reference.py)."""
+    import pf_reference  # noqa: PLC0415 - sibling module; owns the states
+
+    value = value or {"state": "unknown"}
+    detail = pf_reference.describe(value)
+    facts = {"pf_reference": value}
+    state = value.get("state")
+    if state == "ok":
+        return Finding("pf_reference", OK, "pf_reference_ok", detail, facts)
+    if state == "no_reference":
+        return Finding("pf_reference", PROBLEM, "pf_reference_missing", detail, facts)
+    if state == "pfd_exiting":
+        return Finding("pf_reference", PROBLEM, "pf_pfd_exiting", detail, facts)
+    if state == "holder_missing":
+        return Finding("pf_reference", PROBLEM, "pf_boot_holder_missing", detail, facts)
+    if state == "not_applicable":
+        return Finding("pf_reference", NOT_APPLICABLE, "pf_not_applicable", detail, facts)
+    return Finding("pf_reference", UNKNOWN, "pf_reference_unknown", detail, facts)
+
+
 def check_signing_prompts(value: dict | None, home: Path) -> Finding:
     """Whether the keychain setup can raise a password dialog (signing_prompt_guard.py)."""
     import signing_prompt_guard
@@ -1200,7 +1267,8 @@ def check_signing_prompts(value: dict | None, home: Path) -> Finding:
         try:
             value = signing_prompt_guard.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
-            value = {"state": "unknown", "detail": str(exc)}
+            import secret_files
+            value = {"state": "unknown", "detail": secret_files.redact(exc, home)}
     facts = {"signing_prompts": value}
     state = value.get("state")
     if state == "not_applicable":
@@ -1439,6 +1507,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
+            pf_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
@@ -1589,6 +1658,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             support_agents_value = {"state": "unreadable", "error": str(exc)}
     findings.extend(check_support_agents(support_agents_value))
+    findings.append(check_vm_janitor(support_agents_value))
     if reuse_canary_value is None:
         try:
             import reuse_canary
@@ -1606,6 +1676,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             power_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_power(power_value))
+    if pf_value is None:
+        try:
+            import pf_reference
+            pf_value = pf_reference.status(len(fit_records), vm_dhcp_value)
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            pf_value = {"state": "unknown", "error": str(exc)}
+    findings.append(check_pf_reference(pf_value))
     findings.append(check_signing_prompts(signing_prompts_value, home))
 
     def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:

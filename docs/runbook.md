@@ -243,7 +243,13 @@ possibly torn profile.
 
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
-uses `TART_HOME`, capacity and cleanup will disagree.
+uses `TART_HOME`, capacity and cleanup will disagree. `tartci doctor` (including
+`doctor --reap`, which Shipyard's health probe runs) and `tartci observe` hold
+that invariant for you: with no `TART_HOME` in the environment they export the
+fleet profile's `[host].tart_home`, and they print `tart store: <path> (<why>)`.
+An explicit `TART_HOME` that differs from the profile's wins but is printed with
+a WARNING. Raw `tart` over ssh still reads `~/.tart` unless you pass the store
+(see gotchas: "`ssh <host> 'tart list'` shows no gate VMs").
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 Do not diagnose installation state from raw `ssh host 'command -v tart'` output:
@@ -1710,8 +1716,9 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
   `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
   the same once-per-episode path as a host left OFF, closed when a VM gets an
-  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
-  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  address. Its title is the host and the episode's start only
+  (`[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z`), and its first
+  three lines are the statement,
   `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
   fleet_reasons, so it is usable from a phone notification. It is raised when
   the breaker is open and:
@@ -1725,10 +1732,22 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
     the third grant: about 10 to 15 min after the breaker opens. One unreported
     probe is a slow boot and raises nothing; neither does a closed or
     `verifying` breaker.
-  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
-  breaker's `events.jsonl`. A close that fails (a new outage replacing one
-  whose issue is still open, or recovery) is kept as `stale_issues` in the
-  alert state and retried every pass, so no issue is left open.
+  **One issue per episode, keyed by host and start.** A reboot and a
+  self-update re-verify both send the breaker through `verifying` and reopen
+  it with a fresh `opened_at`, and a probe often reclassifies the cause. None
+  of those ends the outage, so none opens a second issue: the episode's start
+  is kept in `alert.json` while it is open (a new episode starts from the
+  breaker's running outage, which a reboot carries), a cause change is posted
+  once as a comment on the open issue (`Cause changed: <old> -> <new>`, with
+  the new remedy; a failed comment is retried next pass), and the issue
+  closes only when a VM got an address after the episode began. Before this,
+  m5's outage of 2026-10-09 became three issues (#427, #428, #430), each
+  closed and reopened 2 s apart; `test_m5_on_2026_10_09_is_one_issue` replays
+  that sequence and asserts one.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`, from the
+  episode's start) go to the breaker's `events.jsonl`. A close that fails at
+  recovery is kept as `stale_issues` in the alert state and retried every
+  pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
 - **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
@@ -1788,10 +1807,43 @@ comes up. It is not stale configuration.
    token, which is the undo key (`sudo pfctl -X <token>`). On m5 pfd then ran
    and idle-exited 0, bridge100 came up on the next VM, and the breaker closed
    on its probe's address; `tartci vm-dhcp probe-now` makes that probe
-   immediate. The reference does not survive a reboot: a recurrence after a
-   reboot is caught by the post-boot verification and the alert, and
-   `sudo pfctl -E` is run again. Never `pfctl -d`: it drops every holder's
-   references.
+   immediate. A reference taken by hand does not survive a reboot; hold one
+   at boot with the LaunchDaemon below. Never `pfctl -d`: it drops every
+   holder's references.
+
+   **pf enable reference at boot** (doctor `pf_reference`). m5 lost its VM
+   network after reboots on 2026-10-07 and 2026-10-09; on 10-09 Daniel
+   installed a LaunchDaemon that takes a reference at every boot, and it has
+   not recurred. The doctor's `pf_reference` check reads pfd's launchd record
+   on every run (no root, no VM needed) on any host with VM lanes, and reports
+   `pf_reference_missing` (PROBLEM) while pfd exits 3, before a lane spends a
+   VM on it. Applicability is the host's VM lanes, not InternetSharing:
+   InternetSharing is launched on demand and reads "not running" between jobs.
+   The finding also names any boot-time holder. m3, m5s and m1 have none and
+   a healthy pfd, so a missing holder alone is a fact, not a problem. On a
+   host whose breaker history records a `pfd_crash_loop` outage it is a
+   problem, `pf_boot_holder_missing`: the fault is proven to recur at the next
+   reboot there.
+
+   **Install the holder** (tartci never does this; it needs sudo). From the
+   host's tartci checkout:
+
+   ```sh
+   sudo scripts/install_pf_enable_ref.sh            # plan: what would change
+   sudo scripts/install_pf_enable_ref.sh --install  # write, bootstrap, verify
+   ```
+
+   It installs `launchd/system/com.danielraffel.pf-enable-ref.plist` (the
+   plist m5 has run since 2026-10-09) as
+   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`, root:wheel
+   0644. The daemon runs `/sbin/pfctl -E` at each boot and keeps the token in
+   `/var/run/pf-enable-ref.token`; bootstrapping it takes a reference now too.
+   The installer verifies launchd ran it with exit 0 and the token exists, and
+   is a no-op when the same plist is already loaded, so it never stacks
+   references on a re-run. Then `tartci vm-dhcp probe-now`, and
+   `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
+   com.danielraffel.pf-enable-ref`. The token is the undo key
+   (`sudo pfctl -X <token>`); Never `pfctl -d`.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the
@@ -2003,7 +2055,27 @@ fleet`), and check GitHub's job history against it with
   generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
-  SSH. The marker's age is measured on the peer's own clock.
+  SSH at every attempt (the read is never cached). The marker's age is
+  measured on the peer's own clock. The marker is read before the pool state:
+  a self-update announces and then drains, so a peer mid-update is reported
+  as `peer X is self-updating to <commit> (N min in)`, never as plain
+  `draining`. A peer that is not serving for any other reason is reported with
+  how long its pool state has been unchanged (the mtime of its
+  `~/.config/tartci/pool-state`).
+- **A long markerless drain stops holding the turn.** A peer that is
+  `draining` with no live update marker, whose pool state has not changed for
+  `PEER_DRAIN_STALE_SECONDS` (3 h, the marker's own TTL), is treated like an
+  off peer: it holds no turn and the capacity floor counts it as serving
+  nothing. A self-update holds a live marker through its whole drain, so this
+  is an operator drain or an update that died after draining. A drain of
+  unknown age (the peer's pool-state file could not be read) still holds the
+  turn, and a peer that is `on` but not participating always does.
+- **The recorded reason is as old as the last attempt.** `waiting.json`'s
+  `reason` is the survey of the last attempt, up to one 30 min interval old.
+  A reason that names a peer which now reads `on` is not a stale view: the
+  next attempt reads the peer afresh. On 2026-10-09 m5studio finished its
+  update at 06:10Z and m5's next attempt, which took the turn, ran at 06:36Z;
+  each hand-off between hosts costs up to one interval.
 - **Update queue.** A host that defers keeps a ticket in
   `~/.tartci/state/self-update/waiting.json` whose `since` records when it
   joined the queue and survives new targets. Hosts take turns in `since`
@@ -2697,6 +2769,50 @@ expires, and is reported by `tartci pool status` and `tartci doctor`. No host
 enables it. Design, events, and the runbook for trying it on a new high-RAM
 host (prerequisites, exact profile lines, idle-cost and minutes-saved
 measurement, turning it off): [warm-vm.md](warm-vm.md).
+
+## Retention of per-boot state and support generations (`tartci retention`)
+
+Two trees grow without bound on every fleet host. `~/.tartci/state` gets one
+actions-runner log, one admission-clean receipt and one repository-access
+receipt per VM boot, and `~/.local/share/tartci-generations` gets one
+generation per self-update. Neither is large (under 200 MB a host), but every
+scan of them grows forever. On 2026-10-09 the plan below found these:
+
+| host | old per-boot files | generations kept / to delete |
+|---|---|---|
+| m1 | 5,362 | skipped: m1 was mid self-update |
+| m3 | 4,780 | 10 / 40 |
+| m5 | 5,585 | 10 / 54 |
+| m5studio | 0 | 10 / 29 |
+
+`tartci retention` prints the plan and changes nothing. `tartci retention
+--apply` deletes, and `--json` gives the machine-readable form. It deletes only:
+
+- **Per-boot files** named `<runner>-<pid>-<seq>.<kind>`, where kind is
+  `actions-runner.log`, `admission-clean.json`, `repository-access.json`,
+  `repository-access-error` or `jit-error`, that are older than
+  `--max-age-days` (default 30) and outside the newest `--keep-per-dir`
+  (default 50) of their directory. Per-lane files without a boot suffix
+  (`*.state.json`, `events.jsonl`, `*.disk-admission.json`, locks) and
+  self-update receipts are never touched.
+- **Generations** outside the newest `--keep-generations` (default 10, at
+  least 3) and older than `--generation-grace-days` (default 2), that nothing
+  names: not the wrapper `~/.local/bin/tartci`, not any LaunchAgent plist,
+  not a `~/.config/tartci/*.json` receipt, not the `previous` commit of any
+  rollback snapshot, not the generation running the pass. Generations are kept
+  by count, not age, because a host deploys several times a day. A rollback
+  that needs a deleted generation re-stages it from source.
+
+Idle safety: a per-boot file whose `<runner>-<pid>-<seq>` appears on any
+running command line, and a generation that any process names in its command
+line or holds as its working directory, is kept. If `ps` or `lsof` cannot be
+read, nothing is deleted. While a self-update marker
+(`~/.tartci/state/self-update/active.json`) exists, generations are left alone
+for that pass, since an install may be staging one. Generations are installed
+read-only; `--apply` makes a doomed one writable before removing it.
+
+No agent runs this yet. Run the plan on a host, read it, then `--apply`.
+Scheduling it (for example from the reclaim agent) is a separate decision.
 
 ## Fleet scheduling boundary
 
