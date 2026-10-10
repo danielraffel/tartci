@@ -58,6 +58,7 @@ class FakeSystem(su.System):
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
+        self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -202,8 +203,11 @@ class FakeSystem(su.System):
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
+            pool_since = self.peer_pool_since.get(peer)
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
-                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else ""))
+                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
+                      + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
+                         if pool_since is not None else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -764,6 +768,114 @@ class OnDemandSupplyTests(Base):
         self.assertEqual(self.plan(), su.EXIT_OK)
         self.sys.peers["m5"] = healthy_peer(fleet_ready=False)
         self.assertEqual(self.plan(), su.EXIT_REFUSED)
+
+
+class PeerTurnReplayTests(Base):
+    """The 2026-10-09 update turn, replayed from the hosts' own records.
+
+    This fake host is m1; its peers are studio (m5studio, ssh m3) and m5.
+    Epoch values are the real ones, shifted so the last observation lands on
+    NOW.
+    """
+
+    OBSERVED = 1791529322             # date +%s when the tickets were read
+    SHIFT = NOW - OBSERVED
+
+    def at(self, epoch: float) -> float:
+        return epoch + self.SHIFT
+
+    def test_a_peer_draining_for_its_own_update_reads_as_the_turn_holder(self) -> None:
+        # m5 at 06:05:54Z read m5studio, which announced at 05:55:18Z and then
+        # drained. Read pool state first, it said only "draining".
+        self.sys.peers["m3"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m3"] = {"host_id": "studio",
+                                       "target": "1c32310463f2f5ebabed386c4417eb1653539934",
+                                       "ts": NOW - 636}
+        self.sys.peer_pool_since["m3"] = NOW - 600
+        peer = su.read_peer(self.cfg, self.sys, "studio", "m3")
+        self.assertTrue(peer["busy"])
+        self.assertEqual(peer["evidence"], "peer studio is self-updating to 1c32310463f2 (10 min in)")
+        self.assertEqual(peer["active_age"], 636)
+        self.assertNotIn("draining", peer["evidence"])
+        # The readability fix itself: the turn holder, its target and its age.
+        self.assertIn("self-updating to 1c32310463f2", peer["evidence"])
+        self.assertIn("(10 min in)", peer["evidence"])
+
+    def test_the_recorded_queue_lets_exactly_one_host_go(self) -> None:
+        # waiting.json on m1 and m5studio at 07:02Z, after m5 finished its
+        # update and came back on. Both still carried "peer m5 is draining",
+        # a reason up to one interval old; the next read must not reuse it.
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791526495.20782), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528338.536526)})
+        studio_ticket = {
+            "host_id": "m5studio", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791528023.668664), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528023.668664)}
+        self.sys.peer_waiting["m3"] = studio_ticket
+        self.sys.peer_pool_since["m5"] = self.at(1791528936)   # m5 back on at 06:55:36Z
+        self.sys.peer_pool_since["m3"] = self.at(1791526209)
+        # m1 holds the older ticket, so m1 goes...
+        self.assertUpdated(self.apply())
+        # ...and m5studio, reading m1's ticket, yields to it.
+        ahead = su.queue_ahead("studio", studio_ticket["since"],
+                               {"m1": self.at(1791526495.20782)})
+        self.assertEqual(len(ahead), 1)
+        self.assertTrue(ahead[0].startswith("m1 "), ahead)
+
+    def test_a_markerless_drain_older_than_the_bound_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_STALE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["busy"])
+        self.assertTrue(peer["off"])
+        self.assertIn("draining for 3.0 h with no update marker", peer["evidence"])
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        peers_step = next(step for step in receipt["steps"] if step["step"] == "peers")
+        self.assertIn("counted as serving nothing by the capacity floor: m5",
+                      peers_step["detail"])
+
+    def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
+        # Control, same instrument: only the drain's age changed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+                      su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
+        # No pool-state time (an old peer, or stat failed): fail closed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_update_that_died_after_draining_stops_holding_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 4 * 3600 + 60
+        self.assertUpdated(self.apply())
+
+    def test_an_expired_marker_on_a_recent_drain_still_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 3600
+        self.assertDeferred(self.apply())
+
+    def test_an_opted_out_peer_that_is_on_still_holds_the_turn(self) -> None:
+        # The drain bound is for draining only, never for a host on but not
+        # participating, however long ago its pool state changed.
+        self.sys.peers["m5"] = {"state": "on", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 30 * 86400
+        self.assertDeferred(self.apply())
 
 
 class UpdateQueueTests(Base):
@@ -1401,6 +1513,69 @@ class VmDhcpVerifyTests(Base):
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.apply()
         self.assertEqual(self.sys.vm_verify_calls, [])
+
+
+class PausedByStallTests(Base):
+    """A self-update the launchd guard holds for a timer stall says so itself."""
+
+    STARTED = NOW - 4 * 86400
+
+    SELF = "com.danielraffel.tartci.self-update"
+
+    def guard(self, *, paused=(SELF,), active=True, age=60, directory=None):
+        directory = directory or self.cfg.state_dir.parent / "launchd-interval-guard"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "status.json").write_text(json.dumps({
+            "ts": time.time() - age, "agents_checked": 18, "errors": [], "kicked": [],
+            "stalled": [{"label": self.SELF, "interval": 1800}],
+            "paused": [{"label": label, "interval": 1800} for label in paused],
+            "episode": {"active": active, "labels": [self.SELF], "started_ts": self.STARTED}}))
+
+    def stale_skew(self):
+        su._write_json(self.cfg.state_dir / "skew.json", {
+            "state": "behind", "behind": 44, "stale": True, "installed": INSTALLED,
+            "target": T_OLD, "oldest_undeployed": "2026-10-05T05:21:21Z",
+            "measured_at": su._iso(time.time())})
+
+    def test_a_paused_self_update_says_why_everywhere(self):
+        # m3 from 2026-10-05: behind and stale, no attempt since, the guard
+        # holding it. Its status and doctor read like a failed update.
+        import fleet_doctor
+        self.stale_skew()
+        self.guard()
+        since = su._iso(self.STARTED)
+        lines = su.status_lines(self.cfg.state_dir)
+        self.assertTrue(any(l.startswith(f"self-update PAUSED by the launchd timer stall since {since}")
+                            for l in lines), lines)
+        summary = su.summary(self.home)
+        self.assertIn("a reboot resumes it", summary["paused"])
+        finding = fleet_doctor.check_self_update(summary)
+        self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
+        self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+
+    def test_the_guard_dir_override_is_honoured(self):
+        other = self.home / "guard-elsewhere"
+        self.guard(directory=other)
+        with mock.patch.dict(os.environ, {"TARTCI_INTERVAL_GUARD_DIR": str(other)}):
+            self.assertIsNotNone(su.paused_line(self.cfg.state_dir))
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
+
+    def test_not_paused_unless_the_guard_holds_self_update_in_a_live_stall(self):
+        import fleet_doctor
+        self.stale_skew()
+        for name, kwargs in (("another agent paused, not self-update",
+                              {"paused": ("com.danielraffel.tartci.launchd-watchdog",)}),
+                             ("nothing paused", {"paused": ()}),
+                             ("no active episode", {"active": False}),
+                             ("stale guard receipt", {"age": 10 * 3600})):
+            with self.subTest(case=name):
+                self.guard(**kwargs)
+                self.assertIsNone(su.paused_line(self.cfg.state_dir))
+                self.assertEqual(fleet_doctor.check_self_update(su.summary(self.home)).code,
+                                 "self_update_problem")
+
+    def test_no_guard_receipt_is_not_paused(self):
+        self.assertIsNone(su.paused_line(self.cfg.state_dir))
 
 
 class AgentTemplateTests(unittest.TestCase):
