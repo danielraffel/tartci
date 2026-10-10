@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "manifest_sha256", "source_commit", "provider_digests", "image_digest", "baked_at", "observed_versions"],
+  "properties": {
+    "schema": {"const": 1},
+    "manifest_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "source_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "provider_digests": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+    "image_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "baked_at": {"type": "string", "format": "date-time"},
+    "observed_versions": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "string"}}
+  }
+}

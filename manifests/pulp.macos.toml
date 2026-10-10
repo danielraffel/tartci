@@ -20,21 +20,17 @@ commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
 [toolchain]
-xcode  = "26.5"
-cmake  = "homebrew"
-ninja  = "homebrew"
+clang_format = "required"
+tart = "homebrew"
+rust_targets = ["x86_64-apple-darwin"]
+rust = "stable"
+node = "26.10.0"
 python = "3.12"
-rust   = "stable"   # rustup-managed; release-cli.yml builds the Rust `pulp` CLI
-rust_targets = ["x86_64-apple-darwin"] # release-cli's Darwin Intel cross-build
+ninja = "homebrew"
+cmake = "homebrew"
+xcode = "26.5"
 
 [brew]
-# Homebrew's `rustup` is keg-only and does not provide `rustup-init`. The bake
-# must run `rustup default stable`, add `rust_targets`, and expose the keg's
-# proxies through ~/.cargo/bin. The exact verified recipe is in docs/runbook.md.
-# The `stable` pin matches Pulp's experimental/pulp-rs/rust-toolchain.toml, so
-# there's no reproducibility drift vs. the workflow fallback. release-cli.yml
-# keeps a run-time rustup bootstrap as the portability belt; baking it here just
-# skips the ~30-60s per-run install on steady-state release runs.
 packages = [
   "git",
   "git-lfs",
@@ -42,18 +38,23 @@ packages = [
   "rsync",
   "ccache",
   "jq",
+  "coreutils",
+  "tailscale",
   "cmake",
   "ninja",
   "node",
   "python@3.12",
   "rustup",
-  # clang-format for the `pulp fmt` CLI. Without it on PATH, the Build-and-Test
-  # gate's `pulp fmt` shell-out tests (test_cli_fmt_shellout.cpp) HANG and hit
-  # their 10s timeout on this VM golden (r.timed_out) rather than exercising the
-  # formatter — reddening the required macOS leg. The Homebrew `clang-format`
-  # formula installs a standalone `clang-format` binary (no full LLVM needed).
   "clang-format",
 ]
+# Homebrew's `rustup` is keg-only. The bake must run `rustup default stable`,
+# add the Darwin target, and expose ~/.cargo/bin. clang-format is required:
+# without it, the pulp fmt shell-out test hangs until its timeout.
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = macos
+# END GENERATED PULP TOOLCHAIN
 
 [skia]
 release = "chrome/m153"
