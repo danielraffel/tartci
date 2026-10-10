@@ -18,6 +18,16 @@ scanned or written. Per host and fleet-wide over a window (default 24h):
 * JIT discards: VMs that were cloned and torn down without being assigned a
   job, by the event that named the cause.
 * lease denials by axis (cores / memory / disk), from `lease_denied`.
+* lifecycle: where a served VM's slot time went, from the one `vm_lifecycle`
+  event a lane writes at teardown (providers/tart-macos/lifecycle.lib.sh):
+  clone, boot to address, address to SSH, prep, runner registration, idle
+  until assigned, the job, teardown. Per phase: VMs, total and median
+  seconds. `job_share` is job seconds over VM seconds (clone through
+  teardown, so pre_clone is excluded: no VM exists yet), and
+  `overhead_per_served_job_s` is the rest of those VM seconds per served
+  job. Only VMs that reached a runner write the event; VMs discarded earlier
+  are the JIT discards above. Hosts on a tartci without the event report
+  `vms: 0`.
 
 Per-job VM CPU and IO are not sampled anywhere in tartci (runtime_measure
 records only the configured cpu_count), so they are omitted and say so.
@@ -62,6 +72,8 @@ DISCARD_REASONS = (
     "jit_admission_denied", "boot_failed", "supervisor_signal", "teardown_restart",
 )
 LEASE_AXES = ("cores", "memory", "disk")
+LIFECYCLE_PHASES = ("pre_clone", "clone", "boot_ip", "ip_ssh", "prep", "register", "idle",
+                    "job", "teardown", "total")
 CPU_IO_NOTE = ("not sampled: tartci records no per-VM CPU or IO "
                "(runtime_measure stores only the configured cpu_count)")
 
@@ -348,6 +360,7 @@ def lane_report(lane: str, lane_dir: str, events: List[Dict[str, Any]], since: f
         if s["state"] == "idle":
             by_reason[s["reason"]] = by_reason.get(s["reason"], 0.0) + overlap(s["a"], s["b"], since, until)
     holds = lease_fit_holds(events, now)
+    lifecycle = [ev["fields"] for ev in in_win if ev["event"] == "vm_lifecycle"]
     return {
         "lane": lane,
         "runner": runner,
@@ -373,6 +386,7 @@ def lane_report(lane: str, lane_dir: str, events: List[Dict[str, Any]], since: f
         "warm_parked_events": sum(1 for ev in in_win if ev["event"] == "warm_parked"),
         "_spans": spans,
         "_vms": [(v.start, v.end) for v in vms],
+        "_lifecycle": lifecycle,
     }
 
 
@@ -400,6 +414,46 @@ def max_concurrent(spans: List[Tuple[float, float]], lo: float, hi: float) -> in
         cur += d
         best = max(best, cur)
     return best
+
+
+def _seconds(row: Dict[str, Any], phase: str) -> Optional[float]:
+    value = row.get(f"{phase}_s")
+    return float(value) if isinstance(value, (int, float)) and value >= 0 else None
+
+
+def _median(values: List[float]) -> Optional[float]:
+    if not values:
+        return None
+    ordered = sorted(values)
+    mid = len(ordered) // 2
+    return ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def lifecycle_summary(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Per-phase VMs, total and median seconds over `vm_lifecycle` fields, and
+    how much of the VMs' slot time was the job."""
+    phases: Dict[str, Dict[str, Any]] = {}
+    for phase in LIFECYCLE_PHASES:
+        values = [v for v in (_seconds(r, phase) for r in rows) if v is not None]
+        phases[phase] = {"vms": len(values), "seconds": round(sum(values), 1),
+                         "median_s": _median(values)}
+    served = sum(1 for r in rows if r.get("served") == 1)
+    vm_seconds = 0.0
+    for r in rows:
+        total = _seconds(r, "total")
+        if total is not None:
+            vm_seconds += total - (_seconds(r, "pre_clone") or 0.0)
+    job = phases["job"]["seconds"]
+    return {
+        "vms": len(rows),
+        "served": served,
+        "warm": sum(1 for r in rows if r.get("warm") == 1),
+        "vm_seconds": round(vm_seconds, 1),
+        "job_seconds": job,
+        "job_share": round(job / vm_seconds, 4) if vm_seconds else None,
+        "overhead_per_served_job_s": round((vm_seconds - job) / served, 1) if served else None,
+        "phases": phases,
+    }
 
 
 def host_report(root: str, host: str, since: float, until: float, now: float,
@@ -449,8 +503,9 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
             denials[k] = denials.get(k, 0) + v
         for k, v in l["job_results"].items():
             results[k] = results.get(k, 0) + v
+    lifecycle = lifecycle_summary([row for l in lanes for row in l["_lifecycle"]])
     for l in lanes:
-        del l["_spans"], l["_vms"]
+        del l["_spans"], l["_vms"], l["_lifecycle"]
     notes = []
     if first_demand_waiting is None or first_demand_waiting > since:
         notes.append("demand_waiting not recorded for the whole window (first seen: %s): until "
@@ -482,6 +537,7 @@ def host_report(root: str, host: str, since: float, until: float, now: float,
         "lease_fit_holds": sum(l["lease_fit_holds"] for l in lanes),
         "lease_fit_hold_seconds": round(sum(l["lease_fit_hold_seconds"] for l in lanes), 1),
         "job_results": dict(sorted(results.items())),
+        "lifecycle": lifecycle,
         "vm_cpu_io": None,
         "notes": notes,
         "errors": errors,
@@ -501,6 +557,18 @@ def fleet_total(hosts: List[Dict[str, Any]]) -> Dict[str, Any]:
         out[k] = round(sum(h[k] for h in ok), 1)
     out["occupancy"] = round(out["busy_vm_seconds"] / out["capacity_vm_seconds"], 4) \
         if out["capacity_vm_seconds"] else None
+    lc = [h.get("lifecycle") or {} for h in ok]
+    vm_s = round(sum(x.get("vm_seconds") or 0 for x in lc), 1)
+    job_s = round(sum(x.get("job_seconds") or 0 for x in lc), 1)
+    served = sum(x.get("served") or 0 for x in lc)
+    out["lifecycle"] = {
+        "vms": sum(x.get("vms") or 0 for x in lc), "served": served,
+        "vm_seconds": vm_s, "job_seconds": job_s,
+        "job_share": round(job_s / vm_s, 4) if vm_s else None,
+        "overhead_per_served_job_s": round((vm_s - job_s) / served, 1) if served else None,
+        "phase_seconds": {ph: round(sum(((x.get("phases") or {}).get(ph) or {}).get("seconds") or 0
+                                        for x in lc), 1) for ph in LIFECYCLE_PHASES},
+    }
     for key in ("discards_by_reason", "lease_denials_by_axis", "idle_with_demand_by_reason"):
         merged: Dict[str, float] = {a: 0 for a in LEASE_AXES} if key == "lease_denials_by_axis" else {}
         for h in ok:
@@ -571,11 +639,31 @@ def render_host(h: Dict[str, Any]) -> List[str]:
     out.append(f"  discards by reason: {counts(h['discards_by_reason'])}")
     out.append(f"  lease denials by axis: {axes(h['lease_denials_by_axis'])}; lease-fit holds "
                f"{h['lease_fit_holds']} ({mins(h['lease_fit_hold_seconds'])} lane-min)")
+    out += render_lifecycle(h.get("lifecycle") or {})
     out.append(f"  per-job VM CPU/IO: {CPU_IO_NOTE}")
     for n in h["notes"]:
         out.append(f"  note: {n}")
     for e in h["errors"]:
         out.append(f"  error: {e}")
+    return out
+
+
+def render_lifecycle(lc: Dict[str, Any]) -> List[str]:
+    if not lc.get("vms"):
+        return ["  lifecycle: no vm_lifecycle events in the window (a tartci without them, "
+                "or no VM reached a runner)"]
+    out = [f"  lifecycle ({lc['vms']} VM(s) that reached a runner, {lc['served']} served, "
+           f"{lc['warm']} warm): job share {pct(lc['job_share'])} of "
+           f"{mins(lc['vm_seconds'])} VM-min; overhead per served job "
+           + ("n/a" if lc["overhead_per_served_job_s"] is None
+              else f"{mins(lc['overhead_per_served_job_s'])} min")]
+    cells = []
+    for phase in LIFECYCLE_PHASES:
+        row = lc["phases"][phase]
+        if row["vms"]:
+            cells.append(f"{phase} {mins(row['seconds'])} min (median "
+                         f"{row['median_s']:.0f}s, {row['vms']})")
+    out.append("  phases: " + "; ".join(cells))
     return out
 
 
@@ -594,6 +682,13 @@ def render(rep: Dict[str, Any]) -> str:
                    f"{mins(f['full_host_wait_seconds'])} min; served {f['jobs_served']}; "
                    f"discarded {f['vms_discarded']} ({counts(f['discards_by_reason'])}); "
                    f"lease denials {axes(f['lease_denials_by_axis'])}")
+        lc = f.get("lifecycle") or {}
+        if lc.get("vms"):
+            out.append(f"fleet lifecycle: job share {pct(lc['job_share'])} of "
+                       f"{mins(lc['vm_seconds'])} VM-min over {lc['vms']} VM(s); overhead per "
+                       "served job "
+                       + ("n/a" if lc["overhead_per_served_job_s"] is None
+                          else f"{mins(lc['overhead_per_served_job_s'])} min"))
     return "\n".join(out)
 
 

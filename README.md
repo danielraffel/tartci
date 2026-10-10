@@ -51,6 +51,23 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+**Where a VM's slot time went** is the report's `lifecycle` block. A macOS
+lane writes one `vm_lifecycle` event per VM that reached a runner, at teardown
+(`providers/tart-macos/lifecycle.lib.sh`), with each phase in seconds:
+`pre_clone` (admission, job claim, lease wait; no VM yet), `clone`, `boot_ip`
+(clone done to an address), `ip_ssh`, `prep` (SSH to JIT mint: preflights and
+the admission boundary), `register` (mint to "Listening for Jobs"), `idle`
+(listening to "Running job:", or to the runner's exit when unserved), `job`,
+`teardown` and `total`, plus `served`, `warm` and `rc`. A warm handoff has no
+clone or boot phases. The report gives per phase the VMs, total and median
+seconds, the job share of VM seconds (clone through teardown) and the overhead
+per served job, per host and fleet-wide. The runner log is read every 5 s, so
+`register` and `idle` are host-observed to within 5 s. VMs discarded before a
+runner write no event and stay in the discard counts; a host on a tartci
+without the event reports none rather than zero overhead. With
+`TARTCI_RUNTIME_MEASURE=1` the same phases are also `lc_*` rows in the VM's
+`timing.tsv`.
+
 The support LaunchAgents a host carries (reclaimer, artifact-cache refresher,
 keychain unlocker, schedule backstop, reuse canary, launchd watchdog, reaper)
 are declared in its fleet profile's `[support_agents]` table and compared after
