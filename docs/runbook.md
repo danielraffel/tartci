@@ -2707,6 +2707,50 @@ enables it. Design, events, and the runbook for trying it on a new high-RAM
 host (prerequisites, exact profile lines, idle-cost and minutes-saved
 measurement, turning it off): [warm-vm.md](warm-vm.md).
 
+## Retention of per-boot state and support generations (`tartci retention`)
+
+Two trees grow without bound on every fleet host. `~/.tartci/state` gets one
+actions-runner log, one admission-clean receipt and one repository-access
+receipt per VM boot, and `~/.local/share/tartci-generations` gets one
+generation per self-update. Neither is large (under 200 MB a host), but every
+scan of them grows forever. On 2026-10-09 the plan below found these:
+
+| host | old per-boot files | generations kept / to delete |
+|---|---|---|
+| m1 | 5,362 | skipped: m1 was mid self-update |
+| m3 | 4,780 | 10 / 40 |
+| m5 | 5,585 | 10 / 54 |
+| m5studio | 0 | 10 / 29 |
+
+`tartci retention` prints the plan and changes nothing. `tartci retention
+--apply` deletes, and `--json` gives the machine-readable form. It deletes only:
+
+- **Per-boot files** named `<runner>-<pid>-<seq>.<kind>`, where kind is
+  `actions-runner.log`, `admission-clean.json`, `repository-access.json`,
+  `repository-access-error` or `jit-error`, that are older than
+  `--max-age-days` (default 30) and outside the newest `--keep-per-dir`
+  (default 50) of their directory. Per-lane files without a boot suffix
+  (`*.state.json`, `events.jsonl`, `*.disk-admission.json`, locks) and
+  self-update receipts are never touched.
+- **Generations** outside the newest `--keep-generations` (default 10, at
+  least 3) and older than `--generation-grace-days` (default 2), that nothing
+  names: not the wrapper `~/.local/bin/tartci`, not any LaunchAgent plist,
+  not a `~/.config/tartci/*.json` receipt, not the `previous` commit of any
+  rollback snapshot, not the generation running the pass. Generations are kept
+  by count, not age, because a host deploys several times a day. A rollback
+  that needs a deleted generation re-stages it from source.
+
+Idle safety: a per-boot file whose `<runner>-<pid>-<seq>` appears on any
+running command line, and a generation that any process names in its command
+line or holds as its working directory, is kept. If `ps` or `lsof` cannot be
+read, nothing is deleted. While a self-update marker
+(`~/.tartci/state/self-update/active.json`) exists, generations are left alone
+for that pass, since an install may be staging one. Generations are installed
+read-only; `--apply` makes a doomed one writable before removing it.
+
+No agent runs this yet. Run the plan on a host, read it, then `--apply`.
+Scheduling it (for example from the reclaim agent) is a separate decision.
+
 ## Fleet scheduling boundary
 
 GitHub Actions is the only fleet scheduler. Shipyard supervises queue ordering,
