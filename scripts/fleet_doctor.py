@@ -1231,7 +1231,8 @@ def check_signing_prompts(value: dict | None, home: Path) -> Finding:
         try:
             value = signing_prompt_guard.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
-            value = {"state": "unknown", "detail": str(exc)}
+            import secret_files
+            value = {"state": "unknown", "detail": secret_files.redact(exc, home)}
     facts = {"signing_prompts": value}
     state = value.get("state")
     if state == "not_applicable":
