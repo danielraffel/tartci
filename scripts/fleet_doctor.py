@@ -104,6 +104,7 @@ CODES: tuple[str, ...] = (
     "peer_unreachable",
     "peer_unreachable_excluded",
     "pf_not_applicable",
+    "pf_boot_holder_missing",
     "pf_pfd_exiting",
     "pf_reference_missing",
     "pf_reference_ok",
@@ -1218,6 +1219,8 @@ def check_pf_reference(value: dict | None) -> Finding:
         return Finding("pf_reference", PROBLEM, "pf_reference_missing", detail, facts)
     if state == "pfd_exiting":
         return Finding("pf_reference", PROBLEM, "pf_pfd_exiting", detail, facts)
+    if state == "holder_missing":
+        return Finding("pf_reference", PROBLEM, "pf_boot_holder_missing", detail, facts)
     if state == "not_applicable":
         return Finding("pf_reference", NOT_APPLICABLE, "pf_not_applicable", detail, facts)
     return Finding("pf_reference", UNKNOWN, "pf_reference_unknown", detail, facts)
@@ -1641,7 +1644,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     if pf_value is None:
         try:
             import pf_reference
-            pf_value = pf_reference.status(len(fit_records))
+            pf_value = pf_reference.status(len(fit_records), vm_dhcp_value)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             pf_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_pf_reference(pf_value))

@@ -1800,37 +1800,31 @@ comes up. It is not stale configuration.
    `pf_reference_missing` (PROBLEM) while pfd exits 3, before a lane spends a
    VM on it. Applicability is the host's VM lanes, not InternetSharing:
    InternetSharing is launched on demand and reads "not running" between jobs.
-   The finding also names any boot-time holder; m3, m5s and m1 have none and
-   a healthy pfd, so a missing holder alone is a fact, not a problem. To
-   install the holder on a host that loses pf across reboots (tartci never
-   does this; it needs sudo), write
-   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`:
+   The finding also names any boot-time holder. m3, m5s and m1 have none and
+   a healthy pfd, so a missing holder alone is a fact, not a problem. On a
+   host whose breaker history records a `pfd_crash_loop` outage it is a
+   problem, `pf_boot_holder_missing`: the fault is proven to recur at the next
+   reboot there.
 
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-   	<key>Label</key>
-   	<string>com.danielraffel.pf-enable-ref</string>
-   	<key>ProgramArguments</key>
-   	<array>
-   		<string>/bin/sh</string>
-   		<string>-c</string>
-   		<string>/sbin/pfctl -E 2&gt;&amp;1 | /usr/bin/sed -n 's/^Token : //p' &gt; /var/run/pf-enable-ref.token</string>
-   	</array>
-   	<key>RunAtLoad</key>
-   	<true/>
-   </dict>
-   </plist>
+   **Install the holder** (tartci never does this; it needs sudo). From the
+   host's tartci checkout:
+
+   ```sh
+   sudo scripts/install_pf_enable_ref.sh            # plan: what would change
+   sudo scripts/install_pf_enable_ref.sh --install  # write, bootstrap, verify
    ```
 
-   then `sudo chown root:wheel` and `sudo chmod 644` it and
-   `sudo launchctl bootstrap system <plist>`. Confirm with
-   `launchctl print system/com.danielraffel.pf-enable-ref` (runs 1, last
-   exit 0), a non-empty `/var/run/pf-enable-ref.token`, and
-   `tartci doctor fleet` reading `pf_reference_ok ... taken at boot by
-   com.danielraffel.pf-enable-ref`. The token in that file is the undo key.
+   It installs `launchd/system/com.danielraffel.pf-enable-ref.plist` (the
+   plist m5 has run since 2026-10-09) as
+   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`, root:wheel
+   0644. The daemon runs `/sbin/pfctl -E` at each boot and keeps the token in
+   `/var/run/pf-enable-ref.token`; bootstrapping it takes a reference now too.
+   The installer verifies launchd ran it with exit 0 and the token exists, and
+   is a no-op when the same plist is already loaded, so it never stacks
+   references on a re-run. Then `tartci vm-dhcp probe-now`, and
+   `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
+   com.danielraffel.pf-enable-ref`. The token is the undo key
+   (`sudo pfctl -X <token>`); never `pfctl -d`.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the

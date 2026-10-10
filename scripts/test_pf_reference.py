@@ -53,8 +53,8 @@ class PfReference(unittest.TestCase):
         self.addCleanup(lambda: [os.environ.pop(k, None) if v is None
                                  else os.environ.__setitem__(k, v) for k, v in saved.items()])
 
-    def finding(self, lanes: int = 3) -> fd.Finding:
-        return fd.check_pf_reference(pr.status(lanes))
+    def finding(self, lanes: int = 3, breaker: dict | None = None) -> fd.Finding:
+        return fd.check_pf_reference(pr.status(lanes, breaker or {"state": "closed"}))
 
     def holder(self, name: str, value: dict) -> None:
         (self.daemons / f"{name}.plist").write_bytes(plistlib.dumps(value))
@@ -102,6 +102,39 @@ class PfReference(unittest.TestCase):
         self.pfd.write_text("")
         found = self.finding()
         self.assertEqual((found.state, found.code), (fd.UNKNOWN, "pf_reference_unknown"))
+
+    # m5's breaker on 2026-10-09 after recovery: one pfd_crash_loop outage.
+    M5_BREAKER = {"state": "closed", "outages": [
+        {"cause": "dhcp_silent", "opened_at": 1791400000.0, "closed_at": 1791400600.0},
+        {"cause": "pfd_crash_loop", "opened_at": 1791519256.8887858,
+         "closed_at": 1791526710.772541, "closed_by": "probe"}]}
+
+    def test_a_host_that_lost_its_reference_before_needs_a_boot_holder(self):
+        found = self.finding(breaker=self.M5_BREAKER)
+        self.assertEqual((found.state, found.code), (fd.PROBLEM, "pf_boot_holder_missing"))
+        self.assertIn("latest 2026-10-09T04:14:16Z", found.detail)
+        # With the holder installed the same history is healthy.
+        self.holder("com.danielraffel.pf-enable-ref", M5_HOLDER)
+        self.assertEqual(self.finding(breaker=self.M5_BREAKER).code, "pf_reference_ok")
+
+    def test_a_host_with_no_pf_episode_and_no_holder_is_ok(self):
+        # Negative control: an outage of another cause is no evidence about pf.
+        history = {"state": "closed", "outages": [self.M5_BREAKER["outages"][0]]}
+        self.assertEqual(self.finding(breaker=history).code, "pf_reference_ok")
+        self.assertEqual(self.finding(breaker={"state": "closed"}).code, "pf_reference_ok")
+
+    def test_an_open_pfd_outage_counts_as_an_episode(self):
+        open_now = {"state": "open", "cause": "pfd_crash_loop", "opened_at": 1791519256.0}
+        self.assertEqual(pr.prior_episodes(open_now), ["2026-10-09T04:14:16Z"])
+        self.assertEqual(pr.prior_episodes({"state": "open", "cause": "dhcp_silent",
+                                            "opened_at": 1.0}), [])
+
+    def test_the_doctor_passes_the_breaker_it_read(self):
+        found = [f for f in fd.collect(home=self.tmp, skip_census=True,
+                                       vm_dhcp_value=self.M5_BREAKER)
+                 if f.check == "pf_reference"]
+        self.assertEqual(found[0].facts["pf_reference"]["prior_episodes"],
+                         ["2026-10-09T04:14:16Z"])
 
     def test_only_a_run_at_load_pfctl_enable_counts_as_a_holder(self):
         self.holder("a-holder", M5_HOLDER)
