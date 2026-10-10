@@ -36,6 +36,8 @@ class ResolverHealth(unittest.TestCase):
 
         self.assertEqual(self.run_pair(124, "", True)["condition"], "resolver_dead")
         self.assertEqual(self.run_pair(1, "", True)["condition"], "resolver_dead")
+        self.assertEqual(self.run_pair(0, "name: github.com\n", True)["condition"], "resolver_dead")
+        self.assertEqual(self.run_pair(0, "", True)["condition"], "resolver_dead")
 
     def test_resolver_dead_requires_three_consecutive_ticks(self):
         root = Path(tempfile.mkdtemp())

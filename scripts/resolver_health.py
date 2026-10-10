@@ -70,7 +70,7 @@ def probe(run: Optional[Runner] = None, tcp_ip: Optional[str] = None) -> Dict[st
     resolver_rc, resolver_out, resolver_err = run(
         ["dscacheutil", "-q", "host", "-a", "name", PROBE_NAME])
     tcp_rc, tcp_out, tcp_err = run(["nc", "-z", "-G", "3", tcp_ip, "443"])
-    resolver_ok = resolver_rc in (0, 124) and bool(IPV4_LINE.search(resolver_out))
+    resolver_ok = bool(IPV4_LINE.search(resolver_out))
     tcp_ok = tcp_rc == 0
     if not resolver_ok and tcp_ok:
         condition = "resolver_dead"
