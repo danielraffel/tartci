@@ -21,14 +21,10 @@ commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
 [toolchain]
-ninja = "apt"  # Handwritten: Linux lane keeps the distro ninja package.
-
-# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
-# generated_platform = linux
-cmake = "system"
-python = "3.12"
 node = "26.10.0"
+python = "3.12"
+cmake = "system"
+ninja = "system"
 
 [apt]
 packages = [
@@ -64,6 +60,12 @@ packages = [
   "libtinfo6:amd64",
   "libxml2:amd64",
 ]
+# The pkg-config module is `libdrm`, not `drm`; ICU headers are required by
+# Skia's bundled HarfBuzz/ICU symbols. binfmt-support registers Rosetta x86_64.
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = linux
 # END GENERATED PULP TOOLCHAIN
 
 [skia]
