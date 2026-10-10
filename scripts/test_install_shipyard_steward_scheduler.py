@@ -34,7 +34,15 @@ class StewardSchedulerInstallerTests(unittest.TestCase):
         self.shipyard = (self.bin / "shipyard").resolve()
         self.shipyard.write_text(
             """#!/bin/sh
-if [ "$1" = "--version" ]; then printf 'shipyard 0.113.0\\n'; exit 0; fi
+[ -z "${NO_CARRIER-}" ] || exit 2
+if [ "$*" = "--json runner carrier --replay /dev/null" ]; then
+  printf '{"schema_version":1,"command":"runner.carrier","apply":false,"replay":"/dev/null","plans":[]}\\n'
+  exit 0
+fi
+if [ "$1 $2 $3 $4" = "--json runner carrier --repo" ]; then
+  printf '{"schema_version":1,"command":"runner.carrier","apply":false,"classes":[],"repos":[{"repo":"%s","base":"main","prs":[],"errors":[]}]}\\n' "$5"
+  exit 0
+fi
 exit 97
 """,
             encoding="utf-8",
@@ -97,9 +105,12 @@ esac
 
     def run_installer(
         self, *extra: str, fail_bootstrap: bool = False, fail_bootout: bool = False,
-        defer_runatload: bool = False,
+        defer_runatload: bool = False, no_carrier: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
+        environment.pop("NO_CARRIER", None)
+        if no_carrier:
+            environment["NO_CARRIER"] = "1"
         environment.update(
             {
                 "HOME": str(self.home),
@@ -150,8 +161,10 @@ esac
         self.assertEqual(result.returncode, 0, result.stderr)
         config_path = self.home / ".config/shipyard/steward-scheduler.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        self.assertFalse(config["enabled"])
+        self.assertEqual(config["schema_version"], 2)
+        self.assertEqual(config["mode"], "disabled")
         self.assertFalse(config["authority"])
+        self.assertEqual(config["classes"], [])
         self.assertEqual(config["repositories"], [{"repo": "owner/repo", "checkout": str(self.repo.resolve())}])
         self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
         # Nothing is copied: the agent runs the installed generation.
@@ -160,6 +173,49 @@ esac
             (self.home / "Library/Logs/shipyard-steward-scheduler.health.json").read_text(encoding="utf-8")
         )
         self.assertEqual(health["status"], "disabled")
+
+    def read_config(self) -> dict[str, object]:
+        path = self.home / ".config/shipyard/steward-scheduler.json"
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    def test_plan_install_publishes_a_plan_config_and_startup_receipt(self) -> None:
+        result = self.run_installer("--mode", "plan", "--install")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = self.read_config()
+        self.assertEqual((config["mode"], config["authority"], config["classes"]), ("plan", False, []))
+        startup = json.loads(
+            (self.home / "Library/Logs/shipyard-steward-scheduler.startup.json").read_text()
+        )
+        self.assertEqual((startup["status"], startup["mode"]), ("started", "plan"))
+
+    def test_live_needs_authority_and_a_live_class(self) -> None:
+        for extra, needle in (
+            (("--mode", "live", "--authority"), "at least one --class"),
+            (("--mode", "live", "--authority", "--class", "update_branch"), "invalid --class"),
+            (("--mode", "plan", "--authority"), "only valid with --mode live"),
+            (("--mode", "plan", "--class", "rearm"), "only valid with --mode live"),
+        ):
+            with self.subTest(extra=extra):
+                result = self.run_installer(*extra)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn(needle, result.stderr)
+
+    def test_reinstalling_without_live_rolls_a_live_controller_back_to_plan(self) -> None:
+        live = self.run_installer("--mode", "live", "--authority", "--class", "redispatch", "--install")
+        self.assertEqual(live.returncode, 0, live.stderr)
+        config = self.read_config()
+        self.assertEqual((config["mode"], config["authority"], config["classes"]), ("live", True, ["redispatch"]))
+        (self.home / ".launchctl-ran").unlink()
+        back = self.run_installer("--mode", "plan", "--install")
+        self.assertEqual(back.returncode, 0, back.stderr)
+        config = self.read_config()
+        self.assertEqual((config["mode"], config["authority"], config["classes"]), ("plan", False, []))
+
+    def test_a_shipyard_without_the_carrier_is_refused(self) -> None:
+        result = self.run_installer("--mode", "plan", no_carrier=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("runner carrier", result.stderr)
+        self.assertFalse((self.home / ".config/shipyard/steward-scheduler.json").exists())
 
     def test_failed_bootstrap_restores_prior_files(self) -> None:
         installed = self.home / ".local/share/tartci/scripts/shipyard_steward_scheduler.py"
