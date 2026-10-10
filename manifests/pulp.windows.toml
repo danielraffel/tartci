@@ -37,7 +37,7 @@ firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
 ssh_hostfwd = "2222:22"
 
 # BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = 1e55579437dd660f1d4b1012bf2e0ff2704aa1e22327311f827a255eeecee799
+# source_sha256 = 09bfe44e0d65d4187eb20203b5f6e833a4fd0f10e4dd252b56e7dc0e7cd99b4f
 # generated_platform = windows
 [toolchain]
 cmake = "system"
