@@ -103,6 +103,11 @@ CODES: tuple[str, ...] = (
     "peer_reachability_unreadable",
     "peer_unreachable",
     "peer_unreachable_excluded",
+    "pf_not_applicable",
+    "pf_pfd_exiting",
+    "pf_reference_missing",
+    "pf_reference_ok",
+    "pf_reference_unknown",
     "persistent_runners_without_hold_receipt",
     "power_ok",
     "power_sleeps",
@@ -131,6 +136,7 @@ CODES: tuple[str, ...] = (
     "reuse_canary_unreadable",
     "sealed_launcher_bundle",
     "self_update_current",
+    "self_update_paused",
     "self_update_problem",
     "self_update_unmeasured",
     "signing_prompts_not_applicable",
@@ -758,6 +764,12 @@ def check_self_update(summary: dict | None) -> Finding:
                        "tartci's skew against main was never measured on this host "
                        "(run `tartci fleet-macos self-update --plan`)")
     lines = "; ".join(summary.get("lines") or [])
+    if summary.get("paused"):
+        # Not a failed update: launchd is not starting it and the interval
+        # guard holds it for the stall, so "read the receipt" finds nothing.
+        return Finding("self_update", PROBLEM, "self_update_paused",
+                       f"{summary['paused']} ({lines})", {"skew": summary.get("skew"),
+                                                          "last": summary.get("last")})
     if summary.get("problem"):
         return Finding("self_update", PROBLEM, "self_update_problem",
                        f"{summary['problem']} ({lines})", {"skew": summary.get("skew"),
@@ -1192,6 +1204,25 @@ def check_power(value: dict | None) -> Finding:
     return Finding("power", UNKNOWN, "power_unknown", detail, facts)
 
 
+def check_pf_reference(value: dict | None) -> Finding:
+    """Whether pf holds an enable reference for the VM network (scripts/pf_reference.py)."""
+    import pf_reference  # noqa: PLC0415 - sibling module; owns the states
+
+    value = value or {"state": "unknown"}
+    detail = pf_reference.describe(value)
+    facts = {"pf_reference": value}
+    state = value.get("state")
+    if state == "ok":
+        return Finding("pf_reference", OK, "pf_reference_ok", detail, facts)
+    if state == "no_reference":
+        return Finding("pf_reference", PROBLEM, "pf_reference_missing", detail, facts)
+    if state == "pfd_exiting":
+        return Finding("pf_reference", PROBLEM, "pf_pfd_exiting", detail, facts)
+    if state == "not_applicable":
+        return Finding("pf_reference", NOT_APPLICABLE, "pf_not_applicable", detail, facts)
+    return Finding("pf_reference", UNKNOWN, "pf_reference_unknown", detail, facts)
+
+
 def check_signing_prompts(value: dict | None, home: Path) -> Finding:
     """Whether the keychain setup can raise a password dialog (signing_prompt_guard.py)."""
     import signing_prompt_guard
@@ -1200,7 +1231,8 @@ def check_signing_prompts(value: dict | None, home: Path) -> Finding:
         try:
             value = signing_prompt_guard.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
-            value = {"state": "unknown", "detail": str(exc)}
+            import secret_files
+            value = {"state": "unknown", "detail": secret_files.redact(exc, home)}
     facts = {"signing_prompts": value}
     state = value.get("state")
     if state == "not_applicable":
@@ -1439,6 +1471,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             support_agents_value: dict | None = None,
             reuse_canary_value: dict | None = None,
             power_value: dict | None = None,
+            pf_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
             ) -> list[Finding]:
@@ -1606,6 +1639,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             power_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_power(power_value))
+    if pf_value is None:
+        try:
+            import pf_reference
+            pf_value = pf_reference.status(len(fit_records))
+        except Exception as exc:  # noqa: BLE001 - reported as unknown
+            pf_value = {"state": "unknown", "error": str(exc)}
+    findings.append(check_pf_reference(pf_value))
     findings.append(check_signing_prompts(signing_prompts_value, home))
 
     def default_tmp_probe(profile: Path) -> tuple[dict | None, str]:

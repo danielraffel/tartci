@@ -59,6 +59,7 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 
 try:
     import tomllib
@@ -403,6 +404,31 @@ def peer_reachability(home: Path | None = None) -> dict:
     return {"state": "dark" if peers else "ok", "peers": peers}
 
 
+def paused_line(state_dir: Path, now: float | None = None) -> str | None:
+    """Why self-update has not run, when the launchd interval guard is holding
+    it: during a launchd timer stall launchd starts nothing on its own and the
+    guard deliberately does not kick self-update, so self-update writes no log
+    line and no attempt of its own. Read-only; None when not paused or when the
+    guard's receipt cannot be read."""
+    try:
+        import launchd_interval_guard as guard  # noqa: PLC0415 - sibling module
+        directory = (Path(os.environ["TARTCI_INTERVAL_GUARD_DIR"])
+                     if os.environ.get("TARTCI_INTERVAL_GUARD_DIR")
+                     else state_dir.parent / "launchd-interval-guard")
+        value = guard.status(directory, now=now)
+    except Exception:  # noqa: BLE001 - a status surface never raises
+        return None
+    paused = [row for row in value.get("paused") or []
+              if isinstance(row, dict) and "self-update" in str(row.get("label"))]
+    if value.get("state") != "stalled" or not paused:
+        return None
+    started = (value.get("episode") or {}).get("started_ts")
+    since = _iso(float(started)) if isinstance(started, (int, float)) else "an unknown time"
+    return (f"self-update PAUSED by the launchd timer stall since {since}: launchd has not "
+            "started it and the interval guard does not kick it during the stall, so it "
+            "has written no attempt since; a reboot resumes it")
+
+
 def summary(home: Path | None = None) -> dict:
     """Cached skew + last attempt for status surfaces. Never fetches or raises."""
     state = state_dir_for(home or Path.home())
@@ -434,7 +460,8 @@ def summary(home: Path | None = None) -> dict:
     aged = skew_stale_note(skew)
     if aged:
         problem = f"{problem}; skew {aged}" if problem else f"skew {aged}"
-    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem}
+    return {"skew": skew, "last": last, "lines": status_lines(state), "problem": problem,
+            "paused": paused_line(state)}
 
 
 def load_config(home: Path, settings: Path | None = None) -> Config:
@@ -1168,21 +1195,36 @@ def extract_signing_identity(sys_: System, bundle: Path, workdir: Path) -> str:
 
 
 def signing_secrets(home: Path) -> dict[str, str]:
-    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env)."""
-    directory = Path(os.environ.get("PULP_SECRETS_DIR") or home / ".config" / "pulp" / "secrets")
-    values: dict[str, str] = {}
-    try:
-        lines = (directory / "keychain.env").read_text().splitlines()
-    except OSError:
-        return values
-    for line in lines:
-        key, sep, value = line.strip().partition("=")
-        if sep and key and not key.startswith("#"):
-            values[key.removeprefix("export ").strip()] = value.strip().strip('"').strip("'")
+    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env).
+
+    Only well-formed lines are returned; see secret_files.parse. Never put a
+    value from here into a message: name the key instead.
+    """
+    env = secret_files.load(home, "keychain.env")
+    values = dict(env.values) if env is not None else {}
     for key in ("PULP_SIGN_KEYCHAIN", "PULP_SIGN_KEYCHAIN_PW"):
         if os.environ.get(key):
             values[key] = os.environ[key]
     return values
+
+
+def signing_secrets_problem(home: Path) -> str | None:
+    """What is wrong with keychain.env, by key name only, or None."""
+    env = secret_files.load(home, "keychain.env")
+    if env is None:
+        return None
+    bad = list(env.malformed)
+    keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
+    if keychain and not secret_files.keychain_path_ok(_expand_home(keychain, home)):
+        bad.append("PULP_SIGN_KEYCHAIN (not a keychain path)")
+    if not bad:
+        return None
+    return ("keychain.env is malformed: " + ", ".join(bad)
+            + "; values withheld. Rewrite it with `pulp ship doctor`")
+
+
+def _expand_home(value: str, home: Path) -> str:
+    return str(Path(value.replace("$HOME", str(home))).expanduser())
 
 
 def signing_keychain(home: Path) -> str | None:
@@ -1191,12 +1233,16 @@ def signing_keychain(home: Path) -> str | None:
     keychain.env's PULP_SIGN_KEYCHAIN, or its `-unattended` sibling when that
     exists: pulp's ensure_signing_ready.sh builds the sibling when the
     configured keychain cannot be unlocked, and signs from it from then on.
+    A value that is not a keychain path is ignored (None): it is what a
+    malformed file parses as, and it may hold the password.
     """
     keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
     if not keychain:
         return None
-    path = Path(keychain.replace("$HOME", str(home))).expanduser()
-    stem = str(path)[: -len(".keychain-db")] if str(path).endswith(".keychain-db") else str(path)
+    path = _expand_home(keychain, home)
+    if not secret_files.keychain_path_ok(path):
+        return None
+    stem = path[: -len(".keychain-db")] if path.endswith(".keychain-db") else path
     sibling = Path(f"{stem}-unattended.keychain-db")
     return str(sibling if sibling.exists() else path)
 
@@ -1216,12 +1262,15 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     keychain = signing_keychain(home)
     password = signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
     if not keychain or not password:
-        return "no dedicated signing keychain configured in keychain.env; probing as-is"
+        problem = signing_secrets_problem(home)
+        return (f"{problem}; probing as-is" if problem else
+                "no dedicated signing keychain configured in keychain.env; probing as-is")
     result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
     if result.rc != 0:
-        return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
-                "the signing probe decides")
-    return f"unlocked {keychain} for this session"
+        return secret_files.redact(
+            f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
+            "the signing probe decides", home)
+    return secret_files.redact(f"unlocked {keychain} for this session", home)
 
 
 def keychain_args(home: Path) -> list[str]:
@@ -1253,8 +1302,8 @@ def signing_probe(sys_: System, identity: str, workdir: Path,
     if result.rc != 0:
         raise Refused(f"SIGNING KEYCHAIN LOCKED or unusable: signing identity {identity} "
                       f"cannot sign unattended (exit {result.rc}: "
-                      f"{result.text[:200]}); run `pulp ship doctor` to prepare the dedicated "
-                      "signing keychain, and never answer a keychain password prompt")
+                      f"{secret_files.redact(result.text)[:200]}); run `pulp ship doctor` to prepare "
+                      "the dedicated signing keychain, and never answer a keychain password prompt")
 
 
 def set_immutable(root: Path, manifest: Path, sys_: System) -> None:
@@ -2418,6 +2467,9 @@ def status_lines(state_dir: Path) -> list[str]:
     skew = _read_json(state_dir / "skew.json")
     aged = skew_stale_note(skew)
     lines = [render_skew(skew) + (f" {aged}" if aged else "")]
+    paused = paused_line(state_dir)
+    if paused:
+        lines.append(paused)
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"
