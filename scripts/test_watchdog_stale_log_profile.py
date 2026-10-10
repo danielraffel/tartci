@@ -21,6 +21,8 @@ from unittest import mock
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import macos_fleet_lanes as fleet  # noqa: E402
 import support_agents as sa  # noqa: E402
 import tartci_launchd_watchdog as wd  # noqa: E402
