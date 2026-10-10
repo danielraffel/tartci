@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -19,6 +20,7 @@ PROBE_NAME = "github.com"
 DEFAULT_TCP_IP = "140.82.112.3"
 HYSTERESIS_TICKS = 3
 TIMEOUT_SECONDS = 5
+IPV4_LINE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 
 Runner = Callable[[list[str]], Tuple[int, str, str]]
 
@@ -62,9 +64,13 @@ def probe(run: Optional[Runner] = None, tcp_ip: Optional[str] = None) -> Dict[st
     """Return resolver/tcp booleans and one of the four classifications."""
     run = run or _run
     tcp_ip = tcp_ip or os.environ.get("TARTCI_RESOLVER_PROBE_IP", DEFAULT_TCP_IP)
-    resolver_rc, resolver_out, resolver_err = run(["dns-sd", "-G", "v4", PROBE_NAME])
+    # dscacheutil exits after one answer. dns-sd can print an answer and then
+    # wait forever, so _run may return 124 after killing it; that is still a
+    # successful resolver probe when an address was printed first.
+    resolver_rc, resolver_out, resolver_err = run(
+        ["dscacheutil", "-q", "host", "-a", "name", PROBE_NAME])
     tcp_rc, tcp_out, tcp_err = run(["nc", "-z", "-G", "3", tcp_ip, "443"])
-    resolver_ok = resolver_rc == 0 and bool(resolver_out.strip())
+    resolver_ok = resolver_rc in (0, 124) and bool(IPV4_LINE.search(resolver_out))
     tcp_ok = tcp_rc == 0
     if not resolver_ok and tcp_ok:
         condition = "resolver_dead"
