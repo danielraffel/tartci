@@ -797,6 +797,9 @@ class PeerTurnReplayTests(Base):
         self.assertEqual(peer["evidence"], "peer studio is self-updating to 1c32310463f2 (10 min in)")
         self.assertEqual(peer["active_age"], 636)
         self.assertNotIn("draining", peer["evidence"])
+        # The readability fix itself: the turn holder, its target and its age.
+        self.assertIn("self-updating to 1c32310463f2", peer["evidence"])
+        self.assertIn("(10 min in)", peer["evidence"])
 
     def test_the_recorded_queue_lets_exactly_one_host_go(self) -> None:
         # waiting.json on m1 and m5studio at 07:02Z, after m5 finished its
