@@ -1898,21 +1898,56 @@ boot_vm_to_ssh(){
   event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
-  local sshok=0
-  for _ in $(seq 1 90); do
-    ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
-      && { sshok=1; break; }
-    sleep 2
-  done
-  if [ "$sshok" != 1 ]; then
-    note "[$i] no SSH after 180s — discarding unregistered VM"
-    event boot_failed "no_ssh"
+  BOOT_SSH_HEARTBEAT_PHASE="$boot_phase"
+  if ! tartci_vm_ssh_wait "$VM_USER@$ip"; then
+    note "[$i] no SSH after ${BOOT_SSH_WAITED_SECS}s (${BOOT_SSH_ATTEMPTS} attempts, deadline ${TARTCI_BOOT_SSH_DEADLINE_SECS:-180}s) — discarding unregistered VM"
+    event boot_failed "no_ssh" \
+      "waited_s=$BOOT_SSH_WAITED_SECS" "attempts=$BOOT_SSH_ATTEMPTS"
     runtime_emit_complete fail ssh_failed 1 "" "$logdir"
     discard_current_vm
     tartci_release_vm_lease
     return 1
   fi
   return 0
+}
+
+# Wait for a booted VM's sshd, bounded by WALL-CLOCK time, not by attempts.
+#
+# ConnectTimeout bounds only the TCP connect. A guest whose network answers but
+# whose sshd never completes the handshake holds each `ssh ... true` for about
+# 60 s, so a loop of 90 attempts meant to last 180 s ran for about 93 minutes,
+# writing no heartbeat: m1's pulp-gate.slot2 sat in `booting` for 71+ minutes
+# on 2026-10-09 while readiness reported only `heartbeat_stale`. Each attempt
+# is now killed at TARTCI_BOOT_SSH_ATTEMPT_SECS (default 15) and the whole wait
+# ends at TARTCI_BOOT_SSH_DEADLINE_SECS (default 180). Each failed attempt
+# refreshes the boot phase's heartbeat: the supervisor is alive and the wait
+# has a hard end, so this cannot hide a wedge longer than the deadline.
+# Sets BOOT_SSH_WAITED_SECS and BOOT_SSH_ATTEMPTS for the caller's receipt.
+tartci_vm_ssh_wait(){
+  local dest="$1" deadline="${TARTCI_BOOT_SSH_DEADLINE_SECS:-180}"
+  local per="${TARTCI_BOOT_SSH_ATTEMPT_SECS:-15}" started="$SECONDS" left bound
+  case "$deadline" in ''|*[!0-9]*|0) deadline=180 ;; esac
+  case "$per" in ''|*[!0-9]*|0) per=15 ;; esac
+  BOOT_SSH_ATTEMPTS=0
+  BOOT_SSH_WAITED_SECS=0
+  while :; do
+    left=$(( deadline - (SECONDS - started) ))
+    [ "$left" -gt 0 ] || break
+    bound="$per"; [ "$left" -lt "$bound" ] && bound="$left"
+    BOOT_SSH_ATTEMPTS=$((BOOT_SSH_ATTEMPTS + 1))
+    if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "$bound" \
+         --operation boot_ssh_probe -- \
+         ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
+      BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
+      return 0
+    fi
+    [ -z "${BOOT_SSH_HEARTBEAT_PHASE:-}" ] || heartbeat "$BOOT_SSH_HEARTBEAT_PHASE"
+    left=$(( deadline - (SECONDS - started) ))
+    [ "$left" -gt 2 ] || break
+    sleep 2
+  done
+  BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
+  return 1
 }
 
 # A VM booted for a class the pre-mint check just denied serves whichever class

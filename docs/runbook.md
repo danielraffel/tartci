@@ -2961,6 +2961,17 @@ lanes change.
   runner census the real transition takes (two paginated GitHub API calls per
   protected repository). Do not run it in a tight loop; poll no faster than
   once a minute, and never on a host whose census CLI is anonymous (see below).
+- **`fleet_not_ready` names each problem's lane and age.** `tartci doctor
+  fleet` prints every readiness problem as `code (lane, detail)`, for example
+  `heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`. A stale
+  heartbeat on one lane makes the whole host count as not serving for its
+  peers' capacity floor, so read the lane, then its state file under
+  `~/.tartci/state/macos-fleet/<lane>/` and its `events.jsonl`. A lane stuck
+  in `booting` after `boot_ip` is the guest's sshd not answering; the boot
+  helper gives it `TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180) of wall-clock
+  time, killing each attempt at `TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15),
+  then discards the VM with `boot_failed no_ssh` (gotchas: "A gate lane sits
+  in `booting` for over an hour").
 - **Capacity-floor refusals come in two kinds, and only one is overridable.**
   `last serving host` (the floor's exit 3) means the census answered and no
   other host serves the label: none has an online runner carrying it, and no
