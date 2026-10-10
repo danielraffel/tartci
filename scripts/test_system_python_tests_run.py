@@ -122,6 +122,9 @@ ALLOWED = {
     ("test_gate_ccache_trim.py",
      "Run"):
         reads_profile("gate_ccache_trim.load_settings()"),
+    ("test_gate_ccache_trim.py",
+     "Settings.test_every_macos_fleet_profile_opts_in_with_the_default_window"):
+        SHIPPED,
     ("test_gate_reserve_fit.py",
      "FitTests.test_m3_m5studio_and_m5_fit_and_m1_overcommits_cores"):
         SHIPPED,
