@@ -1872,6 +1872,56 @@ After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
 instead of waiting out the 300 s cadence; a fix that changes the chain usually
 triggers it on its own.
 
+### launchd stalled on a peer (`peer_launchd_stalled`)
+
+A stalled macOS automatic install can leave a host's launchd refusing every
+non-demand spawn. The interval guard (`scripts/launchd_interval_guard.py`)
+keeps the timers running from inside a lane supervisor, but it pauses
+self-update for the whole episode, and the stalled host opened no issue: m3
+was stalled from 2026-10-05T05:41Z for 97 h and 44 commits behind before
+anyone looked. A host in that state is the wrong one to rely on for its own
+alert, so its peers raise it.
+
+- **Who reads.** Every fleet host's launchd watchdog runs
+  `scripts/peer_stall_alert.py` after its heal work, at most once every
+  30 min (`TARTCI_PEER_STALL_READ_SECS`). It reads each published peer (the
+  same list and SSH targets self-update uses) with one SSH command that prints
+  the peer's clock and its guard receipt
+  (`~/.tartci/state/launchd-interval-guard/status.json`), and judges the
+  receipt with the guard's own `classify` on the peer's clock, so clock skew
+  cannot make a fresh receipt look stale.
+- **When it alerts.** A stall episode open for 6 h
+  (`TARTCI_PEER_STALL_ALERT_SECS`) opens one issue:
+  `[tartci] <peer> launchd stalled / self-update paused since <episode start>`.
+  The body says whether self-update is paused, gives
+  `Run: ssh <peer> 'tartci doctor fleet'`, and the fix: reboot the host when
+  its lanes are idle (a reboot clears the stall), and do not kickstart
+  self-update while it lasts. The watchdog log prints a
+  `WARN peer-stall` line each read while it holds.
+- **One reader acts.** Every watchdog runs on the same cadence, so reads of a
+  peer line up. The peer's primary reader, the lowest published host id other
+  than the peer, is the one that opens and closes its issue. The same SSH
+  command that reads a host's guard receipt also reads that host's own last
+  peer-stall pass, so every other reader can see whether the primary read the
+  peer within two read intervals. After two consecutive reads where it did not
+  (unreachable, stale, or it could not read the peer), the next reader acts.
+  Before opening, any reader adopts an open issue with the exact title, which
+  covers a fallback and a returning primary overlapping. A host that opened
+  or adopted an issue keeps closing it.
+  A host whose own id is unknown (no readable profile) reads and reports but
+  never opens or closes an issue.
+- **When it closes.** When a reader sees a fresh receipt, written after the
+  episode began, that reports no stall. A stale receipt (no guard running
+  there; that host's doctor `launchd_timers` says so) never closes it, and an
+  unreachable peer (often a host mid-reboot) or a guard that never ran decides
+  nothing, so the issue stays as it is.
+- **Where to look.** The reader's `~/.tartci/state/peer-stall/` holds
+  `last-read.json` (every peer's last verdict, whether this host acted and
+  why, and its count of primary misses), one `<peer>.json` per alert,
+  and `events.jsonl` (`peer_launchd_stalled`, once per episode).
+  `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
+  issue.
+
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;
