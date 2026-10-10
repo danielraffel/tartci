@@ -323,6 +323,13 @@ run_runner(){
   touch "$runner_log"
   tail -n +1 -F "$runner_log" & tail_pid=$!
   RUNNER_CLEANUP_TAIL_PID="$tail_pid"
+  # A heartbeat line on stdout, which the host reads through this ssh session:
+  # a guest that froze stops writing it, while its TCP session can stay open
+  # for the whole job timeout (2 h). The host tears the VM down once the line
+  # is older than its TARTCI_GUEST_HEARTBEAT_STALE_SECS.
+  local beat_every="${TARTCI_GUEST_HEARTBEAT_SECS:-30}" since_beat=0
+  case "$beat_every" in ''|*[!0-9]*|0) beat_every=30 ;; esac
+  printf 'TARTCI_GUEST_HEARTBEAT %s\n' "$(date +%s)"
   while [ ! -s "$root/exit" ]; do
     if ! "$LAUNCHCTL" print "gui/$EXPECTED_UID/$label" >/dev/null 2>&1; then
       "$SLEEP" 1
@@ -330,6 +337,11 @@ run_runner(){
       break
     fi
     "$SLEEP" 1
+    since_beat=$((since_beat + 1))
+    if [ "$since_beat" -ge "$beat_every" ]; then
+      since_beat=0
+      printf 'TARTCI_GUEST_HEARTBEAT %s\n' "$(date +%s)"
+    fi
   done
   rc="$(head -n1 "$root/exit")"
   case "$rc" in ''|*[!0-9]*) rc=78 ;; esac
