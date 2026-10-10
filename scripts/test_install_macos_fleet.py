@@ -47,8 +47,16 @@ class InstallMacosFleetTests(unittest.TestCase):
             [ "${FAKE_AUTH_DENY:-0}" = 1 ] && exit 1
             for arg in "$@"; do
               case "$arg" in
-                repos/danielraffel/tartci/commits/*)
-                  printf '%s\n' "${FAKE_AUTH_SHA:-${arg##*/}}"
+                repos/danielraffel/tartci/commits/*|repos/Generous-Corp/tartci/commits/*)
+                  sha="${FAKE_AUTH_SHA:-${arg##*/}}"
+                  repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
+                  repo="${repo%%/commits/*}"
+                  printf '{"sha":"%s"}\n' "$sha"
+                  exit 0
+                  ;;
+                repos/danielraffel/tartci|repos/Generous-Corp/tartci)
+                  repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
+                  printf '{"full_name":"%s"}\n' "$repo"
                   exit 0
                   ;;
               esac

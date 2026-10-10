@@ -58,6 +58,7 @@ class FakeSystem(su.System):
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
+        self.peer_pool_since: dict[str, float] = {}   # mtime of a peer's pool-state file
         self.published = json.loads(json.dumps(PUBLISHED))
         self.checks: dict[str, list] = {}
         self.signing_rc = 0
@@ -72,6 +73,9 @@ class FakeSystem(su.System):
         self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.remote_url = su.REPO_URL + "\n"
+        self.api_repository = su.DEFAULT_REPOSITORY
+        self.unreadable_repositories: set[str] = set()
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -137,15 +141,24 @@ class FakeSystem(su.System):
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.env_calls = getattr(self, "env_calls", [])
+        self.env_calls.append(dict(env or {}))
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
         if a[0] == FAKE_GH:
-            sha = a[2].split("/commits/")[1].split("/")[0]
-            runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
-                                          "conclusion": "success"}])
-            return ok(json.dumps({"check_runs": runs}))
+            repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if repository in self.unreadable_repositories:
+                return su.Result(1, "", "not found")
+            if "check-runs" in a[2]:
+                sha = a[2].split("/commits/")[1].split("/")[0]
+                runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
+                                              "conclusion": "success"}])
+                return ok(json.dumps({"check_runs": runs}))
+            if "/commits/" not in a[2]:
+                return ok(json.dumps({"full_name": self.api_repository}))
+            return ok(json.dumps({"sha": a[2].split("/")[-1]}))
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
@@ -183,7 +196,7 @@ class FakeSystem(su.System):
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
-                return ok(su.REPO_URL + "\n")
+                return ok(self.remote_url)
             if "checkout" in a:
                 self.checked_out = a[-1]
             return ok()
@@ -202,8 +215,11 @@ class FakeSystem(su.System):
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
+            pool_since = self.peer_pool_since.get(peer)
             return ok(f"{clock}\n" + (json.dumps(marker) if marker else "") + "\n"
-                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else ""))
+                      + su.WAITING_SEPARATOR + "\n" + (json.dumps(ticket) if ticket else "")
+                      + ("\n" + su.POOL_SINCE_SEPARATOR + "\n" + str(int(pool_since))
+                         if pool_since is not None else ""))
         if a[:2] == ["python3", "scripts/capacity_floor.py"]:
             return su.Result(0 if self.floor.get("allowed") else 3, json.dumps(self.floor))
         if a[:2] == ["python3", "scripts/network_profile.py"]:
@@ -764,6 +780,114 @@ class OnDemandSupplyTests(Base):
         self.assertEqual(self.plan(), su.EXIT_OK)
         self.sys.peers["m5"] = healthy_peer(fleet_ready=False)
         self.assertEqual(self.plan(), su.EXIT_REFUSED)
+
+
+class PeerTurnReplayTests(Base):
+    """The 2026-10-09 update turn, replayed from the hosts' own records.
+
+    This fake host is m1; its peers are studio (m5studio, ssh m3) and m5.
+    Epoch values are the real ones, shifted so the last observation lands on
+    NOW.
+    """
+
+    OBSERVED = 1791529322             # date +%s when the tickets were read
+    SHIFT = NOW - OBSERVED
+
+    def at(self, epoch: float) -> float:
+        return epoch + self.SHIFT
+
+    def test_a_peer_draining_for_its_own_update_reads_as_the_turn_holder(self) -> None:
+        # m5 at 06:05:54Z read m5studio, which announced at 05:55:18Z and then
+        # drained. Read pool state first, it said only "draining".
+        self.sys.peers["m3"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m3"] = {"host_id": "studio",
+                                       "target": "1c32310463f2f5ebabed386c4417eb1653539934",
+                                       "ts": NOW - 636}
+        self.sys.peer_pool_since["m3"] = NOW - 600
+        peer = su.read_peer(self.cfg, self.sys, "studio", "m3")
+        self.assertTrue(peer["busy"])
+        self.assertEqual(peer["evidence"], "peer studio is self-updating to 1c32310463f2 (10 min in)")
+        self.assertEqual(peer["active_age"], 636)
+        self.assertNotIn("draining", peer["evidence"])
+        # The readability fix itself: the turn holder, its target and its age.
+        self.assertIn("self-updating to 1c32310463f2", peer["evidence"])
+        self.assertIn("(10 min in)", peer["evidence"])
+
+    def test_the_recorded_queue_lets_exactly_one_host_go(self) -> None:
+        # waiting.json on m1 and m5studio at 07:02Z, after m5 finished its
+        # update and came back on. Both still carried "peer m5 is draining",
+        # a reason up to one interval old; the next read must not reuse it.
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791526495.20782), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528338.536526)})
+        studio_ticket = {
+            "host_id": "m5studio", "issue": None,
+            "reason": "another fleet host is not serving normally: peer m5 is draining "
+                      "(participating=False)",
+            "since": self.at(1791528023.668664), "starved_evented": None,
+            "target": "d4158f38974c181e94efd7eb43c2767c084f533b",
+            "ts": self.at(1791528023.668664)}
+        self.sys.peer_waiting["m3"] = studio_ticket
+        self.sys.peer_pool_since["m5"] = self.at(1791528936)   # m5 back on at 06:55:36Z
+        self.sys.peer_pool_since["m3"] = self.at(1791526209)
+        # m1 holds the older ticket, so m1 goes...
+        self.assertUpdated(self.apply())
+        # ...and m5studio, reading m1's ticket, yields to it.
+        ahead = su.queue_ahead("studio", studio_ticket["since"],
+                               {"m1": self.at(1791526495.20782)})
+        self.assertEqual(len(ahead), 1)
+        self.assertTrue(ahead[0].startswith("m1 "), ahead)
+
+    def test_a_markerless_drain_older_than_the_bound_no_longer_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - su.PEER_DRAIN_STALE_SECONDS - 60
+        peer = su.read_peer(self.cfg, self.sys, "m5", "m5")
+        self.assertFalse(peer["busy"])
+        self.assertTrue(peer["off"])
+        self.assertIn("draining for 3.0 h with no update marker", peer["evidence"])
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        peers_step = next(step for step in receipt["steps"] if step["step"] == "peers")
+        self.assertIn("counted as serving nothing by the capacity floor: m5",
+                      peers_step["detail"])
+
+    def test_a_recent_markerless_drain_still_holds_the_turn(self) -> None:
+        # Control, same instrument: only the drain's age changed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 1800
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("peer m5 is draining (participating=False), pool state unchanged for 30 min",
+                      su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_drain_of_unknown_age_holds_the_turn(self) -> None:
+        # No pool-state time (an old peer, or stat failed): fail closed.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_an_update_that_died_after_draining_stops_holding_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 4 * 3600 + 60
+        self.assertUpdated(self.apply())
+
+    def test_an_expired_marker_on_a_recent_drain_still_holds_the_turn(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 4 * 3600}
+        self.sys.peer_pool_since["m5"] = NOW - 3600
+        self.assertDeferred(self.apply())
+
+    def test_an_opted_out_peer_that_is_on_still_holds_the_turn(self) -> None:
+        # The drain bound is for draining only, never for a host on but not
+        # participating, however long ago its pool state changed.
+        self.sys.peers["m5"] = {"state": "on", "participating": False}
+        self.sys.peer_pool_since["m5"] = NOW - 30 * 86400
+        self.assertDeferred(self.apply())
 
 
 class UpdateQueueTests(Base):
@@ -2048,6 +2172,45 @@ class IncidentTests(Base):
         self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
+
+
+class RepositoryIdentityTests(Base):
+    def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            repository = su.configured_repository(self.cfg, self.sys)
+            run = object.__new__(su.Run)
+            run.cfg, run.sys, run.install_args, run.repository = (
+                self.cfg, self.sys, ["fleet-macos", "install", "profile"], repository)
+            run.receipt = mock.Mock()
+            run._writer_fence = lambda: []
+            su.Run._install(run, run.install_args)
+        self.assertEqual(su.LEGACY_REPOSITORY, repository)
+        self.assertEqual(su.LEGACY_REPOSITORY, self.sys.env_calls[-1]["GH_REPO"])
+
+    def test_default_resolution_uses_first_readable_accepted_slug(self):
+        self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
+        self.sys.api_repository = su.DEFAULT_REPOSITORY
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.DEFAULT_REPOSITORY,
+                             su.canonical_repository(self.cfg, self.sys))
+
+    def test_api_accepts_legacy_and_new_full_name(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.api_repository = repository
+            with mock.patch.dict(os.environ, {"GH_REPO": repository}):
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys), repository)
+
+    def test_api_rejects_third_repository(self):
+        self.sys.api_repository = "example/other-tartci"
+        with self.assertRaises(su.Refused):
+            su.canonical_repository(self.cfg, self.sys)
+
+    def test_refresh_rejects_third_remote(self):
+        self.sys.remote_url = "https://example.invalid/other-tartci.git\n"
+        with self.assertRaises(su.Refused):
+            su.refresh_checkout(self.cfg, self.sys)
 
 
 class OsInterpreterRefreshTests(Base):

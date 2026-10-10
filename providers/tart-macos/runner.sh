@@ -207,6 +207,10 @@ PENDING_DELETE_ATTEMPTS=0
 CURRENT_TEARDOWN_PENDING=""
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
+# A listener whose guest stops writing TARTCI_GUEST_HEARTBEAT lines for this
+# long is a frozen VM, torn down in minutes rather than at JOB_TIMEOUT.
+GUEST_HEARTBEAT_STALE="${TARTCI_GUEST_HEARTBEAT_STALE_SECS:-600}"
+case "$GUEST_HEARTBEAT_STALE" in ''|*[!0-9]*|0) GUEST_HEARTBEAT_STALE=600 ;; esac
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
 JIT_DENIAL_FILE=""
 EVENT_LOG="${TARTCI_EVENT_LOG:-$STATE_DIR/events.jsonl}"
@@ -1668,9 +1672,24 @@ run_runner_until_done_unlayered(){
   start="$(date +%s)"
   [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \
     || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))
+  local guest_beat_seen=0 guest_silent
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
+    if [ "$guest_beat_seen" = 0 ] && grep -q '^TARTCI_GUEST_HEARTBEAT ' "$runner_log" 2>/dev/null; then
+      guest_beat_seen=1
+    fi
+    if [ "$guest_beat_seen" = 1 ] \
+       && guest_silent="$(tartci_guest_silent_secs "$runner_log" "$now")" \
+       && [ "$guest_silent" -ge "$GUEST_HEARTBEAT_STALE" ]; then
+      event guest_heartbeat_stale "silent=${guest_silent}s stale_after=${GUEST_HEARTBEAT_STALE}s assigned=$assigned run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}" \
+        "silent_s=$guest_silent" "assigned=$assigned"
+      [ "$assigned" = 0 ] || cancel_current_run || true
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+      sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
+      return 124
+    fi
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
       assigned_at="$now"
@@ -1688,7 +1707,7 @@ run_runner_until_done_unlayered(){
       event idle_timeout "elapsed=${idle_elapsed}s rerun_eligible=false"
       kill "$ssh_pid" 2>/dev/null || true
       wait "$ssh_pid" 2>/dev/null || true
-      sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+      sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
       return 124
     fi
     if [ "$assigned" = 0 ] && [ "$retarget_next" -gt 0 ] && [ "$now" -ge "$retarget_next" ]; then
@@ -1702,7 +1721,7 @@ run_runner_until_done_unlayered(){
         else
           kill "$ssh_pid" 2>/dev/null || true
           wait "$ssh_pid" 2>/dev/null || true
-          sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+          sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
           return "$IDLE_RETARGET_RC"
         fi
       fi
@@ -1726,7 +1745,7 @@ run_runner_until_done_unlayered(){
         done
         kill -0 "$ssh_pid" 2>/dev/null && kill "$ssh_pid" 2>/dev/null || true
         wait "$ssh_pid" 2>/dev/null || true
-        sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+        sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
         return 124
       fi
     fi
@@ -1735,8 +1754,19 @@ run_runner_until_done_unlayered(){
   done
   wait "$ssh_pid" || rc=$?
   finalize_listener_receipt "$rc" "$assigned" "$runner_log"
-  sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+  sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
+}
+
+# Seconds since the listener's log last changed. The guest writes a heartbeat
+# line into it every TARTCI_GUEST_HEARTBEAT_SECS, so a long silence means the
+# guest stopped, not that the job is quiet.
+tartci_guest_silent_secs(){
+  local log="$1" now="$2" mtime
+  mtime="$(stat -f %m "$log" 2>/dev/null)" || mtime=""
+  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -c %Y "$log" 2>/dev/null)" || return 1 ;; esac
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' $(( now > mtime ? now - mtime : 0 ))
 }
 
 install_and_preflight_aqua_runner(){
@@ -1870,21 +1900,56 @@ boot_vm_to_ssh(){
   event boot_ip "ip=$ip clone_to_ip_s=$clone_to_ip_s" "clone_to_ip_s=$clone_to_ip_s"
   tartci_vm_dhcp_record "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" ip "$vm"
   rm -f "$boot_log"
-  local sshok=0
-  for _ in $(seq 1 90); do
-    ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null \
-      && { sshok=1; break; }
-    sleep 2
-  done
-  if [ "$sshok" != 1 ]; then
-    note "[$i] no SSH after 180s — discarding unregistered VM"
-    event boot_failed "no_ssh"
+  BOOT_SSH_HEARTBEAT_PHASE="$boot_phase"
+  if ! tartci_vm_ssh_wait "$VM_USER@$ip"; then
+    note "[$i] no SSH after ${BOOT_SSH_WAITED_SECS}s (${BOOT_SSH_ATTEMPTS} attempts, deadline ${TARTCI_BOOT_SSH_DEADLINE_SECS:-180}s) — discarding unregistered VM"
+    event boot_failed "no_ssh" \
+      "waited_s=$BOOT_SSH_WAITED_SECS" "attempts=$BOOT_SSH_ATTEMPTS"
     runtime_emit_complete fail ssh_failed 1 "" "$logdir"
     discard_current_vm
     tartci_release_vm_lease
     return 1
   fi
   return 0
+}
+
+# Wait for a booted VM's sshd, bounded by WALL-CLOCK time, not by attempts.
+#
+# ConnectTimeout bounds only the TCP connect. A guest whose network answers but
+# whose sshd never completes the handshake holds each `ssh ... true` for about
+# 60 s, so a loop of 90 attempts meant to last 180 s ran for about 93 minutes,
+# writing no heartbeat: m1's pulp-gate.slot2 sat in `booting` for 71+ minutes
+# on 2026-10-09 while readiness reported only `heartbeat_stale`. Each attempt
+# is now killed at TARTCI_BOOT_SSH_ATTEMPT_SECS (default 15) and the whole wait
+# ends at TARTCI_BOOT_SSH_DEADLINE_SECS (default 180). Each failed attempt
+# refreshes the boot phase's heartbeat: the supervisor is alive and the wait
+# has a hard end, so this cannot hide a wedge longer than the deadline.
+# Sets BOOT_SSH_WAITED_SECS and BOOT_SSH_ATTEMPTS for the caller's receipt.
+tartci_vm_ssh_wait(){
+  local dest="$1" deadline="${TARTCI_BOOT_SSH_DEADLINE_SECS:-180}"
+  local per="${TARTCI_BOOT_SSH_ATTEMPT_SECS:-15}" started="$SECONDS" left bound
+  case "$deadline" in ''|*[!0-9]*|0) deadline=180 ;; esac
+  case "$per" in ''|*[!0-9]*|0) per=15 ;; esac
+  BOOT_SSH_ATTEMPTS=0
+  BOOT_SSH_WAITED_SECS=0
+  while :; do
+    left=$(( deadline - (SECONDS - started) ))
+    [ "$left" -gt 0 ] || break
+    bound="$per"; [ "$left" -lt "$bound" ] && bound="$left"
+    BOOT_SSH_ATTEMPTS=$((BOOT_SSH_ATTEMPTS + 1))
+    if python3 "$TARTCI_ROOT/scripts/bounded_command.py" --timeout "$bound" \
+         --operation boot_ssh_probe -- \
+         ssh -n "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$dest" true >/dev/null 2>&1; then
+      BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
+      return 0
+    fi
+    [ -z "${BOOT_SSH_HEARTBEAT_PHASE:-}" ] || heartbeat "$BOOT_SSH_HEARTBEAT_PHASE"
+    left=$(( deadline - (SECONDS - started) ))
+    [ "$left" -gt 2 ] || break
+    sleep 2
+  done
+  BOOT_SSH_WAITED_SECS=$(( SECONDS - started ))
+  return 1
 }
 
 # A VM booted for a class the pre-mint check just denied serves whichever class
