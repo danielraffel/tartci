@@ -92,7 +92,7 @@ class PeerStall(unittest.TestCase):
         self.assertEqual(out["peers"]["studio"]["hours"], 97.3)
         self.assertEqual([t for t, _ in self.opened], [TITLE])
         body = self.opened[0][1].splitlines()
-        self.assertIn("Self-update is paused for the stall", body[0])
+        self.assertIn("The guard lists self-update as paused", body[0])
         self.assertEqual(body[1], "Run: ssh m3 'tartci doctor fleet'")
         self.assertTrue(body[2].startswith("Fix: reboot studio when its lanes are idle"))
         self.assertFalse(out["peers"]["m5"]["active"])
@@ -282,6 +282,25 @@ class PeerStall(unittest.TestCase):
                              "the same list self-update's turn reads")
         with self.assertRaises(RuntimeError):
             psa.published_peers(home=self.tmp, run=lambda argv: (128, "", "fatal: bad object"))
+
+    def test_a_host_without_a_self_update_checkout_is_quiet(self):
+        home = self.tmp / "home"
+        home.mkdir()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+                mock.patch.object(psa, "published_peers") as peers:
+            out = psa.alert_pass(now=RECEIPT_TS, directory=self.tmp / "quiet")
+        peers.assert_not_called()
+        self.assertEqual((out["skipped"], out["reason"]), (True, "no self-update checkout"))
+        import tartci_launchd_watchdog as wd
+        with mock.patch.dict(os.environ, {"HOME": str(home),
+                                          "TARTCI_PEER_STALL_DIR": str(self.tmp / "quiet")}):
+            self.assertIsNone(wd.peer_stall_pass(now=RECEIPT_TS))
+        # Control: with a checkout, the peer list is read.
+        (home / ".local" / "share" / "tartci" / "update-checkout" / ".git").mkdir(parents=True)
+        with mock.patch.dict(os.environ, {"HOME": str(home)}), \
+                mock.patch.object(psa, "published_peers", return_value=({}, None)) as peers:
+            psa.alert_pass(now=RECEIPT_TS + 10 * psa.READ_SECS, directory=self.tmp / "quiet2")
+        peers.assert_called_once()
 
     def test_the_watchdog_runs_the_pass_and_never_raises(self):
         import tartci_launchd_watchdog as wd

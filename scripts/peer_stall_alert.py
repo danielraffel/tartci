@@ -172,8 +172,8 @@ def alert_text(peer: str, target: str, me: str, info: Dict[str, Any],
     body = "\n".join([
         f"{peer}'s launchd has not started its timer jobs on its own since {verdict['since']} "
         f"({verdict['hours']} h). "
-        + ("Self-update is paused for the stall, so its tartci is not updating."
-           if held else "The guard is starting the timers; self-update was not listed as paused."),
+        + ("The guard lists self-update as paused, so its tartci is not updating."
+           if held else "The guard is starting the timers; self-update is not listed as paused."),
         f"Run: ssh {target} 'tartci doctor fleet'",
         f"Fix: reboot {peer} when its lanes are idle; a reboot clears the stall. "
         "Do not kickstart self-update while the stall lasts.",
@@ -284,6 +284,11 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
     if isinstance(last.get("ts"), (int, float)) and 0 <= now - float(last["ts"]) < interval:
         return {"skipped": True, "peers": last.get("peers") or {}}
     if peers is None:
+        checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
+        if not (checkout / ".git").exists():
+            # Not a managed fleet host (a CI runner, a fresh clone): there is
+            # no published supply to read peers from, and nothing to say.
+            return {"skipped": True, "peers": {}, "reason": "no self-update checkout"}
         peers, me = published_peers()
     result: Dict[str, Any] = {}
     enabled = (os.environ.get("TARTCI_PEER_STALL_ISSUE", "1") != "0"
