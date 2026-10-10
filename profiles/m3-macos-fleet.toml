@@ -104,6 +104,13 @@ scratch_dirs = true
 # host): 232 idle, clean, pushed worktrees there held ~143 GiB on 2026-09-29.
 # Dirty, unpushed, recent, in-use and lineage-active checkouts stay.
 worktree_root_checkouts = true
+# Evict gate ccache entries unused for 14 days, once a day, only while no VM
+# is running or leased (scripts/gate_ccache_trim.py). m3's gate cache held 414k entries and the guard ran out of budget on
+# 8-13% of boots. The m5 canary
+# (2026-10-03 to 10-09) cut the pre-boot guard's ok-run median from 89 s to
+# 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
+# rate held at 99.49% (99.51% before). Rollback: delete this key.
+gate_ccache_trim = true
 
 [[lane]]
 id = "pulp-gate"
