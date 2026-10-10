@@ -201,6 +201,20 @@ class DebugHold(unittest.TestCase):
         out = dh.expire(self.sys, self.dir)
         self.assertEqual(out["deleted"], [{"name": b, "reason": "pr_closed"}])
 
+    def test_a_hold_with_multiple_prs_waits_until_all_are_closed(self):
+        name = self.keep("held-batched", pr=None)
+        path = self.dir / "held" / f"{name}.json"
+        value = json.loads(path.read_text())
+        value["prs"] = [1, 2]
+        path.write_text(json.dumps(value))
+        self.sys.prs = {1: "MERGED", 2: "OPEN"}
+        self.assertEqual(dh.expire(self.sys, self.dir)["deleted"], [])
+        self.assertIn(name, self.sys.vms)
+        self.sys.t += dh.PR_READ_SECS
+        self.sys.prs = {1: "MERGED", 2: "CLOSED"}
+        self.assertEqual(dh.expire(self.sys, self.dir)["deleted"],
+                         [{"name": name, "reason": "pr_closed"}])
+
     def test_an_inspection_left_running_is_stopped(self):
         name = self.keep()
         self.cli("inspect", name)
@@ -257,7 +271,8 @@ class LaneLib(unittest.TestCase):
             "gh": f'echo "gh $*" >>{self.log}\n'
                   f'if [ "$2" = -X ]; then [ -s {self.tmp}/delete-works ] && : >{self.tmp}/listed; exit 0; fi\n'
                   f'cat {self.tmp}/listed\n',
-            "tart": f'echo "tart $*" >>{self.log}\n',
+            "tart": f'echo "tart $*" >>{self.log}\n'
+                     f'if [ "$1" = rename ] && [ "${{RENAME_FAIL:-0}}" = 1 ]; then exit 1; fi\n',
             "pgrep": f'[ -s {self.tmp}/listener ]\n',
         }.items():
             (bindir / name).write_text("#!/bin/bash\n" + body)
@@ -265,7 +280,8 @@ class LaneLib(unittest.TestCase):
         self.env = {**os.environ, "PATH": f"{bindir}:{os.environ['PATH']}",
                     "TARTCI_DEBUG_HOLD_DIR": str(self.tmp / "hold")}
 
-    def run_hold(self, result: str = "Failed", verdict: str = "hold held-lane-vm-1") -> tuple:
+    def run_hold(self, result: str = "Failed", verdict: str = "hold held-lane-vm-1",
+                 rename_fail: bool = False) -> tuple:
         (self.state / "lane-vm-1.actions-runner.log").write_text(
             f"2026-10-09 07:00:00Z: Job macos completed with result: {result}\n")
         script = f'''
@@ -293,7 +309,8 @@ source {str(LIB)!r}
 tartci_debug_hold_current_vm; rc=$?
 echo "rc=$rc vm=${{CURRENT_VM}}"
 '''
-        out = subprocess.run(["bash", "-c", script], env=self.env, capture_output=True,
+        env = {**self.env, "RENAME_FAIL": "1" if rename_fail else "0"}
+        out = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
                              text=True, timeout=60)
         calls = self.log.read_text() if self.log.exists() else ""
         return out.stdout.strip().splitlines()[-1], calls
@@ -319,6 +336,13 @@ echo "rc=$rc vm=${{CURRENT_VM}}"
         self.assertEqual(last, "rc=1 vm=lane-vm-1")
         self.assertNotIn("tart rename", calls)
         self.assertIn("reason=deregistration_unproved", calls)
+
+    def test_a_failed_rename_deletes_instead_and_reports_refusal(self):
+        last, calls = self.run_hold(rename_fail=True)
+        self.assertEqual(last, "rc=1 vm=lane-vm-1")
+        self.assertIn("tart rename lane-vm-1 held-lane-vm-1", calls)
+        self.assertIn("reason=rename_failed", calls)
+        self.assertNotIn("debug_hold_kept", calls)
 
     def test_a_surviving_listener_deletes_instead(self):
         (self.tmp / "listener").write_text("1")
