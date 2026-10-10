@@ -73,6 +73,9 @@ class FakeSystem(su.System):
         self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.remote_url = su.REPO_URL + "\n"
+        self.api_repository = su.DEFAULT_REPOSITORY
+        self.unreadable_repositories: set[str] = set()
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -138,15 +141,24 @@ class FakeSystem(su.System):
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.env_calls = getattr(self, "env_calls", [])
+        self.env_calls.append(dict(env or {}))
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
         if a[0] == FAKE_GH:
-            sha = a[2].split("/commits/")[1].split("/")[0]
-            runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
-                                          "conclusion": "success"}])
-            return ok(json.dumps({"check_runs": runs}))
+            repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if repository in self.unreadable_repositories:
+                return su.Result(1, "", "not found")
+            if "check-runs" in a[2]:
+                sha = a[2].split("/commits/")[1].split("/")[0]
+                runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
+                                              "conclusion": "success"}])
+                return ok(json.dumps({"check_runs": runs}))
+            if "/commits/" not in a[2]:
+                return ok(json.dumps({"full_name": self.api_repository}))
+            return ok(json.dumps({"sha": a[2].split("/")[-1]}))
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
@@ -184,7 +196,7 @@ class FakeSystem(su.System):
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
-                return ok(su.REPO_URL + "\n")
+                return ok(self.remote_url)
             if "checkout" in a:
                 self.checked_out = a[-1]
             return ok()
@@ -2160,6 +2172,45 @@ class IncidentTests(Base):
         self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
+
+
+class RepositoryIdentityTests(Base):
+    def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            repository = su.configured_repository(self.cfg, self.sys)
+            run = object.__new__(su.Run)
+            run.cfg, run.sys, run.install_args, run.repository = (
+                self.cfg, self.sys, ["fleet-macos", "install", "profile"], repository)
+            run.receipt = mock.Mock()
+            run._writer_fence = lambda: []
+            su.Run._install(run, run.install_args)
+        self.assertEqual(su.LEGACY_REPOSITORY, repository)
+        self.assertEqual(su.LEGACY_REPOSITORY, self.sys.env_calls[-1]["GH_REPO"])
+
+    def test_default_resolution_uses_first_readable_accepted_slug(self):
+        self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
+        self.sys.api_repository = su.DEFAULT_REPOSITORY
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.DEFAULT_REPOSITORY,
+                             su.canonical_repository(self.cfg, self.sys))
+
+    def test_api_accepts_legacy_and_new_full_name(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.api_repository = repository
+            with mock.patch.dict(os.environ, {"GH_REPO": repository}):
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys), repository)
+
+    def test_api_rejects_third_repository(self):
+        self.sys.api_repository = "example/other-tartci"
+        with self.assertRaises(su.Refused):
+            su.canonical_repository(self.cfg, self.sys)
+
+    def test_refresh_rejects_third_remote(self):
+        self.sys.remote_url = "https://example.invalid/other-tartci.git\n"
+        with self.assertRaises(su.Refused):
+            su.refresh_checkout(self.cfg, self.sys)
 
 
 class OsInterpreterRefreshTests(Base):

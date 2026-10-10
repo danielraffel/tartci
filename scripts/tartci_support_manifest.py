@@ -27,7 +27,10 @@ ROOT_FILES = {"tartci"}
 ROOT_DIRS = {"fleet", "launchd", "native", "profiles", "providers", "scripts"}
 MANIFEST_NAME = ".tartci-support-manifest.json"
 LAUNCH_NAME = ".tartci-launch"
-TRUSTED_REPOSITORY = "https://github.com/danielraffel/tartci.git"
+TRUSTED_REPOSITORIES = frozenset({
+    "https://github.com/danielraffel/tartci.git",
+    "https://github.com/generous-corp/tartci.git",
+})
 
 
 def fail(message: str) -> None:
@@ -94,7 +97,7 @@ def repository_key(root: Path) -> str:
         fail("support source origin must identify one exact GitHub repository")
     owner, repository = match.groups()
     canonical = f"https://github.com/{owner.lower()}/{repository.lower()}.git"
-    if canonical != TRUSTED_REPOSITORY:
+    if canonical not in TRUSTED_REPOSITORIES:
         fail(f"support source repository is not trusted: {canonical}")
     return canonical
 
