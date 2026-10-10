@@ -39,7 +39,6 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime as dt
-import fcntl
 import json
 import math
 import os
@@ -50,6 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from observation_lock import FairObservationLock
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
@@ -306,42 +306,19 @@ class AssignmentScanner:
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        lock_deadline = time.monotonic() + self.args.observation_lock_timeout
-        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
-            while True:
-                try:
-                    fcntl.flock(
-                        handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                    )
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= lock_deadline:
-                        raise ScanError(
-                            "host queue observation lock timed out after "
-                            f"{self.args.observation_lock_timeout}s"
-                        )
-                    time.sleep(0.05)
-            # The wait is over, so the scan begins now. Budgeting the scan from
-            # invocation instead charged it for however long the queue behind
-            # this host-global lock happened to be, which is the one quantity
-            # the scan does not control: a lane that waited most of its budget
-            # then ran an exhaustive pass on the remainder, and the leftover
-            # was handed to `gh` as a shortened per-call timeout, so the scan
-            # died mid-pass and reported the queue unobservable. The total is
-            # still bounded -- by --observation-lock-timeout plus
-            # --scan-timeout, each explicit.
+        with FairObservationLock(
+            str(self.observation_lock_path), self.args.observation_lock_timeout,
+            self.args.repo, getattr(self.args, "observation_backoff_file", None),
+            getattr(self.args, "observation_backoff_seconds", 30.0),
+        ).hold() as handle:
             self.deadline = time.monotonic() + self.args.scan_timeout
+            self.observation_lock_fd = os.dup(handle.fileno())
+            os.set_inheritable(self.observation_lock_fd, True)
             try:
-                self.observation_lock_fd = os.dup(handle.fileno())
-                os.set_inheritable(self.observation_lock_fd, True)
-                try:
-                    yield
-                finally:
-                    os.close(self.observation_lock_fd)
-                    self.observation_lock_fd = None
+                yield
             finally:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                os.close(self.observation_lock_fd)
+                self.observation_lock_fd = None
 
     def _gh_once(self, path: str) -> dict[str, Any]:
         with self.api_calls_lock:
@@ -966,6 +943,15 @@ def parse_args() -> argparse.Namespace:
             os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")
         ),
     )
+    parser.add_argument(
+        "--observation-backoff-file",
+        default=os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"),
+    )
+    parser.add_argument(
+        "--observation-backoff-seconds",
+        type=float,
+        default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_SECS", "30")),
+    )
     args = parser.parse_args()
     if args.gh_timeout <= 0:
         parser.error("--gh-timeout must be positive")
@@ -996,6 +982,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("--stale-demand-ttl-seconds must be positive")
     if args.stale_demand_min_age_seconds < 0:
         parser.error("--stale-demand-min-age-seconds must be non-negative")
+    if args.observation_backoff_file is None:
+        args.observation_backoff_file = str(
+            Path(args.observation_lock_file).with_name("queue-observation-backoff.json")
+        )
+    if not math.isfinite(args.observation_backoff_seconds) or args.observation_backoff_seconds <= 0:
+        parser.error("--observation-backoff-seconds must be positive")
     if args.stale_demand_quarantine_file is None:
         # Follows whatever state directory the observation lock uses, so a test
         # or a redirected fleet root does not write into the real one.
