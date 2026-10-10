@@ -49,6 +49,7 @@
 #   tartci windows golden [nm] # clean-shutdown + compress-tag a Windows golden
 #   tartci goldens list        # canonical golden + drift/prune candidates
 #   tartci goldens sync --to HOST [--os windows] [--prune] [--dry-run]  # copy canonical golden to a host (fastest link) + verify + repoint
+#   tartci goldens doctor [--receipt FILE] [--promotion]                     # read-only receipt/freshness check
 #   tartci prepare <os>        # bake/provision a golden from the provider recipe
 #   tartci up <os>             # one on-demand build+ctest in a throwaway clone, then discard
 #   tartci serve <os> [--loop] # serve the GitHub Actions pool: ephemeral per-job runner(s)

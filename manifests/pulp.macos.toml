@@ -19,41 +19,37 @@ repository = "https://github.com/Generous-Corp/pulp"
 commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = 1e55579437dd660f1d4b1012bf2e0ff2704aa1e22327311f827a255eeecee799
+# generated_platform = macos
 [toolchain]
-xcode  = "26.5"
-cmake  = "homebrew"
-ninja  = "homebrew"
+xcode = "26.5"
+cmake = "4.4.3"
+ninja = "homebrew"
 python = "3.12"
-rust   = "stable"   # rustup-managed; release-cli.yml builds the Rust `pulp` CLI
-rust_targets = ["x86_64-apple-darwin"] # release-cli's Darwin Intel cross-build
+node = "26.10.0"
+rust = "1.98.1"
+tart = "2.38.0"
+clang_format = "required"
+rust_targets = ["x86_64-apple-darwin"]
 
 [brew]
-# Homebrew's `rustup` is keg-only and does not provide `rustup-init`. The bake
-# must run `rustup default stable`, add `rust_targets`, and expose the keg's
-# proxies through ~/.cargo/bin. The exact verified recipe is in docs/runbook.md.
-# The `stable` pin matches Pulp's experimental/pulp-rs/rust-toolchain.toml, so
-# there's no reproducibility drift vs. the workflow fallback. release-cli.yml
-# keeps a run-time rustup bootstrap as the portability belt; baking it here just
-# skips the ~30-60s per-run install on steady-state release runs.
 packages = [
   "git",
-  "git-lfs",
   "gh",
   "rsync",
   "ccache",
   "jq",
+  "coreutils",
+  "tailscale",
   "cmake",
   "ninja",
   "node",
   "python@3.12",
   "rustup",
-  # clang-format for the `pulp fmt` CLI. Without it on PATH, the Build-and-Test
-  # gate's `pulp fmt` shell-out tests (test_cli_fmt_shellout.cpp) HANG and hit
-  # their 10s timeout on this VM golden (r.timed_out) rather than exercising the
-  # formatter — reddening the required macOS leg. The Homebrew `clang-format`
-  # formula installs a standalone `clang-format` binary (no full LLVM needed).
   "clang-format",
 ]
+# END GENERATED PULP TOOLCHAIN
 
 [skia]
 release = "chrome/m153"

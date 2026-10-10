@@ -36,17 +36,23 @@ install_media_bus = "usb-storage"   # ALL install CDs on USB — autounattend is
 firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
 ssh_hostfwd = "2222:22"
 
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = 1e55579437dd660f1d4b1012bf2e0ff2704aa1e22327311f827a255eeecee799
+# generated_platform = windows
 [toolchain]
-# Provisioned over SSH with `powershell -EncodedCommand` (scp'd .cmd mis-execute;
-# cmd mangles | / % / >). MSVC: if the VS Installer no-ops silently (phantom
-# partial-instance), nuke BuildTools+Packages+Setup, reboot, clean reinstall.
-msvc   = "14.44"          # cl.exe at VC\Tools\MSVC\14.44.x\bin\Hostarm64\arm64
-cmake  = "system"
-ninja  = "system"
+cmake = "system"
 python = "3.12"
+node = "26.10.0"
+rust_targets = ["x86_64-apple-darwin"]
 
 [choco]
-packages = ["git", "cmake", "ninja", "python3"]
+packages = [
+  "git",
+  "cmake",
+  "ninja",
+  "python3",
+]
+# END GENERATED PULP TOOLCHAIN
 
 [skia]
 platforms = ["windows-arm64", "windows-x64"]
