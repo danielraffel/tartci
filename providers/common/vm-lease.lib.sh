@@ -175,6 +175,10 @@ tartci_vm_lease_cores(){
     tart-linux)
       value="${TARTCI_LINUX_VM_CORES:-${PULP_LINUX_VM_CORES:-}}"
       ;;
+    tart-linux-lint)
+      # Sized only from the host profile: a lint VM never takes a typed size.
+      key="lint_vm_cores"
+      ;;
     qemu-windows)
       value="${TARTCI_WIN_VM_CORES:-${PULP_WIN_VM_CORES:-${fallback:-}}}"
       ;;
@@ -208,6 +212,9 @@ tartci_vm_lease_mem_mb(){
       ;;
     tart-linux)
       value="${TARTCI_LINUX_VM_MEM_MB:-${PULP_LINUX_VM_MEM_MB:-}}"
+      ;;
+    tart-linux-lint)
+      value="$(tartci_profile_value lint_vm_mem_mb 2>/dev/null || true)"
       ;;
     qemu-windows)
       value="${TARTCI_WIN_MEMORY_MB:-${PULP_WIN_MEMORY_MB:-${fallback:-}}}"

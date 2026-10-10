@@ -226,6 +226,17 @@ while [ $# -gt 0 ]; do case "$1" in
   *) die "unknown arg: $1";;
 esac; done
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
+# shellcheck source=providers/tart-linux/lint-lane.lib.sh
+source "$TARTCI_ROOT/providers/tart-linux/lint-lane.lib.sh"
+LANE_PROVIDER=tart-linux
+LANE_LEASE_KIND=tart-linux-vm
+if tartci_lint_lane_enabled; then
+  tartci_lint_lane_configure
+  LANE_PROVIDER=tart-linux-lint
+  LANE_LEASE_KIND=tart-linux-lint-vm
+  tartci_lint_softnet_ready \
+    || die "lint lane: softnet cannot get root (needs SUID root or NOPASSWD sudo); refusing to boot an untrusted guest on default NAT"
+fi
 
 # Count fresh queued jobs whose labels this runner can satisfy. 0 on any gh
 # failure, treating a flaky API as "no work" so it does not spin VMs.
@@ -244,6 +255,8 @@ queued_work(){
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
+  local net_args=() lint_probe="" egress_summary=""
+  if tartci_lint_lane_enabled; then vm="$(tartci_lint_vm_name "$1")"; fi
   local build_parallel_effective
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
@@ -272,14 +285,14 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     tartci_write_vm_state tart-linux "$vm" "$vm" "$1" ephemeral "$state_dir"
   }
   mark_runner_assigned(){ write_state job-running; }
-  lease_cores="$(tartci_vm_lease_cores tart-linux)"
-  lease_mem="$(tartci_vm_lease_mem_mb tart-linux)"
+  lease_cores="$(tartci_vm_lease_cores "$LANE_PROVIDER")"
+  lease_mem="$(tartci_vm_lease_mem_mb "$LANE_PROVIDER")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
   CURRENT_VM="$vm"
   CURRENT_STATE_DIR="$state_dir"
   CURRENT_LEASE_ACTIVE=1
   CURRENT_CLEANED_UP=0
-  tartci_acquire_vm_lease "$vm" "$lease_cores" "tart-linux-vm" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" \
+  tartci_acquire_vm_lease "$vm" "$lease_cores" "$LANE_LEASE_KIND" "$lease_priority" "$LABELS" "$lease_mem" "$TART_HOME" \
     tart-linux "${TARTCI_QUEUE_LANE_ID:-tart-linux}" "${TARTCI_RUNNER_NAME:-$vm}" || {
     local lease_rc=$?
     discard_current_linux_vm
@@ -308,13 +321,29 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
-  tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux" || {
-    discard_current_linux_vm
-    runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
-    return 1
-  }
+  if tartci_lint_lane_enabled; then
+    # Untrusted guest: no host directory is shared, and egress is default-deny
+    # with only GitHub's published self-hosted-runner egress set allowed.
+    egress_summary="$logdir/egress.json"
+    local net_lines="" net_line
+    net_lines="$(tartci_lint_softnet_args "$egress_summary")" || net_lines=""
+    net_args=()
+    while IFS= read -r net_line; do [ -z "$net_line" ] || net_args+=("$net_line"); done <<<"$net_lines"
+    if [ "${#net_args[@]}" -ne 2 ]; then
+      note "[$i] cannot derive the egress allowlist — refusing to boot (the ALERT line above names the cause and fix)"
+      discard_current_linux_vm
+      return 1
+    fi
+  else
+    tartci_prepare_disk_root "$CACHE_ROOT/ccache-linux" || {
+      discard_current_linux_vm
+      runtime_emit_complete fail cache_setup_failed 1 "$vm" "$vm" "" "$logdir"
+      return 1
+    }
+    net_args=(--dir="ccache:$CACHE_ROOT/ccache-linux")
+  fi
   local boot_log; boot_log="$logdir/tart-run.log"
-  tartci_vm_lease_guard_exec tart run --no-graphics --dir="ccache:$CACHE_ROOT/ccache-linux" "$vm" >"$boot_log" 2>&1 & rpid=$!
+  tartci_vm_lease_guard_exec tart run --no-graphics "${net_args[@]}" "$vm" >"$boot_log" 2>&1 & rpid=$!
   CURRENT_RPID="$rpid"
   write_state booting
 
@@ -335,6 +364,32 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   fi
   t_booted="$(now_epoch)"
+  if tartci_lint_lane_enabled; then
+    write_state isolation-check
+    lint_probe="$(tartci_lint_guest_probe "$ip" 2>/dev/null)" || lint_probe=""
+    if ! tartci_lint_probe_ok "$lint_probe"; then
+      tartci_lint_write_receipt "$logdir/receipt.json" "$vm" "$lint_probe" "$egress_summary" \
+        "$lease_cores" "$lease_mem" refused || true
+      note "[$i] guest isolation probe failed — refusing to register a runner ($(tr '\n' ' ' <<<"$lint_probe"))"
+      discard_current_linux_vm
+      return 1
+    fi
+    tartci_lint_write_receipt "$logdir/receipt.json" "$vm" "$lint_probe" "$egress_summary" \
+      "$lease_cores" "$lease_mem" ok
+    if [ -n "${TARTCI_LINT_TEST_FIXTURE:-}" ]; then
+      # Test mode: run a fixture script in the guest as a job would, then
+      # discard. No runner is registered and no workflow is involved.
+      note "[$i] test mode: running fixture $(basename "$TARTCI_LINT_TEST_FIXTURE") in $vm"
+      # The wall cap is what ends a job that takes its own guest down.
+      perl -e 'alarm shift; exec @ARGV' "${TARTCI_LINT_FIXTURE_WALL_SECS:-300}" \
+        ssh "${SSH_OPTS[@]}" -o ServerAliveInterval=5 -o ServerAliveCountMax=3 \
+        -i "$SSH_KEY_PRIV" "$VM_USER@$ip" bash -s \
+        <"$TARTCI_LINT_TEST_FIXTURE" >"$logdir/fixture-output.log" 2>&1 || run_status=$?
+      prefix_guest_log "$logdir/fixture-output.log"
+      discard_current_linux_vm
+      return "$run_status"
+    fi
+  else
   write_state cache-setup
   if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host && \
@@ -349,6 +404,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return 1
   fi
   prefix_guest_log "$logdir/ccache-setup.log"
+  fi
 
   if tartci_admission_clean_enabled; then
     local admission_json="" admission_rc=0
