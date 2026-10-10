@@ -92,6 +92,21 @@ class LifecycleLib(unittest.TestCase):
         out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
         self.assertEqual(out.stdout.split(), ["unmarked", "marked", str(T + 5), "1"])
 
+    def test_mark_keeps_the_first_sighting_for_every_boundary(self):
+        variables = {
+            "clone_start": "LC_CLONE_START", "cloned": "LC_CLONED", "ip": "LC_IP",
+            "ssh": "LC_SSH", "minted": "LC_MINTED", "listening": "LC_LISTENING",
+            "assigned": "LC_ASSIGNED",
+        }
+        for name, variable in variables.items():
+            script = (f'source "{LIB}"\ntartci_lifecycle_reset\n'
+                      f'tartci_lifecycle_mark {name} {T + 5}\n'
+                      f'tartci_lifecycle_mark {name} {T + 9}\n'
+                      f'printf "%s\\n" "${variable}"\n')
+            out = subprocess.run(["bash", "-c", script], capture_output=True,
+                                 text=True, check=True)
+            self.assertEqual(out.stdout.strip(), str(T + 5), name)
+
     def test_reset_clears_the_previous_vm(self):
         script = (f'source "{LIB}"\nevent(){{ printf "%s\\n" "$@"; }}\n'
                   f'LC_ASSIGNED={T}; LC_CLONED={T}; CLONE_STARTED_AT={T}\n'
@@ -139,6 +154,16 @@ class RunnerWiring(unittest.TestCase):
         self.after("grep -q 'Listening for Jobs'", 'tartci_lifecycle_mark listening "$now"', 160)
         self.after('      assigned_at="$now"\n', 'tartci_lifecycle_mark assigned "$now"', 200)
         self.after('vm="$CURRENT_VM"\n      tartci_lifecycle_mark warm', "tartci_boundary_proof_start")
+
+    def test_running_job_without_listening_stamps_registration_and_zero_idle(self):
+        branch = self.src[self.src.index('if [ "$assigned" = 0 ] && grep -q \'Running job:'):]
+        branch = branch[:branch.index('    fi', branch.index('tartci_lifecycle_mark assigned'))]
+        self.assertIn('tartci_lifecycle_mark listening "$now"', branch)
+        self.assertLess(branch.index('tartci_lifecycle_mark listening'),
+                        branch.index('tartci_lifecycle_mark assigned'))
+        stamps = {**SERVED, "LC_LISTENING": T + 300, "LC_ASSIGNED": T + 300}
+        got = fields(emit(stamps, SERVED_TIMES))
+        self.assertEqual((got["register_s"], got["idle_s"]), (60, 0))
 
     def test_the_event_is_written_after_teardown_and_before_timing(self):
         emit_at = self.src.index('tartci_lifecycle_emit "$t_start" "$t_runner_done" "$t_done" "$rc"')
