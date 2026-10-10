@@ -633,3 +633,39 @@ class PoolRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VmJanitorTests(unittest.TestCase):
+    def receipt(self, state="match_bytes", loaded=True, declared=("reap",)):
+        ok = state in ("match_bytes", "match_plist") and loaded
+        return {"state": "drift", "declared": list(declared),
+                "changes": [] if ok else ["reap"],
+                "agents": {"reap": {"state": state, "loaded": loaded, "leaked": False}}}
+
+    def test_right_after_an_apply_that_installed_it_reads_loaded(self):
+        # The pass found it missing and installed it: status() drops it from
+        # `changes`, and the doctor must follow that, not the found state.
+        value = self.receipt(state="missing", loaded=False)
+        value["changes"] = []
+        self.assertEqual(fd.check_vm_janitor(value).code, "vm_janitor_loaded")
+
+    def test_loaded_janitor_is_ok(self):
+        self.assertEqual(fd.check_vm_janitor(self.receipt()).code, "vm_janitor_loaded")
+
+    def test_m1_on_2026_10_09_reads_missing(self):
+        finding = fd.check_vm_janitor(self.receipt(state="missing", loaded=False))
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "vm_janitor_missing"))
+        self.assertIn("declared but missing, not loaded", finding.detail)
+
+    def test_undeclared_or_unloaded_is_missing_and_no_receipt_is_unknown(self):
+        self.assertEqual(fd.check_vm_janitor(self.receipt(declared=())).code, "vm_janitor_missing")
+        self.assertEqual(fd.check_vm_janitor(self.receipt(loaded=False)).code, "vm_janitor_missing")
+        self.assertEqual(fd.check_vm_janitor({"state": "never"}).code, "vm_janitor_unknown")
+        self.assertEqual(fd.check_vm_janitor(None).code, "vm_janitor_unknown")
+
+    def test_every_janitor_code_has_a_reason(self):
+        import pathlib
+        reasons = json.loads((pathlib.Path(fd.__file__).parent / "fleet_reasons.json").read_text())
+        flat = json.dumps(reasons)
+        for code in ("vm_janitor_loaded", "vm_janitor_missing", "vm_janitor_unknown"):
+            self.assertIn(f'"{code}"', flat)
