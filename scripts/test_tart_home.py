@@ -21,6 +21,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE))
 import tart_home  # noqa: E402
+import testing_support  # noqa: E402
 
 PROFILE = '[host]\nid = "m1"\ntart_home = "/Users/x/VMs"\n'
 
@@ -38,11 +39,13 @@ class ResolveTests(unittest.TestCase):
         self.addCleanup(self.td.cleanup)
         self.home = Path(self.td.name)
 
+    @testing_support.requires_tomllib
     def test_an_ssh_shell_without_tart_home_reads_the_profile_store(self) -> None:
         write_profile(self.home)
         value = tart_home.resolve({}, self.home)
         self.assertEqual((value["path"], value["source"]), ("/Users/x/VMs", "profile"))
 
+    @testing_support.requires_tomllib
     def test_an_explicit_tart_home_wins_and_a_mismatch_is_named(self) -> None:
         write_profile(self.home)
         value = tart_home.resolve({"TART_HOME": "/tmp/other"}, self.home)
@@ -51,6 +54,7 @@ class ResolveTests(unittest.TestCase):
         same = tart_home.resolve({"TART_HOME": "/Users/x/VMs"}, self.home)
         self.assertNotIn("warning", same)
 
+    @testing_support.requires_tomllib
     def test_the_dispatcher_export_keeps_the_profile_as_its_source(self) -> None:
         write_profile(self.home)
         value = tart_home.resolve({"TART_HOME": "/Users/x/VMs",
@@ -62,6 +66,7 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual((value["path"], value["source"]), (str(self.home / ".tart"), "default"))
         self.assertIn("no fleet profile", value["detail"])
 
+    @testing_support.requires_tomllib
     def test_a_profile_without_the_key_or_without_tomllib_is_default(self) -> None:
         write_profile(self.home, '[host]\nid = "m1"\n')
         self.assertIn("declares no [host].tart_home",
@@ -72,6 +77,7 @@ class ResolveTests(unittest.TestCase):
         self.assertEqual(value["source"], "default")
         self.assertIn("no tomllib", value["detail"])
 
+    @testing_support.requires_tomllib
     def test_the_profile_path_override_is_honoured(self) -> None:
         other = self.home / "elsewhere.toml"
         other.write_text('[host]\ntart_home = "/Volumes/Store/VMs"\n')
@@ -103,6 +109,7 @@ class DispatcherTests(unittest.TestCase):
                                 env={**clean, "HOME": str(home), **env}, check=True)
         return result.stdout
 
+    @testing_support.requires_tomllib
     def test_an_unset_tart_home_is_exported_from_the_profile(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             write_profile(Path(td))
@@ -132,6 +139,7 @@ class DispatcherTests(unittest.TestCase):
 
 
 class VmReapTests(unittest.TestCase):
+    @testing_support.requires_tomllib
     def test_a_direct_run_exports_the_profile_store_for_its_tart_calls(self) -> None:
         import vm_reap
         with tempfile.TemporaryDirectory() as td:
