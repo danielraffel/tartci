@@ -207,6 +207,10 @@ PENDING_DELETE_ATTEMPTS=0
 CURRENT_TEARDOWN_PENDING=""
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
+# A listener whose guest stops writing TARTCI_GUEST_HEARTBEAT lines for this
+# long is a frozen VM, torn down in minutes rather than at JOB_TIMEOUT.
+GUEST_HEARTBEAT_STALE="${TARTCI_GUEST_HEARTBEAT_STALE_SECS:-600}"
+case "$GUEST_HEARTBEAT_STALE" in ''|*[!0-9]*|0) GUEST_HEARTBEAT_STALE=600 ;; esac
 STATE_DIR="${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}"
 JIT_DENIAL_FILE=""
 EVENT_LOG="${TARTCI_EVENT_LOG:-$STATE_DIR/events.jsonl}"
@@ -1666,9 +1670,24 @@ run_runner_until_done_unlayered(){
   start="$(date +%s)"
   [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \
     || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))
+  local guest_beat_seen=0 guest_silent
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
+    if [ "$guest_beat_seen" = 0 ] && grep -q '^TARTCI_GUEST_HEARTBEAT ' "$runner_log" 2>/dev/null; then
+      guest_beat_seen=1
+    fi
+    if [ "$guest_beat_seen" = 1 ] \
+       && guest_silent="$(tartci_guest_silent_secs "$runner_log" "$now")" \
+       && [ "$guest_silent" -ge "$GUEST_HEARTBEAT_STALE" ]; then
+      event guest_heartbeat_stale "silent=${guest_silent}s stale_after=${GUEST_HEARTBEAT_STALE}s assigned=$assigned run_id=${CURRENT_RUN_ID:-} job_id=${CURRENT_JOB_ID:-}" \
+        "silent_s=$guest_silent" "assigned=$assigned"
+      [ "$assigned" = 0 ] || cancel_current_run || true
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+      sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
+      return 124
+    fi
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
       assigned=1
       assigned_at="$now"
@@ -1686,7 +1705,7 @@ run_runner_until_done_unlayered(){
       event idle_timeout "elapsed=${idle_elapsed}s rerun_eligible=false"
       kill "$ssh_pid" 2>/dev/null || true
       wait "$ssh_pid" 2>/dev/null || true
-      sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+      sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
       return 124
     fi
     if [ "$assigned" = 0 ] && [ "$retarget_next" -gt 0 ] && [ "$now" -ge "$retarget_next" ]; then
@@ -1700,7 +1719,7 @@ run_runner_until_done_unlayered(){
         else
           kill "$ssh_pid" 2>/dev/null || true
           wait "$ssh_pid" 2>/dev/null || true
-          sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+          sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
           return "$IDLE_RETARGET_RC"
         fi
       fi
@@ -1724,7 +1743,7 @@ run_runner_until_done_unlayered(){
         done
         kill -0 "$ssh_pid" 2>/dev/null && kill "$ssh_pid" 2>/dev/null || true
         wait "$ssh_pid" 2>/dev/null || true
-        sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+        sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
         return 124
       fi
     fi
@@ -1733,8 +1752,19 @@ run_runner_until_done_unlayered(){
   done
   wait "$ssh_pid" || rc=$?
   finalize_listener_receipt "$rc" "$assigned" "$runner_log"
-  sed 's/^/[actions-runner] /' "$runner_log" >&2 || true
+  sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
+}
+
+# Seconds since the listener's log last changed. The guest writes a heartbeat
+# line into it every TARTCI_GUEST_HEARTBEAT_SECS, so a long silence means the
+# guest stopped, not that the job is quiet.
+tartci_guest_silent_secs(){
+  local log="$1" now="$2" mtime
+  mtime="$(stat -f %m "$log" 2>/dev/null)" || mtime=""
+  case "$mtime" in ''|*[!0-9]*) mtime="$(stat -c %Y "$log" 2>/dev/null)" || return 1 ;; esac
+  case "$mtime" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' $(( now > mtime ? now - mtime : 0 ))
 }
 
 install_and_preflight_aqua_runner(){

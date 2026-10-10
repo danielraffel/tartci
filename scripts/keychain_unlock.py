@@ -13,7 +13,8 @@ The com.danielraffel.tartci.keychain-unlock LaunchAgent runs this at load
 (su.signing_keychain: keychain.env's PULP_SIGN_KEYCHAIN, or its -unattended
 sibling) and clears any auto-lock timeout. The password goes to `security -i`
 on standard input: it is never an argument (visible in `ps`) and never written
-to the log or the state file. `unlock-keychain -p` cannot prompt; a wrong
+to the log or the state file. A malformed keychain.env is reported by key name
+only, and every line printed or stored passes through secret_files.redact(). `unlock-keychain -p` cannot prompt; a wrong
 password fails and is reported. Settings are only read after a successful
 unlock, because reading them from a locked keychain is itself what prompts.
 
@@ -34,6 +35,7 @@ from typing import Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import fleet_self_update as su  # noqa: E402
+import secret_files  # noqa: E402
 
 LABEL = "com.danielraffel.tartci.keychain-unlock"
 INTERVAL_SECS = 900
@@ -60,8 +62,10 @@ def state_path(home: Path | None = None) -> Path:
     return Path(root) / "state" / "keychain-unlock" / "last.json"
 
 
-def _scrub(text: str, secret: str) -> str:
-    return text.replace(secret, "<redacted>") if secret else text
+def _scrub(text: str, secret: str, home: Path) -> str:
+    # Before any slicing: a truncated secret no longer matches.
+    text = text.replace(secret, "<redacted>") if secret else text
+    return secret_files.redact(text, home)
 
 
 def run(home: Path | None = None, interactive: Interactive = _security_interactive,
@@ -70,7 +74,10 @@ def run(home: Path | None = None, interactive: Interactive = _security_interacti
     now = time.time() if now is None else now
     keychain = su.signing_keychain(home)
     password = su.signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
-    if not keychain or not password:
+    problem = su.signing_secrets_problem(home)
+    if problem and (not keychain or not password):
+        value = {"state": "failed", "keychain": keychain, "detail": problem}
+    elif not keychain or not password:
         value = {"state": "not_applicable", "keychain": keychain,
                  "detail": "no dedicated signing keychain in keychain.env"}
     elif not Path(keychain).is_file():
@@ -80,7 +87,7 @@ def run(home: Path | None = None, interactive: Interactive = _security_interacti
         rc, out = interactive(f"unlock-keychain -p {_quote(password)} {_quote(keychain)}\n")
         if rc != 0:
             value = {"state": "failed", "keychain": keychain,
-                     "detail": f"unlock failed (exit {rc}): {_scrub(out, password).strip()[-200:]}"
+                     "detail": f"unlock failed (exit {rc}): {_scrub(out, password, home).strip()[-200:]}"
                                "; run `pulp ship doctor`"}
         else:
             # Unlocked now, so these cannot raise a dialog.
@@ -90,7 +97,9 @@ def run(home: Path | None = None, interactive: Interactive = _security_interacti
             value = {"state": "failed" if rc != 0 or relocks else "ok", "keychain": keychain,
                      "detail": ("unlocked, no auto-lock" if rc == 0 and not relocks else
                                 f"unlocked but settings not cleared (exit {rc}): "
-                                f"{_scrub(out, password).strip()[-160:]}")}
+                                f"{_scrub(out, password, home).strip()[-160:]}")}
+    value = {k: (secret_files.redact(v, home) if isinstance(v, str) else v)
+             for k, v in value.items()}
     value["at"] = now
     path = state_path(home)
     try:
@@ -115,7 +124,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.parse_args(argv)
     value = run()
     stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value["at"]))
-    print(f"{stamp} keychain-unlock: {value['state']}: {value.get('keychain')}: {value['detail']}")
+    print(secret_files.redact(
+        f"{stamp} keychain-unlock: {value['state']}: {value.get('keychain')}: {value['detail']}"))
     return 1 if value["state"] == "failed" else 0
 
 
