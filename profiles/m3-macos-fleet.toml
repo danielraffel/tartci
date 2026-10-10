@@ -245,6 +245,12 @@ guest_heartbeat_stale_seconds = 600
 # The support LaunchAgents this host carries (scripts/support_agents.py).
 # Self-update renders and compares them after every update; with bootstrap =
 # false it only reports, and installs or changes nothing.
+# The watchdog's frozen-lane threshold. 4500 s outlasts a gate job's longest
+# silent stretch; the 1800 default healed live supervisors (#191). It lived
+# only on hand-edited plists until it moved here (#195).
+[launchd_watchdog]
+stale_log_seconds = 4500
+
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
 bootstrap = false
