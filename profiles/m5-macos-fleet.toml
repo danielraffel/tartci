@@ -101,6 +101,13 @@ registration_scope = "repository"
 golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
+# Pre-clone demand check: before cloning, re-ask the pre-mint question live and
+# skip the clone when the selected class is proven empty or a preferred class
+# waits; an uncertain scan clones as before. m5 joins m1, m3 and m5studio after
+# its ranked-lease canary read (2026-10-03..10, 168 h: 0 real inversions), which
+# this check would otherwise have confounded. Rollback is removing this key.
+# See docs/assignment-v2-rollout.md, "Pre-clone demand check".
+assignment_pre_clone_demand_check = true
 assignment_omit_labels = ["pulp-gate-fast"]
 # Two Pulp supervisors can overlap exhaustive GitHub App scans. Retain the
 # bounded M1 margin rather than treating healthy serialized traffic as blind.

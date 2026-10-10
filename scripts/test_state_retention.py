@@ -89,6 +89,20 @@ class StateFileTests(unittest.TestCase):
         for path in keepers:
             self.assertNotIn(path, plan.files)
 
+    def test_a_young_file_beyond_the_newest_few_is_kept(self) -> None:
+        # Both bounds must hold: on a busy lane the file just past the
+        # per-directory count can be hours old, and deleting it on the count
+        # alone would remove that day's boot logs.
+        h = Home(self)
+        newest = h.file("macos/m1-pulp-gate-01-1-1.actions-runner.log", 1)
+        young = h.file("macos/m1-pulp-gate-01-2-1.actions-runner.log", 2)
+        old = h.file("macos/m1-pulp-gate-01-3-1.actions-runner.log", 40)
+        plan = h.plan(keep_per_dir=1)
+        self.assertNotIn(newest, plan.files)
+        self.assertNotIn(young, plan.files)
+        self.assertEqual(plan.files, [old])
+        self.assertEqual(plan.files_kept_recent, 2)
+
     def test_a_boot_still_named_by_a_live_process_is_kept(self) -> None:
         h = Home(self)
         live = h.file("macos/m1-pulp-gate-01-777-3.actions-runner.log", 60)

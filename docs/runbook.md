@@ -1716,8 +1716,9 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
   `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
   the same once-per-episode path as a host left OFF, closed when a VM gets an
-  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
-  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  address. Its title is the host and the episode's start only
+  (`[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z`), and its first
+  three lines are the statement,
   `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
   fleet_reasons, so it is usable from a phone notification. It is raised when
   the breaker is open and:
@@ -1731,10 +1732,22 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
     the third grant: about 10 to 15 min after the breaker opens. One unreported
     probe is a slow boot and raises nothing; neither does a closed or
     `verifying` breaker.
-  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
-  breaker's `events.jsonl`. A close that fails (a new outage replacing one
-  whose issue is still open, or recovery) is kept as `stale_issues` in the
-  alert state and retried every pass, so no issue is left open.
+  **One issue per episode, keyed by host and start.** A reboot and a
+  self-update re-verify both send the breaker through `verifying` and reopen
+  it with a fresh `opened_at`, and a probe often reclassifies the cause. None
+  of those ends the outage, so none opens a second issue: the episode's start
+  is kept in `alert.json` while it is open (a new episode starts from the
+  breaker's running outage, which a reboot carries), a cause change is posted
+  once as a comment on the open issue (`Cause changed: <old> -> <new>`, with
+  the new remedy; a failed comment is retried next pass), and the issue
+  closes only when a VM got an address after the episode began. Before this,
+  m5's outage of 2026-10-09 became three issues (#427, #428, #430), each
+  closed and reopened 2 s apart; `test_m5_on_2026_10_09_is_one_issue` replays
+  that sequence and asserts one.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`, from the
+  episode's start) go to the breaker's `events.jsonl`. A close that fails at
+  recovery is kept as `stale_issues` in the alert state and retried every
+  pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
 - **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
@@ -1806,37 +1819,31 @@ comes up. It is not stale configuration.
    `pf_reference_missing` (PROBLEM) while pfd exits 3, before a lane spends a
    VM on it. Applicability is the host's VM lanes, not InternetSharing:
    InternetSharing is launched on demand and reads "not running" between jobs.
-   The finding also names any boot-time holder; m3, m5s and m1 have none and
-   a healthy pfd, so a missing holder alone is a fact, not a problem. To
-   install the holder on a host that loses pf across reboots (tartci never
-   does this; it needs sudo), write
-   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`:
+   The finding also names any boot-time holder. m3, m5s and m1 have none and
+   a healthy pfd, so a missing holder alone is a fact, not a problem. On a
+   host whose breaker history records a `pfd_crash_loop` outage it is a
+   problem, `pf_boot_holder_missing`: the fault is proven to recur at the next
+   reboot there.
 
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-   	<key>Label</key>
-   	<string>com.danielraffel.pf-enable-ref</string>
-   	<key>ProgramArguments</key>
-   	<array>
-   		<string>/bin/sh</string>
-   		<string>-c</string>
-   		<string>/sbin/pfctl -E 2&gt;&amp;1 | /usr/bin/sed -n 's/^Token : //p' &gt; /var/run/pf-enable-ref.token</string>
-   	</array>
-   	<key>RunAtLoad</key>
-   	<true/>
-   </dict>
-   </plist>
+   **Install the holder** (tartci never does this; it needs sudo). From the
+   host's tartci checkout:
+
+   ```sh
+   sudo scripts/install_pf_enable_ref.sh            # plan: what would change
+   sudo scripts/install_pf_enable_ref.sh --install  # write, bootstrap, verify
    ```
 
-   then `sudo chown root:wheel` and `sudo chmod 644` it and
-   `sudo launchctl bootstrap system <plist>`. Confirm with
-   `launchctl print system/com.danielraffel.pf-enable-ref` (runs 1, last
-   exit 0), a non-empty `/var/run/pf-enable-ref.token`, and
-   `tartci doctor fleet` reading `pf_reference_ok ... taken at boot by
-   com.danielraffel.pf-enable-ref`. The token in that file is the undo key.
+   It installs `launchd/system/com.danielraffel.pf-enable-ref.plist` (the
+   plist m5 has run since 2026-10-09) as
+   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`, root:wheel
+   0644. The daemon runs `/sbin/pfctl -E` at each boot and keeps the token in
+   `/var/run/pf-enable-ref.token`; bootstrapping it takes a reference now too.
+   The installer verifies launchd ran it with exit 0 and the token exists, and
+   is a no-op when the same plist is already loaded, so it never stacks
+   references on a re-run. Then `tartci vm-dhcp probe-now`, and
+   `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
+   com.danielraffel.pf-enable-ref`. The token is the undo key
+   (`sudo pfctl -X <token>`); Never `pfctl -d`.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the
@@ -1864,6 +1871,56 @@ comes up. It is not stale configuration.
 After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
 instead of waiting out the 300 s cadence; a fix that changes the chain usually
 triggers it on its own.
+
+### launchd stalled on a peer (`peer_launchd_stalled`)
+
+A stalled macOS automatic install can leave a host's launchd refusing every
+non-demand spawn. The interval guard (`scripts/launchd_interval_guard.py`)
+keeps the timers running from inside a lane supervisor, but it pauses
+self-update for the whole episode, and the stalled host opened no issue: m3
+was stalled from 2026-10-05T05:41Z for 97 h and 44 commits behind before
+anyone looked. A host in that state is the wrong one to rely on for its own
+alert, so its peers raise it.
+
+- **Who reads.** Every fleet host's launchd watchdog runs
+  `scripts/peer_stall_alert.py` after its heal work, at most once every
+  30 min (`TARTCI_PEER_STALL_READ_SECS`). It reads each published peer (the
+  same list and SSH targets self-update uses) with one SSH command that prints
+  the peer's clock and its guard receipt
+  (`~/.tartci/state/launchd-interval-guard/status.json`), and judges the
+  receipt with the guard's own `classify` on the peer's clock, so clock skew
+  cannot make a fresh receipt look stale.
+- **When it alerts.** A stall episode open for 6 h
+  (`TARTCI_PEER_STALL_ALERT_SECS`) opens one issue:
+  `[tartci] <peer> launchd stalled / self-update paused since <episode start>`.
+  The body says whether self-update is paused, gives
+  `Run: ssh <peer> 'tartci doctor fleet'`, and the fix: reboot the host when
+  its lanes are idle (a reboot clears the stall), and do not kickstart
+  self-update while it lasts. The watchdog log prints a
+  `WARN peer-stall` line each read while it holds.
+- **One reader acts.** Every watchdog runs on the same cadence, so reads of a
+  peer line up. The peer's primary reader, the lowest published host id other
+  than the peer, is the one that opens and closes its issue. The same SSH
+  command that reads a host's guard receipt also reads that host's own last
+  peer-stall pass, so every other reader can see whether the primary read the
+  peer within two read intervals. After two consecutive reads where it did not
+  (unreachable, stale, or it could not read the peer), the next reader acts.
+  Before opening, any reader adopts an open issue with the exact title, which
+  covers a fallback and a returning primary overlapping. A host that opened
+  or adopted an issue keeps closing it.
+  A host whose own id is unknown (no readable profile) reads and reports but
+  never opens or closes an issue.
+- **When it closes.** When a reader sees a fresh receipt, written after the
+  episode began, that reports no stall. A stale receipt (no guard running
+  there; that host's doctor `launchd_timers` says so) never closes it, and an
+  unreachable peer (often a host mid-reboot) or a guard that never ran decides
+  nothing, so the issue stays as it is.
+- **Where to look.** The reader's `~/.tartci/state/peer-stall/` holds
+  `last-read.json` (every peer's last verdict, whether this host acted and
+  why, and its count of primary misses), one `<peer>.json` per alert,
+  and `events.jsonl` (`peer_launchd_stalled`, once per episode).
+  `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
+  issue.
 
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
@@ -2904,6 +2961,17 @@ lanes change.
   runner census the real transition takes (two paginated GitHub API calls per
   protected repository). Do not run it in a tight loop; poll no faster than
   once a minute, and never on a host whose census CLI is anonymous (see below).
+- **`fleet_not_ready` names each problem's lane and age.** `tartci doctor
+  fleet` prints every readiness problem as `code (lane, detail)`, for example
+  `heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`. A stale
+  heartbeat on one lane makes the whole host count as not serving for its
+  peers' capacity floor, so read the lane, then its state file under
+  `~/.tartci/state/macos-fleet/<lane>/` and its `events.jsonl`. A lane stuck
+  in `booting` after `boot_ip` is the guest's sshd not answering; the boot
+  helper gives it `TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180) of wall-clock
+  time, killing each attempt at `TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15),
+  then discards the VM with `boot_failed no_ssh` (gotchas: "A gate lane sits
+  in `booting` for over an hour").
 - **Capacity-floor refusals come in two kinds, and only one is overridable.**
   `last serving host` (the floor's exit 3) means the census answered and no
   other host serves the label: none has an online runner carrying it, and no
