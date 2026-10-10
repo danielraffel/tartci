@@ -46,14 +46,23 @@ class Listener:
                        + guest_body)
         ssh.chmod(0o755)
 
-    def run(self, stale: int, timeout: float = 60) -> tuple[subprocess.CompletedProcess, float]:
+    def run(self, stale: int | None, timeout: float = 60,
+            env_stale: str | None = None) -> tuple[subprocess.CompletedProcess, float]:
+        """`stale` sets the listener's threshold directly; None takes it from
+        runner.sh's own top-level assignment and TARTCI_GUEST_HEARTBEAT_STALE_SECS."""
         source = RUNNER.read_text()
+        if stale is None:
+            start = source.index('GUEST_HEARTBEAT_STALE="${TARTCI_GUEST_HEARTBEAT_STALE_SECS')
+            end = source.index("esac\n", start) + len("esac\n")
+            threshold = source[start:end]
+        else:
+            threshold = f"GUEST_HEARTBEAT_STALE={stale}\n"
         script = (
             "set -uo pipefail\n"
             f"STATE_DIR={str(self.tmp)!r}\n"
             "SSH_OPTS=(-o BatchMode=yes); SSH_KEY_PRIV=/dev/null; VM_USER=admin\n"
             "ASSIGNMENT_V2_IDLE_RETARGET_SECS=0; IDLE_TIMEOUT=600; JOB_WARN=600; JOB_TIMEOUT=7200\n"
-            f"GUEST_HEARTBEAT_STALE={stale}\n"
+            + threshold +
             "CCACHE_MAX_SIZE=1G; CCACHE_LAYER_GUEST_PREP=''; CCACHE_LAYER_GUEST_ENV=''\n"
             "GUEST_HTTP_PROXY=''; CURRENT_GUEST_CORES=''; CURRENT_GUEST_MEM_MB=''\n"
             "CURRENT_PIP_WHEELHOUSE=0; CURRENT_ARTIFACT_CACHE=0; GUEST_PIP_WHEELHOUSE=''; GUEST_ARTIFACT_CACHE=''\n"
@@ -68,7 +77,10 @@ class Listener:
             + function(source, "run_runner_until_done_unlayered") + "\n"
             "run_runner_until_done_unlayered vm1 192.0.2.1 jit 0; echo \"rc=$?\"\n"
         )
-        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}")
+        env = {k: v for k, v in os.environ.items() if k != "TARTCI_GUEST_HEARTBEAT_STALE_SECS"}
+        env["PATH"] = f"{self.bin}:{os.environ['PATH']}"
+        if env_stale is not None:
+            env["TARTCI_GUEST_HEARTBEAT_STALE_SECS"] = env_stale
         started = time.monotonic()
         result = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
                                 env=env, timeout=timeout, check=False)
@@ -98,6 +110,19 @@ class GuestHeartbeatTests(unittest.TestCase):
         self.assertIn("assigned=1", events)
         self.assertIn("cancel", events, "an assigned job's run is cancelled")
         self.assertNotIn("TARTCI_GUEST_HEARTBEAT", result.stderr, "heartbeats are not echoed")
+
+    def test_the_rendered_threshold_reaches_the_listener(self) -> None:
+        # The profile renders TARTCI_GUEST_HEARTBEAT_STALE_SECS; a listener
+        # that ignored it would wait the 600 s default and outlive this test.
+        listener = Listener(self, FROZEN)
+        result, elapsed = listener.run(stale=None, env_stale="4", timeout=40)
+        self.assertIn("rc=124", result.stdout, result.stderr)
+        self.assertLess(elapsed, 20)
+        self.assertIn("stale_after=4s", listener.event_text())
+
+    def test_a_malformed_threshold_falls_back_to_the_default(self) -> None:
+        source = RUNNER.read_text()
+        self.assertIn('case "$GUEST_HEARTBEAT_STALE" in \'\'|*[!0-9]*|0) GUEST_HEARTBEAT_STALE=600', source)
 
     def test_a_guest_that_keeps_heartbeating_is_left_alone(self) -> None:
         # Control, same instrument and threshold: only the guest's beats differ.
