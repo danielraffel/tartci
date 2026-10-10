@@ -161,8 +161,8 @@ assignment_idle_retarget_seconds = 120
 # See docs/assignment-v2-rollout.md, "Pre-clone demand check".
 assignment_pre_clone_demand_check = true
 # Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
-# preference" and "Release event classes"). Slot 2 keeps the PR-first canary:
-# PR-head before merge-group, the fix for PR-head starvation; releases follow
+# preference" and "Release event classes"). Slot 2 keeps merge-group ahead of
+# PR-head so a queued merge group is selected before ordinary PR checks; releases follow
 # the gate classes there. Slot 1 is this host's release-first slot: both
 # release classes before the gate classes, falling back to gate work whenever
 # no release waits. The release tiers below serve only jobs carrying a release
