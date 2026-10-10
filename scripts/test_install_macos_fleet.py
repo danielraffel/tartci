@@ -26,6 +26,26 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class InstallMacosFleetTests(unittest.TestCase):
+    def test_fake_ghapp_rejects_reduced_environment_and_unexpected_path(self) -> None:
+        result = subprocess.run(["/bin/sh", str(self.bin / "ghapp"), "api", "repos/danielraffel/tartci"],
+                                env={"PATH": os.environ.get("PATH", "")},
+                                capture_output=True, text=True)
+        self.assertEqual(77, result.returncode)
+        result = subprocess.run(["/bin/sh", str(self.bin / "ghapp"), "api", "repos/danielraffel/tartci"],
+                                env={"HOME": str(self.home), "FAKE_EXPECTED_GHAPP_PATH": "/unexpected"},
+                                capture_output=True, text=True)
+        self.assertEqual(78, result.returncode)
+
+    def test_commit_response_uses_real_repository_shape_without_second_installation_lookup(self) -> None:
+        """The commit API carries repository.full_name; avoid a second repo lookup.
+
+        GitHub returns this nested object on commit responses. A second
+        repos/<slug> call asks ghapp to resolve the installation again and can
+        404 for the pre-transfer user-owned slug even when the commit request
+        itself is authorized.
+        """
+        self.assertIn('"repository":{"full_name":"%s"}', (self.bin / "ghapp").read_text())
+
     def setUp(self) -> None:
         self.uid = os.getuid()
         self.temp = tempfile.TemporaryDirectory()
@@ -44,6 +64,11 @@ class InstallMacosFleetTests(unittest.TestCase):
         ghapp = self.bin / "ghapp"
         ghapp.write_text(textwrap.dedent("""\
             #!/bin/sh
+            [ -n "${HOME:-}" ] || { echo "fake ghapp requires HOME" >&2; exit 77; }
+            if [ -n "${FAKE_EXPECTED_GHAPP_PATH:-}" ] && [ "$0" != "$FAKE_EXPECTED_GHAPP_PATH" ]; then
+              echo "fake ghapp invoked from unexpected path" >&2
+              exit 78
+            fi
             [ "${FAKE_AUTH_DENY:-0}" = 1 ] && exit 1
             for arg in "$@"; do
               case "$arg" in
@@ -51,10 +76,11 @@ class InstallMacosFleetTests(unittest.TestCase):
                   sha="${FAKE_AUTH_SHA:-${arg##*/}}"
                   repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
                   repo="${repo%%/commits/*}"
-                  printf '{"sha":"%s"}\n' "$sha"
+                  printf '{"sha":"%s","repository":{"full_name":"%s"}}\n' "$sha" "$repo"
                   exit 0
                   ;;
                 repos/danielraffel/tartci|repos/Generous-Corp/tartci)
+                  [ "${FAKE_REPOSITORY_LOOKUP_DENY:-0}" = 1 ] && exit 1
                   repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
                   printf '{"full_name":"%s"}\n' "$repo"
                   exit 0
@@ -504,6 +530,11 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("could not prove", result.stderr)
         self.assertTrue(self.legacy.exists())
         self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
+
+    def test_apply_accepts_commit_repository_shape_when_repo_lookup_is_404(self) -> None:
+        result = self.run_installer("--apply", FAKE_REPOSITORY_LOOKUP_DENY="1")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("installed 1 profile-rendered", result.stdout)
 
     def test_apply_requires_authenticated_exact_repository_commit(self) -> None:
         for env, message in (
