@@ -243,7 +243,13 @@ possibly torn profile.
 
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
-uses `TART_HOME`, capacity and cleanup will disagree.
+uses `TART_HOME`, capacity and cleanup will disagree. `tartci doctor` (including
+`doctor --reap`, which Shipyard's health probe runs) and `tartci observe` hold
+that invariant for you: with no `TART_HOME` in the environment they export the
+fleet profile's `[host].tart_home`, and they print `tart store: <path> (<why>)`.
+An explicit `TART_HOME` that differs from the profile's wins but is printed with
+a WARNING. Raw `tart` over ssh still reads `~/.tart` unless you pass the store
+(see gotchas: "`ssh <host> 'tart list'` shows no gate VMs").
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 Do not diagnose installation state from raw `ssh host 'command -v tart'` output:
@@ -1986,7 +1992,27 @@ fleet`), and check GitHub's job history against it with
   generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
-  SSH. The marker's age is measured on the peer's own clock.
+  SSH at every attempt (the read is never cached). The marker's age is
+  measured on the peer's own clock. The marker is read before the pool state:
+  a self-update announces and then drains, so a peer mid-update is reported
+  as `peer X is self-updating to <commit> (N min in)`, never as plain
+  `draining`. A peer that is not serving for any other reason is reported with
+  how long its pool state has been unchanged (the mtime of its
+  `~/.config/tartci/pool-state`).
+- **A long markerless drain stops holding the turn.** A peer that is
+  `draining` with no live update marker, whose pool state has not changed for
+  `PEER_DRAIN_STALE_SECONDS` (3 h, the marker's own TTL), is treated like an
+  off peer: it holds no turn and the capacity floor counts it as serving
+  nothing. A self-update holds a live marker through its whole drain, so this
+  is an operator drain or an update that died after draining. A drain of
+  unknown age (the peer's pool-state file could not be read) still holds the
+  turn, and a peer that is `on` but not participating always does.
+- **The recorded reason is as old as the last attempt.** `waiting.json`'s
+  `reason` is the survey of the last attempt, up to one 30 min interval old.
+  A reason that names a peer which now reads `on` is not a stale view: the
+  next attempt reads the peer afresh. On 2026-10-09 m5studio finished its
+  update at 06:10Z and m5's next attempt, which took the turn, ran at 06:36Z;
+  each hand-off between hosts costs up to one interval.
 - **Update queue.** A host that defers keeps a ticket in
   `~/.tartci/state/self-update/waiting.json` whose `since` records when it
   joined the queue and survives new targets. Hosts take turns in `since`
@@ -2680,6 +2706,50 @@ expires, and is reported by `tartci pool status` and `tartci doctor`. No host
 enables it. Design, events, and the runbook for trying it on a new high-RAM
 host (prerequisites, exact profile lines, idle-cost and minutes-saved
 measurement, turning it off): [warm-vm.md](warm-vm.md).
+
+## Retention of per-boot state and support generations (`tartci retention`)
+
+Two trees grow without bound on every fleet host. `~/.tartci/state` gets one
+actions-runner log, one admission-clean receipt and one repository-access
+receipt per VM boot, and `~/.local/share/tartci-generations` gets one
+generation per self-update. Neither is large (under 200 MB a host), but every
+scan of them grows forever. On 2026-10-09 the plan below found these:
+
+| host | old per-boot files | generations kept / to delete |
+|---|---|---|
+| m1 | 5,362 | skipped: m1 was mid self-update |
+| m3 | 4,780 | 10 / 40 |
+| m5 | 5,585 | 10 / 54 |
+| m5studio | 0 | 10 / 29 |
+
+`tartci retention` prints the plan and changes nothing. `tartci retention
+--apply` deletes, and `--json` gives the machine-readable form. It deletes only:
+
+- **Per-boot files** named `<runner>-<pid>-<seq>.<kind>`, where kind is
+  `actions-runner.log`, `admission-clean.json`, `repository-access.json`,
+  `repository-access-error` or `jit-error`, that are older than
+  `--max-age-days` (default 30) and outside the newest `--keep-per-dir`
+  (default 50) of their directory. Per-lane files without a boot suffix
+  (`*.state.json`, `events.jsonl`, `*.disk-admission.json`, locks) and
+  self-update receipts are never touched.
+- **Generations** outside the newest `--keep-generations` (default 10, at
+  least 3) and older than `--generation-grace-days` (default 2), that nothing
+  names: not the wrapper `~/.local/bin/tartci`, not any LaunchAgent plist,
+  not a `~/.config/tartci/*.json` receipt, not the `previous` commit of any
+  rollback snapshot, not the generation running the pass. Generations are kept
+  by count, not age, because a host deploys several times a day. A rollback
+  that needs a deleted generation re-stages it from source.
+
+Idle safety: a per-boot file whose `<runner>-<pid>-<seq>` appears on any
+running command line, and a generation that any process names in its command
+line or holds as its working directory, is kept. If `ps` or `lsof` cannot be
+read, nothing is deleted. While a self-update marker
+(`~/.tartci/state/self-update/active.json`) exists, generations are left alone
+for that pass, since an install may be staging one. Generations are installed
+read-only; `--apply` makes a doomed one writable before removing it.
+
+No agent runs this yet. Run the plan on a host, read it, then `--apply`.
+Scheduling it (for example from the reclaim agent) is a separate decision.
 
 ## Fleet scheduling boundary
 

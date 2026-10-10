@@ -59,6 +59,7 @@ from typing import Any, Callable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import capacity_floor  # noqa: E402 - sibling module; owns the peer liveness judgement
+import secret_files  # noqa: E402 - reads keychain.env without leaking a value
 
 try:
     import tomllib
@@ -125,6 +126,13 @@ PEER_UNREACHABLE_MIN_READS = 4
 # measured on its own clock.
 PEER_UNREACHABLE_FRESH_SECONDS = 3600
 PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# A peer DRAINING with no live update marker, whose pool state has not changed
+# for this long, stops holding the update turn and is left to the capacity
+# floor, like an off peer. A self-update holds a live marker for its whole
+# drain, and a drain waits only for running jobs, so a markerless drain this
+# old is an operator drain or an update that died after draining. The bound is
+# the marker's own TTL: a dead update's marker stops counting at the same age.
+PEER_DRAIN_STALE_SECONDS = ACTIVE_MARKER_TTL
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -745,12 +753,15 @@ def self_host_id(cfg: Config) -> str:
 # the peer's clock so host clock skew cannot make a live marker look stale.
 WAITING_SEPARATOR = "--- waiting ---"
 UNREADABLE_SEPARATOR = "--- unreadable ---"
+POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
                 'echo; echo "' + UNREADABLE_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
-                + '" 2>/dev/null || true')
+                + '" 2>/dev/null || true; echo; echo "' + POOL_SINCE_SEPARATOR + '"; '
+                'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
+                '2>/dev/null || true')
 
 
 def _ssh_failure_kind(result: Result) -> str:
@@ -808,8 +819,11 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     first, _, rest = marker.out.partition("\n")
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
     out["clock"] = clock
+    rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
     waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
+    pool_since = (int(pool_since_text.strip())
+                  if clock is not None and pool_since_text.strip().isdigit() else None)
     if clock is not None and unreadable_text.strip():
         try:
             report = json.loads(unreadable_text)
@@ -826,22 +840,42 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
                 and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL):
             out["since"] = float(ticket["since"])
     is_off = value.get("state") == "off"
-    if not is_off and (value.get("state") != "on" or value.get("participating") is not True):
-        out["evidence"] = (f"peer {host_id} is {value.get('state')} "
-                           f"(participating={value.get('participating')})")
-        return out
+    serving = value.get("state") == "on" and value.get("participating") is True
+    not_serving = (f"peer {host_id} is {value.get('state')} "
+                   f"(participating={value.get('participating')})")
     if clock is None:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable (exit {marker.rc})")
         return out
+    # The update marker is read BEFORE the pool state. A self-update announces,
+    # then drains, so a peer mid-update reads as draining; checked first, the
+    # pool state hid that it was the turn holder and how long it had held the
+    # turn (m5 on 2026-10-09 read "peer m5studio is draining" for an update
+    # that was 10 minutes in).
     active = None
     try:
         active = json.loads(active_text) if active_text.strip() else None
     except json.JSONDecodeError:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable")
         return out
     if isinstance(active, dict) and clock - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
-        out.update(evidence=f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}",
-                   active_age=max(0.0, clock - float(active.get("ts", 0))))
+        age = max(0.0, clock - float(active.get("ts", 0)))
+        out.update(evidence=(f"peer {host_id} is self-updating to "
+                             f"{str(active.get('target'))[:12]} ({int(age // 60)} min in)"),
+                   active_age=age)
+        return out
+    if value.get("state") == "draining" and pool_since is not None \
+            and clock - pool_since >= PEER_DRAIN_STALE_SECONDS:
+        out.update(busy=False, off=True,
+                   evidence=(f"peer {host_id} has been draining for "
+                             f"{(clock - pool_since) / 3600:.1f} h with no update marker "
+                             "(left to the capacity floor)"))
+        return out
+    if not is_off and not serving:
+        since = (f", pool state unchanged for {int((clock - pool_since) // 60)} min"
+                 if pool_since is not None else "")
+        out["evidence"] = not_serving + since
         return out
     if is_off:
         out.update(busy=False, off=True,
@@ -1194,21 +1228,36 @@ def extract_signing_identity(sys_: System, bundle: Path, workdir: Path) -> str:
 
 
 def signing_secrets(home: Path) -> dict[str, str]:
-    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env)."""
-    directory = Path(os.environ.get("PULP_SECRETS_DIR") or home / ".config" / "pulp" / "secrets")
-    values: dict[str, str] = {}
-    try:
-        lines = (directory / "keychain.env").read_text().splitlines()
-    except OSError:
-        return values
-    for line in lines:
-        key, sep, value = line.strip().partition("=")
-        if sep and key and not key.startswith("#"):
-            values[key.removeprefix("export ").strip()] = value.strip().strip('"').strip("'")
+    """pulp's dedicated signing keychain settings (~/.config/pulp/secrets/keychain.env).
+
+    Only well-formed lines are returned; see secret_files.parse. Never put a
+    value from here into a message: name the key instead.
+    """
+    env = secret_files.load(home, "keychain.env")
+    values = dict(env.values) if env is not None else {}
     for key in ("PULP_SIGN_KEYCHAIN", "PULP_SIGN_KEYCHAIN_PW"):
         if os.environ.get(key):
             values[key] = os.environ[key]
     return values
+
+
+def signing_secrets_problem(home: Path) -> str | None:
+    """What is wrong with keychain.env, by key name only, or None."""
+    env = secret_files.load(home, "keychain.env")
+    if env is None:
+        return None
+    bad = list(env.malformed)
+    keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
+    if keychain and not secret_files.keychain_path_ok(_expand_home(keychain, home)):
+        bad.append("PULP_SIGN_KEYCHAIN (not a keychain path)")
+    if not bad:
+        return None
+    return ("keychain.env is malformed: " + ", ".join(bad)
+            + "; values withheld. Rewrite it with `pulp ship doctor`")
+
+
+def _expand_home(value: str, home: Path) -> str:
+    return str(Path(value.replace("$HOME", str(home))).expanduser())
 
 
 def signing_keychain(home: Path) -> str | None:
@@ -1217,12 +1266,16 @@ def signing_keychain(home: Path) -> str | None:
     keychain.env's PULP_SIGN_KEYCHAIN, or its `-unattended` sibling when that
     exists: pulp's ensure_signing_ready.sh builds the sibling when the
     configured keychain cannot be unlocked, and signs from it from then on.
+    A value that is not a keychain path is ignored (None): it is what a
+    malformed file parses as, and it may hold the password.
     """
     keychain = signing_secrets(home).get("PULP_SIGN_KEYCHAIN")
     if not keychain:
         return None
-    path = Path(keychain.replace("$HOME", str(home))).expanduser()
-    stem = str(path)[: -len(".keychain-db")] if str(path).endswith(".keychain-db") else str(path)
+    path = _expand_home(keychain, home)
+    if not secret_files.keychain_path_ok(path):
+        return None
+    stem = path[: -len(".keychain-db")] if path.endswith(".keychain-db") else path
     sibling = Path(f"{stem}-unattended.keychain-db")
     return str(sibling if sibling.exists() else path)
 
@@ -1242,12 +1295,15 @@ def unlock_signing_keychain(sys_: System, home: Path) -> str:
     keychain = signing_keychain(home)
     password = signing_secrets(home).get("PULP_SIGN_KEYCHAIN_PW")
     if not keychain or not password:
-        return "no dedicated signing keychain configured in keychain.env; probing as-is"
+        problem = signing_secrets_problem(home)
+        return (f"{problem}; probing as-is" if problem else
+                "no dedicated signing keychain configured in keychain.env; probing as-is")
     result = sys_.run(["security", "unlock-keychain", "-p", password, keychain], timeout=30)
     if result.rc != 0:
-        return (f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
-                "the signing probe decides")
-    return f"unlocked {keychain} for this session"
+        return secret_files.redact(
+            f"{keychain} could not be unlocked from keychain.env (exit {result.rc}); "
+            "the signing probe decides", home)
+    return secret_files.redact(f"unlocked {keychain} for this session", home)
 
 
 def keychain_args(home: Path) -> list[str]:
@@ -1279,8 +1335,8 @@ def signing_probe(sys_: System, identity: str, workdir: Path,
     if result.rc != 0:
         raise Refused(f"SIGNING KEYCHAIN LOCKED or unusable: signing identity {identity} "
                       f"cannot sign unattended (exit {result.rc}: "
-                      f"{result.text[:200]}); run `pulp ship doctor` to prepare the dedicated "
-                      "signing keychain, and never answer a keychain password prompt")
+                      f"{secret_files.redact(result.text)[:200]}); run `pulp ship doctor` to prepare "
+                      "the dedicated signing keychain, and never answer a keychain password prompt")
 
 
 def set_immutable(root: Path, manifest: Path, sys_: System) -> None:

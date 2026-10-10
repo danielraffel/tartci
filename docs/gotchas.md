@@ -92,6 +92,26 @@ Do not kickstart self-update during the stall.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
+
+**Symptom:** a lane reads `job-running` for up to two hours while its VM is
+frozen; the watchdog's frozen-lane heal skips a host with a running VM, so
+nothing frees the slot before `TARTCI_JOB_TIMEOUT_SECS` (7200).
+
+**Cause:** the host waits on the ssh session that runs the guest's listener. A
+guest that hangs can keep that TCP session open, so the host sees neither
+output nor an exit.
+
+**Fix:** the guest launcher writes `TARTCI_GUEST_HEARTBEAT <epoch>` every
+`TARTCI_GUEST_HEARTBEAT_SECS` (30) into that session. Once the first one
+arrives, the host tears the VM down when the listener log has been silent for
+`TARTCI_GUEST_HEARTBEAT_STALE_SECS`: it records `guest_heartbeat_stale`,
+cancels an assigned job's run, and frees the slot. Every lane in the shipped
+profiles sets it with `guest_heartbeat_stale_seconds = 600`. Before the first
+heartbeat (runner still starting, or a guest launcher from an older
+generation) silence proves nothing and the idle and job timeouts apply.
+Heartbeat lines are dropped from the runner log the host echoes.
+
 ## A `while read` loop ends early after a peer read over ssh (2026-10-04)
 
 *Symptom:* the supervisor observed only the first class with young demand;
@@ -254,6 +274,22 @@ first; list it only when what it asserts really needs tomllib.
   Python 3.11+ path in the host's launchd environment when the default
   Homebrew locations do not apply. Verify by *parsing the config*, not by
   checking the file exists.
+
+- **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
+  them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/Workshop/VMs`); a
+  shell over ssh has none, so `tart` reads its default `~/.tart`. Before
+  2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
+  doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0
+  running VMs and 2 free slots while two gate VMs ran. → *Fix:* `tartci
+  doctor` and `tartci observe` now export the fleet profile's
+  `[host].tart_home` when the shell has no `TART_HOME`, and print the store
+  they read and where it came from (`tart store: /Users/<you>/VMs
+  ([host].tart_home from ...)`); the reap digest carries it as
+  `config.tart_home`. A shell `TART_HOME` that differs from the profile's is
+  kept but flagged. For raw Tart over ssh, pass the store yourself:
+  `ssh <host> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list'`.
+  `python3 scripts/tart_home.py` prints what a command on that host resolves.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.

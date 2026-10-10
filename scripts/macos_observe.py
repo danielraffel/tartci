@@ -331,6 +331,10 @@ def print_human(data: dict[str, Any]) -> None:
         f"{coverage_line(digest)} "
         f"problems={len(problems)}"
     )
+    store = (digest.get("config") or {}).get("tart_home") or {}
+    if store:
+        print(f"  tart store: {store.get('path')} (from {store.get('source')})"
+              + (f" WARNING: {store['warning']}" if store.get("warning") else ""))
     for problem in problems:
         print(f"  problem: {problem}")
     if not data.get("observations"):
