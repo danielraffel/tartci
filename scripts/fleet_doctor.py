@@ -104,6 +104,7 @@ CODES: tuple[str, ...] = (
     "peer_unreachable",
     "peer_unreachable_excluded",
     "pf_not_applicable",
+    "pf_boot_holder_missing",
     "pf_pfd_exiting",
     "pf_reference_missing",
     "pf_reference_ok",
@@ -156,6 +157,9 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_janitor_loaded",
+    "vm_janitor_missing",
+    "vm_janitor_unknown",
     "vm_boot_degraded",
     "vm_boot_ok",
     "vm_boot_unmeasured",
@@ -581,13 +585,53 @@ def check_readiness(probes: dict[str, dict], *, authority: str) -> Finding:
         return Finding(check, OK, "fleet_ready",
                        "the installed generation reports the fleet ready", facts)
     if ready is False:
-        codes = ", ".join(
-            str(problem.get("code")) for problem in problems if isinstance(problem, dict)
+        codes = "; ".join(
+            describe_readiness_problem(problem)
+            for problem in problems if isinstance(problem, dict)
         ) or "no problem code was reported"
         return Finding(check, PROBLEM, "fleet_not_ready",
                        f"the fleet is not ready: {codes}", facts)
     return Finding(check, UNKNOWN, "readiness_probe_failed",
                    "the readiness probe returned no fleet_ready verdict", facts)
+
+
+LANE_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+
+
+def describe_readiness_problem(problem: dict) -> str:
+    """One readiness problem as `code (lane, detail)`.
+
+    The bare code was all the finding used to print, so m1 read
+    `heartbeat_stale, heartbeat_stale` with no word of which supervisor or how
+    stale, and the operator had to re-run the probe to learn either. The probe
+    already carries both: `label` is the lane's launchd label, `detail` is
+    `age_seconds=N` for a heartbeat problem and free text for the rest.
+    """
+    code = str(problem.get("code"))
+    parts = []
+    label = str(problem.get("label") or "")
+    if label:
+        parts.append(label[len(LANE_LABEL_PREFIX):] if label.startswith(LANE_LABEL_PREFIX)
+                     else label)
+    detail = str(problem.get("detail") or "")
+    if detail.startswith("age_seconds="):
+        try:
+            seconds = int(detail.split("=", 1)[1])
+        except ValueError:
+            parts.append(detail)
+        else:
+            parts.append(f"heartbeat {_age_words(seconds)} old")
+    elif detail:
+        parts.append(detail)
+    return f"{code} ({', '.join(parts)})" if parts else code
+
+
+def _age_words(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
 # ── Assembly ───────────────────────────────────────────────────────────────
@@ -1076,6 +1120,36 @@ def check_support_agents(value: dict | None) -> list[Finding]:
     return [found, extra]
 
 
+VM_JANITOR = "reap"
+
+
+def check_vm_janitor(value: dict | None) -> Finding:
+    """Whether the VM janitor (com.danielraffel.tartci.reap) is installed and loaded.
+
+    Without it a stale VM or overlay stays until someone notices: on
+    2026-10-09 it was loaded on m3 only, while every profile declared it,
+    because `bootstrap = false` kept the support-agents step to a plan.
+    """
+    value = value or {"state": "unreadable"}
+    facts = {"vm_janitor": (value.get("agents") or {}).get(VM_JANITOR)}
+    if value.get("state") in (None, "unreadable", "never"):
+        return Finding("vm_janitor", UNKNOWN, "vm_janitor_unknown",
+                       "no readable support-agents receipt to say whether the VM janitor "
+                       "is installed", facts)
+    if VM_JANITOR not in (value.get("declared") or []):
+        return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                       "the VM janitor (reap) is not declared in this host's profile", facts)
+    entry = (value.get("agents") or {}).get(VM_JANITOR) or {}
+    # `changes` is support_agents.status's verdict, which accounts for what an
+    # apply pass installed; the per-agent state is what the pass found before.
+    if VM_JANITOR not in (value.get("changes") or []):
+        return Finding("vm_janitor", OK, "vm_janitor_loaded",
+                       "the VM janitor (reap) is installed and loaded", facts)
+    return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                   f"the VM janitor (reap) is declared but {entry.get('state') or 'unknown'}"
+                   f"{'' if entry.get('loaded') else ', not loaded'}", facts)
+
+
 def check_reuse_canary(value: dict | None) -> Finding:
     """Whether the reuse canary keeps a bindable record (scripts/reuse_canary.py)."""
     value = value or {"state": "unreadable", "error": "no status"}
@@ -1218,6 +1292,8 @@ def check_pf_reference(value: dict | None) -> Finding:
         return Finding("pf_reference", PROBLEM, "pf_reference_missing", detail, facts)
     if state == "pfd_exiting":
         return Finding("pf_reference", PROBLEM, "pf_pfd_exiting", detail, facts)
+    if state == "holder_missing":
+        return Finding("pf_reference", PROBLEM, "pf_boot_holder_missing", detail, facts)
     if state == "not_applicable":
         return Finding("pf_reference", NOT_APPLICABLE, "pf_not_applicable", detail, facts)
     return Finding("pf_reference", UNKNOWN, "pf_reference_unknown", detail, facts)
@@ -1622,6 +1698,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             support_agents_value = {"state": "unreadable", "error": str(exc)}
     findings.extend(check_support_agents(support_agents_value))
+    findings.append(check_vm_janitor(support_agents_value))
     if reuse_canary_value is None:
         try:
             import reuse_canary
@@ -1642,7 +1719,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     if pf_value is None:
         try:
             import pf_reference
-            pf_value = pf_reference.status(len(fit_records))
+            pf_value = pf_reference.status(len(fit_records), vm_dhcp_value)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
             pf_value = {"state": "unknown", "error": str(exc)}
     findings.append(check_pf_reference(pf_value))

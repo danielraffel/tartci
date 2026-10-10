@@ -483,6 +483,37 @@ class ReadinessTests(unittest.TestCase):
         self.assertEqual(finding.code, "fleet_not_ready")
         self.assertIn("persistent_loaded_receipt_mismatch", finding.detail)
 
+    def test_m1_on_2026_10_09_names_the_stale_supervisor_and_its_age(self):
+        # The live probe on m1: one gate lane wedged in its SSH wait. The
+        # finding used to read `heartbeat_stale` and nothing else.
+        probes = {"/gen/root": {
+            "managed": True, "fleet_ready": False,
+            "problems": [
+                {"code": "heartbeat_stale", "detail": "age_seconds=4286",
+                 "label": "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate.slot2"},
+                {"code": "heartbeat_stale", "detail": "age_seconds=95",
+                 "label": "com.danielraffel.tartci.tart-runner-macos-fleet.m1.pulp-gate"},
+            ]}}
+        finding = fd.check_readiness(probes, authority="/gen/root")
+        self.assertEqual(finding.code, "fleet_not_ready")
+        self.assertIn("heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)", finding.detail)
+        self.assertIn("heartbeat_stale (m1.pulp-gate, heartbeat 95s old)", finding.detail)
+        # Negative control: the bare-code rendering this replaces.
+        self.assertNotIn("heartbeat_stale, heartbeat_stale", finding.detail)
+
+    def test_a_problem_without_label_or_detail_still_reads_as_its_code(self):
+        self.assertEqual(fd.describe_readiness_problem({"code": "persistent_loaded_receipt_mismatch"}),
+                         "persistent_loaded_receipt_mismatch")
+        self.assertEqual(fd.describe_readiness_problem(
+            {"code": "heartbeat_from_future", "label": "other.label", "detail": "skew_seconds=40"}),
+            "heartbeat_from_future (other.label, skew_seconds=40)")
+        self.assertEqual(fd.describe_readiness_problem(
+            {"code": "heartbeat_stale", "detail": "age_seconds=9000"}),
+            "heartbeat_stale (heartbeat 2h30m old)")
+        self.assertEqual(fd.describe_readiness_problem(
+            {"code": "heartbeat_stale", "detail": "age_seconds=junk"}),
+            "heartbeat_stale (age_seconds=junk)")
+
     def test_good_ready_single_root_does_not_alarm(self):
         probes = {"/gen/root": {
             "managed": True, "fleet_ready": True,
@@ -602,3 +633,39 @@ class PoolRecordTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VmJanitorTests(unittest.TestCase):
+    def receipt(self, state="match_bytes", loaded=True, declared=("reap",)):
+        ok = state in ("match_bytes", "match_plist") and loaded
+        return {"state": "drift", "declared": list(declared),
+                "changes": [] if ok else ["reap"],
+                "agents": {"reap": {"state": state, "loaded": loaded, "leaked": False}}}
+
+    def test_right_after_an_apply_that_installed_it_reads_loaded(self):
+        # The pass found it missing and installed it: status() drops it from
+        # `changes`, and the doctor must follow that, not the found state.
+        value = self.receipt(state="missing", loaded=False)
+        value["changes"] = []
+        self.assertEqual(fd.check_vm_janitor(value).code, "vm_janitor_loaded")
+
+    def test_loaded_janitor_is_ok(self):
+        self.assertEqual(fd.check_vm_janitor(self.receipt()).code, "vm_janitor_loaded")
+
+    def test_m1_on_2026_10_09_reads_missing(self):
+        finding = fd.check_vm_janitor(self.receipt(state="missing", loaded=False))
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "vm_janitor_missing"))
+        self.assertIn("declared but missing, not loaded", finding.detail)
+
+    def test_undeclared_or_unloaded_is_missing_and_no_receipt_is_unknown(self):
+        self.assertEqual(fd.check_vm_janitor(self.receipt(declared=())).code, "vm_janitor_missing")
+        self.assertEqual(fd.check_vm_janitor(self.receipt(loaded=False)).code, "vm_janitor_missing")
+        self.assertEqual(fd.check_vm_janitor({"state": "never"}).code, "vm_janitor_unknown")
+        self.assertEqual(fd.check_vm_janitor(None).code, "vm_janitor_unknown")
+
+    def test_every_janitor_code_has_a_reason(self):
+        import pathlib
+        reasons = json.loads((pathlib.Path(fd.__file__).parent / "fleet_reasons.json").read_text())
+        flat = json.dumps(reasons)
+        for code in ("vm_janitor_loaded", "vm_janitor_missing", "vm_janitor_unknown"):
+            self.assertIn(f'"{code}"', flat)

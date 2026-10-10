@@ -93,6 +93,15 @@ SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 # old. During a legit build the log DOES go this stale (run_one is quiet until the job
 # ends), which is why the alive-but-frozen signature also requires no running VM.
 DEFAULT_STALE_LOG_S = 1800  # 30 min
+
+
+
+def default_stale_log_seconds() -> int:
+    """TARTCI_WATCHDOG_STALE_LOG_SECONDS (rendered from the fleet profile's
+    [launchd_watchdog] stale_log_seconds), else DEFAULT_STALE_LOG_S. A
+    malformed value keeps the default rather than failing the pass."""
+    raw = os.environ.get("TARTCI_WATCHDOG_STALE_LOG_SECONDS", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else DEFAULT_STALE_LOG_S
 # `serve ... --loop` deliberately exits EX_TEMPFAIL after sustained GitHub
 # observation blindness so launchd can give it a fresh App-auth environment.
 # If launchd does not respawn it, that explicit restart contract has failed; do
@@ -1278,6 +1287,31 @@ def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | N
     return None
 
 
+def peer_stall_pass(now: float | None = None) -> str | None:
+    """Tell someone when a PEER's launchd has stalled (scripts/peer_stall_alert.py).
+
+    A stalled host cannot be relied on to alert about itself, so each host
+    reads its peers' guard receipts over SSH, at most every 30 min, and opens
+    (or adopts) one issue per stalled peer. Runs after the heal work so a slow
+    peer never delays it. Prints a WARN for each peer past the threshold.
+    Never raises.
+    """
+    try:
+        import peer_stall_alert  # noqa: PLC0415 - sibling module
+        out = peer_stall_alert.alert_pass(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN peer-stall check FAILED "
+                f"({type(exc).__name__}: {exc}); a stalled peer would not be reported")
+    if out.get("skipped"):
+        return None
+    stalled = [f"{peer} since {v.get('since')} ({v.get('hours')} h)"
+               for peer, v in sorted((out.get("peers") or {}).items()) if v.get("active")]
+    if stalled:
+        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN peer-stall: "
+                f"launchd stalled on {'; '.join(stalled)}")
+    return None
+
+
 def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
     """Recover and alert for a host a failed self-update left OFF.
 
@@ -1364,7 +1398,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
-    ap.add_argument("--stale-log-seconds", type=int, default=DEFAULT_STALE_LOG_S)
+    ap.add_argument("--stale-log-seconds", type=int, default=default_stale_log_seconds())
     ap.add_argument("--restart-grace-seconds", type=int,
                     default=DEFAULT_RESTART_GRACE_S)
     ap.add_argument("--max-heals", type=int, default=DEFAULT_MAX_HEALS)
@@ -1480,6 +1514,9 @@ def main(argv: list[str] | None = None) -> int:
         attestation_line = host_attestation_pass()
         if attestation_line:
             print(attestation_line)
+        peer_stall_line = peer_stall_pass()
+        if peer_stall_line:
+            print(peer_stall_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
