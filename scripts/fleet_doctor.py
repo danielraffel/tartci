@@ -156,6 +156,9 @@ CODES: tuple[str, ...] = (
     "tool_freshness_unmeasured",
     "undeclared_fleet_agent",
     "undeclared_fleet_agents_none",
+    "vm_janitor_loaded",
+    "vm_janitor_missing",
+    "vm_janitor_unknown",
     "vm_boot_degraded",
     "vm_boot_ok",
     "vm_boot_unmeasured",
@@ -1076,6 +1079,36 @@ def check_support_agents(value: dict | None) -> list[Finding]:
     return [found, extra]
 
 
+VM_JANITOR = "reap"
+
+
+def check_vm_janitor(value: dict | None) -> Finding:
+    """Whether the VM janitor (com.danielraffel.tartci.reap) is installed and loaded.
+
+    Without it a stale VM or overlay stays until someone notices: on
+    2026-10-09 it was loaded on m3 only, while every profile declared it,
+    because `bootstrap = false` kept the support-agents step to a plan.
+    """
+    value = value or {"state": "unreadable"}
+    facts = {"vm_janitor": (value.get("agents") or {}).get(VM_JANITOR)}
+    if value.get("state") in (None, "unreadable", "never"):
+        return Finding("vm_janitor", UNKNOWN, "vm_janitor_unknown",
+                       "no readable support-agents receipt to say whether the VM janitor "
+                       "is installed", facts)
+    if VM_JANITOR not in (value.get("declared") or []):
+        return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                       "the VM janitor (reap) is not declared in this host's profile", facts)
+    entry = (value.get("agents") or {}).get(VM_JANITOR) or {}
+    # `changes` is support_agents.status's verdict, which accounts for what an
+    # apply pass installed; the per-agent state is what the pass found before.
+    if VM_JANITOR not in (value.get("changes") or []):
+        return Finding("vm_janitor", OK, "vm_janitor_loaded",
+                       "the VM janitor (reap) is installed and loaded", facts)
+    return Finding("vm_janitor", PROBLEM, "vm_janitor_missing",
+                   f"the VM janitor (reap) is declared but {entry.get('state') or 'unknown'}"
+                   f"{'' if entry.get('loaded') else ', not loaded'}", facts)
+
+
 def check_reuse_canary(value: dict | None) -> Finding:
     """Whether the reuse canary keeps a bindable record (scripts/reuse_canary.py)."""
     value = value or {"state": "unreadable", "error": "no status"}
@@ -1231,7 +1264,8 @@ def check_signing_prompts(value: dict | None, home: Path) -> Finding:
         try:
             value = signing_prompt_guard.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as unknown
-            value = {"state": "unknown", "detail": str(exc)}
+            import secret_files
+            value = {"state": "unknown", "detail": secret_files.redact(exc, home)}
     facts = {"signing_prompts": value}
     state = value.get("state")
     if state == "not_applicable":
@@ -1621,6 +1655,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as unreadable
             support_agents_value = {"state": "unreadable", "error": str(exc)}
     findings.extend(check_support_agents(support_agents_value))
+    findings.append(check_vm_janitor(support_agents_value))
     if reuse_canary_value is None:
         try:
             import reuse_canary

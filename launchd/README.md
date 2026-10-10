@@ -529,7 +529,7 @@ The fleet profile names the support LaunchAgents a host carries:
 ```toml
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
-bootstrap = false
+bootstrap = ["reap"]
 ```
 
 `scripts/support_agents.py` holds the registry of declarable agents (today the
@@ -549,6 +549,20 @@ this table only says which agents the host carries. `schedule-backstop` must be
 declared exactly when `schedule_backstop` is `live` or `dry-run`, and
 `reuse-canary` exactly when `[reuse_canary] enabled = true`.
 
+The watchdog's frozen-lane threshold comes from the profile too:
+
+```toml
+[launchd_watchdog]
+stale_log_seconds = 4500   # 600-14400; absent = the watchdog's 1800 default
+```
+
+It renders as `TARTCI_WATCHDOG_STALE_LOG_SECONDS` in the watchdog's
+environment, which `tartci launchd heal` reads as its `--stale-log-seconds`
+default (an explicit flag still wins). Every shipped profile sets 4500. Before
+this, m1, m5 and m5studio carried `--stale-log-seconds 4500` only in
+hand-edited plists, so any re-render from this file restored the 1800 default
+and the heals that #191 diagnosed (#195).
+
 After self-update verifies the lanes it runs `tartci fleet-macos support-agents
 auto`. With `bootstrap = false` that is a plan: it compares each declared
 agent's installed plist with its render (`match_bytes`, `match_plist` for key
@@ -563,6 +577,16 @@ matching, loaded agent alone. A declaration dropped from a present table, that
 the previous receipt shows declared under a present table, is booted out and its
 plist moved to `~/.local/share/tartci-support-agents.retired-<date>/`; its log
 stays. An absent table manages and removes nothing.
+
+`bootstrap` may also be a list of declared names: only those agents are
+written and (re)bootstrapped, every other declared agent is planned and
+reported exactly as with `false`, and a list never drops an agent. Every
+shipped profile uses `bootstrap = ["reap"]`. On 2026-10-09 every profile
+declared the VM janitor and only m3 had it, because `false` kept the step to a
+plan; the list installs the janitor on the next self-update without touching
+the other agents. `tartci doctor fleet` reports `vm_janitor_missing` (PROBLEM)
+while the janitor is undeclared, missing or not loaded, and `vm_janitor_loaded`
+once it is.
 
 The step never fails the update: a failure is a receipt step with `ok=false`
 and a `tartci doctor fleet` finding (`support_agents_pending`,

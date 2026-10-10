@@ -157,6 +157,68 @@ class HostMaintenanceAgents(Case):
 
 
 @unittest.skipIf(sa.tomllib is None, "needs tomllib")
+class BootstrapOnly(Case):
+    """`bootstrap = ["reap"]` installs the VM janitor and nothing else.
+
+    On 2026-10-09 every profile declared reap and only m3 had it: with
+    bootstrap = false the self-update pass only planned. Turning bootstrap on
+    for the whole table would also rewrite or install every other agent.
+    """
+
+    DECLARED = ["reclaim", "artifact-cache-refresh", "keychain-unlock",
+                "launchd-watchdog", "reap"]
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write_profile(table(self.DECLARED).replace(
+            "bootstrap = false", 'bootstrap = ["reap"]').replace(
+            '[host]\nid = "t"\n', '[host]\nid = "m1"\ntart_home = "/Users/x/VMs"\n'))
+
+    def test_only_the_janitor_is_installed(self):
+        self.assertEqual(self.run_pass(), sa.EXIT_OK, self.receipt())
+        self.assertEqual(self.sys.loaded[sa.REGISTRY["reap"].label], str(self.plist("reap")))
+        for name in self.DECLARED[:-1]:
+            self.assertFalse(self.plist(name).exists(), name)
+        import fleet_doctor
+        self.assertEqual(fleet_doctor.check_vm_janitor(sa.status(self.state)).code,
+                         "vm_janitor_loaded", "the doctor reads the pass that installed it")
+        written = {c[2] for c in self.sys.mutations() if c[0] == "bootstrap"}
+        self.assertEqual(written, {str(self.plist("reap"))})
+        self.assertEqual(self.receipt()["bootstrap_only"], ["reap"])
+
+    def test_the_others_stay_reported_as_pending(self):
+        self.run_pass()
+        status = sa.status(self.state)
+        self.assertEqual(status["state"], "drift")
+        self.assertNotIn("reap", status["changes"])
+        self.assertIn("launchd-watchdog", status["changes"])
+
+    def test_a_list_never_drops_an_agent(self):
+        self.run_pass()
+        self.write_profile(table(["reap"]).replace("bootstrap = false", 'bootstrap = ["reap"]'))
+        self.install_rendered("reclaim")
+        self.run_pass()
+        self.assertTrue(self.plist("reclaim").exists())
+        reclaim = sa.REGISTRY["reclaim"].label
+        self.assertFalse([c for c in self.sys.mutations()
+                          if c[0] == "bootout" and c[1].endswith(reclaim)])
+
+    def test_false_still_writes_nothing(self):
+        # Control, same instrument: only the switch changed.
+        self.write_profile(table(self.DECLARED))
+        self.assertEqual(self.run_pass(), sa.EXIT_OK)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse(self.plist("reap").exists())
+
+    def test_every_shipped_profile_bootstraps_the_janitor_only(self):
+        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+            data, _ = sa.load_profile(path)
+            with self.subTest(profile=path.name):
+                self.assertEqual(data["support_agents"]["bootstrap"], ["reap"])
+                self.assertEqual(sa.validate(data), [])
+
+
+@unittest.skipIf(sa.tomllib is None, "needs tomllib")
 class Plan(Case):
     def test_missing_matching_and_differing_are_named_and_nothing_is_written(self):
         self.write_profile(table(THREE))
@@ -478,6 +540,11 @@ class Validate(unittest.TestCase):
         self.assertTrue(self.problems(table(["reclaim", "nope"])))
         self.assertTrue(self.problems(table(["reclaim", "reclaim"])))
         self.assertTrue(self.problems(table(THREE).replace("bootstrap = false", 'bootstrap = "no"')))
+        self.assertEqual(self.problems(table(THREE).replace(
+            "bootstrap = false", 'bootstrap = ["reclaim"]')), [])
+        for bad in ('[]', '["reap"]', '["reclaim", "reclaim"]', '[1]'):
+            self.assertTrue(self.problems(table(THREE).replace(
+                "bootstrap = false", f"bootstrap = {bad}")), bad)
         self.assertTrue(self.problems(table(THREE).replace("bootstrap = false", "extra = 1")))
         self.assertTrue(self.problems(table(FOUR)), "backstop declared while off")
         self.assertTrue(self.problems(table(THREE, backstop="live")), "backstop live, undeclared")
@@ -493,7 +560,10 @@ class Validate(unittest.TestCase):
             with self.subTest(path=path.name):
                 data, why = sa.load_profile(path)
                 self.assertIsNotNone(data, why)
-                self.assertIs(data[sa.TABLE]["bootstrap"], False, "bootstrap stays off until approved")
+                # Whole-table bootstrap stays off until approved; the VM
+                # janitor alone is converged everywhere.
+                self.assertEqual(data[sa.TABLE]["bootstrap"], ["reap"],
+                                 "only the VM janitor is bootstrapped")
                 self.assertTrue(set(THREE) <= set(data[sa.TABLE]["declared"]))
                 canary = (data.get("reuse_canary") or {}).get("enabled") is True
                 self.assertEqual(canary, "reuse-canary" in data[sa.TABLE]["declared"])
