@@ -12,6 +12,8 @@ profile the source of truth:
     [support_agents]
     declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock"]
     bootstrap = false      # false: render, compare, report; never write
+                           # true: converge every declared agent
+                           # ["reap"]: converge only the named agents
 
 Each declared name is a REGISTRY entry. Its plist is rendered with the same
 `render_launchd_template.py` arguments its install script uses, so a host the
@@ -32,7 +34,9 @@ and lists every installed agent under the tartci and `tmp.` prefixes that no
 declaration, lane, or other codified installer (OTHER_OWNERS) accounts for. An
 undeclared agent is reported, never touched.
 
-`apply` acts only when the profile says `bootstrap = true`. It renders every
+`apply` acts only when the profile turns bootstrap on: `true` for every
+declared agent, or a list of declared names for only those (the others are
+planned and reported, never written, and a list never drops an agent). It renders every
 declared agent first; if any render fails it changes nothing in that pass.
 Then, per agent: a missing or differing plist is written and (re)bootstrapped,
 and kickstarted only if its template has RunAtLoad (exactly as its install
@@ -192,8 +196,16 @@ def validate(data: Dict[str, Any]) -> List[str]:
                         f"known: {sorted(REGISTRY)}")
     if len(set(declared)) != len(declared):
         problems.append("support_agents.declared lists an agent twice")
-    if type(table.get("bootstrap", False)) is not bool:
-        problems.append("support_agents.bootstrap must be a boolean")
+    switch = table.get("bootstrap", False)
+    if isinstance(switch, list):
+        if (not switch or not all(isinstance(n, str) for n in switch)
+                or len(set(switch)) != len(switch)
+                or any(n not in declared for n in switch)):
+            problems.append("support_agents.bootstrap list must name declared agents, "
+                            "each once")
+    elif type(switch) is not bool:
+        problems.append("support_agents.bootstrap must be a boolean or a list of "
+                        "declared agent names")
     canary = data.get(reuse_canary.TABLE)
     canary_on = isinstance(canary, dict) and canary.get("enabled") is True
     if canary_on != ("reuse-canary" in declared):
@@ -392,13 +404,18 @@ class Converger:
         table = data.get(TABLE)
         present = isinstance(table, dict)
         declared: List[str] = list(table.get("declared", [])) if present else []
-        switch = bool(table.get("bootstrap", False)) if present else False
+        raw_switch = table.get("bootstrap", False) if present else False
+        # A list converges only the named agents; True converges every one.
+        only = [n for n in raw_switch if n in declared] if isinstance(raw_switch, list) else None
+        switch = bool(only) if only is not None else raw_switch is True
         acting = mode == "apply" or (mode == "auto" and switch)
         if mode == "apply" and not switch:
             acting = False
             receipt["refused"] = "bootstrap = false in the profile; plan only"
         receipt.update(table_present=present, table_sha256=table_digest(table if present else None),
                        declared=declared, bootstrap=switch, mode="apply" if acting else "plan")
+        if only is not None:
+            receipt["bootstrap_only"] = only
         receipt["undeclared"] = self.undeclared({REGISTRY[n].label for n in declared})
         # Plan everything first: one failing render changes nothing in the pass.
         renders: Dict[str, bytes] = {}
@@ -425,9 +442,10 @@ class Converger:
             return self.finish(receipt, EXIT_REFUSED)
         if not acting:
             return self.finish(receipt, EXIT_OK)
-        for name in declared:
+        for name in (only if only is not None else declared):
             self.apply_one(name, renders[name], receipt)
-        self.drop(receipt, declared, present)
+        if only is None:
+            self.drop(receipt, declared, present)
         return self.finish(receipt, EXIT_FAILED if receipt["failures"] else EXIT_OK)
 
     def apply_one(self, name: str, rendered: bytes, receipt: Dict[str, Any]) -> None:
@@ -542,13 +560,18 @@ def status(state_dir: Path) -> Dict[str, Any]:
     if value.get("refused") and value.get("table_present") is None:
         return dict(value, state="unreadable", error=value["refused"])
     agents = value.get("agents") or {}
-    if value.get("mode") == "apply":
+    only = value.get("bootstrap_only")
+    if value.get("mode") == "apply" and not only:
         # An applied pass converged everything except what it reported failing.
         changes = sorted({f.split(":")[0].replace("drop ", "") for f in value.get("failures") or []})
     else:
         changes = sorted(n for n, e in agents.items()
                          if e.get("state") not in ("match_bytes", "match_plist")
                          or not e.get("loaded") or e.get("leaked"))
+        if only and value.get("mode") == "apply":
+            # The named agents were applied: only their failures remain.
+            failed = {f.split(":")[0] for f in value.get("failures") or []}
+            changes = sorted(n for n in changes if n not in only or n in failed)
     state = "ok" if not changes else ("drift" if value.get("bootstrap") else "pending")
     return dict(value, state=state, changes=changes)
 
