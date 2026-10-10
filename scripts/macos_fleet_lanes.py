@@ -102,7 +102,7 @@ LANE_KEYS = {
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
-    "warm_vm", "warm_vm_max_park_seconds",
+    "warm_vm", "warm_vm_max_park_seconds", "v2_gate_classes",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -912,7 +912,8 @@ def load(path: Path) -> dict:
                 )
             tier_group_by_label[label] = group_id
         if assignment_mode == "event-class-v2":
-            validate_v2_tiers(lane_id, lane["repo"], tiers)
+            validate_v2_tiers(lane_id, lane["repo"], tiers,
+                              v2_gate_classes(lane_id, lane.get("v2_gate_classes")))
             if "pulp-gate-fast" not in omit_labels:
                 fail(f"lane {lane_id}: event-class-v2 must omit pulp-gate-fast")
             if any(group_id != 1 for group_id in tier_groups):
@@ -996,30 +997,53 @@ def load(path: Path) -> dict:
     return data
 
 
-def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict]) -> None:
+def v2_gate_classes(lane_id: str, declared: object) -> tuple[str, ...]:
+    """The gate classes an event-class-v2 lane serves; both unless it says so.
+
+    A lane may drop a gate class only by naming the ones it keeps, in the
+    canonical order, so an omitted tier is a stated decision and never a
+    typo. m1 serves PR-head only: its 3-core guest ran merge_group jobs in
+    33-35 min against 15-22 min elsewhere.
+    """
+    if declared is None:
+        return V2_GATE_CLASSES
+    if (not isinstance(declared, list) or not declared
+            or len(set(declared)) != len(declared)
+            or any(item not in V2_GATE_CLASSES for item in declared)
+            or list(declared) != [c for c in V2_GATE_CLASSES if c in declared]):
+        fail(
+            f"lane {lane_id}: v2_gate_classes must be a non-empty subset of "
+            f"{list(V2_GATE_CLASSES)} in that order"
+        )
+    return tuple(declared)
+
+
+def validate_v2_tiers(lane_id: str, repo: str, tiers: list[dict],
+                      gate_classes: tuple[str, ...] = V2_GATE_CLASSES) -> None:
     """The event-class-v2 tier contract: gate classes first, then extras.
 
-    The two gate classes lead, one workflow row each. Any further rows belong to
-    declared extra classes: each must be a known class, listed contiguously,
-    with exactly that class's workflows in order and never twice.
+    The lane's gate classes (both, unless `v2_gate_classes` names fewer) lead,
+    one workflow row each. Any further rows belong to declared extra classes:
+    each must be a known class, listed contiguously, with exactly that class's
+    workflows in order and never twice.
     """
     labels = [tier["label"] for tier in tiers]
-    if labels[:2] != list(V2_GATE_CLASSES) or len(set(labels[:2])) != 2:
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    if any(label in V2_GATE_CLASSES for label in labels[2:]):
-        fail(
-            f"lane {lane_id}: event-class-v2 requires merge-group then PR-head tiers"
-        )
-    extras = list(dict.fromkeys(labels[2:]))
+    n = len(gate_classes)
+    expected = " then ".join(
+        {"pulp-build-merge-group": "merge-group", "pulp-build-pr-head": "PR-head"}[c]
+        for c in gate_classes)
+    if labels[:n] != list(gate_classes):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    if any(label in V2_GATE_CLASSES for label in labels[n:]):
+        fail(f"lane {lane_id}: event-class-v2 requires {expected} tiers")
+    extras = list(dict.fromkeys(labels[n:]))
     if not extras:
         return
     if repo != "Generous-Corp/pulp":
         fail(f"lane {lane_id}: extra event classes are Pulp classes")
-    grouped = [label for label in extras for _ in range(labels[2:].count(label))]
-    if grouped != labels[2:]:
-        fail(f"lane {lane_id}: event class {labels[2:]} rows must be contiguous and unique")
+    grouped = [label for label in extras for _ in range(labels[n:].count(label))]
+    if grouped != labels[n:]:
+        fail(f"lane {lane_id}: event class {labels[n:]} rows must be contiguous and unique")
     for label in extras:
         expected = V2_EXTRA_CLASS_WORKFLOWS.get(label)
         if expected is None:
