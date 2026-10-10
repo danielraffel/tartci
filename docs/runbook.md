@@ -1716,8 +1716,9 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
   `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
   the same once-per-episode path as a host left OFF, closed when a VM gets an
-  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
-  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  address. Its title is the host and the episode's start only
+  (`[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z`), and its first
+  three lines are the statement,
   `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
   fleet_reasons, so it is usable from a phone notification. It is raised when
   the breaker is open and:
@@ -1731,10 +1732,22 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
     the third grant: about 10 to 15 min after the breaker opens. One unreported
     probe is a slow boot and raises nothing; neither does a closed or
     `verifying` breaker.
-  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
-  breaker's `events.jsonl`. A close that fails (a new outage replacing one
-  whose issue is still open, or recovery) is kept as `stale_issues` in the
-  alert state and retried every pass, so no issue is left open.
+  **One issue per episode, keyed by host and start.** A reboot and a
+  self-update re-verify both send the breaker through `verifying` and reopen
+  it with a fresh `opened_at`, and a probe often reclassifies the cause. None
+  of those ends the outage, so none opens a second issue: the episode's start
+  is kept in `alert.json` while it is open (a new episode starts from the
+  breaker's running outage, which a reboot carries), a cause change is posted
+  once as a comment on the open issue (`Cause changed: <old> -> <new>`, with
+  the new remedy; a failed comment is retried next pass), and the issue
+  closes only when a VM got an address after the episode began. Before this,
+  m5's outage of 2026-10-09 became three issues (#427, #428, #430), each
+  closed and reopened 2 s apart; `test_m5_on_2026_10_09_is_one_issue` replays
+  that sequence and asserts one.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`, from the
+  episode's start) go to the breaker's `events.jsonl`. A close that fails at
+  recovery is kept as `stale_issues` in the alert state and retried every
+  pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
 - **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
@@ -1806,37 +1819,31 @@ comes up. It is not stale configuration.
    `pf_reference_missing` (PROBLEM) while pfd exits 3, before a lane spends a
    VM on it. Applicability is the host's VM lanes, not InternetSharing:
    InternetSharing is launched on demand and reads "not running" between jobs.
-   The finding also names any boot-time holder; m3, m5s and m1 have none and
-   a healthy pfd, so a missing holder alone is a fact, not a problem. To
-   install the holder on a host that loses pf across reboots (tartci never
-   does this; it needs sudo), write
-   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`:
+   The finding also names any boot-time holder. m3, m5s and m1 have none and
+   a healthy pfd, so a missing holder alone is a fact, not a problem. On a
+   host whose breaker history records a `pfd_crash_loop` outage it is a
+   problem, `pf_boot_holder_missing`: the fault is proven to recur at the next
+   reboot there.
 
-   ```xml
-   <?xml version="1.0" encoding="UTF-8"?>
-   <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-   <plist version="1.0">
-   <dict>
-   	<key>Label</key>
-   	<string>com.danielraffel.pf-enable-ref</string>
-   	<key>ProgramArguments</key>
-   	<array>
-   		<string>/bin/sh</string>
-   		<string>-c</string>
-   		<string>/sbin/pfctl -E 2&gt;&amp;1 | /usr/bin/sed -n 's/^Token : //p' &gt; /var/run/pf-enable-ref.token</string>
-   	</array>
-   	<key>RunAtLoad</key>
-   	<true/>
-   </dict>
-   </plist>
+   **Install the holder** (tartci never does this; it needs sudo). From the
+   host's tartci checkout:
+
+   ```sh
+   sudo scripts/install_pf_enable_ref.sh            # plan: what would change
+   sudo scripts/install_pf_enable_ref.sh --install  # write, bootstrap, verify
    ```
 
-   then `sudo chown root:wheel` and `sudo chmod 644` it and
-   `sudo launchctl bootstrap system <plist>`. Confirm with
-   `launchctl print system/com.danielraffel.pf-enable-ref` (runs 1, last
-   exit 0), a non-empty `/var/run/pf-enable-ref.token`, and
-   `tartci doctor fleet` reading `pf_reference_ok ... taken at boot by
-   com.danielraffel.pf-enable-ref`. The token in that file is the undo key.
+   It installs `launchd/system/com.danielraffel.pf-enable-ref.plist` (the
+   plist m5 has run since 2026-10-09) as
+   `/Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist`, root:wheel
+   0644. The daemon runs `/sbin/pfctl -E` at each boot and keeps the token in
+   `/var/run/pf-enable-ref.token`; bootstrapping it takes a reference now too.
+   The installer verifies launchd ran it with exit 0 and the token exists, and
+   is a no-op when the same plist is already loaded, so it never stacks
+   references on a re-run. Then `tartci vm-dhcp probe-now`, and
+   `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
+   com.danielraffel.pf-enable-ref`. The token is the undo key
+   (`sudo pfctl -X <token>`); Never `pfctl -d`.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the
