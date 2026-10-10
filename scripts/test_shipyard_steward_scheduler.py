@@ -351,6 +351,24 @@ class StewardSchedulerTests(unittest.TestCase):
         self.assertIn("runner carrier", report["error"])
         self.assertFalse(any("--repo" in line for line in self.call_lines()))
 
+    def test_a_token_reaching_a_child_makes_the_tick_unhealthy_before_any_plan(self) -> None:
+        # Exercise the gate in-process: the probe reports a leaked token.
+        path = self.root / "config.json"
+        self.write_config(path, mode="plan")
+        config = scheduler.load_config(path)
+        logger = scheduler.SchedulerLog(self.root / "probe.log", 1024 * 1024, 2)
+        plans = scheduler.SchedulerLog(self.root / "probe-plans.jsonl", 1024 * 1024, 2)
+        leaked = {"GH_TOKEN": True, "GITHUB_TOKEN": False}
+        with mock.patch.object(scheduler, "probe_child_environment", return_value=leaked), \
+                mock.patch.dict(os.environ, self.environment()):
+            code, report = scheduler.scheduler(config, logger, plans, self.root / "intent.json")
+        self.assertEqual(code, 1)
+        self.assertEqual(report["status"], "unhealthy")
+        self.assertIn("ambient GitHub token", report["error"])
+        self.assertEqual(report["child_environment_tokens"], leaked)
+        self.assertFalse(any("--repo" in line for line in self.call_lines()))
+        self.assertFalse((self.root / "probe-plans.jsonl").read_text())
+
     def test_mode_authority_and_classes_must_agree(self) -> None:
         cases = [
             ({"mode": "live", "classes": []}, "at least one class"),
