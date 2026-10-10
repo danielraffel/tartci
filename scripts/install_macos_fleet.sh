@@ -2,6 +2,15 @@
 # Install one rendered dynamic macOS fleet profile while host admission is off.
 set -euo pipefail
 
+DEFAULT_TARTCI_REPOSITORY="Generous-Corp/tartci"
+LEGACY_TARTCI_REPOSITORY="danielraffel/tartci"
+TARTCI_REPOSITORY="${GH_REPO:-$DEFAULT_TARTCI_REPOSITORY}"
+case "$TARTCI_REPOSITORY" in
+  "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
+  *) echo "fleet install refuses unsupported TartCI repository identity: $TARTCI_REPOSITORY" >&2; exit 3 ;;
+esac
+TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
+
 APPLY=0
 CONFIG=""
 SUPPORT_MANIFEST=""
@@ -519,6 +528,7 @@ stage_result="$("$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" stage-i
 support_root="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<<"$stage_result")"
 installed_support_manifest="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["manifest"])' <<<"$stage_result")"
 launch_entrypoint="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["launch_entrypoint"])' <<<"$stage_result")"
+support_commit="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
 
 mkdir -p "$(dirname "$ENTRYPOINT")"
 "$PYTHON_BIN" - "$(dirname "$ENTRYPOINT")" <<'PY' || {
@@ -603,9 +613,19 @@ print(next(iter(ghapp_paths)))
 PY
 )"
 
-support_repository="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
-support_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$installed_support_manifest")"
-authority_env_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
+support_repository="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
+case "$support_repository" in
+  "https://github.com/generous-corp/tartci.git"|"https://github.com/danielraffel/tartci.git") ;;
+  *)
+    echo "fleet install refuses an untrusted support repository: $support_repository" >&2
+    exit 3
+    ;;
+esac
+if [ "$support_repository" != "$TARTCI_REPOSITORY_URL" ]; then
+  echo "fleet install accepts the legacy support identity during migration: $support_repository" >&2
+fi
+
+authority_env_json="$($PYTHON_BIN - "$locked_config" "$ROOT" <<'PYINNER'
 import json
 import sys
 from pathlib import Path
@@ -616,37 +636,64 @@ if app is None:
     print("{}")
     raise SystemExit(0)
 print(json.dumps(app))
-PY
+PYINNER
 )"
-[ "$support_repository" = "https://github.com/danielraffel/tartci.git" ] || {
-  echo "fleet install refuses an untrusted support repository: $support_repository" >&2
-  exit 3
-}
-if [ "$authority_env_json" = "{}" ]; then
-  source_authority_commit="$(
-    SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-      "$ghapp_path" api \
-        "repos/danielraffel/tartci/commits/$support_commit" --jq .sha
-  )" || source_authority_commit=""
-else
-  app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
-  app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
-  app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
-  source_authority_commit="$(
+
+api_commit_json() {
+  local commit="$1"
+  if [ "$authority_env_json" = "{}" ]; then
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY/commits/$commit"
+  else
+    local app_id app_key app_cache
+    app_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
     SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
-    SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-      "$ghapp_path" api \
-        "repos/danielraffel/tartci/commits/$support_commit" --jq .sha
-  )" || source_authority_commit=""
-fi
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY/commits/$commit"
+  fi
+}
+
+api_repository_json() {
+  if [ "$authority_env_json" = "{}" ]; then
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY"
+  else
+    local app_id app_key app_cache
+    app_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
+    SHIPYARD_GITHUB_APP_ID="$app_id" \
+    SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
+    SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY"
+  fi
+}
+
+verify_source_commit() {
+  local expected="$1" response repository_response canonical actual
+  response="$(api_commit_json "$expected")" || return 1
+  repository_response="$(api_repository_json)" || return 1
+  canonical="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$repository_response")"
+  actual="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$response")"
+  case "$canonical" in
+    "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
+    *) echo "fleet install API returned an untrusted canonical repository: $canonical" >&2; return 1 ;;
+  esac
+  [ "$actual" = "$expected" ] || {
+    echo "fleet install source authority returned a mismatched commit ($actual != $expected)" >&2
+    return 1
+  }
+  printf '%s\n' "$actual"
+}
+
+source_authority_commit="$(verify_source_commit "$support_commit")" || source_authority_commit=""
 [ -n "$source_authority_commit" ] || {
   echo "fleet install could not authenticate the exact TartCI source commit" >&2
-  exit 3
-}
-[ "$source_authority_commit" = "$support_commit" ] || {
-  echo "fleet install source authority returned a mismatched commit" >&2
   exit 3
 }
 if [ -n "$launcher_target" ]; then
@@ -654,22 +701,7 @@ if [ -n "$launcher_target" ]; then
     echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
     exit 3
   }
-  if [ "$authority_env_json" = "{}" ]; then
-    launcher_authority_commit="$(
-      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-        "$ghapp_path" api \
-          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
-    )" || launcher_authority_commit=""
-  else
-    launcher_authority_commit="$(
-      SHIPYARD_GITHUB_APP_ID="$app_id" \
-      SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
-      SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
-      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-        "$ghapp_path" api \
-          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
-    )" || launcher_authority_commit=""
-  fi
+  launcher_authority_commit="$(verify_source_commit "$launcher_source_commit")" || launcher_authority_commit=""
   [ "$launcher_authority_commit" = "$launcher_source_commit" ] || {
     echo "fleet install could not authenticate the launcher's exact TartCI source commit" >&2
     exit 3

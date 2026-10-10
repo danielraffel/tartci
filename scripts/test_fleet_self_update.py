@@ -73,6 +73,8 @@ class FakeSystem(su.System):
         self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.remote_url = su.REPO_URL + "\n"
+        self.api_repository = su.DEFAULT_REPOSITORY
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -143,10 +145,14 @@ class FakeSystem(su.System):
         if self.hook:
             self.hook(a)
         if a[0] == FAKE_GH:
-            sha = a[2].split("/commits/")[1].split("/")[0]
-            runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
-                                          "conclusion": "success"}])
-            return ok(json.dumps({"check_runs": runs}))
+            if "check-runs" in a[2]:
+                sha = a[2].split("/commits/")[1].split("/")[0]
+                runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
+                                              "conclusion": "success"}])
+                return ok(json.dumps({"check_runs": runs}))
+            if "/commits/" not in a[2]:
+                return ok(json.dumps({"full_name": self.api_repository}))
+            return ok(json.dumps({"sha": a[2].split("/")[-1]}))
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
@@ -184,7 +190,7 @@ class FakeSystem(su.System):
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
-                return ok(su.REPO_URL + "\n")
+                return ok(self.remote_url)
             if "checkout" in a:
                 self.checked_out = a[-1]
             return ok()
@@ -2160,6 +2166,24 @@ class IncidentTests(Base):
         self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
+
+
+class RepositoryIdentityTests(Base):
+    def test_api_accepts_legacy_and_new_full_name(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.api_repository = repository
+            with mock.patch.dict(os.environ, {"GH_REPO": repository}):
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys, T_NEW), repository)
+
+    def test_api_rejects_third_repository(self):
+        self.sys.api_repository = "example/other-tartci"
+        with self.assertRaises(su.Refused):
+            su.canonical_repository(self.cfg, self.sys, T_NEW)
+
+    def test_refresh_rejects_third_remote(self):
+        self.sys.remote_url = "https://example.invalid/other-tartci.git\n"
+        with self.assertRaises(su.Refused):
+            su.refresh_checkout(self.cfg, self.sys)
 
 
 class OsInterpreterRefreshTests(Base):

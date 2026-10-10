@@ -70,7 +70,10 @@ SCHEMA = "tartci.self-update/v1"
 # How often the launchd watchdog re-measures skew (tartci_launchd_watchdog.py
 # refresh_skew); a cached skew older than state_age.STALE_FACTOR of these reads STALE.
 SKEW_REFRESH_S = 1800
-REPO_URL = "https://github.com/danielraffel/tartci.git"
+DEFAULT_REPOSITORY = "Generous-Corp/tartci"
+LEGACY_REPOSITORY = "danielraffel/tartci"
+ACCEPTED_REPOSITORIES = frozenset({DEFAULT_REPOSITORY, LEGACY_REPOSITORY})
+REPO_URL = f"https://github.com/{DEFAULT_REPOSITORY}.git"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_SOAK_SECONDS = 1800
 DEFAULT_RATE_HOURS = 6
@@ -137,7 +140,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
 SIGNING_PROBE_TIMEOUT = 60
-TARTCI_REPO = "danielraffel/tartci"
+TARTCI_REPO = DEFAULT_REPOSITORY
 # A peer with no `ssh` in its profile is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
@@ -568,8 +571,9 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".update-checkout.", dir=path.parent))
-        result = sys_.run(["git", "clone", "--quiet", "--no-checkout", REPO_URL,
-                           str(staging / "clone")])
+        repository = configured_repository()
+        result = sys_.run(["git", "clone", "--quiet", "--no-checkout",
+                           repository_url(repository), str(staging / "clone")])
         if result.rc != 0 or not (staging / "clone" / ".git").exists():
             shutil.rmtree(staging, ignore_errors=True)
             raise Refused(f"cannot create the update checkout: {result.text}")
@@ -578,16 +582,51 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         os.rename(staging / "clone", path)
         shutil.rmtree(staging, ignore_errors=True)
     origin = sys_.run(["git", "-C", str(path), "remote", "get-url", "origin"])
-    if origin.rc != 0 or origin.out.strip().rstrip("/").removesuffix(".git").lower() \
-            != REPO_URL.removesuffix(".git").lower():
-        raise Refused(f"update checkout {path} is not a danielraffel/tartci clone")
+    remote = origin.out.strip().rstrip("/").removesuffix(".git").lower()
+    accepted_remotes = {repository_url(value).removesuffix(".git").lower()
+                        for value in ACCEPTED_REPOSITORIES}
+    if origin.rc != 0 or remote not in accepted_remotes:
+        raise Refused(f"update checkout {path} is not an accepted TartCI clone")
     fetched = sys_.run(["git", "-C", str(path), "fetch", "--quiet", "--prune", "origin", "main"])
     if fetched.rc != 0:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
+def configured_repository() -> str:
+    """Return the explicitly bound repository, defaulting to the destination.
+
+    During the transfer window hosts may override GH_REPO to the legacy slug.
+    The API's canonical repository identity is checked before a result is used.
+    """
+    repository = os.environ.get("GH_REPO", DEFAULT_REPOSITORY).strip()
+    if repository not in ACCEPTED_REPOSITORIES:
+        raise Refused(f"unsupported TartCI repository identity: {repository}")
+    return repository
+
+
+def repository_url(repository: str) -> str:
+    return f"https://github.com/{repository}.git"
+
+
 def gh_cli() -> str:
     return os.environ.get("TARTCI_GH_CLI") or ("ghapp" if shutil.which("ghapp") else "gh")
+
+
+def canonical_repository(cfg: Config, sys_: System, sha: str) -> str:
+    """Resolve and validate the API's canonical full_name for a commit."""
+    repository = configured_repository()
+    binding = {"GH_REPO": repository, "SHIPYARD_GHAPP_REPO": repository,
+               "SHIPYARD_GH_APP_REPO": repository}
+    result = sys_.run([gh_cli(), "api", f"repos/{repository}"],
+                      cwd=str(cfg.checkout), env=binding, timeout=60)
+    try:
+        value = json.loads(result.out)
+        canonical = value.get("full_name")
+    except (json.JSONDecodeError, AttributeError):
+        canonical = None
+    if result.rc != 0 or canonical not in ACCEPTED_REPOSITORIES:
+        raise Refused(f"TartCI source repository identity is not accepted: {canonical or result.text[:160]}")
+    return canonical
 
 
 def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
@@ -596,9 +635,10 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
     Age alone is not evidence: a commit that broke main's CI soaks like any
     other. An unreadable answer is not green.
     """
-    binding = {"GH_REPO": TARTCI_REPO, "SHIPYARD_GHAPP_REPO": TARTCI_REPO,
-               "SHIPYARD_GH_APP_REPO": TARTCI_REPO}
-    result = sys_.run([gh_cli(), "api", f"repos/{TARTCI_REPO}/commits/{sha}/check-runs?per_page=100"],
+    repository = canonical_repository(cfg, sys_, sha)
+    binding = {"GH_REPO": repository, "SHIPYARD_GHAPP_REPO": repository,
+               "SHIPYARD_GH_APP_REPO": repository}
+    result = sys_.run([gh_cli(), "api", f"repos/{repository}/commits/{sha}/check-runs?per_page=100"],
                       cwd=str(cfg.checkout), env=binding, timeout=60)
     try:
         runs = json.loads(result.out).get("check_runs")
