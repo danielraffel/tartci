@@ -93,6 +93,15 @@ SELF_LABEL = "com.danielraffel.tartci.launchd-watchdog"
 # old. During a legit build the log DOES go this stale (run_one is quiet until the job
 # ends), which is why the alive-but-frozen signature also requires no running VM.
 DEFAULT_STALE_LOG_S = 1800  # 30 min
+
+
+
+def default_stale_log_seconds() -> int:
+    """TARTCI_WATCHDOG_STALE_LOG_SECONDS (rendered from the fleet profile's
+    [launchd_watchdog] stale_log_seconds), else DEFAULT_STALE_LOG_S. A
+    malformed value keeps the default rather than failing the pass."""
+    raw = os.environ.get("TARTCI_WATCHDOG_STALE_LOG_SECONDS", "").strip()
+    return int(raw) if raw.isdigit() and int(raw) > 0 else DEFAULT_STALE_LOG_S
 # `serve ... --loop` deliberately exits EX_TEMPFAIL after sustained GitHub
 # observation blindness so launchd can give it a fresh App-auth environment.
 # If launchd does not respawn it, that explicit restart contract has failed; do
@@ -1364,7 +1373,7 @@ def main(argv: list[str] | None = None) -> int:
                     help="--reload only: proceed even though the lane is "
                     "mid-job (kills the running VM/job)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")
-    ap.add_argument("--stale-log-seconds", type=int, default=DEFAULT_STALE_LOG_S)
+    ap.add_argument("--stale-log-seconds", type=int, default=default_stale_log_seconds())
     ap.add_argument("--restart-grace-seconds", type=int,
                     default=DEFAULT_RESTART_GRACE_S)
     ap.add_argument("--max-heals", type=int, default=DEFAULT_MAX_HEALS)
