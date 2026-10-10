@@ -172,28 +172,33 @@ def alert_pass(now: float | None = None, directory: pathlib.Path | None = None,
                        {"cause": value.get("cause"), "since": since,
                         "vms_spent": value.get("vms_spent")}, now)
 
+    switched_on = os.environ.get("TARTCI_VM_BOOT_ISSUE", "1") != "0"
     out = host_off.episode_alert(
         state_path, active=due or (bool(before.get("since")) and not recovered),
         resolved=recovered, since=since,
         raise_event=raise_event, render=lambda: alert_text(value, host, target, since),
         issue=issue, close=close,
-        issues_enabled=(os.environ.get("TARTCI_VM_BOOT_ISSUE", "1") != "0"
-                        and (issue is not None or not _scratch(directory))))
+        issues_enabled=switched_on and (issue is not None or not _scratch(directory)))
     if out.get("closed"):
         down = int(now - began) if began is not None else None
         host_off.event(directory, "host_vm_boot_up", f"{host}: a VM got an address",
                        {"down_s": down, "issue": before.get("issue")}, now)
     else:
-        out["commented"] = _note_cause(state_path, value, comment)
+        out["commented"] = _note_cause(
+            state_path, value, comment,
+            enabled=switched_on and (comment is not None or not _scratch(directory)))
     return {"due": due, "why": why, **out}
 
 
-def _note_cause(state_path: pathlib.Path, value: dict[str, Any], comment: Any) -> bool:
+def _note_cause(state_path: pathlib.Path, value: dict[str, Any], comment: Any,
+                enabled: bool = True) -> bool:
     """Comment on the open issue when the open breaker's cause changed.
 
     Only an open breaker has a cause worth naming (verifying is a probe in
     flight). The first cause seen for an issue is recorded without a comment;
-    a failed comment keeps the old cause so the next pass retries it."""
+    a failed comment keeps the old cause so the next pass retries it. Like the
+    issue itself, a comment is never posted from a test's scratch breaker
+    unless the test passes its own `comment`."""
     state = host_off._read_json(state_path) or {}
     if not state.get("since") or value.get("state") != "open":
         return False
@@ -204,7 +209,7 @@ def _note_cause(state_path: pathlib.Path, value: dict[str, Any], comment: Any) -
         state["cause"] = code
         host_off._write_json(state_path, state)
         return False
-    if state["cause"] == code:
+    if state["cause"] == code or not enabled:
         return False
     rc, text = (comment or _comment_issue)(str(state["issue"]),
                                            cause_comment(str(state["cause"]), value))

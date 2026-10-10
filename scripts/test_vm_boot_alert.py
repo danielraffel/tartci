@@ -259,6 +259,80 @@ class Alert(Case):
         self.watch(T0 + 1100)
         self.assertEqual(self.closed, ["77"])
 
+    def test_a_failed_issue_open_is_retried_while_the_breaker_verifies(self):
+        self.comments = []
+        self.open_at(T0)                                    # opens at T0 + 200
+        self.issue_rc = 1
+        out = self.replay(T0 + 200 + vb.PROBE_SECS)         # due; the open fails
+        self.assertTrue(out["due"])
+        self.assertIsNone(self.state_file().get("issue"))
+        self.assertIn("issue_error", self.state_file())
+        self.assertEqual(self.names(), ["host_vm_boot_down"])
+        # The cause changes while the open keeps failing: there is no issue to
+        # comment on, so nothing is posted (never to issues/None).
+        self.ifaces.write_text("lo0 en0")
+        self.check(T0 + 600, lane="p")
+        self.record("no_ip", T0 + 650, lane="p")
+        self.assertEqual(self.state()["cause"], "vm_network_missing")
+        self.replay(T0 + 700)
+        self.assertEqual(self.comments, [])
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 1000)
+        self.check(T0 + 1100, lane="a")                     # reboot: verifying
+        self.assertEqual(self.state()["state"], "verifying")
+        self.issue_rc = 0
+        out = self.replay(T0 + 1150)                        # not due, still inside the outage
+        self.assertFalse(out["due"])
+        self.assertEqual(self.state_file().get("issue"), "79",   # the fixture numbers attempts
+                         "the retry must not wait for the breaker to reopen")
+        self.assertNotIn("issue_error", self.state_file())
+        self.assertEqual(self.names(), ["host_vm_boot_down"], "the event is raised once")
+        down = json.loads((self.tmp / "vm-dhcp" / "events.jsonl").read_text().splitlines()[0])
+        self.assertEqual(down["fields"]["since"], vb.iso(T0 + 200))
+        self.assertTrue(self.opened[-1][0].startswith(
+            f"[tartci] m5: cannot boot VMs since {vb.iso(T0 + 200)}"), self.opened[-1][0])
+        self.record("no_ip", T0 + 1300, lane="a")           # reopened, fresh opened_at
+        self.replay(T0 + 1310)
+        self.assertEqual(self.closed, [])
+        self.assertEqual(self.state_file()["issue"], "79")
+        self.record("ip", T0 + 1500, lane="b")
+        self.replay(T0 + 1600)
+        self.assertEqual(self.closed, ["79"])
+        self.assertEqual(self.names(), ["host_vm_boot_down", "host_vm_boot_up"])
+
+    def test_an_issue_first_opened_after_a_reboot_starts_at_the_first_open(self):
+        self.open_at(T0)                                    # opens at T0 + 200; not yet due
+        self.assertFalse(self.watch(T0 + 300)["due"])
+        self.assertEqual(self.state_file(), {})
+        os.environ["TARTCI_VM_DHCP_BOOT_TIME"] = str(T0 + 350)
+        self.check(T0 + 400, lane="a")                      # reboot: verifying
+        self.record("no_ip", T0 + 500, lane="a")            # post-boot probe fails: reopened
+        out = self.watch(T0 + 510)
+        self.assertEqual((out["due"], out["why"]), (True, "a post-boot probe got no address"))
+        self.assertEqual(self.state_file()["since"], vb.iso(T0 + 200),
+                         "the episode began at the first open, which the reboot carried")
+        self.assertTrue(self.opened[0][0].endswith(vb.iso(T0 + 200)), self.opened[0][0])
+        self.record("ip", T0 + 900, lane="b")
+        self.watch(T0 + 1000)
+        up = [json.loads(l) for l in
+              (self.tmp / "vm-dhcp" / "events.jsonl").read_text().splitlines()][-1]
+        self.assertEqual(up["fields"]["down_s"], 800)
+
+    def test_a_scratch_breaker_never_comments_on_github_unstubbed(self):
+        import host_off
+        self.comments = []
+        self.open_at(T0)
+        self.replay(T0 + 200 + vb.PROBE_SECS)               # issue 77, cause recorded
+        self.ifaces.write_text("lo0 en0")
+        self.check(T0 + 600, lane="p")
+        self.record("no_ip", T0 + 650, lane="p")            # the cause changes
+        with mock.patch.object(host_off, "_ghapp", return_value=(0, "1")) as real:
+            out = vba.alert_pass(now=T0 + 700, directory=self.tmp / "vm-dhcp",
+                                 issue=self.issue, close=self.close, host="m5", target="m5")
+        real.assert_not_called()
+        self.assertFalse(out["commented"])
+        # Control: the stubbed comment on the same state is posted.
+        self.assertTrue(self.replay(T0 + 1000)["commented"])
+
     def test_a_failed_close_at_recovery_is_retried_without_a_second_up_event(self):
         self.open_at(T0)
         self.watch(T0 + 200 + vb.PROBE_SECS)                 # issue 77
