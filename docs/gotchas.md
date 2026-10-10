@@ -92,6 +92,26 @@ Do not kickstart self-update during the stall.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
+
+**Symptom:** a lane reads `job-running` for up to two hours while its VM is
+frozen; the watchdog's frozen-lane heal skips a host with a running VM, so
+nothing frees the slot before `TARTCI_JOB_TIMEOUT_SECS` (7200).
+
+**Cause:** the host waits on the ssh session that runs the guest's listener. A
+guest that hangs can keep that TCP session open, so the host sees neither
+output nor an exit.
+
+**Fix:** the guest launcher writes `TARTCI_GUEST_HEARTBEAT <epoch>` every
+`TARTCI_GUEST_HEARTBEAT_SECS` (30) into that session. Once the first one
+arrives, the host tears the VM down when the listener log has been silent for
+`TARTCI_GUEST_HEARTBEAT_STALE_SECS`: it records `guest_heartbeat_stale`,
+cancels an assigned job's run, and frees the slot. Every lane in the shipped
+profiles sets it with `guest_heartbeat_stale_seconds = 600`. Before the first
+heartbeat (runner still starting, or a guest launcher from an older
+generation) silence proves nothing and the idle and job timeouts apply.
+Heartbeat lines are dropped from the runner log the host echoes.
+
 ## A `while read` loop ends early after a peer read over ssh (2026-10-04)
 
 *Symptom:* the supervisor observed only the first class with young demand;

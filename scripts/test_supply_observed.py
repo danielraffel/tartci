@@ -75,9 +75,10 @@ class RecordedFixtureTests(unittest.TestCase):
         self.assertEqual(result["jobs_considered"], 3)
         self.assertEqual(verdict(result, "m5", "pulp-gate", "pulp-build-pr-head")["verdict"], so.IDLE)
         # Demand existed and another host served it: NOT_OBSERVED, attributed.
-        m1 = verdict(result, "m1", "pulp-gate", "pulp-build-merge-group")
-        self.assertEqual(m1["verdict"], so.NOT_OBSERVED)
-        self.assertEqual(m1["served_by"], {"studio/pulp-gate": 1})
+        # Read on m5, which declares merge-group whether or not m1 does.
+        m5 = verdict(result, "m5", "pulp-gate", "pulp-build-merge-group")
+        self.assertEqual(m5["verdict"], so.NOT_OBSERVED)
+        self.assertEqual(m5["served_by"], {"studio/pulp-gate": 1})
         self.assertEqual(result["undeclared"], [])
 
     @testing_support.requires_tomllib
