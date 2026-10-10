@@ -1716,8 +1716,9 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
 - **Tells someone, once per outage** (`tartci_launchd_watchdog.py`
   `vm_boot_pass`, every 300 s): a GitHub issue on danielraffel/tartci, through
   the same once-per-episode path as a host left OFF, closed when a VM gets an
-  address. Its title leads with the host (`[tartci] m5: cannot boot VMs since
-  … (vm_dhcp_pfd_crash_loop)`), and its first three lines are the statement,
+  address. Its title is the host and the episode's start only
+  (`[tartci] m5: cannot boot VMs since 2026-10-09T01:33:48Z`), and its first
+  three lines are the statement,
   `Run: ssh <host> 'tartci doctor fleet'`, and the remedy read from
   fleet_reasons, so it is usable from a phone notification. It is raised when
   the breaker is open and:
@@ -1731,10 +1732,22 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
     the third grant: about 10 to 15 min after the breaker opens. One unreported
     probe is a slow boot and raises nothing; neither does a closed or
     `verifying` breaker.
-  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`) go to the
-  breaker's `events.jsonl`. A close that fails (a new outage replacing one
-  whose issue is still open, or recovery) is kept as `stale_issues` in the
-  alert state and retried every pass, so no issue is left open.
+  **One issue per episode, keyed by host and start.** A reboot and a
+  self-update re-verify both send the breaker through `verifying` and reopen
+  it with a fresh `opened_at`, and a probe often reclassifies the cause. None
+  of those ends the outage, so none opens a second issue: the episode's start
+  is kept in `alert.json` while it is open (a new episode starts from the
+  breaker's running outage, which a reboot carries), a cause change is posted
+  once as a comment on the open issue (`Cause changed: <old> -> <new>`, with
+  the new remedy; a failed comment is retried next pass), and the issue
+  closes only when a VM got an address after the episode began. Before this,
+  m5's outage of 2026-10-09 became three issues (#427, #428, #430), each
+  closed and reopened 2 s apart; `test_m5_on_2026_10_09_is_one_issue` replays
+  that sequence and asserts one.
+  Events `host_vm_boot_down` and `host_vm_boot_up` (`down_s`, from the
+  episode's start) go to the breaker's `events.jsonl`. A close that fails at
+  recovery is kept as `stale_issues` in the alert state and retried every
+  pass, so no issue is left open.
   `TARTCI_VM_BOOT_ISSUE=0` keeps the event and the watchdog's WARN line but
   opens no issue.
 - **Measures every boot** (doctor `vm_boot`): each `record ip|no_ip` adds one
