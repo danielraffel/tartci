@@ -451,6 +451,8 @@ source "$TARTCI_ROOT/providers/tart-macos/ccache-layer.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/guest-dns.lib.sh"
 # shellcheck source=providers/tart-macos/spawn-diagnostics.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/spawn-diagnostics.lib.sh"
+# shellcheck source=providers/tart-macos/debug-hold.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/debug-hold.lib.sh"
 
 usage(){ sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; }
 
@@ -2293,7 +2295,9 @@ run_one(){
 
   note "[$i] discarding ephemeral VM $vm"
   event teardown "rc=$rc"
-  if ! discard_current_vm; then
+  if tartci_debug_hold_current_vm; then
+    :
+  elif ! discard_current_vm; then
     note "[$i] teardown ownership could not be proved — capacity stays held (pending-delete when the guardian is terminal, fail-closed restart otherwise)"
     return 75
   fi

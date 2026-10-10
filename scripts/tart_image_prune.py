@@ -55,6 +55,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
     tomllib = None  # type: ignore[assignment]
 
+# scripts/debug_hold.py HELD_PREFIX; this module stays import-light.
+HELD_PREFIX = "held-"
 GIB = 1024 ** 3
 DAY = 86400
 DEFAULT_MIN_IDLE_DAYS = 14
@@ -176,6 +178,12 @@ def plan(vms: list[dict[str, Any]], *, vms_dir: pathlib.Path, profile_values: se
     for vm in sorted(local, key=lambda v: v["Name"]):
         name = vm["Name"]
         size = int(vm.get("Size") or 0) * GIB
+        if name.startswith(HELD_PREFIX):
+            # A failed gate VM kept for debugging (scripts/debug_hold.py owns
+            # its expiry); never an image this prunes.
+            images.append({"name": name, "verdict": "keep", "reason": "debug_hold",
+                           "accessed": vm.get("Accessed"), "size_bytes": size})
+            continue
         if not image_like(name):
             slots.append({"name": name, "state": vm.get("State"), "size_bytes": size})
             continue

@@ -25,6 +25,7 @@ import sys
 import time
 from typing import Any
 
+import debug_hold  # sibling module; owns the held- prefix
 import runner_census
 from bounded_subprocess import ObservationError, require_success, run_bounded
 
@@ -131,6 +132,11 @@ def is_protected_name(name: str, protected: list[str]) -> bool:
     if name.startswith("bench-") or name.endswith("-bench") or "-bench-" in name:
         return True
     if name.endswith(":latest"):
+        return True
+    if debug_hold.is_held(name):
+        # A failed VM kept for debugging (scripts/debug_hold.py): it has no
+        # state file and no runner by design, and is deleted only by its TTL,
+        # its PR closing, or an operator.
         return True
     return False
 

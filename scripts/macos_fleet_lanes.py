@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import debug_hold
 import reuse_canary
 import power_status
 
@@ -50,7 +51,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary",
+    "reuse_canary", "debug_hold",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -491,6 +492,12 @@ def load(path: Path) -> dict:
     canary = data.get(reuse_canary.TABLE)
     if canary is not None:
         problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Whether this host keeps failed gate VMs for debugging (off by default).
+    hold = data.get(debug_hold.TABLE)
+    if hold is not None:
+        problems = debug_hold.validate_table(hold)
         if problems:
             fail("; ".join(problems))
     # Which support LaunchAgents this host carries (checked after the agents'
