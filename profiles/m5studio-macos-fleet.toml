@@ -118,6 +118,9 @@ assignment_scan_max_workers = 4
 supervisors = 2
 labels = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 # The queue scan this supervisor runs is latency-sensitive: a Background
 # supervisor's GitHub API calls measured materially slower than the same calls
 # at normal priority, and every observed scan failure on this lane is a
@@ -178,6 +181,9 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
 workflows = ["Spectr M5 Product Acceptance"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "forge-gate"
@@ -192,6 +198,9 @@ labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "for
 # the reusable callee directly. Watch both names on the same runner contract.
 workflows = ["build", "protected macOS build"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "vellum-gate"
@@ -203,6 +212,9 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5studio"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 # The support LaunchAgents this host carries (scripts/support_agents.py).
 # Self-update renders and compares them after every update; with bootstrap =
