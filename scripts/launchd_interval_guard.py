@@ -536,14 +536,23 @@ def status(state_dir: Optional[pathlib.Path] = None, *,
            now: Optional[float] = None) -> Dict[str, Any]:
     path = (state_dir or default_dir()) / "status.json"
     now = time.time() if now is None else now
-    out: Dict[str, Any] = {"receipt": str(path), "stale_after_s": RECEIPT_STALE_S}
     try:
         receipt = json.loads(path.read_text())
     except FileNotFoundError:
-        out["state"] = "never"
-        return out
+        return classify(None, now, receipt_path=str(path))
     except (OSError, ValueError) as exc:
-        out.update(state="unreadable", error=str(exc))
+        return {"receipt": str(path), "stale_after_s": RECEIPT_STALE_S,
+                "state": "unreadable", "error": str(exc)}
+    return classify(receipt, now, receipt_path=str(path))
+
+
+def classify(receipt: Any, now: float, *, receipt_path: str = "") -> Dict[str, Any]:
+    """The guard's state from a parsed receipt (None: never written), judged at
+    `now`. Pure, so a peer that read the receipt over SSH can judge it on the
+    receipt host's own clock (scripts/peer_stall_alert.py)."""
+    out: Dict[str, Any] = {"receipt": receipt_path, "stale_after_s": RECEIPT_STALE_S}
+    if receipt is None:
+        out["state"] = "never"
         return out
     if not isinstance(receipt, dict) or not isinstance(receipt.get("ts"), (int, float)):
         out.update(state="unreadable", error="receipt has no ts")
