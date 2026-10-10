@@ -16,6 +16,8 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import testing_support  # noqa: E402
+testing_support.skip_module_without_tomllib()
 import macos_fleet_lanes as fleet  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
