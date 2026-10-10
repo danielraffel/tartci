@@ -549,6 +549,20 @@ this table only says which agents the host carries. `schedule-backstop` must be
 declared exactly when `schedule_backstop` is `live` or `dry-run`, and
 `reuse-canary` exactly when `[reuse_canary] enabled = true`.
 
+The watchdog's frozen-lane threshold comes from the profile too:
+
+```toml
+[launchd_watchdog]
+stale_log_seconds = 4500   # 600-14400; absent = the watchdog's 1800 default
+```
+
+It renders as `TARTCI_WATCHDOG_STALE_LOG_SECONDS` in the watchdog's
+environment, which `tartci launchd heal` reads as its `--stale-log-seconds`
+default (an explicit flag still wins). Every shipped profile sets 4500. Before
+this, m1, m5 and m5studio carried `--stale-log-seconds 4500` only in
+hand-edited plists, so any re-render from this file restored the 1800 default
+and the heals that #191 diagnosed (#195).
+
 After self-update verifies the lanes it runs `tartci fleet-macos support-agents
 auto`. With `bootstrap = false` that is a plan: it compares each declared
 agent's installed plist with its render (`match_bytes`, `match_plist` for key
