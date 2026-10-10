@@ -1,6 +1,7 @@
 import threading
 import time
 import tempfile
+import os
 import unittest
 from pathlib import Path
 
@@ -13,7 +14,7 @@ class ObservationLockTests(unittest.TestCase):
             lock = Path(td) / "observation.lock"
             queue = Path(str(lock) + ".fifo")
             queue.mkdir()
-            older = queue / "00000000000000000000.external"
+            older = queue / f"00000000000000000000.{os.getpid()}"
             older.touch()
             entered = threading.Event()
 

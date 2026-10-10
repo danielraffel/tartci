@@ -78,6 +78,18 @@ class FairObservationLock:
         marker.touch()
         return marker
 
+    @staticmethod
+    def _remove_stale(queue: Path) -> None:
+        for marker in queue.glob("[0-9]*.*"):
+            try:
+                pid = int(marker.name.rsplit(".", 1)[1])
+                os.kill(pid, 0)
+            except (ValueError, ProcessLookupError, PermissionError):
+                try:
+                    marker.unlink()
+                except FileNotFoundError:
+                    pass
+
     @contextlib.contextmanager
     def hold(self) -> Iterator[None]:
         self._check_backoff()
@@ -88,6 +100,7 @@ class FairObservationLock:
         deadline = time.monotonic() + self.timeout
         try:
             while True:
+                self._remove_stale(queue)
                 lower = sorted(p for p in queue.glob("[0-9]*.*") if p.name < marker.name)
                 if not lower:
                     break
