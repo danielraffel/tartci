@@ -228,7 +228,8 @@ replaces_launchd_labels = []
 # false it only reports, and installs or changes nothing.
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
-bootstrap = false
+# Converge only the VM janitor; every other declared agent stays plan-only.
+bootstrap = ["reap"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse

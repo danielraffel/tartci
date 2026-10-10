@@ -249,4 +249,5 @@ replaces_launchd_labels = []
 # false it only reports, and installs or changes nothing.
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
-bootstrap = false
+# Converge only the VM janitor; every other declared agent stays plan-only.
+bootstrap = ["reap"]
