@@ -50,7 +50,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary",
+    "reuse_canary", "launchd_watchdog",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -102,7 +102,7 @@ LANE_KEYS = {
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
-    "warm_vm", "warm_vm_max_park_seconds",
+    "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -464,6 +464,16 @@ def load(path: Path) -> dict:
             fail("worktree_cleanup is restricted to the reviewed M3 merged-main-v1 contract")
         if host.get("id") != "studio" or host.get("tart_home") != "/Volumes/Workshop/VMs":
             fail("worktree_cleanup is restricted to the private M3 profile")
+    watchdog = data.get("launchd_watchdog")
+    if watchdog is not None:
+        # The watchdog's frozen-lane threshold, rendered into its plist by the
+        # support-agents step; it lived only on hand-edited plists (#195).
+        if not isinstance(watchdog, dict) or set(watchdog) - {"stale_log_seconds"}:
+            fail("launchd_watchdog must be a table with only stale_log_seconds")
+        stale = watchdog.get("stale_log_seconds")
+        if stale is not None and (type(stale) is not int or not 600 <= stale <= 14400):
+            fail("launchd_watchdog.stale_log_seconds must be an integer from 600 "
+                 "through 14400")
     disagreement = data.get("build_disagreement")
     if disagreement is not None:
         if not isinstance(disagreement, dict):
@@ -767,6 +777,13 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
                 "from 300 through 14400 beside warm_vm = true"
+            )
+        guest_stale = lane.get("guest_heartbeat_stale_seconds")
+        if guest_stale is not None and (
+                type(guest_stale) is not int or not 120 <= guest_stale <= 3600):
+            fail(
+                f"lane {lane_id}: guest_heartbeat_stale_seconds must be an "
+                "integer from 120 through 3600"
             )
         idle_timeout = lane.get("runner_idle_timeout_seconds")
         if idle_timeout is not None and (
@@ -2463,6 +2480,8 @@ def lane_plist(
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
+    if "guest_heartbeat_stale_seconds" in lane:
+        env["TARTCI_GUEST_HEARTBEAT_STALE_SECS"] = str(lane["guest_heartbeat_stale_seconds"])
     if "runner_idle_timeout_seconds" in lane:
         env["TARTCI_RUNNER_IDLE_TIMEOUT_SECS"] = str(
             lane["runner_idle_timeout_seconds"]
