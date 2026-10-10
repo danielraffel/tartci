@@ -234,8 +234,9 @@ fail-open clones (`_uncertain`), served jobs up from 156 to 229, no refused
 work. The per-job fall in pre-mint `own_class_empty` matched the no-knob control
 host, so the measured win is the skipped clones, not a lower discard rate. On
 that evidence the key is set on the pulp-gate lane of the m1, m3 and m5studio
-profiles. m5 follows after its ranked-lease canary read, which the check would
-otherwise confound.
+profiles. m5 joined after its ranked-lease canary read (2026-10-03 18:34Z to
+10-10 18:38Z, 168 h: 846 leases, 0 real inversions), which the check would
+otherwise have confounded, so every pulp-gate lane now runs it.
 
 What it does not fix: two hosts that both clone for the same single job inside
 the same few seconds. Neither can see the other's boot until one mints, so the
