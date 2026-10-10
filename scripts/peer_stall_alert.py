@@ -16,10 +16,16 @@ opens one GitHub issue per peer and episode, titled
 
     [tartci] <peer> launchd stalled / self-update paused since <episode start>
 
-Every healthy host reads the same receipt and builds the same title, so before
-opening, a host looks for an open issue with that exact title and adopts it:
-the fleet raises one issue, not one per reader. The issue closes when a reader
-sees the peer's guard report no stall. An unreachable peer, an unreadable or
+Every watchdog runs on the same cadence, so the reads of one peer align by
+construction. One host acts for each stalled peer: its primary reader, the
+lowest published host id other than the peer. Every other reader reads the
+primary's own last pass along with the primary's guard receipt (the same SSH
+command), and acts only when that pass has been missing, stale or unable to
+read the peer for PRIMARY_MISSES consecutive reads. Before opening, any reader
+looks for an open issue with the exact title and adopts it, which backs up the
+rule when a fallback and a returning primary overlap. The issue closes when a
+reader sees a fresh receipt, written after the episode began, that reports no
+stall. An unreachable peer, an unreadable or
 stale receipt, or a guard that has never run decides nothing: the issue stays
 as it is (an unreachable host is self-update's peer-reachability record, and
 a stale receipt is the doctor's launchd_timers check on that host).
@@ -31,6 +37,7 @@ that names no published host it reads every published host, itself included.
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import pathlib
@@ -45,11 +52,16 @@ STALL_ALERT_SECS = 6 * 3600
 READ_SECS = 1800
 SSH_TIMEOUT_SECS = 30
 TITLE = "[tartci] {peer} launchd stalled / self-update paused since {since}"
+PRIMARY_MISSES = 2
 SEPARATOR = "--- guard ---"
-# Printed by the peer: its clock, then its guard receipt (empty when none).
+LAST_SEPARATOR = "--- peer-stall ---"
+# Printed by the peer: its clock, its guard receipt, then its own last
+# peer-stall pass (each empty when absent).
 PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_HOME:-$HOME/.tartci}/state/launchd-interval-guard/status.json" '
-             '2>/dev/null || true')
+             '2>/dev/null || true; echo; echo "' + LAST_SEPARATOR + '"; '
+             'cat "${TARTCI_PEER_STALL_DIR:-${TARTCI_HOME:-$HOME/.tartci}/state/peer-stall}'
+             '/last-read.json" 2>/dev/null || true')
 
 Runner = Callable[[List[str]], Tuple[int, str, str]]
 
@@ -96,6 +108,11 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
                 "error": f"exit {rc}: {(err or out).strip()[:200]}"}
     clock = int(first.strip())
     _, _, body = rest.partition(SEPARATOR)
+    body, _, last_text = body.partition(LAST_SEPARATOR)
+    try:
+        last = json.loads(last_text) if last_text.strip() else None
+    except ValueError:
+        last = None
     body = body.strip()
     if not body:
         receipt = None
@@ -103,22 +120,37 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
         try:
             receipt = json.loads(body)
         except ValueError as exc:
-            return {"readable": True, "clock": clock,
+            return {"readable": True, "clock": clock, "last": last,
                     "guard": {"state": "unreadable", "error": str(exc)}, "error": ""}
-    return {"readable": True, "clock": clock, "guard": launchd_interval_guard.classify(
-        receipt, float(clock), receipt_path=f"{target}:launchd-interval-guard/status.json"),
-        "error": ""}
+    return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
+            "guard": launchd_interval_guard.classify(
+                receipt, float(clock),
+                receipt_path=f"{target}:launchd-interval-guard/status.json"),
+            "error": ""}
 
 
-def judge(info: Dict[str, Any], threshold: int) -> Dict[str, Any]:
+def _epoch(stamp: Any) -> Optional[float]:
+    try:
+        return float(calendar.timegm(time.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def judge(info: Dict[str, Any], threshold: int,
+          episode_since: Optional[str] = None) -> Dict[str, Any]:
     """{"active", "resolved", "since", "hours"} for one peer read. Only a
-    readable, fresh receipt decides anything."""
+    readable, fresh receipt decides anything, and only a receipt written
+    after `episode_since` (the open alert's start) can end it."""
     guard = info.get("guard") or {}
     state = guard.get("state")
     out: Dict[str, Any] = {"active": False, "resolved": False, "since": None, "hours": None,
                            "state": state if info.get("readable") else "unreachable"}
     if state == "ok":
-        out["resolved"] = True
+        written = (float(info["clock"]) - float(guard.get("age_seconds") or 0)
+                   if info.get("clock") is not None else None)
+        began = _epoch(episode_since) if episode_since else None
+        out["resolved"] = (began is None
+                           or (written is not None and written > began))
     elif state == "stalled":
         started = (guard.get("episode") or {}).get("started_ts")
         if isinstance(started, (int, float)):
@@ -181,6 +213,24 @@ def _open_or_adopt(title: str, body: str) -> Tuple[int, str]:
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 
 
+def primary_reader(peer: str, hosts: List[str]) -> Optional[str]:
+    """The host that acts for `peer`: the lowest published id other than it."""
+    others = sorted(h for h in hosts if h != peer)
+    return others[0] if others else None
+
+
+def primary_healthy(last: Optional[Dict[str, Any]], clock: Optional[float], peer: str,
+                    interval: int) -> bool:
+    """Whether the primary's own last pass (read from it with its clock) is
+    recent, within two read intervals, and read `peer`."""
+    if not isinstance(last, dict) or clock is None or not isinstance(last.get("ts"), (int, float)):
+        return False
+    if not 0 <= clock - float(last["ts"]) <= 2 * interval:
+        return False
+    row = (last.get("peers") or {}).get(peer)
+    return isinstance(row, dict) and not row.get("error")
+
+
 def published_peers(home: Optional[pathlib.Path] = None,
                     run: Optional[Runner] = None) -> Tuple[Dict[str, str], Optional[str]]:
     """(host_id -> SSH target, this host's id or None) from main's published
@@ -238,11 +288,32 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
     result: Dict[str, Any] = {}
     enabled = (os.environ.get("TARTCI_PEER_STALL_ISSUE", "1") != "0"
                and (issue is not None or not _scratch(directory)))
+    hosts = sorted(set(peers) | ({me} if me else set()))
+    reads = {peer: read_peer(target, run) for peer, target in sorted(peers.items())
+             if peer != me}
+    misses = (last.get("primary_misses") or {}) if isinstance(last.get("primary_misses"), dict) \
+        else {}
+    next_misses: Dict[str, int] = {}
     for peer, target in sorted(peers.items()):
         if peer == me:
             continue
-        info = read_peer(target, run)
-        verdict = judge(info, threshold)
+        info = reads[peer]
+        state_path = directory / f"{peer}.json"
+        held = host_off._read_json(state_path) or {}
+        verdict = judge(info, threshold, held.get("since"))
+        primary = primary_reader(peer, hosts)
+        if me is None or primary == me:
+            acting, why = True, "primary"
+        else:
+            pinfo = reads.get(primary) or {}
+            if primary_healthy(pinfo.get("last"), pinfo.get("clock"), peer, interval):
+                next_misses[peer] = 0
+                acting, why = False, f"{primary} is the primary reader"
+            else:
+                next_misses[peer] = int(misses.get(peer) or 0) + 1
+                acting = next_misses[peer] >= PRIMARY_MISSES
+                why = (f"{primary} has not read {peer} for {next_misses[peer]} read(s)"
+                       + ("; acting" if acting else ""))
 
         def raise_event(peer: str = peer, verdict: Dict[str, Any] = verdict) -> None:
             host_off.event(directory, "peer_launchd_stalled",
@@ -250,14 +321,18 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                            f"({verdict['hours']} h)",
                            {"peer": peer, "since": verdict["since"], "reader": me}, now)
 
-        out = host_off.episode_alert(
-            directory / f"{peer}.json", active=verdict["active"],
-            resolved=verdict["resolved"], since=verdict["since"],
-            raise_event=raise_event,
-            render=lambda peer=peer, target=target, info=info, verdict=verdict: alert_text(
-                peer, target, me or "a peer", info, verdict, now),
-            issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
-        result[peer] = {**verdict, "issue": out.get("issue"), "closed": bool(out.get("closed")),
-                        "error": info.get("error") or None}
-    host_off._write_json(last_path, {"ts": now, "peers": result})
+        out: Dict[str, Any] = {}
+        if acting or held:
+            # A host that alerted keeps closing what it opened.
+            out = host_off.episode_alert(
+                state_path, active=verdict["active"] and acting,
+                resolved=verdict["resolved"], since=verdict["since"],
+                raise_event=raise_event,
+                render=lambda peer=peer, target=target, info=info, verdict=verdict: alert_text(
+                    peer, target, me or "a peer", info, verdict, now),
+                issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
+        result[peer] = {**verdict, "acting": acting, "why": why, "issue": out.get("issue"),
+                        "closed": bool(out.get("closed")), "error": info.get("error") or None}
+    host_off._write_json(last_path, {"ts": now, "peers": result,
+                                     "primary_misses": next_misses})
     return {"skipped": False, "peers": result}

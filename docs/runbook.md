@@ -1846,15 +1846,24 @@ alert, so its peers raise it.
   its lanes are idle (a reboot clears the stall), and do not kickstart
   self-update while it lasts. The watchdog log prints a
   `WARN peer-stall` line each read while it holds.
-- **One issue for the fleet.** Every healthy host builds the same title from
-  the same receipt, so a host first looks for an open issue with that exact
-  title and adopts it. Four readers make one issue.
-- **When it closes.** When any reader sees the peer's guard report no stall.
-  An unreachable peer (often a host mid-reboot), a stale receipt (no guard
-  running there; that host's doctor `launchd_timers` says so) or a guard that
-  never ran decides nothing, so the issue stays as it is.
+- **One reader acts.** Every watchdog runs on the same cadence, so reads of a
+  peer line up. The peer's primary reader, the lowest published host id other
+  than the peer, is the one that opens and closes its issue. The same SSH
+  command that reads a host's guard receipt also reads that host's own last
+  peer-stall pass, so every other reader can see whether the primary read the
+  peer within two read intervals. After two consecutive reads where it did not
+  (unreachable, stale, or it could not read the peer), the next reader acts.
+  Before opening, any reader adopts an open issue with the exact title, which
+  covers a fallback and a returning primary overlapping. A host that opened
+  or adopted an issue keeps closing it.
+- **When it closes.** When a reader sees a fresh receipt, written after the
+  episode began, that reports no stall. A stale receipt (no guard running
+  there; that host's doctor `launchd_timers` says so) never closes it, and an
+  unreachable peer (often a host mid-reboot) or a guard that never ran decides
+  nothing, so the issue stays as it is.
 - **Where to look.** The reader's `~/.tartci/state/peer-stall/` holds
-  `last-read.json` (every peer's last verdict), one `<peer>.json` per alert,
+  `last-read.json` (every peer's last verdict, whether this host acted and
+  why, and its count of primary misses), one `<peer>.json` per alert,
   and `events.jsonl` (`peer_launchd_stalled`, once per episode).
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.

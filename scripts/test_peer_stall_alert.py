@@ -45,9 +45,12 @@ class Fleet:
         self.answers: dict[str, tuple[int, str, str]] = {}
         self.calls: list[str] = []
 
-    def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60) -> None:
+    def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
+              last: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
-        self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n", "")
+        tail = json.dumps(last) if last is not None else ""
+        self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
+                                   f"{psa.LAST_SEPARATOR}\n{tail}\n", "")
 
     def healthy(self, target: str) -> None:
         self.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
@@ -78,7 +81,7 @@ class PeerStall(unittest.TestCase):
         self.closed.append(number)
         return 0, "closed"
 
-    def run_pass(self, at: float, host: str = "m5", **kw) -> dict:
+    def run_pass(self, at: float, host: str = "m1", **kw) -> dict:
         kw.setdefault("issue", self.issue)
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
@@ -92,9 +95,10 @@ class PeerStall(unittest.TestCase):
         self.assertIn("Self-update is paused for the stall", body[0])
         self.assertEqual(body[1], "Run: ssh m3 'tartci doctor fleet'")
         self.assertTrue(body[2].startswith("Fix: reboot studio when its lanes are idle"))
-        self.assertFalse(out["peers"]["m1"]["active"])
-        self.assertNotIn("m5", out["peers"], "a host never reads itself")
-        self.assertNotIn("m5", self.fleet.calls)
+        self.assertFalse(out["peers"]["m5"]["active"])
+        self.assertEqual(out["peers"]["studio"]["why"], "primary")
+        self.assertNotIn("m1", out["peers"], "a host never reads itself")
+        self.assertNotIn("m1", self.fleet.calls)
 
     def test_a_short_stall_is_not_reported(self):
         # Negative control: the same receipt, an episode two hours old.
@@ -117,7 +121,7 @@ class PeerStall(unittest.TestCase):
         out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS)
         self.assertTrue(out["peers"]["studio"]["closed"])
         self.assertEqual(self.closed, ["501"])
-        self.assertFalse((self.tmp / "m5" / "studio.json").exists())
+        self.assertFalse((self.tmp / "m1" / "studio.json").exists())
 
     def test_unreachable_stale_or_never_decides_nothing(self):
         self.run_pass(RECEIPT_TS + 60)
@@ -135,7 +139,74 @@ class PeerStall(unittest.TestCase):
             self.assertFalse(out["peers"]["studio"]["active"])
         self.assertEqual(self.closed, [], "the issue stays open until a read shows the stall over")
         self.assertEqual(len(self.opened), 1)
-        self.assertEqual(json.loads((self.tmp / "m5" / "studio.json").read_text())["issue"], "501")
+        self.assertEqual(json.loads((self.tmp / "m1" / "studio.json").read_text())["issue"], "501")
+
+    def fresh_primary_pass(self, ok: bool = True) -> dict:
+        """m1's own last pass as m5 would read it over SSH."""
+        return {"ts": RECEIPT_TS, "peers": {"studio": {"state": "stalled",
+                                                       "error": None if ok else "exit 255"}}}
+
+    def test_only_the_primary_acts_while_it_reads_the_peer(self):
+        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                "paused": []}, last=self.fresh_primary_pass())
+        for k in range(3):
+            out = self.run_pass(RECEIPT_TS + 60 + k * psa.READ_SECS, host="m5")
+            self.assertFalse(out["peers"]["studio"]["acting"])
+            self.assertEqual(out["peers"]["studio"]["why"], "m1 is the primary reader")
+        self.assertEqual(self.opened, [])
+        self.assertTrue(out["peers"]["studio"]["active"], "it still sees the stall")
+
+    def test_a_fallback_acts_after_the_primary_misses_two_reads(self):
+        for answer in ((255, "", "ssh: Operation timed out"), None):
+            self.setUp()
+            if answer is None:     # reachable, but its own pass could not read studio
+                self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False},
+                                        "stalled": [], "paused": []},
+                                 last=self.fresh_primary_pass(ok=False))
+            else:
+                self.fleet.answers["m1"] = answer
+            first = self.run_pass(RECEIPT_TS + 60, host="m5")
+            self.assertFalse(first["peers"]["studio"]["acting"])
+            self.assertEqual(self.opened, [], "one miss is not enough")
+            second = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS, host="m5")
+            self.assertTrue(second["peers"]["studio"]["acting"])
+            self.assertEqual([t for t, _ in self.opened], [TITLE])
+
+    def test_a_stale_primary_pass_counts_as_a_miss(self):
+        stale = {**self.fresh_primary_pass(), "ts": RECEIPT_TS - 3 * psa.READ_SECS}
+        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                "paused": []}, last=stale)
+        self.run_pass(RECEIPT_TS + 60, host="m5")
+        out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS, host="m5")
+        self.assertTrue(out["peers"]["studio"]["acting"])
+
+    def test_the_primary_is_the_lowest_published_id_other_than_the_peer(self):
+        hosts = ["m1", "m5", "m5studio", "studio"]
+        self.assertEqual(psa.primary_reader("studio", hosts), "m1")
+        self.assertEqual(psa.primary_reader("m1", hosts), "m5")
+        self.assertIsNone(psa.primary_reader("m1", ["m1"]))
+
+    def test_a_stale_ok_receipt_does_not_close(self):
+        self.run_pass(RECEIPT_TS + 60)
+        ok = {**M3_RECEIPT, "episode": {"active": False}, "stalled": [], "paused": []}
+        self.fleet.guard("m3", ok, clock=RECEIPT_TS + 3600)        # written 60 min ago
+        out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS)
+        self.assertFalse(out["peers"]["studio"]["closed"])
+        self.assertEqual(self.closed, [])
+
+    def test_an_ok_receipt_written_before_the_episode_does_not_close(self):
+        self.run_pass(RECEIPT_TS + 60)
+        # The peer's clock went back: an "ok" receipt that reads fresh but was
+        # written before the episode this issue is about began.
+        ok = {**M3_RECEIPT, "ts": STARTED - 600, "episode": {"active": False},
+              "stalled": [], "paused": []}
+        self.fleet.guard("m3", ok, clock=STARTED - 540)
+        out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS)
+        self.assertFalse(out["peers"]["studio"]["closed"])
+        # Control: the same receipt written after the start closes it.
+        self.fleet.guard("m3", {**ok, "ts": RECEIPT_TS + 100}, clock=RECEIPT_TS + 160)
+        out = self.run_pass(RECEIPT_TS + 60 + 2 * psa.READ_SECS)
+        self.assertTrue(out["peers"]["studio"]["closed"])
 
     def test_reads_at_most_once_per_interval(self):
         self.run_pass(RECEIPT_TS + 60)
@@ -166,24 +237,28 @@ class PeerStall(unittest.TestCase):
         with mock.patch.object(host_off, "_ghapp", side_effect=ghapp), \
                 mock.patch.object(host_off, "_scratch_home", return_value=False), \
                 mock.patch.object(psa, "_scratch", return_value=False):
-            for host in ("m1", "m5", "m5studio"):
-                psa.alert_pass(now=RECEIPT_TS + 60, directory=self.tmp / host, peers=PEERS,
-                               me=host, run=self.fleet.run)
+            # m1 is studio's primary. The fleet double serves no m1 pass, so
+            # m5 and m5studio count misses and fall back on their second read:
+            # they adopt m1's issue by title rather than open another.
+            for at in (RECEIPT_TS + 60, RECEIPT_TS + 60 + psa.READ_SECS):
+                for host in ("m1", "m5", "m5studio"):
+                    psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS,
+                                   me=host, run=self.fleet.run)
             self.assertEqual([v["title"] for v in github.values()], [TITLE])
             self.assertEqual({json.loads((self.tmp / h / "studio.json").read_text())["issue"]
                               for h in ("m1", "m5", "m5studio")}, {"600"})
             # Recovery read by one host closes the fleet's one issue.
             self.fleet.healthy("m3")
-            psa.alert_pass(now=RECEIPT_TS + 60 + psa.READ_SECS, directory=self.tmp / "m1",
+            psa.alert_pass(now=RECEIPT_TS + 60 + 2 * psa.READ_SECS, directory=self.tmp / "m1",
                            peers=PEERS, me="m1", run=self.fleet.run)
             self.assertEqual(github["600"]["state"], "closed")
 
     def test_a_scratch_directory_never_reaches_github_unstubbed(self):
         with mock.patch.object(psa, "_open_or_adopt") as real:
-            psa.alert_pass(now=RECEIPT_TS + 60, directory=self.tmp / "m5", peers=PEERS,
-                           me="m5", run=self.fleet.run)
+            psa.alert_pass(now=RECEIPT_TS + 60, directory=self.tmp / "m1", peers=PEERS,
+                           me="m1", run=self.fleet.run)
         real.assert_not_called()
-        self.assertTrue(json.loads((self.tmp / "m5" / "studio.json").read_text())["evented"])
+        self.assertTrue(json.loads((self.tmp / "m1" / "studio.json").read_text())["evented"])
 
     def test_peers_are_the_published_supply_as_self_update_reads_them(self):
         import fleet_self_update as fsu
