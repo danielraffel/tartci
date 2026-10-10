@@ -1922,6 +1922,24 @@ alert, so its peers raise it.
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.
 
+### System resolver dead while TCP is alive (`resolver_dead`)
+
+The same watchdog tick also runs `scripts/resolver_health.py`. It looks up
+`github.com` through the system resolver and connects to the known GitHub IP
+literal `140.82.112.3:443`; it never gives a name to the TCP probe. The four
+results are `resolver_dead` (lookup fails, TCP works), `network_down` (both
+fail), `upstream_unreachable` (lookup works, TCP fails), and `healthy`.
+
+The host publishes `~/.tartci/state/resolver-health/state.json` only after
+three consecutive non-healthy ticks. A peer reads that state through the
+existing peer-alert SSH path and the primary reader opens or updates one issue:
+`[tartci] <peer> resolver dead while TCP alive since <time>`. The first remedy
+line is to restart Tailscale through the LAN fallback (`scutil --nc stop/start
+Tailscale`, then `tailscale up` with no flags); expect `scan_recovered`. The
+fallback is `sudo killall -HUP mDNSResponder`. The issue closes when a peer
+reads a later non-`resolver_dead` state. The watchdog never changes host
+network configuration itself.
+
 ### Reloading a lane supervisor safely (`tartci launchd reload`)
 
 launchd caches a job's spec, so `kickstart`/`KeepAlive` re-run the CACHED spec;

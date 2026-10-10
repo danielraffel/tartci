@@ -56,11 +56,14 @@ SSH_TIMEOUT_SECS = 30
 TITLE = "[tartci] {peer} launchd stalled / self-update paused since {since}"
 PRIMARY_MISSES = 2
 SEPARATOR = "--- guard ---"
+RESOLVER_SEPARATOR = "--- resolver ---"
 LAST_SEPARATOR = "--- peer-stall ---"
 # Printed by the peer: its clock, its guard receipt, then its own last
 # peer-stall pass (each empty when absent).
 PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_HOME:-$HOME/.tartci}/state/launchd-interval-guard/status.json" '
+             '2>/dev/null || true; echo; echo "' + RESOLVER_SEPARATOR + '"; '
+             'cat "${TARTCI_HOME:-$HOME/.tartci}/state/resolver-health/state.json" '
              '2>/dev/null || true; echo; echo "' + LAST_SEPARATOR + '"; '
              'cat "${TARTCI_PEER_STALL_DIR:-${TARTCI_HOME:-$HOME/.tartci}/state/peer-stall}'
              '/last-read.json" 2>/dev/null || true')
@@ -111,20 +114,27 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     clock = int(first.strip())
     _, _, body = rest.partition(SEPARATOR)
     body, _, last_text = body.partition(LAST_SEPARATOR)
+    guard_text, _, resolver_text = body.partition(RESOLVER_SEPARATOR)
     try:
         last = json.loads(last_text) if last_text.strip() else None
     except ValueError:
         last = None
-    body = body.strip()
-    if not body:
+    guard_text = guard_text.strip()
+    resolver_text = resolver_text.strip()
+    if not guard_text:
         receipt = None
     else:
         try:
-            receipt = json.loads(body)
+            receipt = json.loads(guard_text)
         except ValueError as exc:
             return {"readable": True, "clock": clock, "last": last,
                     "guard": {"state": "unreadable", "error": str(exc)}, "error": ""}
+    try:
+        resolver = json.loads(resolver_text) if resolver_text else None
+    except ValueError:
+        resolver = None
     return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
+            "resolver": resolver if isinstance(resolver, dict) else None,
             "guard": launchd_interval_guard.classify(
                 receipt, float(clock),
                 receipt_path=f"{target}:launchd-interval-guard/status.json"),
@@ -191,6 +201,34 @@ def alert_text(peer: str, target: str, me: str, info: Dict[str, Any],
         "rest adopt it by its title. It closes itself when a host reads the stall over.",
     ])
     return title, body
+
+
+RESOLVER_TITLE = "[tartci] {peer} resolver dead while TCP alive since {since}"
+
+
+def resolver_judge(info: Dict[str, Any]) -> Dict[str, Any]:
+    state = info.get("resolver") or {}
+    condition = state.get("condition")
+    since = state.get("since") if isinstance(state.get("since"), str) else None
+    updated = state.get("updated_at") if isinstance(state.get("updated_at"), str) else None
+    return {"active": condition == "resolver_dead",
+            "resolved": condition in {"healthy", "network_down", "upstream_unreachable"},
+            "since": since, "updated_at": updated, "state": condition or "unknown"}
+
+
+def resolver_alert_text(peer: str, target: str, me: str,
+                        verdict: Dict[str, Any], now: float) -> Tuple[str, str]:
+    since = verdict["since"] or iso(now)
+    return (RESOLVER_TITLE.format(peer=peer, since=since), "\n".join([
+        f"{peer}'s system resolver is dead while TCP to an IP literal is alive since {since}.",
+        f"Run: ssh {target} 'tartci doctor fleet'",
+        "Fix: restart Tailscale via the LAN fallback (`scutil --nc stop/start Tailscale`, "
+        "then `tailscale up` with no flags); expect scan_recovered.",
+        "Alternative: `sudo killall -HUP mDNSResponder`.",
+        "",
+        f"Read by {me} over SSH at {iso(now)}. The peer path raised this because the host "
+        "cannot reliably alert through GitHub by name while its resolver is wedged.",
+    ]))
 
 
 def _scratch(directory: pathlib.Path) -> bool:
@@ -344,6 +382,22 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                 issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
         result[peer] = {**verdict, "acting": acting, "why": why, "issue": out.get("issue"),
                         "closed": bool(out.get("closed")), "error": info.get("error") or None}
+        resolver_verdict = resolver_judge(info)
+        resolver_path = directory / f"{peer}.resolver.json"
+        resolver_out: Dict[str, Any] = {}
+        if acting or host_off._read_json(resolver_path):
+            resolver_out = host_off.episode_alert(
+                resolver_path, active=resolver_verdict["active"] and acting,
+                resolved=resolver_verdict["resolved"], since=resolver_verdict["since"],
+                raise_event=lambda peer=peer, verdict=resolver_verdict: host_off.event(
+                    directory, "resolver_dead", f"{peer}: resolver dead while TCP alive since "
+                    f"{verdict['since']}", {"peer": peer, "reader": me}, now),
+                render=lambda peer=peer, target=target, verdict=resolver_verdict:
+                    resolver_alert_text(peer, target, me or "a peer", verdict, now),
+                issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
+        result[peer]["resolver"] = {**resolver_verdict, "acting": acting,
+                                     "issue": resolver_out.get("issue"),
+                                     "closed": bool(resolver_out.get("closed"))}
     host_off._write_json(last_path, {"ts": now, "peers": result,
                                      "primary_misses": next_misses})
     return {"skipped": False, "peers": result}
