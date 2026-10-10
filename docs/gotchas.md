@@ -92,6 +92,33 @@ Do not kickstart self-update during the stall.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A gate lane sits in `booting` for over an hour with a stale heartbeat (m1, 2026-10-09)
+
+**Symptom:** `tartci doctor fleet` reports `fleet_not_ready` with
+`heartbeat_stale`, while the host still serves jobs on its other lanes. The
+stale lane's state file shows `phase: booting`, its VM has an IP
+(`boot_ip` in the lane's `events.jsonl`), there is no actions-runner log for
+the VM, and `ps` shows the supervisor running one `ssh admin@<vm-ip> true`
+after another, each lasting about a minute.
+
+**Cause:** the boot helper waited for the guest's sshd with 90 attempts and a
+2 s sleep, meant as 180 s. `ConnectTimeout=10` bounds only the TCP connect,
+so a guest that accepts the connection but never finishes the handshake holds
+each attempt for about 60 s. The 90 attempts then take about 93 minutes, and
+nothing writes a heartbeat meanwhile. On m1, `pulp-gate.slot2` sat there for
+71+ minutes.
+
+**Fix:** the wait is bounded by wall-clock time. Each attempt is killed at
+`TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15) and the whole wait ends at
+`TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180), after which the VM is discarded
+with `boot_failed no_ssh` and `waited_s`/`attempts` fields. Each failed
+attempt refreshes the boot phase's heartbeat, which is honest because the wait
+has a hard end. The doctor's `fleet_not_ready` line now names each problem's
+lane and heartbeat age, for example
+`heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`.
+A host on a generation from before this fix discards such a VM only after the
+attempts run out; it heals once it self-updates.
+
 ## A `while read` loop ends early after a peer read over ssh (2026-10-04)
 
 *Symptom:* the supervisor observed only the first class with young demand;

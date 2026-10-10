@@ -581,13 +581,53 @@ def check_readiness(probes: dict[str, dict], *, authority: str) -> Finding:
         return Finding(check, OK, "fleet_ready",
                        "the installed generation reports the fleet ready", facts)
     if ready is False:
-        codes = ", ".join(
-            str(problem.get("code")) for problem in problems if isinstance(problem, dict)
+        codes = "; ".join(
+            describe_readiness_problem(problem)
+            for problem in problems if isinstance(problem, dict)
         ) or "no problem code was reported"
         return Finding(check, PROBLEM, "fleet_not_ready",
                        f"the fleet is not ready: {codes}", facts)
     return Finding(check, UNKNOWN, "readiness_probe_failed",
                    "the readiness probe returned no fleet_ready verdict", facts)
+
+
+LANE_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+
+
+def describe_readiness_problem(problem: dict) -> str:
+    """One readiness problem as `code (lane, detail)`.
+
+    The bare code was all the finding used to print, so m1 read
+    `heartbeat_stale, heartbeat_stale` with no word of which supervisor or how
+    stale, and the operator had to re-run the probe to learn either. The probe
+    already carries both: `label` is the lane's launchd label, `detail` is
+    `age_seconds=N` for a heartbeat problem and free text for the rest.
+    """
+    code = str(problem.get("code"))
+    parts = []
+    label = str(problem.get("label") or "")
+    if label:
+        parts.append(label[len(LANE_LABEL_PREFIX):] if label.startswith(LANE_LABEL_PREFIX)
+                     else label)
+    detail = str(problem.get("detail") or "")
+    if detail.startswith("age_seconds="):
+        try:
+            seconds = int(detail.split("=", 1)[1])
+        except ValueError:
+            parts.append(detail)
+        else:
+            parts.append(f"heartbeat {_age_words(seconds)} old")
+    elif detail:
+        parts.append(detail)
+    return f"{code} ({', '.join(parts)})" if parts else code
+
+
+def _age_words(seconds: int) -> str:
+    if seconds < 120:
+        return f"{seconds}s"
+    if seconds < 7200:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 
 # ── Assembly ───────────────────────────────────────────────────────────────
