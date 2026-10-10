@@ -13,6 +13,7 @@
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
+#   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
@@ -1365,6 +1366,7 @@ case "${1:-help}" in
   reclaim) shift; cmd_reclaim "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
+  retention) shift; exec python3 "$HERE/scripts/state_retention.py" "$@" ;;
   vm-dhcp) shift; exec python3 "$HERE/scripts/vm_dhcp_breaker.py" "$@" ;;
   artifact-cache) shift; cmd_artifact_cache "$@" ;;
   keychain-unlock) shift; cmd_keychain_unlock "$@" ;;
