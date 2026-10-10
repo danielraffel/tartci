@@ -1147,14 +1147,17 @@ def python_shim_dir() -> str:
     return _PYTHON_SHIM_DIR
 
 
-def census_env() -> dict[str, str]:
+def census_env(repository: str | None = None) -> dict[str, str]:
     # The census binds its identity per call (#227); this also pins the CLI and
     # the interpreter every tartci helper runs under, including on rollback.
-    return {
+    env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
         "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
+    if repository is not None:
+        env["GH_REPO"] = repository
+    return env
 
 
 # The capacity floor owns the judgement of whether a peer can mint on demand;
@@ -1628,9 +1631,10 @@ def relay_enabled(cfg: Config) -> bool:
         return True  # unreadable profile: run reconcile, which will say why
 
 
-def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
+def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
+           repository: str | None = None) -> Result:
     """The TARGET commit's tartci, run from the managed checkout."""
-    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(),
+    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(repository),
                     timeout=timeout)
 
 
@@ -1835,8 +1839,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          "certificate; a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
+        repository = configured_repository(cfg, sys_)
         if helper is None:
-            dry = tartci(cfg, sys_, *install_args)
+            dry = tartci(cfg, sys_, *install_args, repository=repository)
             if dry.rc != 0:
                 raise Refused(f"install dry-run failed: {dry.text}")
             receipt.step("install-dry-run", "ok")
@@ -1906,6 +1911,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_OK
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
+                  repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded)
         return run.execute()
     except Deferred as exc:
@@ -1962,12 +1968,14 @@ class Run:
     def __init__(self, cfg: Config, sys_: System, receipt: Receipt, *, me: str, target: str,
                  previous: str, profile: Path, install_args: list[str], allow: bool,
                  helper: dict | None, approval: Path | None,
+                 repository: str | None = None,
                  excluded: list[str] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
+        self.repository = repository
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -2097,7 +2105,7 @@ class Run:
             self._write_pin(self.approval.read_text())
             self.pin_moved = True
             self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
-            dry = tartci(cfg, sys_, *self.install_args)
+            dry = tartci(cfg, sys_, *self.install_args, repository=self.repository)
             if dry.rc != 0:
                 raise Failed(f"install dry-run failed against the new pin: {dry.text}")
             self.receipt.step("install-dry-run", "ok against the new pin")
@@ -2188,7 +2196,7 @@ class Run:
         fence = self._writer_fence()
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(),
+                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:

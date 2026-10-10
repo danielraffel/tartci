@@ -141,6 +141,8 @@ class FakeSystem(su.System):
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.env_calls = getattr(self, "env_calls", [])
+        self.env_calls.append(dict(env or {}))
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
@@ -2173,6 +2175,20 @@ class IncidentTests(Base):
 
 
 class RepositoryIdentityTests(Base):
+    def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            repository = su.configured_repository(self.cfg, self.sys)
+            run = object.__new__(su.Run)
+            run.cfg, run.sys, run.install_args, run.repository = (
+                self.cfg, self.sys, ["fleet-macos", "install", "profile"], repository)
+            run.receipt = mock.Mock()
+            run._writer_fence = lambda: []
+            su.Run._install(run, run.install_args)
+        self.assertEqual(su.LEGACY_REPOSITORY, repository)
+        self.assertEqual(su.LEGACY_REPOSITORY, self.sys.env_calls[-1]["GH_REPO"])
+
     def test_default_resolution_uses_first_readable_accepted_slug(self):
         self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
         self.sys.api_repository = su.DEFAULT_REPOSITORY
