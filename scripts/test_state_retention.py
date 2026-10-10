@@ -11,6 +11,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import state_retention as r  # noqa: E402
@@ -178,6 +179,36 @@ class ApplyTests(unittest.TestCase):
         self.assertFalse(old_file.exists())
         for path in keep:
             self.assertTrue(path.exists())
+
+
+class ProcessTableTests(unittest.TestCase):
+    """Idle safety rests on the process table, so any doubt about it is None."""
+
+    def table(self, ps, lsof):
+        calls = iter([ps, lsof])
+
+        def fake_run(argv, **_kwargs):
+            outcome = next(calls)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            return subprocess.CompletedProcess(argv, outcome[0], outcome[1], "")
+        with mock.patch.object(r.subprocess, "run", side_effect=fake_run):
+            return r.process_table()
+
+    def test_a_readable_table_returns_commands_and_cwds(self) -> None:
+        self.assertEqual(self.table((0, "bash runner.sh\n"), (1, "p1\nn/Users/x\n")),
+                         (["bash runner.sh"], ["/Users/x"]))
+
+    def test_any_doubt_returns_none(self) -> None:
+        cases = {
+            "ps failed": ((1, ""), (0, "p1\nn/\n")),
+            "lsof read nothing": ((0, "bash\n"), (1, "")),
+            "ps missing": (OSError("no ps"), (0, "")),
+            "lsof timed out": ((0, "bash\n"), subprocess.TimeoutExpired("lsof", 60)),
+        }
+        for name, (ps, lsof) in cases.items():
+            with self.subTest(case=name):
+                self.assertIsNone(self.table(ps, lsof))
 
 
 class CliTests(unittest.TestCase):
