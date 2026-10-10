@@ -17,25 +17,6 @@
       "lane": "pulp-gate",
       "repo": "Generous-Corp/pulp",
       "assignment_mode": "event-class-v2",
-      "class_label": "pulp-build-merge-group",
-      "labels": [
-        "self-hosted",
-        "macOS",
-        "ARM64",
-        "pulp-build",
-        "pulp-build-vm",
-        "pulp-build-merge-group"
-      ],
-      "workflows": [
-        "Build and Test"
-      ]
-    },
-    {
-      "profile": "m1-macos-fleet",
-      "host_id": "m1",
-      "lane": "pulp-gate",
-      "repo": "Generous-Corp/pulp",
-      "assignment_mode": "event-class-v2",
       "class_label": "pulp-build-pr-head",
       "labels": [
         "self-hosted",

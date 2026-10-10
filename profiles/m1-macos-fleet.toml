@@ -150,12 +150,12 @@ process_type = "Adaptive"
 # The release tiers below serve only jobs carrying a release class label, which
 # Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in. Rollback: delete this key
 # and the release tiers, re-render, reload slot 2 at an idle boundary.
-assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
-
-[[lane.tier]]
-label = "pulp-build-merge-group"
-workflow = "Build and Test"
-runner_group_id = 1
+assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-pr-head"] }
+v2_gate_classes = ["pulp-build-pr-head"]
+# No pulp-build-merge-group tier: m1's 3-core gate guest ran merge_group jobs
+# in 33-35 min against 15-22 min on m3, m5 and m5studio (4 of 33 jobs over a
+# week), so every batch it took held the queue longest. m1 keeps PR-head and
+# release work; merge-group work goes to the faster hosts.
 
 [[lane.tier]]
 label = "pulp-build-pr-head"
