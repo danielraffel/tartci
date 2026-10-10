@@ -1824,7 +1824,7 @@ comes up. It is not stale configuration.
    references on a re-run. Then `tartci vm-dhcp probe-now`, and
    `tartci doctor fleet` reads `pf_reference_ok ... taken at boot by
    com.danielraffel.pf-enable-ref`. The token is the undo key
-   (`sudo pfctl -X <token>`); never `pfctl -d`.
+   (`sudo pfctl -X <token>`); Never `pfctl -d`.
 2. **VM network never created** (`vm_dhcp_vm_network_missing`): no `bridge100`
    existed while a VM ran, and pfd is healthy. Tart's NAT network is vmnet
    shared mode, which InternetSharing creates per VM. Restarting the

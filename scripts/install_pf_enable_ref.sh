@@ -87,7 +87,12 @@ if [ "$same" != 1 ]; then
   [ "$loaded" = 1 ] && "$LAUNCHCTL" bootout "system/$LABEL" 2>/dev/null || true
   loaded=0
 fi
-[ "$loaded" = 1 ] || "$LAUNCHCTL" bootstrap system "$TARGET"
+[ "$loaded" = 1 ] || {
+  "$LAUNCHCTL" bootstrap system "$TARGET"
+  # bootstrap loads the job but can leave RunAtLoad pended on a stalled launchd.
+  # Kickstart starts this boot's reference-taking run explicitly.
+  "$LAUNCHCTL" kickstart "system/$LABEL"
+}
 
 # Verify: launchd holds it from $TARGET, its run exited 0, and a token exists.
 ok=1

@@ -27,6 +27,8 @@ class InstallPfEnableRef(unittest.TestCase):
         self.loaded = self.tmp / "loaded"      # holds the plist path launchd "has"
         self.exit_code = self.tmp / "exit"
         self.exit_code.write_text("0")
+        self.write_token = self.tmp / "write-token"
+        self.write_token.write_text("1")
         double = self.tmp / "launchctl"
         double.write_text(
             "#!/bin/bash\n"
@@ -35,8 +37,8 @@ class InstallPfEnableRef(unittest.TestCase):
             f"  print) [ -s {str(self.loaded)!r} ] || exit 113\n"
             f"         printf '\\tpath = %s\\n\\tlast exit code = %s\\n' \"$(cat {str(self.loaded)!r})\""
             f" \"$(cat {str(self.exit_code)!r})\" ;;\n"
-            f"  bootstrap) printf '%s' \"$3\" >{str(self.loaded)!r}\n"
-            f"             [ \"$(cat {str(self.exit_code)!r})\" != 0 ] || echo tok123 >{str(self.token)!r} ;;\n"
+            f"  bootstrap) printf '%s' \"$3\" >{str(self.loaded)!r} ;;\n"
+            f"  kickstart) [ \"$(cat {str(self.exit_code)!r})\" != 0 ] || [ \"$(cat {str(self.write_token)!r})\" != 1 ] || echo tok123 >{str(self.token)!r} ;;\n"
             f"  bootout) : >{str(self.loaded)!r} ;;\n"
             "esac\n")
         double.chmod(0o755)
@@ -78,6 +80,8 @@ class InstallPfEnableRef(unittest.TestCase):
         self.assertEqual(target.read_bytes(), SOURCE.read_bytes())
         self.assertEqual(oct(target.stat().st_mode & 0o777), "0o644")
         self.assertIn(f"bootstrap system {target}", self.calls.read_text())
+        self.assertIn(f"kickstart system/{LABEL}", self.calls.read_text())
+        self.assertTrue(self.token.exists())
         self.assertIn("installed and loaded", out.stdout)
 
     def test_a_rerun_takes_no_second_reference(self):
@@ -95,7 +99,25 @@ class InstallPfEnableRef(unittest.TestCase):
         out = self.run_it("--install")
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(target.read_bytes(), SOURCE.read_bytes())
-        self.assertEqual(self.verbs()[-3:-1], ["bootout", "bootstrap"])
+        verbs = self.verbs()
+        at = len(verbs) - 1 - verbs[::-1].index("bootstrap")
+        self.assertEqual(verbs[at - 1:at + 2], ["bootout", "bootstrap", "kickstart"])
+
+    def test_a_foreign_loaded_path_is_booted_out_before_bootstrap(self):
+        target = self.daemons / f"{LABEL}.plist"
+        target.write_bytes(SOURCE.read_bytes())
+        self.loaded.write_text(str(self.tmp / "foreign.plist"))
+        out = self.run_it("--install")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        verbs = self.verbs()
+        self.assertLess(verbs.index("bootout"), verbs.index("bootstrap"))
+        self.assertIn("boot it out", out.stdout)
+
+    def test_missing_token_fails_even_when_the_run_exit_is_zero(self):
+        self.write_token.write_text("0")
+        out = self.run_it("--install")
+        self.assertEqual(out.returncode, 5)
+        self.assertIn("token", out.stderr)
 
     def test_a_failed_run_is_reported_not_called_installed(self):
         self.exit_code.write_text("1")
