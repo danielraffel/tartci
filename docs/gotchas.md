@@ -92,6 +92,53 @@ Do not kickstart self-update during the stall.
 Hard-won, one bullet each. Grouped by lane. If a build/install behaves
 inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
 
+## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
+
+**Symptom:** a lane reads `job-running` for up to two hours while its VM is
+frozen; the watchdog's frozen-lane heal skips a host with a running VM, so
+nothing frees the slot before `TARTCI_JOB_TIMEOUT_SECS` (7200).
+
+**Cause:** the host waits on the ssh session that runs the guest's listener. A
+guest that hangs can keep that TCP session open, so the host sees neither
+output nor an exit.
+
+**Fix:** the guest launcher writes `TARTCI_GUEST_HEARTBEAT <epoch>` every
+`TARTCI_GUEST_HEARTBEAT_SECS` (30) into that session. Once the first one
+arrives, the host tears the VM down when the listener log has been silent for
+`TARTCI_GUEST_HEARTBEAT_STALE_SECS`: it records `guest_heartbeat_stale`,
+cancels an assigned job's run, and frees the slot. Every lane in the shipped
+profiles sets it with `guest_heartbeat_stale_seconds = 600`. Before the first
+heartbeat (runner still starting, or a guest launcher from an older
+generation) silence proves nothing and the idle and job timeouts apply.
+Heartbeat lines are dropped from the runner log the host echoes.
+
+## A gate lane sits in `booting` for over an hour with a stale heartbeat (m1, 2026-10-09)
+
+**Symptom:** `tartci doctor fleet` reports `fleet_not_ready` with
+`heartbeat_stale`, while the host still serves jobs on its other lanes. The
+stale lane's state file shows `phase: booting`, its VM has an IP
+(`boot_ip` in the lane's `events.jsonl`), there is no actions-runner log for
+the VM, and `ps` shows the supervisor running one `ssh admin@<vm-ip> true`
+after another, each lasting about a minute.
+
+**Cause:** the boot helper waited for the guest's sshd with 90 attempts and a
+2 s sleep, meant as 180 s. `ConnectTimeout=10` bounds only the TCP connect,
+so a guest that accepts the connection but never finishes the handshake holds
+each attempt for about 60 s. The 90 attempts then take about 93 minutes, and
+nothing writes a heartbeat meanwhile. On m1, `pulp-gate.slot2` sat there for
+71+ minutes.
+
+**Fix:** the wait is bounded by wall-clock time. Each attempt is killed at
+`TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15) and the whole wait ends at
+`TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180), after which the VM is discarded
+with `boot_failed no_ssh` and `waited_s`/`attempts` fields. Each failed
+attempt refreshes the boot phase's heartbeat, which is honest because the wait
+has a hard end. The doctor's `fleet_not_ready` line now names each problem's
+lane and heartbeat age, for example
+`heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`.
+A host on a generation from before this fix discards such a VM only after the
+attempts run out; it heals once it self-updates.
+
 ## A `while read` loop ends early after a peer read over ssh (2026-10-04)
 
 *Symptom:* the supervisor observed only the first class with young demand;
@@ -254,6 +301,22 @@ first; list it only when what it asserts really needs tomllib.
   Python 3.11+ path in the host's launchd environment when the default
   Homebrew locations do not apply. Verify by *parsing the config*, not by
   checking the file exists.
+
+- **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
+  them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/Workshop/VMs`); a
+  shell over ssh has none, so `tart` reads its default `~/.tart`. Before
+  2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
+  doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0
+  running VMs and 2 free slots while two gate VMs ran. → *Fix:* `tartci
+  doctor` and `tartci observe` now export the fleet profile's
+  `[host].tart_home` when the shell has no `TART_HOME`, and print the store
+  they read and where it came from (`tart store: /Users/<you>/VMs
+  ([host].tart_home from ...)`); the reap digest carries it as
+  `config.tart_home`. A shell `TART_HOME` that differs from the profile's is
+  kept but flagged. For raw Tart over ssh, pass the store yourself:
+  `ssh <host> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list'`.
+  `python3 scripts/tart_home.py` prints what a command on that host resolves.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.

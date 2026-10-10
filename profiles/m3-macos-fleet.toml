@@ -104,6 +104,13 @@ scratch_dirs = true
 # host): 232 idle, clean, pushed worktrees there held ~143 GiB on 2026-09-29.
 # Dirty, unpushed, recent, in-use and lineage-active checkouts stay.
 worktree_root_checkouts = true
+# Evict gate ccache entries unused for 14 days, once a day, only while no VM
+# is running or leased (scripts/gate_ccache_trim.py). m3's gate cache held 414k entries and the guard ran out of budget on
+# 8-13% of boots. The m5 canary
+# (2026-10-03 to 10-09) cut the pre-boot guard's ok-run median from 89 s to
+# 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
+# rate held at 99.49% (99.51% before). Rollback: delete this key.
+gate_ccache_trim = true
 
 [[lane]]
 id = "pulp-gate"
@@ -129,6 +136,9 @@ replaces_launchd_labels = [
   "com.danielraffel.pulp.tart-runner",
   "com.danielraffel.pulp.tart-runner-slot2",
 ]
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 # The queue scan this supervisor runs is latency-sensitive: a Background
 # supervisor's GitHub API calls measured materially slower than the same calls
 # at normal priority, and every observed scan failure on this lane is a
@@ -197,6 +207,9 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
 workflows = ["Spectr M5 Product Acceptance"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "forge-gate"
@@ -211,6 +224,9 @@ labels = ["self-hosted", "macOS", "ARM64", "forge-build", "forge-build-vm", "for
 # the reusable callee directly. Watch both names on the same runner contract.
 workflows = ["build", "protected macOS build"]
 replaces_launchd_labels = ["com.danielraffel.forge.tart-runner-macos"]
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 [[lane]]
 id = "vellum-gate"
@@ -222,13 +238,23 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
 workflows = ["Locked macOS GPU proof", "README clean release proof"]
 replaces_launchd_labels = []
+# Tear a VM down once its guest stops heartbeating for this long; a
+# frozen guest otherwise holds the slot until the 2 h job timeout.
+guest_heartbeat_stale_seconds = 600
 
 # The support LaunchAgents this host carries (scripts/support_agents.py).
 # Self-update renders and compares them after every update; with bootstrap =
 # false it only reports, and installs or changes nothing.
+# The watchdog's frozen-lane threshold. 4500 s outlasts a gate job's longest
+# silent stretch; the 1800 default healed live supervisors (#191). It lived
+# only on hand-edited plists until it moved here (#195).
+[launchd_watchdog]
+stale_log_seconds = 4500
+
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
-bootstrap = false
+# Converge only the VM janitor; every other declared agent stays plan-only.
+bootstrap = ["reap"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse

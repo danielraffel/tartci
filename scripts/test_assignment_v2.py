@@ -1246,8 +1246,9 @@ class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
 
     The class-shaping environment is taken from each rendered profile, so a
     change to any host's shipped order is a change to these verdicts. Tiers are
-    merge-group (0), PR-head (1), release-tagged (2) and release PR gate (3).
-    The release-first slot is slot 2 on m1 and m5 and slot 1 on m3, whose slot
+    read from each host's rendered class labels (merge-group 0, PR-head 1,
+    release-tagged 2 and release PR gate 3 on a host serving both gate
+    classes; a host serving fewer shifts them). The release-first slot is slot 2 on m1 and m5 and slot 1 on m3, whose slot
     2 keeps the PR-first canary; the other slot on each host is the control on
     every identical queue.
     """
@@ -1283,27 +1284,31 @@ class ShippedFleetReleaseFirstSlotTests(RunnerFixture, unittest.TestCase):
         for profile, (_, release_slot) in self.HOSTS.items():
             with self.subTest(host=profile):
                 self.slots = self.hosts[profile]
+                classes = self.slots[1]["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"].split(",")
+                tagged = str(classes.index("pulp-release-tagged"))
+                release_pr = str(classes.index("pulp-release-pr-gate"))
+                gates = {str(i) for i, c in enumerate(classes) if c.startswith("pulp-build-")}
                 other = 3 - release_slot
                 # A tagged release outranks gate work only on the release-first slot.
                 self.assertEqual(
                     [slot for slot in (1, 2)
-                     if self._selected_tier(slot, release=True, **busy) == "2"
-                     and self._pre_mint(slot, "2", release=True, **busy) == "1"],
+                     if self._selected_tier(slot, release=True, **busy) == tagged
+                     and self._pre_mint(slot, tagged, release=True, **busy) == "1"],
                     [release_slot])
                 # The release PR gate is served while gate work waits, likewise.
                 self.assertEqual(
                     [slot for slot in (1, 2)
-                     if self._selected_tier(slot, release_pr=True, **busy) == "3"
-                     and self._pre_mint(slot, "3", release_pr=True, **busy) == "1"],
+                     if self._selected_tier(slot, release_pr=True, **busy) == release_pr
+                     and self._pre_mint(slot, release_pr, release_pr=True, **busy) == "1"],
                     [release_slot])
                 # Control: the other slot serves gate work on the identical queue.
-                self.assertIn(self._selected_tier(other, release=True, **busy), {"0", "1"})
+                self.assertIn(self._selected_tier(other, release=True, **busy), gates)
                 # Work-conserving: with only releases waiting both slots serve them.
                 for slot in (1, 2):
-                    self.assertEqual(self._selected_tier(slot, release=True), "2")
-                    self.assertEqual(self._pre_mint(slot, "2", release=True), "1")
+                    self.assertEqual(self._selected_tier(slot, release=True), tagged)
+                    self.assertEqual(self._pre_mint(slot, tagged, release=True), "1")
                 # With no release waiting the release-first slot serves gate work.
-                self.assertIn(self._selected_tier(release_slot, **busy), {"0", "1"})
+                self.assertIn(self._selected_tier(release_slot, **busy), gates)
 
 
 class IdleRetargetTests(RunnerFixture, unittest.TestCase):
