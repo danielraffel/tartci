@@ -316,6 +316,28 @@ live about 26 min on average against 4-5 min elsewhere. The key is off on every
 lane. Canary: m1, once it has had the pre-clone check for 72 h, with m3, m5 and
 m5studio as same-window controls; m5 joins after its ranked-lease canary read.
 
+## Serving fewer gate classes (`v2_gate_classes`, m1 PR-head only)
+
+An event-class-v2 lane serves both gate classes, merge-group then PR-head, as
+its first tiers. A lane may serve fewer only by naming the classes it keeps:
+
+```toml
+v2_gate_classes = ["pulp-build-pr-head"]
+```
+
+The list must be a non-empty subset of `["pulp-build-merge-group",
+"pulp-build-pr-head"]` in that order, and the lane's leading tiers must match
+it exactly. Dropping a gate tier without the key, or keeping a tier the key
+omits, fails validation, so an omitted class is always a stated decision.
+
+m1's `pulp-gate` declares PR-head only. Its 3-core gate guest ran merge_group
+macos jobs in 33-35 min against 15-22 min on m3, m5 and m5studio (4 of 33 jobs
+over a week to 2026-10-09), so every merge batch it took held the queue
+longest. m1 keeps PR-head and release work; `fleet/advertised-labels.json`
+lists merge-group for m3, m5 and m5studio only. Rollback: delete the key,
+restore the merge-group tier ahead of PR-head and in slot 2's
+`assignment_slot_tier_order`, regenerate the published labels.
+
 ## Per-slot class preference (opt-in, PR-first canary on m3)
 
 Every slot consults the classes in configured tier order, merge-group first.

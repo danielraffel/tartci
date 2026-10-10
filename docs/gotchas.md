@@ -302,6 +302,22 @@ first; list it only when what it asserts really needs tomllib.
   Homebrew locations do not apply. Verify by *parsing the config*, not by
   checking the file exists.
 
+- **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
+  them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/Workshop/VMs`); a
+  shell over ssh has none, so `tart` reads its default `~/.tart`. Before
+  2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
+  doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0
+  running VMs and 2 free slots while two gate VMs ran. → *Fix:* `tartci
+  doctor` and `tartci observe` now export the fleet profile's
+  `[host].tart_home` when the shell has no `TART_HOME`, and print the store
+  they read and where it came from (`tart store: /Users/<you>/VMs
+  ([host].tart_home from ...)`); the reap digest carries it as
+  `config.tart_home`. A shell `TART_HOME` that differs from the profile's is
+  kept but flagged. For raw Tart over ssh, pass the store yourself:
+  `ssh <host> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list'`.
+  `python3 scripts/tart_home.py` prints what a command on that host resolves.
+
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
   → *Fix:* TartCI's watchdog/network-profile inventory probe resolves
