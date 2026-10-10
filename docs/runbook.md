@@ -1992,7 +1992,27 @@ fleet`), and check GitHub's job history against it with
   generation, so it starts with the update after the one that installs it.
 - **One host at a time.** Every other host in main's
   `fleet/advertised-labels.json` must be `on` and not self-updating, read over
-  SSH. The marker's age is measured on the peer's own clock.
+  SSH at every attempt (the read is never cached). The marker's age is
+  measured on the peer's own clock. The marker is read before the pool state:
+  a self-update announces and then drains, so a peer mid-update is reported
+  as `peer X is self-updating to <commit> (N min in)`, never as plain
+  `draining`. A peer that is not serving for any other reason is reported with
+  how long its pool state has been unchanged (the mtime of its
+  `~/.config/tartci/pool-state`).
+- **A long markerless drain stops holding the turn.** A peer that is
+  `draining` with no live update marker, whose pool state has not changed for
+  `PEER_DRAIN_STALE_SECONDS` (3 h, the marker's own TTL), is treated like an
+  off peer: it holds no turn and the capacity floor counts it as serving
+  nothing. A self-update holds a live marker through its whole drain, so this
+  is an operator drain or an update that died after draining. A drain of
+  unknown age (the peer's pool-state file could not be read) still holds the
+  turn, and a peer that is `on` but not participating always does.
+- **The recorded reason is as old as the last attempt.** `waiting.json`'s
+  `reason` is the survey of the last attempt, up to one 30 min interval old.
+  A reason that names a peer which now reads `on` is not a stale view: the
+  next attempt reads the peer afresh. On 2026-10-09 m5studio finished its
+  update at 06:10Z and m5's next attempt, which took the turn, ran at 06:36Z;
+  each hand-off between hosts costs up to one interval.
 - **Update queue.** A host that defers keeps a ticket in
   `~/.tartci/state/self-update/waiting.json` whose `since` records when it
   joined the queue and survives new targets. Hosts take turns in `since`
