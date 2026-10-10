@@ -143,7 +143,7 @@ assignment_idle_retarget_seconds = 120
 # class label, which Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in.
 # Rollback: delete the slot-1 entry and the release tiers (restore slot 2 to
 # the two gate classes), re-render, reload both slots at an idle boundary.
-assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-build-pr-head", "pulp-build-merge-group", "pulp-release-tagged", "pulp-release-pr-gate"] }
+assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
