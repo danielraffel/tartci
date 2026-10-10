@@ -75,6 +75,7 @@ class FakeSystem(su.System):
         self.clone_ok = True
         self.remote_url = su.REPO_URL + "\n"
         self.api_repository = su.DEFAULT_REPOSITORY
+        self.unreadable_repositories: set[str] = set()
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -145,6 +146,9 @@ class FakeSystem(su.System):
         if self.hook:
             self.hook(a)
         if a[0] == FAKE_GH:
+            repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if repository in self.unreadable_repositories:
+                return su.Result(1, "", "not found")
             if "check-runs" in a[2]:
                 sha = a[2].split("/commits/")[1].split("/")[0]
                 runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
@@ -2169,16 +2173,23 @@ class IncidentTests(Base):
 
 
 class RepositoryIdentityTests(Base):
+    def test_default_resolution_uses_first_readable_accepted_slug(self):
+        self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
+        self.sys.api_repository = su.DEFAULT_REPOSITORY
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.DEFAULT_REPOSITORY,
+                             su.canonical_repository(self.cfg, self.sys))
+
     def test_api_accepts_legacy_and_new_full_name(self):
         for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
             self.sys.api_repository = repository
             with mock.patch.dict(os.environ, {"GH_REPO": repository}):
-                self.assertEqual(su.canonical_repository(self.cfg, self.sys, T_NEW), repository)
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys), repository)
 
     def test_api_rejects_third_repository(self):
         self.sys.api_repository = "example/other-tartci"
         with self.assertRaises(su.Refused):
-            su.canonical_repository(self.cfg, self.sys, T_NEW)
+            su.canonical_repository(self.cfg, self.sys)
 
     def test_refresh_rejects_third_remote(self):
         self.sys.remote_url = "https://example.invalid/other-tartci.git\n"

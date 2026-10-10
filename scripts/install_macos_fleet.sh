@@ -528,7 +528,7 @@ stage_result="$("$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" stage-i
 support_root="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<<"$stage_result")"
 installed_support_manifest="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["manifest"])' <<<"$stage_result")"
 launch_entrypoint="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["launch_entrypoint"])' <<<"$stage_result")"
-support_commit="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
+support_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
 
 mkdir -p "$(dirname "$ENTRYPOINT")"
 "$PYTHON_BIN" - "$(dirname "$ENTRYPOINT")" <<'PY' || {
@@ -613,7 +613,7 @@ print(next(iter(ghapp_paths)))
 PY
 )"
 
-support_repository="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
+support_repository="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
 case "$support_repository" in
   "https://github.com/generous-corp/tartci.git"|"https://github.com/danielraffel/tartci.git") ;;
   *)
@@ -625,7 +625,7 @@ if [ "$support_repository" != "$TARTCI_REPOSITORY_URL" ]; then
   echo "fleet install accepts the legacy support identity during migration: $support_repository" >&2
 fi
 
-authority_env_json="$($PYTHON_BIN - "$locked_config" "$ROOT" <<'PYINNER'
+authority_env_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PYINNER'
 import json
 import sys
 from pathlib import Path
@@ -646,9 +646,9 @@ api_commit_json() {
       "$ghapp_path" api "repos/$TARTCI_REPOSITORY/commits/$commit"
   else
     local app_id app_key app_cache
-    app_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
-    app_key="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
-    app_cache="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
     SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
@@ -663,9 +663,9 @@ api_repository_json() {
       "$ghapp_path" api "repos/$TARTCI_REPOSITORY"
   else
     local app_id app_key app_cache
-    app_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
-    app_key="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
-    app_cache="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
     SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
@@ -678,8 +678,8 @@ verify_source_commit() {
   local expected="$1" response repository_response canonical actual
   response="$(api_commit_json "$expected")" || return 1
   repository_response="$(api_repository_json)" || return 1
-  canonical="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$repository_response")"
-  actual="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$response")"
+  canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$repository_response")"
+  actual="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$response")"
   case "$canonical" in
     "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
     *) echo "fleet install API returned an untrusted canonical repository: $canonical" >&2; return 1 ;;
