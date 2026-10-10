@@ -36,14 +36,16 @@ install_media_bus = "usb-storage"   # ALL install CDs on USB — autounattend is
 firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
 ssh_hostfwd = "2222:22"
 
-# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = 09bfe44e0d65d4187eb20203b5f6e833a4fd0f10e4dd252b56e7dc0e7cd99b4f
-# generated_platform = windows
 [toolchain]
+msvc = "14.44"  # Handwritten: MSVC comes from the Windows image.
+ninja = "choco"  # Handwritten: Windows lane keeps Ninja.
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = windows
 cmake = "system"
 python = "3.12"
 node = "26.10.0"
-rust_targets = ["x86_64-apple-darwin"]
 
 [choco]
 packages = [

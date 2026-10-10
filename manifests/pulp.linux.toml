@@ -20,14 +20,15 @@ repository = "https://github.com/Generous-Corp/pulp"
 commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
-# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = 09bfe44e0d65d4187eb20203b5f6e833a4fd0f10e4dd252b56e7dc0e7cd99b4f
-# generated_platform = linux
 [toolchain]
+ninja = "apt"  # Handwritten: Linux lane keeps the distro ninja package.
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = linux
 cmake = "system"
 python = "3.12"
 node = "26.10.0"
-rust_targets = ["x86_64-apple-darwin"]
 
 [apt]
 packages = [
