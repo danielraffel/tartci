@@ -29,6 +29,17 @@ HOST_CONFIGS = {
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
 }
+# The Pulp gate classes each host's pulp-gate serves. m1 serves PR-head only
+# (`v2_gate_classes`): its 3-core guest ran merge_group jobs in 33-35 min
+# against 15-22 min on the other hosts.
+GATE_CLASSES = {"m1": ["pulp-build-pr-head"]}
+BOTH_GATE_CLASSES = ["pulp-build-merge-group", "pulp-build-pr-head"]
+
+
+def gate_classes(host_id: str) -> list[str]:
+    return GATE_CLASSES.get(host_id, BOTH_GATE_CLASSES)
+
+
 RUNNER_GROUP_IDS = {
     "Generous-Corp/pulp": 1,
     "danielraffel/spectr": 1,
@@ -737,11 +748,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 ]
                 self.assertEqual(
                     [tier["label"] for tier in pulp_lane["tier"]],
-                    ["pulp-build-merge-group", "pulp-build-pr-head", *release_tiers],
+                    [*gate_classes(host_id), *release_tiers],
                 )
                 self.assertEqual(
                     [tier["runner_group_id"] for tier in pulp_lane["tier"]],
-                    [1] * (2 + len(release_tiers)),
+                    [1] * (len(gate_classes(host_id)) + len(release_tiers)),
                 )
                 self.assertEqual(pulp_lane["assignment_mode"], "event-class-v2")
                 self.assertEqual(
@@ -968,7 +979,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_OMIT_LABELS"], "pulp-gate-fast")
                         self.assertEqual(env["TARTCI_ASSIGNMENT_V2_REQUIRED_OMIT_LABELS"], "pulp-gate-fast")
                         # Every host declares the release classes.
-                        classes = ["pulp-build-merge-group", "pulp-build-pr-head",
+                        classes = [*gate_classes(host_id),
                                    "pulp-release-tagged", "pulp-release-pr-gate"]
                         self.assertEqual(
                             env["TARTCI_ASSIGNMENT_V2_CLASS_LABELS"],
@@ -1314,12 +1325,14 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", pulp["EnvironmentVariables"])
             self.assertNotIn("TARTCI_MACOS_VM_CORES", pulp["EnvironmentVariables"])
-            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
+            # CONFIG is m1, which serves PR-head and no merge-group work.
+            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-pr-head|"))
+            self.assertNotIn("pulp-build-merge-group", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
                 pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
-                "pulp-build-merge-group|1\npulp-build-pr-head|1\n"
+                "pulp-build-pr-head|1\n"
                 "pulp-release-tagged|1\npulp-release-pr-gate|1",
             )
             self.assertEqual(
@@ -2007,7 +2020,8 @@ class MacosFleetLaneTests(unittest.TestCase):
                            "pulp-build-merge-group,pulp-build-pr-head")
     SHIPPED_SLOT_ORDERS = {
         ".m1.pulp-gate.plist": None,
-        ".m1.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
+        ".m1.pulp-gate.slot2.plist": ("pulp-release-tagged,pulp-release-pr-gate,"
+                                      "pulp-build-pr-head"),
         ".studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
         ".studio.pulp-gate.slot2.plist": ("pulp-build-pr-head,pulp-build-merge-group,"
                                           "pulp-release-tagged,pulp-release-pr-gate"),
@@ -2036,7 +2050,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     # order, so runner groups and tier numbers are unchanged.
                     self.assertEqual(
                         env["TARTCI_RUNNER_WORKFLOW_TIERS"].splitlines()[0],
-                        "pulp-build-merge-group|Build and Test",
+                        f"{gate_classes(host_id)[0]}|Build and Test",
                     )
         self.assertEqual(seen, set(self.SHIPPED_SLOT_ORDERS))
 
@@ -2401,7 +2415,8 @@ workflows=["Product acceptance"]
                     )
 
     def test_pulp_pr_head_contract_cannot_omit_class_or_repository_scope(self) -> None:
-        base = CONFIG.read_text()
+        # m5 serves both gate classes; m1 (CONFIG) serves PR-head only.
+        base = HOST_CONFIGS["m5"].read_text()
         fixtures = {
             "missing-pr-head": base.replace(
                 '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n',
@@ -2775,12 +2790,12 @@ replaces_launchd_labels=REPLACEMENT
         exactly one release-first slot, and its other slot orders both gate
         classes ahead of both release classes. No other lane but m5's legacy
         pulp-release controller scans for or registers a release class."""
-        four = ("pulp-build-merge-group,pulp-build-pr-head,"
-                "pulp-release-tagged,pulp-release-pr-gate")
-        gate = {"pulp-build-merge-group", "pulp-build-pr-head"}
         release = {"pulp-release-tagged", "pulp-release-pr-gate"}
         seen = 0
         for host_id, config in HOST_CONFIGS.items():
+            gate = set(gate_classes(host_id))
+            four = ",".join([*gate_classes(host_id), "pulp-release-tagged",
+                             "pulp-release-pr-gate"])
             orders = {}
             for name, body in fleet.rendered_plists(fleet.load(config)).items():
                 env = plistlib.loads(body)["EnvironmentVariables"]
@@ -2805,8 +2820,8 @@ replaces_launchd_labels=REPLACEMENT
                 self.assertEqual(len(release_first), 1)
                 for slot, order in orders.items():
                     if slot not in release_first:
-                        self.assertEqual(set(order[:2]), gate)
-                        self.assertEqual(set(order[2:]), release)
+                        self.assertEqual(set(order[:len(gate)]), gate)
+                        self.assertEqual(set(order[len(gate):]), release)
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))
         release_rows = {
             (row["profile"], row["lane"], row["class_label"])
