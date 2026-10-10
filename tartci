@@ -13,7 +13,7 @@
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
-  tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
+#   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
 #   tartci ccache scan [--host-cache]    # read-only: count zero-include manifests
 #   tartci ccache quarantine [--host-cache]  # move them to <cache>-quarantine
