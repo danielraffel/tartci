@@ -595,6 +595,18 @@
     "undeclared_fleet_agents_none": {
       "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
     },
+    "vm_janitor_loaded": {
+      "summary": "The VM janitor (com.danielraffel.tartci.reap) is installed from its render and loaded."
+    },
+    "vm_janitor_missing": {
+      "summary": "The VM janitor (com.danielraffel.tartci.reap) is not declared, not installed, or not loaded.",
+      "why": "Without it a stale VM or overlay stays in the Tart store until someone notices. On 2026-10-09 every profile declared it and only m3 had it, because `bootstrap = false` kept the support-agents step to a plan.",
+      "remedy": "Declare reap in [support_agents] declared and list it in bootstrap (bootstrap = [\"reap\"]); the next self-update installs it. To install by hand, run `tartci fleet-macos support-agents apply` with that profile."
+    },
+    "vm_janitor_unknown": {
+      "summary": "No readable support-agents receipt, so whether the VM janitor is installed is unknown.",
+      "remedy": "Run `tartci fleet-macos support-agents plan` and read ~/.tartci/state/support-agents/last.json."
+    },
     "vm_boot_degraded": {
       "summary": "At least max(2, lanes) VM boots on this host got no address in the last 24 h: one failed boot per lane in a day.",
       "why": "On 30 days of the fleet's own lane logs (2026-10-07), m3, m1 and m5studio had no day with any boot that got no address, and m5's outage days had 13, 10, 172 and 122 while its one isolated day had 2 in 53 boots. A count rather than a rate: at these volumes one failure moves the rate, so the rate is reported and never judged. The VM-DHCP breaker stops most of the cloning during an outage; this finding is the record that it happened and how often.",
