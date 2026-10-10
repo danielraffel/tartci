@@ -33,7 +33,9 @@ a stale receipt is the doctor's launchd_timers check on that host).
 It runs wherever the watchdog does, including the system python3 (3.9). The
 peer list is main's published supply in the self-update checkout; without
 tomllib this host's id falls back to its node name (vm_boot_alert), and when
-that names no published host it reads every published host, itself included.
+that names no published host it reads every published host, itself included,
+and acts on none: a reader that cannot name itself cannot tell whether it is
+the primary, so it only reads and reports.
 """
 from __future__ import annotations
 
@@ -307,7 +309,11 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         held = host_off._read_json(state_path) or {}
         verdict = judge(info, threshold, held.get("since"))
         primary = primary_reader(peer, hosts)
-        if me is None or primary == me:
+        if me is None:
+            # A reader that cannot name itself cannot tell whether it is the
+            # primary: it reads and reports, and leaves issues to named hosts.
+            acting, why = False, "this host's id is unknown; read-only"
+        elif primary == me:
             acting, why = True, "primary"
         else:
             pinfo = reads.get(primary) or {}

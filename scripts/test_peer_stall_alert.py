@@ -180,6 +180,36 @@ class PeerStall(unittest.TestCase):
         out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS, host="m5")
         self.assertTrue(out["peers"]["studio"]["acting"])
 
+    def test_a_fallback_keeps_closing_what_it_opened_after_the_primary_returns(self):
+        self.fleet.answers["m1"] = (255, "", "ssh: Operation timed out")
+        self.run_pass(RECEIPT_TS + 60, host="m5")
+        out = self.run_pass(RECEIPT_TS + 60 + psa.READ_SECS, host="m5")
+        self.assertTrue(out["peers"]["studio"]["acting"])
+        self.assertEqual([t for t, _ in self.opened], [TITLE])
+        # The primary is back and reading studio, so m5 is no longer acting.
+        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                "paused": []},
+                         clock=RECEIPT_TS + 2 * psa.READ_SECS + 60,
+                         last={**self.fresh_primary_pass(), "ts": RECEIPT_TS + 2 * psa.READ_SECS})
+        # studio recovers: a fresh ok receipt written after the episode began.
+        self.fleet.guard("m3", {**M3_RECEIPT, "ts": RECEIPT_TS + 2 * psa.READ_SECS,
+                                "episode": {"active": False}, "stalled": [], "paused": []},
+                         clock=RECEIPT_TS + 2 * psa.READ_SECS + 30)
+        out = self.run_pass(RECEIPT_TS + 60 + 2 * psa.READ_SECS, host="m5")
+        self.assertFalse(out["peers"]["studio"]["acting"])
+        self.assertTrue(out["peers"]["studio"]["closed"], "the host that opened it closes it")
+        self.assertEqual(self.closed, ["501"])
+        self.assertFalse((self.tmp / "m5" / "studio.json").exists())
+
+    def test_an_unidentified_reader_is_read_only(self):
+        for k in range(3):        # past any fallback's two misses
+            out = psa.alert_pass(now=RECEIPT_TS + 60 + k * psa.READ_SECS,
+                                 directory=self.tmp / "anon", peers=PEERS, me=None,
+                                 run=self.fleet.run, issue=self.issue, close=self.close)
+        self.assertTrue(out["peers"]["studio"]["active"], "it still sees the stall")
+        self.assertFalse(out["peers"]["studio"]["acting"])
+        self.assertEqual(self.opened, [])
+
     def test_the_primary_is_the_lowest_published_id_other_than_the_peer(self):
         hosts = ["m1", "m5", "m5studio", "studio"]
         self.assertEqual(psa.primary_reader("studio", hosts), "m1")

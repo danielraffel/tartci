@@ -1856,6 +1856,8 @@ alert, so its peers raise it.
   Before opening, any reader adopts an open issue with the exact title, which
   covers a fallback and a returning primary overlapping. A host that opened
   or adopted an issue keeps closing it.
+  A host whose own id is unknown (no readable profile) reads and reports but
+  never opens or closes an issue.
 - **When it closes.** When a reader sees a fresh receipt, written after the
   episode began, that reports no stall. A stale receipt (no guard running
   there; that host's doctor `launchd_timers` says so) never closes it, and an
