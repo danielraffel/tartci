@@ -243,7 +243,13 @@ possibly torn profile.
 
 The key invariant: the LaunchAgent, `tartci doctor`, and Shipyard capacity must
 all point at the same Tart store. If one uses default `tart` state and another
-uses `TART_HOME`, capacity and cleanup will disagree.
+uses `TART_HOME`, capacity and cleanup will disagree. `tartci doctor` (including
+`doctor --reap`, which Shipyard's health probe runs) and `tartci observe` hold
+that invariant for you: with no `TART_HOME` in the environment they export the
+fleet profile's `[host].tart_home`, and they print `tart store: <path> (<why>)`.
+An explicit `TART_HOME` that differs from the profile's wins but is printed with
+a WARNING. Raw `tart` over ssh still reads `~/.tart` unless you pass the store
+(see gotchas: "`ssh <host> 'tart list'` shows no gate VMs").
 Shipyard's fleet health probe also shells `tartci doctor --reap --json` on each
 host, so set `tartci_bin` to the same home-backed wrapper the LaunchAgent uses.
 Do not diagnose installation state from raw `ssh host 'command -v tart'` output:
