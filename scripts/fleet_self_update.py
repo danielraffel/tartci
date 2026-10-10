@@ -125,6 +125,13 @@ PEER_UNREACHABLE_MIN_READS = 4
 # measured on its own clock.
 PEER_UNREACHABLE_FRESH_SECONDS = 3600
 PEER_UNREADABLE_NAME = "peer-unreadable.json"
+# A peer DRAINING with no live update marker, whose pool state has not changed
+# for this long, stops holding the update turn and is left to the capacity
+# floor, like an off peer. A self-update holds a live marker for its whole
+# drain, and a drain waits only for running jobs, so a markerless drain this
+# old is an operator drain or an update that died after draining. The bound is
+# the marker's own TTL: a dead update's marker stops counting at the same age.
+PEER_DRAIN_STALE_SECONDS = ACTIVE_MARKER_TTL
 MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
@@ -745,12 +752,15 @@ def self_host_id(cfg: Config) -> str:
 # the peer's clock so host clock skew cannot make a live marker look stale.
 WAITING_SEPARATOR = "--- waiting ---"
 UNREADABLE_SEPARATOR = "--- unreadable ---"
+POOL_SINCE_SEPARATOR = "--- pool-state-since ---"
 _PEER_MARKER = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/active.json" '
                 '2>/dev/null || true; echo; echo "' + WAITING_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/waiting.json" 2>/dev/null || true; '
                 'echo; echo "' + UNREADABLE_SEPARATOR + '"; '
                 'cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/' + PEER_UNREADABLE_NAME
-                + '" 2>/dev/null || true')
+                + '" 2>/dev/null || true; echo; echo "' + POOL_SINCE_SEPARATOR + '"; '
+                'stat -f %m "${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}" '
+                '2>/dev/null || true')
 
 
 def _ssh_failure_kind(result: Result) -> str:
@@ -808,8 +818,11 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
     first, _, rest = marker.out.partition("\n")
     clock = int(first.strip()) if marker.rc == 0 and first.strip().isdigit() else None
     out["clock"] = clock
+    rest, _, pool_since_text = rest.partition(POOL_SINCE_SEPARATOR)
     active_text, _, waiting_text = rest.partition(WAITING_SEPARATOR)
     waiting_text, _, unreadable_text = waiting_text.partition(UNREADABLE_SEPARATOR)
+    pool_since = (int(pool_since_text.strip())
+                  if clock is not None and pool_since_text.strip().isdigit() else None)
     if clock is not None and unreadable_text.strip():
         try:
             report = json.loads(unreadable_text)
@@ -826,22 +839,42 @@ def read_peer(cfg: Config, sys_: System, host_id: str, target: str) -> dict[str,
                 and clock - float(ticket.get("ts", 0)) < WAITING_TICKET_TTL):
             out["since"] = float(ticket["since"])
     is_off = value.get("state") == "off"
-    if not is_off and (value.get("state") != "on" or value.get("participating") is not True):
-        out["evidence"] = (f"peer {host_id} is {value.get('state')} "
-                           f"(participating={value.get('participating')})")
-        return out
+    serving = value.get("state") == "on" and value.get("participating") is True
+    not_serving = (f"peer {host_id} is {value.get('state')} "
+                   f"(participating={value.get('participating')})")
     if clock is None:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable (exit {marker.rc})"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable (exit {marker.rc})")
         return out
+    # The update marker is read BEFORE the pool state. A self-update announces,
+    # then drains, so a peer mid-update reads as draining; checked first, the
+    # pool state hid that it was the turn holder and how long it had held the
+    # turn (m5 on 2026-10-09 read "peer m5studio is draining" for an update
+    # that was 10 minutes in).
     active = None
     try:
         active = json.loads(active_text) if active_text.strip() else None
     except json.JSONDecodeError:
-        out["evidence"] = f"peer {host_id} self-update marker unreadable"
+        out["evidence"] = (not_serving if not (is_off or serving)
+                           else f"peer {host_id} self-update marker unreadable")
         return out
     if isinstance(active, dict) and clock - float(active.get("ts", 0)) < ACTIVE_MARKER_TTL:
-        out.update(evidence=f"peer {host_id} is self-updating to {str(active.get('target'))[:12]}",
-                   active_age=max(0.0, clock - float(active.get("ts", 0))))
+        age = max(0.0, clock - float(active.get("ts", 0)))
+        out.update(evidence=(f"peer {host_id} is self-updating to "
+                             f"{str(active.get('target'))[:12]} ({int(age // 60)} min in)"),
+                   active_age=age)
+        return out
+    if value.get("state") == "draining" and pool_since is not None \
+            and clock - pool_since >= PEER_DRAIN_STALE_SECONDS:
+        out.update(busy=False, off=True,
+                   evidence=(f"peer {host_id} has been draining for "
+                             f"{(clock - pool_since) / 3600:.1f} h with no update marker "
+                             "(left to the capacity floor)"))
+        return out
+    if not is_off and not serving:
+        since = (f", pool state unchanged for {int((clock - pool_since) // 60)} min"
+                 if pool_since is not None else "")
+        out["evidence"] = not_serving + since
         return out
     if is_off:
         out.update(busy=False, off=True,
