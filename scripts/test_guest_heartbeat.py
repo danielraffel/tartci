@@ -20,6 +20,10 @@ import time
 import unittest
 from pathlib import Path
 
+import sys as _sys
+_sys.path.insert(0, str(Path(__file__).resolve().parent))
+import testing_support  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 GUEST = ROOT / "providers" / "tart-macos" / "guest-aqua-runner.sh"
@@ -147,6 +151,7 @@ class GuestLauncherTests(unittest.TestCase):
         self.assertIn("printf 'TARTCI_GUEST_HEARTBEAT %s\\n'", loop)
         self.assertIn('TARTCI_GUEST_HEARTBEAT_SECS:-30', body)
 
+    @testing_support.requires_tomllib
     def test_the_threshold_comes_from_the_profile(self) -> None:
         import sys
         sys.path.insert(0, str(ROOT / "scripts"))
