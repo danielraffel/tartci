@@ -4,10 +4,11 @@ set -euo pipefail
 
 DEFAULT_TARTCI_REPOSITORY="Generous-Corp/tartci"
 LEGACY_TARTCI_REPOSITORY="danielraffel/tartci"
-TARTCI_REPOSITORY="${GH_REPO:-$DEFAULT_TARTCI_REPOSITORY}"
-case "$TARTCI_REPOSITORY" in
+REQUESTED_TARTCI_REPOSITORY="${GH_REPO:-}"
+case "$REQUESTED_TARTCI_REPOSITORY" in
+  "") TARTCI_REPOSITORY="$DEFAULT_TARTCI_REPOSITORY" ;;
   "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
-  *) echo "fleet install refuses unsupported TartCI repository identity: $TARTCI_REPOSITORY" >&2; exit 3 ;;
+  *) echo "fleet install refuses unsupported TartCI repository identity: $REQUESTED_TARTCI_REPOSITORY" >&2; exit 3 ;;
 esac
 TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
 
@@ -193,7 +194,7 @@ if len(paths) != 1:
 print(next(iter(paths)))
 PY
 )"
-preflight_repository="$TARTCI_REPOSITORY"
+preflight_repository="${REQUESTED_TARTCI_REPOSITORY:-}"
 preflight_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
 preflight_app_json="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
 import json, sys
@@ -204,9 +205,9 @@ print(json.dumps(fleet.load(Path(sys.argv[1])).get("github_app") or {}))
 PY
 )"
 preflight_api() {
-  local endpoint="$1" app_id app_key app_cache
+  local repository="$1" endpoint="$2" app_id app_key app_cache
   if [ "$preflight_app_json" = "{}" ]; then
-    HOME="$HOME" GH_REPO="$preflight_repository" SHIPYARD_GH_APP_REPO="$preflight_repository" \
+    HOME="$HOME" GH_REPO="$repository" SHIPYARD_GH_APP_REPO="$repository" \
       "$preflight_ghapp_path" api "$endpoint"
   else
     app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$preflight_app_json")"
@@ -215,19 +216,35 @@ preflight_api() {
     HOME="$HOME" SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
-    GH_REPO="$preflight_repository" SHIPYARD_GH_APP_REPO="$preflight_repository" \
+    GH_REPO="$repository" SHIPYARD_GH_APP_REPO="$repository" \
       "$preflight_ghapp_path" api "$endpoint"
   fi
 }
-if ! preflight_repository_json="$(preflight_api "repos/$preflight_repository")"; then
-  echo "fleet install could not authenticate repository via rendered ghapp ($preflight_ghapp_path)" >&2
+preflight_repositories="${preflight_repository:-$LEGACY_TARTCI_REPOSITORY $DEFAULT_TARTCI_REPOSITORY}"
+preflight_repository_json=""
+preflight_canonical=""
+for candidate in $preflight_repositories; do
+  if preflight_repository_json="$(preflight_api "$candidate" "repos/$candidate" 2>/dev/null)"; then
+    candidate_canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$preflight_repository_json")"
+    case "$candidate_canonical" in
+      "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY")
+        preflight_repository="$candidate"
+        preflight_canonical="$candidate_canonical"
+        break
+        ;;
+    esac
+  fi
+done
+[ -n "$preflight_repository" ] || {
+  echo "fleet install could not authenticate either supported TartCI repository via rendered ghapp ($preflight_ghapp_path)" >&2
   exit 3
-fi
-if ! preflight_commit_json="$(preflight_api "repos/$preflight_repository/commits/$preflight_commit")"; then
+}
+TARTCI_REPOSITORY="$preflight_canonical"
+TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
+if ! preflight_commit_json="$(preflight_api "$TARTCI_REPOSITORY" "repos/$TARTCI_REPOSITORY/commits/$preflight_commit")"; then
   echo "fleet install could not authenticate exact TartCI source commit via rendered ghapp ($preflight_ghapp_path)" >&2
   exit 3
 fi
-preflight_canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$preflight_repository_json")"
 preflight_actual="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$preflight_commit_json")"
 case "$preflight_canonical" in
   "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
