@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock
+from observation_lock import FairObservationLock, ObservationBackoff
 
 PER_PAGE = 100
 
@@ -42,10 +42,6 @@ class CurrentJobScanner:
         self.api_lock = threading.Lock()
         self.page_fingerprints: dict[str, tuple[tuple[int, ...], ...]] = {}
         self.observation_lock_path = Path(args.observation_lock_file)
-        self.lock_wait_timeout = min(
-            args.observation_lock_timeout, args.scan_timeout
-        )
-        self.lock_deadline = time.monotonic() + self.lock_wait_timeout
         self.observation_lock_fd: int | None = None
 
     @contextlib.contextmanager
@@ -56,7 +52,6 @@ class CurrentJobScanner:
             self.args.repo, getattr(self.args, "observation_backoff_file", None),
             getattr(self.args, "observation_backoff_seconds", 30.0),
         ).hold() as handle:
-            self.deadline = time.monotonic() + self.args.scan_timeout
             self.observation_lock_fd = os.dup(handle.fileno())
             os.set_inheritable(self.observation_lock_fd, True)
             try:
@@ -292,6 +287,10 @@ def main() -> int:
         with scanner.observation_lock():
             receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    except (TimeoutError, ObservationBackoff) as error:
+        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
     except ScanError as error:
         print(json.dumps({"kind": "observation_error", "detail": str(error)},
                          sort_keys=True, separators=(",", ":")))

@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from observation_lock import FairObservationLock
+from observation_lock import FairObservationLock, ObservationBackoff
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -280,18 +280,21 @@ class QueueScanner:
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
         """Bound concurrent GitHub observation across every lane on this host."""
-        with FairObservationLock(
-            str(self.observation_lock_path), self.args.observation_lock_timeout,
-            self.args.repo, getattr(self.args, "observation_backoff_file", None),
-            getattr(self.args, "observation_backoff_seconds", 30.0),
-        ).hold() as handle:
-            self.observation_lock_fd = os.dup(handle.fileno())
-            os.set_inheritable(self.observation_lock_fd, True)
-            try:
-                yield
-            finally:
-                os.close(self.observation_lock_fd)
-                self.observation_lock_fd = None
+        try:
+            with FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+            ).hold() as handle:
+                self.observation_lock_fd = os.dup(handle.fileno())
+                os.set_inheritable(self.observation_lock_fd, True)
+                try:
+                    yield
+                finally:
+                    os.close(self.observation_lock_fd)
+                    self.observation_lock_fd = None
+        except (TimeoutError, ObservationBackoff) as error:
+            raise RuntimeError(str(error)) from error
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.

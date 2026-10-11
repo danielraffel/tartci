@@ -5,6 +5,7 @@ import contextlib
 import fcntl
 import json
 import os
+import subprocess
 import time
 from pathlib import Path
 from typing import Iterator
@@ -14,9 +15,22 @@ class ObservationBackoff(RuntimeError):
     """This repository recently timed out and must yield the host slot."""
 
 
+def _process_start(pid: int) -> str | None:
+    try:
+        return subprocess.check_output(
+            ["ps", "-p", str(pid), "-o", "lstart="], text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _timed_out(error: BaseException) -> bool:
     text = str(error).lower()
-    return any(token in text for token in ("timeout", "timed out", "deadline"))
+    return any(token in text for token in (
+        "scan exceeded its overall deadline",
+        "host queue observation lock timed out",
+    ))
 
 
 class FairObservationLock:
@@ -27,6 +41,7 @@ class FairObservationLock:
         self.repo = repo
         self.backoff_path = Path(backoff_file or (str(self.lock_path) + ".backoff.json"))
         self.backoff_seconds = backoff_seconds
+        self.backoff_lock_path = self.backoff_path.with_name(self.backoff_path.name + ".lock")
         self.ticket_path: Path | None = None
         self.handle = None
 
@@ -39,7 +54,9 @@ class FairObservationLock:
 
     def _write_backoff(self, values: dict[str, float]) -> None:
         self.backoff_path.parent.mkdir(parents=True, exist_ok=True)
-        temp = self.backoff_path.with_name(self.backoff_path.name + f".{os.getpid()}.tmp")
+        temp = self.backoff_path.with_name(
+            self.backoff_path.name + f".{os.getpid()}.{time.time_ns()}.tmp"
+        )
         temp.write_text(json.dumps(values, sort_keys=True, separators=(",", ":")))
         os.replace(temp, self.backoff_path)
 
@@ -47,19 +64,25 @@ class FairObservationLock:
         until = self._backoff().get(self.repo, 0.0)
         if until > time.time():
             raise ObservationBackoff(
-                f"repository observation backoff active for {until - time.time():.1f}s"
+                f"host queue observation lock backoff active for {until - time.time():.1f}s"
             )
 
     def _mark_timeout(self) -> None:
-        values = self._backoff()
-        values[self.repo] = time.time() + self.backoff_seconds
-        self._write_backoff(values)
+        with self.backoff_lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            values = self._backoff()
+            values[self.repo] = time.time() + self.backoff_seconds
+            self._write_backoff(values)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _clear_backoff(self) -> None:
-        values = self._backoff()
-        if self.repo in values:
-            values.pop(self.repo, None)
-            self._write_backoff(values)
+        with self.backoff_lock_path.open("a+", encoding="utf-8") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            values = self._backoff()
+            if self.repo in values:
+                values.pop(self.repo, None)
+                self._write_backoff(values)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
     def _next_ticket(self, queue: Path) -> Path:
         queue.mkdir(parents=True, exist_ok=True)
@@ -75,23 +98,27 @@ class FairObservationLock:
             handle.flush()
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         marker = queue / f"{ticket:020d}.{os.getpid()}"
-        marker.touch()
+        marker.write_text(json.dumps({"pid": os.getpid(), "start": _process_start(os.getpid())}))
         return marker
 
     @staticmethod
     def _remove_stale(queue: Path) -> None:
         for marker in queue.glob("[0-9]*.*"):
             try:
-                pid = int(marker.name.rsplit(".", 1)[1])
+                owner = json.loads(marker.read_text())
+                pid = int(owner["pid"])
+                if not owner.get("start") or owner["start"] != _process_start(pid):
+                    raise ProcessLookupError(pid)
                 os.kill(pid, 0)
-            except (ValueError, ProcessLookupError, PermissionError):
+            except (ValueError, KeyError, TypeError, json.JSONDecodeError,
+                    FileNotFoundError, ProcessLookupError, PermissionError):
                 try:
                     marker.unlink()
                 except FileNotFoundError:
                     pass
 
     @contextlib.contextmanager
-    def hold(self) -> Iterator[None]:
+    def hold(self) -> Iterator[object]:
         self._check_backoff()
         self.lock_path.parent.mkdir(parents=True, exist_ok=True)
         queue = self.lock_path.with_name(self.lock_path.name + ".fifo")
@@ -105,7 +132,7 @@ class FairObservationLock:
                 if not lower:
                     break
                 if time.monotonic() >= deadline:
-                    raise TimeoutError("fair observation queue timed out")
+                    raise TimeoutError("host queue observation lock timed out")
                 time.sleep(0.05)
             with self.lock_path.open("a+", encoding="utf-8") as handle:
                 while True:

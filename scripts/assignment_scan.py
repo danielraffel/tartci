@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
-from observation_lock import FairObservationLock
+from observation_lock import FairObservationLock, ObservationBackoff
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
@@ -1007,6 +1007,9 @@ def main() -> int:
         print(scanner.scan())
     except AuthPreflightError as error:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)
+        return 2
+    except (TimeoutError, ObservationBackoff) as error:
+        print(f"assignment scan failed closed: lock_contention: {error}", file=sys.stderr)
         return 2
     except (ScanError, ValueError) as error:
         identity = scanner.identity if scanner is not None else None

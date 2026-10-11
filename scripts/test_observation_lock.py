@@ -5,7 +5,7 @@ import os
 import unittest
 from pathlib import Path
 
-from observation_lock import FairObservationLock, ObservationBackoff
+from observation_lock import FairObservationLock, ObservationBackoff, _process_start
 
 
 class ObservationLockTests(unittest.TestCase):
@@ -15,7 +15,7 @@ class ObservationLockTests(unittest.TestCase):
             queue = Path(str(lock) + ".fifo")
             queue.mkdir()
             older = queue / f"00000000000000000000.{os.getpid()}"
-            older.touch()
+            older.write_text(__import__("json").dumps({"pid": os.getpid(), "start": _process_start(os.getpid())}))
             entered = threading.Event()
 
             def waiter():
@@ -30,13 +30,35 @@ class ObservationLockTests(unittest.TestCase):
             thread.join(2)
             self.assertTrue(entered.is_set())
 
+    def test_reused_pid_orphan_is_removed_by_start_time(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = Path(td) / "observation.lock"
+            queue = Path(str(lock) + ".fifo")
+            queue.mkdir()
+            orphan = queue / f"00000000000000000000.{os.getpid()}"
+            orphan.write_text(__import__("json").dumps({"pid": os.getpid(), "start": "old-process-start"}))
+            with FairObservationLock(str(lock), 1, "repo").hold():
+                pass
+            self.assertFalse(orphan.exists())
+
+    def test_concurrent_backoff_marks_preserve_all_repositories(self):
+        with tempfile.TemporaryDirectory() as td:
+            lock = str(Path(td) / "observation.lock")
+            backoff = str(Path(td) / "backoff.json")
+            locks = [FairObservationLock(lock, 1, f"repo-{i}", backoff, 30) for i in range(20)]
+            threads = [threading.Thread(target=item._mark_timeout) for item in locks]
+            for thread in threads: thread.start()
+            for thread in threads: thread.join(2)
+            values = __import__("json").loads(Path(backoff).read_text())
+            self.assertEqual(set(values), {f"repo-{i}" for i in range(20)})
+
     def test_timeout_sets_repo_backoff_without_blocking_other_repo(self):
         with tempfile.TemporaryDirectory() as td:
             lock = str(Path(td) / "observation.lock")
             backoff = str(Path(td) / "backoff.json")
             with self.assertRaises(TimeoutError):
                 with FairObservationLock(lock, 1, "slow", backoff, 30).hold():
-                    raise TimeoutError("scan timed out")
+                    raise TimeoutError("scan exceeded its overall deadline")
             with self.assertRaises(ObservationBackoff):
                 with FairObservationLock(lock, 1, "slow", backoff, 30).hold():
                     pass
