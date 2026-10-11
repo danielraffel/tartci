@@ -70,7 +70,10 @@ SCHEMA = "tartci.self-update/v1"
 # How often the launchd watchdog re-measures skew (tartci_launchd_watchdog.py
 # refresh_skew); a cached skew older than state_age.STALE_FACTOR of these reads STALE.
 SKEW_REFRESH_S = 1800
-REPO_URL = "https://github.com/danielraffel/tartci.git"
+DEFAULT_REPOSITORY = "Generous-Corp/tartci"
+LEGACY_REPOSITORY = "danielraffel/tartci"
+ACCEPTED_REPOSITORIES = frozenset({DEFAULT_REPOSITORY, LEGACY_REPOSITORY})
+REPO_URL = f"https://github.com/{DEFAULT_REPOSITORY}.git"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 DEFAULT_SOAK_SECONDS = 1800
 DEFAULT_RATE_HOURS = 6
@@ -137,7 +140,7 @@ MAX_CONSECUTIVE_FAILURES = 3
 REFUSAL_RECEIPT_TTL = 7 * 86400
 CHECK_CANDIDATES = 5
 SIGNING_PROBE_TIMEOUT = 60
-TARTCI_REPO = "danielraffel/tartci"
+TARTCI_REPO = DEFAULT_REPOSITORY
 # A peer with no `ssh` in its profile is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 TERMINAL_STATUSES = ("succeeded", "failed", "rolled_back")
@@ -568,8 +571,9 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
     if not (path / ".git").exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(tempfile.mkdtemp(prefix=".update-checkout.", dir=path.parent))
-        result = sys_.run(["git", "clone", "--quiet", "--no-checkout", REPO_URL,
-                           str(staging / "clone")])
+        repository = configured_repository(cfg, sys_)
+        result = sys_.run(["git", "clone", "--quiet", "--no-checkout",
+                           repository_url(repository), str(staging / "clone")])
         if result.rc != 0 or not (staging / "clone" / ".git").exists():
             shutil.rmtree(staging, ignore_errors=True)
             raise Refused(f"cannot create the update checkout: {result.text}")
@@ -578,16 +582,47 @@ def refresh_checkout(cfg: Config, sys_: System) -> None:
         os.rename(staging / "clone", path)
         shutil.rmtree(staging, ignore_errors=True)
     origin = sys_.run(["git", "-C", str(path), "remote", "get-url", "origin"])
-    if origin.rc != 0 or origin.out.strip().rstrip("/").removesuffix(".git").lower() \
-            != REPO_URL.removesuffix(".git").lower():
-        raise Refused(f"update checkout {path} is not a danielraffel/tartci clone")
+    remote = origin.out.strip().rstrip("/").removesuffix(".git").lower()
+    accepted_remotes = {repository_url(value).removesuffix(".git").lower()
+                        for value in ACCEPTED_REPOSITORIES}
+    if origin.rc != 0 or remote not in accepted_remotes:
+        raise Refused(f"update checkout {path} is not an accepted TartCI clone")
     fetched = sys_.run(["git", "-C", str(path), "fetch", "--quiet", "--prune", "origin", "main"])
     if fetched.rc != 0:
         raise Refused(f"git fetch failed: {fetched.text}")
 
 
+def configured_repository(cfg: Config, sys_: System) -> str:
+    """Resolve an explicit binding or the first readable accepted slug."""
+    bound = os.environ.get("GH_REPO", "").strip()
+    candidates = (bound,) if bound else (LEGACY_REPOSITORY, DEFAULT_REPOSITORY)
+    for repository in candidates:
+        if repository not in ACCEPTED_REPOSITORIES:
+            raise Refused(f"unsupported TartCI repository identity: {repository}")
+        result = sys_.run([gh_cli(), "api", f"repos/{repository}"],
+                          cwd=str(cfg.checkout), env={"GH_REPO": repository}, timeout=60)
+        try:
+            canonical = json.loads(result.out).get("full_name")
+        except (json.JSONDecodeError, AttributeError):
+            canonical = None
+        if result.rc == 0 and canonical in ACCEPTED_REPOSITORIES:
+            return canonical
+        if bound:
+            break
+    raise Refused("no accepted TartCI repository is readable")
+
+
+def repository_url(repository: str) -> str:
+    return f"https://github.com/{repository}.git"
+
+
 def gh_cli() -> str:
     return os.environ.get("TARTCI_GH_CLI") or ("ghapp" if shutil.which("ghapp") else "gh")
+
+
+def canonical_repository(cfg: Config, sys_: System) -> str:
+    """Resolve and validate the API's canonical full_name for a commit."""
+    return configured_repository(cfg, sys_)
 
 
 def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
@@ -596,9 +631,10 @@ def checks_green(cfg: Config, sys_: System, sha: str) -> tuple[bool, str]:
     Age alone is not evidence: a commit that broke main's CI soaks like any
     other. An unreadable answer is not green.
     """
-    binding = {"GH_REPO": TARTCI_REPO, "SHIPYARD_GHAPP_REPO": TARTCI_REPO,
-               "SHIPYARD_GH_APP_REPO": TARTCI_REPO}
-    result = sys_.run([gh_cli(), "api", f"repos/{TARTCI_REPO}/commits/{sha}/check-runs?per_page=100"],
+    repository = canonical_repository(cfg, sys_)
+    binding = {"GH_REPO": repository, "SHIPYARD_GHAPP_REPO": repository,
+               "SHIPYARD_GH_APP_REPO": repository}
+    result = sys_.run([gh_cli(), "api", f"repos/{repository}/commits/{sha}/check-runs?per_page=100"],
                       cwd=str(cfg.checkout), env=binding, timeout=60)
     try:
         runs = json.loads(result.out).get("check_runs")
@@ -1111,14 +1147,17 @@ def python_shim_dir() -> str:
     return _PYTHON_SHIM_DIR
 
 
-def census_env() -> dict[str, str]:
+def census_env(repository: str | None = None) -> dict[str, str]:
     # The census binds its identity per call (#227); this also pins the CLI and
     # the interpreter every tartci helper runs under, including on rollback.
-    return {
+    env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
         "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
+    if repository is not None:
+        env["GH_REPO"] = repository
+    return env
 
 
 # The capacity floor owns the judgement of whether a peer can mint on demand;
@@ -1592,9 +1631,10 @@ def relay_enabled(cfg: Config) -> bool:
         return True  # unreadable profile: run reconcile, which will say why
 
 
-def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900) -> Result:
+def tartci(cfg: Config, sys_: System, *args: str, timeout: float = 900,
+           repository: str | None = None) -> Result:
     """The TARGET commit's tartci, run from the managed checkout."""
-    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(),
+    return sys_.run(["./tartci", *args], cwd=str(cfg.checkout), env=census_env(repository),
                     timeout=timeout)
 
 
@@ -1799,8 +1839,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          "certificate; a timestamped signing probe with it succeeded)")
         install_args = ["fleet-macos", "install", str(profile), "--support-source", ".",
                         "--support-manifest", ".tartci-support-manifest.json"]
+        repository = configured_repository(cfg, sys_)
         if helper is None:
-            dry = tartci(cfg, sys_, *install_args)
+            dry = tartci(cfg, sys_, *install_args, repository=repository)
             if dry.rc != 0:
                 raise Refused(f"install dry-run failed: {dry.text}")
             receipt.step("install-dry-run", "ok")
@@ -1870,6 +1911,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             return EXIT_OK
         run = Run(cfg, sys_, receipt, me=me, target=target, previous=installed,
                   profile=profile, install_args=install_args, allow=allow,
+                  repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded)
         return run.execute()
     except Deferred as exc:
@@ -1926,12 +1968,14 @@ class Run:
     def __init__(self, cfg: Config, sys_: System, receipt: Receipt, *, me: str, target: str,
                  previous: str, profile: Path, install_args: list[str], allow: bool,
                  helper: dict | None, approval: Path | None,
+                 repository: str | None = None,
                  excluded: list[str] | None = None) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
             profile, install_args, helper, approval)
+        self.repository = repository
         self.flag = ["--allow-last-serving-host"] if allow else []
         self.pin_path = Path(helper["approval_sha256_path"]) if helper else None
         self.pin_moved = False
@@ -2061,7 +2105,7 @@ class Run:
             self._write_pin(self.approval.read_text())
             self.pin_moved = True
             self.receipt.step("pin", "new launcher approval pinned (previous in the snapshot)")
-            dry = tartci(cfg, sys_, *self.install_args)
+            dry = tartci(cfg, sys_, *self.install_args, repository=self.repository)
             if dry.rc != 0:
                 raise Failed(f"install dry-run failed against the new pin: {dry.text}")
             self.receipt.step("install-dry-run", "ok against the new pin")
@@ -2152,7 +2196,7 @@ class Run:
         fence = self._writer_fence()
         for attempt in range(1, INSTALL_ATTEMPTS + 1):
             result = self.sys.run_critical([*fence, "./tartci", *args, "--apply"],
-                                           cwd=str(self.cfg.checkout), env=census_env(),
+                                           cwd=str(self.cfg.checkout), env=census_env(self.repository),
                                            timeout=INSTALL_TIMEOUT,
                                            record=self.cfg.state_dir / "installer.json")
             if result.rc == 0:
