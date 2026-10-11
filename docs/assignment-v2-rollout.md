@@ -387,7 +387,7 @@ log.
 The m1 profile is an explicit exception: it declares only
 `pulp-build-pr-head` for its two dedicated slots and does not advertise
 merge-group. This keeps the slower 3-core m1 guest out of merge batches while
-the merge-capable m3 and m5studio slots protect merge-group demand.
+the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
 ## Release event classes (declared per lane, m5 only)
 
