@@ -1329,6 +1329,25 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def resolver_health_pass(now: float | None = None) -> str | None:
+    """Publish one resolver/TCP probe for peers to read.
+
+    The probe is deliberately best effort. A local probe failure must not stop
+    the watchdog's heal and peer paths, and only resolver_health's three-tick
+    hysteresis can publish ``resolver_dead``.
+    """
+    try:
+        import resolver_health  # noqa: PLC0415 - sibling module
+        state = resolver_health.tick(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN resolver check FAILED ({type(exc).__name__}: "
+                f"{exc}); no resolver alert state was published")
+    if state.get("condition") == "resolver_dead":
+        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN resolver dead "
+                "while TCP alive (peer alert path will report it)")
+    return None
+
+
 def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
     """Recover and alert for a host a failed self-update left OFF.
 
@@ -1531,6 +1550,9 @@ def main(argv: list[str] | None = None) -> int:
         attestation_line = host_attestation_pass()
         if attestation_line:
             print(attestation_line)
+        resolver_line = resolver_health_pass()
+        if resolver_line:
+            print(resolver_line)
         hold_line = debug_hold_pass()
         if hold_line:
             print(hold_line)
