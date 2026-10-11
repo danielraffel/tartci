@@ -743,6 +743,14 @@ first; list it only when what it asserts really needs tomllib.
   that a job is terminal.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
+  The host lock remains deliberately global: it is #161's burst guard and
+  licenses `assignment_scan_max_workers` to fan out only after one observer has
+  authority. Acquisition is FIFO across repository namespaces. When a scan
+  times out, that repository records a bounded backoff in the shared state and
+  skips its next attempts, yielding the host slot to other repositories. The
+  backoff is a fairness guard, not a second lock or a per-repository authority;
+  all three scanners (`assignment_scan.py`, `queue_scan.py`, and
+  `current_job_scan.py`) use the same host lock, FIFO queue, and backoff file.
   → *Failure behavior:* lock acquisition is bounded by
   `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
   the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`

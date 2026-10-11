@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
+from observation_lock import FairObservationLock, ObservationBackoff
 from gh_identity import (
     NO_VALID_CREDENTIALS,
     AuthPreflightError,
@@ -279,21 +280,21 @@ class QueueScanner:
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
         """Bound concurrent GitHub observation across every lane on this host."""
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._bounded_lock(
-            self.observation_lock_path, "host queue observation"
-        ) as handle:
-            # Duplicate the locked open-file description into an inheritable
-            # descriptor so every bounded gh/ghapp tree retains the flock if
-            # this scanner is killed. The kernel then releases host authority
-            # only after the old observation tree exits.
-            self.observation_lock_fd = os.dup(handle.fileno())
-            os.set_inheritable(self.observation_lock_fd, True)
-            try:
-                yield
-            finally:
-                os.close(self.observation_lock_fd)
-                self.observation_lock_fd = None
+        try:
+            with FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+            ).hold() as handle:
+                self.observation_lock_fd = os.dup(handle.fileno())
+                os.set_inheritable(self.observation_lock_fd, True)
+                try:
+                    yield
+                finally:
+                    os.close(self.observation_lock_fd)
+                    self.observation_lock_fd = None
+        except (TimeoutError, ObservationBackoff) as error:
+            raise RuntimeError(str(error)) from error
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.
@@ -655,6 +656,8 @@ def parse_args() -> argparse.Namespace:
         ),
         help="seconds to wait for the host-global observation lock",
     )
+    parser.add_argument("--observation-backoff-file", default=os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"))
+    parser.add_argument("--observation-backoff-seconds", type=float, default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_SECS", "30")))
     parser.add_argument("--provider", required=True)
     parser.add_argument(
         "--lane-id",
@@ -716,6 +719,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
+    if args.observation_backoff_file is None:
+        args.observation_backoff_file = str(Path(args.observation_lock_file).with_name("queue-observation-backoff.json"))
+    if not math.isfinite(args.observation_backoff_seconds) or args.observation_backoff_seconds <= 0:
+        parser.error("--observation-backoff-seconds must be positive")
     statuses = {
         status.strip().lower()
         for status in args.job_statuses.split(",")
