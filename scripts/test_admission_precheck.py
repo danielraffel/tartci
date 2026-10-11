@@ -152,6 +152,7 @@ class RunOneHarness:
             f"source {str(LIB)!r}\n"
             f"source {str(PROOF_LIB)!r}\n"
             f"source {str(ROOT / 'providers/tart-macos/job-claim.lib.sh')!r}\n"
+            f"source {str(ROOT / 'providers/tart-macos/lifecycle.lib.sh')!r}\n"
             # The host VM-DHCP breaker reads host state; closed here.
             "tartci_vm_dhcp_check(){ return 0; }\n"
             "tartci_vm_dhcp_record(){ :; }\n"
