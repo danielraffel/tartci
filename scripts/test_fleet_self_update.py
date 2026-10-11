@@ -1659,11 +1659,38 @@ class CensusEnvTests(unittest.TestCase):
             os.environ.pop("TARTCI_PYTHON", None)
             env = su.census_env()
         self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        self.assertEqual(env["HOME"], os.environ.get("HOME") or os.path.expanduser("~"))
         proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
                               env={**os.environ, "PATH": "/usr/bin:/bin", **env},
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(os.path.realpath(proc.stdout.strip()), os.path.realpath(sys.executable))
+
+    def test_census_env_preserves_home_for_production_shaped_ghapp(self) -> None:
+        # The real ghapp wrapper uses HOME for its cache and refuses to run
+        # without it. Exercise the exact reduced census environment rather
+        # than a stub that accepts any environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            ghapp = Path(tmp) / "ghapp"
+            ghapp.write_text(
+                "#!/bin/sh\n"
+                "[ -n \"${HOME:-}\" ] || { echo 'ghapp requires HOME' >&2; exit 78; }\n"
+                "printf '%s\\n' authenticated\n"
+            )
+            ghapp.chmod(0o755)
+            env = su.census_env("danielraffel/tartci")
+            env["PATH"] = f"{tmp}:{env['PATH']}"
+            ok_run = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(ok_run.returncode, 0, ok_run.stderr)
+            self.assertEqual(ok_run.stdout.strip(), "authenticated")
+
+            mutant_env = env.copy()
+            mutant_env.pop("HOME", None)
+            denied = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=mutant_env, capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 78)
+            self.assertIn("requires HOME", denied.stderr)
 
 
 class RollbackTests(Base):

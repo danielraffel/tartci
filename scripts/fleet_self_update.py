@@ -1153,6 +1153,7 @@ def census_env(repository: str | None = None) -> dict[str, str]:
     env = {
         "TARTCI_GH_CLI": os.environ.get("TARTCI_GH_CLI") or "ghapp",
         "TARTCI_PYTHON": os.environ.get("TARTCI_PYTHON") or sys.executable,
+        "HOME": os.environ.get("HOME") or os.path.expanduser("~"),
         "PATH": f"{python_shim_dir()}:{os.environ.get('PATH') or '/usr/bin:/bin'}",
     }
     if repository is not None:
