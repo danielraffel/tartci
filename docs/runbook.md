@@ -1872,6 +1872,73 @@ After any fix, `tartci vm-dhcp probe-now` makes the next lane probe at once
 instead of waiting out the 300 s cadence; a fix that changes the chain usually
 triggers it on its own.
 
+### Holding a failed gate VM for debugging (`tartci held`, `[debug_hold]`)
+
+Off by default. Turning it on is a host behaviour change, so it is on per
+host only with Daniel's OK:
+
+```toml
+[debug_hold]
+enabled = true
+min_free_gb = 100        # required; derived below
+# ttl_hours = 24, max_per_host = 3, inspect_idle_minutes = 60 (defaults)
+```
+
+When a served gate job's runner log closes with `result: Failed`, the lane
+(`providers/tart-macos/debug-hold.lib.sh`) keeps the VM instead of deleting
+it, in this order, and deletes it as usual if any step cannot be proved:
+
+1. Admission (`scripts/debug_hold.py admit`): the key is on, fewer than
+   `max_per_host` VMs are held (a new failure never evicts an older hold), and
+   free disk is at least `min_free_gb`. A refusal is a `debug_hold_refused`
+   event naming the reason; with the key off nothing is logged.
+2. The guest's runner service, JIT config and runner state are removed, and
+   no `Runner.Listener` is left in the guest.
+3. GitHub is read again and must list no runner of that name (it is deleted
+   first when listed). A read that fails proves nothing and refuses.
+4. `tart stop` (disk kept, no guest change), `tart rename` to
+   `held-<vm>`, then the lane releases its lease and slot as after a delete.
+   `debug_hold_kept` names the run and job; `~/.tartci/state/debug-hold/held/`
+   holds a record with its PRs (a merge-queue run's PR comes from its
+   `gh-readonly-queue/.../pr-<n>-...` branch).
+
+A stopped VM uses no slot: Apple's limit counts running guests, and so does
+`tart_inventory`. `held-` is a declared prefix: `vm_reap` and
+`tart_image_prune` never select a `held-` VM.
+
+```sh
+tartci held list
+tartci held inspect held-<vm>   # boots it, waits for SSH, prints the ssh command
+tartci held stop held-<vm>      # stopped automatically after inspect_idle_minutes
+tartci held delete held-<vm>
+```
+
+`inspect` is refused when no slot is free, and while running the held VM
+counts as one. It boots without `--dir` shares, so the logs, build tree and
+test artifacts on its own disk are what you see, and it trusts an address
+only once SSH answers on it (`tart ip` can return the failed run's stale
+3600 s lease). It never registers: its runner service and JIT config are
+gone and nothing mints one.
+
+The launchd watchdog expires holds: at `ttl_hours`, or once every PR the
+failed run belonged to is merged or closed (one batched GraphQL read per
+repository, at most every 15 min), and it stops an inspection left running.
+
+**Deriving `min_free_gb`.** A held VM keeps the blocks its job wrote. On m3 on
+2026-10-09 one pulp gate job (slot2) grew the guest's data volume from
+25.2 GB at boot to 36.7 GB (11.0 GiB) and then stayed flat; the VM's disk
+image never shrinks, so that is a lower bound on what a hold keeps. With the
+host's VM disk floor (`TARTCI_VM_DISK_FREE_FLOOR_GB`, 25 GB), room for two
+running gate VMs and the new hold, each at twice the measured growth rounded up to 24 GB (one sample),
+`min_free_gb` = 25 + 3 x 24 = 97, so 100. Re-derive it from the first holds'
+recorded sizes once a host has some.
+
+Suspend (`tart run --suspendable`) is not used: it changes every gate VM's
+device set (output-only audio, no entropy device) for every job, whether it
+fails or not. A lane may opt into it only after its parity canary (the Pulp
+suite on `--suspendable` against cold boots, same results and timings within
+noise) passes, and its restore path then needs the virtiofs remount and the
+cpu/mem pin, each with a test (planning `2026-10-08-vm-saved-state-trial.md`).
 ### launchd stalled on a peer (`peer_launchd_stalled`)
 
 A stalled macOS automatic install can leave a host's launchd refusing every

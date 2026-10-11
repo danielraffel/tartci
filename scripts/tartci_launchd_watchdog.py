@@ -1287,6 +1287,23 @@ def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | N
     return None
 
 
+def debug_hold_pass() -> str | None:
+    """Expire failed gate VMs kept for debugging (scripts/debug_hold.py): stop
+    an inspection left running, delete at TTL or once their PR is merged or
+    closed. A no-op with nothing held. Never raises."""
+    try:
+        import debug_hold  # noqa: PLC0415 - sibling module
+        directory = debug_hold.state_dir()
+        if not debug_hold.records(directory):
+            return None
+        out = debug_hold.expire(debug_hold.System(), directory)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN debug-hold expiry FAILED "
+                f"({type(exc).__name__}: {exc}); held VMs were not expired")
+    if out.get("deleted") or out.get("stopped"):
+        return (f"{_iso(utcnow())} launchd-watchdog: debug-hold: deleted "
+                f"{[d['name'] + ' (' + d['reason'] + ')' for d in out['deleted']]}, "
+                f"stopped {out['stopped']}")
 def peer_stall_pass(now: float | None = None) -> str | None:
     """Tell someone when a PEER's launchd has stalled (scripts/peer_stall_alert.py).
 
@@ -1536,6 +1553,9 @@ def main(argv: list[str] | None = None) -> int:
         resolver_line = resolver_health_pass()
         if resolver_line:
             print(resolver_line)
+        hold_line = debug_hold_pass()
+        if hold_line:
+            print(hold_line)
         peer_stall_line = peer_stall_pass()
         if peer_stall_line:
             print(peer_stall_line)
