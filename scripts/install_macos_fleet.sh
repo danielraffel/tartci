@@ -178,7 +178,7 @@ echo "  activation=deferred to tartci pool on"
 
 # Authenticate the exact support commit before the dry-run exit. This makes
 # --plan exercise the same rendered App executable and HOME context as --apply.
-preflight_ghapp_path="$($PYTHON_BIN - "$plan_dir" <<'PY'
+preflight_ghapp_path="$("$PYTHON_BIN" - "$plan_dir" <<'PY'
 import plistlib, shutil, sys
 from pathlib import Path
 paths = set()
@@ -194,8 +194,8 @@ print(next(iter(paths)))
 PY
 )"
 preflight_repository="$TARTCI_REPOSITORY"
-preflight_commit="$($PYTHON_BIN -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
-preflight_app_json="$($PYTHON_BIN - "$CONFIG" "$ROOT" <<'PY'
+preflight_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
+preflight_app_json="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
 import json, sys
 from pathlib import Path
 sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
@@ -209,9 +209,9 @@ preflight_api() {
     HOME="$HOME" GH_REPO="$preflight_repository" SHIPYARD_GH_APP_REPO="$preflight_repository" \
       "$preflight_ghapp_path" api "$endpoint"
   else
-    app_id="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$preflight_app_json")"
-    app_key="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$preflight_app_json")"
-    app_cache="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$preflight_app_json")"
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$preflight_app_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$preflight_app_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$preflight_app_json")"
     HOME="$HOME" SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
@@ -227,8 +227,8 @@ if ! preflight_commit_json="$(preflight_api "repos/$preflight_repository/commits
   echo "fleet install could not authenticate exact TartCI source commit via rendered ghapp ($preflight_ghapp_path)" >&2
   exit 3
 fi
-preflight_canonical="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$preflight_repository_json")"
-preflight_actual="$($PYTHON_BIN -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$preflight_commit_json")"
+preflight_canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$preflight_repository_json")"
+preflight_actual="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$preflight_commit_json")"
 case "$preflight_canonical" in
   "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
   *) echo "fleet install API returned an untrusted canonical repository: $preflight_canonical" >&2; exit 3 ;;
