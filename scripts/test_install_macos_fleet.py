@@ -44,6 +44,14 @@ class InstallMacosFleetTests(unittest.TestCase):
         ghapp = self.bin / "ghapp"
         ghapp.write_text(textwrap.dedent("""\
             #!/bin/sh
+            [ "${FAKE_GHAPP_REQUIRE_HOME:-0}" = 1 ] && [ -z "${HOME:-}" ] && {
+              echo "fake ghapp requires HOME" >&2
+              exit 78
+            }
+            [ -n "${FAKE_GHAPP_EXPECTED_PATH:-}" ] && [ "$0" != "$FAKE_GHAPP_EXPECTED_PATH" ] && {
+              echo "fake ghapp unexpected path: $0" >&2
+              exit 79
+            }
             [ "${FAKE_AUTH_DENY:-0}" = 1 ] && exit 1
             for arg in "$@"; do
               case "$arg" in
@@ -315,6 +323,20 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertTrue(self.legacy.exists())
         self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
         self.assertFalse((self.home / ".config/tartci/macos-fleet-install.json").exists())
+
+    def test_dry_run_authenticates_before_exit_with_home_and_rendered_path(self) -> None:
+        result = self.run_installer(
+            FAKE_GHAPP_REQUIRE_HOME="1",
+            FAKE_GHAPP_EXPECTED_PATH=str((self.bin / "ghapp").resolve()),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("action=dry-run", result.stdout)
+
+    def test_dry_run_reports_auth_failure_instead_of_hiding_it(self) -> None:
+        result = self.run_installer(FAKE_AUTH_DENY="1")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("could not authenticate", result.stderr)
+        self.assertNotIn("action=dry-run", result.stdout)
 
     def test_apply_installs_exact_rendered_profile_and_retires_declared_legacy(self) -> None:
         stale = self.agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.removed.plist"

@@ -1659,6 +1659,7 @@ class CensusEnvTests(unittest.TestCase):
             os.environ.pop("TARTCI_PYTHON", None)
             env = su.census_env()
         self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        self.assertEqual(env["HOME"], os.environ.get("HOME") or os.path.expanduser("~"))
         proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
                               env={**os.environ, "PATH": "/usr/bin:/bin", **env},
                               capture_output=True, text=True)
