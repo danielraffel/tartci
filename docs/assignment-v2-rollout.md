@@ -339,23 +339,25 @@ lists merge-group for m3, m5 and m5studio only. Rollback: delete the key,
 restore the merge-group tier ahead of PR-head and in slot 2's
 `assignment_slot_tier_order`, regenerate the published labels.
 
-## Per-slot class preference (opt-in, PR-first canary on m3)
+## Per-slot class preference (merge-group first)
 
-Every slot consults the classes in configured tier order, merge-group first.
-Under a continuous merge queue that starves PR-head work, and the idle retarget
-above cannot help because the slot is never idle. Measured 2026-09-25: a slot
-selects PR-head, merge-group demand appears during the two-to-four-minute boot,
-`assignment_v2_pre_mint_denied selected_tier=1` discards the VM, and the slot
-re-boots for merge-group. PR-head jobs waited 60-80 minutes.
+Every slot consults the classes in configured tier order. Slots that advertise
+both Pulp gate classes put `pulp-build-merge-group` before
+`pulp-build-pr-head`, because a queued merge group blocks the PRs behind it.
+The m3 and m5studio slot-2 profiles now use that merge-group-first order. The
+PR-first order introduced by d278155 on 2026-09-25 rested on the premise that
+the merge-group job kept every other slot in the fleet. That premise expired
+when #439 made m1 PR-only. PR-head fairness now comes from m1's two dedicated
+slots, while m3 and m5studio preserve merge-group progress.
 
 `assignment_slot_tier_order` on an event-class-v2 lane reorders the class
 preference for named supervisor slots:
 
 ```toml
-assignment_slot_tier_order = { 2 = ["pulp-build-pr-head", "pulp-build-merge-group"] }
+assignment_slot_tier_order = { 2 = ["pulp-build-merge-group", "pulp-build-pr-head"] }
 ```
 
-It renders `TARTCI_ASSIGNMENT_V2_TIER_ORDER=pulp-build-pr-head,pulp-build-merge-group`
+It renders `TARTCI_ASSIGNMENT_V2_TIER_ORDER=pulp-build-merge-group,pulp-build-pr-head`
 into that slot's LaunchAgent only; other slots render nothing and keep today's
 behaviour byte for byte. The order must name every tier class exactly once, so a
 preference can never become a reservation, and the slot key must be a supervisor
@@ -365,13 +367,13 @@ supervisor refuses the env var outside `event-class-v2`.
 The same order drives all three V2 decisions, so the slot never contradicts
 itself:
 
-| decision | PR-first slot | default slot |
+| decision | merge-group-first slot | default slot |
 |---|---|---|
-| selection, both classes waiting | PR-head | merge-group |
+| selection, both classes waiting | merge-group | merge-group |
 | selection, only merge-group waiting | merge-group (work-conserving) | merge-group |
-| pre-mint of a PR-head boot, merge-group arrived | **admit** | deny |
-| pre-mint of a merge-group boot, PR-head arrived | deny, re-select PR-head | admit |
-| top-tier receipt (`assignment_top_tier_receipt_max_age_seconds`) | PR-head may use it | merge-group may use it |
+| pre-mint of a PR-head boot, merge-group arrived | deny, re-select merge-group | deny |
+| pre-mint of a merge-group boot, PR-head arrived | admit | admit |
+| top-tier receipt (`assignment_top_tier_receipt_max_age_seconds`) | merge-group may use it | merge-group may use it |
 | idle retarget (if enabled) | falls back in slot order | falls back in slot order |
 
 Tier numbers keep their configured meaning on every slot (0 is merge-group, 1
@@ -382,9 +384,10 @@ configured order, so `fleet/advertised-labels.json` does not move. The startup
 `LOOP` line prints `tier_order=` so the effective order is visible in the slot
 log.
 
-A PR-first slot still yields a merge-group boot to a PR-head arrival: that is
-the same pre-mint recheck every slot runs, applied in this slot's order, and
-the merge-group job keeps every other slot in the fleet, all of which prefer it.
+The m1 profile is an explicit exception: it declares only
+`pulp-build-pr-head` for its two dedicated slots and does not advertise
+merge-group. This keeps the slower 3-core m1 guest out of merge batches while
+the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
 ## Release event classes (declared per lane, m5 only)
 
