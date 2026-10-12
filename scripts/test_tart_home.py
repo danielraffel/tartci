@@ -137,6 +137,31 @@ class DispatcherTests(unittest.TestCase):
         self.assertIn("tartci_resolve_tart_home", dispatcher_function("cmd_observe"))
         self.assertIn("scripts/tart_home.py", doctor, "bare doctor prints the store")
 
+    def test_doctor_reap_is_a_terminal_real_entry_point(self) -> None:
+        """The launchd reap command must not fall through into full doctor."""
+        with tempfile.TemporaryDirectory(prefix="tartci-reap-entry-") as td:
+            root = Path(td)
+            wrapper = root / "python"
+            wrapper.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = \"-c\" ]; then\n"
+                "  case \"$2\" in *tomllib*) exit 0;; esac\n"
+                "  printf 'cpython\\n'; exit 0\n"
+                "fi\n"
+                "case \"$1\" in *vm_reap.py) echo REAP_ONLY; exit 0;; esac\n"
+                f"exec {sys.executable!s} \"$@\"\n"
+            )
+            wrapper.chmod(0o755)
+            env = dict(os.environ, HOME=td, TARTCI_PYTHON=str(wrapper),
+                       TARTCI_MACOS_FLEET_PROFILE=str(root / "missing.toml"))
+            result = subprocess.run(
+                ["bash", str(ROOT / "tartci"), "doctor", "--reap", "--json", "--fix"],
+                cwd=ROOT, env=env, text=True, capture_output=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("REAP_ONLY", result.stdout)
+        self.assertNotIn("tartci doctor — host:", result.stdout)
+
 
 class VmReapTests(unittest.TestCase):
     @testing_support.requires_tomllib

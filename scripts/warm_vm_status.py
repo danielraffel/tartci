@@ -2,9 +2,9 @@
 """Report this host's warm (pre-booted, parked) gate VM, if any.
 
 A supervisor with TARTCI_WARM_VM=1 publishes its parked VM to
-`~/.tartci/state/warm-vm/parked.json` (providers/tart-macos/warm-vm.lib.sh)
-and refreshes it every loop pass. This reads that record for `tartci pool
-status` and `tartci doctor`. It never acts: a stale record is reported, the
+~/.tartci/state/warm-vm/parked.json (providers/tart-macos/warm-vm.lib.sh)
+and refreshes it every loop pass. This reads that record for tartci pool
+status and tartci doctor. It never acts: a stale record is reported, the
 supervisor that wrote it (or the reaper) owns the VM.
 
 States:

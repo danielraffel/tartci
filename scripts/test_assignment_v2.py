@@ -2711,6 +2711,9 @@ else:
         broken, _, _ = self._scan(MATCH="1", FAIL_ON="/jobs?")
         self.assertEqual(broken.returncode, 2, broken.stdout)
         self.assertNotEqual(broken.stdout.strip(), "0")
+        # The failed repository is deliberately backoff-protected; clear the
+        # fixture's persisted cooldown before the independent clean control.
+        (self.root / "queue-observation-backoff.json").unlink(missing_ok=True)
 
         working, _, _ = self._scan(MATCH="1")
         self.assertEqual(working.returncode, 0, working.stderr)

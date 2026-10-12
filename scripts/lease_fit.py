@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Would a VM lease of this size be granted -- now, and ever?
 
-Read-only companion to `leases.py acquire`. It answers with the same capacity
+Read-only companion to leases.py acquire. It answers with the same capacity
 model (the same profile, the same reservations, the same core and memory axes)
 without writing a record, so a VM supervisor can learn that its lease cannot be
 granted BEFORE it spends a Shipyard admission call and a GitHub queue scan on
@@ -15,10 +15,10 @@ Two answers matter, and they are different:
   would be denied on an idle host. That is a configuration fault, not load,
   and polling for work cannot fix it. It is reported, not retried.
 
-Separately, `max_concurrent` says how many leases of this size the budget holds
+Separately, max_concurrent says how many leases of this size the budget holds
 at once. A host whose lanes outnumber it has lanes that can only boot while a
 sibling is idle (m5: two gate lanes at 12 cores in a 14-core universe). That is
-also a configuration finding, surfaced by `tartci doctor fleet`.
+also a configuration finding, surfaced by tartci doctor fleet.
 
 Exit codes: 0 fits now, 3 not now, 4 never, 1 could not tell. Callers must treat
 1 as "unknown" and fall back to acquiring as before.
@@ -185,7 +185,7 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
 
 
 def write_record(path: pathlib.Path, result: dict[str, Any], lane: str) -> None:
-    """The lane's latest verdict, for `tartci doctor fleet` and `pool status`.
+    """The lane's latest verdict, for tartci doctor fleet and pool status.
 
     Best effort: a record that cannot be written must never change the verdict.
     """
@@ -213,10 +213,10 @@ FIT_EVENTS = ("lease_unfit_now", "lease_fit_restored", "lease_never_fits")
 
 def lease_fit_events(path: pathlib.Path, now: dt.datetime | None = None,
                      window_secs: int = EVENT_WINDOW_SECS) -> dict[str, int] | None:
-    """Count this lane's lease-fit transitions in the last `window_secs`.
+    """Count this lane's lease-fit transitions in the last window_secs.
 
-    The lane logs a transition, not every poll: `lease_unfit_now` when its VM
-    stops fitting and `lease_fit_restored` when it fits again. None means the
+    The lane logs a transition, not every poll: lease_unfit_now when its VM
+    stops fitting and lease_fit_restored when it fits again. None means the
     log could not be read, which is not the same as zero transitions.
     """
     now = now or dt.datetime.now(dt.timezone.utc)
@@ -350,7 +350,7 @@ def verdict_summary(records: list[dict[str, Any]]) -> str:
 
 
 def report(argv: list[str]) -> int:
-    """`lease_fit.py report`: the configuration findings for `pool status`."""
+    """lease_fit.py report: the configuration findings for pool status."""
     parser = argparse.ArgumentParser(prog="lease_fit report")
     parser.add_argument("--agents-dir", default=str(pathlib.Path.home() / "Library/LaunchAgents"))
     parser.add_argument("--prefix", default="com.danielraffel.tartci.tart-runner-macos-fleet.")

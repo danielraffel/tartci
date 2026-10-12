@@ -4,7 +4,7 @@
 The gate lanes run with TART_HOME set by their LaunchAgent (on m1 and m5,
 `/Users/<you>/VMs`). A shell over ssh has no TART_HOME, so `tart list` reads
 Tart's default `~/.tart`, where the gate VMs are not. On 2026-10-09, over ssh
-to m1, `tartci doctor --reap --json` reported 0 running VMs and 2 free slots
+to m1, tartci doctor --reap --json reported 0 running VMs and 2 free slots
 while two gate VMs ran; with TART_HOME set it reported 2 running and 0 free.
 Shipyard's fleet health probe shells exactly that command.
 

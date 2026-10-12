@@ -45,7 +45,7 @@ REASONS_PATH = pathlib.Path(__file__).resolve().parent / "fleet_reasons.json"
 
 
 def reasons() -> dict[str, dict]:
-    """fleet_reasons.json, the same table `tartci doctor fleet` cites."""
+    """fleet_reasons.json, the same table tartci doctor fleet cites."""
     try:
         value = json.loads(REASONS_PATH.read_text())
     except (OSError, ValueError):
@@ -56,7 +56,7 @@ def reasons() -> dict[str, dict]:
 
 def _alert_host() -> tuple[str, str]:
     """(host id, ssh target others reach it by): the profile's host.id and
-    host.ssh, else the fleet's `tartci-<id>` alias convention."""
+    host.ssh, else the fleet's tartci-<id> alias convention."""
     host: dict[str, Any] = {}
     try:
         if tomllib is None:

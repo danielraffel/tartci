@@ -92,12 +92,12 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     is normally run from an interactive shell and launchd's job carries its
     own. The failure this exists to surface is a host that never got the agent,
     or got an older generation of it: m1 and m5 carry no VM janitor at all, and
-    nothing in `tartci status` said so. The settings prefix is a parameter
-    because each janitor carries its own (`TARTCI_RECLAIM_*`, `TARTCI_REAP_*`)
+    nothing in tartci status said so. The settings prefix is a parameter
+    because each janitor carries its own (TARTCI_RECLAIM_*, TARTCI_REAP_*)
     and reporting one janitor's knobs under another's name would be worse than
     reporting none.
 
-    `loaded` is deliberately three-valued. False means launchd was asked and
+    loaded is deliberately three-valued. False means launchd was asked and
     does not hold the job; None means the question could not be put (no
     launchctl, as on the Linux CI host). Collapsing those would let an
     unanswerable question read as a definite "not running".
@@ -148,7 +148,7 @@ def disk_space(settings: dict[str, Any] | None = None,
 
     Root discovery is disk_reclaim's own, not a second list, because a status
     that measures a volume the janitor never scans is the one fault nothing
-    downstream can catch. That is not hypothetical: a `$HOME/Code` root
+    downstream can catch. That is not hypothetical: a $HOME/Code root
     reported a clean pass forever on a host that keeps its code on Workshop,
     while Workshop filled.
 
@@ -158,7 +158,7 @@ def disk_space(settings: dict[str, Any] | None = None,
     Bounded, like every other outbound call here. Root discovery resolves the
     paths and then stats the volume each one sits on, and on this fleet one of
     those is external. A wedged or stale mount blocks those calls in the
-    kernel with no timeout of their own, which would hang `tartci status`
+    kernel with no timeout of their own, which would hang tartci status
     exactly during the incident someone runs it to understand. The worker is
     abandoned rather than joined on timeout, because a thread parked in an
     uninterruptible stat cannot be recalled -- only stopped waiting for.

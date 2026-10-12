@@ -5,11 +5,14 @@ import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
 import json
 import os
+import pty
+import select
 import plistlib
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import textwrap
 import threading
 import unittest
@@ -44,11 +47,33 @@ class InstallMacosFleetTests(unittest.TestCase):
         ghapp = self.bin / "ghapp"
         ghapp.write_text(textwrap.dedent("""\
             #!/bin/sh
+            [ "${FAKE_GHAPP_REQUIRE_HOME:-0}" = 1 ] && [ -z "${HOME:-}" ] && {
+              echo "fake ghapp requires HOME" >&2
+              exit 78
+            }
+            [ -n "${FAKE_GHAPP_EXPECTED_PATH:-}" ] && [ "$0" != "$FAKE_GHAPP_EXPECTED_PATH" ] && {
+              echo "fake ghapp unexpected path: $0" >&2
+              exit 79
+            }
             [ "${FAKE_AUTH_DENY:-0}" = 1 ] && exit 1
             for arg in "$@"; do
               case "$arg" in
+                repos/Generous-Corp/tartci|repos/Generous-Corp/tartci/commits/*)
+                  echo "fake ghapp: repository installation not found" >&2
+                  exit 1
+                  ;;
+              esac
+              case "$arg" in
                 repos/danielraffel/tartci/commits/*)
-                  printf '%s\n' "${FAKE_AUTH_SHA:-${arg##*/}}"
+                  sha="${FAKE_AUTH_SHA:-${arg##*/}}"
+                  repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
+                  repo="${repo%%/commits/*}"
+                  printf '{"sha":"%s"}\n' "$sha"
+                  exit 0
+                  ;;
+                repos/danielraffel/tartci)
+                  repo="${FAKE_AUTH_REPOSITORY:-${arg#repos/}}"
+                  printf '{"full_name":"%s"}\n' "$repo"
                   exit 0
                   ;;
               esac
@@ -206,6 +231,11 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.legacy.write_text("legacy\n")
         self.env = os.environ.copy()
         self.env.update(HOME=str(self.home), PATH=f"{self.fakebin}:{os.environ['PATH']}")
+        # Every installer subprocess gets an explicit repository binding unless
+        # a test deliberately removes it. This prevents ambient GH_REPO from
+        # hiding the bound-identity path under test.
+        self.env["GH_REPO"] = "danielraffel/tartci"
+        self.env["TARTCI_TESTING"] = "1"
         # The fixture has no governed Runner.Worker; make that evidence
         # explicit rather than inheriting unrelated host processes.
         ps = self.fakebin / "ps-empty"
@@ -240,15 +270,51 @@ class InstallMacosFleetTests(unittest.TestCase):
                 directory.chmod(0o755)
         self.temp.cleanup()
 
-    def run_installer(self, *args: str, **env: str) -> subprocess.CompletedProcess[str]:
+    def run_installer(
+        self, *args: str, installer_root: Path = ROOT, **env: str
+    ) -> subprocess.CompletedProcess[str]:
         effective = self.env.copy()
         effective.update(env)
         return subprocess.run(
-            [str(ROOT / "tartci"), "fleet-macos", "install", str(self.config),
+            [str(installer_root / "tartci"), "fleet-macos", "install", str(self.config),
              "--support-source", str(self.support_source),
              "--support-manifest", str(self.support_manifest), *args],
             text=True, capture_output=True, check=False, env=effective,
         )
+
+    def run_agent_wrapper_tty(self, wrapper: Path, env: dict[str, str]) -> tuple[int, str]:
+        pid, master = pty.fork()
+        if pid == 0:
+            try:
+                os.execve(str(wrapper), [str(wrapper), "--reap", "2", "--yes"], env)
+            except OSError:
+                os._exit(127)
+            os._exit(127)
+        output = bytearray()
+        sent = False
+        status = None
+        deadline = time.monotonic() + 20
+        while status is None:
+            if time.monotonic() >= deadline:
+                os.kill(pid, 9)
+                os.waitpid(pid, 0)
+                self.fail("installed agent-hygiene wrapper timed out")
+            readable, _, _ = select.select([master], [], [], 0.2)
+            if readable:
+                try:
+                    chunk = os.read(master, 4096)
+                    if chunk:
+                        output.extend(chunk)
+                        if not sent and b"terminate these process groups" in output:
+                            os.write(master, b"n\n")
+                            sent = True
+                except OSError:
+                    pass
+            waited, status = os.waitpid(pid, os.WNOHANG)
+            if waited == 0:
+                status = None
+        os.close(master)
+        return os.waitstatus_to_exitcode(status), output.decode(errors="replace")
 
     def configure_persistent_runner(self) -> tuple[str, Path]:
         label = "actions.runner.Generous-Corp-pulp.pulp-preamble-test"
@@ -283,8 +349,81 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_python_symlink_cycle_is_bounded(self) -> None:
+        first = self.root / "python-cycle-0"
+        first.symlink_to(sys.executable)
+        previous = first
+        for index in range(1, 18):
+            link = self.root / f"python-cycle-{index}"
+            link.symlink_to(previous)
+            previous = link
+        first.unlink()
+        first.symlink_to(previous)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(first))
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("symlink cycle", result.stderr)
+
+    def test_install_persists_pinned_interpreter_for_launcher_and_ghapp(self) -> None:
+        interpreter = self.root / "pinned-python3"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        installed = list(self.agents.glob("*macos-fleet*.plist"))
+        self.assertEqual(len(installed), 1)
+        env = plistlib.loads(installed[0].read_bytes())["EnvironmentVariables"]
+        expected = os.path.realpath(interpreter)
+        self.assertEqual(env["TARTCI_PYTHON"], expected)
+        self.assertEqual(env["SHIPYARD_GHAPP_PYTHON_BINARY"], expected)
+        self.assertTrue(env["PATH"].startswith(str(Path(expected).parent) + ":"))
+
+    def test_slow_pinned_interpreter_fails_fast_with_path(self) -> None:
+        interpreter = self.root / "slow-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) sleep 5 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0")
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("timed out after 3s", result.stderr)
+        self.assertIn(str(interpreter), result.stderr)
+
+    def test_blocked_pinned_interpreter_fails_with_path(self) -> None:
+        interpreter = self.root / "blocked-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) exit 1 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0")
+        self.assertEqual(result.returncode, 127, result.stderr)
+        self.assertIn("interpreter GitHub probe failed", result.stderr)
+        self.assertIn(str(interpreter), result.stderr)
+
+    def test_pinned_interpreter_probe_positive_control(self) -> None:
+        interpreter = self.root / "working-python"
+        interpreter.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            case "$*" in
+              *api.github.com*) exit 0 ;;
+            esac
+            exec {sys.executable} "$@"
+        """))
+        interpreter.chmod(0o755)
+        result = self.run_installer(
+            "--apply", TARTCI_PYTHON=str(interpreter), TARTCI_TESTING="0"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_installed_generation_refuses_itself_as_support_source(self) -> None:
-        # The installed `tartci` lives in a read-only generation, not a git
+        # The installed tartci lives in a read-only generation, not a git
         # checkout; defaulting the support source to it used to fail with a
         # misleading "support member failed verification".
         staged = support_manifest.stage_install(
@@ -307,6 +446,81 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertTrue(self.legacy.exists())
         self.assertEqual([], list(self.agents.glob("*macos-fleet*.plist")))
         self.assertFalse((self.home / ".config/tartci/macos-fleet-install.json").exists())
+
+    def test_dry_run_authenticates_before_exit_with_home_and_rendered_path(self) -> None:
+        result = self.run_installer(
+            FAKE_GHAPP_REQUIRE_HOME="1",
+            FAKE_GHAPP_EXPECTED_PATH=str((self.bin / "ghapp").resolve()),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("action=dry-run", result.stdout)
+
+    def test_installed_agent_hygiene_wrapper_keeps_human_only_gate(self) -> None:
+        if shutil.which("zsh") is None:
+            self.skipTest("agent-hygiene is a macOS zsh entry point")
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = self.bin / "agent-hygiene"
+        self.assertTrue(wrapper.is_file())
+        snapshot = self.root / "agent-ps"
+        snapshot.write_text("999991 1 00-00:01 10 /Users/test/.local/bin/claude\n")
+        transcripts = self.root / "agent-transcripts"
+        transcripts.mkdir()
+        transcript = transcripts / "session-999991.jsonl"
+        transcript.write_text("old")
+        old = time.time() - 3 * 86400
+        os.utime(transcript, (old, old))
+        env = self.env.copy()
+        env.update(AH_PS_SNAPSHOT_FILE=str(snapshot), AH_TRANSCRIPT_DIRS=str(transcripts),
+                   AH_STALE_DAYS="2", AH_PROC_PCT="1000", AH_SWAP_PCT="1000")
+        code, output = self.run_agent_wrapper_tty(wrapper, env)
+        self.assertEqual(code, 0, output)
+        self.assertIn("--yes is ignored", output)
+        self.assertIn("terminate these process groups", output)
+        self.assertNotIn("done; victims log", output)
+
+    def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
+        result = self.run_installer(GH_REPO="danielraffel/tartci")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("repository=danielraffel/tartci", result.stdout)
+        self.assertIn("action=dry-run", result.stdout)
+
+    def test_dry_run_bound_default_repository_reports_auth_failure(self) -> None:
+        result = self.run_installer(GH_REPO="Generous-Corp/tartci")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("could not authenticate", result.stderr)
+        self.assertNotIn("unbound variable", result.stderr)
+
+    def test_mutant_removing_bound_assignment_fails_bound_fixture(self) -> None:
+        mutant_root = self.root / "mutant-installer"
+        shutil.copytree(
+            ROOT,
+            mutant_root,
+            ignore=shutil.ignore_patterns(".git", "__pycache__"),
+        )
+        path = mutant_root / "scripts/install_macos_fleet.sh"
+        source = path.read_text()
+        assignment = (
+            '"$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") '
+            'TARTCI_REPOSITORY="$REQUESTED_TARTCI_REPOSITORY" ;;'
+        )
+        self.assertIn(assignment, source)
+        path.write_text(source.replace(assignment, assignment.split(") ", 1)[0] + ") ;;", 1))
+        result = self.run_installer(installer_root=mutant_root)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("TARTCI_REPOSITORY: unbound variable", result.stderr)
+
+    def test_dry_run_resolves_legacy_repository_when_gh_repo_is_unset(self) -> None:
+        self.env.pop("GH_REPO", None)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("action=dry-run", result.stdout)
+
+    def test_dry_run_reports_auth_failure_instead_of_hiding_it(self) -> None:
+        result = self.run_installer(FAKE_AUTH_DENY="1")
+        self.assertEqual(result.returncode, 3)
+        self.assertIn("could not authenticate", result.stderr)
+        self.assertNotIn("action=dry-run", result.stdout)
 
     def test_apply_installs_exact_rendered_profile_and_retires_declared_legacy(self) -> None:
         stale = self.agents / "com.danielraffel.tartci.tart-runner-macos-fleet.m1.removed.plist"
@@ -1159,24 +1373,54 @@ class InstallMacosFleetTests(unittest.TestCase):
 
                 [github_app]"""))
         )
+        installed_env = plistlib.loads(next(self.agents.glob("*macos-fleet*.plist")).read_bytes())["EnvironmentVariables"]
         for installed in self.agents.glob("*macos-fleet*.plist"):
             installed.unlink()
         data = fleet.load(helper_config)
-        for name, body in fleet.rendered_plists(
-            data, launch_entrypoint=Path(support["launch_entrypoint"]["path"])
-        ).items():
+        previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+        os.environ["TARTCI_RENDER_PYTHON"] = installed_env["TARTCI_PYTHON"]
+        try:
+            rendered = fleet.rendered_plists(
+                data, launch_entrypoint=Path(support["launch_entrypoint"]["path"])
+            )
+        finally:
+            if previous_render_python is None:
+                os.environ.pop("TARTCI_RENDER_PYTHON", None)
+            else:
+                os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
+        for name, body in rendered.items():
             target = self.agents / name
             target.write_bytes(body)
             target.chmod(0o644)
             self.assertEqual(
                 plistlib.loads(body)["ProgramArguments"][0], str(executable)
             )
+        lanes = {}
+        for body in rendered.values():
+            env = plistlib.loads(body)["EnvironmentVariables"]
+            lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
+        (bundle / "Contents/Resources/lanes.json").write_text(
+            json.dumps({"schema": 1, "lanes": lanes})
+        )
         return {
             "config": helper_config,
             "support": support,
             "sealed_launch": sealed_launch,
             "output": self.root / "receipt.json",
         }
+
+    def test_real_installer_checks_build_launcher_lanes_pin(self) -> None:
+        fixture = self.install_and_seal(commit="a" * 40, manifest_sha256="f" * 64)
+        self.config = fixture["config"]
+        lanes_path = self.home / ".local/libexec/TartCILauncher.app/Contents/Resources/lanes.json"
+        lanes = json.loads(lanes_path.read_text())
+        next(iter(lanes["lanes"].values()))["environment"]["TARTCI_PYTHON"] = "/wrong/python"
+        lanes_path.write_text(json.dumps(lanes))
+        result = self.run_installer(
+            "--apply", "--launch-helper-source",
+            str(self.home / ".local/libexec/TartCILauncher.app"),
+        )
+        self.assertIn("launch helper lanes are missing pinned interpreter", result.stderr)
 
     def write_receipt(self, fixture: dict) -> None:
         support = fixture["support"]

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Is a launchd-supervised runner lane mid-job right now?
 
-A lane supervisor (a tartci fleet LaunchAgent, a legacy `tart-runner`, or a
+A lane supervisor (a tartci fleet LaunchAgent, a legacy tart-runner, or a
 persistent `actions.runner.*` service) is mid-job exactly when the process
 launchd started for it has a live descendant doing the work:
 
@@ -9,7 +9,7 @@ launchd started for it has a live descendant doing the work:
   * `qemu-system-*`  the Windows lane's VM (QEMU on the host)
   * `Runner.Worker`  a persistent Actions runner executing a job on the host
 
-Stopping the supervisor (`launchctl bootout`, `kickstart -k`, `tartci pool off`)
+Stopping the supervisor (launchctl bootout, kickstart -k, tartci pool off)
 kills that descendant with it. On 2026-09-22 a raw kickstart of a lane
 supervisor killed a healthy, just-recovered VM mid-job.
 

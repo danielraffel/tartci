@@ -19,6 +19,110 @@ from macos_runner_identity import resolve_plist_identity  # noqa: E402
 
 
 class MacosRunnerIdentityGuardTests(unittest.TestCase):
+    def test_list_timeout_twice_then_answer_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            launchctl = root / "launchctl"
+            calls = root / "calls"
+            launchctl.write_text(
+                f'''#!/bin/sh
+n=0; [ -f "{calls}" ] && n=$(cat "{calls}")
+n=$((n + 1)); echo "$n" > "{calls}"
+[ "$n" -le 2 ] && exit 124
+[ "$1" = list ] && exit 0
+exit 1
+''', encoding="utf-8")
+            launchctl.chmod(0o755)
+            env = {**os.environ, "TARTCI_LAUNCHCTL": str(launchctl)}
+            result = subprocess.run(
+                [str(SCRIPT), "--current-label", "current", "--runner-name", "runner",
+                 "--state-dir", str(root / "state"), "--agents-dir", str(agents)],
+                env=env, text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(calls.read_text().strip(), "1")
+
+    def test_real_runner_retries_guard_enumeration_then_proceeds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            calls = root / "launchctl-calls"
+            launchctl = bin_dir / "launchctl"
+            launchctl.write_text(
+                f'''#!/bin/sh
+n=0; [ -f "{calls}" ] && n=$(cat "{calls}")
+n=$((n + 1)); echo "$n" > "{calls}"
+[ "$1" = list ] && [ "$n" -le 2 ] && exit 124
+[ "$1" = list ] && exit 0
+exit 1
+''', encoding="utf-8")
+            launchctl.chmod(0o755)
+            py = bin_dir / "python3"
+            py.write_text(f'''#!/bin/sh
+case "$*" in *queue_scan.py*) echo 0; exit 0;; esac
+exec {sys.executable} "$@"
+''', encoding="utf-8")
+            py.chmod(0o755)
+            for name in ("tart", "ghapp", "gh"):
+                tool = bin_dir / name
+                tool.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                tool.chmod(0o755)
+            result = subprocess.run(
+                [str(RUNNER), "--print-queue", "--once"],
+                env={**os.environ, "PATH": f"{bin_dir}:/usr/bin:/bin",
+                     "HOME": str(root), "TARTCI_LAUNCHCTL": str(launchctl),
+                     "TARTCI_LAUNCHD_LABEL": "current", "TARTCI_RUNNER_NAME": "runner",
+                     "TARTCI_GH_CLI": "gh",
+                     "TARTCI_STATE_DIR": str(root / "state"),
+                     "TARTCI_IDENTITY_GUARD_RETRY_BACKOFF_SECS": "0"},
+                text=True, capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(calls.read_text().strip(), "3")
+
+    def test_real_duplicate_is_conflict_exit_one(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            label = "com.danielraffel.pulp.tart-runner-old"
+            with (agents / f"{label}.plist").open("wb") as destination:
+                plistlib.dump({"Label": label, "ProgramArguments": ["tartci", "serve", "macos"],
+                               "EnvironmentVariables": {"TARTCI_RUNNER_NAME": "runner",
+                                                         "TARTCI_STATE_DIR": str(root / "state")}},
+                              destination)
+            launchctl = root / "launchctl"
+            launchctl.write_text("#!/bin/sh\n[ \"$1\" = list ] && { echo '1 0 com.danielraffel.pulp.tart-runner-old'; exit 0; }; exit 0\n",
+                                 encoding="utf-8")
+            launchctl.chmod(0o755)
+            result = subprocess.run(
+                [str(SCRIPT), "--current-label", "current", "--runner-name", "runner",
+                 "--state-dir", str(root / "state"), "--agents-dir", str(agents)],
+                env={**os.environ, "TARTCI_LAUNCHCTL": str(launchctl)}, text=True,
+                capture_output=True, check=False)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("duplicate loaded macOS runner", result.stderr)
+
+    def test_narrow_enumeration_never_prints_the_whole_domain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            agents = root / "agents"
+            agents.mkdir()
+            launchctl = root / "launchctl"
+            launchctl.write_text("""#!/bin/sh
+if [ "$1" = list ]; then echo '1 0 com.example.unrelated'; exit 0; fi
+case "$2" in gui/*/*) exit 0 ;; *) echo whole-domain-dump >&2; exit 9 ;; esac
+""", encoding="utf-8")
+            launchctl.chmod(0o755)
+            result = subprocess.run(
+                [str(SCRIPT), "--current-label", "current", "--runner-name", "runner",
+                 "--state-dir", str(root / "state"), "--agents-dir", str(agents)],
+                env={**os.environ, "TARTCI_LAUNCHCTL": str(launchctl)}, text=True,
+                capture_output=True, check=False)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("whole-domain-dump", result.stderr)
+
     def test_known_non_macos_provider_matching_is_exact(self) -> None:
         known = (
             ["/bin/bash", "/opt/tartci/providers/tart-linux/runner.sh", "--loop"],
@@ -108,7 +212,7 @@ services = {
                 capture_output=True,
                 check=False,
             )
-            self.assertEqual(result.returncode, 2)
+            self.assertEqual(result.returncode, 1)
             self.assertIn("duplicate loaded macOS runner", result.stderr)
             self.assertIn("local.custom.tart-macos", result.stderr)
 
@@ -190,10 +294,9 @@ exit 0
             launchctl = root / "launchctl"
             launchctl.write_text(
                 f"""#!/bin/sh
-printf '%s\\n' "$2" >> '{calls}'
-case "$2" in
-  gui/*) printf 'services = {{\\n  "com.apple.textcontextd" => {{\\n  }}\\n  "com.example.menu-helper" => {{\\n  }}\\n}}\\n' ;;
-  */com.apple.textcontextd|*/com.example.menu-helper) exit 77 ;;
+printf '%s\\n' "$1 $2" >> '{calls}'
+case "$1 $2" in
+  "list ") printf 'PID\\tStatus\\tLabel\\n' ;;
 esac
 exit 0
 """,
@@ -222,7 +325,7 @@ exit 0
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(
                 calls.read_text(encoding="utf-8").splitlines(),
-                [f"gui/{os.getuid()}"],
+                ["list "],
             )
 
     def test_plausible_service_launchctl_timeout_fails_closed(self) -> None:
@@ -233,7 +336,8 @@ exit 0
             launchctl = root / "launchctl"
             launchctl.write_text(
                 """#!/bin/sh
-case "$2" in
+case "$1 $2" in
+  "list ") sleep 1 ;;
   gui/*/local.tart-macos-runner) sleep 1 ;;
   gui/*) printf 'services = {\n  "local.tart-macos-runner" => {\n  }\n}\n' ;;
 esac
@@ -264,7 +368,7 @@ exit 0
                 check=False,
             )
             self.assertEqual(result.returncode, 2)
-            self.assertIn("launchctl print timed out", result.stderr)
+            self.assertIn("launchctl list timed out", result.stderr)
 
     def test_loaded_linux_provider_is_positively_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -362,9 +466,9 @@ exit 0
             launchctl = root / "launchctl"
             launchctl.write_text(
                 """#!/bin/sh
-case "$2" in
+case "$1 $2" in
+  "list ") printf '123\\t0\\tlocal.tart-macos-runner\\n' ;;
   */local.tart-macos-runner) printf 'program = /unknown/wrapper\\n' ;;
-  gui/*) printf 'services = {\\n  "local.tart-macos-runner" => {\\n  }\\n}\\n' ;;
 esac
 exit 0
 """,

@@ -151,7 +151,9 @@ tartci_assignment_v2_tier_demand(){
     --require-label "$tier_label" \
     --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \
-    --gh-cli "$GH_CLI" </dev/null 2>"$error_file"; then
+    --gh-cli "$GH_CLI" \
+    --lane-id "$RUNNER_NAME" \
+    --generation "${TARTCI_GENERATION:-unknown}" </dev/null 2>"$error_file"; then
     rc=0
   else
     rc=$?

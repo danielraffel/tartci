@@ -328,8 +328,9 @@ class PoolStatusRenderingTests(unittest.TestCase):
     @staticmethod
     def render(fleet: dict) -> str:
         source = (ROOT / "tartci").read_text()
-        start = source.index('python3 - "$fleet_readiness" <<\'PY\'\n')
-        start += len('python3 - "$fleet_readiness" <<\'PY\'\n')
+        marker = '"$status_python" - "$fleet_readiness" <<\'PY\'\n'
+        start = source.index(marker)
+        start += len(marker)
         block = source[start:source.index("\nPY\n", start)]
         result = subprocess.run(
             ["python3", "-c", block, json.dumps(fleet)],

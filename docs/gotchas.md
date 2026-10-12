@@ -112,6 +112,33 @@ heartbeat (runner still starting, or a guest launcher from an older
 generation) silence proves nothing and the idle and job timeouts apply.
 Heartbeat lines are dropped from the runner log the host echoes.
 
+## A gate lane sits in `booting` for over an hour with a stale heartbeat (m1, 2026-10-09)
+
+**Symptom:** `tartci doctor fleet` reports `fleet_not_ready` with
+`heartbeat_stale`, while the host still serves jobs on its other lanes. The
+stale lane's state file shows `phase: booting`, its VM has an IP
+(`boot_ip` in the lane's `events.jsonl`), there is no actions-runner log for
+the VM, and `ps` shows the supervisor running one `ssh admin@<vm-ip> true`
+after another, each lasting about a minute.
+
+**Cause:** the boot helper waited for the guest's sshd with 90 attempts and a
+2 s sleep, meant as 180 s. `ConnectTimeout=10` bounds only the TCP connect,
+so a guest that accepts the connection but never finishes the handshake holds
+each attempt for about 60 s. The 90 attempts then take about 93 minutes, and
+nothing writes a heartbeat meanwhile. On m1, `pulp-gate.slot2` sat there for
+71+ minutes.
+
+**Fix:** the wait is bounded by wall-clock time. Each attempt is killed at
+`TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15) and the whole wait ends at
+`TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180), after which the VM is discarded
+with `boot_failed no_ssh` and `waited_s`/`attempts` fields. Each failed
+attempt refreshes the boot phase's heartbeat, which is honest because the wait
+has a hard end. The doctor's `fleet_not_ready` line now names each problem's
+lane and heartbeat age, for example
+`heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`.
+A host on a generation from before this fix discards such a VM only after the
+attempts run out; it heals once it self-updates.
+
 ## A `while read` loop ends early after a peer read over ssh (2026-10-04)
 
 *Symptom:* the supervisor observed only the first class with young demand;
@@ -716,6 +743,23 @@ first; list it only when what it asserts really needs tomllib.
   that a job is terminal.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
+  The host lock remains deliberately global: it is #161's burst guard and
+  licenses `assignment_scan_max_workers` to fan out only after one observer has
+  authority. Acquisition is FIFO across repository namespaces. When a scan
+  times out, that repository records a bounded backoff in the shared state and
+  skips its next attempts, yielding the host slot to other repositories. The
+  backoff is a fairness guard, not a second lock or a per-repository authority;
+  all three scanners (`assignment_scan.py`, `queue_scan.py`, and
+  `current_job_scan.py`) use the same host lock, FIFO queue, and backoff file.
+  The lock's `<path>.owner.json` records the active holder PID, process start,
+  lane, generation, and start time. A contender that observes a holder past
+  `TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS` (default 300 seconds) writes
+  `<path>.escalation.json` with the same evidence. The owner record is removed
+  when the flock is released. At timeout diagnostics enumerate live processes
+  that still have the lock file open, so an exec'd child that inherited the
+  descriptor can be identified when the holder probe reports it; lane and
+  generation metadata come from the owner record. Missing or stale records, or
+  an unavailable holder probe, remain fail-closed and are reported as unknown.
   → *Failure behavior:* lock acquisition is bounded by
   `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
   the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
@@ -1019,3 +1063,5 @@ machine-readable disk-axis lease denial. Do not broaden it to old receipts,
 CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
 Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
+
+- **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.

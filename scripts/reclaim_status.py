@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """The disk reclaimer's last pass: how long ago, and how it ended.
 
-Read from the receipt every `tartci reclaim` pass writes when it finishes
+Read from the receipt every tartci reclaim pass writes when it finishes
 ($TARTCI_HOME/state/reclaim/last-run.json), never from launchd. launchd can say
 a job with the right label is loaded while the job it holds is somebody else's:
 m3's reclaimer was shadowed for a day by a leaked registration that exited 127
@@ -165,7 +165,7 @@ def degraded(value: dict[str, Any]) -> list[str]:
     """What the pass could not do although it exited 0, loudest first.
 
     A pass whose Pulp reapers never ran (m5studio's profile names a
-    worktrees_root that does not exist) exited 0 and printed `reclaim: ok`,
+    worktrees_root that does not exist) exited 0 and printed reclaim: ok,
     with the reason in a parenthesis nobody reads.
     """
     out = []

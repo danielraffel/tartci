@@ -320,7 +320,7 @@ class Wiring(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(json.loads(proc.stdout)["schema"], pu.SCHEMA)
         src = (ROOT / "tartci").read_text()
-        self.assertIn('python3 "$HERE/scripts/pool_usage.py" --summary', src)
+        self.assertIn('"$status_python" "$HERE/scripts/pool_usage.py" --summary', src)
 
 
 if __name__ == "__main__":

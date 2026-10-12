@@ -659,6 +659,11 @@
       "summary": "The host's VM DHCP breaker file could not be read.",
       "why": "Lanes read an unreadable breaker as closed and clone as usual; the doctor reports it so the cause is fixed.",
       "remedy": "Inspect ~/.tartci/state/vm-dhcp/breaker.json; the next breaker write replaces it atomically."
+    },
+    "lane_python_unavailable": {
+      "summary": "A lane pins an interpreter path that no longer exists.",
+      "why": "The sealed or managed lane cannot start its verified helper interpreter, so GitHub reads and fleet supervision are unavailable.",
+      "remedy": "Restore the pinned interpreter at the recorded path or reinstall the generation with a verified interpreter, then rerun fleet doctor."
     }
   }
 }

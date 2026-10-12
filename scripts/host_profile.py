@@ -240,13 +240,13 @@ def resolve_role(
 # --- governor: one per-host config surface --------------------------------
 #
 # Every tuning knob of the build governor lives in ONE host-local file,
-# ~/.config/tartci/governor.toml, flat `[governor]` table. `tartci governor
-# show|set|explain` reads and edits it; `tartci host-profile` derives every
+# ~/.config/tartci/governor.toml, flat [governor] table. tartci governor
+# show|set|explain reads and edits it; tartci host-profile derives every
 # exported number from it. Precedence per key: CLI flag > TARTCI_GOV_<KEY>
 # environment > governor.toml > legacy source (role file; fleet profile
 # `[host] agent_floor_cores`) > role default. The TARTCI_GOV_ prefix keeps the
 # overrides apart from host-profile's own exported names, so a shell that
-# evaluated `tartci host-profile` cannot feed its outputs back in as inputs.
+# evaluated tartci host-profile cannot feed its outputs back in as inputs.
 #
 # A malformed value is ignored (with a note in `problems`), never raised: this
 # runs on every lease admission, and a typo in an optional knob must never
@@ -285,7 +285,7 @@ GOVERNOR_HELP: dict[str, str] = {
     "agent_floor_cores": "background-QoS floor lease for a denied background build (0 = off)",
     "agent_floor_pool_cores": "host-wide cap on concurrent floor-lease cores",
     "dynamic_lending": "lend idle gate-reserved cores to interactive builds (preemptible)",
-    "fleet_hosts": "comma-separated SSH aliases `tartci governor fleet` reads",
+    "fleet_hosts": "comma-separated SSH aliases tartci governor fleet reads",
 }
 
 
@@ -1044,8 +1044,8 @@ def classify_delivery(arguments: list[str]) -> dict:
     """Name the delivery mechanism from a plist's ProgramArguments alone.
 
     The two shapes are structurally distinct, so neither needs a hostname:
-    a sealed lane execs `<bundle>.app/Contents/MacOS/tartci-launcher`, a
-    generation lane execs `<generations-root>/<GEN>/.tartci-launch`.
+    a sealed lane execs <bundle>.app/Contents/MacOS/tartci-launcher, a
+    generation lane execs <generations-root>/<GEN>/.tartci-launch.
     """
     for argument in arguments:
         if argument.endswith(LAUNCHER_SUFFIX):
@@ -1168,10 +1168,10 @@ def build_delivery_report(
             "how_to_update": (
                 "rebuild and re-sign the launcher bundle "
                 "(scripts/build_macos_launcher.sh), then re-approve and reinstall; "
-                "`tartci fleet-macos install --apply` stages a generation this "
+                "tartci fleet-macos install --apply stages a generation this "
                 "lane never execs"
                 if sealed else
-                "`tartci fleet-macos install --apply <profile>` stages a new "
+                "tartci fleet-macos install --apply <profile> stages a new "
                 "generation and repoints this lane at it"
                 if classified["delivery"] == "generation" else
                 "unrecognised launch entrypoint; inspect ProgramArguments"

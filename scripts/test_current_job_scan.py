@@ -107,6 +107,14 @@ class CurrentJobScanTests(unittest.TestCase):
         # Either the overall deadline or the call it cut short reports it.
         self.assertRegex(receipt["detail"], r"overall deadline|timed out after")
 
+    def test_api_timeout_is_typed_separately_from_lock_contention(self) -> None:
+        result = self._scan(
+            "unexpected", budgets=("--scan-timeout", "5", "--gh-timeout", "1"), delay=2
+        )
+        receipt = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(receipt["detail"].startswith("api_timeout:"), receipt)
+
     def test_ambiguous_assignment_is_typed(self) -> None:
         receipt = json.loads(self._scan("ambiguous").stdout)
         self.assertEqual(receipt, {"kind": "ambiguous_assignment", "matches": 2})

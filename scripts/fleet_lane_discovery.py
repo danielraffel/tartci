@@ -4,9 +4,9 @@
 Why this exists
 ---------------
 A fleet lane writes its supervisor heartbeat to its OWN state directory,
-``~/.tartci/state/macos-fleet/<identity>/``, named by the lane's installed
+~/.tartci/state/macos-fleet/<identity>/, named by the lane's installed
 plist (``TARTCI_STATE_DIR``). Two observability tools looked somewhere else:
-``vm_reap.py`` globbed a single legacy directory (``~/.tartci/state/macos``)
+vm_reap.py globbed a single legacy directory (~/.tartci/state/macos)
 and ``macos_observe.py`` defaulted ``--state-dir`` to that same legacy path.
 Neither had ever been taught about the per-lane layout, so on a host running
 five fleet lanes they matched zero supervisors and said so as
@@ -139,7 +139,7 @@ def runner_name_prefixes(lanes: Iterable[Lane]) -> list[str]:
     """Ownership prefixes implied by the discovered lanes.
 
     Fleet VMs are named `<host_id>-<identity>-...`, which the legacy default
-    prefix list (`pulp-,linux-ephr-,win-ephr-,tartci-`) does not cover. Derive
+    prefix list (pulp-,linux-ephr-,win-ephr-,tartci-) does not cover. Derive
     them from the lanes rather than adding another literal that can drift.
     """
     prefixes: list[str] = []

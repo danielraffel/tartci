@@ -2,8 +2,8 @@
 """Fleet drift guard — catch the silent config rot that kills event delivery.
 
 Every check here exists because it FAILED SILENTLY in production on
-2026-07-28, and none of the existing surfaces reported it. `tartci doctor`
-checks host prereqs, `tartci pool status` lists agents, and `shipyard runner
+2026-07-28, and none of the existing surfaces reported it. tartci doctor
+checks host prereqs, tartci pool status lists agents, and shipyard runner
 audit` checks label naming — none of them notices that GitHub has been unable
 to reach a host for weeks.
 
@@ -23,7 +23,7 @@ What rotted, and the check that would have caught it:
    307-redirects, the registrar's PATCH does not follow redirects, and
    registration fails permanently.
    → `no-stale-repo-registrations`
-5. A tartci checkout sat on a merged feature branch 13 commits behind `main`,
+5. A tartci checkout sat on a merged feature branch 13 commits behind main,
    so a migration script did not exist on the one host that needed it.
    → `checkout-current`
 6. A token helper under /Volumes/* works interactively but fails for every
@@ -38,7 +38,7 @@ What rotted, and the check that would have caught it:
    and the merge queue went five hours without landing a PR.
    → `gate-labels-match-required`
 9. A failed `migrate_macos_gate_agent.sh` left a host with no gate agent at all,
-   invisible to `tartci pool status`, which still listed it.
+   invisible to tartci pool status, which still listed it.
    → `gate-agent-installed`
 
 Read-only. Never mutates a host or GitHub. Exit 0 clean, 1 drift, 2 usage.
@@ -125,7 +125,7 @@ def check_path_tools(rep: Report) -> None:
     launchd runner plists invoke TartCI by its absolute home-backed path and
     include ``~/.local/bin`` in their service PATH. An SSH probe is commonly a
     non-login shell whose PATH omits that directory; treating ``command -v
-    tartci`` in such a shell as an installation test creates a false outage.
+    tartci in such a shell as an installation test creates a false outage.
     """
     for tool in REQUIRED_ON_PATH:
         found = next(
@@ -447,7 +447,7 @@ def main(argv: list[str]) -> int:
                       "(ProgramArguments --labels and TARTCI_RUNNER_LABELS), then "
                       "bootout + bootstrap the agent.")
             if "checkout-current" in names:
-                print("  Checkout: `git -C ~/Code/tartci checkout main && git pull "
+                print("  Checkout: git -C ~/Code/tartci checkout main && git pull "
                       "--ff-only` — a stale checkout hides its own repair scripts.")
         else:
             print("\nno drift.")

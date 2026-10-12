@@ -195,6 +195,21 @@ echo "$newest"
 SNIP
 }
 
+cmd_doctor(){
+  local receipt="" promotion=0 max_age=14
+  while [ $# -gt 0 ]; do case "$1" in
+    --receipt) receipt="$2"; shift 2;;
+    --promotion|--release) promotion=1; shift;;
+    --max-age-days) max_age="$2"; shift 2;;
+    *) die "unknown arg: $1";;
+  esac; done
+  if [ -z "$receipt" ]; then receipt="$(find "$GOLDENS" -maxdepth 1 -type f -name '*.receipt.json' -print -quit 2>/dev/null || true)"; fi
+  [ -n "$receipt" ] || die "no golden receipt found; provide --receipt FILE"
+  local args=("$receipt" --max-age-days "$max_age")
+  [ "$promotion" = 1 ] && args+=(--promotion)
+  exec python3 "$(dirname "${BASH_SOURCE[0]}")/../providers/common/pulp-golden-receipt.py" "${args[@]}"
+}
+
 cmd_sync(){
   local TO="" FROM="" PRUNE=0 DRY=0 RELOAD=1 VIA=""
   while [ $# -gt 0 ]; do case "$1" in
@@ -270,7 +285,8 @@ sub="${1:-}"; shift || true
 case "$sub" in
   list) cmd_list "$@";;
   sync) cmd_sync "$@";;
+  doctor) cmd_doctor "$@";;
   ""|-h|--help|help)
     sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//';;
-  *) die "unknown goldens subcommand: $sub (try: list, sync)";;
+  *) die "unknown goldens subcommand: $sub (try: list, sync, doctor)";;
 esac

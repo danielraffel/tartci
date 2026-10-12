@@ -11,11 +11,11 @@ over the relay hosts, a short backoff between passes, and a total deadline far
 below any client's CONNECT timeout. Retries happen only before the client is
 told "200 Connection Established", so no client byte is ever relayed twice.
 Every failed attempt, retry, and exhaustion is written to stderr as one
-timestamped ``tartci-relay-event`` JSON line.
+timestamped tartci-relay-event JSON line.
 
 The deployed interpreter is macOS's /usr/bin/python3 (3.9), where
-``socket.timeout`` is NOT a subclass of ``TimeoutError``; socket errors are
-therefore caught as ``OSError``.
+socket.timeout is NOT a subclass of TimeoutError; socket errors are
+therefore caught as OSError.
 """
 
 from __future__ import annotations
@@ -470,7 +470,7 @@ EXIT_PORT_IN_USE = 75
 
 
 def port_holder(port: int, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
-    """Who listens on `port`, as "pid N (command)", or why that is unknown."""
+    """Who listens on port, as "pid N (command)", or why that is unknown."""
     try:
         result = run(
             ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"],

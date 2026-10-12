@@ -33,6 +33,7 @@ import network_profile
 import pulp_reapers
 import schedule_backstop_mode
 import support_agents
+import debug_hold
 import reuse_canary
 import power_status
 
@@ -50,7 +51,7 @@ TOP_KEYS = {
     "schema", "name", "host", "github_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
-    "reuse_canary", "launchd_watchdog",
+    "reuse_canary", "debug_hold", "launchd_watchdog",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
 LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
@@ -484,7 +485,7 @@ def load(path: Path) -> dict:
             fail(f"unknown build_disagreement keys: {sorted(unknown)}")
         if type(disagreement.get("enabled", False)) is not bool:
             fail("build_disagreement.enabled must be a boolean")
-    # Opt-in: run Pulp's own build-directory reapers from `tartci reclaim`
+    # Opt-in: run Pulp's own build-directory reapers from tartci reclaim
     # (scripts/pulp_reapers.py). One validator for install time and run time,
     # so a profile that installs is a profile the reclaim pass acts on.
     reclaim = data.get("reclaim")
@@ -502,6 +503,12 @@ def load(path: Path) -> dict:
     canary = data.get(reuse_canary.TABLE)
     if canary is not None:
         problems = reuse_canary.validate_table(canary)
+        if problems:
+            fail("; ".join(problems))
+    # Whether this host keeps failed gate VMs for debugging (off by default).
+    hold = data.get(debug_hold.TABLE)
+    if hold is not None:
+        problems = debug_hold.validate_table(hold)
         if problems:
             fail("; ".join(problems))
     # Which support LaunchAgents this host carries (checked after the agents'
@@ -1249,7 +1256,24 @@ def write_receipt(
     data = load(config)
     support_root = support_root.resolve()
     launch_entrypoint = launch_entrypoint.resolve()
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                installed_env = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {})
+            except (OSError, plistlib.InvalidFileException):
+                continue
+            pinned = installed_env.get("TARTCI_PYTHON")
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     digests: dict[str, str] = {}
     for name, body in expected.items():
         installed = agents_dir / name
@@ -1278,8 +1302,14 @@ def write_receipt(
         entrypoint_source, entrypoint, support_root
     )
     launch = support_manifest.launch_record(launch_entrypoint, support_root)
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    interpreter = Path(os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3"))
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     if interpreter.is_symlink() or not interpreter.is_file():
         fail("fleet launch interpreter must be a regular non-symlink file")
     interpreter_record = {
@@ -1418,8 +1448,19 @@ def verify_receipt(
         != support.get("launch_entrypoint")
     ):
         fail("installed TartCI launch entrypoint does not match its receipt")
-    interpreter = Path("/usr/bin/python3")
-    interpreter_info = interpreter.lstat()
+    recorded_interpreter = support.get("interpreter")
+    interpreter = Path(
+        recorded_interpreter["path"]
+        if isinstance(recorded_interpreter, dict) and recorded_interpreter.get("path")
+        else os.environ.get("TARTCI_RENDER_PYTHON", "/usr/bin/python3")
+    )
+    try:
+        interpreter_info = interpreter.lstat()
+    except FileNotFoundError:
+        fail(
+            f"fleet launch interpreter unavailable: {interpreter}; "
+            "remedy: reinstall the current TartCI generation to refresh its pin"
+        )
     interpreter_record = {
         "path": str(interpreter),
         "mode": stat.S_IMODE(interpreter_info.st_mode),
@@ -1435,7 +1476,7 @@ def verify_receipt(
                 f"{INTERPRETER_CHANGED_BY_OS_UPDATE}: the OS-managed {interpreter} changed "
                 f"with a macOS update ({evidence}), so the receipt no longer describes it; "
                 "remedy: reinstall the same generation to refresh the receipt "
-                "(`tartci fleet-macos self-update --apply` does this at the next idle window)")
+                "(tartci fleet-macos self-update --apply does this at the next idle window)")
         fail("fleet launch interpreter does not match its receipt")
     if hashlib.sha256(config.read_bytes()).hexdigest() != receipt.get("config_sha256"):
         fail("installed fleet profile digest does not match its receipt")
@@ -1443,7 +1484,26 @@ def verify_receipt(
     recorded_persistent = receipt.get("persistent_plists", {})
     if recorded_persistent != expected_persistent:
         fail("installed persistent runner plist set does not match the profile receipt")
-    expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    # Render with the same rule as write_receipt: pin only when the installed
+    # plist cohort carries TARTCI_PYTHON. Unpinned source renders must verify
+    # as unpinned rather than being silently rewritten during verification.
+    previous_render_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if previous_render_python is None:
+        for installed in sorted(agents_dir.glob("com.danielraffel.tartci.tart-runner-macos-fleet.*.plist")):
+            try:
+                pinned = plistlib.loads(installed.read_bytes()).get("EnvironmentVariables", {}).get("TARTCI_PYTHON")
+            except (OSError, plistlib.InvalidFileException):
+                pinned = None
+            if pinned:
+                os.environ["TARTCI_RENDER_PYTHON"] = pinned
+                break
+    try:
+        expected = rendered_plists(data, launch_entrypoint=launch_entrypoint)
+    finally:
+        if previous_render_python is None:
+            os.environ.pop("TARTCI_RENDER_PYTHON", None)
+        else:
+            os.environ["TARTCI_RENDER_PYTHON"] = previous_render_python
     recorded = receipt.get("plists")
     if not isinstance(recorded, dict) or set(recorded) != set(expected):
         fail("install receipt plist set does not match the profile")
@@ -1464,18 +1524,18 @@ def verify_receipt(
             installed_body = _verified_network_overlay(installed, body, config)
         if recorded.get(name) != digest or installed_body is None:
             fail(f"installed fleet plist failed receipt verification: {installed}")
-    expected_retired = replacements(data)
-    if receipt.get("retired_launchd_labels") != expected_retired:
-        fail("install receipt retired-label set does not match the profile")
-    for label in expected_retired:
-        if (agents_dir / f"{label}.plist").exists():
-            fail(f"declared legacy LaunchAgent became installable again: {label}")
     assert_executed_generation(
         agents_dir, expected,
         launch_entrypoint=launch_entrypoint,
         source_commit=verified_support["source_commit"],
         manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
     )
+    expected_retired = replacements(data)
+    if receipt.get("retired_launchd_labels") != expected_retired:
+        fail("install receipt retired-label set does not match the profile")
+    for label in expected_retired:
+        if (agents_dir / f"{label}.plist").exists():
+            fail(f"declared legacy LaunchAgent became installable again: {label}")
     return receipt
 
 
@@ -1951,7 +2011,10 @@ def fleet_readiness(
                 "blocked_seconds_threshold": blocked_serving_seconds,
             },
             "problems": [{"code": INTERPRETER_CHANGED_BY_OS_UPDATE
-                          if isinstance(exc, InterpreterChangedByOSUpdate) else "receipt_mismatch",
+                          if isinstance(exc, InterpreterChangedByOSUpdate)
+                          else ("lane_python_unavailable"
+                                if "interpreter unavailable" in str(exc)
+                                else "receipt_mismatch"),
                           "detail": str(exc)}],
             "config": config_verdicts(config, support_root),
         }
@@ -2329,7 +2392,7 @@ def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
     The same rule self-update uses for its peers: the host's published
-    `host.ssh` from its checked-in profile, else the `tartci-<host_id>` alias
+    host.ssh from its checked-in profile, else the tartci-<host_id> alias
     convention. Resolved at render time, so the LaunchAgent carries the exact
     target and the supervisor never re-reads profiles.
     """
@@ -2388,6 +2451,14 @@ def lane_plist(
         "TARTCI_ADMISSION_CLEAN_MODE": "required",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    # The installer resolves and probes one interpreter before rendering. Keep
+    # that exact path in every LaunchAgent so TartCILauncher and ghapp cannot
+    # follow a later PATH relink.
+    pinned_python = os.environ.get("TARTCI_RENDER_PYTHON")
+    if pinned_python:
+        env["TARTCI_PYTHON"] = pinned_python
+        env["SHIPYARD_GHAPP_PYTHON_BINARY"] = pinned_python
+        env["PATH"] = f"{Path(pinned_python).parent}:{env['PATH']}"
     cleanup = data.get("worktree_cleanup")
     if cleanup is not None and cleanup["apply"] and lane["repo"] == cleanup["repo"] and lane["id"] == "pulp-gate":
         env.update({
@@ -2738,7 +2809,7 @@ def advertised_labels_snapshot(paths: list[Path], commit: str | None,
         # Additive to v1: runners a host owns whose labels tartci does not set.
         "persistent_runners": persistent,
         # Additive to v1: how fleet hosts reach each other (self-update's
-        # one-at-a-time check). ssh null means the alias `tartci-<host_id>`.
+        # one-at-a-time check). ssh null means the alias tartci-<host_id>.
         "hosts": hosts,
     }
 
@@ -3397,7 +3468,7 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     if current != body:
                         print(f"fleet-macos: {args.check} is stale; regenerate with "
-                              "`tartci fleet-macos advertised-labels --publish > "
+                              "tartci fleet-macos advertised-labels --publish > "
                               "fleet/advertised-labels.json`", file=sys.stderr)
                         return 1
                     print(f"up to date: {args.check}")

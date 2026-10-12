@@ -9,7 +9,7 @@ hosts that cannot take it. This module answers the question that rule was
 standing in for: can a preferred host take this job NOW?
 
 `report` runs on a preferred host (read-only, reached over SSH as
-`tartci pool supply --json`) and says, for one repository and one event class:
+tartci pool supply --json) and says, for one repository and one event class:
 
   free       lanes serving that class whose supervisor is idle and fresh, capped
              by the host's free macOS VM slots (Apple's 2-guest limit, the

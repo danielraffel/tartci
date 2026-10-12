@@ -48,7 +48,7 @@ gate above; a plain clone is always kept (`clone_in_shared_root`), because in
 a developer's Code directory a clone is someone's checkout, not scratch.
 
 Keep-verdicts that only a change to the checkout can reverse are cached
-(`~/.tartci/state/reclaim/checkout-verdicts.json`) while the checkout's newest
+(~/.tartci/state/reclaim/checkout-verdicts.json) while the checkout's newest
 mtime is unchanged, for at most a day, so hundreds of idle checkouts are not
 re-`git status`ed every hour. A stale cached verdict can only keep a checkout.
 

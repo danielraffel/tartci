@@ -3,12 +3,12 @@
 
 A macOS automatic install that stalls part-way (m3, 2026-10-04: 27.0.1 began
 at 03:14 and never finished) can leave launchd's gui domain refusing every
-non-demand spawn. `launchctl print` then shows each StartInterval agent as
-`pended nondemand spawn = interval` with its `runs` counter frozen, and a
-KeepAlive agent that exits sits at `pended nondemand spawn` instead of being
+non-demand spawn. launchctl print then shows each StartInterval agent as
+pended nondemand spawn = interval with its runs counter frozen, and a
+KeepAlive agent that exits sits at pended nondemand spawn instead of being
 respawned. The VM reaper, the launchd watchdog, self-update and the reclaimer
 all stopped for 16 h while the long-running lane supervisors kept serving, so
-nothing looked down. Only a demand spawn (`launchctl kickstart`) still works.
+nothing looked down. Only a demand spawn (launchctl kickstart) still works.
 
 This guard therefore runs inside a process that is already alive: the lane
 supervisor starts it as a background child (providers/tart-macos/
@@ -17,20 +17,20 @@ lock picks the single one that acts, and another takes over within one cadence
 when that supervisor exits. Each pass reads the fleet's LaunchAgents
 (com.danielraffel.*, com.pulp.*) and, with per-call timeouts:
 
-  * kicks a StartInterval agent that is not running and whose `runs` counter
-    has not moved for 2x its interval (event `interval_agent_kicked`);
+  * kicks a StartInterval agent that is not running and whose runs counter
+    has not moved for 2x its interval (event interval_agent_kicked);
   * kicks a fleet runner lane (KeepAlive) that launchd owes a respawn
-    (event `keepalive_agent_kicked`): it exited 75, the code a lane uses only
+    (event keepalive_agent_kicked): it exited 75, the code a lane uses only
     after its fail-closed restart contract ran, it is not running, it has
     stayed that way for KEEPALIVE_PENDED_S, pool participation is on and
     launchd does not list it as disabled. The rule is the watchdog's own
-    (`owes_exit75_respawn`), and unknown enablement kicks nothing. A pended
+    (owes_exit75_respawn), and unknown enablement kicks nothing. A pended
     spawn line is recorded as evidence, never required. A lane stopped with
     any other exit code did not vouch for its own state: it is reported once
-    (`keepalive_agent_stopped`) and left to the watchdog's verdict;
+    (keepalive_agent_stopped) and left to the watchdog's verdict;
   * stops after KICK_CEILING kicks in a row that did not take (the agent
     neither ran nor advanced its run count by the next pass), emitting
-    `interval_kick_ceiling` / `keepalive_kick_ceiling` once, so a job that
+    interval_kick_ceiling / keepalive_kick_ceiling once, so a job that
     cannot start fails loud instead of being kicked forever. The ceiling
     clears when the agent next runs or advances on its own;
   * does not kick self-update (PAUSE_DURING_STALL) while a domain stall
@@ -40,13 +40,13 @@ when that supervisor exits. Each pass reads the fleet's LaunchAgents
     any other. It still counts toward the domain stall;
   * opens a domain-wide episode when two or more interval agents have gone
     2x their interval without launchd starting them on its own (event
-    `launchd_interval_spawns_stalled`, once per episode), and closes it
-    (`launchd_interval_spawns_recovered`) when launchd resumes.
+    launchd_interval_spawns_stalled, once per episode), and closes it
+    (launchd_interval_spawns_recovered) when launchd resumes.
 
 A run the guard caused does not count as launchd making progress, so the
 episode stays open for as long as launchd is broken even though the guard
-keeps the jobs running. Every pass writes a receipt that `tartci pool status`
-and `tartci doctor fleet` read.
+keeps the jobs running. Every pass writes a receipt that tartci pool status
+and tartci doctor fleet read.
 
 Python 3.9-safe: the launchd python on fleet hosts is /usr/bin/python3.
 """
@@ -153,7 +153,7 @@ _FIELD = re.compile(r"^\t([a-z][a-z ]*[a-z]) = (.*)$")
 
 
 def parse_print(text: str) -> Dict[str, str]:
-    """The top-level `key = value` fields of `launchctl print` (one tab deep)."""
+    """The top-level key = value fields of launchctl print (one tab deep)."""
     fields: Dict[str, str] = {}
     for line in text.splitlines():
         match = _FIELD.match(line)
@@ -536,14 +536,23 @@ def status(state_dir: Optional[pathlib.Path] = None, *,
            now: Optional[float] = None) -> Dict[str, Any]:
     path = (state_dir or default_dir()) / "status.json"
     now = time.time() if now is None else now
-    out: Dict[str, Any] = {"receipt": str(path), "stale_after_s": RECEIPT_STALE_S}
     try:
         receipt = json.loads(path.read_text())
     except FileNotFoundError:
-        out["state"] = "never"
-        return out
+        return classify(None, now, receipt_path=str(path))
     except (OSError, ValueError) as exc:
-        out.update(state="unreadable", error=str(exc))
+        return {"receipt": str(path), "stale_after_s": RECEIPT_STALE_S,
+                "state": "unreadable", "error": str(exc)}
+    return classify(receipt, now, receipt_path=str(path))
+
+
+def classify(receipt: Any, now: float, *, receipt_path: str = "") -> Dict[str, Any]:
+    """The guard's state from a parsed receipt (None: never written), judged at
+    now. Pure, so a peer that read the receipt over SSH can judge it on the
+    receipt host's own clock (scripts/peer_stall_alert.py)."""
+    out: Dict[str, Any] = {"receipt": receipt_path, "stale_after_s": RECEIPT_STALE_S}
+    if receipt is None:
+        out["state"] = "never"
         return out
     if not isinstance(receipt, dict) or not isinstance(receipt.get("ts"), (int, float)):
         out.update(state="unreadable", error="receipt has no ts")

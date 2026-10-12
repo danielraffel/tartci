@@ -621,7 +621,7 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
 
 
 def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
-    """(state, code, detail) for `tartci doctor fleet` and the outage alert:
+    """(state, code, detail) for tartci doctor fleet and the outage alert:
     "ok" | "problem" | "unknown", most fundamental failing layer first."""
     if value.get("state") == "open":
         opened = value.get("opened_at")
@@ -810,7 +810,7 @@ def boot_times(root: pathlib.Path, since: float) -> dict[str, Any]:
 
 
 def status(directory: pathlib.Path | None = None) -> dict[str, Any]:
-    """For `tartci doctor fleet`: never a write, never a lock.
+    """For tartci doctor fleet: never a write, never a lock.
 
     An open breaker also carries bootpd's launchd state read now, so the
     doctor can tell a job that is not loaded from one that is loaded but

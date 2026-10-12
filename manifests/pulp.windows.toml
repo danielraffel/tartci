@@ -37,16 +37,26 @@ firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
 ssh_hostfwd = "2222:22"
 
 [toolchain]
-# Provisioned over SSH with `powershell -EncodedCommand` (scp'd .cmd mis-execute;
-# cmd mangles | / % / >). MSVC: if the VS Installer no-ops silently (phantom
-# partial-instance), nuke BuildTools+Packages+Setup, reboot, clean reinstall.
-msvc   = "14.44"          # cl.exe at VC\Tools\MSVC\14.44.x\bin\Hostarm64\arm64
-cmake  = "system"
-ninja  = "system"
+node = "26.10.0"
 python = "3.12"
+cmake = "system"
+# Provisioned over SSH with PowerShell. If VS Installer leaves a phantom
+# partial instance, remove BuildTools, Packages, and Setup, reboot, reinstall.
+msvc = "14.44"
+ninja = "system"
 
 [choco]
-packages = ["git", "cmake", "ninja", "python3"]
+packages = [
+  "git",
+  "cmake",
+  "ninja",
+  "python3",
+]
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = windows
+# END GENERATED PULP TOOLCHAIN
 
 [skia]
 platforms = ["windows-arm64", "windows-x64"]

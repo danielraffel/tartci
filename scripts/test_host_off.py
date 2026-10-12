@@ -151,6 +151,16 @@ class AlertTests(Fixture):
         self.assertEqual(closed, ["42"])
         self.assertFalse((self.sdir / "host-off-alert.json").exists())
 
+    def test_immediate_alert_opens_before_the_loudness_deadline(self) -> None:
+        self.left_off()
+        opened = []
+        host_off.alert(self.sdir, self.pool, "studio", LEFT_AT + 30,
+                       issue=lambda title, body: opened.append((title, body)) or (0, "9"),
+                       immediate=True)
+        self.assertEqual(len(opened), 1)
+        self.assertIn("studio", opened[0][0])
+        self.assertIn("Remedy:", opened[0][1])
+
     def test_a_failed_issue_is_retried_next_pass(self) -> None:
         self.left_off()
         results = iter([(1, "provenance required"), (0, "7")])
@@ -278,7 +288,7 @@ class VolumeProbeTests(unittest.TestCase):
     def test_the_probe_is_not_background_throttled_and_says_why_it_timed_out(self) -> None:
         plists: list[dict] = []
         with mock.patch.object(macos_launcher_probe.subprocess, "run", self.fake_run(plists)):
-            with self.assertRaisesRegex(ValueError, "slow volume I/O, not an access denial"):
+            with self.assertRaisesRegex(ValueError, r"probe wait elapsed [0-9.]+s;.*volume I/O slow"):
                 macos_launcher_probe.run(self.helper, self.profile, timeout_seconds=0.3)
         self.assertEqual(plists[0]["ProcessType"], "Standard")
 

@@ -21,28 +21,52 @@ commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
 [toolchain]
-cmake  = "system"     # apt cmake/ninja are current enough on 24.04
-ninja  = "system"
+node = "26.10.0"
 python = "3.12"
+cmake = "system"
+ninja = "system"
 
 [apt]
-# Full Pulp Linux build deps. NOTE the pkg-config module name `libdrm` (not
-# `drm`) — setup.sh was fixed for this. ICU dev headers are required because
-# Skia's bundled HarfBuzz/ICU symbols (icu_74::Locale) must resolve at link
-# (core/canvas links ICU::uc/i18n/data on UNIX-not-APPLE).
 packages = [
-  "build-essential", "cmake", "ninja-build", "git", "pkg-config", "ccache",
-  "python3", "python3-pip",
+  "build-essential",
+  "cmake",
+  "ninja-build",
+  "git",
+  "pkg-config",
+  "ccache",
+  "python3",
+  "python3-pip",
   "libicu-dev",
-  "libegl1-mesa-dev", "libgbm-dev", "libdrm-dev",
-  "libx11-dev", "libxext-dev", "libxrandr-dev", "libxcursor-dev",
-  "libxi-dev", "libxinerama-dev", "libwayland-dev", "libxkbcommon-dev",
-  "libasound2-dev", "libpulse-dev",
-  "gcc-x86-64-linux-gnu", "g++-x86-64-linux-gnu",
-  "binfmt-support",                      # Rosetta x86_64 binfmt registration
-  "libc6:amd64", "libstdc++6:amd64", "libgcc-s1:amd64",
-  "zlib1g:amd64", "libtinfo6:amd64", "libxml2:amd64",
+  "libegl1-mesa-dev",
+  "libgbm-dev",
+  "libdrm-dev",
+  "libx11-dev",
+  "libxext-dev",
+  "libxrandr-dev",
+  "libxcursor-dev",
+  "libxi-dev",
+  "libxinerama-dev",
+  "libwayland-dev",
+  "libxkbcommon-dev",
+  "libasound2-dev",
+  "libpulse-dev",
+  "gcc-x86-64-linux-gnu",
+  "g++-x86-64-linux-gnu",
+  "binfmt-support",
+  "libc6:amd64",
+  "libstdc++6:amd64",
+  "libgcc-s1:amd64",
+  "zlib1g:amd64",
+  "libtinfo6:amd64",
+  "libxml2:amd64",
 ]
+# The pkg-config module is `libdrm`, not `drm`; ICU headers are required by
+# Skia's bundled HarfBuzz/ICU symbols. binfmt-support registers Rosetta x86_64.
+
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = linux
+# END GENERATED PULP TOOLCHAIN
 
 [skia]
 release = "chrome/m153"

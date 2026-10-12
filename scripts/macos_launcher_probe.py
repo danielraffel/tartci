@@ -77,6 +77,7 @@ def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> di
         probe_error: Exception | None = None
         cleanup_error: str | None = None
         try:
+            probe_started = time.monotonic()
             result = subprocess.run(
                 ["launchctl", "bootstrap", domain, str(plist_path)],
                 text=True, capture_output=True, check=False, timeout=5,
@@ -117,9 +118,10 @@ def run(helper: dict, profile: dict, timeout_seconds: float | None = None) -> di
                     break
                 time.sleep(0.1)
             if outcome is None:
+                wait_elapsed = time.monotonic() - probe_started
                 fail(f"launch helper volume probe timed out after {timeout_seconds:g}s "
-                     f"(its write to {host['tart_home']} did not finish: slow volume I/O, "
-                     "not an access denial)")
+                     f"(probe wait elapsed {wait_elapsed:.3f}s; its write to {host['tart_home']} "
+                     "did not finish: volume I/O slow, not an access denial)")
         except Exception as error:  # Preserve the primary probe diagnosis.
             probe_error = error
         finally:

@@ -4,7 +4,7 @@
 The tick used to be COPIED out of the generation, so a tartci self-update
 never reached it: after the merge path was removed, m3 kept running a
 2026-08-15 copy in `mode=live` until someone re-ran the installer by hand.
-The agent now runs `~/.local/bin/tartci queue-tick`, which follows the
+The agent now runs ~/.local/bin/tartci queue-tick, which follows the
 installed generation, so the only drift left is an agent still installed the
 old way.
 
@@ -92,7 +92,7 @@ def drift(plist: Path | None = None, runner: Runner = subprocess.run) -> dict[st
         return {"state": "current"}
     differing = ["ProgramArguments"]
     detail = (f"{plist.name} runs {' '.join(program or ['<unreadable>'])}, a copied tick "
-              f"no self-update reaches, not `tartci {SUBCOMMAND}`")
+              f"no self-update reaches, not tartci {SUBCOMMAND}")
     loaded = _loaded(runner)
     if loaded is None:
         return {"state": "unknown", "files": differing,
@@ -165,7 +165,7 @@ def refresh(fix: bool, root: Path | None = None, plist: Path | None = None,
 
 
 def status_line(value: dict[str, Any] | None = None) -> str | None:
-    """One `pool status` line when the installed tick is not the running tartci's."""
+    """One pool status line when the installed tick is not the running tartci's."""
     value = value if value is not None else drift()
     state = value.get("state")
     if state == "drift":

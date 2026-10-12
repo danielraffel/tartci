@@ -1,9 +1,19 @@
 #!/usr/bin/env python3
-"""Bounded, single-controller Shipyard stewardship scheduler.
+"""Bounded, single-controller Shipyard carrier scheduler.
 
-The scheduler owns cadence and process isolation only. Shipyard remains the
-authority for exact-head observation, queue mutations, retry policy, and the
-trusted recovery-worker contract.
+The scheduler owns cadence, process isolation, the write-ahead intent, and the
+plan ledger. Shipyard's `runner carrier` owns observation and the plan, which
+it derives from GitHub facts alone, and performs only the mutations the intent
+names and a fresh plan still proposes.
+
+Modes:
+  disabled  invoke nothing.
+  plan      read GitHub through `runner carrier` and record every plan; zero
+            mutations by construction (no `--apply` is ever passed).
+  live      as plan, then write the intent for the enabled classes and run one
+            `runner carrier --apply` per repository that has an action.
+Exactly one host in the fleet may run live; every other install is plan or
+disabled.
 """
 
 from __future__ import annotations
@@ -25,20 +35,25 @@ import time
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+INTENT_SCHEMA_VERSION = 1
+MODES = ("disabled", "plan", "live")
+# update_branch stays planned only until the own-lines invariant exists.
+LIVE_CLASSES = ("redispatch", "rearm")
+AMBIENT_TOKENS = ("GH_TOKEN", "GITHUB_TOKEN")
 MAX_CONFIG_BYTES = 1024 * 1024
 MAX_STDOUT_BYTES = 4 * 1024 * 1024
 MAX_STDERR_BYTES = 256 * 1024
 REPO_PATTERN = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+"
 )
-VERSION_PATTERN = re.compile(r"shipyard (\d+)\.(\d+)\.(\d+)")
 GITHUB_REMOTES = (
     re.compile(r"https://github\.com/([^/]+)/([^/]+)"),
     re.compile(r"git@github\.com:([^/]+)/([^/]+)"),
     re.compile(r"ssh://git@github\.com/([^/]+)/([^/]+)"),
 )
 ACTIVE_PROCESS: subprocess.Popen[bytes] | None = None
+ACTIVE_MUTATES = False
 QUARANTINE_PATH: Path | None = None
 
 
@@ -112,6 +127,11 @@ class SchedulerLog:
         observed = now()
         with self.path.open("a", encoding="utf-8") as destination:
             destination.write(f"{observed} [steward-scheduler] {message}\n")
+
+    def write_json(self, value: object) -> None:
+        """Append one JSON line (the plan ledger's record format)."""
+        with self.path.open("a", encoding="utf-8") as destination:
+            destination.write(json.dumps(value, sort_keys=True) + "\n")
 
 
 def now() -> str:
@@ -244,21 +264,37 @@ def load_config(path: Path) -> dict[str, Any]:
     value = read_protected_json(path)
     expected = {
         "schema_version",
-        "enabled",
+        "mode",
         "authority",
+        "classes",
         "shipyard",
         "repositories",
-        "steward_timeout_seconds",
-        "recovery_timeout_seconds",
+        "carrier_timeout_seconds",
         "max_log_bytes",
         "log_generations",
     }
+    if value.get("schema_version") != SCHEMA_VERSION:
+        raise ConfigurationError(
+            "unsupported scheduler config schema; rerun the installer to write schema 2"
+        )
     if set(value) != expected:
         raise ConfigurationError("scheduler config has missing or unknown fields")
-    if value.get("schema_version") != SCHEMA_VERSION:
-        raise ConfigurationError("unsupported scheduler config schema")
-    if type(value.get("enabled")) is not bool or type(value.get("authority")) is not bool:
-        raise ConfigurationError("enabled and authority must be exact booleans")
+    mode = value.get("mode")
+    if mode not in MODES:
+        raise ConfigurationError("mode must be disabled, plan, or live")
+    if type(value.get("authority")) is not bool:
+        raise ConfigurationError("authority must be an exact boolean")
+    if value["authority"] != (mode == "live"):
+        raise ConfigurationError("authority=true is required for live mode and refused otherwise")
+    classes = value.get("classes")
+    if (
+        not isinstance(classes, list)
+        or any(entry not in LIVE_CLASSES for entry in classes)
+        or len(set(classes)) != len(classes)
+    ):
+        raise ConfigurationError(f"classes must be unique entries from {', '.join(LIVE_CLASSES)}")
+    if (mode == "live") != bool(classes):
+        raise ConfigurationError("live mode needs at least one class; other modes take none")
     shipyard = value.get("shipyard")
     if not isinstance(shipyard, str) or not Path(shipyard).is_absolute():
         raise ConfigurationError("shipyard must be an absolute executable path")
@@ -281,14 +317,13 @@ def load_config(path: Path) -> dict[str, Any]:
             {
                 "repo": repo,
                 "checkout": validate_checkout(
-                    repo, row.get("checkout"), require_protected=value["enabled"]
+                    repo, row.get("checkout"), require_protected=mode != "disabled"
                 ),
             }
         )
     value["repositories"] = normalized
     for name, minimum, maximum in (
-        ("steward_timeout_seconds", 1, 600),
-        ("recovery_timeout_seconds", 1, 3600),
+        ("carrier_timeout_seconds", 1, 600),
         ("max_log_bytes", 1024, 100 * 1024 * 1024),
         ("log_generations", 1, 20),
     ):
@@ -324,7 +359,8 @@ def terminate_active_child(signum: int, _frame: object) -> None:
     """Bind the detached command group to the scheduler service lifecycle."""
     if ACTIVE_PROCESS is not None:
         try:
-            publish_quarantine("scheduler terminated while a mutation command was active")
+            if ACTIVE_MUTATES:
+                publish_quarantine("scheduler terminated while a mutation command was active")
         finally:
             terminate_group(ACTIVE_PROCESS)
     raise SystemExit(128 + signum)
@@ -422,7 +458,7 @@ def bounded_capture(
     *,
     quarantine_on_timeout: bool,
 ) -> dict[str, Any]:
-    global ACTIVE_PROCESS
+    global ACTIVE_PROCESS, ACTIVE_MUTATES
     environment = os.environ.copy()
     environment.pop("GH_TOKEN", None)
     environment.pop("GITHUB_TOKEN", None)
@@ -447,6 +483,7 @@ def bounded_capture(
                 clear_quarantine()
             return {"exit_code": None, "timed_out": False, "error": f"launch failed: {error}"}
         ACTIVE_PROCESS = process
+        ACTIVE_MUTATES = quarantine_on_timeout
     finally:
         # A pending termination signal is delivered only after ACTIVE_PROCESS
         # identifies the newly detached process group, closing the spawn race.
@@ -471,10 +508,13 @@ def bounded_capture(
         raise
     finally:
         ACTIVE_PROCESS = None
+        ACTIVE_MUTATES = False
 
 
-def run_bounded(argv: list[str], cwd: Path, timeout: int) -> dict[str, Any]:
-    result = bounded_capture(argv, cwd, timeout, quarantine_on_timeout=True)
+def run_bounded(
+    argv: list[str], cwd: Path, timeout: int, *, quarantine_on_timeout: bool
+) -> dict[str, Any]:
+    result = bounded_capture(argv, cwd, timeout, quarantine_on_timeout=quarantine_on_timeout)
     if "error" in result:
         return result
     stdout_bytes = result.pop("stdout_bytes")
@@ -508,36 +548,27 @@ def run_bounded_text(argv: list[str], cwd: Path, timeout: int) -> dict[str, Any]
     return result
 
 
-def valid_steward_report(result: dict[str, Any], repo: str) -> bool:
+def carrier_report(result: dict[str, Any], repo: str, *, apply: bool) -> dict[str, Any] | None:
+    """The single-repository carrier envelope, or `None` when it is not one."""
     value = result.get("json")
     repos = value.get("repos") if isinstance(value, dict) else None
-    return (
-        result.get("exit_code") == 0
-        and result.get("timed_out") is False
+    if not (
+        result.get("timed_out") is False
+        and result.get("exit_code") in (0, 1)
         and isinstance(value, dict)
         and value.get("schema_version") == 1
-        and value.get("command") == "runner.steward"
-        and value.get("apply") is True
-        and isinstance(value.get("handoff_ledger"), str)
+        and value.get("command") == "runner.carrier"
+        and value.get("apply") is apply
         and isinstance(repos, list)
         and len(repos) == 1
         and isinstance(repos[0], dict)
-        and repos[0].get("repo") == repo
-        and repos[0].get("errors") == []
-    )
-
-
-def valid_recovery_report(result: dict[str, Any]) -> bool:
-    value = result.get("json")
-    return (
-        result.get("exit_code") == 0
-        and result.get("timed_out") is False
-        and isinstance(value, dict)
-        and value.get("schema_version") == 1
-        and value.get("command") == "runner:recovery-worker"
-        and value.get("apply") is True
-        and isinstance(value.get("requests"), list)
-    )
+        and isinstance(repos[0].get("repo"), str)
+        and repos[0]["repo"].casefold() == repo.casefold()
+        and isinstance(repos[0].get("prs"), list)
+        and isinstance(repos[0].get("errors"), list)
+    ):
+        return None
+    return repos[0]
 
 
 def public_result(result: dict[str, Any], valid: bool) -> dict[str, Any]:
@@ -553,89 +584,203 @@ def public_result(result: dict[str, Any], valid: bool) -> dict[str, Any]:
     }
 
 
-def check_version(shipyard: str, cwd: Path) -> tuple[bool, str]:
-    result = run_bounded_text([shipyard, "--version"], cwd, 15)
+def check_capability(shipyard: str, cwd: Path) -> tuple[bool, str]:
+    """Prove this Shipyard has the carrier interface the scheduler drives.
+
+    Replaying an empty fact file exercises the exact JSON envelope without any
+    GitHub read, so it is a capability probe rather than a version guess.
+    """
+    result = run_bounded_text(
+        [shipyard, "--json", "runner", "carrier", "--replay", "/dev/null"], cwd, 30
+    )
     if result.get("timed_out") or result.get("exit_code") != 0:
-        return False, "Shipyard version check failed"
-    match = VERSION_PATTERN.fullmatch(str(result.get("stdout", "")).strip())
-    if not match or tuple(map(int, match.groups())) < (0, 113, 0):
-        return False, "Shipyard 0.113.0 or newer is required"
-    return True, str(result["stdout"]).strip()
+        return False, "Shipyard lacks `runner carrier`; a newer Shipyard is required"
+    try:
+        value = json.loads(str(result.get("stdout", "")))
+    except json.JSONDecodeError:
+        return False, "Shipyard `runner carrier --replay` did not emit JSON"
+    if value.get("command") != "runner.carrier" or value.get("plans") != []:
+        return False, "Shipyard `runner carrier --replay` emitted an unexpected envelope"
+    return True, "runner carrier available"
 
 
-def scheduler(config: dict[str, Any], logger: SchedulerLog) -> tuple[int, dict[str, Any]]:
+def probe_child_environment(cwd: Path) -> dict[str, bool]:
+    """Which ambient GitHub tokens a child process launched by this tick sees.
+
+    The probe runs through the same launch path as every Shipyard command, so a
+    regression in token stripping shows here as `true`. Only names are read;
+    values never enter the report.
+    """
+    result = run_bounded_text(["/usr/bin/env"], cwd, 10)
+    names = {
+        line.split("=", 1)[0]
+        for line in str(result.get("stdout", "")).splitlines()
+        if "=" in line
+    }
+    return {token: token in names for token in AMBIENT_TOKENS}
+
+
+def summarize_plan(planned: dict[str, Any]) -> dict[str, Any]:
+    """One plan for the ledger: every decision, and the facts behind actions."""
+    row = {key: value for key, value in planned.items() if key not in {"facts"}}
+    if planned.get("decision") == "propose":
+        row["facts"] = planned.get("facts")
+    return row
+
+
+def intent_actions(repo: str, prs: list[Any], classes: list[str]) -> list[dict[str, Any]]:
+    actions = []
+    for planned in prs:
+        if not isinstance(planned, dict) or planned.get("decision") != "propose":
+            continue
+        if planned.get("action") not in classes:
+            continue
+        action = {
+            "repo": repo,
+            "number": planned.get("number"),
+            "head_sha": planned.get("head_sha"),
+            "action": planned.get("action"),
+        }
+        for key in ("head", "run_ids"):
+            if key in planned:
+                action[key] = planned[key]
+        actions.append(action)
+    return actions
+
+
+def scheduler(
+    config: dict[str, Any],
+    logger: SchedulerLog,
+    plans: SchedulerLog,
+    intent_path: Path,
+) -> tuple[int, dict[str, Any]]:
     started = now()
+    mode = config["mode"]
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "started_at": started,
         "completed_at": None,
-        "enabled": config["enabled"],
+        "mode": mode,
         "authority": config["authority"],
+        "classes": config["classes"],
         "status": "disabled",
         "repositories": [],
-        "recovery": {"attempted": False, "status": "not_run"},
+        "proposals": 0,
+        "mutations": 0,
     }
-    if not config["enabled"]:
+    if mode == "disabled":
         logger.write("disabled by trusted config; no Shipyard or GitHub command invoked")
         report["completed_at"] = now()
         return 0, report
-    if not config["authority"]:
+
+    shipyard = str(config["shipyard"])
+    repositories = config["repositories"]
+    capable, detail = check_capability(shipyard, repositories[0]["checkout"])
+    report["shipyard_capability"] = detail
+    probe = probe_child_environment(repositories[0]["checkout"])
+    report["child_environment_tokens"] = probe
+    if not capable or any(probe.values()):
         report["status"] = "unhealthy"
-        report["error"] = "enabled scheduler requires explicit authority=true"
+        report["error"] = detail if not capable else "an ambient GitHub token reached a child process"
         report["completed_at"] = now()
         logger.write(report["error"])
         return 1, report
 
-    shipyard = str(config["shipyard"])
-    repositories = config["repositories"]
-    version_ok, version = check_version(shipyard, repositories[0]["checkout"])
-    report["shipyard_version"] = version
-    if not version_ok:
-        report["status"] = "unhealthy"
-        report["error"] = version
-        report["completed_at"] = now()
-        logger.write(version)
-        return 1, report
-
     healthy = True
+    pending: list[tuple[dict[str, object], list[dict[str, Any]]]] = []
     for row in repositories:
         repo = str(row["repo"])
-        logger.write(f"starting deterministic stewardship for {repo}")
         result = run_bounded(
-            [shipyard, "--json", "runner", "steward", "--repo", repo, "--apply"],
+            [shipyard, "--json", "runner", "carrier", "--repo", repo],
             row["checkout"],
-            config["steward_timeout_seconds"],
+            config["carrier_timeout_seconds"],
+            quarantine_on_timeout=False,
         )
-        valid = valid_steward_report(result, repo)
+        envelope = carrier_report(result, repo, apply=False)
+        mutated = envelope is not None and any(
+            isinstance(planned, dict) and "mutation" in planned for planned in envelope["prs"]
+        )
+        valid = envelope is not None and not mutated and result.get("exit_code") == 0
+        entry = {"repo": repo, "pass": "plan", **public_result(result, valid)}
+        if mutated:
+            entry["error"] = "a plan pass reported a mutation"
+        if envelope is not None:
+            entry["errors"] = envelope["errors"][:20]
+            proposals = [p for p in envelope["prs"] if isinstance(p, dict) and p.get("decision") == "propose"]
+            entry["prs"] = len(envelope["prs"])
+            entry["proposals"] = len(proposals)
+            report["proposals"] += len(proposals)
+            plans.write_json(
+                {
+                    "tick": started,
+                    "mode": mode,
+                    "repo": repo,
+                    "plans": [summarize_plan(p) for p in envelope["prs"] if isinstance(p, dict)],
+                    "errors": envelope["errors"][:20],
+                }
+            )
+            if mode == "live" and not mutated:
+                actions = intent_actions(repo, envelope["prs"], config["classes"])
+                if actions:
+                    pending.append((row, actions))
         healthy &= valid
-        report["repositories"].append({"repo": repo, **public_result(result, valid)})
-        logger.write(f"deterministic stewardship for {repo}: {'ok' if valid else 'error'}")
-        if result.get("timed_out"):
-            report["status"] = "quarantined"
-            report["error"] = "mutation command timed out without complete descendant-termination proof"
-            report["completed_at"] = now()
-            logger.write("quarantining scheduler before peer or recovery mutation")
-            return 1, report
+        report["repositories"].append(entry)
+        logger.write(f"carrier plan for {repo}: {'ok' if valid else 'error'}")
 
-    # Recovery is deliberately sequenced after every deterministic repository
-    # pass and invoked once. Shipyard's trusted worker owns request selection,
-    # exact-head revalidation, deduplication, and any model process.
-    logger.write("starting at-most-one trusted recovery-worker pass")
-    recovery = run_bounded(
-        [shipyard, "--json", "runner", "recovery-worker", "--once", "--apply"],
-        repositories[0]["checkout"],
-        config["recovery_timeout_seconds"],
-    )
-    recovery_valid = valid_recovery_report(recovery)
-    report["recovery"] = {"attempted": True, **public_result(recovery, recovery_valid)}
-    logger.write(f"trusted recovery-worker pass: {'ok' if recovery_valid else 'error'}")
-    if recovery.get("timed_out"):
-        report["status"] = "quarantined"
-        report["error"] = "recovery command timed out without complete descendant-termination proof"
-        report["completed_at"] = now()
-        logger.write("quarantining scheduler after escaped recovery descendant")
-        return 1, report
-    healthy &= recovery_valid
+    if pending:
+        intent = {
+            "schema_version": INTENT_SCHEMA_VERSION,
+            "tick": started,
+            "classes": config["classes"],
+            "actions": [action for _, actions in pending for action in actions],
+        }
+        # Write-ahead: the intent names every action before any is attempted,
+        # so a timeout or crash leaves a record of what did not complete.
+        atomic_json(intent_path, intent)
+        plans.write_json({"tick": started, "mode": mode, "intent": intent})
+        for row, actions in pending:
+            repo = str(row["repo"])
+            argv = [shipyard, "--json", "runner", "carrier", "--repo", repo, "--apply"]
+            for entry_class in config["classes"]:
+                argv.extend(["--class", entry_class])
+            argv.extend(["--intent", str(intent_path)])
+            logger.write(f"applying {len(actions)} intended action(s) for {repo}")
+            result = run_bounded(
+                argv, row["checkout"], config["carrier_timeout_seconds"], quarantine_on_timeout=True
+            )
+            envelope = carrier_report(result, repo, apply=True)
+            valid = envelope is not None and result.get("exit_code") == 0
+            entry = {"repo": repo, "pass": "apply", **public_result(result, valid)}
+            if envelope is not None:
+                outcomes = [
+                    {
+                        "number": p.get("number"),
+                        "head_sha": p.get("head_sha"),
+                        "mutation": p.get("mutation"),
+                        "error": p.get("error"),
+                    }
+                    for p in envelope["prs"]
+                    if isinstance(p, dict) and ("mutation" in p or "error" in p)
+                ]
+                entry["outcomes"] = outcomes
+                report["mutations"] += sum(
+                    1
+                    for outcome in outcomes
+                    if outcome["mutation"] and not str(outcome["mutation"]).startswith("not applied")
+                )
+                plans.write_json({"tick": started, "mode": mode, "repo": repo, "outcomes": outcomes})
+            healthy &= valid
+            report["repositories"].append(entry)
+            if result.get("timed_out"):
+                report["status"] = "quarantined"
+                report["error"] = (
+                    "mutation command timed out without complete descendant-termination proof"
+                )
+                report["completed_at"] = now()
+                logger.write("quarantining scheduler after an apply timeout")
+                return 1, report
+        atomic_json(intent_path, {**intent, "completed_at": now()})
+
     report["status"] = "healthy" if healthy else "unhealthy"
     report["completed_at"] = now()
     return (0 if healthy else 1), report
@@ -679,6 +824,16 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=home / ".local/state/tartci/shipyard-steward-scheduler.quarantine.json",
     )
+    parser.add_argument(
+        "--intent",
+        type=Path,
+        default=home / ".local/state/tartci/shipyard-steward-scheduler.intent.json",
+    )
+    parser.add_argument(
+        "--plans",
+        type=Path,
+        default=home / "Library/Logs/shipyard-steward-scheduler.plans.jsonl",
+    )
     return parser.parse_args()
 
 
@@ -691,33 +846,37 @@ def main() -> int:
     lock = SchedulerLock(args.lock)
     try:
         if not lock.acquire():
+            print("steward scheduler: another tick holds the scheduler lock", file=sys.stderr)
             return 0
         config = load_config(args.config)
         logger = SchedulerLog(args.log, config["max_log_bytes"], config["log_generations"])
+        plans = SchedulerLog(args.plans, config["max_log_bytes"], config["log_generations"])
         args.quarantine.parent.mkdir(parents=True, exist_ok=True)
         validate_protected_path(args.quarantine.parent.resolve(), "scheduler quarantine directory")
-        if config["enabled"] and args.quarantine.exists():
+        if config["mode"] != "disabled" and args.quarantine.exists():
             failure = {
                 "schema_version": SCHEMA_VERSION,
                 "status": "quarantined",
+                "mode": config["mode"],
                 "reason": "prior command termination requires explicit descendant-clearance proof",
                 "observed_at": now(),
             }
             atomic_json(args.report, failure)
             atomic_json(args.health, failure)
-            logger.write("quarantine present; refusing all stewardship and recovery mutations")
+            logger.write("quarantine present; refusing every carrier pass")
             return 2
         atomic_json(
             args.startup,
             {
                 "schema_version": SCHEMA_VERSION,
                 "status": "started",
-                "enabled": config["enabled"],
+                "mode": config["mode"],
                 "authority": config["authority"],
+                "classes": config["classes"],
                 "observed_at": now(),
             },
         )
-        exit_code, report = scheduler(config, logger)
+        exit_code, report = scheduler(config, logger, plans, args.intent)
         if report["status"] == "quarantined":
             atomic_json(
                 args.quarantine,
@@ -734,6 +893,10 @@ def main() -> int:
             {
                 "schema_version": SCHEMA_VERSION,
                 "status": report["status"],
+                "mode": report["mode"],
+                "classes": report["classes"],
+                "proposals": report["proposals"],
+                "mutations": report["mutations"],
                 "reason": report.get("error", report["status"]),
                 "observed_at": report["completed_at"],
             },

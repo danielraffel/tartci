@@ -285,7 +285,8 @@ def episode_alert(path: Path, *, active: bool, resolved: bool, since: str | None
 
 def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
           issue: Callable[[str, str], tuple[int, str]] | None = None,
-          close: Callable[[str], tuple[int, str]] | None = None) -> dict:
+          close: Callable[[str], tuple[int, str]] | None = None,
+          immediate: bool = False) -> dict:
     """Once per episode: event + GitHub issue when loud; close it on recovery.
 
     `issue(title, body)` and `close(number)` default to ghapp; a failure is
@@ -294,17 +295,19 @@ def alert(sdir: Path, pool_file: Path, host: str, now: float | None = None,
     now = time.time() if now is None else now
     current = status(sdir, pool_file, now)
     out = episode_alert(
-        sdir / "host-off-alert.json", active=current["loud"],
+        sdir / "host-off-alert.json", active=current["loud"] or immediate,
         resolved=not current["unexpected"], since=current.get("since"),
         raise_event=lambda: event(sdir, "host_off_unexpected", current["detail"],
                                   {"since": current["since"], "minutes": current["minutes"],
                                    "target": current.get("target")}, now),
         render=lambda: (
             f"[tartci] {host} left OFF by a failed self-update since {current['since']}",
-            f"{current['detail']}\n\nThe host's launchd watchdog and self-update agent "
+            f"{current['detail']}\n\nReason: the self-update could not restore pool service. "
+            "Remedy: inspect the named failure, then run `tartci pool status` and "
+            "`tartci pool on` after the underlying issue is repaired.\n\nThe host's launchd watchdog and self-update agent "
             "retry `pool on` every 5 min; this issue closes itself when the pool is on "
-            "again. Check `tartci pool status` and "
-            "`~/.tartci/state/self-update/last.json` on the host."),
+            "again. Check tartci pool status and "
+            "~/.tartci/state/self-update/last.json on the host."),
         issue=issue, close=close,
         issues_enabled=os.environ.get("TARTCI_HOST_OFF_ISSUE", "1") != "0")
     out.pop("closed", None)

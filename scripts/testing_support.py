@@ -1,7 +1,7 @@
 """Shared test helpers: run the suite honestly under the hosts' Python.
 
 Fleet hosts have two interpreters. launchd agents, the interval guard and the
-`tartci_toml_exec_or_python3` fallbacks run /usr/bin/python3, which is 3.9 and
+tartci_toml_exec_or_python3 fallbacks run /usr/bin/python3, which is 3.9 and
 has no tomllib; the profile-reading paths run under tartci_toml_python
 (Homebrew 3.11+). The python-39-tests CI job runs every test module under 3.9,
 so a test that needs tomllib must say so instead of failing there, and a test

@@ -164,7 +164,7 @@ def user_temp_dir(runner: Runner = subprocess.run) -> pathlib.Path | None:
     """The per-user temp dir (/var/folders/.../T), whatever TMPDIR says.
 
     A launchd agent's TMPDIR is normally this directory, but an operator shell
-    running `tartci reclaim` may export another; the leak lives in the real one.
+    running tartci reclaim may export another; the leak lives in the real one.
     """
     try:
         proc = runner(["getconf", "DARWIN_USER_TEMP_DIR"], capture_output=True,

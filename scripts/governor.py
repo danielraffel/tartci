@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""`tartci governor`: show, set and explain this host's build governor.
+"""tartci governor: show, set and explain this host's build governor.
 
 One file holds every tuning knob: ~/.config/tartci/governor.toml (override
-with TARTCI_GOVERNOR_FILE), a flat `[governor]` table. `tartci host-profile`
+with TARTCI_GOVERNOR_FILE), a flat [governor] table. tartci host-profile
 and the lease store derive every number from it (see host_profile.py,
 "governor: one per-host config surface", and leases.py, "build classes and
 dynamic gate lending").
@@ -11,7 +11,7 @@ dynamic gate lending").
     tartci governor set KEY=VALUE ...      edit the file (validated), then show
     tartci governor unset KEY ...          drop keys back to their defaults
     tartci governor explain [--json]       what each class would get right now
-    tartci governor fleet [--hosts a,b]    one read-only SSH `show` per host
+    tartci governor fleet [--hosts a,b]    one read-only SSH show per host
 """
 
 from __future__ import annotations
@@ -28,9 +28,9 @@ import host_profile
 import leases
 
 HEADER = """\
-# tartci build governor for this host. Edit with `tartci governor set KEY=VALUE`.
+# tartci build governor for this host. Edit with tartci governor set KEY=VALUE.
 # Every key is optional; an absent key (or "auto") takes the role default.
-# `tartci governor show` prints the resolved values and where each came from.
+# tartci governor show prints the resolved values and where each came from.
 """
 
 PROFILE_KEYS = (
@@ -293,7 +293,7 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     unsetter.add_argument("keys", nargs="+")
     explain = sub.add_parser("explain", help="what each build class would get now")
     explain.add_argument("--json", action="store_true")
-    fleet = sub.add_parser("fleet", help="read `governor show` from fleet hosts over SSH")
+    fleet = sub.add_parser("fleet", help="read governor show from fleet hosts over SSH")
     fleet.add_argument("--hosts", help="comma-separated SSH aliases (default: fleet_hosts knob)")
     fleet.add_argument("--json", action="store_true")
     sub.add_parser("keys", help="list every knob with its meaning")

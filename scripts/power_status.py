@@ -7,14 +7,14 @@ automatic sleeping when the display is off" left OFF and spent 4-6 hours a day
 asleep, waking only for maintenance, while every launchd and pool view
 reported it healthy.
 
-Read from `pmset -g custom` (the configured AC Power profile), never from
-`pmset -g`: the live view prints `sleep 1 (sleep prevented by ...)` while some
+Read from pmset -g custom (the configured AC Power profile), never from
+pmset -g: the live view prints sleep 1 (sleep prevented by ...) while some
 app holds an assertion, which reads as awake and is not. The host sleeps as
 soon as that app lets go.
 
 States:
-  ok           AC `sleep` is 0: the host never sleeps on its own
-  sleeps       AC `sleep` is N > 0 minutes
+  ok           AC sleep is 0: the host never sleeps on its own
+  sleeps       AC sleep is N > 0 minutes
   unknown      no AC Power profile could be read (not macOS, or pmset failed)
 """
 
@@ -55,7 +55,7 @@ def refresh_sleep_events(path: Path | None = None, now: float | None = None,
                          run=None) -> dict[str, Any]:
     """Count sleeps in the last hour and cache the result. Never raises.
 
-    `log show` takes seconds, too slow for every `pool status`, so the
+    log show takes seconds, too slow for every pool status, so the
     watchdog's heal pass runs this and status reads the cache.
     """
     path = path or sleep_cache_path()
@@ -96,7 +96,7 @@ def cached_sleep_events(path: Path | None = None, now: float | None = None) -> d
 
 
 def parse_custom(text: str) -> dict[str, int]:
-    """Return the integer settings of the `AC Power:` section of `pmset -g custom`."""
+    """Return the integer settings of the AC Power: section of pmset -g custom."""
     section: str | None = None
     values: dict[str, int] = {}
     for raw in text.splitlines():

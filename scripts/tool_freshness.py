@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Installed-vs-released freshness for the host tools a fleet host runs.
 
-tartci measures its own skew against main (`fleet_self_update.py`). The other
+tartci measures its own skew against main (fleet_self_update.py). The other
 tools every gate and agent session on the host depends on, Shipyard and the
 pulp CLI, had no equivalent, and an installed pulp CLI sat ~2,800 hours behind
 its releases before anyone looked. This module gives each of them one line in
-`tartci pool status`, a finding in `tartci doctor fleet`, and a WARN in the
+tartci pool status, a finding in tartci doctor fleet, and a WARN in the
 launchd watchdog, and optionally applies the update itself:
 
   refresh   (the watchdog, at most every 30 minutes) reads the installed

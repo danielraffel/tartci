@@ -1065,7 +1065,7 @@ def main(argv: list[str] | None = None) -> int:
 
     The receipt is what makes a dead janitor visible. m3's reclaim agent was
     shadowed by a leaked registration for a day and exited 127 every hour
-    without writing a line anywhere tartci looks; `tartci status` kept printing
+    without writing a line anywhere tartci looks; tartci status kept printing
     "installed and loaded" because a job with that label WAS loaded. A pass
     that does not leave a fresh receipt is now the signal, whatever launchd
     believes.

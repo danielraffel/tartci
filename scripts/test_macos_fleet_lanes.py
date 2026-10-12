@@ -29,10 +29,8 @@ HOST_CONFIGS = {
     "studio": ROOT / "profiles" / "m3-macos-fleet.toml",
     "m5": ROOT / "profiles" / "m5-macos-fleet.toml",
 }
-# The Pulp gate classes each host's pulp-gate serves. m1 serves PR-head only
-# (`v2_gate_classes`): its 3-core guest ran merge_group jobs in 33-35 min
-# against 15-22 min on the other hosts.
-GATE_CLASSES = {"m1": ["pulp-build-pr-head"]}
+# The Pulp gate classes each host's pulp-gate serves.
+GATE_CLASSES = {}
 BOTH_GATE_CLASSES = ["pulp-build-merge-group", "pulp-build-pr-head"]
 
 
@@ -1325,14 +1323,14 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("pulp-gate-fast", pulp["EnvironmentVariables"]["TARTCI_RUNNER_LABELS"])
             self.assertNotIn("TARTCI_VM_LEASE_PRIORITY", pulp["EnvironmentVariables"])
             self.assertNotIn("TARTCI_MACOS_VM_CORES", pulp["EnvironmentVariables"])
-            # CONFIG is m1, which serves PR-head and no merge-group work.
-            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-pr-head|"))
-            self.assertNotIn("pulp-build-merge-group", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
+            # CONFIG is m1, which now serves both classes with merge-group first.
+            self.assertTrue(pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"].startswith("pulp-build-merge-group|"))
+            self.assertIn("pulp-build-merge-group", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertIn("pulp-build-pr-head", pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIERS"])
             self.assertEqual(pulp["EnvironmentVariables"]["TARTCI_RUNNER_ASSIGNMENT_MODE"], "event-class-v2")
             self.assertEqual(
                 pulp["EnvironmentVariables"]["TARTCI_RUNNER_WORKFLOW_TIER_GROUPS"],
-                "pulp-build-pr-head|1\n"
+                "pulp-build-merge-group|1\npulp-build-pr-head|1\n"
                 "pulp-release-tagged|1\npulp-release-pr-gate|1",
             )
             self.assertEqual(
@@ -2013,26 +2011,38 @@ class MacosFleetLaneTests(unittest.TestCase):
                             self.assertNotIn(env_key, env)
                     self.assertEqual(pulp_slots, 2)
 
-    # The exact per-slot class order every pulp-gate slot renders. None means
-    # the slot keeps the configured order (merge-group, PR-head, then the
-    # release classes). Each host has exactly one release-first slot; m3's
-    # slot 2 keeps the PR-first canary, so m3's release-first slot is slot 1.
+    # The exact per-slot class order every pulp-gate slot renders. Each host
+    # has exactly one release-first slot; the other slot keeps merge-group
+    # ahead of PR-head to protect merge order.
     RELEASE_FIRST_ORDER = ("pulp-release-tagged,pulp-release-pr-gate,"
                            "pulp-build-merge-group,pulp-build-pr-head")
     SHIPPED_SLOT_ORDERS = {
-        ".m1.pulp-gate.plist": None,
-        ".m1.pulp-gate.slot2.plist": ("pulp-release-tagged,pulp-release-pr-gate,"
-                                      "pulp-build-pr-head"),
+        ".m1.pulp-gate.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
+                                 "pulp-release-tagged,pulp-release-pr-gate"),
+        ".m1.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
         ".studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
-        ".studio.pulp-gate.slot2.plist": ("pulp-build-pr-head,pulp-build-merge-group,"
+        ".studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
                                           "pulp-release-tagged,pulp-release-pr-gate"),
         ".m5.pulp-gate.plist": None,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
     }
 
+    def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:
+        rendered = fleet.rendered_plists(fleet.load(ROOT / "profiles" / "m5studio-macos-fleet.toml"))
+        slot2 = [
+            plistlib.loads(body)["EnvironmentVariables"]
+            for name, body in rendered.items()
+            if name.endswith(".m5studio.pulp-gate.slot2.plist")
+        ]
+        self.assertEqual(len(slot2), 1)
+        self.assertEqual(
+            slot2[0]["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
+            "pulp-build-merge-group,pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+        )
+
     def test_slot_tier_orders_are_pinned_exactly_on_every_pulp_gate_slot(self) -> None:
         """Every pulp-gate slot's rendered order is pinned, so neither m3's
-        PR-first canary on slot 2 nor any host's release-first slot can be
+        merge-group preference on slot 2 nor any host's release-first slot can be
         dropped or swapped by accident; no other lane renders an order."""
         env_key = "TARTCI_ASSIGNMENT_V2_TIER_ORDER"
         seen = set()

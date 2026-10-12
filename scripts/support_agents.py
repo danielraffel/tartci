@@ -30,7 +30,7 @@ agent's installed plist with its render:
     differs         the receipt names each differing key path
     missing         no installed plist
 
-and lists every installed agent under the tartci and `tmp.` prefixes that no
+and lists every installed agent under the tartci and tmp. prefixes that no
 declaration, lane, or other codified installer (OTHER_OWNERS) accounts for. An
 undeclared agent is reported, never touched.
 
@@ -50,7 +50,7 @@ snapshot older than the table must never read as "drop everything".
 `auto` is `apply` when the profile switch is on and `plan` otherwise; it is what
 self-update runs after it verifies the lanes. `check-templates` is self-update's
 pre-drain check that the target checkout can render every declared agent.
-`status --json` is the summary `tartci doctor fleet` reads.
+status --json is the summary tartci doctor fleet reads.
 
 Exit codes: 0 converged or nothing to do, 3 refused (a render failed, or the
 profile is unreadable), 4 an apply step failed.
@@ -83,7 +83,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TABLE = "support_agents"
 TABLE_KEYS = {"declared", "bootstrap"}
 LANE_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
-# Labels the undeclared scan covers: tartci's own agents, and `tmp.`, a class
+# Labels the undeclared scan covers: tartci's own agents, and tmp., a class
 # nothing of ours may ever ship under.
 SCAN_PREFIXES = ("com.danielraffel.tartci.", "com.danielraffel.tmp.")
 EXIT_OK, EXIT_REFUSED, EXIT_FAILED = 0, 3, 4

@@ -2,15 +2,29 @@
 # Install one rendered dynamic macOS fleet profile while host admission is off.
 set -euo pipefail
 
+DEFAULT_TARTCI_REPOSITORY="Generous-Corp/tartci"
+LEGACY_TARTCI_REPOSITORY="danielraffel/tartci"
+REQUESTED_TARTCI_REPOSITORY="${GH_REPO:-}"
+case "$REQUESTED_TARTCI_REPOSITORY" in
+  "") TARTCI_REPOSITORY="$DEFAULT_TARTCI_REPOSITORY" ;;
+  "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") TARTCI_REPOSITORY="$REQUESTED_TARTCI_REPOSITORY" ;;
+  *) echo "fleet install refuses unsupported TartCI repository identity: $REQUESTED_TARTCI_REPOSITORY" >&2; exit 3 ;;
+esac
+TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
+
 APPLY=0
+PREFLIGHT_ONLY=0
+SKIP_PREFLIGHT=0
 CONFIG=""
 SUPPORT_MANIFEST=""
 SUPPORT_SOURCE=""
 LAUNCH_HELPER_SOURCE=""
-USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--apply]"
+USAGE="usage: tartci fleet-macos install CONFIG [--support-source PATH] [--support-manifest PATH] [--launch-helper-source PATH] [--preflight|--skip-preflight] [--apply]"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --apply) APPLY=1 ;;
+    --preflight) PREFLIGHT_ONLY=1 ;;
+    --skip-preflight) SKIP_PREFLIGHT=1 ;;
     --support-manifest)
       shift
       [ "$#" -gt 0 ] || { echo "--support-manifest requires a path" >&2; exit 2; }
@@ -57,7 +71,10 @@ POOL_LIB="$ROOT/providers/common/pool.lib.sh"
 # Python 3.11+ and its stdlib tomllib module.
 PYTHON_BIN=""
 if [ -n "${TARTCI_PYTHON:-}" ]; then
-  PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)"
+  case "$TARTCI_PYTHON" in
+    */*) PYTHON_BIN="$TARTCI_PYTHON" ;;
+    *) PYTHON_BIN="$(command -v "$TARTCI_PYTHON" 2>/dev/null || true)" ;;
+  esac
 else
   for candidate in python3 python3.12 python3.11; do
     candidate="$(command -v "$candidate" 2>/dev/null || true)"
@@ -78,16 +95,67 @@ else
     fi
   done
 fi
-[ -n "$PYTHON_BIN" ] && "$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+[ -n "$PYTHON_BIN" ] || {
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# Record the executable behind a Homebrew `python3` symlink.  Do this without
+# executing the candidate: wrappers used by tests and launchers must remain the
+# pinned executable, while a symlinked Homebrew entry resolves to its target.
+python_link_hops=0
+while [ -L "$PYTHON_BIN" ]; do
+  python_link_hops=$((python_link_hops + 1))
+  if [ "$python_link_hops" -gt 16 ]; then
+    echo "fleet install refused a symlink cycle while resolving Python: $PYTHON_BIN" >&2
+    exit 127
+  fi
+  PYTHON_TARGET="$(readlink "$PYTHON_BIN")"
+  case "$PYTHON_TARGET" in
+    /*) PYTHON_BIN="$PYTHON_TARGET" ;;
+    *) PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd)/$PYTHON_TARGET" ;;
+  esac
+done
+# Match fleet_self_update's pin rule: canonicalise the resolved executable's
+# parent path so a Homebrew bin/.. spelling cannot disagree with lanes.json.
+PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")"
+[ -x "$PYTHON_BIN" ] || { echo "fleet install resolved an unusable Python: $PYTHON_BIN" >&2; exit 127; }
+"$PYTHON_BIN" -c 'import tomllib' >/dev/null 2>&1 || {
+  echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
+  exit 127
+}
+# The interpreter is part of the installed launch contract.  Probe GitHub
+# through that exact executable before writing any LaunchAgent; a PATH python3
+# may be a newly linked Homebrew build that is blocked by the host firewall.
+if [ "${TARTCI_TESTING:-0}" != 1 ]; then
+  if ! /usr/bin/python3 - "$PYTHON_BIN" <<'PY'
+import subprocess
+import sys
+
+interpreter = sys.argv[1]
+code = ("import urllib.request; "
+        "urllib.request.urlopen('https://api.github.com', timeout=2).read(1)")
+try:
+    result = subprocess.run([interpreter, "-c", code], text=True,
+                            capture_output=True, timeout=3, check=False)
+except subprocess.TimeoutExpired:
+    raise SystemExit(f"interpreter GitHub probe timed out after 3s: {interpreter}")
+if result.returncode != 0:
+    detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["unknown error"]
+    raise SystemExit(f"interpreter GitHub probe failed ({interpreter}): {detail[0]}")
+PY
+  then
+    echo "fleet install requires the pinned interpreter to reach api.github.com: $PYTHON_BIN" >&2
+    exit 127
+  fi
+fi
+export TARTCI_RENDER_PYTHON="$PYTHON_BIN"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 RECEIPT="$HOME/.config/tartci/macos-fleet-install.json"
 PROFILE_SNAPSHOT="$HOME/.config/tartci/macos-fleet-profile.toml"
 LOADED_RECEIPT="$HOME/.config/tartci/macos-fleet-loaded.json"
 SUPPORT_GENERATIONS="$HOME/.local/share/tartci-generations"
 ENTRYPOINT="$HOME/.local/bin/tartci"
+AGENT_HYGIENE_ENTRYPOINT="$HOME/.local/bin/agent-hygiene"
 DOMAIN="gui/$(id -u)"
 CONFIG="$("$PYTHON_BIN" - "$CONFIG" <<'PY'
 from pathlib import Path
@@ -164,8 +232,96 @@ echo "  installed_profile=$PROFILE_SNAPSHOT"
 echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
+echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
+echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 echo "  activation=deferred to tartci pool on"
+
+# Authenticate the exact support commit before the dry-run exit. This makes
+# --plan exercise the same rendered App executable and HOME context as --apply.
+if [ "$SKIP_PREFLIGHT" = 0 ]; then
+preflight_ghapp_path="$("$PYTHON_BIN" - "$plan_dir" <<'PY'
+import plistlib, shutil, sys
+from pathlib import Path
+paths = set()
+for path in Path(sys.argv[1]).glob("*.plist"):
+    env = plistlib.loads(path.read_bytes())["EnvironmentVariables"]
+    resolved = shutil.which("ghapp", path=env["PATH"])
+    if not resolved:
+        raise SystemExit(f"rendered launchd PATH cannot resolve ghapp: {path}")
+    paths.add(str(Path(resolved).resolve()))
+if len(paths) != 1:
+    raise SystemExit("rendered fleet lanes must resolve one exact shared ghapp executable")
+print(next(iter(paths)))
+PY
+)"
+preflight_repository="${REQUESTED_TARTCI_REPOSITORY:-}"
+preflight_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
+preflight_app_json="$("$PYTHON_BIN" - "$CONFIG" "$ROOT" <<'PY'
+import json, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[2]) / "scripts"))
+import macos_fleet_lanes as fleet
+print(json.dumps(fleet.load(Path(sys.argv[1])).get("github_app") or {}))
+PY
+)"
+preflight_api() {
+  local repository="$1" endpoint="$2" app_id app_key app_cache
+  if [ "$preflight_app_json" = "{}" ]; then
+    HOME="$HOME" GH_REPO="$repository" SHIPYARD_GH_APP_REPO="$repository" \
+      "$preflight_ghapp_path" api "$endpoint"
+  else
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$preflight_app_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$preflight_app_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$preflight_app_json")"
+    HOME="$HOME" SHIPYARD_GITHUB_APP_ID="$app_id" \
+    SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
+    SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
+    GH_REPO="$repository" SHIPYARD_GH_APP_REPO="$repository" \
+      "$preflight_ghapp_path" api "$endpoint"
+  fi
+}
+preflight_repositories="${preflight_repository:-$LEGACY_TARTCI_REPOSITORY $DEFAULT_TARTCI_REPOSITORY}"
+preflight_repository_json=""
+preflight_canonical=""
+for candidate in $preflight_repositories; do
+  if preflight_repository_json="$(preflight_api "$candidate" "repos/$candidate" 2>/dev/null)"; then
+    candidate_canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$preflight_repository_json")"
+    case "$candidate_canonical" in
+      "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY")
+        preflight_repository="$candidate"
+        preflight_canonical="$candidate_canonical"
+        break
+        ;;
+    esac
+  fi
+done
+[ -n "$preflight_canonical" ] || {
+  echo "fleet install could not authenticate either supported TartCI repository via rendered ghapp ($preflight_ghapp_path)" >&2
+  exit 3
+}
+TARTCI_REPOSITORY="$preflight_canonical"
+TARTCI_REPOSITORY_URL="https://github.com/$(printf '%s' "$TARTCI_REPOSITORY" | tr '[:upper:]' '[:lower:]').git"
+if ! preflight_commit_json="$(preflight_api "$TARTCI_REPOSITORY" "repos/$TARTCI_REPOSITORY/commits/$preflight_commit")"; then
+  echo "fleet install could not authenticate exact TartCI source commit via rendered ghapp ($preflight_ghapp_path)" >&2
+  exit 3
+fi
+preflight_actual="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$preflight_commit_json")"
+case "$preflight_canonical" in
+  "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
+  *) echo "fleet install API returned an untrusted canonical repository: $preflight_canonical" >&2; exit 3 ;;
+esac
+[ "$preflight_actual" = "$preflight_commit" ] || {
+  echo "fleet install source authority returned a mismatched commit ($preflight_actual != $preflight_commit)" >&2
+  exit 3
+}
+if [ "$PREFLIGHT_ONLY" = 1 ]; then
+  echo "  action=preflight (repository and exact source commit authenticated)"
+  exit 0
+fi
+else
+  [ "$PREFLIGHT_ONLY" = 0 ] || { echo "--preflight cannot be combined with --skip-preflight" >&2; exit 2; }
+fi
 [ "$APPLY" = 1 ] || { echo "  action=dry-run (pass --apply only while the pool is terminally off)"; exit 0; }
 
 # shellcheck source=providers/common/pool.lib.sh
@@ -417,6 +573,18 @@ print(value.strip())
 PY
 )"
   [ -n "$LAUNCH_HELPER_SOURCE" ] || LAUNCH_HELPER_SOURCE="$launcher_target"
+  # A sealed launcher owns the lane environment; reject a source bundle that
+  # was rendered without the same verified interpreter as this install.
+  "$PYTHON_BIN" - "$LAUNCH_HELPER_SOURCE" "$PYTHON_BIN" <<'PY'
+import json, sys
+from pathlib import Path
+bundle, expected = Path(sys.argv[1]), sys.argv[2]
+lanes = json.loads((bundle / "Contents/Resources/lanes.json").read_text()).get("lanes", {})
+if not lanes or any((row.get("environment") or {}).get("TARTCI_PYTHON") != expected
+                    or (row.get("environment") or {}).get("SHIPYARD_GHAPP_PYTHON_BINARY") != expected
+                    for row in lanes.values()):
+    raise SystemExit(f"launch helper lanes are missing pinned interpreter: {expected}")
+PY
   launcher_identity_json="$("$PYTHON_BIN" "$ROOT/scripts/macos_launcher_identity.py" verify "$LAUNCH_HELPER_SOURCE" \
     --identifier "$launcher_identifier" --team-id "$launcher_team_id" \
     --sha256 "$launcher_sha256" \
@@ -519,6 +687,7 @@ stage_result="$("$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" stage-i
 support_root="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["root"])' <<<"$stage_result")"
 installed_support_manifest="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["manifest"])' <<<"$stage_result")"
 launch_entrypoint="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["launch_entrypoint"])' <<<"$stage_result")"
+support_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$SUPPORT_MANIFEST")"
 
 mkdir -p "$(dirname "$ENTRYPOINT")"
 "$PYTHON_BIN" - "$(dirname "$ENTRYPOINT")" <<'PY' || {
@@ -535,6 +704,19 @@ PY
 wrapper_candidate="$(mktemp "$(dirname "$ENTRYPOINT")/.tartci-wrapper.XXXXXX")"
 "$PYTHON_BIN" "$ROOT/scripts/tartci_support_manifest.py" wrapper-write "$wrapper_candidate" \
   --support-root "$support_root" >/dev/null
+
+# Keep the human-only agent hygiene command tied to this immutable support cohort.
+mkdir -p "$(dirname "$AGENT_HYGIENE_ENTRYPOINT")"
+"$PYTHON_BIN" - "$AGENT_HYGIENE_ENTRYPOINT" "$support_root/scripts/agent-hygiene" <<'PY'
+import os, stat, sys
+from pathlib import Path
+target, source = map(Path, sys.argv[1:])
+if target.parent.is_symlink() or not target.parent.is_dir() or target.parent.stat().st_uid != os.getuid():
+    raise SystemExit("agent-hygiene entrypoint parent must be owned and non-symlinked")
+content = "#!/bin/zsh\nexec " + str(source) + ' "$@"\n'
+target.write_text(content)
+target.chmod(0o755)
+PY
 
 if [ -z "$launcher_target" ]; then
   "$PYTHON_BIN" - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'
@@ -604,8 +786,18 @@ PY
 )"
 
 support_repository="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["repository"])' "$installed_support_manifest")"
-support_commit="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(open(sys.argv[1]))["source_commit"])' "$installed_support_manifest")"
-authority_env_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PY'
+case "$support_repository" in
+  "https://github.com/generous-corp/tartci.git"|"https://github.com/danielraffel/tartci.git") ;;
+  *)
+    echo "fleet install refuses an untrusted support repository: $support_repository" >&2
+    exit 3
+    ;;
+esac
+if [ "$support_repository" != "$TARTCI_REPOSITORY_URL" ]; then
+  echo "fleet install accepts the legacy support identity during migration: $support_repository" >&2
+fi
+
+authority_env_json="$("$PYTHON_BIN" - "$locked_config" "$ROOT" <<'PYINNER'
 import json
 import sys
 from pathlib import Path
@@ -616,37 +808,64 @@ if app is None:
     print("{}")
     raise SystemExit(0)
 print(json.dumps(app))
-PY
+PYINNER
 )"
-[ "$support_repository" = "https://github.com/danielraffel/tartci.git" ] || {
-  echo "fleet install refuses an untrusted support repository: $support_repository" >&2
-  exit 3
-}
-if [ "$authority_env_json" = "{}" ]; then
-  source_authority_commit="$(
-    SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-      "$ghapp_path" api \
-        "repos/danielraffel/tartci/commits/$support_commit" --jq .sha
-  )" || source_authority_commit=""
-else
-  app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
-  app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
-  app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
-  source_authority_commit="$(
+
+api_commit_json() {
+  local commit="$1"
+  if [ "$authority_env_json" = "{}" ]; then
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY/commits/$commit"
+  else
+    local app_id app_key app_cache
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
     SHIPYARD_GITHUB_APP_ID="$app_id" \
     SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
     SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
-    SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-      "$ghapp_path" api \
-        "repos/danielraffel/tartci/commits/$support_commit" --jq .sha
-  )" || source_authority_commit=""
-fi
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY/commits/$commit"
+  fi
+}
+
+api_repository_json() {
+  if [ "$authority_env_json" = "{}" ]; then
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY"
+  else
+    local app_id app_key app_cache
+    app_id="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["id"])' <<<"$authority_env_json")"
+    app_key="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["private_key_path"])' <<<"$authority_env_json")"
+    app_cache="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin)["cache_dir"])' <<<"$authority_env_json")"
+    SHIPYARD_GITHUB_APP_ID="$app_id" \
+    SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
+    SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
+    GH_REPO="$TARTCI_REPOSITORY" SHIPYARD_GH_APP_REPO="$TARTCI_REPOSITORY" \
+      "$ghapp_path" api "repos/$TARTCI_REPOSITORY"
+  fi
+}
+
+verify_source_commit() {
+  local expected="$1" response repository_response canonical actual
+  response="$(api_commit_json "$expected")" || return 1
+  repository_response="$(api_repository_json)" || return 1
+  canonical="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("full_name", ""))' <<<"$repository_response")"
+  actual="$("$PYTHON_BIN" -c 'import json,sys; print(json.load(sys.stdin).get("sha", ""))' <<<"$response")"
+  case "$canonical" in
+    "$DEFAULT_TARTCI_REPOSITORY"|"$LEGACY_TARTCI_REPOSITORY") ;;
+    *) echo "fleet install API returned an untrusted canonical repository: $canonical" >&2; return 1 ;;
+  esac
+  [ "$actual" = "$expected" ] || {
+    echo "fleet install source authority returned a mismatched commit ($actual != $expected)" >&2
+    return 1
+  }
+  printf '%s\n' "$actual"
+}
+
+source_authority_commit="$(verify_source_commit "$support_commit")" || source_authority_commit=""
 [ -n "$source_authority_commit" ] || {
   echo "fleet install could not authenticate the exact TartCI source commit" >&2
-  exit 3
-}
-[ "$source_authority_commit" = "$support_commit" ] || {
-  echo "fleet install source authority returned a mismatched commit" >&2
   exit 3
 }
 if [ -n "$launcher_target" ]; then
@@ -654,22 +873,7 @@ if [ -n "$launcher_target" ]; then
     echo "fleet install requires launcher and support cohorts from the same exact commit" >&2
     exit 3
   }
-  if [ "$authority_env_json" = "{}" ]; then
-    launcher_authority_commit="$(
-      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-        "$ghapp_path" api \
-          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
-    )" || launcher_authority_commit=""
-  else
-    launcher_authority_commit="$(
-      SHIPYARD_GITHUB_APP_ID="$app_id" \
-      SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH="$app_key" \
-      SHIPYARD_GITHUB_APP_CACHE_DIR="$app_cache" \
-      SHIPYARD_GH_APP_REPO="danielraffel/tartci" \
-        "$ghapp_path" api \
-          "repos/danielraffel/tartci/commits/$launcher_source_commit" --jq .sha
-    )" || launcher_authority_commit=""
-  fi
+  launcher_authority_commit="$(verify_source_commit "$launcher_source_commit")" || launcher_authority_commit=""
   [ "$launcher_authority_commit" = "$launcher_source_commit" ] || {
     echo "fleet install could not authenticate the launcher's exact TartCI source commit" >&2
     exit 3

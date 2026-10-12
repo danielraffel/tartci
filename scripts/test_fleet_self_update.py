@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
+import contextlib
+import io
 import json
 import os
 import plistlib
@@ -49,6 +51,8 @@ class FakeSystem(su.System):
         self.pool_state = "on"
         self.offplan = [0]             # successive `pool off --plan` exit codes
         self.install_rcs = [0]         # successive `install --apply` exit codes
+        self.dry_run_rc = 0
+        self.preflight_rc = 0
         self.floor = {"allowed": True, "reason": "", "findings": []}
         # Keyed by SSH target (what the peer resolves to), not host_id.
         self.peers = {"m1": {"state": "on", "participating": True},
@@ -73,6 +77,9 @@ class FakeSystem(su.System):
         self.on_sleep = None           # called with the seconds of every sleep()
         self.hook = None               # called with argv before dispatch (signal tests)
         self.clone_ok = True
+        self.remote_url = su.REPO_URL + "\n"
+        self.api_repository = su.DEFAULT_REPOSITORY
+        self.unreadable_repositories: set[str] = set()
         self.critical: list[list[str]] = []
         self.snapshot_verify_rc = 0
         self.procs: dict[int, str] = {}     # other live processes: pid -> start
@@ -105,6 +112,7 @@ class FakeSystem(su.System):
         self.writer_domain_exec = True   # the installed shipyard has the subcommand
         self.audit_holds_domain = False  # a Sandbox E2E audit holds it exclusive
         self.fenced: list[list[str]] = []
+        self.launchd_print = None
 
     def now(self) -> float:
         return self.clock
@@ -138,15 +146,26 @@ class FakeSystem(su.System):
 
     def run(self, argv, *, cwd=None, env=None, timeout=900):  # noqa: C901
         self.calls.append((list(argv), cwd))
+        self.env_calls = getattr(self, "env_calls", [])
+        self.env_calls.append(dict(env or {}))
         a = list(argv)
         joined = " ".join(a)
         if self.hook:
             self.hook(a)
+        if a[:2] == ["launchctl", "print"]:
+            return self.launchd_print or su.Result(1, "", "not configured")
         if a[0] == FAKE_GH:
-            sha = a[2].split("/commits/")[1].split("/")[0]
-            runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
-                                          "conclusion": "success"}])
-            return ok(json.dumps({"check_runs": runs}))
+            repository = a[2].removeprefix("repos/").split("/commits/")[0]
+            if repository in self.unreadable_repositories:
+                return su.Result(1, "", "not found")
+            if "check-runs" in a[2]:
+                sha = a[2].split("/commits/")[1].split("/")[0]
+                runs = self.checks.get(sha, [{"name": "lint", "status": "completed",
+                                              "conclusion": "success"}])
+                return ok(json.dumps({"check_runs": runs}))
+            if "/commits/" not in a[2]:
+                return ok(json.dumps({"full_name": self.api_repository}))
+            return ok(json.dumps({"sha": a[2].split("/")[-1]}))
         if a[0] == "/usr/bin/ditto":
             shutil.copytree(a[-2], a[-1], symlinks=True)
             return ok()
@@ -184,7 +203,7 @@ class FakeSystem(su.System):
             if "show" in a:
                 return ok(json.dumps(self.published))
             if "remote" in a:
-                return ok(su.REPO_URL + "\n")
+                return ok(self.remote_url)
             if "checkout" in a:
                 self.checked_out = a[-1]
             return ok()
@@ -218,7 +237,7 @@ class FakeSystem(su.System):
             return su.Result(self.snapshot_verify_rc, "{}", "" if self.snapshot_verify_rc == 0
                              else "launcher sha256 does not match approval")
         if a[:2] == ["python3", "scripts/macos_fleet_lanes.py"]:
-            return self._render(a)
+            return self._render(a, env)
         if a[:3] == ["python3", "scripts/support_agents.py", "check-templates"]:
             return su.Result(self.agents_check_rc, "4 declared agents render" if
                              self.agents_check_rc == 0 else "reclaim: missing template")
@@ -231,7 +250,7 @@ class FakeSystem(su.System):
         if a[0] == "security":
             return ok(f'  1) {IDENTITY} "Developer ID Application: X (95CX6P84C4)"\n')
         if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]:
-            return self._build(a)
+            return self._build(a, env)
         if a[0] == str(self.home / ".local" / "bin" / "shipyard"):
             if a[1:] == ["writer-domain-exec", "--help"]:
                 return ok() if self.writer_domain_exec else su.Result(2, "", "unrecognized subcommand")
@@ -261,7 +280,11 @@ class FakeSystem(su.System):
             return ok("valid")
         if args[:2] == ["fleet-macos", "install"]:
             if "--apply" not in args:
-                return ok("dry run")
+                if "--preflight" in args:
+                    return su.Result(self.preflight_rc, "preflight ok" if self.preflight_rc == 0 else "preflight rejected",
+                                     "" if self.preflight_rc == 0 else "installer preflight failed")
+                return su.Result(self.dry_run_rc, "dry run" if self.dry_run_rc == 0 else "preflight rejected",
+                                 "" if self.dry_run_rc == 0 else "installer preflight failed")
             if self.checked_out == INSTALLED:  # a rollback reinstall
                 if self.rollback_install_rc == 0:
                     self._set_installed(INSTALLED)
@@ -354,21 +377,27 @@ class FakeSystem(su.System):
             receipt = self.home / ".config/tartci/macos-fleet-install.json"
             receipt.write_text(json.dumps({"support": {"source_commit": commit}}))
 
-    def _render(self, a):
+    def _render(self, a, env=None):
         proc = subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), *a[2:]],
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, env={**os.environ, **(env or {})})
         return su.Result(proc.returncode, proc.stdout, proc.stderr)
 
-    def _build(self, a):
+    def _build(self, a, env=None):
         out = Path(a[a.index("--output") + 1])
         approval = Path(a[a.index("--approval-output") + 1])
         profile = Path(a[a.index("--profile") + 1])
         rendered = out.parent / "render"
+        render_env = {**os.environ, **(env or {})}
+        render_env.setdefault("TARTCI_RENDER_PYTHON", sys.executable)
         subprocess.run([sys.executable, str(ROOT / "scripts/macos_fleet_lanes.py"), "render",
-                        str(profile), "--output", str(rendered)], check=True, capture_output=True)
+                        str(profile), "--output", str(rendered)], check=True,
+                       capture_output=True, env=render_env)
         lanes = {}
         for plist in rendered.glob("*.plist"):
             env = plistlib.loads(plist.read_bytes())["EnvironmentVariables"]
+            expected = os.path.realpath(render_env["TARTCI_RENDER_PYTHON"])
+            assert env["TARTCI_PYTHON"] == expected
+            assert env["SHIPYARD_GHAPP_PYTHON_BINARY"] == expected
             lanes[env["TARTCI_QUEUE_LANE_ID"]] = {"environment": dict(sorted(env.items()))}
         res = out / "Contents" / "Resources"
         res.mkdir(parents=True)
@@ -459,6 +488,13 @@ class Base(unittest.TestCase):
         self.assertEqual(rc, su.EXIT_DEFERRED)
         ticket = json.loads((self.cfg.state_dir / "waiting.json").read_text())
         self.assertTrue(ticket.get("reason"), ticket)
+
+    def test_scheduled_pause_refuses_real_apply_before_any_mutation(self) -> None:
+        su._write_json(self.cfg.state_dir / "scheduled-pause.json",
+                       {"at": su._iso(self.sys.now()), "reason": "bad rollout"})
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("self-update PAUSED", "\n".join(su.status_lines(self.cfg.state_dir)))
 
 
 class SkewTests(Base):
@@ -1383,11 +1419,47 @@ class SealedTests(Base):
         # The checkout is writable again after the immutable build.
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
 
+    def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        pinned = self.home / "pinned-python"
+        pinned.symlink_to(sys.executable)
+        with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
+            self.assertEqual(self.apply(), su.EXIT_OK, self.last())
+        build_index = next(i for i, (args, _) in enumerate(self.sys.calls)
+                           if args[:2] == ["bash", "scripts/build_macos_launcher.sh"])
+        build_env = self.sys.env_calls[build_index]
+        self.assertEqual(build_env["TARTCI_RENDER_PYTHON"], os.path.realpath(pinned))
+
     def test_install_failure_restores_the_pin(self) -> None:
         self.sys.install_rcs = [1]
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
         self.assertEqual(self.sys.pool_state, "on")
+
+    def test_installer_preflight_failure_refuses_before_drain(self) -> None:
+        self.sys.preflight_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.sys.mutations(), [])
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        self.assertIn("installer preflight refused before drain", receipt["error"])
+        self.assertFalse(any("--apply" in args for args, _ in self.sys.calls
+                             if args[:2] == ["./tartci", "fleet-macos"]))
+
+    def test_pin_dependent_preflight_refusal_restores_after_drain(self) -> None:
+        self.sys.dry_run_rc = 1
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.pool_state, "on")
+        self.assertEqual(self.pin().read_text(), "0" * 64 + "\n")
+        receipt_path = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        receipt = json.loads(receipt_path.read_text())
+        names = [step["step"] for step in receipt["steps"]]
+        self.assertIn("drain", names)
+        self.assertIn("pool-on", names)
+        self.assertLess(names.index("drain"), names.index("pool-on"))
+        self.assertIn("install-dry-run", names)
+        self.assertIn("refused after drain", receipt["error"])
+        self.assertNotEqual(receipt["status"], "failed")
 
     def test_bad_bundle_refuses_before_drain(self) -> None:
         for mutate in (lambda s: setattr(s, "bundle_commit", "9" * 40),
@@ -1606,6 +1678,34 @@ class AgentTemplateTests(unittest.TestCase):
 
 
 class VerifySettleTests(Base):
+    def test_heartbeat_timeout_rollback_has_distinct_outcome(self) -> None:
+        self.assertEqual(
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: "
+                "[{'code': 'heartbeat_missing', 'label': 'lane'}]",
+                "b" * 40,
+            ),
+            "rollback installed; verification timed out; rolled back to bbbbbbbbbbbb and verified",
+        )
+
+    def test_rollback_wording_requires_rollback_steps_to_succeed(self) -> None:
+        self.assertNotIn(
+            "rollback installed and pool on",
+            su._rollback_terminal_message(
+                "verification of aaaaaaaaaaaa: fleet not ready: heartbeat_missing",
+                "b" * 40),
+        )
+
+    def test_heartbeat_missing_with_crashed_launchd_lane_includes_last_log_line(self) -> None:
+        log = self.home / "lane.log"
+        log.write_text("booting\nlaunchd: runner crashed\n")
+        self.sys.launchd_print = su.Result(
+            0,
+            f"last exit code = 75\nstderr path = {log}\n",
+        )
+        details = su._heartbeat_failure_diagnostics(self.sys, ["lane"])
+        self.assertEqual(details, ["lane lane last exit 75; last log line: launchd: runner crashed"])
+
     def test_a_first_heartbeat_still_pending_is_waited_for(self) -> None:
         self.sys.settling_reads = 3
         start = self.sys.clock
@@ -1647,11 +1747,38 @@ class CensusEnvTests(unittest.TestCase):
             os.environ.pop("TARTCI_PYTHON", None)
             env = su.census_env()
         self.assertEqual(env["TARTCI_PYTHON"], sys.executable)
+        self.assertEqual(env["HOME"], os.environ.get("HOME") or os.path.expanduser("~"))
         proc = subprocess.run(["/bin/sh", "-c", "python3 -c 'import sys; print(sys.executable)'"],
                               env={**os.environ, "PATH": "/usr/bin:/bin", **env},
                               capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(os.path.realpath(proc.stdout.strip()), os.path.realpath(sys.executable))
+
+    def test_census_env_preserves_home_for_production_shaped_ghapp(self) -> None:
+        # The real ghapp wrapper uses HOME for its cache and refuses to run
+        # without it. Exercise the exact reduced census environment rather
+        # than a stub that accepts any environment.
+        with tempfile.TemporaryDirectory() as tmp:
+            ghapp = Path(tmp) / "ghapp"
+            ghapp.write_text(
+                "#!/bin/sh\n"
+                "[ -n \"${HOME:-}\" ] || { echo 'ghapp requires HOME' >&2; exit 78; }\n"
+                "printf '%s\\n' authenticated\n"
+            )
+            ghapp.chmod(0o755)
+            env = su.census_env("danielraffel/tartci")
+            env["PATH"] = f"{tmp}:{env['PATH']}"
+            ok_run = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(ok_run.returncode, 0, ok_run.stderr)
+            self.assertEqual(ok_run.stdout.strip(), "authenticated")
+
+            mutant_env = env.copy()
+            mutant_env.pop("HOME", None)
+            denied = subprocess.run([str(ghapp), "api", "repos/danielraffel/tartci"],
+                                    env=mutant_env, capture_output=True, text=True)
+            self.assertEqual(denied.returncode, 78)
+            self.assertIn("requires HOME", denied.stderr)
 
 
 class RollbackTests(Base):
@@ -1705,6 +1832,12 @@ class RollbackTests(Base):
 class RelayRollbackTests(Base):
     relay = True
 
+    def test_recovery_pool_on_reuses_receipted_serving_set(self) -> None:
+        self.sys.install_rcs = [1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        pool_on = [a for a, _ in self.sys.calls if "pool" in a and "on" in a]
+        self.assertTrue(any("--restore-receipt" in a for a in pool_on), pool_on)
+
     def test_relay_failure_after_install_rolls_back(self) -> None:
         self.sys.relay = {"ok": False, "reason": "probe failed"}
         calls = {"n": 0}
@@ -1724,6 +1857,13 @@ class SealedRollbackTests(Base):
 
     def pin(self) -> Path:
         return self.home / ".config/tartci/m3-launcher-approved.sha256"
+
+    def test_rollback_pool_on_failure_cannot_claim_installed_and_on(self) -> None:
+        self.sys.broken_target = True
+        self.sys.on_rcs = [0, 1, 1, 1, 1, 1]
+        self.assertEqual(self.apply(), su.EXIT_FAILED)
+        self.assertIn("ROLLBACK FAILED", self.last()["error"])
+        self.assertNotIn("rollback installed and pool on", self.last()["error"])
 
     def test_sealed_rollback_restores_bundle_and_pin_together(self) -> None:
         self.sys.broken_target = True
@@ -1807,6 +1947,64 @@ class ChecksAndTargetTests(Base):
         self.assertEqual(self.sys.mutations(), [])
         skew = json.loads((self.cfg.state_dir / "skew.json").read_text())
         self.assertEqual(skew["state"], "unverified")
+
+    def test_explicit_main_tip_soaking_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "soaking")
+        self.assertIn("soaking until", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_explicit_main_tip_soaked_but_red_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, T_NEW, explicit=True)
+        self.assertEqual(skew["state"], "unverified")
+        self.assertIn("not green: ", skew["selection_reason"])
+        self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref=T_NEW, explicit=True), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_default_path_falls_back_to_soaked_green_and_records_skipped(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW)
+        self.assertEqual(skew["selected_target"], T_OLD)
+        self.assertTrue(skew["skipped"])
+
+    def test_explicit_selection_is_printed_and_recorded(self) -> None:
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(su.plan_or_apply(self.cfg, self.sys, apply=False,
+                                              target_ref=T_OLD, explicit=True), su.EXIT_OK)
+        self.assertIn(f"selected {T_OLD} (requested {T_OLD}; same)", output.getvalue())
+        self.assertIn(f"repository={su.DEFAULT_REPOSITORY}", output.getvalue())
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual({key: receipt[key] for key in
+                          ("requested_target", "selected_target", "explicit", "soak_until")},
+                         {"requested_target": T_OLD, "selected_target": T_OLD,
+                          "explicit": True, "soak_until": None})
+
+    def test_main_explicit_target_is_refused_without_install(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 9000)}\n"
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--target", T_NEW, "--plan"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_main_without_target_keeps_default_green_fallback(self) -> None:
+        self.sys.log_lines = f"{T_NEW} {int(NOW - 7200)}\n{T_OLD} {int(NOW - 9000)}\n"
+        self.sys.checks[T_NEW] = [{"name": "lint", "status": "completed", "conclusion": "failure"}]
+        with mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--plan"])
+        self.assertEqual(result, su.EXIT_OK)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        self.assertEqual(json.loads(receipts[0].read_text())["target"], T_OLD)
 
     def test_explicit_target_must_be_on_the_first_parent_chain(self) -> None:
         skew = su.measure_skew(self.cfg, self.sys, INSTALLED, NOW, "d" * 40)
@@ -2129,6 +2327,8 @@ class IncidentTests(Base):
         self.sys.on_rc = 7
         self.assertEqual(self.apply(), su.EXIT_FAILED)
         self.assertTrue(self.last()["host_off"])
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("left OFF", self.issues[0][1])
         self.assertIn("LEFT THIS HOST OFF", su.summary(self.home)["problem"])
         self.assertTrue(any("WAS LEFT OFF" in line for line in su.status_lines(self.cfg.state_dir)))
 
@@ -2160,6 +2360,63 @@ class IncidentTests(Base):
         self.assertUpdated(self.apply())
         ons = [a for a, _ in self.sys.calls if a[-2:] == ["pool", "on"]]
         self.assertEqual(len(ons), 1)
+
+
+class RepositoryIdentityTests(Base):
+    def test_repository_resolution_refusal_is_receipted_at_the_entry_point(self):
+        self.sys.unreadable_repositories.update(
+            {su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY})
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True), \
+                mock.patch.object(su, "load_config", return_value=self.cfg), \
+                mock.patch.object(su, "System", return_value=self.sys):
+            result = su.main(["--home", str(self.home), "--apply"])
+        self.assertEqual(result, su.EXIT_REFUSED)
+        receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertEqual(len(receipts), 1)
+        receipt = json.loads(receipts[0].read_text())
+        self.assertEqual(receipt["status"], "refused")
+        self.assertEqual(receipt["target"], INSTALLED)
+        self.assertIn("no accepted TartCI repository is readable", receipt["error"])
+        self.assertEqual(receipt["steps"][-1]["step"], "refused")
+        self.assertEqual(json.loads((self.cfg.state_dir / "skew.json").read_text())["state"],
+                         "unknown")
+
+    def test_pretransfer_installer_dispatch_carries_readable_legacy_slug(self):
+        self.sys.api_repository = su.LEGACY_REPOSITORY
+        self.sys.unreadable_repositories.add(su.DEFAULT_REPOSITORY)
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            repository = su.configured_repository(self.cfg, self.sys)
+            run = object.__new__(su.Run)
+            run.cfg, run.sys, run.install_args, run.repository = (
+                self.cfg, self.sys, ["fleet-macos", "install", "profile"], repository)
+            run.receipt = mock.Mock()
+            run._writer_fence = lambda: []
+            su.Run._install(run, run.install_args)
+        self.assertEqual(su.LEGACY_REPOSITORY, repository)
+        self.assertEqual(su.LEGACY_REPOSITORY, self.sys.env_calls[-1]["GH_REPO"])
+
+    def test_default_resolution_uses_first_readable_accepted_slug(self):
+        self.sys.unreadable_repositories.add(su.LEGACY_REPOSITORY)
+        self.sys.api_repository = su.DEFAULT_REPOSITORY
+        with mock.patch.dict(os.environ, {"TARTCI_GH_CLI": FAKE_GH}, clear=True):
+            self.assertEqual(su.DEFAULT_REPOSITORY,
+                             su.canonical_repository(self.cfg, self.sys))
+
+    def test_api_accepts_legacy_and_new_full_name(self):
+        for repository in (su.LEGACY_REPOSITORY, su.DEFAULT_REPOSITORY):
+            self.sys.api_repository = repository
+            with mock.patch.dict(os.environ, {"GH_REPO": repository}):
+                self.assertEqual(su.canonical_repository(self.cfg, self.sys), repository)
+
+    def test_api_rejects_third_repository(self):
+        self.sys.api_repository = "example/other-tartci"
+        with self.assertRaises(su.Refused):
+            su.canonical_repository(self.cfg, self.sys)
+
+    def test_refresh_rejects_third_remote(self):
+        self.sys.remote_url = "https://example.invalid/other-tartci.git\n"
+        with self.assertRaises(su.Refused):
+            su.refresh_checkout(self.cfg, self.sys)
 
 
 class OsInterpreterRefreshTests(Base):

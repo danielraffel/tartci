@@ -60,7 +60,7 @@ records ``launchd_readable: false`` instead of a census of zero. A sensor that
 cannot report its own failure is the failure mode this whole exercise exists to
 fix.
 
-Run: ``python3 scripts/tartci_host_attestation.py --write``
+Run: python3 scripts/tartci_host_attestation.py --write
 """
 
 from __future__ import annotations

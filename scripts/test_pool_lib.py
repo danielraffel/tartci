@@ -12,10 +12,18 @@ import subprocess
 import tempfile
 import textwrap
 import unittest
+import resource
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LIB = ROOT / "providers" / "common" / "pool.lib.sh"
+
+
+def bounded_nproc() -> None:
+    current = len(subprocess.check_output(
+        ["ps", "-u", str(os.getuid()), "-o", "pid="]
+    ).splitlines())
+    resource.setrlimit(resource.RLIMIT_NPROC, (current + 300, current + 300))
 
 
 def _bash(script: str, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
@@ -565,11 +573,15 @@ class PoolCommandHelpTests(unittest.TestCase):
             with (agents / f"{label}.plist").open("wb") as handle:
                 plistlib.dump({"Label": label, "ProgramArguments": ["/bin/true"]}, handle)
             # /bin/sh resolves but has no tomllib, so the resolver exits 127.
-            env = {**os.environ, "HOME": str(home), "TARTCI_PYTHON": "/bin/sh"}
+            env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "TARTCI_PYTHON": "/bin/sh"}
+
+            def bounded() -> None:
+                bounded_nproc()
 
             body = json.loads(subprocess.run(
                 [str(ROOT / "tartci"), "pool", "status", "--json"],
-                text=True, capture_output=True, check=False, env=env,
+                text=True, capture_output=True, check=False, env=env, timeout=10,
+                preexec_fn=bounded,
             ).stdout)
             self.assertEqual(
                 body["fleet"]["problems"][0]["code"],
@@ -579,7 +591,8 @@ class PoolCommandHelpTests(unittest.TestCase):
 
             human = subprocess.run(
                 [str(ROOT / "tartci"), "pool", "status"],
-                text=True, capture_output=True, check=False, env=env,
+                text=True, capture_output=True, check=False, env=env, timeout=10,
+                preexec_fn=bounded,
             )
             self.assertEqual(human.returncode, 0, human.stderr)
             self.assertIn("verified running supervisors: unknown", human.stdout)

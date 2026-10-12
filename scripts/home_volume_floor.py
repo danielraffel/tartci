@@ -26,7 +26,7 @@ capacity outage.
 
 State lives beside the lease records (`home-volume.json` in the store dir):
 the free-space samples, the consecutive-denial count and when reads started
-failing, which `tartci doctor fleet` reads.
+failing, which tartci doctor fleet reads.
 
 Python 3.9-safe: the launchd python on fleet hosts is /usr/bin/python3.
 """

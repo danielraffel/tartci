@@ -621,7 +621,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         #
         # The rule now: a delegation may only pass when it names the ARTIFACT
         # carrying the other side's verdict, and absence of that artifact is a
-        # fault. `tartci_host_attestation.py` writes it; Shipyard's landability
+        # fault. tartci_host_attestation.py writes it; Shipyard's landability
         # preflight reads it and reports Unknown - never Served - when it is
         # missing or stale. The verdict is still not computed here, because
         # that is genuinely Shipyard's half; what changed is that the reader is
@@ -717,7 +717,7 @@ def is_pool_runner(label: str) -> bool:
 def pool_participating(path: str) -> bool:
     """Read durable pool intent. Missing/unrecognised values preserve legacy ON.
 
-    `tartci pool` and Shipyard use the numeric 1/0 contract; accepting the old
+    tartci pool and Shipyard use the numeric 1/0 contract; accepting the old
     true/false spelling keeps deployed hosts compatible.
     """
     try:
@@ -841,7 +841,7 @@ def mid_job_refusal(label: str, launch_agents_dir: str | None = None) -> str | N
 
 def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
                    allow_mid_job: bool) -> int:
-    """The explicit `tartci launchd reload LABEL` entry, with every guard."""
+    """The explicit tartci launchd reload LABEL entry, with every guard."""
     plist = os.path.join(launch_agents_dir, f"{label}.plist")
     verb = "would" if dry_run else "will"
     if not os.path.exists(plist):
@@ -853,7 +853,7 @@ def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
         if refusal is not None:
             print(f"launchd-watchdog: REFUSE: {refusal}.\n"
                   "  Instead: wait for the lane to go idle and re-run, or run "
-                  "`tartci pool drain` so it finishes its job and stops.\n"
+                  "tartci pool drain so it finishes its job and stops.\n"
                   "  Override (kills the job): tartci launchd reload "
                   f"{label} --allow-mid-job", file=sys.stderr)
             return RELOAD_REFUSED
@@ -1287,6 +1287,67 @@ def vm_boot_pass(status_only: bool = False, now: float | None = None) -> str | N
     return None
 
 
+def debug_hold_pass() -> str | None:
+    """Expire failed gate VMs kept for debugging (scripts/debug_hold.py): stop
+    an inspection left running, delete at TTL or once their PR is merged or
+    closed. A no-op with nothing held. Never raises."""
+    try:
+        import debug_hold  # noqa: PLC0415 - sibling module
+        directory = debug_hold.state_dir()
+        if not debug_hold.records(directory):
+            return None
+        out = debug_hold.expire(debug_hold.System(), directory)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN debug-hold expiry FAILED "
+                f"({type(exc).__name__}: {exc}); held VMs were not expired")
+    if out.get("deleted") or out.get("stopped"):
+        return (f"{_iso(utcnow())} launchd-watchdog: debug-hold: deleted "
+                f"{[d['name'] + ' (' + d['reason'] + ')' for d in out['deleted']]}, "
+                f"stopped {out['stopped']}")
+def peer_stall_pass(now: float | None = None) -> str | None:
+    """Tell someone when a PEER's launchd has stalled (scripts/peer_stall_alert.py).
+
+    A stalled host cannot be relied on to alert about itself, so each host
+    reads its peers' guard receipts over SSH, at most every 30 min, and opens
+    (or adopts) one issue per stalled peer. Runs after the heal work so a slow
+    peer never delays it. Prints a WARN for each peer past the threshold.
+    Never raises.
+    """
+    try:
+        import peer_stall_alert  # noqa: PLC0415 - sibling module
+        out = peer_stall_alert.alert_pass(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN peer-stall check FAILED "
+                f"({type(exc).__name__}: {exc}); a stalled peer would not be reported")
+    if out.get("skipped"):
+        return None
+    stalled = [f"{peer} since {v.get('since')} ({v.get('hours')} h)"
+               for peer, v in sorted((out.get("peers") or {}).items()) if v.get("active")]
+    if stalled:
+        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN peer-stall: "
+                f"launchd stalled on {'; '.join(stalled)}")
+    return None
+
+
+def resolver_health_pass(now: float | None = None) -> str | None:
+    """Publish one resolver/TCP probe for peers to read.
+
+    The probe is deliberately best effort. A local probe failure must not stop
+    the watchdog's heal and peer paths, and only resolver_health's three-tick
+    hysteresis can publish ``resolver_dead``.
+    """
+    try:
+        import resolver_health  # noqa: PLC0415 - sibling module
+        state = resolver_health.tick(now=utcnow() if now is None else now)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN resolver check FAILED ({type(exc).__name__}: "
+                f"{exc}); no resolver alert state was published")
+    if state.get("condition") == "resolver_dead":
+        return (f"{_iso(utcnow() if now is None else now)} launchd-watchdog: WARN resolver dead "
+                "while TCP alive (peer alert path will report it)")
+    return None
+
+
 def host_off_pass(status_only: bool = False, now: float | None = None) -> str | None:
     """Recover and alert for a host a failed self-update left OFF.
 
@@ -1489,6 +1550,15 @@ def main(argv: list[str] | None = None) -> int:
         attestation_line = host_attestation_pass()
         if attestation_line:
             print(attestation_line)
+        resolver_line = resolver_health_pass()
+        if resolver_line:
+            print(resolver_line)
+        hold_line = debug_hold_pass()
+        if hold_line:
+            print(hold_line)
+        peer_stall_line = peer_stall_pass()
+        if peer_stall_line:
+            print(peer_stall_line)
         try:
             import power_status  # noqa: PLC0415 - sibling module
             power_status.refresh_sleep_events()
@@ -1553,7 +1623,7 @@ def main(argv: list[str] | None = None) -> int:
         if config["warned"] or (args.status and config_summary):
             # Report only: the watchdog never acts on configuration drift.
             print(f"{_iso(now)} launchd-watchdog: WARN config: {config_summary} "
-                  "(report only; see `tartci fleet-macos verify-supply` / `profile-drift`)")
+                  "(report only; see tartci fleet-macos verify-supply / profile-drift)")
         # no_tomllib is already covered by the config WARN; printing it here
         # would repeat every pass rather than every due cycle.
         if disagreement.get("ran") or (disagreement.get("state") == "unknown"

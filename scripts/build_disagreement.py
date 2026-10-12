@@ -75,7 +75,7 @@ DEFAULT_HOST_PREFIXES: tuple[tuple[str, str], ...] = (
 HEAD_BUILDING_EVENTS = frozenset({"push", "merge_group", "workflow_dispatch", "schedule"})
 
 REMEDY = (
-    "Probable poisoned compiler cache on {host}. On {host}, run `tartci ccache "
+    "Probable poisoned compiler cache on {host}. On {host}, run tartci ccache "
     "reset` (quarantines zero-include manifests; add --reset to move the whole "
     "shared cache aside; refuses while a VM runs or holds a lease unless "
     "--force). On a host whose installed tartci predates that command, drain its "

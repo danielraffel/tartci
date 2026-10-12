@@ -3,11 +3,11 @@
 
 Why this exists: Shipyard can bind a pull request's mac validation to an earlier
 run of the same tree ("reuse") only when a bindable record for that tree exists
-on a host in `shadow_compare` mode. Pull requests run only the fast tier, so in
+on a host in shadow_compare mode. Pull requests run only the fast tier, so in
 practice no such record is ever written. This agent produces one: on each
-shadow_compare host it runs `shipyard run --targets mac` at origin/main's head,
+shadow_compare host it runs shipyard run --targets mac at origin/main's head,
 in a dedicated canary worktree, at background build priority, and records what
-`shipyard reuse records` reports for that SHA.
+shipyard reuse records reports for that SHA.
 
 Opt-in per host, OFF unless the installed fleet profile says:
 
@@ -16,9 +16,9 @@ Opt-in per host, OFF unless the installed fleet profile says:
     repo = "/Volumes/Workshop/Code/pulp"                       # a Pulp checkout
     worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"  # PULP_WORKTREES_ROOT
 
-The LaunchAgent (`com.danielraffel.tartci.reuse-canary`, every 6 h, from
-launchd/com.danielraffel.tartci.reuse-canary.plist.template) runs `tartci
-reuse-canary run`, the installed generation's copy of this file, so self-update
+The LaunchAgent (com.danielraffel.tartci.reuse-canary, every 6 h, from
+launchd/com.danielraffel.tartci.reuse-canary.plist.template) runs tartci
+reuse-canary run, the installed generation's copy of this file, so self-update
 refreshes it. The interval guard kicks it like any fleet timer when launchd
 stops starting timers, so a stalled host still runs it within twice its
 interval.
@@ -26,30 +26,30 @@ interval.
 Each pass, in order:
 
   1. takes a nonblocking host lock; a pass already running makes this one a
-     no-op (`busy`);
+     no-op (busy);
   2. refuses, touching nothing, when pool participation is off or draining
      (self-update drains the pool first, so an update in progress refuses too);
-  3. reads origin/main's head with `git ls-remote`;
-  4. skips when today's ledger holds a completed (`ran`) pass for that SHA, or
+  3. reads origin/main's head with git ls-remote;
+  4. skips when today's ledger holds a completed (ran) pass for that SHA, or
      MAX_STARTS_PER_DAY starts of it. A failed, timed-out or unrecorded pass
      may retry within that cap, and so may a half-run (a start with no finish,
      the pass was killed);
-  5. refuses unless `shipyard reuse records` reports
-     `changed_surface_execution_mode` = `shadow_compare`, read from the trusted
+  5. refuses unless shipyard reuse records reports
+     changed_surface_execution_mode = shadow_compare, read from the trusted
      machine config exactly as the ship path reads it; any failure refuses;
-  6. checks the canary worktree out at that SHA under `worktrees_root`, never
+  6. checks the canary worktree out at that SHA under worktrees_root, never
      falling back to another disk when the root's volume is not mounted;
-  7. runs `shipyard run --targets mac` there with PULP_BUILD_CLASS=background
+  7. runs shipyard run --targets mac there with PULP_BUILD_CLASS=background
      (the lease comes from governed-build.sh, as for any local mac run), in its
      own process group, bounded by RUN_TIMEOUT_S, writing a progress line every
      HEARTBEAT_S so the launchd watchdog sees a live log;
-  8. records `shipyard reuse records` for the SHA verbatim. Only that output
+  8. records shipyard reuse records for the SHA verbatim. Only that output
      says whether the run is bindable; this file never infers it. The store
      files nothing for a run that died before writing job.json, so an empty
      list after a pass reads as not filed, and not bindable;
   9. writes an atomic receipt and one terminal event.
 
-`status --json` summarises the newest receipts for `tartci doctor fleet`.
+status --json summarises the newest receipts for tartci doctor fleet.
 
 Exit codes: 0 ran or nothing due, 3 refused by a gate (host untouched), 4 the
 run failed or timed out, 5 records unreadable or the profile incomplete,
@@ -115,7 +115,7 @@ def records_command(sha: str) -> List[str]:
 # ── settings ───────────────────────────────────────────────────────────────
 
 def validate_table(table: Any) -> List[str]:
-    """Problems with a `[reuse_canary]` table; empty when it is acceptable.
+    """Problems with a [reuse_canary] table; empty when it is acceptable.
 
     Shared by the install-time profile validator and the runtime reader, so a
     profile that installs is a profile this module acts on.
@@ -293,7 +293,7 @@ class Canary:
     def mode_gate(self, sha: str) -> Optional[str]:
         """Refuse unless Shipyard reads its own mode as shadow_compare.
 
-        The mode comes from `shipyard reuse records`, which reads the trusted
+        The mode comes from shipyard reuse records, which reads the trusted
         machine config exactly as the ship path does; any failure refuses.
         """
         value, why = self.records(Path(self.settings["repo"]), sha)
@@ -320,7 +320,7 @@ class Canary:
         return value if isinstance(value, dict) else {}
 
     def due(self, ledger: Dict[str, Any], day: str, sha: str) -> Tuple[bool, str]:
-        """A `ran` finish is final for the day; anything else may retry within the cap."""
+        """A ran finish is final for the day; anything else may retry within the cap."""
         entry = (ledger.get(day) or {}).get(sha) or {}
         if "ran" in (entry.get("finishes") or []):
             return False, f"already ran {sha[:12]} today"
@@ -479,7 +479,7 @@ def acquire_lock(path: Path) -> Optional[Any]:
 
 def status(state_dir: Path, settings: Optional[Dict[str, Any]], *, plist: Path,
            now: Optional[float] = None) -> Dict[str, Any]:
-    """The facts `tartci doctor fleet` judges, from the receipts alone."""
+    """The facts tartci doctor fleet judges, from the receipts alone."""
     now = time.time() if now is None else now
     if settings is None:
         return {"state": "unreadable", "error": "fleet profile unreadable"}

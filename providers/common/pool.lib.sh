@@ -31,6 +31,27 @@ TARTCI_POOL_FLEET_PLIST_GLOB='com.danielraffel.tartci.tart-runner-macos-fleet.*.
 # "mid-job": the label's launchd pid owns a `tart run` or Runner.Worker).
 TARTCI_POOL_LANE_BUSY="${TARTCI_POOL_LANE_BUSY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" 2>/dev/null && pwd)/lane_busy.py}"
 
+# Resolve the verified interpreter supplied by tartci. Standalone callers use
+# the fixed system interpreter; PATH python3 is never accepted.
+tartci_pool_python() {
+  if declare -F tartci_verified_python >/dev/null 2>&1; then
+    local verified
+    if verified="$(tartci_verified_python)"; then
+      printf '%s\n' "$verified"
+      return
+    fi
+  fi
+  local python="${TARTCI_PYTHON:-/usr/bin/python3}" implementation
+  implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  if [ "$implementation" != cpython ] && [ -n "${TARTCI_PYTHON:-}" ]; then
+    echo "tartci: pool helper interpreter failed verification: $python (expected cpython, got ${implementation:-unavailable}); using /usr/bin/python3" >&2
+    python=/usr/bin/python3
+    implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  fi
+  [ "$implementation" = cpython ] || return 127
+  printf '%s\n' "$python"
+}
+
 # Read participation: 1 = participating, 0 = opted out. Absent means
 # participating — opting out is an explicit act, and a missing/garbage file must
 # never silently pull a host out of the pool.
@@ -132,7 +153,7 @@ tartci_pool_runner_agents() {
 tartci_pool_receipt_services() {
   local receipt="${1:-$TARTCI_POOL_FLEET_RECEIPT}"
   [ -f "$receipt" ] || return 0
-  python3 - "$receipt" 2>/dev/null <<'PY' || true
+  "$(tartci_pool_python)" - "$receipt" 2>/dev/null <<'PY' || true
 import json
 import sys
 
@@ -338,7 +359,7 @@ tartci_pool_lock_release() {
 
 tartci_pool_lock_identity() {
   local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}"
-  python3 - "$lock" <<'PY'
+  "$(tartci_pool_python)" - "$lock" <<'PY'
 import os, stat, sys
 try:
  s=os.lstat(sys.argv[1])
@@ -388,7 +409,7 @@ EOF
 }
 
 tartci_pool_lock_health_json() {
-  tartci_pool_lock_health "${1:-$TARTCI_POOL_TRANSITION_LOCK}" | python3 -c '
+  tartci_pool_lock_health "${1:-$TARTCI_POOL_TRANSITION_LOCK}" | "$(tartci_pool_python)" -c '
 import json, sys
 fields = {}
 for raw in sys.stdin:
@@ -487,7 +508,7 @@ tartci_pool_zero_running_vms() {
     printf '%s\n' "$qemu_processes" | grep -Eq '(^|[[:space:]/])qemu-system-' && return 1
     return 0
   fi
-  python3 - "$tart" <<'PY'
+  "$(tartci_pool_python)" - "$tart" <<'PY'
 import json, subprocess, sys
 try:
  result=subprocess.run([sys.argv[1], "list", "--format", "json"], check=True,
@@ -539,7 +560,7 @@ tartci_pool_mid_job() {
 $labels
 EOF
   [ "${#argv[@]}" -gt 0 ] || return 0
-  python3 "$TARTCI_POOL_LANE_BUSY" --agents-dir "$dir" "${argv[@]}" || rc=$?
+  "$(tartci_pool_python)" "$TARTCI_POOL_LANE_BUSY" --agents-dir "$dir" "${argv[@]}" || rc=$?
   case "$rc" in
     0|1|2) return "$rc" ;;
     *) printf 'lane busy probe failed (exit %s)\n' "$rc"; return 2 ;;

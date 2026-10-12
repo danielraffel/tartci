@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Periodic, report-only runner for the cross-host build disagreement alarm.
 
-The launchd watchdog (`tartci launchd heal`, every 5 minutes) calls `cycle`
+The launchd watchdog (tartci launchd heal, every 5 minutes) calls cycle
 once per pass. This module decides whether the detector is due, runs it
 bounded, and turns its findings into log lines for the watchdog log. It never
 resets a cache, never touches scheduling and never fails the watchdog: every
