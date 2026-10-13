@@ -2,3 +2,4 @@
 # This file deliberately does not compile, so the required `lint` check fails
 # and this pull request can never merge, even while armed.
 def broken(:
+# second commit
