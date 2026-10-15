@@ -910,6 +910,8 @@ def build_profile(
         reserved_gate_mem_mb = 0
     non_gate_capacity_mem_mb = max(0, lease_capacity_mem_mb - reserved_gate_mem_mb)
 
+    lint_vm = lint_vm_settings(non_gate_capacity, non_gate_capacity_mem_mb)
+
     floor_settings, floor_source = agent_floor_settings(fleet_profile)
     agent_floor = min(max(0, floor_settings.get("agent_floor_cores", 0)), lease_capacity)
     agent_floor_pool = floor_settings.get("agent_floor_pool_cores", agent_floor)
@@ -948,6 +950,7 @@ def build_profile(
         "non_gate_capacity_mem_mb": non_gate_capacity_mem_mb,
         "per_compile_job_mem_mb": PER_COMPILE_JOB_MEM_MB,
         "pulp_build_mem_budget_mb": pulp_build_mem_budget_mb,
+        **lint_vm,
         "qos": defaults.qos,
         "agent_floor_cores": agent_floor,
         "agent_floor_pool_cores": agent_floor_pool,
@@ -965,6 +968,37 @@ def build_profile(
             "lease_capacity_cores is the host-wide budget before any consumer opts in",
         ],
     }
+
+
+# Lint-class Linux VMs (tart-linux lane "lint"): one VM per seconds-to-minutes
+# job that compiles nothing, so it needs one vCPU and a small guest. Its size and
+# per-host slot count come from the non-gate share, never from the human/agent
+# headroom and never from a number typed into a lane config.
+LINT_VM_CORES = 1
+LINT_VM_MEM_CEILING_MB = 2048
+LINT_VM_MEM_FLOOR_MB = 1024
+LINT_VM_SLOT_CEILING = 2
+
+
+def lint_vm_settings(non_gate_cores: int, non_gate_mem_mb: int) -> dict[str, int]:
+    """Size and slot count for lint VMs from this host's non-gate share.
+
+    Memory is a quarter of the non-gate memory share, held between a floor that
+    boots Ubuntu with the runner and a ceiling the lint jobs never exceed. Slots
+    are what both axes can hold at once, capped so a lint burst cannot take the
+    whole non-gate share from builds. 0 slots means the host cannot host one.
+    """
+    cores = min(LINT_VM_CORES, max(0, non_gate_cores))
+    if non_gate_mem_mb > 0:
+        mem_mb = max(LINT_VM_MEM_FLOOR_MB, min(LINT_VM_MEM_CEILING_MB, non_gate_mem_mb // 4))
+    else:
+        mem_mb = LINT_VM_MEM_FLOOR_MB
+    if cores <= 0 or (non_gate_mem_mb > 0 and non_gate_mem_mb < mem_mb):
+        slots = 0
+    else:
+        by_mem = non_gate_mem_mb // mem_mb if non_gate_mem_mb > 0 else LINT_VM_SLOT_CEILING
+        slots = max(0, min(LINT_VM_SLOT_CEILING, non_gate_cores // cores, by_mem))
+    return {"lint_vm_cores": cores, "lint_vm_mem_mb": mem_mb, "lint_vm_slots": slots}
 
 
 def shell_exports(profile: dict[str, Any]) -> str:
@@ -991,6 +1025,9 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "TARTCI_NON_GATE_CAPACITY_MEM_MB": profile["non_gate_capacity_mem_mb"],
         "TARTCI_LINK_LTO_RESERVE_MEM_MB": profile["link_lto_reserve_mem_mb"],
         "TARTCI_PER_JOB_MEM_MB": profile["per_compile_job_mem_mb"],
+        "TARTCI_LINT_VM_CORES": profile["lint_vm_cores"],
+        "TARTCI_LINT_VM_MEM_MB": profile["lint_vm_mem_mb"],
+        "TARTCI_LINT_VM_SLOTS": profile["lint_vm_slots"],
         "PULP_BUILD_MEM_BUDGET_MB": profile["pulp_build_mem_budget_mb"],
         # Build classes + dynamic lending (tartci governor). A consumer that
         # sees TARTCI_GOVERNOR_SCHEMA may pass `leases acquire --class`.
