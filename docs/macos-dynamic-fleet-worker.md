@@ -8,7 +8,7 @@ VM only after it sees an exact matching queued job and acquires a governed
 lease. Failed queue discovery is fail-closed.
 
 The checked-in declarations are `profiles/{m1,m3,m5}-macos-fleet.toml`. M1 and
-M5 use `$HOME/VMs`; M3 uses `/Volumes/Workshop/VMs`. M3's durable Shipyard host
+M5 use `$HOME/VMs`; M3 uses `/Volumes/<data-volume>/VMs`. M3's durable Shipyard host
 tag is `studio`, so its profile binds `host.id = "studio"` even though the file
 uses the operator-facing M3 name. Paths are absolute in rendered LaunchAgents
 because minimal launchd/SSH environments must not guess `HOME`, `PATH`, or
@@ -27,7 +27,7 @@ owner, and mode. Fleet
 installation consumes an already-signed artifact; it never holds a signing
 identity. Before admission,
 `pool on` uses a temporary LaunchAgent to prove bounded write/read/delete access
-to `/Volumes/Workshop/VMs`. Failure leaves participation closed and starts no
+to `/Volumes/<data-volume>/VMs`. Failure leaves participation closed and starts no
 runner. This is private host policy encoded by the M3 profile, not a default
 imposed on TartCI users.
 
@@ -107,7 +107,7 @@ for file in "$out"/*.plist; do plutil -lint "$file"; done
 ssh m1-lan 'mkdir -p "$HOME/Library/Logs/tartci"'
 ```
 
-For M3 (and m5studio, whose store is on `/Volumes/Atelier`), stage the exact
+For M3 (and m5studio, whose store is on `/Volumes/<data-volume>`), stage the exact
 profile-pinned signed launcher alongside the immutable support cohort, then
 install only at a terminal idle boundary:
 
@@ -255,9 +255,9 @@ needed, run from the source host and plan first:
 ./tartci tart-image-sync \
   --name pulp-build-runner:latest \
   --destination m1-lan --fallback m1 \
-  --source-tart-home /Volumes/Workshop/VMs \
-  --destination-tart-home /Users/danielraffel/VMs \
-  --staging /Volumes/Workshop/VMs/transfers/m1
+  --source-tart-home /Volumes/<data-volume>/VMs \
+  --destination-tart-home /Users/<you>/VMs \
+  --staging /Volumes/<data-volume>/VMs/transfers/m1
 ```
 
 At an authorized idle boundary, add `--apply` to export and checksum a resumable

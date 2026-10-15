@@ -2944,8 +2944,8 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
       [reclaim]
       pulp_worktree_builds = true
-      repo = "/Volumes/Workshop/Code/pulp"
-      worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+      repo = "/Volumes/<data-volume>/Code/pulp"
+      worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
       pressure_free_gb = 200          # optional
       worktree_build_idle_hours = 2   # optional, 2..24
 
@@ -3030,7 +3030,7 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 
   **The home volume has its own floor.** The disk axis above judges the
   volume holding the Tart store. When the store is on another volume
-  (m5studio's `/Volumes/Atelier`), a VM lease also judges the home volume,
+  (m5studio's `/Volumes/<data-volume>`), a VM lease also judges the home volume,
   which holds every supervisor's temp files and the build trees
   (`scripts/home_volume_floor.py`). m5studio, 2026-10-04: the boot Data volume
   reached 99% with coverage build dirs, ENOSPC killed a merge-group runner and

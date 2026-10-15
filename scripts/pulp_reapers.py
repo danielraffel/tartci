@@ -14,8 +14,8 @@ Opt-in per host, OFF unless the installed fleet profile says:
 
     [reclaim]
     pulp_worktree_builds = true
-    repo = "/Volumes/Workshop/Code/pulp"          # a Pulp checkout
-    worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+    repo = "/Volumes/<data-volume>/Code/pulp"          # a Pulp checkout
+    worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
     pressure_free_gb = 200                        # optional, default 200
     worktree_build_idle_hours = 2                 # optional, 2..24, default 2
 

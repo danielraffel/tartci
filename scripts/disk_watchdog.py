@@ -2,7 +2,7 @@
 """Tell someone, once per episode, that a cache or VM volume stopped writing.
 
 On m5studio on 2026-10-12 (outage O10 in the planning ledger) every create on
-/Volumes/Atelier stalled about 6 s, for hours, while reads stayed instant. A
+/Volumes/<data-volume> stalled about 6 s, for hours, while reads stayed instant. A
 tartci disk probe that ran `open()` there sat inside the kernel's `__open` for
 7 h, the WindowServer watchdog eventually killed the login session, and the
 kernel log that might have named the cause had rotated by the time anyone

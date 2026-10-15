@@ -60,8 +60,8 @@ private func spawn(_ executable: String, _ arguments: [String], _ environment: [
 }
 struct SealedMetadata: Decodable { let tart_home: String }
 /// The Tart store sealed into this bundle at build time (bundle.json): the
-/// profile's own external-volume store, e.g. /Volumes/Workshop/VMs on m3 or
-/// /Volumes/Atelier/VMs on m5studio. It is covered by the bundle signature.
+/// profile's own external-volume store, e.g. /Volumes/<data-volume>/VMs on m3 or
+/// /Volumes/<data-volume>/VMs on m5studio. It is covered by the bundle signature.
 private func sealedStore(_ root: URL) -> String {
     let value: SealedMetadata
     do {

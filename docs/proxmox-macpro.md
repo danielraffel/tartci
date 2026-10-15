@@ -24,7 +24,7 @@ macOS launchd provider.
 
 | | |
 |---|---|
-| **Host** | `macpro` 192.168.86.43 — Proxmox VE 9.2, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
+| **Host** | `macpro` (LAN address: see the private fleet table) — Proxmox VE 9.2, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
 | **Serves** | operator-dispatched Pulp `Linux (x64)` · an opportunistic Windows x64 build VM |
 | **Model** | golden template → linked clone → one job → destroy |
 | **Templates** | `9005` `pulp-linux-golden-warm4` (current and retained parent) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
@@ -56,7 +56,7 @@ That is the whole point: it is the only x86_64 host in a fleet of Apple Silicon.
 ## The machine
 
 ```
-host      macpro   192.168.86.43   `ssh macpro`   (reachable from m1, m3, m5)
+host      macpro   <lan-address>   `ssh macpro`   (reachable from m1, m3, m5)
           Proxmox VE 9.2, kernel 7.0.14-16-pve
 cpu       Xeon E5-1650 v2 — 6 cores / 12 threads @ 3.5 GHz (Ivy Bridge-EP)
 memory    31 GB DDR3
@@ -116,7 +116,7 @@ and label. Sharing a service between `pulp-auto-linux-x64` and
 `pulp-pr-safe-linux-x64` destroys the isolation boundary even if the VM itself
 is disposable.
 
-VMIDs `200..202` have stable network identities: `192.168.86.251..253` and
+VMIDs `200..202` have stable network identities: three reserved LAN addresses (listed in the private fleet table) and
 deterministic locally administered MAC addresses. The Actions registration name
 is deliberately different: `pulp-ci-ephemeral-<vmid>-<uuid>` is unique for every
 invocation so an interrupted runner cannot collide with its replacement.
@@ -386,7 +386,7 @@ things about that install are worth knowing before you redo it:
   runs but cannot talk to the host. Install `vioserial\2k22\amd64\vioser.inf`
   from the attached `virtio-win.iso` with `pnputil /add-driver ... /install`;
   `qm guest cmd 300 ping` then works.
-- **It takes a DHCP lease on the LAN** (192.168.86.21 at install time). SSH as
+- **It takes a DHCP lease on the LAN** (its address is not fixed). SSH as
   `ci` with the operator key named in the unattend file; read the current address
   with `qm guest cmd 300 network-get-interfaces`.
 

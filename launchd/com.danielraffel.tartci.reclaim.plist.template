@@ -29,8 +29,8 @@
 
   Scan roots are DISCOVERED, not declared. This template deliberately does not
   set TARTCI_RECLAIM_ROOTS: the janitor keeps whichever of ~/Code and the
-  installed fleet profile's [reclaim] code root (m3: /Volumes/Workshop/Code,
-  m5studio: /Volumes/Atelier/Code) the host actually has. A hand-tuned root is the one
+  installed fleet profile's [reclaim] code root (m3: /Volumes/<data-volume>/Code,
+  m5studio: /Volumes/<data-volume>/Code) the host actually has. A hand-tuned root is the one
   failure the guards cannot catch, because a root that EXISTS but sits on the
   wrong volume passes every check and reports a clean exit 0 forever while the
   volume it was installed to protect fills up. m3 is exactly that shape: it

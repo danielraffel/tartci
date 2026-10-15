@@ -42,7 +42,7 @@ created in the two days after 09-27, while the Workshop volume went from 70% to
 
 A host whose agents also leave worktrees in a directory that holds real clones
 (m5s's internal ~/Code: 229 worktrees of an old primary checkout, 923 GiB,
-after its worktree root moved to /Volumes/Atelier) names it in
+after its worktree root moved to /Volumes/<data-volume>) names it in
 `extra_worktree_roots`. There only linked worktrees are eligible, under every
 gate above; a plain clone is always kept (`clone_in_shared_root`), because in
 a developer's Code directory a clone is someone's checkout, not scratch.

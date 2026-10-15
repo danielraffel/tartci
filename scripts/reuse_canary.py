@@ -13,8 +13,8 @@ Opt-in per host, OFF unless the installed fleet profile says:
 
     [reuse_canary]
     enabled = true
-    repo = "/Volumes/Workshop/Code/pulp"                       # a Pulp checkout
-    worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"  # PULP_WORKTREES_ROOT
+    repo = "/Volumes/<data-volume>/Code/pulp"                       # a Pulp checkout
+    worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"  # PULP_WORKTREES_ROOT
 
 The LaunchAgent (com.danielraffel.tartci.reuse-canary, every 6 h, from
 launchd/com.danielraffel.tartci.reuse-canary.plist.template) runs tartci

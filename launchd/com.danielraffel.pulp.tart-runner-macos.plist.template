@@ -5,10 +5,10 @@
   pool-serving sibling of `tartci up macos`.
 
   IMPORTANT: the Mac Studio proof on 2026-06-09 showed that launchd cannot
-  execute the Pulp runner from /Volumes/Workshop/Code/pulp:
+  execute the Pulp runner from /Volumes/<data-volume>/Code/pulp:
 
     shell-init: getcwd: Operation not permitted
-    /bin/bash: /Volumes/Workshop/Code/pulp/tools/ci/tart-runner.sh: Operation not permitted
+    /bin/bash: /Volumes/<data-volume>/Code/pulp/tools/ci/tart-runner.sh: Operation not permitted
 
   Keep this plist anchored under $HOME:
   - ProgramArguments points at $HOME/.local/bin/tartci, not a /Volumes checkout.

@@ -79,7 +79,7 @@ Proof status, 2026-06-13:
   `tart-linux`, `tart-macos`, and `qemu-windows` rows plus a failed
   idle-timeout row.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
-(canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
+(canonical at `/Volumes/<data-volume>/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
 agent-facing `shipyard metrics watch/advise/compare` contract. **This plan is the
 tartci side of that boundary:** the optional VM-lane emitter of host-local

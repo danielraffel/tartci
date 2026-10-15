@@ -42,8 +42,8 @@ GUI to toggle them.
 
 The macOS lane must not point launchd at a `/Volumes` checkout or VM store. On
 2026-06-09 the Studio proof showed the existing Pulp plist crash-looping with
-exit 126 because launchd could not `getcwd` under `/Volumes/Workshop/Code/pulp`
-or read `/Volumes/Workshop/Code/pulp/tools/ci/tart-runner.sh`. The green proof
+exit 126 because launchd could not `getcwd` under `/Volumes/<data-volume>/Code/pulp`
+or read `/Volumes/<data-volume>/Code/pulp/tools/ci/tart-runner.sh`. The green proof
 used `WorkingDirectory=$HOME`, a wrapper under `$HOME/.local/bin`, and
 `TART_HOME=$HOME/VMs`; launchd booted a macOS clone and exited 0.
 
@@ -63,8 +63,8 @@ capacity and supervisor health will be read from different Tart homes.
 ### External-volume responsible process (Daniel's M3 and m5studio profiles)
 
 `profiles/m3-macos-fleet.toml` deliberately keeps its 4 TiB Tart store at
-`/Volumes/Workshop/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
-store at `/Volumes/Atelier/VMs`. The volume name is the profile's, not the
+`/Volumes/<data-volume>/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
+store at `/Volumes/<data-volume>/VMs`. The volume name is the profile's, not the
 code's: the build seals the profile's own `tart_home` into the bundle
 (`bundle.json`), the launcher probes and enforces that store, and each host has
 its own approval digest (`~/.config/tartci/<host>-launcher-approved.sha256`).
@@ -418,7 +418,7 @@ reports busy or returns unknown state, stop; do not replace the registration.
 ## Disk write-latency watchdog
 
 `com.danielraffel.tartci.disk-watchdog.plist.template` runs `tartci disk watch`
-every 60 s. On m5studio on 2026-10-12 every create on `/Volumes/Atelier`
+every 60 s. On m5studio on 2026-10-12 every create on `/Volumes/<data-volume>`
 stalled about 6 s for hours while reads stayed instant, and the kernel log
 had rotated before anyone looked (outage O10). Each pass:
 
@@ -689,8 +689,8 @@ It is enabled per host by the fleet profile:
 ```toml
 [reuse_canary]
 enabled = true
-repo = "/Volumes/Workshop/Code/pulp"
-worktrees_root = "/Volumes/Workshop/Code/agent-worktrees"
+repo = "/Volumes/<data-volume>/Code/pulp"
+worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
 ```
 
 Only the m3 and m1 profiles enable it, and declare `reuse-canary` in their
@@ -933,8 +933,8 @@ the same figure is what was freed.
 
 Scan roots are discovered rather than declared: the janitor keeps whichever of
 `~/Code` and the installed fleet profile's `[reclaim]` code root (the parent
-of `repo` / `worktrees_root`, e.g. `/Volumes/Workshop/Code` on m3,
-`/Volumes/Atelier/Code` on m5studio) the host actually has, and measures free
+of `repo` / `worktrees_root`, e.g. `/Volumes/<data-volume>/Code` on m3,
+`/Volumes/<data-volume>/Code` on m5studio) the host actually has, and measures free
 space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
 floor is judged against the tightest of those volumes, so a healthy disk cannot
 certify a full one. Pressure is scoped per volume instead: only candidates on a

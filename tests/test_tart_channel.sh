@@ -134,8 +134,16 @@ if [ -z "$canary_line" ] || [ -z "$pool_on_line" ] || \
   echo "pool participation resumes before the Tart VM canary" >&2
   exit 1
 fi
-if grep -R -qE 'finishes in-flight jobs|drains gracefully' \
-  "$repo_root/README.md" "$repo_root/docs/runbook.md" \
+# Every doc is scanned, not a fixed list: the operator detail moves between
+# README.md, docs/reference.md and docs/agents/ as the docs are reorganised.
+drain_claim='finishes in-flight jobs|drains gracefully'
+printf 'pool off drains gracefully\n' >"$tmp/drain-claim.md"
+if ! grep -R -qE "$drain_claim" "$tmp/drain-claim.md"; then
+  echo "drain-claim grep cannot see its own phrase" >&2
+  exit 1
+fi
+if grep -R -qE "$drain_claim" \
+  "$repo_root/README.md" "$repo_root/docs" \
   "$repo_root/providers/common/pool.lib.sh" "$repo_root/tartci"; then
   echo "pool off still claims to drain in-flight work" >&2
   exit 1

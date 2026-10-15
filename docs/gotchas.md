@@ -207,7 +207,7 @@ first; list it only when what it asserts really needs tomllib.
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
-  M3 runner LaunchAgents fail or leave `/Volumes/Workshop/VMs` idle.**
+  M3 runner LaunchAgents fail or leave `/Volumes/<data-volume>/VMs` idle.**
   → *Cause:* launchd started `/bin/bash` directly. macOS attributed external-
   volume access to mutable/shared interpreter identities rather than to TartCI;
   static runner labels and free VM slots could then look healthy while the
@@ -304,7 +304,7 @@ first; list it only when what it asserts really needs tomllib.
 
 - **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
   them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
-  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/Workshop/VMs`); a
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/<data-volume>/VMs`); a
   shell over ssh has none, so `tart` reads its default `~/.tart`. Before
   2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
   doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0

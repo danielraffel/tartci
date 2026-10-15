@@ -90,7 +90,7 @@ import hashlib, json, plistlib, re, stat, sys, tomllib
 from pathlib import Path
 source, profile, manifest, output, metadata, launch = map(Path, sys.argv[1:7]); sys_python = sys.argv[7]; lanes = {}
 # The sealed store is the profile's own external-volume Tart home (m3:
-# /Volumes/Workshop/VMs, m5studio: /Volumes/Atelier/VMs); every lane must use it.
+# /Volumes/<data-volume>/VMs, m5studio: /Volumes/<data-volume>/VMs); every lane must use it.
 tart_home = tomllib.loads(profile.read_text())["host"]["tart_home"]
 store_parts = tart_home.split("/")[1:]
 if not tart_home.startswith("/Volumes/") or len(store_parts) < 3 or any(p in ("", ".", "..") for p in store_parts):

@@ -28,10 +28,10 @@ them first** and let their outcomes finalize Phases 2 and 5. After each phase, a
 under it (see the Progress checklist at the end) and commit.
 
 **Repos on this host (verify paths before use):**
-- `tartci` — `/Users/danielraffel/Code/tartci` (abstraction target; you'll add the macOS provider here).
-- `pulp` — `/Volumes/Workshop/Code/pulp` (the launchd plist references this path; first consumer).
+- `tartci` — `/Users/<you>/Code/tartci` (abstraction target; you'll add the macOS provider here).
+- `pulp` — `/Volumes/<data-volume>/Code/pulp` (the launchd plist references this path; first consumer).
 - `shipyard` — clone if not present (scheduler / `capacity.rs` / `reroute.rs`).
-- Goldens live in `TART_HOME=/Volumes/Workshop/VMs` (export it before any `tart` command).
+- Goldens live in `TART_HOME=/Volumes/<data-volume>/VMs` (export it before any `tart` command).
 
 **Branch / commit / PR rules (obey each repo's CLAUDE.md):**
 - **pulp & shipyard: NEVER push to `main`.** Branch → PR → CI → merge. In shipyard use `shipyard pr` /
@@ -71,14 +71,14 @@ makes wedge handling far simpler than today's bare-metal worker-killing.
 ## Verified current state (live inspection of `macstudio` + the three repos, 2026-06-09)
 
 1. **pulp macOS CI runs bare-metal.** 3 persistent runners (`pulp-studio-01/02/03`) build directly on
-   the host into reused warm dirs `/Volumes/Workshop/ci/pulp/work/pulp-studio-0N/pulp/pulp/build-*`.
+   the host into reused warm dirs `/Volumes/<data-volume>/ci/pulp/work/pulp-studio-0N/pulp/pulp/build-*`.
    Confirmed by live `ninja`/`cmake` with host paths. (Also on this Mac: a `Shipyard-studio-01` runner,
    a `v8builder-01` runner, and interactive agent/dev work — the host is shared.)
-2. **The VM lane is fully built but dead.** Goldens in `TART_HOME=/Volumes/Workshop/VMs`:
+2. **The VM lane is fully built but dead.** Goldens in `TART_HOME=/Volumes/<data-volume>/VMs`:
    `pulp-build-runner:latest`, layered `macos-build-base → pulp-build-base → pulp-build-runner`, plus
    `pulp-linux-build`, `windows-build-wip`, persistent `pulp-vm`. Supervisor
    `com.danielraffel.pulp.tart-runner.plist` exits **126** (`/bin/bash: …/tart-runner.sh: Operation not
-   permitted`) — a LaunchAgent can't exec a script on the `/Volumes/Workshop` secondary volume (macOS
+   permitted`) — a LaunchAgent can't exec a script on the `/Volumes/<data-volume>` secondary volume (macOS
    TCC). Bare-metal runners dodge it because everything is under `~/actions-runner-*`.
 3. **tartci is the abstraction, mostly done.** First-class `providers/tart-linux/`,
    `providers/qemu-windows/`; schema-v2 manifests; a `tartci` dispatcher (`up`/`serve`/`doctor`/`bench`
@@ -230,13 +230,13 @@ A named goal: make repeat builds nearly as fast as the warm bare-metal dirs, **w
 ## Open decisions to resolve *empirically first*
 
 1. **Launchd fix [CODEX — top risk].** Exit-126 is an *exec* denial; relocating the executable to
-   `$HOME` may clear it but `tart` still must reach `/Volumes/Workshop/VMs` at *runtime*. Docs warn
+   `$HOME` may clear it but `tart` still must reach `/Volumes/<data-volume>/VMs` at *runtime*. Docs warn
    `/Volumes` under launchd needs Full Disk Access; bare-metal works because *everything* is under
    `$HOME`/`/Users/Shared`. **Experiment (~10 min):** move `TART_HOME` to `$HOME/VMs`, point a minimal
    LaunchAgent at a `$HOME` wrapper, `launchctl start`, see if a VM boots. Decides: relocate data +
    executable (cheap) vs. signed FDA helper (expensive). Not fixed until a VM boots **from launchd**.
    **Status 2026-06-09:** resolved in favor of relocation. The production plist's log shows the real
-   exit-126 cause: `getcwd` on `/Volumes/Workshop/Code/pulp` and `/bin/bash` reading the script under
+   exit-126 cause: `getcwd` on `/Volumes/<data-volume>/Code/pulp` and `/bin/bash` reading the script under
    `/Volumes` both fail with `Operation not permitted`. A proof LaunchAgent with `WorkingDirectory=$HOME`,
    executable under `$HOME/.local/bin`, and `TART_HOME=$HOME/VMs` booted a macOS clone from launchd and
    logged `BOOT_OK vm=launchd-home-proof-20260609-01 ip=192.168.64.37`; launchd reported last exit `0`.
@@ -263,7 +263,7 @@ A named goal: make repeat builds nearly as fast as the warm bare-metal dirs, **w
 ## Phased plan
 
 Each phase: goal → key changes → validation gate. Representative commands assume `export
-TART_HOME=/Volumes/Workshop/VMs` and the pulp checkout at `/Volumes/Workshop/Code/pulp`. **Confirm
+TART_HOME=/Volumes/<data-volume>/VMs` and the pulp checkout at `/Volumes/<data-volume>/Code/pulp`. **Confirm
 script flags via `--help` before running.**
 
 ### Phase 0 — Safety freeze & inventory
@@ -271,7 +271,7 @@ Keep bare-metal `pulp-build` online; change no labels. Inventory goldens + **liv
 `tart list --format json`. **Gate:** ≥1 free macOS slot on Studio; required `pulp-build` still on bare metal.
 
 **Status 2026-06-09:** complete. Started from `feat/macos-vm-lane-revival` in tartci with no label changes.
-Initial `TART_HOME=/Volumes/Workshop/VMs tart list --format json` had no running VMs. Final safety check
+Initial `TART_HOME=/Volumes/<data-volume>/VMs tart list --format json` had no running VMs. Final safety check
 showed four online, idle required bare-metal runners carrying `pulp-build`: `pulp-m5-01`,
 `pulp-studio-01`, `pulp-studio-02`, and `pulp-studio-03`.
 
@@ -280,13 +280,13 @@ Local on macstudio, independent of launchd/GitHub: clone `pulp-build-runner:late
 build → discard, e.g. `tools/ci/tart-run-job.sh --golden pulp-build-runner:latest --src "$PWD" --vm
 macos-proof-01 --build-type Release --ctest-args "--output-on-failure -N"` (confirm flags first).
 **[CODEX] Also prove the JIT path** (`tart-runner.sh` / a `--once` mode). Verify exit 0; `tart list`
-shows no clone; build ran *inside* the VM (not under `/Volumes/Workshop/ci/pulp/work/pulp-studio-*`);
+shows no clone; build ran *inside* the VM (not under `/Volumes/<data-volume>/ci/pulp/work/pulp-studio-*`);
 ccache shows activity. **Gate:** an interactive throwaway-VM build succeeds and leaves no clone behind.
 
 **Status 2026-06-09:** interactive primitive is green; JIT infrastructure is green, but the Pulp payload
 was red. `tart-run-job.sh --golden pulp-build-runner:latest --vm macos-proof-20260609-01 --build-type
 Release --ctest-args "--output-on-failure -N"` built inside the guest (`/Users/admin/build`, not
-`/Volumes/Workshop/ci/pulp/work/pulp-studio-*`), listed `Total Tests: 10005`, reported ccache activity
+`/Volumes/<data-volume>/ci/pulp/work/pulp-studio-*`), listed `Total Tests: 10005`, reported ccache activity
 (`1686` cacheable calls, `674` hits), exited `0`, and deleted the clone. The one-shot JIT runner
 `macos-jit-proof-20260609-01` registered with `self-hosted,macOS,ARM64,pulp-build-vm`, claimed scratch
 workflow run `27230185763`, ran the macOS job inside `/Users/admin/actions-runner/_work/pulp/pulp/build-macos`,
@@ -321,7 +321,7 @@ its registration reclaimed, no clone remains, the LaunchAgent keeps serving**; `
 
 **Status 2026-06-09:** tartci macOS provider/Tier-1 CLI gate green; production LaunchAgent pilot is still
 Phase 4. Added `providers/tart-macos/{run,runner,provision}.sh`, `manifests/pulp.macos.toml`, and wired
-`tartci prepare/up/serve macos`. `tartci up macos --src /Volumes/Workshop/Code/pulp --golden
+`tartci prepare/up/serve macos`. `tartci up macos --src /Volumes/<data-volume>/Code/pulp --golden
 pulp-build-runner:latest --vm tartci-macos-up-proof-20260609-01 --build-type Release --ctest-args
 "--output-on-failure -N"` built in the guest, listed `Total Tests: 10011`, reported warm ccache activity
 (`1491/1687` hits), exited `0`, and deleted the clone. `tartci serve macos --once` assigned scratch run
@@ -365,7 +365,7 @@ below, then the direct retarget scratch branch produced the required `pulp-build
 **Host-side Phase-4 note 2026-06-09:** installed tartci under `$HOME/.local/share/tartci` with a
 `$HOME/.local/bin/tartci` shim that executes the copied dispatcher via `/bin/bash`, then rendered and
 bootstrapped `~/Library/LaunchAgents/com.danielraffel.tartci.reap.plist`. `launchctl kickstart` ran the
-janitor with `TART_HOME=/Users/danielraffel/VMs`; `launchctl print` reported `state = not running`,
+janitor with `TART_HOME=/Users/<you>/VMs`; `launchctl print` reported `state = not running`,
 `runs = 2`, `last exit code = 0`, and `run interval = 300 seconds`. The log JSON had `fix=true`,
 `problems=[]`, `fixed=[]`, `capacity.free=2`, and only the protected stopped proof VM
 `macos-build-base:launchd-proof`. Did not start the persistent `pulp-build-vm` serve LaunchAgent yet:
@@ -374,7 +374,7 @@ the home Tart store does not have `pulp-build-runner:latest` installed, and the 
 exit `126`; replacing that label must stay pilot-only and must not advertise required `pulp-build`.
 
 **Serve-loop pilot note 2026-06-09:** copied `pulp-build-runner:latest` into the launchd-accessible
-home Tart store (`TART_HOME=/Users/danielraffel/VMs`; `tart get` reported `OS=darwin`, `State=stopped`,
+home Tart store (`TART_HOME=/Users/<you>/VMs`; `tart get` reported `OS=darwin`, `State=stopped`,
 `Disk=150`, `Size=150.041`). Hardened `providers/tart-macos/runner.sh` so `queued_work` inspects queued
 jobs and only counts jobs whose requested labels are a subset of the configured runner labels; added a
 bounded `TARTCI_GH_TIMEOUT_SECS` around those `gh api` calls and `--print-queue` as a safe preflight.
@@ -394,18 +394,18 @@ open until real `pulp-build-vm` jobs pass x3.
 failure out of `9177`: `4708 - Screenshot render_to_rgba produces non-black pixels (Skia raster)`, with
 the failing assertion at `/Users/admin/actions-runner/_work/pulp/pulp/test/test_screenshot.cpp:132`.
 The Actions runner removed `.credentials` and `.runner`, exited `0`, and the supervisor discarded
-`pulp-vm-01`; `TART_HOME=/Users/danielraffel/VMs tart list` showed only stopped
+`pulp-vm-01`; `TART_HOME=/Users/<you>/VMs tart list` showed only stopped
 `macos-build-base:launchd-proof` and `pulp-build-runner:latest`, and GitHub had no `pulp-vm-01`
 registration. The scratch run was cancelled after the macOS result to stop unrelated hosted jobs, and
 the scratch branch was deleted. This is a valid isolation/lifecycle pilot but **not** a green pilot.
 
 **Pilot payload diagnosis 2026-06-09:** the first real VM pilot used `workflow_dispatch`, and Pulp's
 macOS workflow configures non-PR runs with `-DPULP_ENABLE_GPU=OFF`
-(`/Volumes/Workshop/Code/pulp/.github/workflows/build.yml:799`). The failing test is compiled on every
+(`/Volumes/<data-volume>/Code/pulp/.github/workflows/build.yml:799`). The failing test is compiled on every
 Apple build because its gate is `defined(__APPLE__) || defined(PULP_HAS_SKIA)`
-(`/Volumes/Workshop/Code/pulp/test/test_screenshot.cpp:105`), but the macOS implementation returns an
+(`/Volumes/<data-volume>/Code/pulp/test/test_screenshot.cpp:105`), but the macOS implementation returns an
 empty RGBA buffer whenever `PULP_HAS_SKIA` is not defined
-(`/Volumes/Workshop/Code/pulp/core/view/platform/mac/screenshot_mac.mm:243`). So the current
+(`/Volumes/<data-volume>/Code/pulp/core/view/platform/mac/screenshot_mac.mm:243`). So the current
 `workflow_dispatch` pilot path cannot produce a green macOS payload until Pulp either keeps the needed
 Skia/CPU-raster path enabled for dispatch builds or changes the test/implementation gate for Apple
 no-Skia builds. Do not treat this as a tartci lifecycle failure, and do not edit Pulp from this lane
@@ -785,12 +785,12 @@ Three independent checks that finalize Phases 2/3/5:
 
 Live status and next-agent prompt now live in Pulp planning:
 
-- `/Volumes/Workshop/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-status.md`
-- `/Volumes/Workshop/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-handoff.md`
+- `/Volumes/<data-volume>/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-status.md`
+- `/Volumes/<data-volume>/Code/pulp/planning/2026-06-11-tartci-local-ci-vm-lane-handoff.md`
 
 Implementation branch:
 
-- `/Volumes/Workshop/Code/tartci`
+- `/Volumes/<data-volume>/Code/tartci`
 - branch `feat/macos-vm-lane-revival`
 - commit `9a561ee feat: wire release and windows vm runner lanes`
 

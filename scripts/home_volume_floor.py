@@ -4,7 +4,7 @@
 The lease disk axis judges the volume that holds the Tart store. On a host
 whose store is on another volume, the home (boot) volume is judged by nothing
 at admission, yet it holds every supervisor's temp files, the build trees and
-each tool's state. m5studio, 2026-10-04: the store was on /Volumes/Atelier,
+each tool's state. m5studio, 2026-10-04: the store was on /Volumes/<data-volume>,
 the boot Data volume filled to 99% with coverage build dirs, ENOSPC killed a
 merge-group runner at 19:35Z and every lane supervisor exited 1 (`cannot
 create temp file for here document`), while VM leases kept being granted.
