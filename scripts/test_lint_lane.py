@@ -21,6 +21,8 @@ import subprocess
 import tempfile
 import time
 import unittest
+
+import testing_support
 from pathlib import Path
 from unittest import mock
 
@@ -480,6 +482,7 @@ class FixtureContractTests(unittest.TestCase):
                        "iptables -F", "probe_set root", "PERSIST", "CRED", "ESCAPE", "fork-bomb"):
             self.assertIn(needle, fixture)
 
+    @testing_support.requires_tomllib
     def test_golden_manifest_is_pinned(self) -> None:
         import tomllib
         m = tomllib.loads(MANIFEST.read_text())
