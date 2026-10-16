@@ -87,7 +87,7 @@ declared file:
 | Layer | Where it runs | Command |
 |---|---|---|
 | **Declared** (git) | anywhere | `./tartci fleet-macos advertised-labels --check fleet/advertised-labels.json` |
-| **Installed** (host profile) | on a fleet host, read-only | `tartci fleet-macos verify-supply [--json] [--published FILE\|URL]` |
+| **Installed** (host profile) | on a fleet host, read-only | `tartci fleet-macos verify-supply [--json] [--published FILE]` |
 | **Observed** (GitHub job history) | anywhere with GitHub read | `scripts/supply_observed.py --repo OWNER/REPO [--lookback-hours N] [--json]` |
 
 **Installed:** `verify-supply` computes the registrations of the host's
@@ -98,8 +98,9 @@ publish), `DECLARED_ONLY` (git publishes something the host does not register),
 or `LABELS_DIFFER` (labels, workflows, repo or mode). Exit 0 all match, 1 any
 mismatch, 2 `UNKNOWN` (unreadable profile or published file, or a `host_id`
 the file does not declare); unknown is never reported as a match.
-`--published https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json`
-checks against `main` instead of the local checkout. `tartci doctor fleet`
+By default it reads the selected fleet source's supply (the checkout's copy, or
+a configured private source); `--published FILE` checks another file. URLs are
+refused. `tartci doctor fleet`
 reports the same comparison as its `supply` finding, next to `profile_drift`.
 
 The installed layer also surfaces without anyone asking, report-only:

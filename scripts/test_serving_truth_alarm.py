@@ -645,5 +645,51 @@ class WatchdogTests(unittest.TestCase):
             self.assertIn("host_id is unknown", line)
 
 
+
+class ConfiguredFleetSourceWatchdogTests(unittest.TestCase):
+    def test_an_invalid_configured_source_fails_the_pass_without_another_supply(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        import test_fleet_source  # noqa: PLC0415 - owns what a valid source is
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lane = home / "state" / "macos-fleet" / "pulp-gate"
+            lane.mkdir(parents=True)
+            (lane / "events.jsonl").write_text(
+                json.dumps(row(BASE - 120, "job_assigned", runner="studio-pulp-gate-01")) + "\n")
+            env = {"TARTCI_HOME": str(home), "TARTCI_HOST_ID": "m5",
+                   "TARTCI_CHECKOUT": str(FIX / "gate_job_demand"),
+                   **test_fleet_source.configured_source(home / "source")}
+            (home / "source" / "profiles" / "canary-macos-fleet.toml").write_text("schema = 2\n")
+            with mock.patch.dict("os.environ", env, clear=True), \
+                    mock.patch.object(watchdog, "utcnow", return_value=BASE), \
+                    mock.patch.object(alarm, "fetch_demand",
+                                      side_effect=AssertionError("read a supply")):
+                line = watchdog.serving_truth_pass()
+            self.assertIn("WARN serving-truth check FAILED (ValueError", line)
+            self.assertIn("stale or incomplete", line)
+
+    def test_a_valid_configured_source_is_the_supply_read(self) -> None:
+        import tartci_launchd_watchdog as watchdog  # noqa: PLC0415
+        import test_fleet_source  # noqa: PLC0415
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            lane = home / "state" / "macos-fleet" / "pulp-gate"
+            lane.mkdir(parents=True)
+            (lane / "events.jsonl").write_text(
+                json.dumps(row(BASE - 120, "job_assigned", runner="studio-pulp-gate-01")) + "\n")
+            fixture = json.loads((FIX / "gate_job_demand" / "advertised-labels.json").read_text())
+            env = {"TARTCI_HOME": str(home), "TARTCI_HOST_ID": "m5",
+                   **test_fleet_source.configured_source(
+                       home / "source", {"registrations": fixture["registrations"]})}
+            seen: list = []
+            with mock.patch.dict("os.environ", env, clear=True), \
+                    mock.patch.object(watchdog, "utcnow", return_value=BASE), \
+                    mock.patch.object(alarm, "fetch_demand",
+                                      lambda cli, adv, me, now: (seen.append(adv) or [], [])):
+                watchdog.serving_truth_pass()
+            self.assertEqual(1, len(seen))
+            self.assertEqual(test_fleet_source.PRIVATE_REPOSITORY, seen[0]["generated_from"]["repo"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -66,9 +66,11 @@ tartci_job_claim_fleet_peer_claims(){
   : >"$out_file"
   [ "${TARTCI_JOB_CLAIM_FLEET_PEERS:-0}" = 1 ] || return 0
   [ -n "${TARTCI_RECEIPT_HOST_ID:-}" ] || return 0
+  # Without TARTCI_JOB_CLAIM_SUPPLY, job_claim.py reads the selected fleet
+  # source's supply (fleet_source.selected_published_supply).
   python3 "$TARTCI_ROOT/scripts/job_claim.py" gather-peers --out "$out_file" \
     --self-host "$TARTCI_RECEIPT_HOST_ID" \
-    --supply "${TARTCI_JOB_CLAIM_SUPPLY:-$TARTCI_ROOT/fleet/advertised-labels.json}" \
+    ${TARTCI_JOB_CLAIM_SUPPLY:+--supply "$TARTCI_JOB_CLAIM_SUPPLY"} \
     --read-secs "${TARTCI_JOB_CLAIM_FLEET_READ_SECS:-5}" \
     --ssh "${TARTCI_JOB_CLAIM_SSH:-ssh}" </dev/null >/dev/null 2>&1 || : >"$out_file"
 }

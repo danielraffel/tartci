@@ -25,6 +25,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import tomllib
@@ -652,6 +653,46 @@ class ProviderWiringTests(unittest.TestCase):
 
         self.assertEqual(streak("1"), "0")
         self.assertEqual(streak("0"), "4", "the control: an unserved entry still counts")
+
+
+
+class PeerSupplyTests(unittest.TestCase):
+    """gather-peers reads the selected fleet source's supply."""
+
+    def setUp(self) -> None:
+        sys.path.insert(0, str(ROOT / "scripts"))
+        import job_claim  # noqa: PLC0415
+        import test_fleet_source  # noqa: PLC0415 - owns what a valid source is
+        self.job_claim, self.fixture = job_claim, test_fleet_source
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        names = ("TARTCI_FLEET_SOURCE_ROOT", "TARTCI_FLEET_SOURCE_COMMIT",
+                 "TARTCI_FLEET_SOURCE_REPOSITORY", "TARTCI_ADVERTISED_LABELS")
+        patcher = mock.patch.dict(os.environ)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in names:
+            os.environ.pop(name, None)
+
+    def test_without_a_source_the_checkout_copy_is_read(self) -> None:
+        self.assertEqual(ROOT / "fleet" / "advertised-labels.json",
+                         self.job_claim.peer_supply(None))
+        self.assertEqual(Path("/named.json"), self.job_claim.peer_supply("/named.json"))
+
+    def test_a_configured_source_is_the_default(self) -> None:
+        os.environ.update(self.fixture.configured_source(self.tmp / "source"))
+        self.assertEqual((self.tmp / "source").resolve() / "fleet" / "advertised-labels.json",
+                         self.job_claim.peer_supply(None))
+
+    def test_a_named_supply_other_than_the_source_is_refused(self) -> None:
+        os.environ.update(self.fixture.configured_source(self.tmp / "source"))
+        with self.assertRaisesRegex(ValueError, "is not the configured fleet source"):
+            self.job_claim.peer_supply(str(ROOT / "fleet" / "advertised-labels.json"))
+
+    def test_the_lane_passes_no_supply_unless_one_is_set(self) -> None:
+        text = LIB.read_text()
+        self.assertIn('${TARTCI_JOB_CLAIM_SUPPLY:+--supply "$TARTCI_JOB_CLAIM_SUPPLY"}', text)
+        self.assertNotIn("$TARTCI_ROOT/fleet/advertised-labels.json", text)
 
 
 if __name__ == "__main__":

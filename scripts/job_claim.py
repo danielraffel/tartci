@@ -68,6 +68,7 @@ except ImportError:  # pragma: no cover - macOS and Linux both have it
     fcntl = None  # type: ignore[assignment]
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import fleet_source  # noqa: E402
 import leases  # noqa: E402
 
 CLAIMED = 0
@@ -369,6 +370,25 @@ def declared_max_age() -> int | None:
     return value if type(value) is int and value > 0 else None
 
 
+def peer_supply(named: str | None) -> pathlib.Path:
+    """The published supply to read peers from.
+
+    A configured fleet source is validated and must be the supply named, if
+    one is named; otherwise the named file, else this checkout's copy. Raises
+    ValueError rather than reading another supply, and the caller's claims
+    then fail open.
+    """
+    selected = fleet_source.selected_published_supply()
+    if named and selected is not None and os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip():
+        if pathlib.Path(named).expanduser().resolve() != selected.resolve():
+            raise ValueError(f"--supply {named} is not the configured fleet source's {selected}")
+    if named:
+        return pathlib.Path(named)
+    if selected is not None:
+        return selected
+    return pathlib.Path(__file__).resolve().parents[1] / fleet_source.PUBLISHED_SUPPLY
+
+
 def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     """Read every other published host's claims, in parallel, within a hard budget.
 
@@ -376,7 +396,7 @@ def gather_peers(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     the budget is killed and recorded unread; nothing here can block a boot.
     """
     me = args.self_host
-    targets = peer_targets(pathlib.Path(args.supply), me)
+    targets = peer_targets(peer_supply(args.supply), me)
     procs: dict[str, subprocess.Popen] = {}
     ssh = args.ssh
     for host, target in targets.items():
@@ -485,7 +505,8 @@ def build_parser() -> argparse.ArgumentParser:
     gp = sub.add_parser("gather-peers")
     gp.add_argument("--out", required=True)
     gp.add_argument("--self-host", required=True)
-    gp.add_argument("--supply", required=True)
+    gp.add_argument("--supply", default=None,
+                    help="published supply (default: the selected fleet source's)")
     gp.add_argument("--read-secs", type=float, default=DEFAULT_PEER_READ_SECS)
     gp.add_argument("--ssh", default="ssh")
     return parser

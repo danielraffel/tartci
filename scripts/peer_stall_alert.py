@@ -48,6 +48,7 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import fleet_source
 import host_off
 
 STALL_ALERT_SECS = 6 * 3600
@@ -326,10 +327,13 @@ def published_peers(home: Optional[pathlib.Path] = None,
     (test_system_python_tests_run follows it). A `[peers]` override in
     self-update.toml applies when tomllib can read it."""
     home = home or pathlib.Path.home()
-    configured = os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip()
-    if configured:
+    try:
+        configured = fleet_source.selected_published_supply()
+    except ValueError as exc:
+        raise RuntimeError(f"published supply refused: {exc}") from exc
+    if configured is not None:
         try:
-            value = json.loads(pathlib.Path(configured).read_text())
+            value = json.loads(configured.read_text())
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"published supply unreadable from {configured}: {exc}") from exc
         return _published_peer_rows(value, home)
@@ -382,7 +386,9 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         return {"skipped": True, "peers": last.get("peers") or {}}
     if peers is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
+        if not (checkout / ".git").exists() and not any(
+                os.environ.get(name, "").strip()
+                for name in ("TARTCI_ADVERTISED_LABELS", "TARTCI_FLEET_SOURCE_ROOT")):
             # Not a managed fleet host (a CI runner, a fresh clone): there is
             # no published supply to read peers from, and nothing to say.
             return {"skipped": True, "peers": {}, "reason": "no self-update checkout"}

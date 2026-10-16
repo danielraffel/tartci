@@ -2958,9 +2958,6 @@ def _display_path(path: Path, root: Path | None = None) -> str:
 
 TARTCI_ROOT = Path(__file__).resolve().parents[1]
 PUBLISHED_SUPPLY = fleet_source.resolve(TARTCI_ROOT, allow_environment=False).published_supply
-PUBLISHED_SUPPLY_URL = (
-    "https://raw.githubusercontent.com/danielraffel/tartci/main/fleet/advertised-labels.json"
-)
 FLEET_PROFILE_GLOB = "*-macos-fleet.toml"
 _PERSISTENT_RUNNER_NAME = re.compile(
     r"^actions\.runner\.[A-Za-z0-9_.-]+\.(?P<name>[A-Za-z0-9_.-]+)$")
@@ -3052,15 +3049,16 @@ def render_published(snapshot: dict) -> str:
     return json.dumps(snapshot, indent=2) + "\n"
 
 
-def read_published(source: str | Path, timeout: float = 15.0) -> dict:
-    text: str
-    if isinstance(source, str) and source.startswith(("https://", "http://")):
-        import urllib.request
-        with urllib.request.urlopen(source, timeout=timeout) as response:  # noqa: S310
-            text = response.read().decode("utf-8")
-    else:
-        text = Path(source).read_text()
-    value = json.loads(text)
+def read_published(source: str | Path) -> dict:
+    """A published supply read from a local file.
+
+    URLs are refused: the supply a host checks comes from its selected fleet
+    source (fleet_source), never from a network fetch of the public copy.
+    """
+    if str(source).startswith(("https://", "http://")):
+        raise ValueError("a published supply is read from a file, not a URL; "
+                         "the default is the selected fleet source's")
+    value = json.loads(Path(source).read_text())
     if not isinstance(value, dict) or value.get("schema") != ADVERTISED_LABELS_SCHEMA:
         raise ValueError(f"not a {ADVERTISED_LABELS_SCHEMA} document")
     if not isinstance(value.get("registrations"), list):
@@ -3098,8 +3096,8 @@ def published_commit(source: str | Path) -> str | None:
     """The tartci commit a published supply was generated at, when knowable.
 
     A file inside an installed generation takes that generation's manifest
-    source_commit; a file in a git checkout takes its HEAD; the raw URL asks
-    GitHub for main's head (best effort). The committed file itself carries
+    source_commit; a file in a git checkout takes its HEAD; a configured
+    fleet source takes its pinned commit. The committed file itself carries
     no commit, so this is always read from where the file came from.
     """
     text = str(source)
@@ -3112,18 +3110,7 @@ def published_commit(source: str | Path) -> str | None:
             and Path(text).expanduser().resolve() == configured_supply):
         return configured_commit
     if text.startswith(("https://", "http://")):
-        if text != PUBLISHED_SUPPLY_URL:
-            return None
-        try:
-            import urllib.request
-            request = urllib.request.Request(
-                "https://api.github.com/repos/danielraffel/tartci/commits/main",
-                headers={"Accept": "application/vnd.github.sha"})
-            with urllib.request.urlopen(request, timeout=10) as response:  # noqa: S310
-                value = response.read().decode().strip()
-            return value if _SHA.fullmatch(value) else None
-        except Exception:  # noqa: BLE001 - provenance is best effort
-            return None
+        return None
     root = Path(text).resolve().parent.parent
     manifest = root / support_manifest.MANIFEST_NAME
     if manifest.is_file():
@@ -3668,7 +3655,7 @@ def main(argv: list[str] | None = None) -> int:
         help="read-only: installed profile's registrations vs the published supply")
     supply.add_argument("--installed", type=Path, default=None)
     supply.add_argument("--published", default=None,
-                        help=f"file or URL (default: repo copy; main: {PUBLISHED_SUPPLY_URL})")
+                        help="file (default: the selected fleet source's)")
     supply.add_argument("--receipt", type=Path, default=DEFAULT_INSTALL_RECEIPT,
                         help="installed fleet receipt naming this host's tartci commit")
     supply.add_argument("--json", action="store_true")

@@ -20,6 +20,7 @@ alias, and the read-only address listing.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -618,6 +619,36 @@ class WatchdogTests(Base):
         with mock.patch.object(tna, "alert_pass", return_value={"skipped": False, "hosts": {
                 "m1": {"state": "online", "routes": {}}}}):
             self.assertIsNone(watchdog.tailnet_pass(now=OFFLINE_SINCE))
+
+
+
+class ConfiguredFleetSourceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import test_fleet_source  # noqa: PLC0415 - owns what a valid source is
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.dir = Path(tmp.name)
+        env = test_fleet_source.configured_source(self.dir / "source", {
+            "hosts": [{"host_id": host} for host in HOSTS]})
+        patcher = mock.patch.dict("os.environ", env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("TARTCI_ADVERTISED_LABELS", None)
+
+    @staticmethod
+    def git(argv):
+        raise AssertionError(f"read the public supply: {argv}")
+
+    def test_a_configured_source_is_read_without_git(self) -> None:
+        import vm_boot_alert
+        with mock.patch.object(vm_boot_alert, "_alert_host", return_value=("m5", "m5")):
+            hosts, me = tna.published_hosts(home=self.dir, run=self.git)
+        self.assertEqual((sorted(HOSTS), "m5"), (hosts, me))
+
+    def test_an_invalid_source_refuses_without_falling_back(self) -> None:
+        (self.dir / "source" / "fleet" / "advertised-labels.json").write_text("{}\n")
+        with self.assertRaisesRegex(RuntimeError, "published supply refused"):
+            tna.published_hosts(home=self.dir, run=self.git)
 
 
 if __name__ == "__main__":

@@ -3625,5 +3625,20 @@ class ShippedProfileGitHubTimeoutTests(unittest.TestCase):
             self.assertLessEqual(value, 60, f"{path.name}: above the validated ceiling")
 
 
+
+class PublishedSupplyIsAFileTests(unittest.TestCase):
+    def test_a_url_is_refused_without_a_network_read(self) -> None:
+        url = "https://example.invalid/fleet/advertised-labels.json"
+        with mock.patch("urllib.request.urlopen", side_effect=AssertionError("fetched")):
+            with self.assertRaisesRegex(ValueError, "from a file, not a URL"):
+                fleet.read_published(url)
+            self.assertIsNone(fleet.published_commit(url))
+
+    def test_the_default_is_the_selected_source(self) -> None:
+        self.assertFalse(hasattr(fleet, "PUBLISHED_SUPPLY_URL"))
+        published = fleet.read_published(fleet.PUBLISHED_SUPPLY)
+        self.assertEqual("tartci.advertised-labels/v1", published["schema"])
+
+
 if __name__ == "__main__":
     unittest.main()

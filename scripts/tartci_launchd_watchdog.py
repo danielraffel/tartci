@@ -1718,7 +1718,9 @@ def serving_truth_pass(now: float | None = None) -> str | None:
         if not me:
             return (f"{stamp} launchd-watchdog: WARN serving-truth skipped: this host's host_id is "
                     "unknown (set TARTCI_HOST_ID or install a fleet profile with host.id)")
-        advertised_path = os.environ.get("TARTCI_ADVERTISED_LABELS", "")
+        import fleet_source  # noqa: PLC0415 - sibling module; validates a private source
+        selected = fleet_source.selected_published_supply()
+        advertised_path = str(selected) if selected is not None else ""
         if not advertised_path:
             checkout = os.environ.get("TARTCI_CHECKOUT") or host_off._update_checkout()
             advertised_path = str(Path(checkout) / "fleet/advertised-labels.json") if checkout else ""

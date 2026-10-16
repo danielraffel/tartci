@@ -59,6 +59,7 @@ import subprocess
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import fleet_source
 import gate_job_demand
 import host_off
 import tartci_incident
@@ -689,10 +690,13 @@ def published_hosts(home: Optional[pathlib.Path] = None,
     """(published host ids, this host's id or None) from main's published
     supply in the self-update checkout, as peer_stall_alert reads it."""
     home = home or pathlib.Path.home()
-    configured = os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip()
-    if configured:
+    try:
+        configured = fleet_source.selected_published_supply()
+    except ValueError as exc:
+        raise RuntimeError(f"published supply refused: {exc}") from exc
+    if configured is not None:
         try:
-            value = json.loads(pathlib.Path(configured).read_text())
+            value = json.loads(configured.read_text())
         except (OSError, ValueError) as exc:
             raise RuntimeError(f"published supply unreadable from {configured}: {exc}") from exc
         return _published_host_rows(value, home)
@@ -729,7 +733,9 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
     threshold = setting("TARTCI_TAILNET_OFFLINE_ALERT_SECS", OFFLINE_ALERT_SECS)
     if hosts is None:
         checkout = pathlib.Path.home() / ".local" / "share" / "tartci" / "update-checkout"
-        if not (checkout / ".git").exists() and not os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip():
+        if not (checkout / ".git").exists() and not any(
+                os.environ.get(name, "").strip()
+                for name in ("TARTCI_ADVERTISED_LABELS", "TARTCI_FLEET_SOURCE_ROOT")):
             return {"skipped": True, "reason": "no self-update checkout", "hosts": {}}
         hosts, me = published_hosts()
     directory.mkdir(parents=True, exist_ok=True)

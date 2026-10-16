@@ -276,7 +276,7 @@ def exit_code(result: dict) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--published", default=None,
-                        help="file or URL of the tartci.advertised-labels/v1 supply")
+                        help="file of the tartci.advertised-labels/v1 supply")
     parser.add_argument("--repo", required=True)
     parser.add_argument("--lookback-hours", type=int, default=24)
     parser.add_argument("--max-runs", type=int, default=150)

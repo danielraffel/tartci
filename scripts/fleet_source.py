@@ -17,6 +17,7 @@ from pathlib import Path
 
 
 PROFILE_GLOB = "*-macos-fleet.toml"
+PUBLISHED_SUPPLY = "fleet/advertised-labels.json"
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -80,7 +81,7 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
     root = Path(configured_root).expanduser() if configured_root else default_root
     root = root.resolve()
     profiles_dir = root / "profiles"
-    published_supply = root / "fleet" / "advertised-labels.json"
+    published_supply = root / PUBLISHED_SUPPLY
     if configured_root:
         if not profiles_dir.is_dir():
             raise ValueError(f"configured fleet source has no profiles directory: {profiles_dir}")
@@ -133,3 +134,23 @@ def resolve(default_root: Path, *, allow_environment: bool = True) -> FleetSourc
                 "configured fleet source published supply provenance does not match environment"
             )
     return FleetSource(root, profiles_dir, published_supply, bool(configured_root))
+
+
+def selected_published_supply() -> Path | None:
+    """The published supply this process must read, or None for the caller's default.
+
+    A configured source is validated first and wins; TARTCI_ADVERTISED_LABELS,
+    when also set, must name that same file. Without a configured source the
+    file TARTCI_ADVERTISED_LABELS names is returned as is. Raises ValueError
+    when a configured source is invalid or disagrees with
+    TARTCI_ADVERTISED_LABELS; a caller must then not read any other supply.
+    """
+    named = os.environ.get("TARTCI_ADVERTISED_LABELS", "").strip()
+    if not os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip():
+        return Path(named).expanduser() if named else None
+    supply = resolve(Path("/")).published_supply
+    if named and Path(named).expanduser().resolve() != supply.resolve():
+        raise ValueError(
+            f"TARTCI_ADVERTISED_LABELS names {named}, but the configured fleet source "
+            f"publishes {supply}")
+    return supply
