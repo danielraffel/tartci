@@ -1,6 +1,6 @@
 # Private fleet profile source refresh
 
-Status: implementation complete locally; review pending; external-source rollout intentionally gated
+Status: implementation merged; external-source rollout intentionally gated
 
 ## Goal
 
@@ -71,13 +71,20 @@ source, source-sync, self-update, published-supply, lane, and installer tests
 pass. The exact published head was checked out in an isolated M1 worktree;
 M1 lint and the source, source-sync, and self-update suites passed there.
 
-The branch is published for review at
-`feat/private-profile-source-refresh-20261016`. It has not been merged or
-installed on a fleet host.
+The implementation was merged to `main` in
+https://github.com/danielraffel/tartci/commit/f0cc51c1ec3e2f635669134ff186ea8d9e681d3e
+through https://github.com/danielraffel/tartci/pull/589. It has not been
+installed on a fleet host and no external source is configured.
 
 The private authority still lacks a complete export with the required profile
 set and published supply document. A partial export would omit routing and
 capacity authority, so it is not being created or rolled out.
+
+The remaining work is operational rather than another public-code change:
+produce the authenticated private export, validate it against the merged
+resolver, run the least-capacity-critical canary with a receipt, soak it while
+watching pool readiness, and prove rollback to the checked-in default. Until
+those receipts exist, every host continues to use the public default.
 
 The first Python 3.9 run exposed a compatibility gap: stock Python 3.9 has no
 `tomllib`, so valid configured sources were rejected. Export now performs full
