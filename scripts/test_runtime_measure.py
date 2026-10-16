@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import pathlib
 import subprocess
@@ -133,7 +134,7 @@ class RuntimeMeasureCliTest(unittest.TestCase):
             ).stdout)
             record = payload["records"][0]
             self.assertEqual(record["schema_version"], 2)
-            self.assertEqual(record["correlation_id"], "corr:" + __import__("hashlib").sha256(
+            self.assertEqual(record["correlation_id"], "corr:" + hashlib.sha256(
                 b"github:7/8/2"
             ).hexdigest()[:32])
             self.assertEqual(record["image_generation"], "image-r17")
@@ -192,6 +193,53 @@ class RuntimeMeasureCliTest(unittest.TestCase):
             self.assertEqual(record["cache_generation"], "cache-r3")
             phases = {row["phase"]: row for row in record["phase_rows"]}
             self.assertEqual(phases["total"], {"phase": "total", "duration_ms": 2000, "status": "measured"})
+
+    def test_phase_translation_explicit_correlation_attempt_and_queue_timestamps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            timing = root / "timing.tsv"
+            timing.write_text(
+                "phase\tseconds\ncleanup\t0.1\nlc_clone\t0.2\nlc_boot_ip\t0.3\nlc_ip_ssh\t0.4\nlc_prep\t0.5\nlc_register\t0.6\nlc_teardown\t0.7\ntotal\t9\n",
+                encoding="utf-8",
+            )
+            common = [
+                "--store", str(root / "store"), "complete", "--repo", "owner/repo",
+                "--provider", "tart-macos", "--runner-name", "lane", "--run-id", "7",
+                "--job-id", "8", "--timing-path", str(timing), "--queued-at", "2026-10-16T00:00:00Z",
+                "--started-at", "2026-10-16T00:00:05Z", "--exit-code", "0", "--json",
+            ]
+            first = json.loads(self.run_cli(*common, "--attempt", "1").stdout)["record"]
+            second = json.loads(self.run_cli(*common, "--attempt", "2").stdout)["record"]
+            explicit = json.loads(self.run_cli(*common, "--attempt", "3", "--correlation-id", "corr:explicit").stdout)["record"]
+            self.assertNotEqual(first["correlation_id"], second["correlation_id"])
+            self.assertEqual(explicit["correlation_id"], "corr:explicit")
+            phases = {row["phase"]: row for row in first["phase_rows"]}
+            for phase in ("vm_clone", "vm_boot", "guest_ready", "setup", "dispatch", "teardown"):
+                self.assertEqual(phases[phase]["status"], "measured", phase)
+            self.assertEqual(phases["queue_wait"]["duration_ms"], 5000)
+            self.assertEqual(phases["queue_wait"]["started_at"], "2026-10-16T00:00:00Z")
+            self.assertEqual(phases["queue_wait"]["completed_at"], "2026-10-16T00:00:05Z")
+            self.assertEqual(phases["total"]["duration_ms"], 9000)
+            self.assertEqual(phases["cleanup"]["status"], "measured")
+
+    def test_golden_name_without_content_hash_is_unavailable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            record = json.loads(self.run_cli(
+                "--store", str(pathlib.Path(tmp) / "store"), "complete", "--repo", "owner/repo",
+                "--provider", "tart-macos", "--golden", "some-vm-name", "--exit-code", "0", "--json",
+            ).stdout)["record"]
+            self.assertEqual(record["image_generation"], "unavailable")
+
+    def test_metrics_backfill_same_timestamp_uses_line_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp)
+            metrics = root / "metrics.jsonl"
+            source = {"provider": "tart-linux", "ts": "2026-10-16T00:00:00Z", "build_s": 1}
+            metrics.write_text(json.dumps(source) + "\n" + json.dumps(source) + "\n", encoding="utf-8")
+            self.run_cli("--store", str(root / "store"), "backfill", "--repo", "owner/repo", "--metrics-jsonl", str(metrics))
+            rows = [json.loads(line) for line in (root / "store" / "records" / "owner__repo.jsonl").read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertNotEqual(rows[0]["correlation_id"], rows[1]["correlation_id"])
 
 
 if __name__ == "__main__":

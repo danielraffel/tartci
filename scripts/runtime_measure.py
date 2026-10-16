@@ -50,7 +50,6 @@ PHASE_VOCABULARY = (
     "total",
 )
 TIMING_PHASE_MAP = {
-    "cleanup": "teardown",
     # Providers emit these lifecycle spans when available.  The broad
     # boot_to_ssh span remains provider-specific because it includes clone,
     # boot, and guest readiness on some providers.
@@ -205,22 +204,32 @@ def parse_timing_fields(path: str | None) -> tuple[dict[str, Any], dict[str, int
     return mapped, phases_ms
 
 
-def phase_rows(phases_ms: dict[str, int]) -> list[dict[str, Any]]:
+def phase_rows(
+    phases_ms: dict[str, int],
+    phase_timestamps: dict[str, tuple[str, str]] | None = None,
+) -> list[dict[str, Any]]:
     """Return the immutable, provider-neutral phase surface for one run."""
     mapped: dict[str, int] = {}
     for source, duration in phases_ms.items():
         mapped[TIMING_PHASE_MAP.get(source, source)] = duration
     rows = []
+    phase_timestamps = phase_timestamps or {}
     for phase in PHASE_VOCABULARY:
         if phase in mapped:
-            rows.append({"phase": phase, "duration_ms": mapped[phase], "status": "measured"})
+            row: dict[str, Any] = {"phase": phase, "duration_ms": mapped[phase], "status": "measured"}
+            if phase in phase_timestamps:
+                row["started_at"], row["completed_at"] = phase_timestamps[phase]
+            rows.append(row)
         else:
             rows.append({"phase": phase, "duration_ms": None, "status": "unavailable"})
     # Keep provider-specific measurements (if any) without silently dropping
     # them; canonical rows above are the stable join surface.
     for phase, duration in mapped.items():
         if phase not in PHASE_VOCABULARY:
-            rows.append({"phase": phase, "duration_ms": duration, "status": "measured"})
+            row = {"phase": phase, "duration_ms": duration, "status": "measured"}
+            if phase in phase_timestamps:
+                row["started_at"], row["completed_at"] = phase_timestamps[phase]
+            rows.append(row)
     return rows
 
 
@@ -312,7 +321,10 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
     cache_generation = cache_generation_arg if cache_generation_arg is not None else os.environ.get("TARTCI_CACHE_GENERATION", "")
     golden_identity = stat_golden(args.golden, args.golden_hash)
     if not image_generation:
-        image_generation = golden_identity.get("golden_sha256") or golden_identity.get("golden_name") or "unavailable"
+        # A mutable Tart VM/image name is not a generation identity.  Only a
+        # content digest (or an explicit provider generation variable) is safe
+        # to use for cross-run stratification.
+        image_generation = golden_identity.get("golden_sha256") or "unavailable"
     host = args.host or socket.gethostname()
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -376,7 +388,10 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         phase_durations["queue_wait"] = record["queue_ms"]
     if record.get("total_ms") is not None and "total" not in phase_durations:
         phase_durations["total"] = record["total_ms"]
-    record["phase_rows"] = phase_rows(phase_durations)
+    phase_timestamps: dict[str, tuple[str, str]] = {}
+    if record.get("queued_at") and record.get("started_at"):
+        phase_timestamps["queue_wait"] = (record["queued_at"], record["started_at"])
+    record["phase_rows"] = phase_rows(phase_durations, phase_timestamps)
     return {k: v for k, v in record.items() if v is not None}
 
 
