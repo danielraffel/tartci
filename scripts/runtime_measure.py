@@ -22,7 +22,46 @@ from typing import Any
 from timing_lib import collect, parse_timing
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# The vocabulary is deliberately provider-independent.  Providers may emit a
+# smaller timing.tsv today; rows for phases they cannot observe remain present
+# with an explicit unavailable disposition so scorecards never confuse absence
+# with zero time.
+PHASE_VOCABULARY = (
+    "submit",
+    "queue_wait",
+    "lease_wait",
+    "dispatch",
+    "source_transfer",
+    "vm_clone",
+    "vm_boot",
+    "guest_ready",
+    "setup",
+    "cache_restore",
+    "configure",
+    "build",
+    "test",
+    "cache_save",
+    "teardown",
+    "diagnosis",
+    "rerun",
+    "merge_queue_wait",
+    "merged",
+    "total",
+)
+TIMING_PHASE_MAP = {
+    "cleanup": "teardown",
+    # Providers emit these lifecycle spans when available.  The broad
+    # boot_to_ssh span remains provider-specific because it includes clone,
+    # boot, and guest readiness on some providers.
+    "lc_clone": "vm_clone",
+    "lc_boot_ip": "vm_boot",
+    "lc_ip_ssh": "guest_ready",
+    "lc_prep": "setup",
+    "lc_register": "dispatch",
+    "lc_teardown": "teardown",
+    "total": "total",
+}
 FAILURE_CLASSES = {
     "source_failure",
     "runner_timeout",
@@ -166,6 +205,25 @@ def parse_timing_fields(path: str | None) -> tuple[dict[str, Any], dict[str, int
     return mapped, phases_ms
 
 
+def phase_rows(phases_ms: dict[str, int]) -> list[dict[str, Any]]:
+    """Return the immutable, provider-neutral phase surface for one run."""
+    mapped: dict[str, int] = {}
+    for source, duration in phases_ms.items():
+        mapped[TIMING_PHASE_MAP.get(source, source)] = duration
+    rows = []
+    for phase in PHASE_VOCABULARY:
+        if phase in mapped:
+            rows.append({"phase": phase, "duration_ms": mapped[phase], "status": "measured"})
+        else:
+            rows.append({"phase": phase, "duration_ms": None, "status": "unavailable"})
+    # Keep provider-specific measurements (if any) without silently dropping
+    # them; canonical rows above are the stable join surface.
+    for phase, duration in mapped.items():
+        if phase not in PHASE_VOCABULARY:
+            rows.append({"phase": phase, "duration_ms": duration, "status": "measured"})
+    return rows
+
+
 # Match the providers: route enrichment GitHub calls through TARTCI_GH_CLI
 # (default `gh`) so a host that authenticates as a GitHub App keeps this path off
 # the shared personal PAT too. Lower-frequency than the per-poll loop, but it
@@ -211,7 +269,7 @@ def enrich_from_github(repo: str, runner_name: str, workflow: str, timeout: int)
 
 
 def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
-    timing_fields, _ = parse_timing_fields(args.timing_path)
+    timing_fields, phases_ms = parse_timing_fields(getattr(args, "timing_path", ""))
     now = utc_now()
     status = args.status or ("pass" if args.exit_code == 0 else "fail")
     failure_class = args.failure_class or ("unknown" if status == "pass" else "source_failure")
@@ -228,8 +286,33 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         workflow = workflow or enriched.get("workflow", "")
         job = job or enriched.get("job", "")
     attempt = args.attempt or ""
-    external_id = args.external_id or (f"github:{run_id}/{job_id}/{attempt}" if run_id or job_id else "")
     repo = args.repo
+    external_id = args.external_id or (f"github:{run_id}/{job_id}/{attempt}" if run_id or job_id else "")
+    correlation_seed = external_id or "|".join(
+        (
+            repo,
+            run_id,
+            job_id,
+            attempt,
+            args.provider,
+            args.host or "",
+            args.runner_name or "",
+            args.vm_name or "",
+            getattr(args, "timing_path", "") or "",
+            args.log_dir or "",
+            args.completed_at or "",
+        )
+    )
+    correlation_id = getattr(args, "correlation_id", "") or f"corr:{hashlib.sha256(correlation_seed.encode()).hexdigest()[:32]}"
+    image_generation_arg = getattr(args, "image_generation", None)
+    toolchain_generation_arg = getattr(args, "toolchain_generation", None)
+    cache_generation_arg = getattr(args, "cache_generation", None)
+    image_generation = image_generation_arg if image_generation_arg is not None else os.environ.get("TARTCI_IMAGE_GENERATION", "")
+    toolchain_generation = toolchain_generation_arg if toolchain_generation_arg is not None else os.environ.get("TARTCI_TOOLCHAIN_GENERATION", "")
+    cache_generation = cache_generation_arg if cache_generation_arg is not None else os.environ.get("TARTCI_CACHE_GENERATION", "")
+    golden_identity = stat_golden(args.golden, args.golden_hash)
+    if not image_generation:
+        image_generation = golden_identity.get("golden_sha256") or golden_identity.get("golden_name") or "unavailable"
     host = args.host or socket.gethostname()
     record: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -247,6 +330,7 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "vm_name": args.vm_name or args.runner_name or "",
         "labels": split_csv(args.labels),
         "external_id": external_id,
+        "correlation_id": correlation_id,
         "run_id": run_id,
         "job_id": job_id,
         "attempt": attempt,
@@ -264,6 +348,9 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "ccache_hit_pct": args.ccache_hit_pct,
         "cache_restore_ms": args.cache_restore_ms,
         "cache_save_ms": args.cache_save_ms,
+        "image_generation": image_generation or "unavailable",
+        "toolchain_generation": toolchain_generation or "unavailable",
+        "cache_generation": cache_generation or "unavailable",
         "cpu_count": args.cpu_count,
         "ram_mb": args.ram_mb,
         "tags": split_csv(args.tags or os.environ.get("TARTCI_RUNTIME_TAGS", "")),
@@ -271,7 +358,7 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "recorded_at": now,
     }
     record.update(timing_fields)
-    record.update(stat_golden(args.golden, args.golden_hash))
+    record.update(golden_identity)
 
     started = parse_utc(record.get("started_at"))
     completed = parse_utc(record.get("completed_at"))
@@ -280,6 +367,16 @@ def record_from_args(args: argparse.Namespace) -> dict[str, Any]:
         record["total_ms"] = int(round((completed - started).total_seconds() * 1000))
     if queued and started and "queue_ms" not in record:
         record["queue_ms"] = int(round((started - queued).total_seconds() * 1000))
+    phase_durations = dict(phases_ms)
+    for phase, field in (("cache_restore", "cache_restore_ms"), ("cache_save", "cache_save_ms")):
+        value = record.get(field)
+        if value is not None:
+            phase_durations[phase] = value
+    if record.get("queue_ms") is not None:
+        phase_durations["queue_wait"] = record["queue_ms"]
+    if record.get("total_ms") is not None and "total" not in phase_durations:
+        phase_durations["total"] = record["total_ms"]
+    record["phase_rows"] = phase_rows(phase_durations)
     return {k: v for k, v in record.items() if v is not None}
 
 
@@ -441,6 +538,10 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 golden="",
                 golden_hash=False,
                 timing_path=str(timing.path),
+                correlation_id="",
+                image_generation="unavailable",
+                toolchain_generation="unavailable",
+                cache_generation="unavailable",
                 json=True,
                 gh_enrich=False,
                 gh_timeout=15,
@@ -450,7 +551,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             count += 1
     for metrics_file in args.metrics_jsonl:
         with metrics_file.open("r", encoding="utf-8") as fh:
-            for line in fh:
+            for line_number, line in enumerate(fh, 1):
                 line = line.strip()
                 if not line:
                     continue
@@ -476,10 +577,20 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                     "completed_at": source.get("ts", ""),
                     "recorded_at": utc_now(),
                     "tags": split_csv(args.tags),
+                    "correlation_id": "corr:" + hashlib.sha256(
+                        f"{args.repo}|{metrics_file}|{line_number}|{source.get('ts', '')}".encode()
+                    ).hexdigest()[:32],
+                    "image_generation": "unavailable",
+                    "toolchain_generation": "unavailable",
+                    "cache_generation": "unavailable",
                 }
+                metric_phases: dict[str, int] = {}
                 for source_key, target_key in (("build_s", "run_ms"), ("ctest_s", "test_ms"), ("configure_s", "setup_ms")):
                     if source.get(source_key) is not None:
-                        record[target_key] = int(round(float(source[source_key]) * 1000))
+                        value = int(round(float(source[source_key]) * 1000))
+                        record[target_key] = value
+                        metric_phases[{"run_ms": "build", "test_ms": "test", "setup_ms": "configure"}[target_key]] = value
+                record["phase_rows"] = phase_rows(metric_phases)
                 append_jsonl_locked(records_path(args.store, args.repo), record)
                 count += 1
     print(json.dumps({"backfilled": count}, sort_keys=True))
@@ -545,6 +656,7 @@ def add_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--job-id", default="")
     parser.add_argument("--attempt", default="")
     parser.add_argument("--external-id", default="")
+    parser.add_argument("--correlation-id", default="")
     parser.add_argument("--queued-at", default="")
     parser.add_argument("--started-at", default="")
     parser.add_argument("--completed-at", default="")
@@ -559,6 +671,9 @@ def add_record_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--ccache-hit-pct", type=float)
     parser.add_argument("--cache-restore-ms", type=int)
     parser.add_argument("--cache-save-ms", type=int)
+    parser.add_argument("--image-generation", default=None)
+    parser.add_argument("--toolchain-generation", default=None)
+    parser.add_argument("--cache-generation", default=None)
     parser.add_argument("--cpu-count", type=int)
     parser.add_argument("--ram-mb", type=int)
     parser.add_argument("--golden", default="")
