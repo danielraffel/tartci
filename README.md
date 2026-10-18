@@ -76,6 +76,14 @@ git clone https://github.com/danielraffel/tartci.git && cd tartci
 ./tartci host-profile    # the CPU and memory budget tartci derived for this Mac
 ```
 
+To create a profile, follow the [profile-authoring guide](docs/profile-authoring.md)
+and its clean inline example. The public
+[`normal-local-fast.toml`](profiles/normal-local-fast.toml) profile is a fuller
+operator reference. A private fleet source can replace the checked-in
+`*-macos-fleet.toml` profiles and advertised labels used by fleet tooling;
+TartCI validates its commit and digests when installing, starting with the
+canary host.
+
 To serve one GitHub Actions job from a fresh macOS VM, you need a macOS
 golden image on this host and a `gh` login that may register self-hosted
 runners on your repository. Point tartci at the repository, the golden and the

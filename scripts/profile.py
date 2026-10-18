@@ -217,6 +217,17 @@ def _iter_lane_target_refs(node: Any) -> Any:
                 yield from _iter_lane_target_refs(value)
 
 
+def _target_reference_errors(profile: dict[str, Any]) -> list[str]:
+    """Return errors for lane target IDs absent from the target catalog."""
+    targets = profile.get("targets") or {}
+    name = profile.get("name", "<unnamed>")
+    errors = []
+    for target_id in _iter_lane_target_refs(profile):
+        if not isinstance(target_id, str) or target_id not in targets:
+            errors.append(f"{name}: lane references undefined target {target_id!r}")
+    return sorted(set(errors))
+
+
 def cmd_validate(args: argparse.Namespace) -> int:
     names = [args.name] if getattr(args, "name", None) else [p.stem for p in profile_files()]
     errors: list[str] = []
@@ -235,6 +246,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
                     f"{name}: target {target_id!r} has unknown provider {provider!r} "
                     f"(expected one of {sorted(VALID_TARGET_PROVIDERS)})"
                 )
+        errors.extend(_target_reference_errors(profile))
     if errors:
         for err in sorted(set(errors)):
             print(f"profile-validate: {err}", file=sys.stderr)
@@ -252,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_show = sub.add_parser("show")
     p_show.add_argument("name")
     p_show.set_defaults(func=cmd_show)
-    p_validate = sub.add_parser("validate", help="check target providers + lane selectability")
+    p_validate = sub.add_parser("validate", help="check target providers and lane target references")
     p_validate.add_argument("name", nargs="?", help="profile name (default: all)")
     p_validate.set_defaults(func=cmd_validate)
     for name, func in (("explain", cmd_explain), ("plan", cmd_plan)):

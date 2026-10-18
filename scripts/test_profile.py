@@ -6,8 +6,11 @@ from __future__ import annotations
 import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
 import argparse
+import contextlib
+import io
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -32,6 +35,29 @@ class ProviderVocabularyTests(unittest.TestCase):
 
 
 class ValidateCommandTests(unittest.TestCase):
+    def test_undefined_lane_target_is_rejected(self) -> None:
+        profile = {
+            "name": "example",
+            "targets": {"present": {"provider": "tartci"}},
+            "repo": {"example/project": {"pr": {"macos": {"targets": ["present", "missing"]}}}},
+        }
+        self.assertEqual(
+            P._target_reference_errors(profile),
+            ["example: lane references undefined target 'missing'"],
+        )
+
+    def test_validate_returns_failure_for_undefined_lane_target(self) -> None:
+        profile = {
+            "name": "example",
+            "targets": {"present": {"provider": "tartci"}},
+            "repo": {"example/project": {"pr": {"macos": {"targets": ["missing"]}}}},
+        }
+        with mock.patch.object(P, "load_profile", return_value=(Path("example.toml"), profile)):
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                result = P.cmd_validate(_ns(name="example"))
+        self.assertEqual(result, 1)
+        self.assertIn("undefined target 'missing'", stderr.getvalue())
+
     def test_shipped_profile_validates_clean(self) -> None:
         self.assertEqual(P.cmd_validate(_ns(name="normal-local-fast")), 0)
 
