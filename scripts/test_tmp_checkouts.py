@@ -87,6 +87,17 @@ class Fixture(unittest.TestCase):
 
 
 class GateTests(Fixture):
+    def test_git_timeout_kills_process_group_without_waiting_forever(self) -> None:
+        child = mock.Mock(pid=1234)
+        child.communicate.side_effect = subprocess.TimeoutExpired(["git"], 1)
+        child.wait.side_effect = subprocess.TimeoutExpired(["git"], 0.2)
+        with mock.patch.object(tc.subprocess, "Popen", return_value=child), \
+                mock.patch.object(tc.os, "killpg") as killpg:
+            with self.assertRaises(subprocess.TimeoutExpired):
+                tc._bounded_git(["git", "status"], timeout=1)
+        killpg.assert_called_once_with(1234, tc.signal.SIGKILL)
+        child.wait.assert_called_once_with(timeout=0.2)
+
     def test_a_finished_clone_and_worktree_are_removed(self) -> None:
         clone = self.clone("done-clone")
         wt = self.worktree("done-wt")

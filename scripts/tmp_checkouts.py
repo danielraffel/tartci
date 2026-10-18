@@ -66,6 +66,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import signal
 import shutil
 import subprocess
 import time
@@ -92,6 +93,38 @@ CACHEABLE = frozenset({"dirty", "unpushed", "stash", "has_worktrees", "lineage_a
 CACHE_TTL_S = 24 * 3600
 
 Runner = Callable[..., subprocess.CompletedProcess]
+
+
+def _bounded_git(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+    """Run git without letting timed-out metadata wedge the janitor.
+
+    ``subprocess.run(timeout=...)`` kills the direct child and then waits for
+    its pipes to close. A git helper stuck in filesystem metadata can keep an
+    inherited pipe open after the parent is killed, so that cleanup wait can
+    hang the whole hourly reclaim process. Put git in its own process group,
+    kill the group on timeout, and return without a second unbounded wait.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True,
+                            start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        # Reap when the kernel allows it, but never let cleanup turn the
+        # timeout into a second hang. A process in uninterruptible I/O may
+        # remain until the volume recovers; this pass must still return.
+        try:
+            proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        raise subprocess.TimeoutExpired(argv, timeout,
+                                        output=exc.output or "",
+                                        stderr=exc.stderr or "") from None
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
 
 
 def validate(table: dict[str, Any]) -> list[str]:
@@ -186,8 +219,11 @@ def _git(path: pathlib.Path, *args: str, runner: Runner) -> subprocess.Completed
     # --no-optional-locks: `git status` must not refresh the index, or asking
     # would itself make the checkout look recently used (the idle gate reads
     # the index mtime) and hide it from the next pass for another 48 h.
-    return runner(["git", "--no-optional-locks", "-C", str(path), *args],
-                  capture_output=True, text=True, timeout=GIT_TIMEOUT_S, check=False)
+    argv = ["git", "--no-optional-locks", "-C", str(path), *args]
+    if runner is subprocess.run:
+        return _bounded_git(argv, timeout=GIT_TIMEOUT_S)
+    return runner(argv, capture_output=True, text=True,
+                  timeout=GIT_TIMEOUT_S, check=False)
 
 
 def gitdir_of(checkout: pathlib.Path) -> tuple[str, pathlib.Path | None]:
@@ -285,9 +321,12 @@ def remove(checkout: pathlib.Path, kind: str, gitdir: pathlib.Path,
                       runner=runner)
         if common.returncode != 0 or not common.stdout.strip():
             return "git_error"
-        proc = runner(["git", "--git-dir", common.stdout.strip(), "worktree", "remove",
-                       str(checkout)], capture_output=True, text=True,
-                      timeout=GIT_TIMEOUT_S, check=False)
+        argv = ["git", "--git-dir", common.stdout.strip(), "worktree", "remove",
+                str(checkout)]
+        proc = (_bounded_git(argv, timeout=GIT_TIMEOUT_S)
+                if runner is subprocess.run else
+                runner(argv, capture_output=True, text=True,
+                       timeout=GIT_TIMEOUT_S, check=False))
         if proc.returncode != 0 or checkout.exists():
             return "worktree_remove_refused"
         return None
