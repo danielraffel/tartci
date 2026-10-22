@@ -35,13 +35,13 @@ persistent_runner_labels = []
 # after a day of report data shows no false refusals, and with Daniel's OK.
 home_volume_floor_mode = "report"
 # The pinned mise binary (runbook: Pinned mise). Built from source at mise
-# v2026.10.11 and copied from m1 by digest. m5 had no earlier pin, so the
-# rollback is deleting this table; the 2026.10.8 binary stays installed for the
-# interactive shell. It changes no PATH and no lane.
+# v2026.10.17 and copied by digest. The previous pin (2026.10.11) stays
+# installed beside it as the rollback: restore this table's three values to it.
+# It changes no PATH and no lane.
 [mise]
-version = "2026.10.11"
-path = "/Users/danielraffel/.local/opt/mise-2026.10.11/bin/mise"
-sha256 = "25e38f796fff67fc5f4c44f6963d4b8ed15be82a5d9244f693cc55d40a245ee3"
+version = "2026.10.17"
+path = "/Users/danielraffel/.local/opt/mise-2026.10.17/bin/mise"
+sha256 = "284869e5b5f57211377f026309910bea91ef65b3a71b934295fa8bd712436dfc"
 
 [github_app]
 id = "3878000"
