@@ -243,6 +243,6 @@ guest_heartbeat_stale_seconds = 600
 stale_log_seconds = 4500
 
 [support_agents]
-declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap", "disk-watchdog"]
 # Converge only the VM janitor; every other declared agent stays plan-only.
 bootstrap = ["reap"]
