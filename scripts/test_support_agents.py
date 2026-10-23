@@ -32,6 +32,13 @@ import support_agents as sa  # noqa: E402
 
 FOUR = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop"]
 THREE = FOUR[:3]
+# Owner-approved bootstrap beyond the VM janitor, per profile. Every profile
+# not named here bootstraps `reap` alone; adding one needs the owner's approval.
+APPROVED_BOOTSTRAP = {
+    # 2026-10-22: m5studio only. A hand-installed disk watchdog is not
+    # reconciled, and m5studio ran none for days.
+    "m5studio-macos-fleet.toml": ["reap", "disk-watchdog"],
+}
 
 
 def table(declared: List[str], bootstrap: bool = False, backstop: str = "off") -> str:
@@ -215,7 +222,8 @@ class BootstrapOnly(Case):
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
             data, _ = sa.load_profile(path)
             with self.subTest(profile=path.name):
-                self.assertEqual(data["support_agents"]["bootstrap"], ["reap"])
+                self.assertEqual(data["support_agents"]["bootstrap"],
+                                 APPROVED_BOOTSTRAP.get(path.name, ["reap"]))
                 self.assertEqual(sa.validate(data), [])
 
 
@@ -590,9 +598,11 @@ class Validate(unittest.TestCase):
                 data, why = sa.load_profile(path)
                 self.assertIsNotNone(data, why)
                 # Whole-table bootstrap stays off until approved; the VM
-                # janitor alone is converged everywhere.
-                self.assertEqual(data[sa.TABLE]["bootstrap"], ["reap"],
-                                 "only the VM janitor is bootstrapped")
+                # janitor alone is converged everywhere, plus each
+                # owner-approved per-host addition.
+                self.assertEqual(data[sa.TABLE]["bootstrap"],
+                                 APPROVED_BOOTSTRAP.get(path.name, ["reap"]),
+                                 "only the VM janitor and approved agents are bootstrapped")
                 self.assertTrue(set(THREE) <= set(data[sa.TABLE]["declared"]))
                 canary = (data.get("reuse_canary") or {}).get("enabled") is True
                 self.assertEqual(canary, "reuse-canary" in data[sa.TABLE]["declared"])
