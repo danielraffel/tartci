@@ -116,6 +116,9 @@ DEVICEFS_HELPER = "DeviceFS.appex/Contents/MacOS/DeviceFS"
 # Each probe of a wedged mount can leave one process the kernel never returns;
 # past this many still alive, the pass stops starting new ones.
 DEVICEFS_MAX_STUCK = 3
+# Consecutive passes with no answer that confirm a wedge when no probe has
+# outlived SIGKILL.
+DEVICEFS_CONFIRM_PASSES = 2
 # A status older than this many agent intervals means the agent is not running.
 STALE_S = 600.0
 
@@ -466,32 +469,37 @@ def devicefs_mounts(mount_text: str) -> List[str]:
     """Mount points of type devicefs in `/sbin/mount` output."""
     found = []
     for line in mount_text.splitlines():
-        match = re.match(r"^.*? on (/.*) \(([^,)]+)", line)
-        if match and match.group(2).strip() == "devicefs" and match.group(1) not in found:
+        match = re.match(r"^.* on (/.*) \(devicefs[,)]", line)
+        if match and match.group(1) not in found:
             found.append(match.group(1))
     return found
 
 
 def devicefs_helpers(ps_text: str) -> List[Dict[str, Any]]:
-    """DeviceFS helper processes in `ps -axo pid,stat,command` output."""
+    """DeviceFS helper processes in `ps -axo pid,stat,command` output. Only
+    the executable is matched, so a command that merely names the helper's
+    path (an lsof, a grep) is never taken for it."""
     helpers = []
     for line in ps_text.splitlines()[1:]:
         parts = line.split(None, 2)
-        if len(parts) == 3 and parts[0].isdigit() and DEVICEFS_HELPER in parts[2]:
+        if (len(parts) == 3 and parts[0].isdigit()
+                and parts[2].split(None, 1)[0].endswith(DEVICEFS_HELPER)):
             helpers.append({"pid": int(parts[0]), "stat": parts[1]})
     return helpers
 
 
-def _list_devicefs(directory: pathlib.Path, run: Runner) -> List[str]:
-    """The devicefs mount points. `mount` reads the kernel's mount table
-    without touching any filesystem, so a wedged mount cannot block it."""
+def _list_devicefs(directory: pathlib.Path, run: Runner) -> Optional[List[str]]:
+    """The devicefs mount points, or None when `mount` did not answer. `mount`
+    reads the kernel's mount table without touching any filesystem, so a
+    wedged mount cannot block it; an empty answer from a failed run is not
+    evidence that nothing is mounted."""
     raw = os.environ.get("TARTCI_DEVICEFS_MOUNTS")
     if raw is not None:
         return [part for part in raw.split(os.pathsep) if part]
     out = directory / "devicefs-mount.txt"
-    _, text = run(["/sbin/mount"], 10.0, out)
+    outcome, text = run(["/sbin/mount"], 10.0, out)
     out.unlink(missing_ok=True)
-    return devicefs_mounts(text)
+    return devicefs_mounts(text) if outcome == "ok" else None
 
 
 def _kill(pid: int) -> str:
@@ -507,18 +515,35 @@ def _kill(pid: int) -> str:
 
 
 def _devicefs_remediate(directory: pathlib.Path, mounts: List[str], run: Runner,
-                        helpers: List[Dict[str, Any]]) -> List[str]:
+                        helpers: List[Dict[str, Any]], state: Dict[str, Any]) -> List[str]:
     """Kill the DeviceFS helper by pid, then force-unmount any wedged mount
     it left. Killing the helper is what releases the mount; CoreDevice starts
     a fresh one when it next needs the phone."""
     scratch = directory / "devicefs-remediate.txt"
+    # Only a helper stuck in the kernel (U) is the one behind the wedge; a
+    # healthy helper serving another phone is left alone.
     actions = [f"DeviceFS helper pid {h['pid']} ({h['stat']}): {_kill(int(h['pid']))}"
-               for h in helpers] or ["no DeviceFS helper running"]
-    still = set(_list_devicefs(directory, run))
+               for h in helpers if str(h.get("stat", "")).startswith("U")] \
+        or ["no DeviceFS helper is stuck in the kernel; none killed"]
+    listed = _list_devicefs(directory, run)
+    # When mount did not answer, try the unmount anyway: it only names the
+    # wedged mount, and a mount that is already gone just fails.
+    still = set(mounts if listed is None else listed)
+    pending = state.get("umount_pid")
     for mount in mounts:
-        if mount in still:
-            outcome, _ = run(["/sbin/umount", "-f", mount], 15.0, scratch)
-            actions.append(f"umount -f {mount}: {outcome}")
+        if mount not in still:
+            continue
+        if isinstance(pending, int) and _alive(pending):
+            # An earlier umount is itself stuck in the kernel; another would
+            # only add a second unkillable process.
+            actions.append(f"umount -f {mount}: skipped, pid {pending} from an earlier "
+                           "pass is still stuck")
+            continue
+        outcome, _ = run(["/sbin/umount", "-f", mount], 15.0, scratch)
+        abandoned = re.match(r"abandoned pid (\d+)", outcome)
+        if abandoned:
+            state["umount_pid"] = int(abandoned.group(1))
+        actions.append(f"umount -f {mount}: {outcome}")
     scratch.unlink(missing_ok=True)
     return actions
 
@@ -565,12 +590,19 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
     run = run or bounded
     timeout = _env_float("TARTCI_DISK_PROBE_TIMEOUT_S", PROBE_TIMEOUT_S)
     stuck = [pid for pid in state.get("stuck", []) if isinstance(pid, int) and _probe_alive(pid)]
-    mounts = _list_devicefs(directory, run)
+    listed = _list_devicefs(directory, run)
+    mounts = listed or []
     probes = []
+    if listed is None:
+        probes.append({"path": None, "status": "unprobed", "elapsed_s": 0.0,
+                       "detail": "/sbin/mount did not answer; mounts unknown"})
     for mount in mounts:
         if len(stuck) >= DEVICEFS_MAX_STUCK:
-            probe = {"status": "timeout", "stuck": True, "elapsed_s": 0.0,
-                     "detail": f"{len(stuck)} earlier probes are still stuck; none started"}
+            # Not a reading: the pass cannot tell a healthy remount from a
+            # wedge without probing, so it neither acts nor resolves.
+            probe = {"status": "unprobed", "elapsed_s": 0.0,
+                     "detail": f"{len(stuck)} earlier probes are still stuck in the kernel; "
+                               "none started until a reboot clears them"}
         else:
             try:
                 command = probe_command(mount, "TARTCI_DEVICEFS_PROBE_COMMAND", DEVICEFS_PROBE)
@@ -584,40 +616,55 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
                 if probe.get("status") == "timeout" and probe.get("stuck"):
                     stuck.append(int(probe["pid"]))
         probes.append({"path": mount, **probe})
-    wedged = [p for p in probes if p["status"] == "timeout"]
+    unanswered = [p for p in probes if p["status"] == "timeout"]
+    unprobed = any(p["status"] == "unprobed" for p in probes)
+    if unanswered:
+        state["no_answer_passes"] = int(state.get("no_answer_passes") or 0) + 1
+    elif not unprobed:
+        state["no_answer_passes"] = 0
+    # A wedge is confirmed by a probe the kernel kept past SIGKILL, or by no
+    # answer on consecutive passes; one slow listing is never acted on.
+    wedged = [p for p in unanswered
+              if p.get("stuck") or int(state["no_answer_passes"]) >= DEVICEFS_CONFIRM_PASSES]
     actions: List[str] = []
     remaining: List[str] = []
     helpers: List[Dict[str, Any]] = []
     if wedged:
-        # The helper's state before anything is killed: U is a wedge in the kernel.
+        # The helpers' state before anything is killed: U is stuck in the kernel.
         out = directory / "devicefs-ps.txt"
         _, ps_text = run(["/bin/ps", "-axo", "pid,stat,command"], 10.0, out)
         out.unlink(missing_ok=True)
         helpers = devicefs_helpers(ps_text)
-    if wedged and os.environ.get("TARTCI_DEVICEFS_REMEDIATE", "1") != "0":
-        actions = _devicefs_remediate(directory, [p["path"] for p in wedged], run, helpers)
-        remaining = [m for m in _list_devicefs(directory, run) if m in {p["path"] for p in wedged}]
-    if wedged:
         state["ok_streak"] = 0
         state.setdefault("since", _iso(now))
+    elif unanswered or unprobed:
+        state["ok_streak"] = 0  # not healthy yet, and not a reading to act on
     else:
         state["ok_streak"] = int(state.get("ok_streak") or 0) + 1
     since = state.get("since")
+    evidence_dir = directory / "evidence" / f"devicefs-{str(since or '').replace(':', '')}"
+    first = wedged[0] if wedged else {}
+    if wedged and not state.get("evidence"):
+        # Before anything is killed, while the stuck helper's stack still exists.
+        summary = capture_evidence(evidence_dir, str(first.get("path")), first, run=run)
+        state["evidence"] = str(evidence_dir)
+        state["blocked_pids"] = summary.get("blocked_pids")
+    if wedged and os.environ.get("TARTCI_DEVICEFS_REMEDIATE", "1") != "0":
+        actions = _devicefs_remediate(directory, [p["path"] for p in wedged], run, helpers, state)
+        after = _list_devicefs(directory, run)
+        remaining = [p["path"] for p in wedged
+                     if after is None or p["path"] in after]
     resolved = bool(since) and int(state.get("ok_streak") or 0) >= RECOVER_PASSES
     if host is None or target is None:
         host, target = _alert_host()
-    evidence_dir = directory / "evidence" / f"devicefs-{str(since or '').replace(':', '')}"
-    first = wedged[0] if wedged else {}
 
     def raise_event() -> None:
-        summary = capture_evidence(evidence_dir, str(first.get("path")), first, run=run)
-        state["evidence"] = str(evidence_dir)
         host_off.event(directory, "devicefs_wedged",
                        f"{host}: {first.get('path')} no answer within {first.get('elapsed_s')} s",
                        {"probe": first, "helpers": helpers, "actions": actions,
                         "still_mounted": remaining,
-                        "stuck_probes": stuck, "evidence": str(evidence_dir),
-                        "blocked_pids": summary.get("blocked_pids")}, now)
+                        "stuck_probes": stuck, "evidence": state.get("evidence"),
+                        "blocked_pids": state.get("blocked_pids")}, now)
 
     switched_on = os.environ.get("TARTCI_DISK_WATCH_ISSUE", "1") != "0"
     out = host_off.episode_alert(
@@ -630,7 +677,7 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
     if out.get("closed"):
         host_off.event(directory, "devicefs_recovered", f"{host}: device filesystem healthy",
                        {"since": since}, now)
-        for name in ("since", "evidence"):
+        for name in ("since", "evidence", "blocked_pids", "no_answer_passes"):
             state.pop(name, None)
     state["stuck"] = stuck
     state["last"] = {"at": _iso(now), "mounts": mounts, "wedged": [p["path"] for p in wedged],
@@ -741,8 +788,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             at = (row.get("last") or {}).get("at") if args.action == "status" else result["at"]
             print(f"{at or 'never'} disk-watchdog: {_line(row)}")
         if result.get("devicefs") is not None:
-            print(f"{result.get('at', '')} disk-watchdog: {_devicefs_line(result['devicefs'])}"
-                  .strip())
+            at = (result.get("at") if args.action == "watch"
+                  else (result["devicefs"].get("last") or {}).get("at"))
+            print(f"{at or 'never'} disk-watchdog: {_devicefs_line(result['devicefs'])}")
     return 0
 
 

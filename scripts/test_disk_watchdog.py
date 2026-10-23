@@ -307,13 +307,24 @@ class DeviceFS(unittest.TestCase):
         self.addCleanup(self.helper.wait)
         self.addCleanup(self.helper.kill)
 
+    helper_stat = "Us"
+    mount_outcome = "ok"
+    umount_outcome = "ok"
+
     def run_fake(self, command, timeout, out):
         self.commands.append(list(command))
+        if command[0] == "/usr/bin/log":
+            # Evidence capture must see the stuck helper before it is killed.
+            self.helper_alive_at_capture = self.helper.poll() is None
         text = ""
         if command[0] == "/bin/ps":
-            text = (f"PID STAT COMMAND\n{self.helper.pid} Us /x/{dw.DEVICEFS_HELPER}\n"
-                    f"{os.getpid()} S python3 test_disk_watchdog.py\n")
+            text = (f"PID STAT COMMAND\n{self.helper.pid} {self.helper_stat} "
+                    f"/x/{dw.DEVICEFS_HELPER}\n{os.getpid()} S python3 test_disk_watchdog.py\n")
         out.write_text(text)
+        if command[0] == "/sbin/mount":
+            return self.mount_outcome, text
+        if command[0] == "/sbin/umount":
+            return self.umount_outcome, text
         return "ok", text
 
     def helper_killed(self) -> bool:
@@ -348,12 +359,27 @@ class DeviceFS(unittest.TestCase):
         self.assertIsNone(self.helper.poll())
         self.assertEqual(self.opened, [])
 
-    def test_a_wedged_mount_is_cleared_reported_once_and_closed_on_recovery(self) -> None:
+    def test_one_unanswered_pass_is_not_acted_on(self) -> None:
+        # A probe SIGKILL could still take (not in the kernel) is a slow
+        # answer until the next pass confirms it.
         self.h.state.mkdir(parents=True)
         self.h.mode("hang")
         row = self.watch()
         self.assertEqual(row["probes"][0]["status"], "timeout")
-        # The helper ps reported, and only it, was killed by pid.
+        self.assertFalse(row["probes"][0]["stuck"])
+        self.assertIsNone(self.helper.poll(), "a single slow pass killed the helper")
+        self.assertEqual(self.acted("/sbin/umount"), [])
+        self.assertEqual(self.opened, [])
+        self.assertIsNone(row["episode_since"])
+
+    def test_a_confirmed_wedge_is_cleared_reported_once_and_closed_on_recovery(self) -> None:
+        self.h.state.mkdir(parents=True)
+        self.h.mode("hang")
+        self.watch()
+        row = self.watch()  # the second pass with no answer confirms it
+        # The helper stuck in the kernel, and only it, was killed by pid,
+        # after the evidence was taken.
+        self.assertTrue(self.helper_alive_at_capture)
         self.assertTrue(self.helper_killed())
         self.assertEqual(row["actions"][0], f"DeviceFS helper pid {self.helper.pid} (Us): killed")
         self.assertEqual(self.acted("/sbin/umount"), [["/sbin/umount", "-f", str(self.mount)]])
@@ -376,18 +402,55 @@ class DeviceFS(unittest.TestCase):
         self.assertEqual(self.closed, ["77"])
         self.assertEqual(len(self.opened), 1)
 
+    def test_a_helper_not_stuck_in_the_kernel_is_spared(self) -> None:
+        self.h.state.mkdir(parents=True)
+        self.helper_stat = "Ss"
+        self.h.mode("hang")
+        self.watch()
+        row = self.watch()
+        self.assertIsNone(self.helper.poll(), "a healthy helper was killed")
+        self.assertEqual(row["actions"][0], "no DeviceFS helper is stuck in the kernel; none killed")
+
+    def test_a_stuck_umount_is_not_joined_by_another(self) -> None:
+        self.h.state.mkdir(parents=True)
+        stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(stand_in.wait)
+        self.addCleanup(stand_in.kill)
+        self.umount_outcome = f"abandoned pid {stand_in.pid} after 15 s"
+        self.h.mode("hang")
+        self.watch()
+        self.watch()
+        self.assertEqual(len(self.acted("/sbin/umount")), 1)
+        row = self.watch()
+        self.assertEqual(len(self.acted("/sbin/umount")), 1, "a second umount was started")
+        self.assertIn(f"pid {stand_in.pid} from an earlier pass is still stuck", row["actions"][-1])
+
+    def test_a_failed_mount_listing_is_unknown_not_healthy(self) -> None:
+        self.h.state.mkdir(parents=True)
+        os.environ.pop("TARTCI_DEVICEFS_MOUNTS")
+        self.mount_outcome = "timed out after 10 s"
+        (self.h.state / "devicefs.json").write_text(json.dumps(
+            {"since": "2026-10-22T00:00:00Z", "ok_streak": 2}))
+        row = self.watch()
+        self.assertEqual(row["probes"][0]["status"], "unprobed")
+        state = json.loads((self.h.state / "devicefs.json").read_text())
+        self.assertEqual(state["ok_streak"], 0, "an unanswered mount listing counted as healthy")
+        self.assertEqual(self.closed, [])
+
     def test_report_only_mode_does_not_act(self) -> None:
         self.h.state.mkdir(parents=True)
         os.environ["TARTCI_DEVICEFS_REMEDIATE"] = "0"
         self.h.mode("hang")
+        self.watch()
         row = self.watch()
         self.assertEqual(row["probes"][0]["status"], "timeout")
         self.assertIsNone(self.helper.poll(), "report-only mode killed the helper")
         self.assertEqual(self.acted("/sbin/umount"), [])
         self.assertIn("TARTCI_DEVICEFS_REMEDIATE=0", self.opened[0][1])
 
-    def test_stuck_probes_are_capped(self) -> None:
-        # Probes the kernel never returned are not joined by more past the cap.
+    def test_capped_stuck_probes_take_no_action_and_do_not_resolve(self) -> None:
+        # Past the cap the pass cannot see the mount, so it must neither act
+        # on a healthy remount nor close the episode.
         self.h.state.mkdir(parents=True)
         self.h.mode("fast")
         stuck = []
@@ -397,10 +460,17 @@ class DeviceFS(unittest.TestCase):
             self.addCleanup(proc.wait)
             self.addCleanup(proc.kill)
             stuck.append(proc.pid)
-        (self.h.state / "devicefs.json").write_text(json.dumps({"stuck": stuck}))
-        row = self.watch()
+        (self.h.state / "devicefs.json").write_text(json.dumps(
+            {"stuck": stuck, "since": "2026-10-22T00:00:00Z", "ok_streak": 0}))
+        for _ in range(dw.RECOVER_PASSES + 1):
+            row = self.watch()
         self.assertEqual(self.h.probes(), 0, "a probe started beside the stuck ones")
-        self.assertEqual(row["probes"][0]["status"], "timeout")
+        self.assertEqual(row["probes"][0]["status"], "unprobed")
+        self.assertIsNone(self.helper.poll(), "a capped pass killed the helper")
+        self.assertEqual(self.acted("/sbin/umount"), [])
+        self.assertEqual(self.acted("/bin/ps"), [])
+        self.assertEqual(self.closed, [])
+        self.assertTrue(row["episode_since"])
         self.assertEqual(row["stuck_probes"], stuck)
 
 
@@ -424,6 +494,7 @@ class Pieces(unittest.TestCase):
             "DeviceFS.appex/Contents/MacOS/DeviceFS -BSServiceDomains {}",
             " 8923 Us   /Library/Developer/.../DeviceFS.appex/Contents/MacOS/DeviceFS",
             "  900 S    /usr/bin/rg DeviceFS",
+            "  901 S    /usr/sbin/lsof /Library/Developer/.../DeviceFS.appex/Contents/MacOS/DeviceFS",
         ])
         self.assertEqual(dw.devicefs_helpers(ps), [{"pid": 8824, "stat": "Ss"},
                                                    {"pid": 8923, "stat": "Us"}])

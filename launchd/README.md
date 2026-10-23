@@ -447,13 +447,17 @@ network-paired iPhone at `~/Library/Developer/CoreDevice/DeviceFS` (type
 the kernel for good, so `rg`/`find` over `$HOME`, `lsof` with a path and `du`
 leak unkillable processes (m3 from 2026-10-18; m5studio on 2026-10-22, where it
 read as an external-volume failure). Each pass lists devicefs mounts from the
-kernel mount table and stats each in a bounded child probe. A probe with no
-answer is a wedge: the pass SIGKILLs the DeviceFS helper by the pids `ps`
-reports for it, force-unmounts whatever is still mounted, saves evidence and opens one
+kernel mount table and stats each in a bounded child probe. A wedge is
+confirmed by a probe the kernel keeps past SIGKILL, or by no answer on two
+passes in a row; one slow listing is never acted on. On a confirmed wedge the
+pass saves evidence first, then SIGKILLs only the DeviceFS helpers `ps` shows
+stuck in the kernel (state U), force-unmounts the wedged mount (never starting
+a second `umount -f` while an earlier one is stuck), and opens one
 `devicefs_wedged` episode, closed after three healthy passes. Processes already
-stuck there clear only with a reboot; the issue counts them. At most three
-stuck probes are kept before the pass stops starting new ones.
-`TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
+stuck there clear only with a reboot; the issue counts them. Once three probes
+are stuck the pass stops probing: it takes no action, keeps the episode open
+and says a reboot is needed. A `mount` that does not answer counts as unknown,
+never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
 
 `tartci disk status [--json]` prints each path's last probe stamped with its
 own time, its open episode and its evidence directory, and the device
