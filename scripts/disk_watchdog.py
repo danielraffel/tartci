@@ -42,9 +42,11 @@ devicefs). When its DeviceFS helper wedges, every stat of the mount blocks in
 the kernel for good: on m3 from 2026-10-18 it left about 21 unkillable lsof and
 rg processes and hung the Shipyard sandbox guardian, and on m5studio on
 2026-10-22 an rg over $HOME sat in it for 19 h while it looked like an external
-volume had failed. The pass stats each devicefs mount in a child probe; one
-that gets no answer is wedged. It then kills the helper and force-unmounts
-the mount, which is what cleared both hosts, and reports a `devicefs_wedged`
+volume had failed. The pass stats each devicefs mount in a child probe. A
+wedge is confirmed by a probe the kernel keeps past SIGKILL, or by no answer on
+two passes in a row. The pass then kills the DeviceFS helper that is stuck in
+the kernel (state U, as the wedged helper was on m5studio while a healthy one
+sat in S) and force-unmounts the mount, and reports a `devicefs_wedged`
 episode through the same alert path. Processes blocked on the mount
 (including this watchdog's probes) are released once the stuck helper is
 killed: on m5studio a SIGKILL to the helper's pid freed a 19 h rg with no
@@ -516,26 +518,48 @@ def _kill(pid: int) -> str:
     return "killed"
 
 
+def _umount_alive(pid: int) -> bool:
+    """True while `pid` is still the umount this watchdog started, not a
+    reused pid (state outlives the pass and the host's uptime)."""
+    if not _alive(pid):
+        return False
+    try:
+        out = subprocess.run(["/bin/ps", "-p", str(pid), "-o", "command="],
+                             capture_output=True, text=True, timeout=5, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return True  # cannot tell: never start a second one beside it
+    return out.stdout.strip().startswith("/sbin/umount")
+
+
 def _devicefs_remediate(directory: pathlib.Path, mounts: List[str], run: Runner,
-                        helpers: List[Dict[str, Any]], state: Dict[str, Any]) -> List[str]:
+                        helpers: List[Dict[str, Any]], state: Dict[str, Any],
+                        stuck_probe: bool) -> List[str]:
     """Kill the DeviceFS helper by pid, then force-unmount any wedged mount
     it left. Killing the helper is what releases the mount; CoreDevice starts
     a fresh one when it next needs the phone."""
     scratch = directory / "devicefs-remediate.txt"
     # Only a helper stuck in the kernel (U) is the one behind the wedge; a
     # healthy helper serving another phone is left alone.
-    actions = [f"DeviceFS helper pid {h['pid']} ({h['stat']}): {_kill(int(h['pid']))}"
-               for h in helpers if str(h.get("stat", "")).startswith("U")] \
-        or ["no DeviceFS helper is stuck in the kernel; none killed"]
+    killed = [f"DeviceFS helper pid {h['pid']} ({h['stat']}): {_kill(int(h['pid']))}"
+              for h in helpers if str(h.get("stat", "")).startswith("U")]
+    actions = killed or ["no DeviceFS helper is stuck in the kernel; none killed"]
+    if not killed and not stuck_probe:
+        # Two slow answers with nothing stuck anywhere may be a far-away phone,
+        # not a wedge: leave the mount alone and let the next passes decide.
+        actions.append("umount -f skipped: no helper or probe is stuck in the kernel")
+        return actions
     listed = _list_devicefs(directory, run)
     # When mount did not answer, try the unmount anyway: it only names the
     # wedged mount, and a mount that is already gone just fails.
     still = set(mounts if listed is None else listed)
     pending = state.get("umount_pid")
+    if not (isinstance(pending, int) and _umount_alive(pending)):
+        state.pop("umount_pid", None)
+        pending = None
     for mount in mounts:
         if mount not in still:
             continue
-        if isinstance(pending, int) and _alive(pending):
+        if pending is not None:
             # An earlier umount is itself stuck in the kernel; another would
             # only add a second unkillable process.
             actions.append(f"umount -f {mount}: skipped, pid {pending} from an earlier "
@@ -620,9 +644,10 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
         probes.append({"path": mount, **probe})
     unanswered = [p for p in probes if p["status"] == "timeout"]
     unprobed = any(p["status"] == "unprobed" for p in probes)
-    if unanswered:
+    # Consecutive means consecutive: a pass that could not probe breaks the run.
+    if unanswered and not unprobed:
         state["no_answer_passes"] = int(state.get("no_answer_passes") or 0) + 1
-    elif not unprobed:
+    else:
         state["no_answer_passes"] = 0
     # A wedge is confirmed by a probe the kernel kept past SIGKILL, or by no
     # answer on consecutive passes; one slow listing is never acted on.
@@ -652,10 +677,13 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
         state["evidence"] = str(evidence_dir)
         state["blocked_pids"] = summary.get("blocked_pids")
     if wedged and os.environ.get("TARTCI_DEVICEFS_REMEDIATE", "1") != "0":
-        actions = _devicefs_remediate(directory, [p["path"] for p in wedged], run, helpers, state)
+        actions = _devicefs_remediate(directory, [p["path"] for p in wedged], run, helpers,
+                                      state, any(p.get("stuck") for p in wedged))
         after = _list_devicefs(directory, run)
-        remaining = [p["path"] for p in wedged
-                     if after is None or p["path"] in after]
+        if after is None:
+            actions.append("mount state after the repair unknown: /sbin/mount did not answer")
+        else:
+            remaining = [p["path"] for p in wedged if p["path"] in after]
     resolved = bool(since) and int(state.get("ok_streak") or 0) >= RECOVER_PASSES
     if host is None or target is None:
         host, target = _alert_host()
@@ -679,7 +707,7 @@ def watch_devicefs(directory: pathlib.Path, now: float, *, issue: Any = None,
     if out.get("closed"):
         host_off.event(directory, "devicefs_recovered", f"{host}: device filesystem healthy",
                        {"since": since}, now)
-        for name in ("since", "evidence", "blocked_pids", "no_answer_passes"):
+        for name in ("since", "evidence", "blocked_pids", "no_answer_passes", "umount_pid"):
             state.pop(name, None)
     state["stuck"] = stuck
     state["last"] = {"at": _iso(now), "mounts": mounts, "wedged": [p["path"] for p in wedged],

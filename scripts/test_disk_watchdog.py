@@ -416,6 +416,10 @@ class DeviceFS(unittest.TestCase):
         stand_in = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
         self.addCleanup(stand_in.wait)
         self.addCleanup(stand_in.kill)
+        # The stand-in plays a stuck /sbin/umount; a real one cannot be made.
+        original = dw._umount_alive
+        dw._umount_alive = lambda pid: pid == stand_in.pid and stand_in.poll() is None
+        self.addCleanup(setattr, dw, "_umount_alive", original)
         self.umount_outcome = f"abandoned pid {stand_in.pid} after 15 s"
         self.h.mode("hang")
         self.watch()
@@ -424,6 +428,33 @@ class DeviceFS(unittest.TestCase):
         row = self.watch()
         self.assertEqual(len(self.acted("/sbin/umount")), 1, "a second umount was started")
         self.assertIn(f"pid {stand_in.pid} from an earlier pass is still stuck", row["actions"][-1])
+
+    def test_a_reused_umount_pid_does_not_block_the_unmount(self) -> None:
+        # State outlives the pass: a recorded pid now belonging to some other
+        # process must not stop every later unmount.
+        self.h.state.mkdir(parents=True)
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+        self.addCleanup(other.wait)
+        self.addCleanup(other.kill)
+        (self.h.state / "devicefs.json").write_text(json.dumps({"umount_pid": other.pid}))
+        self.h.mode("hang")
+        self.watch()
+        self.watch()
+        self.assertEqual(self.acted("/sbin/umount"), [["/sbin/umount", "-f", str(self.mount)]])
+        state = json.loads((self.h.state / "devicefs.json").read_text())
+        self.assertNotIn("umount_pid", state)
+
+    def test_slow_passes_with_nothing_stuck_do_not_force_unmount(self) -> None:
+        # Two slow answers, no helper in the kernel, no probe past SIGKILL:
+        # possibly a far-away phone, so the mount is left alone.
+        self.h.state.mkdir(parents=True)
+        self.helper_stat = "Ss"
+        self.h.mode("hang")
+        self.watch()
+        row = self.watch()
+        self.assertEqual(self.acted("/sbin/umount"), [])
+        self.assertIn("umount -f skipped: no helper or probe is stuck in the kernel",
+                      row["actions"])
 
     def test_a_failed_mount_listing_is_unknown_not_healthy(self) -> None:
         self.h.state.mkdir(parents=True)
