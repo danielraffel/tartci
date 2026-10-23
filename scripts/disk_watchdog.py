@@ -45,9 +45,11 @@ rg processes and hung the Shipyard sandbox guardian, and on m5studio on
 volume had failed. The pass stats each devicefs mount in a child probe; one
 that gets no answer is wedged. It then kills the helper and force-unmounts
 the mount, which is what cleared both hosts, and reports a `devicefs_wedged`
-episode through the same alert path. Processes already stuck there stay stuck
-until a reboot; the issue says how many. TARTCI_DEVICEFS_REMEDIATE=0 reports
-without acting.
+episode through the same alert path. Processes blocked on the mount
+(including this watchdog's probes) are released once the stuck helper is
+killed: on m5studio a SIGKILL to the helper's pid freed a 19 h rg with no
+reboot. Any still stuck after that need a reboot; the issue says how many.
+TARTCI_DEVICEFS_REMEDIATE=0 reports without acting.
 
 Python 3.9-safe: the launchd python on fleet hosts is /usr/bin/python3.
 """
@@ -560,9 +562,9 @@ def devicefs_alert_text(host: str, target: str, since: str, probe: Dict[str, Any
         "Done: " + ("; ".join(actions) if actions else
                     "nothing (TARTCI_DEVICEFS_REMEDIATE=0)") + ".",
         ("Still mounted: " + ", ".join(remaining) + ". " if remaining else "")
-        + (f"{stuck} probe(s) are still stuck in the kernel; processes already stuck "
-           "there only clear with a reboot, so restart the host when it is idle."
-           if stuck else ""),
+        + (f"{stuck} probe(s) are still stuck in the kernel after the helper was "
+           "killed; if they do not clear on the next passes, restart the host when "
+           "it is idle." if stuck else ""),
         "Prevent: turn off \"Connect via network\" for the phone in Xcode > Devices on "
         "hosts that do not need it, and keep recursive searches off $HOME "
         "(rg --one-file-system, find -x, du -x).",

@@ -453,8 +453,10 @@ passes in a row; one slow listing is never acted on. On a confirmed wedge the
 pass saves evidence first, then SIGKILLs only the DeviceFS helpers `ps` shows
 stuck in the kernel (state U), force-unmounts the wedged mount (never starting
 a second `umount -f` while an earlier one is stuck), and opens one
-`devicefs_wedged` episode, closed after three healthy passes. Processes already
-stuck there clear only with a reboot; the issue counts them. Once three probes
+`devicefs_wedged` episode, closed after three healthy passes. Processes
+blocked on the mount are released once the stuck helper is killed (a SIGKILL
+to its pid freed a 19 h `rg` on m5studio with no reboot); any still stuck after
+that need a reboot, and the issue counts them. Once three probes
 are stuck the pass stops probing: it takes no action, keeps the episode open
 and says a reboot is needed. A `mount` that does not answer counts as unknown,
 never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
