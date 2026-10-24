@@ -190,10 +190,10 @@ runner_group_id = 1
 [[lane]]
 id = "pulp-release"
 repo = "Generous-Corp/pulp"
-runtime_measure = true
-runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
+runtime_measure = true
+runtime_tags = "pulp"
 golden = "pulp-build-runner:latest"
 min_queued_age_seconds = 0
 supervisors = 1
