@@ -104,6 +104,7 @@ LANE_KEYS = {
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
     "jit_github_cli", "chrome_app_dir", "assignment_mode", "cache_root",
     "ccache_write_isolation",
+    "runtime_measure", "runtime_gh_enrich", "runtime_tags",
     "assignment_omit_labels", "supervisors", "process_type",
     "assignment_scan_timeout_seconds", "assignment_scan_max_workers",
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
@@ -1000,6 +1001,20 @@ def load(path: Path) -> dict:
         ccache_isolation = lane.get("ccache_write_isolation")
         if ccache_isolation is not None and type(ccache_isolation) is not bool:
             fail(f"lane {lane_id}: ccache_write_isolation must be a boolean")
+        runtime_measure = lane.get("runtime_measure")
+        if runtime_measure is not None and type(runtime_measure) is not bool:
+            fail(f"lane {lane_id}: runtime_measure must be a boolean")
+        runtime_gh_enrich = lane.get("runtime_gh_enrich")
+        if runtime_gh_enrich is not None and type(runtime_gh_enrich) is not bool:
+            fail(f"lane {lane_id}: runtime_gh_enrich must be a boolean")
+        if runtime_gh_enrich and runtime_measure is not True:
+            fail(f"lane {lane_id}: runtime_gh_enrich requires runtime_measure = true")
+        runtime_tags = lane.get("runtime_tags")
+        if runtime_tags is not None and (
+                not isinstance(runtime_tags, str)
+                or not runtime_tags.strip()
+                or any(char in runtime_tags for char in "\r\n")):
+            fail(f"lane {lane_id}: runtime_tags must be a non-empty single line")
         omit_labels = lane.get("assignment_omit_labels", [])
         if (not isinstance(omit_labels, list)
                 or not all(isinstance(value, str) and LABEL.fullmatch(value)
@@ -2865,6 +2880,12 @@ def lane_plist(
         "TARTCI_LAUNCHD": "1",
         "TARTCI_RUNNER_MIN_QUEUED_AGE_SECONDS": str(lane.get("min_queued_age_seconds", 0)),
     }
+    if lane.get("runtime_measure"):
+        env["TARTCI_RUNTIME_MEASURE"] = "1"
+        env["TARTCI_RUNTIME_STORE"] = f"{host['home']}/.tartci/runtime"
+        env["TARTCI_RUNTIME_TAGS"] = lane.get("runtime_tags") or host["id"]
+        if lane.get("runtime_gh_enrich"):
+            env["TARTCI_RUNTIME_GH_ENRICH"] = "1"
     configured_source = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
     if source is None and configured_source:
         source = fleet_source.resolve(TARTCI_ROOT)

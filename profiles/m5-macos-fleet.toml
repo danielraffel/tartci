@@ -105,6 +105,8 @@ rank_vm_waiters = true
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
+runtime_measure = true
+runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
@@ -188,6 +190,8 @@ runner_group_id = 1
 [[lane]]
 id = "pulp-release"
 repo = "Generous-Corp/pulp"
+runtime_measure = true
+runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"

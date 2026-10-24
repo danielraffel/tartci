@@ -653,6 +653,13 @@ changing runner behavior. Set `TARTCI_RUNTIME_MEASURE=1` on a serving
 LaunchAgent or one-shot `tartci serve` invocation. When unset, no runtime store
 is created and the runners behave as before.
 
+Fleet profiles can opt a lane in without hand-editing its LaunchAgent by
+setting `runtime_measure = true` in that `[[lane]]`. The renderer binds the
+store to the host's `~/.tartci/runtime` and tags records with the host (or the
+lane's optional `runtime_tags` value). `runtime_gh_enrich = true` is an
+additional opt-in for best-effort GitHub outcome enrichment and requires
+`runtime_measure = true`.
+
 Records live under `TARTCI_RUNTIME_STORE` (default `~/.tartci/runtime`) as
 append-only JSONL plus per-run summaries. They include VM boot/setup/run/cleanup
 durations, runner identity, repo/run/job linkage when available, cache/golden

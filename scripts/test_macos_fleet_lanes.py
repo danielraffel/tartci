@@ -1289,6 +1289,33 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "yield_max_wait_seconds"):
                     fleet.load(path)
 
+    def test_runtime_measurement_is_opt_in_and_uses_host_local_store(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        marker = 'id = "spectr-gate"\n'
+        self.assertEqual(body.count(marker), 1)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                marker, marker + 'runtime_measure = true\nruntime_tags = "pulp"\n'
+            ))
+            data = fleet.load(path)
+            lane = next(row for row in data["lane"] if row["id"] == "spectr-gate")
+            env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+            self.assertEqual(env["TARTCI_RUNTIME_MEASURE"], "1")
+            self.assertEqual(env["TARTCI_RUNTIME_STORE"], "/Users/danielraffel/.tartci/runtime")
+            self.assertEqual(env["TARTCI_RUNTIME_TAGS"], "pulp")
+
+    def test_runtime_enrichment_requires_measurement(self) -> None:
+        body = HOST_CONFIGS["m5"].read_text()
+        marker = 'id = "spectr-gate"\n'
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(body.replace(
+                marker, marker + 'runtime_gh_enrich = true\n'
+            ))
+            with self.assertRaisesRegex(ValueError, "runtime_gh_enrich"):
+                fleet.load(path)
+
     def test_yield_bound_requires_a_yield_target(self) -> None:
         body = HOST_CONFIGS["m5"].read_text()
         marker = 'id = "spectr-gate"\n'

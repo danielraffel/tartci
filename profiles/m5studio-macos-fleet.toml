@@ -111,6 +111,8 @@ gate_ccache_trim = true
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"
+runtime_measure = true
+runtime_tags = "pulp"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
