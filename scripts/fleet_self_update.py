@@ -3345,7 +3345,13 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 raise Refused(tart_held)
             # An operator's --reinstall-current is not a retry of an automatic
             # attempt, so the attempt rate does not hold it back.
-            prior = None if reinstall else recent_attempt(cfg, target, now, selected_source)
+            # A private-source move is a same-generation refresh. Its target
+            # commit is unchanged, so the normal commit rate limiter would
+            # mistake the earlier generation update for a repeated refresh
+            # and strand the new profile source for the full backoff window.
+            source_refresh = bool(refresh and refresh.startswith("fleet source moved to "))
+            prior = (None if reinstall or source_refresh
+                     else recent_attempt(cfg, target, now, selected_source))
             if prior:
                 raise Refused(f"already attempted {target[:12]} within {cfg.rate_hours}h: {prior}")
         layout = planned_layout(cfg)

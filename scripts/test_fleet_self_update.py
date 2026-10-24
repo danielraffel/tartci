@@ -4792,6 +4792,21 @@ class FleetSourceSyncTests(FleetSourceFixture):
         self.cfg.install_receipt.write_text(json.dumps(receipt))
         self.assertIsNone(su.refresh_reason(self.cfg, self.sys))
 
+    def test_a_source_move_ignores_the_previous_generation_rate_limit(self) -> None:
+        # A source-only refresh keeps the TartCI generation unchanged. A recent
+        # attempt of that generation must not strand the new private profiles.
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        (attempts / "recent.json").write_text(json.dumps({
+            "mode": "apply", "target": INSTALLED, "status": "succeeded",
+            "started_at": su._iso(NOW - 60),
+            "fleet_source": {"repository": self.fixture.PRIVATE,
+                             "commit": self.OLDER},
+        }))
+        self.sys.log_lines = ""
+        self.assertEqual(su.EXIT_OK, self.apply(), self.last())
+        self.assertEqual([self.fixture.COMMIT], self.sys.installed_sources)
+
     def test_a_current_host_reinstalls_from_a_moved_source(self) -> None:
         self.sys.log_lines = ""   # current with main
         self.assertEqual(su.EXIT_OK, self.apply(), self.last())
