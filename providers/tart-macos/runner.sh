@@ -2307,6 +2307,7 @@ run_one(){
     [ -z "$precheck_json" ] \
       || printf '%s\n' "$precheck_json" >"$STATE_DIR/$RUNNER_NAME.admission-precheck.json"
     tartci_admission_contention_event "$precheck_json" precheck
+    tartci_admission_reuse_event "$precheck_json" precheck
     if [ "$precheck_rc" -ne 0 ]; then
       local precheck_detail
       precheck_detail="$(tartci_admission_clean_detail "$precheck_json")" \
@@ -2467,6 +2468,7 @@ run_one(){
     [ -z "$admission_json" ] \
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     tartci_admission_contention_event "$admission_json" boundary
+    tartci_admission_reuse_event "$admission_json" boundary
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \

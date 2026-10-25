@@ -89,7 +89,12 @@ tartci_boundary_proof_start(){
         json="$(tartci_admission_clean "$REPO" "$labels")"
         rc=$?
         printf '%s\n' "$json" >"$dir/admission.json"
-        date +%s >"$dir/admission.at"
+        # A reused admit was observed before this call answered; date the
+        # result from that observation, so the boundary's age bound covers
+        # the reuse window as well as the wait.
+        reused_age="$(printf '%s' "$json" \
+          | sed -n 's/.*"tartci_reused_admit_age_secs":\([0-9][0-9]*\).*/\1/p')"
+        printf '%s\n' "$(( $(date +%s) - ${reused_age:-0} ))" >"$dir/admission.at"
         printf '%s\n' "$rc" >"$dir/admission.rc"
       ) &
     fi

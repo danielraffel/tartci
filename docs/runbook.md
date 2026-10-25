@@ -1590,6 +1590,21 @@ about the queue and is returned at once. A verdict that waited carries
 `tartci_contention_waits`, and the provider event renders it as
 `contention_waits=N`.
 
+A `revalidation_failed` error is Shipyard failing to re-read GitHub (on
+2026-10-25 a `gh pr list` 504) after it has already looked once. TartCI cannot
+hand Shipyard an older PR list, but it can reuse Shipyard's own last `admit`
+for the same `(repo, base, labels)`, which was computed from a PR list that
+did read. The adapter records every genuine admit under
+`TARTCI_ADMISSION_CLEAN_STATE_DIR` and, on `revalidation_failed` only, admits
+on that record when Shipyard's `observed_at` for it is no older than
+`TARTCI_ADMISSION_CLEAN_REUSE_SECS` (default 60, range 0..300; 0 disables). Any later `defer` or conclusive error
+deletes the record, a reuse never rewrites it, and a missing, unreadable or
+older record fails closed exactly as before. The failure still counts toward
+the inconclusive breaker. A reused verdict carries `tartci_reused_admit` and
+its age, the provider emits `admission_reused age_secs=N`, and on macOS the
+parallel boundary proof dates it from the original observation, so
+`TARTCI_BOUNDARY_PROOF_MAX_AGE_SECS` bounds the reuse as well.
+
 On macOS the boundary's two network proofs, the admission verdict and the
 runner group's repository-access proof, start in the background as soon as the
 VM lease is held, beside the clone and boot, and the boundary consumes their
