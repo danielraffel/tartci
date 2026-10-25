@@ -366,6 +366,35 @@ class EndToEnd(Isolated):
         self.assertFalse(cov.exists(), log)
 
     @testing_support.requires_tomllib
+    def test_a_volume_past_the_used_percent_is_pressure_with_free_gib_to_spare(self):
+        # m3 and m5, 2026-10-24/25: 91% and 92.5% used with 364 and 281 GiB
+        # free. Judged by free GiB alone it was "no pressure", so the worktree
+        # reaper never ran while readiness took both hosts out of the fleet.
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=1)
+        usage = shutil.disk_usage(repo.worktrees)
+        if usage.free / pr.GIB < 1 or not usage.used:  # pragma: no cover
+            self.skipTest("the free-GiB control isn't constructible on this host")
+        (out, log) = self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state,
+                                pressure_used_percent=0.01)
+        self.assertTrue(out["pressure"], out)
+        self.assertIn("clean_worktree_builds", [r["reaper"] for r in out["runs"]], log)
+        self.assertNotIn("clean_worktree_builds", out.get("skipped") or {})
+
+    @testing_support.requires_tomllib
+    def test_used_percent_off_or_not_reached_keeps_the_free_gib_rule(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=1)
+        if shutil.disk_usage(repo.worktrees).free / pr.GIB < 1:  # pragma: no cover
+            self.skipTest("the free-GiB control isn't constructible on this host")
+        for percent in (0, 100):
+            with self.subTest(pressure_used_percent=percent):
+                (out, _log) = self.quiet(pr.run, fix=True, profile=profile, state_dir=self.state,
+                                         pressure_used_percent=percent)
+                self.assertFalse(out["pressure"], out)
+                self.assertIn("clean_worktree_builds", out["skipped"])
+
+    @testing_support.requires_tomllib
     def test_merged_idle_worktree_build_goes_under_pressure_and_the_guarded_ones_stay(self):
         repo = PulpRepo(self.tmp)
         merged = repo.worktree("merged", "feat/merged")
