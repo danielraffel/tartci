@@ -24,7 +24,12 @@ concurrency:
 
 jobs:
   lint:
-    runs-on: ubuntu-latest
+    # Pinned, not ubuntu-latest: on 2026-10-25 ubuntu-latest became 26.04,
+    # whose system Python is 3.14 with no python3.12/python3.11 on PATH, so
+    # the launcher builder's unpinned fallback resolved bare /usr/bin/python3
+    # and test_signing_prompt_guard's "a real interpreter, not python3" check
+    # failed on every PR. python-39-tests runs on this same image.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
@@ -79,7 +84,9 @@ jobs:
     # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
     # that call `python3` get it too. A test that genuinely needs tomllib says
     # so (scripts/testing_support.py) and is skipped rather than failing.
-    runs-on: ubuntu-latest
+    # Pinned with the lint job: setup-python publishes no 3.9 for Ubuntu
+    # 26.04 (ubuntu-latest from 2026-10-25), so `latest` cannot hold the floor.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

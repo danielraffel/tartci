@@ -44,6 +44,15 @@ class CiLaneTests(unittest.TestCase):
         self.assertNotIn("! python3 -c 'import tomllib'", job)
         self.assertIn("python3 -m unittest discover -s scripts -p 'test_*.py'", job)
 
+    def test_the_3_9_lane_and_the_lint_job_pin_one_image_that_has_3_9(self) -> None:
+        text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
+        lint = text.split("  lint:", 1)[1].split("\n  python-39-tests:", 1)[0]
+        job = text.split("  python-39-tests:", 1)[1].split("\n  python-floor:", 1)[0]
+        # setup-python has no 3.9 for ubuntu-latest once that is 26.04.
+        self.assertIn("runs-on: ubuntu-24.04", job)
+        self.assertIn("runs-on: ubuntu-24.04", lint)
+        self.assertNotIn("runs-on: ubuntu-latest", job + lint)
+
     def test_only_pull_request_runs_are_superseded(self) -> None:
         text = (ROOT / ".github" / "workflows" / "ci.yml").read_text()
         # A shared group would drop pending main runs even without
