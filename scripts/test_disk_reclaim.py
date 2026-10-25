@@ -1768,5 +1768,25 @@ class HomeRootGuardTests(unittest.TestCase):
             dr.bounded_scandir(self.home / "Library" / "Mail")
         self.assertEqual(raised.exception.errno, errno.EPERM)
 
+class PulpReaperPressureTests(unittest.TestCase):
+    def test_the_used_percent_threshold_reaches_the_pulp_reapers(self):
+        # The Pulp worktree reaper judged pressure by free GiB alone, so a
+        # 92%-full volume with 281 GiB free never ran it (m5, 2026-10-25).
+        from unittest import mock
+        seen: dict = {}
+
+        def fake_run(**kwargs):
+            seen.update(kwargs)
+            return {"enabled": False, "reason": "stub"}
+
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(dr.pulp_reapers, "run", fake_run), \
+                mock.patch("sys.stdout", new_callable=io.StringIO), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            rc = dr.main(["--roots", td, "--json", "--pressure-used-percent", "90", "--state-dir", td])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen.get("pressure_used_percent"), 90.0)
+
+
 if __name__ == "__main__":
     unittest.main()

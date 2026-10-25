@@ -1345,7 +1345,8 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     pulp_skip = pulp_reapers.skip_reason_for_scan_timeouts(SCAN_TIMEOUTS)
     pulp = pulp_reapers.run(
         fix=args.fix, state_dir=state_dir(args), discovered_roots=roots,
-        deadline=PASS_DEADLINE, skip_reason=pulp_skip)
+        deadline=PASS_DEADLINE, skip_reason=pulp_skip,
+        pressure_used_percent=args.pressure_used_percent)
     receipt["pulp_reapers"] = pulp
     # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
     # gates). A live build naming one protects it, exactly as for build dirs;

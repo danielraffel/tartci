@@ -271,6 +271,16 @@ def free_bytes(path: pathlib.Path, deadline: float | None = None) -> int | None:
         return None
 
 
+def used_percent(path: pathlib.Path, deadline: float | None = None) -> float | None:
+    """Percent of `path`'s volume in use, or None when it cannot be read."""
+    try:
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", deadline=deadline)
+    except OSError:
+        return None
+    return 100.0 * usage.used / usage.total if usage.total else None
+
+
 def _git(repo: pathlib.Path, *args: str, runner: Runner = subprocess.run,
          deadline: float | None = None) -> subprocess.CompletedProcess:
     timeout = _bounded_timeout(GIT_TIMEOUT_S, deadline)
@@ -606,8 +616,14 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         reaper: Callable[..., dict[str, Any]] = run_reaper,
         discovered_roots: list[pathlib.Path] | None = None,
         deadline: float | None = None,
-        skip_reason: str | None = None) -> dict[str, Any]:
-    """One pass of the opt-in Pulp reapers. Never raises, never deletes itself."""
+        skip_reason: str | None = None,
+        pressure_used_percent: float = 0.0) -> dict[str, Any]:
+    """One pass of the opt-in Pulp reapers. Never raises, never deletes itself.
+
+    `pressure_used_percent` is disk_reclaim's --pressure-used-percent: when
+    positive, a volume at least that full is pressure even with
+    `pressure_free_gb` to spare, as for disk_reclaim's own build-dir tier.
+    """
     profile = profile or default_profile_path()
     settings, why = load_settings(profile)
     if settings is None:
@@ -667,7 +683,15 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
     # Unknown free space is not pressure: guessing "full" would run the heavier
     # reaper on exactly the host whose volume we cannot read.
     pressure = free is not None and free < settings["pressure_free_gb"] * GIB
+    # A large volume can sit past readiness's disk_pressure limit (92% used)
+    # with hundreds of GiB free (m3, m5, 2026-10-24/25), so a used-percent
+    # threshold is pressure too. An unreadable percent is not.
+    used = None
+    if not pressure and pressure_used_percent > 0 and free is not None:
+        used = used_percent(root, deadline)
+        pressure = used is not None and used >= pressure_used_percent
     report["pressure"] = pressure
+    report["used_percent"] = used
     if checkout is None:
         report["error"] = detail
         report["free_bytes_after"] = free
@@ -676,6 +700,8 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
     if not pressure:
         report["skipped"] = {WORKTREE_BUILDS: "no pressure: free space is at or above "
                              f"{settings['pressure_free_gb']:g} GiB"
+                             + (f" and the volume is under {pressure_used_percent:g}% used"
+                                if pressure_used_percent > 0 else "")
                              if free is not None else "free space unreadable"}
     def invoke_reaper(script: pathlib.Path, *, worktrees_root: str,
                       measure_path: pathlib.Path, timeout_s: float) -> dict[str, Any]:
