@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import datetime
@@ -84,6 +85,13 @@ CONCLUSIVE_ERROR_REASONS = {"invalid_labels", "mutation_failed"}
 # gets the real verdict; giving up discards a VM that is already booted.  Every
 # other `defer` is a statement about the queue and is returned at once.
 CONTENTION_DEFER_REASONS = {"observation_in_progress", "stewardship_in_progress"}
+# A `revalidation_failed` error is Shipyard failing to re-read GitHub (most
+# often `gh pr list` answering 504) after it has already looked once.  The
+# reads that decide admission are Shipyard's, so TartCI cannot hand it an older
+# PR list; what it can reuse is Shipyard's own last `admit` for the same lane
+# target, which was computed from a PR list that did read.  Only this reason
+# reuses, and only an admit no older than TARTCI_ADMISSION_CLEAN_REUSE_SECS.
+REUSABLE_ERROR_REASONS = {"revalidation_failed"}
 
 
 class ConfigurationError(ValueError):
@@ -187,13 +195,22 @@ def _bounded_env_int(name: str, default: int, low: int, high: int) -> int:
     return int(raw)
 
 
+def _target_key(repo: str, base: str, labels: Sequence[str]) -> str:
+    return hashlib.sha256(
+        "\n".join([repo, base, ",".join(labels)]).encode()
+    ).hexdigest()[:32]
+
+
 def _counter_path(repo: str, base: str, labels: Sequence[str]) -> pathlib.Path:
     # Key per lane target.  Two lanes sharing a state dir must not pool each
     # other's failures into a degrade that neither one earned.
-    key = hashlib.sha256(
-        "\n".join([repo, base, ",".join(labels)]).encode()
-    ).hexdigest()[:32]
-    return _state_dir() / f"inconclusive.{key}.json"
+    return _state_dir() / f"inconclusive.{_target_key(repo, base, labels)}.json"
+
+
+def _last_admit_path(repo: str, base: str, labels: Sequence[str]) -> pathlib.Path:
+    # Same key as the counter: an admit is only ever evidence for the exact
+    # (repo, base, labels) it was computed for.
+    return _state_dir() / f"last-admit.{_target_key(repo, base, labels)}.json"
 
 
 def _read_counter(path: pathlib.Path) -> int:
@@ -231,6 +248,77 @@ def _clear_counter(path: pathlib.Path) -> None:
         pass
 
 
+def _observed_epoch(value: dict[str, Any]) -> float | None:
+    """When Shipyard made the observation, never later than now.
+
+    The PR list behind an admit was read at `observed_at`, not when this call
+    returned, so freshness is measured from there. Fractional seconds are
+    dropped (older Pythons parse at most six digits), which can only make the
+    record look older.
+    """
+    try:
+        stamp = re.sub(r"\.[0-9]+", "", str(value["observed_at"]))
+        observed = datetime.datetime.fromisoformat(
+            stamp.replace("Z", "+00:00")
+        ).timestamp()
+    except (KeyError, ValueError):
+        return None
+    return min(observed, time.time())
+
+
+def _write_last_admit(path: pathlib.Path, value: dict[str, Any]) -> None:
+    observed = _observed_epoch(value)
+    if observed is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Shipyard's envelope only: TartCI's own annotations describe how this
+        # call reached its verdict, not the verdict.
+        envelope = {k: v for k, v in value.items() if not k.startswith("tartci_")}
+        payload = json.dumps({"observed_epoch": observed, "envelope": envelope})
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(payload)
+        os.replace(tmp, path)
+    except OSError:
+        # Losing the record only costs a future reuse; admission is unaffected.
+        pass
+
+
+def _fresh_last_admit(
+    args: argparse.Namespace, labels: Sequence[str], max_age: int
+) -> tuple[dict[str, Any], int] | None:
+    """The recorded admit and its age in whole seconds, when it is reusable.
+
+    Anything unreadable, malformed, from the future, older than `max_age`, or
+    no longer a valid admit for this exact target is not reusable, and the
+    caller fails closed exactly as it would have without a record.
+    """
+    if max_age <= 0:
+        return None
+    try:
+        record = json.loads(_last_admit_path(args.repo, args.base, labels).read_text())
+        recorded = record["observed_epoch"]
+        envelope = record["envelope"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not isinstance(recorded, (int, float)) or isinstance(recorded, bool):
+        return None
+    age = time.time() - recorded
+    if not 0 <= age <= max_age:
+        return None
+    try:
+        envelope = validate_verdict(
+            envelope, repo=args.repo, base=args.base, labels=labels, process_exit=0
+        )
+    except ValueError:
+        return None
+    if envelope["verdict"] != "admit" or any(
+        key.startswith("tartci_") for key in envelope
+    ):
+        return None
+    return envelope, math.ceil(age)
+
+
 def _now_rfc3339() -> str:
     return (
         datetime.datetime.now(datetime.timezone.utc)
@@ -261,6 +349,11 @@ def contention_wait() -> tuple[int, int]:
     return total, poll
 
 
+def reuse_window() -> int:
+    """Oldest admit, in seconds, a `revalidation_failed` may reuse; 0 disables."""
+    return _bounded_env_int("TARTCI_ADMISSION_CLEAN_REUSE_SECS", 60, 0, 300)
+
+
 def validate_configuration(args: argparse.Namespace) -> list[str]:
     if not REPO_PATTERN.fullmatch(args.repo):
         raise ConfigurationError("repo must be a canonical owner/name slug")
@@ -269,6 +362,7 @@ def validate_configuration(args: argparse.Namespace) -> list[str]:
     labels = parse_labels(args.labels)
     bounded_timeout()
     contention_wait()
+    reuse_window()
     return labels
 
 
@@ -378,12 +472,24 @@ def _apply_breaker(
     verdict = value["verdict"]
     reason = value["reason"]
     path = _counter_path(args.repo, args.base, labels)
+    last_admit = _last_admit_path(args.repo, args.base, labels)
+    inconclusive = verdict == "error" and (
+        unknown_reason or reason in INCONCLUSIVE_ERROR_REASONS
+    )
+    if verdict == "admit":
+        _write_last_admit(last_admit, value)
+    elif not inconclusive:
+        # Any later verdict that speaks about the queue supersedes the admit,
+        # so a defer seen after it can never be skipped by a reuse.
+        try:
+            last_admit.unlink()
+        except OSError:
+            pass
     if verdict != "error":
         # A real admit or defer proves Shipyard can observe again.
         _clear_counter(path)
         print(json.dumps(value, separators=(",", ":"), sort_keys=True))
         return VERDICT_EXIT[verdict]
-    inconclusive = unknown_reason or reason in INCONCLUSIVE_ERROR_REASONS
     if not inconclusive:
         # Shipyard looked and found dirt it could not clear.  Stay closed.
         print(json.dumps(value, separators=(",", ":"), sort_keys=True))
@@ -396,6 +502,27 @@ def _apply_breaker(
     )
     count = _read_counter(path) + 1
     _write_counter(path, count, reason)
+    reused = (
+        _fresh_last_admit(args, labels, reuse_window())
+        if reason in REUSABLE_ERROR_REASONS and not unknown_reason
+        else None
+    )
+    if reused is not None:
+        # The record is never rewritten from a reuse, so a chain of failed
+        # re-reads cannot keep one admit alive past the window.  The counter
+        # still counts this failure toward the breaker.
+        envelope, age = reused
+        envelope = dict(envelope)
+        envelope["tartci_reused_admit"] = True
+        envelope["tartci_reused_admit_age_secs"] = age
+        envelope["tartci_reused_for_reason"] = reason
+        print(json.dumps(envelope, separators=(",", ":"), sort_keys=True))
+        print(
+            f"admission-clean REUSED: {reason}; admitting on Shipyard's admit "
+            f"from {age}s ago (window {reuse_window()}s).",
+            file=sys.stderr,
+        )
+        return 0
     if count < degrade_after or count > degrade_max:
         # Below the threshold the gate keeps its full strength; above the cap it
         # closes again so a permanent outage cannot leave the gate open forever.

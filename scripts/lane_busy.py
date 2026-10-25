@@ -89,6 +89,9 @@ BUSY_PHASES = frozenset({
     "cloning", "booting", "ensuring-runner", "aqua-preflight", "chrome-preflight",
     "admission-check", "admission-deferred", "admission-error",
     "minting-jit", "idle-wait", "idle-retarget-check",
+    # A booted VM held for one more demand scan before the pre-mint discard
+    # (retarget_after_pre_mint_denial); it still holds its lease.
+    "pre-mint-hold",
     "job-running", "cancel-pending-terminal",
     # A torn-down VM whose deletion is not yet proved; the lane still holds
     # its lease and reservation (reconcile_pending_delete).

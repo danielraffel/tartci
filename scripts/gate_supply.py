@@ -75,6 +75,11 @@ IN_FLIGHT_PHASES = frozenset({
     "cloning", "admission-precheck", "booting", "ensuring-runner", "aqua-preflight",
     "chrome-preflight", "admission-check", "minting-jit", "idle-wait",
     "idle-retarget-check", "warm-handoff",
+    # A booted VM held before the pre-mint discard. Unlike the other phases
+    # it may serve ANY class when the hold ends, so it counts in flight for
+    # every class (classify_lane): a fallback that booted beside it for the
+    # same job would mint one runner too many.
+    "pre-mint-hold",
 })
 # Holding a job, or refused / blind / draining: cannot take a new job now.
 BLOCKED_PHASES = frozenset({
@@ -263,7 +268,7 @@ def classify_lane(env: dict, heartbeat: dict | None, class_label: str, classes: 
     if phase in IN_FLIGHT_PHASES:
         labels = {item.strip() for item in str(heartbeat.get("labels") or "").split(",")}
         other = [label for label in classes if label in labels and label != class_label]
-        if other and class_label not in labels:
+        if other and class_label not in labels and phase != "pre-mint-hold":
             return "blocked", f"{phase} for {other[0]}"
         return "in_flight", f"{phase} {int(age)}s ago"
     if phase in BLOCKED_PHASES:
