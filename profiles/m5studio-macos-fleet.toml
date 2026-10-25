@@ -244,7 +244,8 @@ stale_log_seconds = 4500
 
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap", "disk-watchdog"]
-# Converge the VM janitor and the disk watchdog; every other declared agent
-# stays plan-only. disk-watchdog bootstrap is owner-approved for m5studio only
+# Converge the VM janitor, the disk watchdog and the disk reclaimer (so reclaim
+# fixes such as the 90%-used pressure trigger reach the host); every other
+# declared agent stays plan-only. disk-watchdog bootstrap is owner-approved for m5studio only
 # (2026-10-22): a hand install is not reconciled, and m5studio ran none for days.
-bootstrap = ["reap", "disk-watchdog"]
+bootstrap = ["reap", "disk-watchdog", "reclaim"]

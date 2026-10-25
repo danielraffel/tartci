@@ -296,5 +296,6 @@ stale_log_seconds = 4500
 
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
-# Converge only the VM janitor; every other declared agent stays plan-only.
-bootstrap = ["reap"]
+# Converge the VM janitor and the disk reclaimer (so reclaim fixes such as the
+# 90%-used pressure trigger reach the host); every other declared agent stays plan-only.
+bootstrap = ["reap", "reclaim"]
