@@ -837,7 +837,13 @@ first; list it only when what it asserts really needs tomllib.
   bounds the narrower case of a second workflow appearing under an
   already-cached display name. Set
   `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS=0` to disable it and resolve
-  the ids on every poll. Tests must override
+  the ids on every poll. The cache is published under its own file lock
+  (`assignment-workflow-ids.json.lock`), never the host observation lock:
+  that lock carries the repository's timeout backoff, and publishing under it
+  failed scans whose reads had all succeeded and left the cache expired, so
+  on 2026-10-25 most SCAN BLIND polls on m3 read `lock_contention: host queue
+  observation lock backoff active` straight after a successful workflow
+  listing. Tests must override
   `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE` for the same reason they override
   the lock path, and additionally because a cache shared between tests is a
   channel between them: one test's resolved id satisfies the next test's

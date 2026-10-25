@@ -2765,6 +2765,36 @@ else:
                 self.assertEqual(result.stdout.strip(), "1")
                 self.assertEqual(census["workflows"], 1, census)
 
+    def test_a_repository_backoff_does_not_blind_a_cold_cache_scan(self) -> None:
+        """Publishing the ids never waits on the host observation lock.
+
+        On m3 on 2026-10-25 most SCAN BLIND lines read the workflow listing
+        successfully and then failed closed on `lock backoff active`, because
+        the publish took the host lock that carries the repository's timeout
+        backoff. The expired cache was never refreshed, so the next poll did
+        the same. The control is the same backoff against a scan whose queue
+        read itself fails: that scan still fails closed.
+        """
+        cache = self.root / "workflow-ids.json"
+        backoff = self.root / "queue-observation-backoff.json"
+        backoff.write_text(json.dumps({"Generous-Corp/pulp": time.time() + 600}))
+
+        cold, cold_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(cold.returncode, 0, cold.stderr)
+        self.assertEqual(cold.stdout.strip(), "1")
+        self.assertNotIn("lock_contention", cold.stderr)
+        self.assertEqual(cold_census["workflows"], 1, cold_census)
+        # Published despite the backoff, so the next lane reads it instead.
+        self.assertIn("Generous-Corp/pulp", json.loads(cache.read_text()))
+        warm, warm_census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(warm.returncode, 0, warm.stderr)
+        self.assertEqual(warm_census["workflows"], 0, warm_census)
+
+        cache.unlink()
+        broken, _, _ = self._scan(cache=cache, ttl="300", MATCH="1", FAIL_ON="/jobs?")
+        self.assertEqual(broken.returncode, 2, broken.stdout)
+        self.assertNotEqual(broken.stdout.strip(), "0")
+
     def test_a_cached_id_that_stops_resolving_fails_the_scan_closed(self) -> None:
         """The cache cannot turn a broken lookup into an empty queue.
 

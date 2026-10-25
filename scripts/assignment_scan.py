@@ -39,6 +39,7 @@ import argparse
 import concurrent.futures
 import contextlib
 import datetime as dt
+import fcntl
 import json
 import math
 import os
@@ -662,31 +663,39 @@ class AssignmentScanner:
         """
         if self.args.workflow_id_cache_ttl <= 0:
             return
+        lock_path = self.workflow_id_cache_path.with_name(
+            self.workflow_id_cache_path.name + ".lock"
+        )
         try:
             self.workflow_id_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                payload = json.loads(
-                    self.workflow_id_cache_path.read_text(encoding="utf-8")
+            # Serializes the read-modify-write between lanes publishing for
+            # different repositories; held for the file operation only, and
+            # released when the handle closes.
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                try:
+                    payload = json.loads(
+                        self.workflow_id_cache_path.read_text(encoding="utf-8")
+                    )
+                except (OSError, ValueError):
+                    payload = {}
+                if not isinstance(payload, dict):
+                    payload = {}
+                payload[self.args.repo] = {
+                    "fetched_at": time.time(),
+                    "workflows": dict(resolved),
+                }
+                tmp = self.workflow_id_cache_path.with_name(
+                    f"{self.workflow_id_cache_path.name}.{os.getpid()}.tmp"
                 )
-            except (OSError, ValueError):
-                payload = {}
-            if not isinstance(payload, dict):
-                payload = {}
-            payload[self.args.repo] = {
-                "fetched_at": time.time(),
-                "workflows": dict(resolved),
-            }
-            tmp = self.workflow_id_cache_path.with_name(
-                f"{self.workflow_id_cache_path.name}.{os.getpid()}.tmp"
-            )
-            try:
-                tmp.write_text(json.dumps(payload), encoding="utf-8")
-                os.replace(tmp, self.workflow_id_cache_path)
-            finally:
-                # A replace that did not happen must not leave the temp file
-                # behind in state every lane on this host shares.
-                with contextlib.suppress(OSError):
-                    tmp.unlink()
+                try:
+                    tmp.write_text(json.dumps(payload), encoding="utf-8")
+                    os.replace(tmp, self.workflow_id_cache_path)
+                finally:
+                    # A replace that did not happen must not leave the temp
+                    # file behind in state every lane on this host shares.
+                    with contextlib.suppress(OSError):
+                        tmp.unlink()
         except OSError:
             return
 
@@ -827,10 +836,13 @@ class AssignmentScanner:
         self._preflight_identity()
         if workflow_ids is None:
             workflow_ids = self._workflow_ids()
-            # Publishing a resolved workflow id is the only shared mutation in
-            # this phase, so keep the host lock for that short file operation.
-            with self._observation_lock():
-                self._store_workflow_ids(workflow_ids)
+            # Published under the cache's own file lock, never the host
+            # observation lock. That lock carries the repository's timeout
+            # backoff, so publishing under it failed a scan whose reads had all
+            # succeeded, and the cache it would have refreshed stayed expired:
+            # on 2026-10-25 every gate lane on m3 went SCAN BLIND this way on
+            # most polls, each one after a successful workflow listing.
+            self._store_workflow_ids(workflow_ids)
         scanned: set[int] = set()
 
         # Concurrency remains opt-in for a measured host. The reliable fleet
