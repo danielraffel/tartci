@@ -124,6 +124,22 @@ class ClassifyAndFitTests(unittest.TestCase):
             MERGE, [MERGE, PR], time.time())
         self.assertEqual(own, "in_flight")
 
+    def test_a_held_pre_mint_vm_covers_every_class(self) -> None:
+        """A VM held before its pre-mint discard may serve whichever class
+        appears, so a fallback must not boot beside it for that class. The
+        control is the same labels in an ordinary in-flight phase."""
+        for class_label in (MERGE, PR):
+            with self.subTest(class_label=class_label):
+                state, _ = gate_supply.classify_lane(
+                    lane_env(), {"ts": stamp(5), "phase": "pre-mint-hold",
+                                 "labels": f"a,b,{PR}"},
+                    class_label, [MERGE, PR], time.time())
+                self.assertEqual(state, "in_flight")
+        control, _ = gate_supply.classify_lane(
+            lane_env(), {"ts": stamp(5), "phase": "booting", "labels": f"a,b,{PR}"},
+            MERGE, [MERGE, PR], time.time())
+        self.assertEqual(control, "blocked")
+
     def test_m5_second_lane_can_never_fit_a_12_core_vm_in_a_14_core_universe(self) -> None:
         busy = {"total_cores": 14, "used_cores": 12, "total_mem_mb": 100000, "used_mem_mb": 16384}
         self.assertEqual(gate_supply.lease_fit_count(busy, 12, 16384, 2), 0)
@@ -298,6 +314,16 @@ class DecideTests(unittest.TestCase):
     def test_an_in_flight_sibling_covers_one_job(self) -> None:
         local = {"verdict": "ok", "lanes": [{"state_dir": "/state/sib", "slot": 2, "state": "in_flight"}]}
         self.assertEqual(self._decide(1, [self._peer("studio", 0)], local)[0], "hold")
+
+    def test_a_held_pre_mint_sibling_covers_one_job(self) -> None:
+        local = {"verdict": "ok", "lanes": [{"state_dir": "/state/sib", "slot": 2,
+                                             "state": gate_supply.classify_lane(
+                                                 lane_env(slot=2),
+                                                 {"ts": stamp(5), "phase": "pre-mint-hold",
+                                                  "labels": f"a,b,{PR}"},
+                                                 MERGE, [MERGE, PR], time.time())[0]}]}
+        self.assertEqual(self._decide(1, [self._peer("studio", 0)], local)[0], "hold")
+        self.assertEqual(self._decide(2, [self._peer("studio", 0)], local)[0], "grant")
 
     def test_unreadable_siblings_are_unknown(self) -> None:
         verdict, _ = self._decide(1, [self._peer("studio", 0)], {"verdict": "unknown", "reason": "x"})

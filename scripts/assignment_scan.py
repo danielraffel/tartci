@@ -66,6 +66,8 @@ from gh_identity import (
 
 PER_PAGE = 100
 _RETRY_BACKOFF_CAP = 4.0
+# Bound on waiting for the workflow-id cache's own file lock.
+_CACHE_LOCK_WAIT_SECS = 2.0
 
 
 class ScanError(RuntimeError):
@@ -670,9 +672,19 @@ class AssignmentScanner:
             self.workflow_id_cache_path.parent.mkdir(parents=True, exist_ok=True)
             # Serializes the read-modify-write between lanes publishing for
             # different repositories; held for the file operation only, and
-            # released when the handle closes.
+            # released when the handle closes. Never blocks: a lock still held
+            # after the bounded retry skips the publish, which costs only the
+            # next lane's listing call.
             with lock_path.open("a+", encoding="utf-8") as lock:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                deadline = time.monotonic() + _CACHE_LOCK_WAIT_SECS
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            return
+                        time.sleep(0.05)
                 try:
                     payload = json.loads(
                         self.workflow_id_cache_path.read_text(encoding="utf-8")

@@ -2187,9 +2187,11 @@ tartci_vm_ssh_wait(){
 # lock while it waits, so it never stalls another lane's mint, and takes it
 # again before the rescan. That rescan is the same live pre-mint check, so the
 # hold can only delay a discard; it never admits what the check would refuse.
+# After a hold the lane's job claim moves to the class it will serve, and a
+# class another lane already covers is discarded (demand_covered).
 retarget_after_pre_mint_denial(){
   local i="$1" group_id="$2" tier="" label="" labels="" reason="no_class_waiting"
-  local hold="${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" held=0 pass
+  local hold="${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" held=0 pass claim_rc
   tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
   # The second pass runs only after one hold.
   for pass in 1 2; do
@@ -2224,6 +2226,17 @@ retarget_after_pre_mint_denial(){
       break
     fi
   done
+  # Another lane may have booted or minted for the class that appeared while
+  # this VM was held. Move this lane's job claim to the class it now serves,
+  # so the claim store counts both, and discard when the other lane already
+  # covers every queued job of that class rather than mint a second runner.
+  if [ -z "$reason" ] && [ "$held" = 1 ]; then
+    tartci_job_claim_release
+    claim_rc=0
+    tartci_job_claim_acquire "$vm" "$labels" "$tier" 1 \
+      "${selected_runner_api_root:-$RUNNER_API_ROOT}" || claim_rc=$?
+    [ "$claim_rc" -ne 75 ] || reason="demand_covered"
+  fi
   if [ -n "$reason" ]; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($reason)"

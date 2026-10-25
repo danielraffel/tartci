@@ -822,6 +822,10 @@ runner_group_id_for_tier(){ echo "${GROUP_FOR_TIER:-1}"; }
 jit_admission_denied(){ return 1; }
 tartci_pool_lock_release(){ echo unlock >>"$calls"; }
 tartci_pool_lock_acquire(){ echo lock >>"$calls"; [ "${LOCK_BUSY:-0}" = 0 ]; }
+# The claim store: CLAIM_RC 75 means another lane already covers the class.
+tartci_job_claim_release(){ echo "claim-release" >>"$calls"; }
+tartci_job_claim_acquire(){ echo "claim $2 tier=$3 queued=$4" >>"$calls"; return "${CLAIM_RC:-0}"; }
+vm=lane-vm-1
 discard_current_vm(){ echo discard >>"$calls"; }
 tartci_release_vm_lease(){ echo release >>"$calls"; }
 sleep(){ echo "sleep $1" >>"$calls"; }
@@ -872,6 +876,31 @@ class PreMintHoldTests(unittest.TestCase):
         self.assertIn("assignment_v2_pre_mint_hold", calls[2])
         self.assertEqual(calls[5], "scan 0")
         self.assertIn("held=1", calls[-1])
+
+    def test_the_claim_moves_to_the_class_served_after_a_hold(self) -> None:
+        _, calls = self._deny("none", "0")
+        claims = [c for c in calls if c.startswith("claim")]
+        self.assertEqual(claims, ["claim-release",
+                                  "claim self-hosted,macOS,ARM64,pulp-build-vm,pulp-build-merge-group tier=0 queued=1"])
+        # Taken after the rescan under the re-acquired lock, before any mint.
+        self.assertLess(calls.index("scan 0"), calls.index("claim-release"))
+
+    def test_a_class_another_lane_covered_during_the_hold_is_not_minted_twice(self) -> None:
+        """A fallback or sibling that booted for the arriving job while this VM
+        was held already holds the claim; this VM is discarded, not minted."""
+        out, calls = self._deny("none", "0", CLAIM_RC="75")
+        self.assertTrue(out.startswith("rc=1 tier=1 "), out)
+        self.assertIn("discard", calls)
+        self.assertTrue(any("reason=demand_covered" in c and "held=1" in c for c in calls), calls)
+        # Control: claim machinery failing open still serves the class.
+        out, calls = self._deny("none", "0", CLAIM_RC="1")
+        self.assertTrue(out.startswith("rc=0 tier=0 "), out)
+        self.assertNotIn("discard", calls)
+
+    def test_without_a_hold_the_claim_is_untouched(self) -> None:
+        # Control: a pass-one retarget keeps today's behaviour exactly.
+        _, calls = self._deny("0")
+        self.assertFalse(any(c.startswith("claim") for c in calls), calls)
 
     def test_its_own_class_returning_keeps_the_vm(self) -> None:
         out, calls = self._deny("none", "1")
@@ -2912,6 +2941,25 @@ else:
         broken, _, _ = self._scan(cache=cache, ttl="300", MATCH="1", FAIL_ON="/jobs?")
         self.assertEqual(broken.returncode, 2, broken.stdout)
         self.assertNotEqual(broken.stdout.strip(), "0")
+
+    def test_a_held_cache_lock_skips_the_publish_and_never_blocks(self) -> None:
+        """The cache's own lock is taken with a bounded non-blocking retry."""
+        import fcntl  # noqa: PLC0415
+        cache = self.root / "workflow-ids.json"
+        with open(str(cache) + ".lock", "a+") as held:
+            fcntl.flock(held.fileno(), fcntl.LOCK_EX)
+            started = time.monotonic()
+            blocked, census, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+            elapsed = time.monotonic() - started
+        self.assertEqual(blocked.returncode, 0, blocked.stderr)
+        self.assertEqual(blocked.stdout.strip(), "1")
+        self.assertEqual(census["workflows"], 1, census)
+        self.assertFalse(cache.exists(), "a publish that could not lock must be skipped")
+        self.assertLess(elapsed, 30.0)
+        # Control: the lock released, the same scan publishes.
+        free, _, _ = self._scan(cache=cache, ttl="300", MATCH="1")
+        self.assertEqual(free.returncode, 0, free.stderr)
+        self.assertIn("Generous-Corp/pulp", json.loads(cache.read_text()))
 
     def test_a_cached_id_that_stops_resolving_fails_the_scan_closed(self) -> None:
         """The cache cannot turn a broken lookup into an empty queue.

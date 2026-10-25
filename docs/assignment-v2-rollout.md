@@ -285,8 +285,12 @@ host-global mint lock, waits `TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS`
 same live retarget scan. A class that now admits is served
 (`assignment_v2_pre_mint_retarget … held=1`, or `assignment_v2_pre_mint_kept`
 when it is the VM's own class); otherwise the VM is discarded as before with
-`held=1`. The hold runs at most once per boot and never for the other discard
-reasons. On m3 slot 1 on 2026-10-25 five booted VMs were discarded for
+`held=1`. After a hold the lane's job claim moves to the class it will serve,
+and a class another lane already covers (it booted or minted for the job during
+the hold) is discarded with `demand_covered` instead of minting a second runner.
+A held lane heartbeats `pre-mint-hold`, which `tartci pool supply` counts in
+flight for every class, since the VM may serve any of them. The hold runs at
+most once per boot and never for the other discard reasons. On m3 slot 1 on 2026-10-25 five booted VMs were discarded for
 `no_class_waiting`.
 
 `tartci pre-mint-outcomes [--days N] [--json]` counts retargets and discards per
