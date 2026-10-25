@@ -926,6 +926,25 @@ class UsedPercentPressureTests(unittest.TestCase):
         self.assertFalse(report["pressure"])
         self.assertEqual([k["reason"] for k in report["kept"]], ["too_recent"])
 
+    def test_the_percent_threshold_reaches_the_pulp_worktree_reaper(self):
+        # The Pulp worktree reaper judges pressure with the same helper, but
+        # only if the pass hands it the threshold: without it a 92%-full
+        # volume with ~280 GiB free never ran clean_worktree_builds.
+        seen: list = []
+
+        def fake_run(**kwargs):
+            seen.append(kwargs.get("pressure_used_percent"))
+            return {"enabled": False, "reason": "stub"}
+
+        with unittest.mock.patch.object(dr.pulp_reapers, "run", fake_run):
+            code, _ = self.run_json("--pressure-used-percent", "90")
+            self.assertEqual(code, 0)
+            with unittest.mock.patch.dict(os.environ,
+                                          {"TARTCI_RECLAIM_PRESSURE_USED_PERCENT": "87.5"}):
+                code, _ = self.run_json()
+            self.assertEqual(code, 0)
+        self.assertEqual(seen, [90.0, 87.5])
+
     def test_unknown_free_space_never_selects_pressure_by_percent(self):
         make_build_tree(self.root / "wt" / "build", age_days=10)
         with unittest.mock.patch.object(dr, "free_bytes", return_value=None):
