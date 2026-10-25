@@ -277,10 +277,23 @@ treats them alike, and releasing it would let another lane take the slot between
 release and re-acquire. `--print-pre-mint-retarget <tier>` prints `keep`, the
 retarget tier, or `discard` as a safe preflight.
 
+**Hold before discarding.** When no class is waiting at all
+(`no_class_waiting`), the booted VM is held for one more scan first
+(`assignment_v2_pre_mint_hold hold_seconds=N`). The lane releases the
+host-global mint lock, waits `TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS`
+(default 25, range 0..60; 0 disables), takes the lock again and repeats the
+same live retarget scan. A class that now admits is served
+(`assignment_v2_pre_mint_retarget … held=1`, or `assignment_v2_pre_mint_kept`
+when it is the VM's own class); otherwise the VM is discarded as before with
+`held=1`. The hold runs at most once per boot and never for the other discard
+reasons. On m3 slot 1 on 2026-10-25 five booted VMs were discarded for
+`no_class_waiting`.
+
 `tartci pre-mint-outcomes [--days N] [--json]` counts retargets and discards per
 lane per day from each lane's `events.jsonl`. Every pre-mint denial ends in one
 of the two, so discards are denials minus retargets, which keeps logs written
-before retargeting existed comparable.
+before retargeting existed comparable. A VM the hold kept for its own class
+counts with the retargets.
 
 **Canary: m3 `pulp-gate` (both slots).** m3 has the highest share of
 catchable denials (42 of 74 pre-mint discards in the baseline) and the most

@@ -32,6 +32,11 @@ tartci_assignment_v2_configure(){
     0|1) ;;
     *) die "invalid TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK: expected 0 or 1" ;;
   esac
+  case "${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" in
+    ''|*[!0-9]*) die "invalid TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS: expected 0-60" ;;
+    *) [ "${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" -le 60 ] \
+      || die "TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS must be at most 60" ;;
+  esac
   # Work-conserving idle retarget (opt-in; 0 = off). Bounded below so an idle
   # runner is never re-observed faster than GitHub ordinarily assigns a job to
   # a fresh registration, and never more often than one exhaustive scan per

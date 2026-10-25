@@ -44,6 +44,10 @@
 # the clone when the selected class is proven empty or a preferred class
 # waits; an uncertain scan clones as before. `--print-pre-clone-selection
 # <tier>` reports that decision as a safe preflight.
+# Pre-mint hold (V2 only): a booted VM whose class lost its job, with no other
+# class waiting, is held for one more demand scan after
+# TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS (default 25, 0-60, 0 = off) and serves
+# whichever class then admits, instead of being discarded at once.
 # Per-slot class preference (opt-in, V2 only): TARTCI_ASSIGNMENT_V2_TIER_ORDER
 # is a comma-separated permutation of the configured class labels. Selection,
 # pre-mint admission, and idle retarget consult classes in that order instead
@@ -2176,37 +2180,70 @@ tartci_vm_ssh_wait(){
 # lease store treats alike, and releasing it would let another lane take the
 # slot. Runs inside run_one under the mint lock and rewrites its selected_tier
 # and selected_labels; returns 1 after discarding the VM.
+#
+# When no class is waiting at all, the VM is held for one more scan first. On
+# m3 slot 1 on 2026-10-25 five booted VMs were discarded for no_class_waiting,
+# each after a full clone and boot. The hold releases the host-global mint
+# lock while it waits, so it never stalls another lane's mint, and takes it
+# again before the rescan. That rescan is the same live pre-mint check, so the
+# hold can only delay a discard; it never admits what the check would refuse.
 retarget_after_pre_mint_denial(){
   local i="$1" group_id="$2" tier="" label="" labels="" reason="no_class_waiting"
+  local hold="${TARTCI_ASSIGNMENT_V2_PRE_MINT_HOLD_SECS:-25}" held=0 pass
   tartci_assignment_v2_pre_mint_denied_event "$selected_tier" "$selected_labels"
-  if tier="$(tartci_assignment_v2_pre_mint_retarget)" \
-     && label="$(tartci_assignment_v2_tier_label_at "$tier")"; then
-    labels="$(tartci_assignment_v2_tier_labels "$label")"
-    if [ "$(runner_group_id_for_tier "$tier")" != "$group_id" ]; then
-      reason="runner_group_differs"
-    elif jit_admission_denied "$group_id" "$labels"; then
-      reason="jit_admission_denied"
-    elif [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
-      # Booted with the shared cache mounted; a release tier boots cold.
-      reason="release_tier_no_shared_cache"
-    else
-      reason=""
+  # The second pass runs only after one hold.
+  for pass in 1 2; do
+    reason="no_class_waiting"
+    if tier="$(tartci_assignment_v2_pre_mint_retarget)" \
+       && label="$(tartci_assignment_v2_tier_label_at "$tier")"; then
+      labels="$(tartci_assignment_v2_tier_labels "$label")"
+      if [ "$(runner_group_id_for_tier "$tier")" != "$group_id" ]; then
+        reason="runner_group_differs"
+      elif jit_admission_denied "$group_id" "$labels"; then
+        reason="jit_admission_denied"
+      elif [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && ! tartci_labels_mount_shared_cache "$labels"; then
+        # Booted with the shared cache mounted; a release tier boots cold.
+        reason="release_tier_no_shared_cache"
+      else
+        reason=""
+      fi
     fi
-  fi
+    if [ "$reason" != no_class_waiting ] || [ "$pass" = 2 ] || [ "$hold" -eq 0 ]; then
+      break
+    fi
+    held=1
+    tartci_pool_lock_release
+    note "[$i] V2 assignment demand gone before JIT mint — holding the booted VM ${hold}s for one more demand scan"
+    event assignment_v2_pre_mint_hold \
+      "selected_tier=$selected_tier labels=$selected_labels hold_seconds=$hold" \
+      "selected_tier=$selected_tier" "hold_seconds=$hold"
+    heartbeat pre-mint-hold
+    sleep "$hold"
+    if ! tartci_pool_lock_acquire; then
+      reason="pool_transition_busy"
+      break
+    fi
+  done
   if [ -n "$reason" ]; then
     tartci_pool_lock_release
     note "[$i] V2 assignment demand changed or became uncertain before JIT mint — discarding unassigned VM ($reason)"
     event assignment_v2_pre_mint_discard \
-      "selected_tier=$selected_tier labels=$selected_labels reason=$reason" \
-      "selected_tier=$selected_tier" "reason=$reason"
+      "selected_tier=$selected_tier labels=$selected_labels reason=$reason held=$held" \
+      "selected_tier=$selected_tier" "reason=$reason" "held=$held"
     discard_current_vm
     tartci_release_vm_lease
     return 1
   fi
+  if [ "$tier" = "$selected_tier" ]; then
+    note "[$i] V2 assignment demand for tier $tier returned before JIT mint — keeping the booted VM ($label)"
+    event assignment_v2_pre_mint_kept \
+      "selected_tier=$tier labels=$labels held=$held" "selected_tier=$tier" "held=$held"
+    return 0
+  fi
   note "[$i] V2 assignment demand moved before JIT mint — retargeting the booted VM from tier $selected_tier to tier $tier ($label)"
   event assignment_v2_pre_mint_retarget \
-    "from_tier=$selected_tier to_tier=$tier labels=$labels" \
-    "from_tier=$selected_tier" "to_tier=$tier"
+    "from_tier=$selected_tier to_tier=$tier labels=$labels held=$held" \
+    "from_tier=$selected_tier" "to_tier=$tier" "held=$held"
   selected_tier="$tier"
   selected_labels="$labels"
 }
