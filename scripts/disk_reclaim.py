@@ -1246,15 +1246,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     pressured_devices = {
         volume["device"] for volume in volumes_before
         if volume["device"] is not None
-        and volume["free_bytes"] is not None
-        and (volume["free_bytes"] < args.pressure_free_gb * GIB
-             # A large volume reaches the readiness limit (DISK_PROBLEM_PERCENT
-             # in macos_fleet_lanes) with hundreds of GiB free: m3's 3.6 TiB
-             # Workshop volume did at ~290 GiB, so the GiB test alone never
-             # fired while the host was already out of the fleet.
-             or (args.pressure_used_percent > 0
-                 and volume.get("used_percent") is not None
-                 and volume["used_percent"] >= args.pressure_used_percent))
+        # The same test the Pulp worktree reaper runs under (see its
+        # docstring for why the percent arm exists).
+        and pulp_reapers.under_pressure(
+            volume["free_bytes"], volume.get("used_percent"),
+            pressure_free_gb=args.pressure_free_gb,
+            pressure_used_percent=args.pressure_used_percent)
     }
     pressure = bool(pressured_devices)
 
@@ -1345,7 +1342,8 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     pulp_skip = pulp_reapers.skip_reason_for_scan_timeouts(SCAN_TIMEOUTS)
     pulp = pulp_reapers.run(
         fix=args.fix, state_dir=state_dir(args), discovered_roots=roots,
-        deadline=PASS_DEADLINE, skip_reason=pulp_skip)
+        deadline=PASS_DEADLINE, skip_reason=pulp_skip,
+        pressure_used_percent=args.pressure_used_percent)
     receipt["pulp_reapers"] = pulp
     # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
     # gates). A live build naming one protects it, exactly as for build dirs;

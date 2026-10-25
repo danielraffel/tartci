@@ -669,6 +669,12 @@ the other agents. `tartci doctor fleet` reports `vm_janitor_missing` (PROBLEM)
 while the janitor is undeclared, missing or not loaded, and `vm_janitor_loaded`
 once it is.
 
+Taking an agent out of a `bootstrap` list does not unload it: the agent goes
+back to plan-only, and a host that already has it keeps it loaded and running
+the plist it was last given. To remove it from a host, drop it from `declared`
+(the next apply boots it out and retires its plist, as above), or `launchctl
+bootout gui/$(id -u)/<label>` by hand.
+
 The step never fails the update: a failure is a receipt step with `ok=false`
 and a `tartci doctor fleet` finding (`support_agents_pending`,
 `support_agents_drift`, `undeclared_fleet_agent`). Before draining, self-update

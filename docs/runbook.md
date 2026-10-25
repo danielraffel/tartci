@@ -3127,8 +3127,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Each pass then materializes a sparse origin/main worktree of `repo`
   (tools/scripts + tools/ci) under `~/.tartci/state/reclaim/pulp-reapers` and
   runs Pulp's `clean_build_cov.sh --yes` every pass and
-  `clean_worktree_builds.sh --yes` while the `worktrees_root` volume is below
-  `pressure_free_gb`, both with `PULP_WORKTREES_ROOT=worktrees_root`. Their own
+  `clean_worktree_builds.sh --yes` while the `worktrees_root` volume is under
+  pressure, both with `PULP_WORKTREES_ROOT=worktrees_root`. Pressure is the
+  test disk_reclaim applies to its own build dirs: below `pressure_free_gb`
+  free, or at least `TARTCI_RECLAIM_PRESSURE_USED_PERCENT` used (90 in the
+  installed agent), so a multi-TiB volume at 92% with ~290 GiB free still
+  counts. The skip reason in the receipt names both measures. Their own
   gates (merged and proven, idle, no process using it, lineage not `active`,
   a fresh path check) are the safety; tartci adds and relaxes none.
 

@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 import unittest.mock
 from typing import Optional
@@ -327,6 +328,75 @@ class Materialize(Isolated):
                      reaper=lambda script, **kw: calls.append(script) or {})
         self.assertIn("build_dir_lock.py", out["error"])
         self.assertEqual(calls, [])
+
+
+class UsedPercentPressure(Isolated):
+    """The worktree reaper's pressure is disk_reclaim's: free GiB OR used percent.
+
+    m3 and m5 sat at 91-92.5% used with ~280-300 GiB free, so a GiB-only test
+    never ran the worktree reaper while readiness had the host out on
+    disk_pressure. The threshold is the installed agent's own
+    (TARTCI_RECLAIM_PRESSURE_USED_PERCENT), handed over by disk_reclaim.
+    """
+
+    FLOOR_GB = 200.0
+    THRESHOLD = 90.0
+    CASES = (  # (GiB free, percent used, pressure?)
+        (280, 92.0, True),    # big volume over the percent: the m3/m5 case
+        (300, 80.0, False),   # neither measure is pressed
+        (150, 70.0, True),    # under the GiB floor alone
+    )
+
+    def test_pressure_is_free_gib_or_used_percent(self):
+        for free_gb, used, expected in self.CASES:
+            with self.subTest(free_gb=free_gb, used=used):
+                self.assertIs(pr.under_pressure(
+                    int(free_gb * pr.GIB), used, pressure_free_gb=self.FLOOR_GB,
+                    pressure_used_percent=self.THRESHOLD), expected)
+        # Control: with the percent trigger off, only the GiB floor counts.
+        self.assertFalse(pr.under_pressure(280 * pr.GIB, 92.0, pressure_free_gb=self.FLOOR_GB,
+                                           pressure_used_percent=0))
+        # Unknown free space is never pressure, whatever the percent says.
+        self.assertFalse(pr.under_pressure(None, 99.0, pressure_free_gb=self.FLOOR_GB,
+                                           pressure_used_percent=self.THRESHOLD))
+
+    def test_the_threshold_disk_reclaim_hands_over_is_the_installed_agents(self):
+        text = (HERE.parent / "launchd" / "com.danielraffel.tartci.reclaim.plist.template"
+                ).read_text()
+        match = re.search(r"<key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>\s*"
+                          r"<string>([0-9.]+)</string>", text)
+        self.assertIsNotNone(match)
+        self.assertEqual(float(match.group(1)), self.THRESHOLD)
+
+    @testing_support.requires_tomllib
+    def test_run_takes_the_worktree_reaper_by_either_measure(self):
+        repo = PulpRepo(self.tmp)
+        profile = repo.profile(self.tmp / "p.toml", pressure_free_gb=self.FLOOR_GB)
+        real = shutil.disk_usage
+        for free_gb, used, expected in self.CASES:
+            total = int(free_gb * pr.GIB * 100 / (100 - used))
+            fake = types.SimpleNamespace(total=total, used=total * used / 100,
+                                         free=int(free_gb * pr.GIB))
+
+            def usage(path, fake=fake):
+                same = pathlib.Path(path).resolve() == repo.worktrees.resolve()
+                return fake if same else real(path)
+            calls = []
+            with self.subTest(free_gb=free_gb, used=used), \
+                    unittest.mock.patch.object(pr.shutil, "disk_usage", usage):
+                out = pr.run(fix=False, profile=profile, state_dir=self.state,
+                             pressure_used_percent=self.THRESHOLD,
+                             reaper=lambda script, **kw: calls.append(script.stem)
+                             or {"reaper": script.stem, "exit_code": 0, "reclaimed_bytes": 0})
+                self.assertIs(out["pressure"], expected, out)
+                self.assertAlmostEqual(out["used_percent_before"], used, places=3)
+                self.assertEqual(pr.WORKTREE_BUILDS in calls, expected, calls)
+                self.assertIn(pr.BUILD_COV, calls)  # control: the cheap one always runs
+                if not expected:
+                    reason = out["skipped"][pr.WORKTREE_BUILDS]
+                    # The log line names both measures, not only the GiB floor.
+                    self.assertIn("300.0 GiB free, at or above 200 GiB", reason)
+                    self.assertIn("80.0% used, below 90%", reason)
 
 
 class EndToEnd(Isolated):

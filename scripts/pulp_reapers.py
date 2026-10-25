@@ -31,8 +31,11 @@ When enabled, every pass:
      ModuleNotFoundError on the first candidate.
   2. runs `clean_build_cov.sh` (cheap: a two-level find) every pass, and
   3. runs `clean_worktree_builds.sh` only while the volume holding
-     `worktrees_root` is below `pressure_free_gb`, because that one walks every
-     candidate build tree in full and fetches origin.
+     `worktrees_root` is under pressure, because that one walks every
+     candidate build tree in full and fetches origin. Pressure is the same
+     test disk_reclaim applies to its own build dirs (`under_pressure`): free
+     space below `pressure_free_gb`, or the volume at least
+     `--pressure-used-percent` used (the installed agent sets 90).
 
 Both run with PULP_WORKTREES_ROOT=worktrees_root, `--yes` under `--fix` and in
 their own dry-run mode otherwise. Each run is recorded with the free space of
@@ -269,6 +272,35 @@ def free_bytes(path: pathlib.Path, deadline: float | None = None) -> int | None:
                                description=f"disk usage {path}", deadline=deadline)
     except OSError:
         return None
+
+
+def used_percent(path: pathlib.Path, deadline: float | None = None) -> float | None:
+    """Percent of `path`'s volume in use, or None when it cannot be read."""
+    try:
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", deadline=deadline)
+    except OSError:
+        return None
+    return 100.0 * usage.used / usage.total if usage.total else None
+
+
+def under_pressure(free: int | None, used: float | None, *, pressure_free_gb: float,
+                   pressure_used_percent: float) -> bool:
+    """Whether a volume is under disk pressure; shared with disk_reclaim.
+
+    Free space below the floor, or (when the percent trigger is on) at least
+    that percent used. A large volume reaches the readiness limit
+    (DISK_PROBLEM_PERCENT in macos_fleet_lanes) with hundreds of GiB free: m3's
+    3.6 TiB Workshop volume did at ~290 GiB, so the GiB test alone never fired
+    while the host was already out of the fleet. Unknown free space is never
+    pressure, whatever the percent says.
+    """
+    if free is None:
+        return False
+    return (free < pressure_free_gb * GIB
+            or (pressure_used_percent > 0
+                and used is not None
+                and used >= pressure_used_percent))
 
 
 def _git(repo: pathlib.Path, *args: str, runner: Runner = subprocess.run,
@@ -600,13 +632,27 @@ def same_origin_worktrees(root: pathlib.Path, origin: str, runner: Runner = subp
     return matching, seen, unreadable, clones
 
 
+def no_pressure_reason(free: int | None, used: float | None, *, pressure_free_gb: float,
+                       pressure_used_percent: float) -> str:
+    """Why the worktree reaper did not run, naming both measures."""
+    if free is None:
+        return "free space unreadable"
+    percent = ("used percent unreadable" if used is None
+               else f"{used:.1f}% used")
+    trigger = (f"below {pressure_used_percent:g}%" if pressure_used_percent > 0
+               else "percent trigger off")
+    return (f"no pressure: {free / GIB:.1f} GiB free, at or above "
+            f"{pressure_free_gb:g} GiB; {percent}, {trigger}")
+
+
 def run(*, fix: bool, profile: pathlib.Path | None = None,
         state_dir: pathlib.Path | None = None,
         runner: Runner = subprocess.run, stream: Any = None,
         reaper: Callable[..., dict[str, Any]] = run_reaper,
         discovered_roots: list[pathlib.Path] | None = None,
         deadline: float | None = None,
-        skip_reason: str | None = None) -> dict[str, Any]:
+        skip_reason: str | None = None,
+        pressure_used_percent: float = 0.0) -> dict[str, Any]:
     """One pass of the opt-in Pulp reapers. Never raises, never deletes itself."""
     profile = profile or default_profile_path()
     settings, why = load_settings(profile)
@@ -616,6 +662,7 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
     report: dict[str, Any] = {
         "enabled": True, "repo": settings["repo"], "worktrees_root": str(root),
         "pressure_free_gb": settings["pressure_free_gb"],
+        "pressure_used_percent": pressure_used_percent,
         "worktree_build_idle_hours": settings["worktree_build_idle_hours"], "runs": [],
         "reclaimed_bytes": 0,
         # Present from the start, so "discovery did not run" reads differently
@@ -663,10 +710,13 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         report["error"] = f"worktrees_root {root} is not a directory"
         return report
     free = free_bytes(root, deadline)
+    used = used_percent(root, deadline) if free is not None else None
     report["free_bytes_before"] = free
+    report["used_percent_before"] = used
     # Unknown free space is not pressure: guessing "full" would run the heavier
     # reaper on exactly the host whose volume we cannot read.
-    pressure = free is not None and free < settings["pressure_free_gb"] * GIB
+    pressure = under_pressure(free, used, pressure_free_gb=settings["pressure_free_gb"],
+                              pressure_used_percent=pressure_used_percent)
     report["pressure"] = pressure
     if checkout is None:
         report["error"] = detail
@@ -674,9 +724,9 @@ def run(*, fix: bool, profile: pathlib.Path | None = None,
         return report
     wanted = [BUILD_COV] + ([WORKTREE_BUILDS] if pressure else [])
     if not pressure:
-        report["skipped"] = {WORKTREE_BUILDS: "no pressure: free space is at or above "
-                             f"{settings['pressure_free_gb']:g} GiB"
-                             if free is not None else "free space unreadable"}
+        report["skipped"] = {WORKTREE_BUILDS: no_pressure_reason(
+            free, used, pressure_free_gb=settings["pressure_free_gb"],
+            pressure_used_percent=pressure_used_percent)}
     def invoke_reaper(script: pathlib.Path, *, worktrees_root: str,
                       measure_path: pathlib.Path, timeout_s: float) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
