@@ -2,9 +2,11 @@
 """Pre-mint outcomes per lane per day: how many booted VMs were retargeted to
 another waiting class and how many were discarded unused.
 
-Every pre-mint denial ends in exactly one of the two. Before retargeting
-existed every denial was a discard, so discards are counted as denials minus
-retargets; that keeps older event logs comparable.
+Every pre-mint denial ends in exactly one of the two. A VM the pre-mint hold
+kept for its own returning class was not discarded either, so it counts with
+the retargets. Before retargeting existed every denial was a discard, so
+discards are counted as denials minus retargets; that keeps older event logs
+comparable.
 
     tartci pre-mint-outcomes [--state-root ~/.tartci/state] [--days N] [--json]
 """
@@ -22,6 +24,7 @@ from typing import Any
 
 DENIED = "assignment_v2_pre_mint_denied"
 RETARGET = "assignment_v2_pre_mint_retarget"
+KEPT = "assignment_v2_pre_mint_kept"
 
 
 def lane_logs(state_root: Path) -> dict[str, Path]:
@@ -38,7 +41,7 @@ def outcomes(logs: dict[str, Path], since: dt.date | None = None) -> list[dict[s
     for lane, path in logs.items():
         with path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
-                if DENIED not in line and RETARGET not in line:
+                if DENIED not in line and RETARGET not in line and KEPT not in line:
                     continue
                 try:
                     record = json.loads(line)
@@ -49,7 +52,7 @@ def outcomes(logs: dict[str, Path], since: dt.date | None = None) -> list[dict[s
                     continue
                 if record.get("event") == DENIED:
                     counts[(lane, day)]["denied"] += 1
-                elif record.get("event") == RETARGET:
+                elif record.get("event") in (RETARGET, KEPT):
                     counts[(lane, day)]["retargets"] += 1
     rows = []
     for (lane, day), value in sorted(counts.items(), key=lambda item: (item[0][1], item[0][0])):

@@ -38,7 +38,7 @@ REPO = "Generous-Corp/pulp"
 LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm"
 
 
-def envelope(verdict: str, reason: str) -> dict[str, object]:
+def envelope(verdict: str, reason: str, observed_at: str = "2026-09-26T05:00:00Z") -> dict[str, object]:
     return {
         "schema_version": 1,
         "command": "runner:admission-clean",
@@ -47,7 +47,7 @@ def envelope(verdict: str, reason: str) -> dict[str, object]:
         "repo": REPO,
         "base": "main",
         "labels": sorted({label.lower() for label in LABELS.split(",")}),
-        "observed_at": "2026-09-26T05:00:00Z",
+        "observed_at": observed_at,
         "blocker_run_ids": [] if verdict == "admit" else [1],
     }
 
@@ -85,13 +85,14 @@ class Harness:
         path.write_text(body, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
-    def stub_shipyard(self, script: list[tuple[str, str, int]], delay: float = 0) -> None:
+    def stub_shipyard(self, script: list[tuple[str, str, int]], delay: float = 0,
+                      observed_at: str = "2026-09-26T05:00:00Z") -> None:
         """One verdict per call in order (the last repeats); each call logs its start."""
         payloads = self.tmp / "payloads"
         payloads.mkdir()
         for index, (verdict, reason, code) in enumerate(script):
             (payloads / f"{index}.json").write_text(
-                json.dumps(envelope(verdict, reason)), encoding="utf-8"
+                json.dumps(envelope(verdict, reason, observed_at)), encoding="utf-8"
             )
             (payloads / f"{index}.rc").write_text(str(code), encoding="utf-8")
         self._exe(
@@ -419,6 +420,47 @@ class FallbackToTheSynchronousCallTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(len(h.call_times()), 1)
+
+    def _reused(self, max_age: str) -> tuple[subprocess.CompletedProcess, Harness]:
+        """Admit once, age that record 50s, then boot on a failed re-read."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        h = Harness(Path(tmp.name))
+        h.stub_shipyard([("admit", "clean", 0), ("error", "revalidation_failed", 1)],
+                        observed_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+        h.stub_gh()
+        age = (
+            "python3 - \"$TARTCI_ADMISSION_CLEAN_STATE_DIR\" <<'PY'\n"
+            "import json, pathlib, sys\n"
+            "(p,) = pathlib.Path(sys.argv[1]).glob('admission-clean/last-admit.*.json')\n"
+            "v = json.loads(p.read_text()); v['observed_epoch'] -= 50\n"
+            "p.write_text(json.dumps(v))\n"
+            "PY\n"
+        )
+        result = h.run(
+            boundary_function()
+            + "tartci_admission_clean \"$REPO\" \"$selected_labels\" >/dev/null\n"
+            + age
+            + "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 1\n"
+            + "rc=0; boundary || rc=$?\nexit $rc\n",
+            env={"TARTCI_BOUNDARY_PROOF_MAX_AGE_SECS": max_age},
+        )
+        return result, h
+
+    def test_a_reused_admit_is_dated_from_its_observation(self) -> None:
+        # 50s old when reused: past a 30s bound however fast the call was, so
+        # the boundary asks again rather than stacking the two windows.
+        result, h = self._reused("30")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(h.call_times()), 3)
+        self.assertIn("admission_parallel_stale", h.event_names())
+        # Control: inside a 120s bound the same reuse is consumed as-is.
+        result, h = self._reused("120")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(h.call_times()), 2)
+        self.assertNotIn("admission_parallel_stale", h.event_names())
+        self.assertIn("admission_reused", h.event_names())
+        self.assertIn("stage=boundary", h.events.read_text())
 
     def test_disabled_knob_runs_the_boundary_synchronously(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
