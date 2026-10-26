@@ -25,7 +25,10 @@ import gate_supply  # noqa: E402
 SCHEMA = "tartci.fleet-capacity/v1"
 GATE_SCHEMA = "tartci.gate-supply/v1"
 SOURCE = "tartci"
-AUTH_METHODS = frozenset({"managed_local", "managed_ssh"})
+# This command emits an integrity-bound observation, not an authenticated
+# attestation.  A caller cannot select a stronger authority by changing a
+# field in the JSON receipt.
+AUTH_METHODS = frozenset({"untrusted_local"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
@@ -36,7 +39,7 @@ REQUIRED = frozenset({
     "schema", "sample_id", "observed_at", "valid_until", "host_id", "host_boot_id",
     "generation", "repo", "target", "profile_sha256", "configured_slots",
     "eligible_slots", "free_slots", "occupied_slots", "in_flight_slots", "unknown_slots",
-    "pool_state", "source", "auth_method", "verification", "evidence_sha256", "census_sha256",
+    "pool_state", "source", "auth_method", "verification", "evidence", "evidence_sha256", "census_sha256",
 })
 OPTIONAL = frozenset({"reason"})
 
@@ -105,7 +108,7 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
                  host_id: str, host_boot: str, generation: str,
                  profile_sha256: str, observed_at: dt.datetime,
                  valid_for_seconds: int = DEFAULT_VALID_FOR_SECONDS,
-                 auth_method: str = "managed_local") -> dict[str, Any]:
+                 auth_method: str = "untrusted_local") -> dict[str, Any]:
     """Build and validate one sample from an already-read gate-supply report."""
     if not REPO.fullmatch(repo):
         raise ValueError("repo must be OWNER/REPO")
@@ -127,6 +130,11 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         raise ValueError("capacity report identity does not match repo/target")
     if str(report.get("host") or "").strip() != host_id:
         raise ValueError("capacity report host does not match host_id")
+    measured_profile = report.get("profile_sha256")
+    if not isinstance(measured_profile, str) or not HEX64.fullmatch(measured_profile):
+        raise ValueError("capacity report profile digest is unavailable")
+    if measured_profile != profile_sha256:
+        raise ValueError("profile digest does not match capacity report")
 
     lanes = report.get("lanes") if isinstance(report.get("lanes"), list) else []
     configured = len(lanes)
@@ -135,21 +143,28 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
     if verdict == "ok" and pool == "on":
         free = _int_or_none(report.get("free"))
         inflight = _int_or_none(report.get("in_flight"))
-        if free is None or inflight is None or free + inflight > configured:
+        occupied = _int_or_none(report.get("occupied"))
+        blocked = [row for row in lanes if isinstance(row, Mapping) and row.get("state") == "blocked"
+                   and not str(row.get("detail") or "").startswith("job-running")]
+        if (free is None or inflight is None or occupied is None
+                or free + inflight + occupied > configured or blocked):
             verification = "unknown"
-            reason = "capacity report is incomplete or inconsistent"
-            free = inflight = eligible = occupied = unknown = None
+            reason = ("capacity report is incomplete or inconsistent" if not blocked
+                      else "capacity report contains blocked lanes")
+            free = inflight = eligible = occupied = None
+            unknown = configured if configured else 1
         else:
             verification = "verified"
             reason = None
-            eligible = free + inflight
-            occupied = inflight
+            eligible = free + inflight + occupied
             unknown = configured - eligible
     else:
         verification = "unknown"
         reason = str(report.get("reason") or f"capacity report verdict={verdict!r} pool={pool!r}")
         free = inflight = eligible = occupied = None
-        unknown = configured if configured else 1
+        if not configured:
+            configured = 1
+        unknown = configured
 
     evidence = dict(report)
     evidence_sha = digest_bytes(canonical_bytes(evidence))
@@ -177,6 +192,7 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         "source": SOURCE,
         "auth_method": auth_method,
         "verification": verification,
+        "evidence": evidence,
         "evidence_sha256": evidence_sha,
         "census_sha256": census_sha,
     }
@@ -216,15 +232,33 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
         item = value.get(key)
         if item is not None and (isinstance(item, bool) or not isinstance(item, int) or item < 0):
             raise ValueError(f"{key} must be a nonnegative integer or null")
+    evidence = value.get("evidence")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("evidence must be an object")
+    if value["evidence_sha256"] != digest_bytes(canonical_bytes(evidence)):
+        raise ValueError("evidence_sha256 does not match evidence")
+    census = {key: evidence.get(key) for key in
+              ("schema", "host", "repo", "class", "verdict", "pool", "lanes")}
+    if value["census_sha256"] != digest_bytes(canonical_bytes(census)):
+        raise ValueError("census_sha256 does not match evidence")
     configured = value["configured_slots"]
-    eligible, free, occupied = value["eligible_slots"], value["free_slots"], value["occupied_slots"]
+    eligible = value["eligible_slots"]
+    free = value["free_slots"]
+    occupied = value["occupied_slots"]
+    inflight = value["in_flight_slots"]
+    unknown = value["unknown_slots"]
     if value["verification"] == "verified":
-        if any(item is None for item in (eligible, free, occupied, value["in_flight_slots"])):
+        if any(item is None for item in (eligible, free, occupied, inflight, unknown)):
             raise ValueError("verified sample cannot have unknown capacity")
-        if not (free + occupied <= eligible <= configured):
-            raise ValueError("capacity counts violate free+occupied <= eligible <= configured")
+        if free + occupied + inflight != eligible or eligible + unknown != configured:
+            raise ValueError("capacity counts do not partition configured slots")
     elif value["verification"] != "unknown":
         raise ValueError("verification must be verified or unknown")
+    else:
+        if any(item is not None for item in (eligible, free, occupied, inflight)):
+            raise ValueError("unknown sample must not advertise capacity counts")
+        if unknown is None or unknown != configured:
+            raise ValueError("unknown sample must mark all configured slots unknown")
     if value["auth_method"] not in AUTH_METHODS:
         raise ValueError("unsupported auth_method")
     if not isinstance(value["pool_state"], str) or value["pool_state"] not in {"on", "draining", "off", "unknown"}:

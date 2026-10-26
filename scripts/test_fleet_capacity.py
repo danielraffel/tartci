@@ -25,8 +25,10 @@ def report(**overrides):
         "verdict": "ok",
         "pool": "on",
         "free": 1,
-        "in_flight": 1,
+        "in_flight": 0,
+        "occupied": 1,
         "lanes": [{"lane": "a"}, {"lane": "b"}],
+        "profile_sha256": "a" * 64,
     }
     value.update(overrides)
     return value
@@ -55,7 +57,7 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(value["schema"], "tartci.fleet-capacity/v1")
         self.assertEqual(value["verification"], "verified")
         self.assertEqual(value["eligible_slots"], 2)
-        self.assertEqual(value["free_slots"] + value["occupied_slots"], 2)
+        self.assertEqual(value["free_slots"] + value["occupied_slots"] + value["in_flight_slots"], 2)
         self.assertNotEqual(value["evidence_sha256"], value["census_sha256"])
         self.assertEqual(value["sample_id"], fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True)))
         self.assertEqual(fc.validate_sample(value), value)
@@ -66,6 +68,30 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertIsNone(value["eligible_slots"])
         self.assertGreaterEqual(value["unknown_slots"], 1)
         fc.validate_sample(value)
+
+    def test_unknown_report_without_lane_census_uses_unknown_sentinel(self):
+        value = self.sample(report=report(verdict="unknown", lanes=[], reason="launchd"))
+        self.assertEqual((value["configured_slots"], value["unknown_slots"]), (1, 1))
+        self.assertIsNone(value["eligible_slots"])
+        fc.validate_sample(value)
+
+    def test_inconsistent_report_fails_closed_with_unknown_count(self):
+        value = self.sample(report=report(free=99, in_flight=99, occupied=0))
+        self.assertEqual(value["verification"], "unknown")
+        self.assertEqual(value["unknown_slots"], value["configured_slots"])
+        fc.validate_sample(value)
+
+    def test_profile_digest_must_match_measured_report(self):
+        with self.assertRaisesRegex(ValueError, "profile digest"):
+            self.sample(profile_sha256="b" * 64)
+
+    def test_evidence_is_reconstructible(self):
+        value = self.sample()
+        self.assertEqual(value["evidence_sha256"], fc.digest_bytes(fc.canonical_bytes(value["evidence"])))
+        value["evidence"]["free"] = 0
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "evidence_sha256"):
+            fc.validate_sample(value)
 
     def test_pool_draining_is_unknown(self):
         value = self.sample(report=report(pool="draining"))
@@ -86,7 +112,20 @@ class FleetCapacityTests(unittest.TestCase):
         value = self.sample()
         value["eligible_slots"] = 1
         value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
-        with self.assertRaisesRegex(ValueError, r"free\+occupied"):
+        with self.assertRaisesRegex(ValueError, "partition"):
+            fc.validate_sample(value)
+
+        value = self.sample()
+        value["unknown_slots"] = 1
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "partition"):
+            fc.validate_sample(value)
+
+    def test_unknown_sample_cannot_carry_partial_counts(self):
+        value = self.sample(report=report(verdict="unknown", reason="blocked"))
+        value["free_slots"] = 0
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "unknown sample"):
             fc.validate_sample(value)
 
     def test_profile_and_identity_are_required(self):
@@ -142,6 +181,7 @@ class FleetCapacityTests(unittest.TestCase):
             profile.write_text("[host]\nname = 'test'\n")
             output = io.StringIO()
             with mock.patch.object(fc.gate_supply, "host_report", return_value=report()), \
+                 mock.patch.object(fc, "profile_digest", return_value="a" * 64), \
                  contextlib.redirect_stdout(output):
                 result = fc.main([
                     "--repo", "Generous-Corp/pulp", "--target", "macos",
@@ -162,6 +202,7 @@ class FleetCapacityTests(unittest.TestCase):
             output = io.StringIO()
             with mock.patch.object(fc.gate_supply, "host_report",
                                    return_value=report(verdict="unknown", reason="stale")), \
+                 mock.patch.object(fc, "profile_digest", return_value="a" * 64), \
                  contextlib.redirect_stdout(output):
                 result = fc.main([
                     "--repo", "Generous-Corp/pulp", "--target", "macos",

@@ -231,7 +231,13 @@ class BuildReportTests(unittest.TestCase):
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "booting", "labels": ""}),
                  "b": (lane_env(2), {"ts": stamp(5), "phase": "job-running"})}
         report = self._report(lanes)
-        self.assertEqual((report["free"], report["in_flight"]), (0, 1))
+        self.assertEqual((report["free"], report["in_flight"], report["occupied"]), (0, 1, 1))
+
+    def test_blocked_only_lanes_are_unknown_not_verified_zero(self) -> None:
+        lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "draining"})}
+        report = self._report(lanes)
+        self.assertEqual(report["verdict"], "unknown")
+        self.assertEqual(report["free"], 0)
 
     def test_an_unreadable_inventory_advertises_no_new_vm_slots(self) -> None:
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "waiting"})}
@@ -246,7 +252,7 @@ class BuildReportTests(unittest.TestCase):
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "inventory-unavailable"})}
         report = self._report(lanes)
         self.assertEqual((report["verdict"], report["free"], report["lanes"][0]["state"]),
-                         ("ok", 0, "blocked"))
+                         ("unknown", 0, "blocked"))
 
     def test_blindness_is_unknown_never_zero(self) -> None:
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "waiting"})}

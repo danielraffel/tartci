@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -299,7 +300,8 @@ def build_report(
     report: dict[str, Any] = {
         "schema": SCHEMA, "host": host or os.uname().nodename.split(".")[0],
         "now": int(now), "repo": repo, "class": class_label,
-        "verdict": "ok", "reason": None, "free": 0, "in_flight": 0, "lanes": [],
+        "verdict": "ok", "reason": None, "free": 0, "in_flight": 0,
+        "occupied": 0, "lanes": [],
     }
 
     def unknown(reason: str) -> dict[str, Any]:
@@ -330,6 +332,11 @@ def build_report(
             return unknown(f"lane {lane.identity}: {detail}")
         if state == "in_flight":
             report["in_flight"] += 1
+        elif state == "blocked" and str(heartbeat.get("phase") or "") == "job-running":
+            # A healthy lane serving a job is occupied capacity.  It cannot
+            # take another job now, but it remains part of the eligible
+            # fleet-hour denominator for an observation receipt.
+            report["occupied"] += 1
         elif state == "free":
             default_cores = (default_cores_reader or (lambda: 1))()
             free_lanes.append(lane_request(env, default_cores, share_cores_reader))
@@ -337,6 +344,11 @@ def build_report(
         report["reason"] = f"pool {pool}"
         return report
     if not free_lanes:
+        if report["lanes"] and report["in_flight"] == 0 and report["occupied"] == 0:
+            # Known refusal/drain/blind phases do not prove zero capacity.
+            # Keep the report unknown so a receipt cannot turn them into a
+            # verified zero denominator.
+            return unknown("all matching lanes are blocked")
         return report
     running = (running_reader or (lambda: 0))()
     cap = (cap_reader or (lambda: DEFAULT_VM_CAP))()
@@ -424,7 +436,7 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
         import host_profile  # noqa: PLC0415
         return gate_reserve_fit.share_cores(host_profile.build_profile(), slots)
 
-    return build_report(
+    report = build_report(
         repo, class_label, lanes=lanes, lane_problems=problems,
         env_reader=lambda label: lane_busy.lane_environment(label, agents_dir),
         capacity_reader=capacity, running_reader=running,
@@ -440,6 +452,16 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
             Path(os.environ.get("TARTCI_MACOS_RESV_DIR") or config / "macos-vm-reservations"),
             time.time()),
     )
+    # Keep profile provenance beside the report that was measured.  A capacity
+    # receipt must never hash an arbitrary caller-supplied file and call it the
+    # profile that produced these counts.
+    import host_profile  # noqa: PLC0415
+    profile = host_profile.fleet_profile_path()
+    try:
+        report["profile_sha256"] = hashlib.sha256(profile.read_bytes()).hexdigest()
+    except (OSError, TypeError):
+        report["profile_sha256"] = None
+    return report
 
 
 # ── decision (fallback host) ────────────────────────────────────────────────
