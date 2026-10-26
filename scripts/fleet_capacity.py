@@ -67,6 +67,12 @@ def profile_digest(path: pathlib.Path) -> str:
     return digest_bytes(path.read_bytes())
 
 
+def canonical_profile_path() -> pathlib.Path:
+    """The same installed profile path that gate_supply measures."""
+    import host_profile  # noqa: PLC0415
+    return host_profile.fleet_profile_path()
+
+
 def host_boot_id() -> str:
     explicit = os.environ.get("TARTCI_HOST_BOOT_ID", "").strip()
     if explicit:
@@ -287,8 +293,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     parser.add_argument("--repo", required=True)
     parser.add_argument("--target", required=True)
-    parser.add_argument("--profile", type=pathlib.Path,
-                        default=pathlib.Path.home() / ".config/tartci/macos-fleet-profile.toml")
+    parser.add_argument("--profile", type=pathlib.Path, default=None,
+                        help="profile to hash (defaults to the installed fleet profile)")
     parser.add_argument("--host-id", default=os.uname().nodename.split(".", 1)[0])
     parser.add_argument("--host-boot-id", default=None)
     parser.add_argument("--generation", default=None)
@@ -297,11 +303,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = gate_supply.host_report(args.repo, args.target)
+        profile = args.profile or canonical_profile_path()
         sample = build_sample(report=report, repo=args.repo, target=args.target,
                               host_id=args.host_id,
                               host_boot=args.host_boot_id or host_boot_id(),
                               generation=args.generation or generation_id(),
-                              profile_sha256=profile_digest(args.profile),
+                              profile_sha256=profile_digest(profile),
                               observed_at=utc_now(), valid_for_seconds=args.valid_for_seconds)
     except Exception as exc:  # noqa: BLE001 - observation must fail closed
         payload = {"schema": SCHEMA, "verification": "unknown", "reason": str(exc)}
