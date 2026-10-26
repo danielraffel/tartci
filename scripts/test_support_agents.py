@@ -35,9 +35,17 @@ THREE = FOUR[:3]
 # Owner-approved bootstrap beyond the VM janitor, per profile. Every profile
 # not named here bootstraps `reap` alone; adding one needs the owner's approval.
 APPROVED_BOOTSTRAP = {
+    # 2026-10-25, owner-approved for every host: converge the disk reclaimer.
+    # Plan-only reclaim never received its own fixes (#661's 90%-used pressure
+    # trigger stayed unrendered fleet-wide), and m3 then m5 left the fleet on
+    # disk_pressure with hundreds of GiB of idle build trees it would have
+    # removed.
+    "m1-macos-fleet.toml": ["reap", "reclaim"],
+    "m3-macos-fleet.toml": ["reap", "reclaim"],
+    "m5-macos-fleet.toml": ["reap", "reclaim"],
     # 2026-10-22: m5studio only. A hand-installed disk watchdog is not
     # reconciled, and m5studio ran none for days.
-    "m5studio-macos-fleet.toml": ["reap", "disk-watchdog"],
+    "m5studio-macos-fleet.toml": ["reap", "disk-watchdog", "reclaim"],
 }
 
 
@@ -598,8 +606,8 @@ class Validate(unittest.TestCase):
                 data, why = sa.load_profile(path)
                 self.assertIsNotNone(data, why)
                 # Whole-table bootstrap stays off until approved; the VM
-                # janitor alone is converged everywhere, plus each
-                # owner-approved per-host addition.
+                # janitor is converged everywhere, plus each owner-approved
+                # addition (the disk reclaimer on every host, 2026-10-25).
                 self.assertEqual(data[sa.TABLE]["bootstrap"],
                                  APPROVED_BOOTSTRAP.get(path.name, ["reap"]),
                                  "only the VM janitor and approved agents are bootstrapped")
