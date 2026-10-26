@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import contextlib
+import io
+import json
+import pathlib
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+import fleet_capacity as fc  # noqa: E402
+
+
+def report(**overrides):
+    value = {
+        "schema": "tartci.gate-supply/v1",
+        "host": "m3",
+        "repo": "Generous-Corp/pulp",
+        "class": "macos",
+        "verdict": "ok",
+        "pool": "on",
+        "free": 1,
+        "in_flight": 1,
+        "lanes": [{"lane": "a"}, {"lane": "b"}],
+    }
+    value.update(overrides)
+    return value
+
+
+class FleetCapacityTests(unittest.TestCase):
+    def setUp(self):
+        self.profile = "a" * 64
+        self.when = dt.datetime(2026, 10, 26, tzinfo=dt.timezone.utc)
+
+    def sample(self, **kwargs):
+        return fc.build_sample(
+            report=kwargs.pop("report", report()),
+            repo="Generous-Corp/pulp",
+            target="macos",
+            host_id=kwargs.pop("host_id", "m3"),
+            host_boot=kwargs.pop("host_boot", "boot-1"),
+            generation=kwargs.pop("generation", "generation-1"),
+            profile_sha256=kwargs.pop("profile_sha256", self.profile),
+            observed_at=kwargs.pop("observed_at", self.when),
+            **kwargs,
+        )
+
+    def test_verified_sample_has_canonical_id_and_capacity_invariants(self):
+        value = self.sample()
+        self.assertEqual(value["schema"], "tartci.fleet-capacity/v1")
+        self.assertEqual(value["verification"], "verified")
+        self.assertEqual(value["eligible_slots"], 2)
+        self.assertEqual(value["free_slots"] + value["occupied_slots"], 2)
+        self.assertNotEqual(value["evidence_sha256"], value["census_sha256"])
+        self.assertEqual(value["sample_id"], fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True)))
+        self.assertEqual(fc.validate_sample(value), value)
+
+    def test_unknown_report_never_becomes_zero_capacity(self):
+        value = self.sample(report=report(verdict="unknown", reason="stale heartbeat", free=0, in_flight=0))
+        self.assertEqual(value["verification"], "unknown")
+        self.assertIsNone(value["eligible_slots"])
+        self.assertGreaterEqual(value["unknown_slots"], 1)
+        fc.validate_sample(value)
+
+    def test_pool_draining_is_unknown(self):
+        value = self.sample(report=report(pool="draining"))
+        self.assertEqual(value["verification"], "unknown")
+        self.assertIsNone(value["free_slots"])
+
+    def test_tamper_and_unknown_fields_refuse(self):
+        value = self.sample()
+        value["free_slots"] = 99
+        with self.assertRaisesRegex(ValueError, "sample_id"):
+            fc.validate_sample(value)
+        value = self.sample()
+        value["unexpected"] = True
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            fc.validate_sample(value)
+
+    def test_inconsistent_verified_counts_refuse(self):
+        value = self.sample()
+        value["eligible_slots"] = 1
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, r"free\+occupied"):
+            fc.validate_sample(value)
+
+    def test_profile_and_identity_are_required(self):
+        with self.assertRaises(ValueError):
+            self.sample(host_boot="")
+        with self.assertRaises(ValueError):
+            self.sample(generation="")
+        with self.assertRaises(ValueError):
+            self.sample(profile_sha256="bad")
+
+    def test_report_identity_is_bound_to_sample_identity(self):
+        with self.assertRaisesRegex(ValueError, "identity"):
+            self.sample(report=report(repo="other/repo"))
+        with self.assertRaisesRegex(ValueError, "host_id"):
+            self.sample(report=report(host="other-host"))
+
+    def test_valid_until_is_bounded(self):
+        value = self.sample(valid_for_seconds=60)
+        self.assertEqual(value["valid_until"], "2026-10-26T00:01:00Z")
+        value["valid_until"] = value["observed_at"]
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "valid_until"):
+            fc.validate_sample(value)
+
+    def test_cli_emits_verified_json_receipt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            with mock.patch.object(fc.gate_supply, "host_report", return_value=report()), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 0)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "verified")
+            self.assertEqual(value["repo"], "Generous-Corp/pulp")
+            self.assertEqual(value["target"], "macos")
+            fc.validate_sample(value)
+
+    def test_cli_returns_unknown_for_unverified_supply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            with mock.patch.object(fc.gate_supply, "host_report",
+                                   return_value=report(verdict="unknown", reason="stale")), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 2)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "unknown")
+            self.assertIsNone(value["eligible_slots"])
+            fc.validate_sample(value)
+
+
+if __name__ == "__main__":
+    unittest.main()

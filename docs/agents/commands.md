@@ -23,6 +23,7 @@ would do; **write** changes host state.
 | `tartci leases status` | read | host lease store |
 | `tartci pool status [--json] [--require-ready] [--require-serving]` | read | admission state and participation |
 | `tartci pool status --usage [--range 24h] [--json]` | read | slot occupancy, idle-with-demand, discards, per-phase VM time |
+| `tartci fleet capacity --repo OWNER/REPO --target LABEL [--profile ABS] [--json]` | read | digest-bound observation-only capacity receipt; unknown state fails closed |
 | `tartci pool log --status` | read | bounded history of pool status |
 | `tartci observe macos [--json] [--no-guest] [--runner NAME]` | read | live macOS VM jobs. Exit 0 trustworthy, 3 coverage shortfall (`BLIND:` or `UNKNOWN:`) |
 | `tartci profile list\|show\|explain\|plan` | read | routing profiles in `profiles/` |

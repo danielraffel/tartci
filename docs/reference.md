@@ -42,6 +42,16 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+**Current eligible capacity** can be exported as a digest-bound, observation-only
+receipt with `tartci fleet capacity --repo OWNER/REPO --target LABEL --json`.
+The `tartci.fleet-capacity/v1` record binds the counts to the exact host boot,
+TartCI generation, profile digest, and gate-supply census. It has a short
+`valid_until` interval and fails closed when the pool, heartbeat, lease store,
+or Tart inventory cannot be verified; an unknown report is never treated as
+zero capacity. The command only reads local state. It does not route jobs,
+change leases, or open admission. Shipyard can import these receipts later to
+measure fleet capacity without inferring it from queue behavior.
+
 **Where a VM's slot time went** is the report's `lifecycle` block. A macOS
 lane writes one `vm_lifecycle` event per VM that reached a runner, at teardown
 (`providers/tart-macos/lifecycle.lib.sh`), with each phase in seconds:
