@@ -323,7 +323,15 @@ class PinnedKeychainTests(Host):
         self.assertTrue(resolved.is_absolute())
         self.assertTrue(resolved.is_file())
         self.assertTrue(os.access(resolved, os.X_OK))
-        self.assertNotEqual(resolved.name, "python3")
+        # Canonical means the symlink chain is followed to the real file, not
+        # that the file is named anything in particular. Where no python3.12 or
+        # python3.11 is on PATH (ubuntu-26.04 ships 3.14) the resolver falls
+        # back to `python3`, and CI's lint job has already replaced
+        # /usr/bin/python3 with the real binary, so its name is `python3`.
+        self.assertFalse(resolved.is_symlink(), resolved)
+        probe = subprocess.run([str(resolved), "-c", "import tomllib"],
+                               capture_output=True, text=True, check=False)
+        self.assertEqual(probe.returncode, 0, probe.stderr)
 
     def test_launcher_builder_reports_missing_interpreter(self) -> None:
         result = subprocess.run(
