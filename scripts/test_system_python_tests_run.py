@@ -285,6 +285,9 @@ ALLOWED = {
      "OffByDefault.test_profile_without_the_table_or_with_it_false_runs_nothing"):
         reads_profile("pulp_reapers.run()"),
     ("test_pulp_reapers.py",
+     "UsedPercentPressure.test_run_takes_the_worktree_reaper_by_either_measure"):
+        reads_profile("pulp_reapers.run()"),
+    ("test_pulp_reapers.py",
      "Validation.test_fleet_profile_loader_uses_the_same_validator"):
         LANES,
     ("test_pulp_reapers.py",
