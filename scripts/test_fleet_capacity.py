@@ -111,6 +111,31 @@ class FleetCapacityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "valid_until"):
             fc.validate_sample(value)
 
+        with self.assertRaisesRegex(ValueError, "between 1 and 3600"):
+            self.sample(valid_for_seconds=fc.MAX_VALID_FOR_SECONDS + 1)
+
+        value = self.sample(valid_for_seconds=60)
+        observed = dt.datetime.fromisoformat(value["observed_at"].replace("Z", "+00:00"))
+        value["valid_until"] = fc.iso(observed + dt.timedelta(seconds=fc.MAX_VALID_FOR_SECONDS + 1))
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "exceeds 3600"):
+            fc.validate_sample(value)
+
+    def test_timestamps_are_timezone_aware_and_not_materially_future(self):
+        value = self.sample()
+        value["observed_at"] = "2026-10-26T00:00:00"
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "timezone"):
+            fc.validate_sample(value)
+
+        value = self.sample()
+        future = fc.utc_now() + dt.timedelta(seconds=fc.MAX_OBSERVATION_FUTURE_SECONDS + 1)
+        value["observed_at"] = fc.iso(future)
+        value["valid_until"] = fc.iso(future + dt.timedelta(seconds=60))
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "future"):
+            fc.validate_sample(value)
+
     def test_cli_emits_verified_json_receipt(self):
         with tempfile.TemporaryDirectory() as directory:
             profile = pathlib.Path(directory) / "profile.toml"

@@ -29,6 +29,9 @@ AUTH_METHODS = frozenset({"managed_local", "managed_ssh"})
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*$")
 TARGET = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+DEFAULT_VALID_FOR_SECONDS = 120
+MAX_VALID_FOR_SECONDS = 3600
+MAX_OBSERVATION_FUTURE_SECONDS = 60
 REQUIRED = frozenset({
     "schema", "sample_id", "observed_at", "valid_until", "host_id", "host_boot_id",
     "generation", "repo", "target", "profile_sha256", "configured_slots",
@@ -101,7 +104,7 @@ def _int_or_none(value: Any) -> int | None:
 def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
                  host_id: str, host_boot: str, generation: str,
                  profile_sha256: str, observed_at: dt.datetime,
-                 valid_for_seconds: int = 120,
+                 valid_for_seconds: int = DEFAULT_VALID_FOR_SECONDS,
                  auth_method: str = "managed_local") -> dict[str, Any]:
     """Build and validate one sample from an already-read gate-supply report."""
     if not REPO.fullmatch(repo):
@@ -114,8 +117,10 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         raise ValueError("profile_sha256 must be a SHA-256 digest")
     if auth_method not in AUTH_METHODS:
         raise ValueError("unsupported auth_method")
-    if valid_for_seconds <= 0:
-        raise ValueError("valid_for_seconds must be positive")
+    if not 0 < valid_for_seconds <= MAX_VALID_FOR_SECONDS:
+        raise ValueError(
+            f"valid_for_seconds must be between 1 and {MAX_VALID_FOR_SECONDS}"
+        )
     if report.get("schema") != GATE_SCHEMA:
         raise ValueError("capacity report has an unsupported schema")
     if report.get("repo") != repo or report.get("class") != target:
@@ -224,17 +229,23 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ValueError("unsupported auth_method")
     if not isinstance(value["pool_state"], str) or value["pool_state"] not in {"on", "draining", "off", "unknown"}:
         raise ValueError("invalid pool_state")
+    parsed_times: dict[str, dt.datetime] = {}
     for field in ("observed_at", "valid_until"):
         try:
             parsed = dt.datetime.fromisoformat(str(value[field]).replace("Z", "+00:00"))
         except ValueError as exc:
             raise ValueError(f"{field} must be RFC3339") from exc
-        if parsed.tzinfo is None:
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
             raise ValueError(f"{field} must include timezone")
-    observed = dt.datetime.fromisoformat(value["observed_at"].replace("Z", "+00:00"))
-    valid_until = dt.datetime.fromisoformat(value["valid_until"].replace("Z", "+00:00"))
+        parsed_times[field] = parsed
+    observed = parsed_times["observed_at"]
+    valid_until = parsed_times["valid_until"]
+    if observed > utc_now() + dt.timedelta(seconds=MAX_OBSERVATION_FUTURE_SECONDS):
+        raise ValueError("observed_at is materially in the future")
     if valid_until <= observed:
         raise ValueError("valid_until must be after observed_at")
+    if valid_until - observed > dt.timedelta(seconds=MAX_VALID_FOR_SECONDS):
+        raise ValueError(f"validity interval exceeds {MAX_VALID_FOR_SECONDS} seconds")
     return dict(value)
 
 
@@ -247,7 +258,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host-id", default=os.uname().nodename.split(".", 1)[0])
     parser.add_argument("--host-boot-id", default=None)
     parser.add_argument("--generation", default=None)
-    parser.add_argument("--valid-for-seconds", type=int, default=120)
+    parser.add_argument("--valid-for-seconds", type=int, default=DEFAULT_VALID_FOR_SECONDS)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
