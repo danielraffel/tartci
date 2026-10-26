@@ -79,10 +79,17 @@ jobs:
     # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
     # that call `python3` get it too. A test that genuinely needs tomllib says
     # so (scripts/testing_support.py) and is skipped rather than failing.
-    runs-on: ubuntu-latest
+    #
+    # Pinned to ubuntu-24.04, not ubuntu-latest: setup-python can only install
+    # a version it has a build of for the runner image, and it has no 3.9 for
+    # ubuntu-26.04, so on the moved `latest` label this job (and with it the
+    # signing_prompt_guard tests it runs under 3.9) fails at setup. The action
+    # is pinned by SHA (v6.3.0, as in review-verdict.yml) for the same reason:
+    # what this job tests must not move under it.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.9"
       - name: Refuse anything but a 3.9 interpreter on PATH
