@@ -7,11 +7,11 @@
 # Softnet with Tart, so it is pinned too.
 
 [tart]
-version = "2.40.1"
-sha256 = "363e2701154a8155cbc1bb6d845430c9b42697d2a186bc49574471ca2877db46"
+version = "2.41.1"
+sha256 = "e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2"
 formula = "openai/tools/tart"
 
 [softnet]
-version = "0.24.0"
-sha256 = "dc208e5037b525e769337c064f5dda83da83b4d1e4a038f434e83050b39a560b"
+version = "0.24.1"
+sha256 = "8ff8ff099c2b5ac1b1128e7999c4a730ac85f486c8a4cb0239eb98432859a0f7"
 formula = "openai/tools/softnet"

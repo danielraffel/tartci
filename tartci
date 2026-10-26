@@ -33,7 +33,8 @@
 #                              # bring THIS host's tartci current (asks y/N; hosts
 #                              # take turns); --status one line, --wait until done
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
-#   tartci fleet-macos tool-freshness [--refresh] [--json] # Shipyard + pulp CLI vs latest release
+#   tartci fleet-macos tool-freshness [--refresh] [--json] # tool freshness vs latest release
+#   tartci fleet-macos tart-pin [--check|--json] # discover the upstream Tart pin (read-only)
 #   tartci job-claim status [--publish]  # this host's live boot claims (peers read --publish)
 #   tartci vm-dhcp <status|probe-now>    # VM DHCP breaker; probe at once after a fix
 #   tartci runner-heal [--fix]           # keep declared persistent runners registered + listening
@@ -358,10 +359,13 @@ cmd_fleet_macos() {
     tool-freshness)
       tartci_toml_python_exec "$HERE/scripts/tool_freshness.py" "$@"
       ;;
+    tart-pin)
+      tartci_toml_python_exec "$HERE/scripts/tart_pin_update.py" --check "$@"
+      ;;
     support-agents)
       tartci_toml_python_exec "$HERE/scripts/support_agents.py" "$@"
       ;;
-    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness|support-agents> ..."; return 2 ;;
+    *) echo "usage: tartci fleet-macos <validate|render|install|advertised-labels|profile-drift|verify-supply|config-verdicts|self-update|tool-freshness|tart-pin|support-agents> ..."; return 2 ;;
   esac
 }
 
