@@ -71,9 +71,24 @@ class FleetCapacityTests(unittest.TestCase):
 
     def test_unknown_report_without_lane_census_uses_unknown_sentinel(self):
         value = self.sample(report=report(verdict="unknown", lanes=[], reason="launchd"))
-        self.assertEqual((value["configured_slots"], value["unknown_slots"]), (1, 1))
+        self.assertEqual((value["configured_slots"], value["unknown_slots"]), (0, 0))
         self.assertIsNone(value["eligible_slots"])
         fc.validate_sample(value)
+
+    def test_canonical_bytes_matches_rust_json_for_utf8_float_and_large_integer(self):
+        value = report(label="café", threshold=1e-6, large=9007199254740993)
+        encoded = fc.canonical_bytes(value).decode()
+        self.assertIn('"label":"café"', encoded)
+        self.assertIn('"threshold":1e-6', encoded)
+        self.assertIn('"large":9007199254740993', encoded)
+
+    def test_evidence_identity_and_slot_bindings_are_checked(self):
+        value = self.sample()
+        value["evidence"]["free"] = 0
+        value["evidence_sha256"] = fc.digest_bytes(fc.canonical_bytes(value["evidence"]))
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "evidence free"):
+            fc.validate_sample(value)
 
     def test_inconsistent_report_fails_closed_with_unknown_count(self):
         value = self.sample(report=report(free=99, in_flight=99, occupied=0))
@@ -90,7 +105,7 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertEqual(value["evidence_sha256"], fc.digest_bytes(fc.canonical_bytes(value["evidence"])))
         value["evidence"]["free"] = 0
         value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
-        with self.assertRaisesRegex(ValueError, "evidence_sha256"):
+        with self.assertRaisesRegex(ValueError, "evidence free"):
             fc.validate_sample(value)
 
     def test_pool_draining_is_unknown(self):
@@ -213,6 +228,43 @@ class FleetCapacityTests(unittest.TestCase):
             value = json.loads(output.getvalue())
             self.assertEqual(value["verification"], "unknown")
             self.assertIsNone(value["eligible_slots"])
+            fc.validate_sample(value)
+
+    def test_cli_emits_importable_unknown_when_report_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            with mock.patch.object(fc.gate_supply, "host_report",
+                                   side_effect=RuntimeError("launchd unavailable")), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 2)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "unknown")
+            self.assertEqual(value["configured_slots"], 0)
+            fc.validate_sample(value)
+
+    def test_cli_emits_importable_unknown_when_profile_changes_during_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            changed = report(profile_sha256=None, verdict="unknown", reason="profile changed")
+            with mock.patch.object(fc.gate_supply, "host_report", return_value=changed), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 2)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "unknown")
             fc.validate_sample(value)
 
 

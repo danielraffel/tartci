@@ -49,7 +49,12 @@ TartCI generation, the profile digest used by the measured gate-supply report,
 and the embedded gate-supply evidence/census. It has a short `valid_until`
 interval and fails closed when the pool, heartbeat, lease store, or Tart
 inventory cannot be verified; an unknown report is never treated as zero
-capacity. The record is an integrity-bound local observation, not an
+capacity. If the command itself cannot read a report it emits an explicit
+unknown receipt with the same identity and digest fields, so downstream
+metrics can retain the gap. A readable inventory still applies the VM cap,
+live reservations, and lease-fit limit; `free` is the minimum of those
+verified bounds, not a promise that a later admission will succeed. The
+record is an integrity-bound local observation, not an
 authenticated attestation (`auth_method` is explicitly `untrusted_local`). The
 command only reads local state. It does not route jobs, change leases, or open
 admission. Shipyard can import these receipts later to measure fleet capacity

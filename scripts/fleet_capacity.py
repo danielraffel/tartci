@@ -54,7 +54,13 @@ def iso(value: dt.datetime) -> str:
 
 def canonical_bytes(value: Mapping[str, Any], *, omit_sample_id: bool = False) -> bytes:
     payload = {key: value[key] for key in sorted(value) if not (omit_sample_id and key == "sample_id")}
-    return (json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True) + "\n").encode()
+    # Keep this byte-for-byte compatible with serde_json::to_vec: UTF-8 is
+    # emitted directly, keys are sorted recursively, and exponent padding is
+    # omitted (serde_json writes ``1e-6`` rather than Python's ``1e-06``).
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    text = re.sub(r"(?P<number>-?(?:\d+(?:\.\d*)?|\.\d+))e(?P<sign>[+-])0+(?P<exp>\d+)(?P<end>(?=[,}\]]|$))",
+                  r"\g<number>e\g<sign>\g<exp>", text)
+    return (text + "\n").encode("utf-8")
 
 
 def digest_bytes(payload: bytes) -> str:
@@ -168,8 +174,6 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         verification = "unknown"
         reason = str(report.get("reason") or f"capacity report verdict={verdict!r} pool={pool!r}")
         free = inflight = eligible = occupied = None
-        if not configured:
-            configured = 1
         unknown = configured
 
     evidence = dict(report)
@@ -241,6 +245,29 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
     evidence = value.get("evidence")
     if not isinstance(evidence, Mapping):
         raise ValueError("evidence must be an object")
+    if evidence.get("schema") != GATE_SCHEMA:
+        raise ValueError("evidence has an unsupported schema")
+    if evidence.get("host") != value["host_id"] or evidence.get("repo") != value["repo"] \
+            or evidence.get("class") != value["target"] \
+            or evidence.get("profile_sha256") != value["profile_sha256"]:
+        raise ValueError("evidence identity or profile does not match sample")
+    lanes = evidence.get("lanes")
+    if not isinstance(lanes, list):
+        raise ValueError("evidence lanes must be an array")
+    if value["configured_slots"] != len(lanes):
+        raise ValueError("configured_slots must match evidence lane count")
+    if not isinstance(evidence.get("verdict"), str) or not isinstance(evidence.get("pool"), str):
+        raise ValueError("evidence verdict and pool are required")
+    if value["pool_state"] != evidence["pool"]:
+        raise ValueError("pool_state must match evidence pool")
+    if value["verification"] == "verified":
+        if evidence["verdict"] != "ok" or evidence["pool"] != "on":
+            raise ValueError("verified sample requires ok/on evidence")
+        for key, expected in (("free", value["free_slots"]),
+                              ("occupied", value["occupied_slots"]),
+                              ("in_flight", value["in_flight_slots"])):
+            if evidence.get(key) != expected:
+                raise ValueError(f"evidence {key} does not match sample")
     if value["evidence_sha256"] != digest_bytes(canonical_bytes(evidence)):
         raise ValueError("evidence_sha256 does not match evidence")
     census = {key: evidence.get(key) for key in
@@ -302,13 +329,39 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
-        report = gate_supply.host_report(args.repo, args.target)
         profile = args.profile or canonical_profile_path()
+        profile_sha = profile_digest(profile)
+        host_boot = args.host_boot_id or host_boot_id() or "unknown"
+        generation = args.generation or generation_id() or "unknown"
+        report = gate_supply.host_report(args.repo, args.target)
+    except Exception as exc:  # noqa: BLE001 - emit an importable unknown receipt
+        # Keep an observation failure useful to the metrics importer.  The
+        # sentinel identities are explicit unknowns, never evidence of a
+        # healthy host or zero capacity.
+        try:
+            profile = args.profile or canonical_profile_path()
+            profile_sha = profile_digest(profile)
+        except Exception:
+            profile_sha = digest_bytes(b"tartci unknown profile")
+        host_boot = args.host_boot_id or host_boot_id() or "unknown"
+        generation = args.generation or generation_id() or "unknown"
+        report = {
+            "schema": GATE_SCHEMA, "host": args.host_id, "repo": args.repo,
+            "class": args.target, "verdict": "unknown", "pool": "unknown",
+            "reason": str(exc), "lanes": [], "profile_sha256": profile_sha,
+        }
+    try:
+        if report.get("verdict") != "ok" and report.get("profile_sha256") != profile_sha:
+            # A report that observed the profile changing is deliberately
+            # unknown. Replace the unusable measured digest with an explicit
+            # sentinel so the unknown observation remains importable without
+            # pretending either profile version was authoritative.
+            profile_sha = digest_bytes(b"tartci unknown profile")
+            report = dict(report)
+            report["profile_sha256"] = profile_sha
         sample = build_sample(report=report, repo=args.repo, target=args.target,
-                              host_id=args.host_id,
-                              host_boot=args.host_boot_id or host_boot_id(),
-                              generation=args.generation or generation_id(),
-                              profile_sha256=profile_digest(profile),
+                              host_id=args.host_id, host_boot=host_boot,
+                              generation=generation, profile_sha256=profile_sha,
                               observed_at=utc_now(), valid_for_seconds=args.valid_for_seconds)
     except Exception as exc:  # noqa: BLE001 - observation must fail closed
         payload = {"schema": SCHEMA, "verification": "unknown", "reason": str(exc)}
