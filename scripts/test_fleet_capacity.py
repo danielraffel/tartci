@@ -77,6 +77,13 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertIsNone(value["eligible_slots"])
         fc.validate_sample(value)
 
+    def test_unrecognized_inventory_never_becomes_verified(self):
+        value = self.sample(report=report(inventory="unknown"))
+        self.assertEqual(value["verification"], "unknown")
+        self.assertEqual(value["reason"], "capacity inventory is unrecognized")
+        self.assertIsNone(value["eligible_slots"])
+        fc.validate_sample(value)
+
     def test_unknown_report_without_lane_census_uses_unknown_sentinel(self):
         value = self.sample(report=report(verdict="unknown", lanes=[], reason="launchd"))
         self.assertEqual((value["configured_slots"], value["unknown_slots"]), (0, 0))
@@ -103,6 +110,13 @@ class FleetCapacityTests(unittest.TestCase):
         value["evidence_sha256"] = fc.digest_bytes(fc.canonical_bytes(value["evidence"]))
         value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
         with self.assertRaisesRegex(ValueError, "available capacity inventory"):
+            fc.validate_sample(value)
+
+        value = self.sample()
+        value["evidence"]["inventory"] = "unknown"
+        value["evidence_sha256"] = fc.digest_bytes(fc.canonical_bytes(value["evidence"]))
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "recognized capacity inventory"):
             fc.validate_sample(value)
 
     def test_inconsistent_report_fails_closed_with_unknown_count(self):

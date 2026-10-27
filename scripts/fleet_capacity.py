@@ -152,8 +152,11 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
     configured = len(lanes)
     verdict = report.get("verdict")
     pool = report.get("pool")
-    inventory_unavailable = report.get("inventory") == "unavailable"
-    if verdict == "ok" and pool == "on" and not inventory_unavailable:
+    inventory_present = "inventory" in report
+    inventory = report.get("inventory")
+    inventory_unavailable = inventory == "unavailable"
+    inventory_recognized = not inventory_present or inventory in {"tart", "unavailable"}
+    if verdict == "ok" and pool == "on" and inventory_recognized and not inventory_unavailable:
         free = _int_or_none(report.get("free"))
         inflight = _int_or_none(report.get("in_flight"))
         occupied = _int_or_none(report.get("occupied"))
@@ -175,6 +178,7 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         verification = "unknown"
         reason = str(report.get("reason") or (
             "capacity inventory is unavailable" if inventory_unavailable
+            else "capacity inventory is unrecognized" if inventory_present
             else f"capacity report verdict={verdict!r} pool={pool!r}"
         ))
         free = inflight = eligible = occupied = None
@@ -269,6 +273,8 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
             raise ValueError("verified sample requires ok/on evidence")
         if evidence.get("inventory") == "unavailable":
             raise ValueError("verified sample requires available capacity inventory")
+        if "inventory" in evidence and evidence["inventory"] != "tart":
+            raise ValueError("verified sample requires a recognized capacity inventory")
         for key, expected in (("free", value["free_slots"]),
                               ("occupied", value["occupied_slots"]),
                               ("in_flight", value["in_flight_slots"])):
