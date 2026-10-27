@@ -148,7 +148,12 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
     if measured_profile != profile_sha256:
         raise ValueError("profile digest does not match capacity report")
 
-    lanes = report.get("lanes") if isinstance(report.get("lanes"), list) else []
+    lanes_value = report.get("lanes")
+    lanes = lanes_value if isinstance(lanes_value, list) else []
+    lanes_malformed = "lanes" in report and (
+        not isinstance(lanes_value, list)
+        or any(not isinstance(row, Mapping) for row in lanes)
+    )
     configured = len(lanes)
     verdict = report.get("verdict")
     pool = report.get("pool")
@@ -156,7 +161,8 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
     inventory = report.get("inventory")
     inventory_unavailable = inventory == "unavailable"
     inventory_recognized = not inventory_present or inventory in {"tart", "unavailable"}
-    if verdict == "ok" and pool == "on" and inventory_recognized and not inventory_unavailable:
+    if (verdict == "ok" and pool == "on" and inventory_recognized
+            and not inventory_unavailable and not lanes_malformed):
         free = _int_or_none(report.get("free"))
         inflight = _int_or_none(report.get("in_flight"))
         occupied = _int_or_none(report.get("occupied"))
@@ -179,6 +185,7 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
         reason = str(report.get("reason") or (
             "capacity inventory is unavailable" if inventory_unavailable
             else "capacity inventory is unrecognized" if inventory_present
+            else "capacity report lane census is malformed" if lanes_malformed
             else f"capacity report verdict={verdict!r} pool={pool!r}"
         ))
         free = inflight = eligible = occupied = None
@@ -271,6 +278,8 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
     if value["verification"] == "verified":
         if evidence["verdict"] != "ok" or evidence["pool"] != "on":
             raise ValueError("verified sample requires ok/on evidence")
+        if any(not isinstance(lane, Mapping) for lane in lanes):
+            raise ValueError("verified sample requires object lane entries")
         if evidence.get("inventory") == "unavailable":
             raise ValueError("verified sample requires available capacity inventory")
         if "inventory" in evidence and evidence["inventory"] != "tart":
