@@ -16,7 +16,7 @@ disk_gb = 150
 
 [source]
 repository = "https://github.com/Generous-Corp/pulp"
-commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
+commit     = "951cdd9042909575d0d6ffc6751b9f7279c4200b"
 manifest   = "tools/deps/manifest.json"
 
 [toolchain]
@@ -52,12 +52,12 @@ packages = [
 # without it, the pulp fmt shell-out test hangs until its timeout.
 
 # BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# source_sha256 = 3cbe8514fd7c32c4d2bb544618182804766356a96d57110f4df82d02cb16d4a6
 # generated_platform = macos
 # END GENERATED PULP TOOLCHAIN
 
 [skia]
-release = "chrome/m153"
+release = "chrome/m157"
 variant = "darwin-arm64-gpu"
 path    = "/Users/admin/pulp-skia-build"
 
@@ -68,7 +68,7 @@ variant     = "darwin-arm64"
 [golden_readiness]
 # TartCI does not yet have a receipt-backed consumer that can prove an existing
 # macOS golden contains this exact source/provider generation. Keep this
-# explicitly unready: list/resize/tag are inventory operations, not m153 proof.
+# explicitly unready: list/resize/tag are inventory operations, not m157 proof.
 status = "unready"
 reason = "requires receipt-backed exact-golden verification before promotion"
 
