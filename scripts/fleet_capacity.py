@@ -152,7 +152,8 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
     configured = len(lanes)
     verdict = report.get("verdict")
     pool = report.get("pool")
-    if verdict == "ok" and pool == "on":
+    inventory_unavailable = report.get("inventory") == "unavailable"
+    if verdict == "ok" and pool == "on" and not inventory_unavailable:
         free = _int_or_none(report.get("free"))
         inflight = _int_or_none(report.get("in_flight"))
         occupied = _int_or_none(report.get("occupied"))
@@ -172,7 +173,10 @@ def build_sample(*, report: Mapping[str, Any], repo: str, target: str,
             unknown = configured - eligible
     else:
         verification = "unknown"
-        reason = str(report.get("reason") or f"capacity report verdict={verdict!r} pool={pool!r}")
+        reason = str(report.get("reason") or (
+            "capacity inventory is unavailable" if inventory_unavailable
+            else f"capacity report verdict={verdict!r} pool={pool!r}"
+        ))
         free = inflight = eligible = occupied = None
         unknown = configured
 
@@ -263,6 +267,8 @@ def validate_sample(value: Mapping[str, Any]) -> dict[str, Any]:
     if value["verification"] == "verified":
         if evidence["verdict"] != "ok" or evidence["pool"] != "on":
             raise ValueError("verified sample requires ok/on evidence")
+        if evidence.get("inventory") == "unavailable":
+            raise ValueError("verified sample requires available capacity inventory")
         for key, expected in (("free", value["free_slots"]),
                               ("occupied", value["occupied_slots"]),
                               ("in_flight", value["in_flight_slots"])):
@@ -351,13 +357,16 @@ def main(argv: list[str] | None = None) -> int:
             "reason": str(exc), "lanes": [], "profile_sha256": profile_sha,
         }
     try:
-        if report.get("verdict") != "ok" and report.get("profile_sha256") != profile_sha:
+        if report.get("profile_sha256") != profile_sha:
             # A report that observed the profile changing is deliberately
-            # unknown. Replace the unusable measured digest with an explicit
-            # sentinel so the unknown observation remains importable without
-            # pretending either profile version was authoritative.
+            # unknown, even if the rest of the report says ok. Replace the
+            # unusable measured digest with an explicit sentinel so the
+            # unknown observation remains importable without pretending either
+            # profile version was authoritative.
             profile_sha = digest_bytes(b"tartci unknown profile")
             report = dict(report)
+            report["verdict"] = "unknown"
+            report["reason"] = "profile changed during capacity observation"
             report["profile_sha256"] = profile_sha
         sample = build_sample(report=report, repo=args.repo, target=args.target,
                               host_id=args.host_id, host_boot=host_boot,

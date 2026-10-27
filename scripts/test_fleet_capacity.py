@@ -69,6 +69,14 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertGreaterEqual(value["unknown_slots"], 1)
         fc.validate_sample(value)
 
+    def test_unavailable_inventory_never_becomes_verified_zero_capacity(self):
+        value = self.sample(report=report(inventory="unavailable", free=0,
+                                          reason=None))
+        self.assertEqual(value["verification"], "unknown")
+        self.assertEqual(value["reason"], "capacity inventory is unavailable")
+        self.assertIsNone(value["eligible_slots"])
+        fc.validate_sample(value)
+
     def test_unknown_report_without_lane_census_uses_unknown_sentinel(self):
         value = self.sample(report=report(verdict="unknown", lanes=[], reason="launchd"))
         self.assertEqual((value["configured_slots"], value["unknown_slots"]), (0, 0))
@@ -88,6 +96,13 @@ class FleetCapacityTests(unittest.TestCase):
         value["evidence_sha256"] = fc.digest_bytes(fc.canonical_bytes(value["evidence"]))
         value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
         with self.assertRaisesRegex(ValueError, "evidence free"):
+            fc.validate_sample(value)
+
+        value = self.sample()
+        value["evidence"]["inventory"] = "unavailable"
+        value["evidence_sha256"] = fc.digest_bytes(fc.canonical_bytes(value["evidence"]))
+        value["sample_id"] = fc.digest_bytes(fc.canonical_bytes(value, omit_sample_id=True))
+        with self.assertRaisesRegex(ValueError, "available capacity inventory"):
             fc.validate_sample(value)
 
     def test_inconsistent_report_fails_closed_with_unknown_count(self):
@@ -265,6 +280,26 @@ class FleetCapacityTests(unittest.TestCase):
             self.assertEqual(result, 2)
             value = json.loads(output.getvalue())
             self.assertEqual(value["verification"], "unknown")
+            fc.validate_sample(value)
+
+    def test_cli_emits_importable_unknown_when_ok_report_profile_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            changed = report(profile_sha256="b" * 64)
+            with mock.patch.object(fc.gate_supply, "host_report", return_value=changed), \
+                 mock.patch.object(fc, "profile_digest", return_value="a" * 64), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 2)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "unknown")
+            self.assertEqual(value["reason"], "profile changed during capacity observation")
             fc.validate_sample(value)
 
 
