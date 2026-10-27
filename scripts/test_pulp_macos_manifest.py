@@ -24,7 +24,7 @@ class PulpMacosManifest(unittest.TestCase):
 
     def test_release_rust_toolchain_is_baked(self) -> None:
         toolchain = self.manifest["toolchain"]
-        self.assertEqual(toolchain["rust"], "stable")
+        self.assertEqual(toolchain["rust"], "1.97.1")
         self.assertIn("x86_64-apple-darwin", toolchain["rust_targets"])
         self.assertIn("rustup", self.manifest["brew"]["packages"])
 
