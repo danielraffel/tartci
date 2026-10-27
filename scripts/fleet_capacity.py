@@ -379,9 +379,24 @@ def main(argv: list[str] | None = None) -> int:
                               generation=generation, profile_sha256=profile_sha,
                               observed_at=utc_now(), valid_for_seconds=args.valid_for_seconds)
     except Exception as exc:  # noqa: BLE001 - observation must fail closed
-        payload = {"schema": SCHEMA, "verification": "unknown", "reason": str(exc)}
-        print(json.dumps(payload, sort_keys=True))
-        return 2
+        # Normalize malformed-but-readable producer output into the same
+        # importable unknown receipt used when the host report itself fails.
+        # Keep the minimal envelope only when the CLI arguments or local
+        # identity are themselves invalid and no receipt can be constructed.
+        fallback = {
+            "schema": GATE_SCHEMA, "host": args.host_id, "repo": args.repo,
+            "class": args.target, "verdict": "unknown", "pool": "unknown",
+            "reason": str(exc), "lanes": [], "profile_sha256": profile_sha,
+        }
+        try:
+            sample = build_sample(report=fallback, repo=args.repo, target=args.target,
+                                  host_id=args.host_id, host_boot=host_boot,
+                                  generation=generation, profile_sha256=profile_sha,
+                                  observed_at=utc_now(), valid_for_seconds=args.valid_for_seconds)
+        except Exception:
+            payload = {"schema": SCHEMA, "verification": "unknown", "reason": str(exc)}
+            print(json.dumps(payload, sort_keys=True))
+            return 2
     print(json.dumps(sample, sort_keys=True) if args.json else
           f"{sample['verification']} eligible={sample['eligible_slots']} free={sample['free_slots']} "
           f"occupied={sample['occupied_slots']} sample_id={sample['sample_id']}")

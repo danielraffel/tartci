@@ -316,6 +316,26 @@ class FleetCapacityTests(unittest.TestCase):
             self.assertEqual(value["reason"], "profile changed during capacity observation")
             fc.validate_sample(value)
 
+    def test_cli_normalizes_malformed_report_to_importable_unknown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            profile = pathlib.Path(directory) / "profile.toml"
+            profile.write_text("[host]\nname = 'test'\n")
+            output = io.StringIO()
+            malformed = report(repo="Other/repo")
+            with mock.patch.object(fc.gate_supply, "host_report", return_value=malformed), \
+                 mock.patch.object(fc, "profile_digest", return_value="a" * 64), \
+                 contextlib.redirect_stdout(output):
+                result = fc.main([
+                    "--repo", "Generous-Corp/pulp", "--target", "macos",
+                    "--profile", str(profile), "--host-id", "m3",
+                    "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                ])
+            self.assertEqual(result, 2)
+            value = json.loads(output.getvalue())
+            self.assertEqual(value["verification"], "unknown")
+            self.assertIn("identity", value["reason"])
+            fc.validate_sample(value)
+
 
 if __name__ == "__main__":
     unittest.main()
