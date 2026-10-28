@@ -489,6 +489,10 @@ class Config:
     tart_upgrade: bool = False
     tart_canary: str | None = None
     tart_soak_seconds: int = tart_pin.DEFAULT_SOAK_SECONDS
+    # [launcher] auto_apply: acknowledge a launcher change by itself when the
+    # target is on main and keeps the installed Team ID. false is the owner's
+    # override: every launcher change waits for launcher-change-ack again.
+    launcher_auto_apply: bool = True
 
     @property
     def checkout(self) -> Path:
@@ -661,6 +665,14 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
             cfg.tart_upgrade = tart.get("upgrade", False)
             cfg.tart_canary = str(tart.get("canary", "")).strip() or None
             cfg.tart_soak_seconds = tart.get("soak_seconds", tart_pin.DEFAULT_SOAK_SECONDS)
+        launcher = data.get("launcher")
+        if launcher is not None:
+            if not isinstance(launcher, dict) or any(
+                    key != "auto_apply" or not isinstance(value, bool)
+                    for key, value in launcher.items()):
+                raise ConfigError(f"{path}: [launcher] {launcher!r} is not valid (keys: "
+                                  "auto_apply = true|false)")
+            cfg.launcher_auto_apply = launcher.get("auto_apply", True)
     return cfg
 
 
@@ -1863,9 +1875,10 @@ def launcher_change_refusal(cfg: Config, target: str, installed: str,
     to a new commit replaces TartCILauncher.app, and replacing it can reset
     its Removable Volumes consent. On a host whose Tart store is on an
     external volume the helper's open() then blocks and every lane stops. The
-    update proceeds only once an operator has acknowledged that exact target
-    commit in launcher-change-ack (the bundle digest cannot be the key: each
-    build is re-signed with a new timestamp). Checked before any drain.
+    update proceeds only once that exact target commit is acknowledged, in
+    launcher-change-ack by an operator or automatically (auto_acknowledge);
+    the bundle digest cannot be the key: each build is re-signed with a new
+    timestamp. Checked before any drain.
     """
     if launch_helper(cfg) is None or refresh or target == installed:
         return None
@@ -2015,6 +2028,119 @@ def v2_ack_refusal(cfg: Config, change: LauncherChange) -> str | None:
     return (f"launcher change needs consent ({'; '.join(change.differs)}): a new TartCI "
             "Launcher can reset its Removable Volumes consent; acknowledge with: "
             f"echo '{change.ack}' > {launcher_ack_path(cfg)}")
+
+
+LAUNCHER_AUTO_APPLY_NAME = "launcher-auto-apply.json"
+REMOVABLE_VOLUMES_GRANT = ("grant Removable Volumes to TartCI Launcher (System Settings > "
+                           "Privacy & Security > Files and Folders)")
+
+
+def bundle_team(sys_: System, path: str | Path) -> str | None:
+    """The TeamIdentifier `codesign -dv` reports for a signed bundle."""
+    detail = sys_.run(["codesign", "-d", "--verbose=2", str(path)])
+    match = re.search(r"^TeamIdentifier=(\S+)$", detail.text or "", re.MULTILINE)
+    return match.group(1) if match and match.group(1) != "not" else None
+
+
+def launcher_auto_apply_hold(cfg: Config) -> dict | None:
+    """The target whose automatic launcher change failed, with why and how to
+    take it by hand; None when nothing is held."""
+    value = _read_json(cfg.state_dir / LAUNCHER_AUTO_APPLY_NAME)
+    return value if isinstance(value, dict) and value.get("target") else None
+
+
+def hold_launcher_auto_apply(cfg: Config, sys_: System, target: str, outcome: str,
+                             detail: str, ack: str) -> None:
+    """Never auto-acknowledge `target` again: the next attempt at it waits for
+    launcher-change-ack, and a new target is tried automatically once."""
+    _write_json(cfg.state_dir / LAUNCHER_AUTO_APPLY_NAME, {
+        "target": target, "outcome": outcome, "at": _iso(sys_.now()), "detail": detail[:500],
+        "acknowledge": f"echo '{ack}' > {launcher_ack_path(cfg)}"})
+
+
+def launcher_auto_ack_refusal(cfg: Config, sys_: System, target: str,
+                              refresh: str | None) -> str | None:
+    """Why this launcher change may not be acknowledged automatically, or None.
+
+    Daniel approved acknowledging routine launcher changes (2026-10-27): a
+    target on tartci main, signed for the installed app's team (checked by
+    the callers), not one whose automatic apply already failed here.
+    """
+    if not cfg.launcher_auto_apply:
+        return f"launcher auto-apply is off ([launcher] auto_apply = false in {cfg.settings})"
+    if refresh:
+        return "a same-generation refresh (" + refresh[:120] + ") is acknowledged by a person"
+    held = launcher_auto_apply_hold(cfg)
+    if held and held.get("target") == target:
+        return (f"the automatic apply of {target[:12]} already failed here "
+                f"({held.get('outcome')} at {held.get('at')}); held until the target changes")
+    on_main = sys_.run(["git", "-C", str(cfg.checkout), "merge-base", "--is-ancestor",
+                        target, "origin/main"])
+    if on_main.rc != 0:
+        return f"{target[:12]} is not on tartci origin/main"
+    return None
+
+
+def auto_acknowledge(cfg: Config, sys_: System, receipt: Receipt, target: str,
+                     refresh: str | None, *, key: str, team: str | None, live_bundle: str,
+                     live_team: str | None = None, why_not: str | None = None) -> bool:
+    """Acknowledge this launcher change in the receipt instead of
+    launcher-change-ack when launcher_auto_ack_refusal allows it and the new
+    app keeps the installed Team ID. `team` None means the build decides
+    (verify_auto_ack_team); a v1 launcher is signed by the live identity."""
+    why_not = why_not or launcher_auto_ack_refusal(cfg, sys_, target, refresh)
+    if why_not is None and live_team is None:
+        live_team = bundle_team(sys_, live_bundle)
+    if why_not is None and live_team is None:
+        why_not = "the installed launcher's Team ID is unreadable"
+    if why_not is None and team is not None and team != live_team:
+        why_not = f"the new launcher is for team {team}, the installed one for {live_team}"
+    if why_not is not None:
+        receipt.value["launcher_ack"] = {"mode": "manual", "auto_refused": why_not}
+        receipt.step("launcher-ack", f"not acknowledged automatically: {why_not}", ok=False)
+        return False
+    receipt.value["launcher_ack"] = {
+        "mode": "automatic", "target": target, "key": key, "at": _iso(sys_.now()),
+        "reason": "target is on tartci main and the new launcher keeps the installed Team ID",
+        "team_id": team, "installed_team_id": live_team}
+    receipt.step("launcher-ack", f"acknowledged automatically: {target[:12]} is on tartci main; "
+                 f"team {team or '(checked on the built bundle)'} = installed {live_team}")
+    return True
+
+
+def verify_auto_ack_team(cfg: Config, sys_: System, receipt: Receipt, bundle: Path,
+                         live_team: str | None) -> None:
+    """Before any drain: the built launcher verifies and carries the installed
+    app's TeamIdentifier, or the change waits for a person and this target is
+    held."""
+    ack = receipt.value["launcher_ack"]
+    check = sys_.run(["codesign", "--verify", "--strict", str(bundle)])
+    team = bundle_team(sys_, bundle) if check.rc == 0 else None
+    ack["team_id"] = team
+    if check.rc == 0 and team is not None and team == live_team:
+        receipt.step("launcher-ack-team", f"built launcher verifies, team {team} = installed")
+        return
+    why = (f"codesign --verify failed: {check.text[:200]}" if check.rc != 0 else
+           f"the built launcher is for team {team or 'unknown'}, the installed one for {live_team}")
+    ack.update(mode="manual", auto_refused=why)
+    receipt.step("launcher-ack-team", why, ok=False)
+    hold_launcher_auto_apply(cfg, sys_, str(ack["target"]), "team_mismatch", why, str(ack["key"]))
+    raise Refused(f"launcher change not acknowledged automatically: {why}; refused before drain, "
+                  f"the host keeps serving; acknowledge with: echo '{ack['key']}' > "
+                  f"{launcher_ack_path(cfg)}")
+
+
+def launcher_auto_apply_line(state_dir: Path) -> str | None:
+    """For status: an automatic launcher change rolled back for lost consent
+    and the last attempt is still that one."""
+    held = _read_json(state_dir / LAUNCHER_AUTO_APPLY_NAME) or {}
+    last = _read_json(state_dir / "last.json") or {}
+    if (not held or held.get("outcome") != "probe_failed"
+            or last.get("target") != held.get("target") or last.get("status") == "succeeded"):
+        return None
+    return (f"self-update: LAUNCHER CONSENT LOST for {str(held['target'])[:12]} at "
+            f"{held.get('at')}: {REMOVABLE_VOLUMES_GRANT} once it installs; install it with: "
+            f"{held.get('acknowledge')} (auto-apply rolled back and holds this target)")
 
 
 def launcher_consent_alert(cfg: Config, me: str, target: str, installed: str,
@@ -2170,9 +2296,11 @@ def store_volume_slow(cfg: Config, sys_: System, *, write: bool = True,
     return f"a small write to {store} failed: {result.get('error', 'unknown')}"
 
 
-def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float) -> None:
-    """One issue when a new launcher's volume probe fails and the host is left
-    OFF without a rollback. Best effort: never raises."""
+def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: float,
+                         rolled_back: str | None = None) -> None:
+    """One issue when a new launcher's volume probe fails: the host is left
+    OFF without a rollback, or, after an automatic acknowledgement, rolled
+    back to `rolled_back`. Best effort: never raises."""
     if os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") == "0":
         return
     try:
@@ -2183,6 +2311,8 @@ def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: flo
         def render() -> tuple[str, str]:
             if probe_slow_volume(probe):
                 return render_slow()
+            if rolled_back:
+                return render_rolled_back()
             body = "\n".join([
                 "## What happened",
                 f"`{me}`'s self-update installed `{target[:12]}`, which replaced TartCI "
@@ -2210,6 +2340,39 @@ def launcher_probe_alert(cfg: Config, me: str, target: str, probe: str, now: flo
                 "This issue closes after the next self-update that completes.",
             ])
             title = f"[tartci] {me} is OFF: grant Removable Volumes to TartCI Launcher, then pool on"
+            marker = tartci_incident.marker(me, "launcher_probe_failed", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        def render_rolled_back() -> tuple[str, str]:
+            held = launcher_auto_apply_hold(cfg) or {}
+            body = "\n".join([
+                "## What happened",
+                f"`{me}`'s self-update acknowledged a new TartCI Launcher for `{target[:12]}` "
+                "automatically (on main, same Team ID), installed it, and `pool on` failed the "
+                f"launch-helper volume probe. It rolled back to `{rolled_back[:12]}` and holds "
+                "this target: it will not retry it by itself.", "",
+                "## Evidence",
+                f"- pool on: `{probe.strip()[:600]}`",
+                "- the self-update receipt's `launcher-ack`, `pool-on` and `rollback` steps",
+                f"- `{cfg.state_dir / LAUNCHER_AUTO_APPLY_NAME}`", "",
+                "## Likely cause",
+                "The new launcher app did not inherit the per-app Removable Volumes consent, "
+                "so the helper blocks in open() on the external-volume Tart store.", "",
+                "## Fix", "```sh",
+                "# 1. let the next self-update install this launcher",
+                str(held.get("acknowledge") or f"echo {target} > {launcher_ack_path(cfg)}"),
+                "# 2. once it installs: System Settings > Privacy & Security >",
+                "#    Files and Folders > TartCI Launcher > Removable Volumes (on)",
+                "tartci pool on",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. The consent is a person's decision in System Settings.", "",
+                "## How to verify",
+                "`tartci pool on` passes the launch-helper volume probe and the lanes start. "
+                "This issue closes after the next self-update that completes.",
+            ])
+            title = (f"[tartci] {me}: launcher auto-apply rolled back; grant Removable Volumes "
+                     f"to TartCI Launcher for {target[:12]}")
             marker = tartci_incident.marker(me, "launcher_probe_failed", since, since)
             return title, tartci_incident.with_marker(body, marker)
 
@@ -3392,6 +3555,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         layout = planned_layout(cfg)
         consent = (launcher_change_refusal(cfg, target, installed, bool(refresh))
                    if layout != "v2" else None)
+        auto_ack = False
+        live_team = None
+        if consent is not None:
+            live_bundle = launch_helper(cfg)["path"]
+            auto_ack = auto_acknowledge(cfg, sys_, receipt, target, refresh, key=target,
+                                        team=None, live_bundle=live_bundle)
+            if auto_ack:
+                consent = None
+                live_team = receipt.value["launcher_ack"]["installed_team_id"]
         if apply:
             launcher_consent_alert(cfg, me, target, installed, consent, now)
         if consent is not None:
@@ -3424,6 +3596,15 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                 change = v2_launcher_change(cfg, sys_, helper, profile, identity, live_identity)
                 receipt.step("launcher", change.describe())
                 ack = v2_ack_refusal(cfg, change)
+                if ack is not None:
+                    auto_ack = auto_acknowledge(
+                        cfg, sys_, receipt, target, refresh, key=change.ack, team=change.team,
+                        live_bundle=helper["path"], live_team=change.live_team,
+                        why_not=("a move from launcher v1 to v2 is acknowledged by a person"
+                                 if change.live_layout != "v2" else None))
+                    if auto_ack:
+                        ack = None
+                        live_team = change.live_team
                 if apply:
                     launcher_consent_alert(cfg, me, target, installed, ack, now)
                 if ack is not None:
@@ -3534,6 +3715,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             except Refused as exc:
                 raise HostFault(str(exc)) from exc
             prune_dirs(builds, KEEP_BUILDS)
+            if auto_ack:
+                verify_auto_ack_team(cfg, sys_, receipt, bundle, live_team)
             install_args += ["--launch-helper-source", str(bundle)]
             receipt.step("launcher-build", f"{bundle} verified for {target[:12]}")
         if not apply:
@@ -3550,7 +3733,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   profile=profile, install_args=install_args, allow=allow,
                   repository=repository,
                   helper=helper, approval=approval, excluded=survey.excluded,
-                  previous_fleet_source=previous_fleet_source)
+                  previous_fleet_source=previous_fleet_source, auto_ack=auto_ack)
         rc = run.execute()
         if rc == EXIT_OK and receipt.value.get("status") == "succeeded":
             publish_fleet_source_verified(cfg, sys_, selected_source)
@@ -3845,8 +4028,12 @@ class Run:
                  helper: dict | None, approval: Path | None,
                  repository: str | None = None,
                  excluded: list[str] | None = None,
-                 previous_fleet_source: dict[str, Any] | None = None) -> None:
+                 previous_fleet_source: dict[str, Any] | None = None,
+                 auto_ack: bool = False) -> None:
         self.cfg, self.sys, self.receipt = cfg, sys_, receipt
+        # The launcher change was acknowledged automatically, not by a person
+        # waiting to grant Removable Volumes: a lost grant rolls back.
+        self.auto_ack = auto_ack
         self.excluded = list(excluded or [])
         self.me, self.target, self.previous = me, target, previous
         self.profile, self.install_args, self.helper, self.approval = (
@@ -3904,6 +4091,8 @@ class Run:
             try:
                 self._update()
             except LauncherConsent as exc:
+                if self.auto_ack and not probe_slow_volume(str(exc)):
+                    return self._roll_back_lost_consent(str(exc))
                 return self._stop_for_consent(str(exc))
             except TartBroken as exc:
                 return self._stop_tart_broken(str(exc))
@@ -3918,6 +4107,7 @@ class Run:
                 return self._safe_recover(f"{type(exc).__name__} during {self.phase}: {exc}")
             self._record_skew_after_apply()
             close_launcher_probe_alert(self.cfg)
+            (self.cfg.state_dir / LAUNCHER_AUTO_APPLY_NAME).unlink(missing_ok=True)
             self.receipt.finish("succeeded")
             prune_dirs(self.cfg.state_dir / "rollback", KEEP_SNAPSHOTS)
             return EXIT_OK
@@ -4544,7 +4734,8 @@ class Run:
             return None
 
     def _stop_for_consent(self, probe: str) -> int:
-        """Stop with the new launcher installed and the host OFF; never roll back.
+        """Stop with the new launcher installed and the host OFF; never roll back
+        (a person acknowledged this change, or the store volume was slow).
 
         Rolling back replaces TartCILauncher.app a second time, which can reset
         its Removable Volumes consent again; the new bundle stays in place and
@@ -4566,6 +4757,25 @@ class Run:
             f"{self.target[:12]}; STOPPED and NOT rolled back (a rollback replaces the launcher "
             f"again and can reset its consent). {next_step} Probe: {probe[:300]}",
             pool_state=self._pool_state_quiet())
+
+    def _roll_back_lost_consent(self, probe: str) -> int:
+        """An automatically acknowledged launcher failed its volume probe: no
+        person is standing by to grant Removable Volumes, so put the previous
+        generation (its byte-identical launcher, which keeps its grant) back,
+        hold this target, and say what the owner does to take it by hand.
+        """
+        ack = self.receipt.value.get("launcher_ack") or {}
+        ack["outcome"] = "probe_failed_rolled_back"
+        self.receipt.value["launcher_consent_lost"] = True
+        hold_launcher_auto_apply(self.cfg, self.sys, self.target, "probe_failed", probe,
+                                 str(ack.get("key") or self.target))
+        launcher_probe_alert(self.cfg, self.me, self.target, probe, self.sys.now(),
+                             rolled_back=self.previous)
+        return self._safe_recover(
+            f"launcher consent lost: the automatically applied TartCI Launcher for "
+            f"{self.target[:12]} failed its Removable Volumes probe; {REMOVABLE_VOLUMES_GRANT} "
+            f"once it installs (tartci pool status prints the command that installs it); "
+            f"auto-apply holds this target. Probe: {probe[:200]}")
 
     def _stop_tart_broken(self, reason: str) -> int:
         """Stop with the pool OFF: the Tart upgrade failed and its rollback did
@@ -4885,6 +5095,9 @@ def status_lines(state_dir: Path, sys_: System | None = None) -> list[str]:
     scheduled = scheduled_pause(state_dir)
     if scheduled:
         lines.append(scheduled)
+    consent_lost = launcher_auto_apply_line(state_dir)
+    if consent_lost:
+        lines.append(consent_lost)
     last = _read_json(state_dir / "last.json")
     if last and last.get("status") in ("failed", "rolled_back"):
         word = "FAILED" if last["status"] == "failed" else "ROLLED BACK"

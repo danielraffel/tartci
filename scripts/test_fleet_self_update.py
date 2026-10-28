@@ -10,6 +10,7 @@ import io
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -129,6 +130,8 @@ class FakeSystem(su.System):
 
         self.log_lines = f"{T_NEW} {int(NOW - 60)}\n{T_OLD} {int(NOW - 7200)}\n"
         self.ancestor = True
+        self.off_main: set[str] = set()   # commits `merge-base --is-ancestor <c> origin/main` rejects
+        self.built_team: str | None = None  # a built launcher's TeamIdentifier, if not the live one's
         self.cat_file_rc = 0
         self.relay = {"ok": True, "probe": "relay authenticated"}
         self.status_after_on = {"state": "on", "participating": True,
@@ -334,6 +337,8 @@ class FakeSystem(su.System):
             if "cat-file" in a:
                 return su.Result(self.cat_file_rc, "", "missing commit" if self.cat_file_rc else "")
             if "merge-base" in a:
+                if a[-1] == "origin/main":
+                    return su.Result(1 if a[-2] in self.off_main else 0)
                 return su.Result(0 if self.ancestor else 1)
             if "log" in a:
                 # Honour `base..main` the way git does: commits newer than base.
@@ -390,7 +395,9 @@ class FakeSystem(su.System):
         if a[0] == "codesign" and "--extract-certificates" in joined:
             return ok()
         if a[0] == "codesign" and "-d" in a and "--verbose=2" in a:
-            return su.Result(0, "", f"Identifier=x\nTeamIdentifier={self.live_team}\n")
+            team = (self.built_team if self.built_team and "/builds/" in a[-1]
+                    else self.live_team)
+            return su.Result(0, "", f"Identifier=x\nTeamIdentifier={team}\n")
         if a[0] == "codesign" and "--verify" in a:
             return su.Result(self.codesign_verify_rc, "", "" if self.codesign_verify_rc == 0 else "invalid signature")
         if a[0] == "openssl":
@@ -3048,6 +3055,9 @@ class LauncherConsentTests(Base):
 
     def setUp(self) -> None:
         super().setUp()
+        # The owner's override ([launcher] auto_apply = false): every change
+        # waits for the ack. LauncherAutoApplyTests covers the default.
+        self.cfg.launcher_auto_apply = False
         self.ack().write_text(T_OLD + "\n")
 
     def latest(self) -> dict:
@@ -3107,6 +3117,170 @@ class LauncherConsentTests(Base):
         self.ack().unlink()
         with mock.patch.object(su, "launch_helper", return_value=None):
             self.assertIsNone(su.launcher_change_refusal(self.cfg, T_OLD, INSTALLED, False))
+
+
+# danielraffel/agent-skills .fleet/fleet-liveness.sh alerts on the first
+# `tartci pool status` line this matches and posts it as the remedy.
+LIVENESS_SELF_UPDATE_FAIL = re.compile(
+    r"^self-update.*(HALTED|STARVED|WAS LEFT|LAUNCHER CONSENT LOST|"
+    r"LAST ATTEMPT (FAILED|ROLLED BACK))")
+
+
+class LauncherAutoApplyTests(Base):
+    """Plan item 12: a launcher change applies without launcher-change-ack
+    when the target is on tartci main and the new launcher keeps the
+    installed Team ID; a lost Removable Volumes grant rolls back, holds the
+    target and alerts with the remedy."""
+    sealed = True
+    consent_gate = True
+
+    def ack(self) -> Path:
+        return self.home / ".config/tartci/launcher-change-ack"
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def builds(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if a[:2] == ["bash", "scripts/build_macos_launcher.sh"]]
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def hold(self) -> dict | None:
+        return su._read_json(self.cfg.state_dir / su.LAUNCHER_AUTO_APPLY_NAME)
+
+    def fail_probe_until_rollback(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+
+    def test_on_main_with_the_same_team_it_applies_and_records_the_ack(self) -> None:
+        self.assertFalse(self.ack().exists())
+        self.assertUpdated(self.apply())
+        ack = self.latest()["launcher_ack"]
+        self.assertEqual("automatic", ack["mode"])
+        self.assertEqual(T_OLD, ack["target"])
+        self.assertEqual(T_OLD, ack["key"])
+        self.assertEqual(self.sys.live_team, ack["team_id"])
+        self.assertEqual(self.sys.live_team, ack["installed_team_id"])
+        self.assertIn("on tartci main", ack["reason"])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+        self.assertFalse(self.ack().exists(), "no ack file is written")
+        self.assertEqual([], [i for i in self.issues if i[0] == "open"])
+        self.assertIsNone(self.hold())
+
+    def test_an_off_main_target_waits_for_the_ack(self) -> None:
+        self.sys.off_main = {T_OLD}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual([], self.builds())
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+        self.assertIn(f"echo {T_OLD} > {self.ack()}", self.latest()["error"])
+        self.assertIn("not on tartci origin/main", self.latest()["launcher_ack"]["auto_refused"])
+        # Control: the same run on main applies.
+        self.sys.off_main = set()
+        self.assertUpdated(self.apply())
+
+    def test_a_built_launcher_for_another_team_is_refused_before_drain_and_held(self) -> None:
+        self.sys.built_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations(), "refused before any drain")
+        error = self.latest()["error"]
+        self.assertIn(f"is for team ZZZZZZZZZZ, the installed one for {self.sys.live_team}", error)
+        self.assertIn(f"acknowledge with: echo '{T_OLD}' > {self.ack()}", error)
+        self.assertEqual("team_mismatch", self.hold()["outcome"])
+        # Held: the next turn neither auto-acknowledges nor builds again.
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(1, len(self.builds()))
+        self.assertIn("held until the target changes",
+                      self.latest()["launcher_ack"]["auto_refused"])
+        # The printed ack is the owner's way through.
+        self.ack().write_text(T_OLD + "\n")
+        self.assertUpdated(self.apply())
+
+    def test_the_owner_override_requires_the_ack_again(self) -> None:
+        settings = self.home / ".config/tartci/self-update.toml"
+        settings.write_text("[launcher]\nauto_apply = false\n")
+        self.cfg = su.load_config(self.home)
+        self.cfg.poll_seconds, self.cfg.wait_seconds = 45, 600
+        self.assertFalse(self.cfg.launcher_auto_apply)
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn("auto_apply = false", self.latest()["launcher_ack"]["auto_refused"])
+        settings.write_text("[launcher]\nauto_apply = \"no\"\n")
+        with self.assertRaisesRegex(su.ConfigError, "auto_apply = true\\|false"):
+            su.load_config(self.home)
+
+    def test_a_lost_grant_rolls_back_holds_the_target_and_alerts(self) -> None:
+        self.fail_probe_until_rollback()
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("rolled_back", last["status"], last)
+        self.assertTrue(last["error"].startswith("launcher consent lost"), last["error"])
+        self.assertIn("grant Removable Volumes to TartCI Launcher", last["error"])
+        self.assertEqual(INSTALLED, self.sys.running())
+        self.assertEqual(2, len(self.installs()), "forward install, then the rollback")
+        receipt = json.loads(Path(last["receipt"]).read_text())
+        self.assertIs(True, receipt["launcher_consent_lost"])
+        self.assertEqual("probe_failed_rolled_back", receipt["launcher_ack"]["outcome"])
+        hold = self.hold()
+        self.assertEqual((T_OLD, "probe_failed"), (hold["target"], hold["outcome"]))
+        self.assertEqual(f"echo '{T_OLD}' > {self.ack()}", hold["acknowledge"])
+        opened = [title for kind, title in self.issues if kind == "open"]
+        self.assertIn(f"[tartci] studio: launcher auto-apply rolled back; grant Removable "
+                      f"Volumes to TartCI Launcher for {T_OLD[:12]}", opened)
+        # The liveness check's first matching status line carries the remedy
+        # and the exact command.
+        lines = su.status_lines(self.cfg.state_dir, self.sys)
+        alert = next(line for line in lines if LIVENESS_SELF_UPDATE_FAIL.search(line))
+        self.assertIn("LAUNCHER CONSENT LOST", alert)
+        self.assertIn("System Settings > Privacy & Security > Files and Folders", alert)
+        self.assertIn(f"echo '{T_OLD}' > {self.ack()}", alert)
+        # No loop: past the attempt window the same target waits for the ack
+        # (main has not moved; a newer target would be tried once).
+        self.sys.log_lines = f"{T_OLD} {int(NOW - 7200)}\n"
+        self.sys.clock += self.cfg.rate_hours * 3600 + 60
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual(2, len(self.installs()))
+        self.assertIn("held until the target changes",
+                      self.latest()["launcher_ack"]["auto_refused"])
+        self.assertTrue(any(LIVENESS_SELF_UPDATE_FAIL.search(line)
+                            for line in su.status_lines(self.cfg.state_dir, self.sys)))
+
+    def test_a_new_target_after_a_hold_is_tried_automatically(self) -> None:
+        su.hold_launcher_auto_apply(self.cfg, self.sys, "c" * 40, "probe_failed", "x", "c" * 40)
+        self.assertUpdated(self.apply())
+        self.assertEqual("automatic", self.latest()["launcher_ack"]["mode"])
+        self.assertIsNone(self.hold(), "a completed update clears the hold")
+
+    def test_a_slow_volume_after_an_auto_ack_still_stops_without_rollback(self) -> None:
+        # A slow store is not a lost grant, and a rollback would not help.
+        self.sys.on_rc = 1
+        self.sys.on_text = ("fleet readiness: launch helper volume probe timed out after 60s: "
+                            "volume I/O slow; same-dir write from parent took 4200 ms")
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertIn("STOPPED and NOT rolled back", self.last()["error"])
+        self.assertEqual(1, len(self.installs()))
+        self.assertIsNone(self.hold())
+
+    def test_a_failed_rollback_still_names_the_lost_grant(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        last = self.last()
+        self.assertEqual("failed", last["status"])
+        self.assertTrue(last["error"].startswith("launcher consent lost"), last["error"])
+        self.assertIn("ROLLBACK FAILED", last["error"])
+
+    def test_a_plan_reports_the_automatic_ack_and_changes_nothing(self) -> None:
+        self.assertEqual(su.EXIT_OK, self.plan())
+        self.assertEqual([], self.sys.mutations())
+        self.assertEqual("automatic", self.latest()["launcher_ack"]["mode"])
 
 
 class ChildPythonCallSiteTests(unittest.TestCase):
@@ -5526,6 +5700,8 @@ class LauncherV2SelfUpdateTests(Base):
     def setUp(self) -> None:
         super().setUp()
         make_v2_host(self)
+        # The owner's override; LauncherV2AutoApplyTests covers the default.
+        self.cfg.launcher_auto_apply = False
 
     def ack_path(self) -> Path:
         return self.home / ".config/tartci/launcher-change-ack"
@@ -5734,6 +5910,66 @@ class LauncherV2SelfUpdateTests(Base):
         rollback = self.installs()[-1]
         self.assertEqual("v1", rollback[rollback.index("--launcher-layout") + 1])
         self.assertNotIn("--launch-set-identity", rollback)
+
+
+class LauncherV2AutoApplyTests(Base):
+    """Plan item 12 on a launcher v2 host: a launcher change keyed on inputs,
+    identity and team applies by itself when the team is the installed app's."""
+    sealed = True
+    TEAM = "95CX6P84C4"
+
+    def setUp(self) -> None:
+        super().setUp()
+        make_v2_host(self)
+        inputs = self.home / "libexec/TartCILauncher.app/Contents/Resources/inputs.json"
+        inputs.write_text(json.dumps({"schema": 1, "sha256": "e" * 64}))
+
+    def latest(self) -> dict:
+        attempts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(attempts[-1].read_text())
+
+    def installs(self) -> list[list[str]]:
+        return [a for a, _ in self.sys.calls if "--apply" in a and "install" in a]
+
+    def test_changed_inputs_with_the_same_team_apply_automatically(self) -> None:
+        self.assertUpdated(self.apply())
+        ack = self.latest()["launcher_ack"]
+        self.assertEqual(("automatic", self.TEAM, self.TEAM),
+                         (ack["mode"], ack["team_id"], ack["installed_team_id"]))
+        self.assertEqual(f"v2 inputs={'f' * 64} identity={IDENTITY} team={self.TEAM}", ack["key"])
+        self.assertIn("--launch-helper-source", self.installs()[0])
+
+    def test_a_team_change_waits_for_the_ack(self) -> None:
+        self.sys.live_team = "ZZZZZZZZZZ"
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertEqual([], self.sys.mutations())
+        self.assertIn(f"the new launcher is for team {self.TEAM}, the installed one for "
+                      "ZZZZZZZZZZ", self.latest()["launcher_ack"]["auto_refused"])
+        self.assertIn("launcher change needs consent", self.latest()["error"])
+
+    def test_the_move_from_v1_waits_for_the_ack(self) -> None:
+        (self.home / ".config/tartci/macos-fleet-install.json").write_text(json.dumps(
+            {"launch_helper": {"schema": 1}, "support": {"source_commit": INSTALLED}}))
+        (self.home / "libexec/TartCILauncher.app/Contents/Resources/bundle.json").write_text(
+            json.dumps({"source_commit": INSTALLED}))
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("v1 to v2", self.latest()["launcher_ack"]["auto_refused"])
+
+    def test_a_lost_grant_rolls_back_to_the_previous_generation(self) -> None:
+        self.sys.on_rc = 1
+        self.sys.on_text = LauncherProbeStopTests.PROBE
+
+        def recover(argv):
+            if "--apply" in argv and "rollback" in " ".join(argv):
+                self.sys.on_rc = 0
+        self.sys.hook = recover
+        self.assertEqual(su.EXIT_FAILED, self.apply())
+        self.assertEqual("rolled_back", self.last()["status"], self.last())
+        self.assertEqual(INSTALLED, self.sys.running())
+        rollback = self.installs()[-1]
+        self.assertEqual("v2", rollback[rollback.index("--launcher-layout") + 1])
+        hold = su._read_json(self.cfg.state_dir / su.LAUNCHER_AUTO_APPLY_NAME)
+        self.assertIn("v2 inputs=", hold["acknowledge"])
 
 
 class LauncherV2FleetSourceTests(FleetSourceFixture):

@@ -3999,11 +3999,44 @@ the app, and replacing the app can reset it. Without it the helper blocks in
 - The installer leaves an identical live launcher in place. A same-generation
   reinstall, a retried install or a rollback whose bundle matches the live one
   byte for byte does not replace it (`launcher: unchanged, left in place`).
-- Self-update refuses, before any drain, to install a commit that would
-  replace the launcher until an operator acknowledges that commit, and opens
+- **Automatic acknowledgement (default, plan item 12).** Self-update
+  acknowledges a launcher change by itself, before any drain, when all hold:
+  the target commit is on tartci `origin/main`; the new launcher is for the
+  installed app's Team ID (v2: the signing certificate's team against the live
+  app's `codesign -dv` TeamIdentifier; v1 and v2: the built bundle must pass
+  `codesign --verify --strict` and carry the same TeamIdentifier, checked
+  before the drain); it is not a `[fleet_source]` refresh or the move from v1
+  to v2; and this target has not already failed automatically on this host.
+  The receipt's `launcher_ack` records the mode, reason, target, key and both
+  Team IDs, and its `launcher-ack` step says why an acknowledgement was or was
+  not automatic.
+  - A built launcher for another team, or one that does not verify, refuses
+    before the drain and holds the target (`team_mismatch`); the refusal
+    prints the manual ack.
+  - If the automatically applied launcher then fails its volume probe (a lost
+    Removable Volumes grant), self-update rolls back to the previous
+    generation, whose byte-identical launcher keeps its grant, and holds the
+    target in `~/.tartci/state/self-update/launcher-auto-apply.json`
+    (`probe_failed`). The receipt is `rolled_back` with
+    `launcher_consent_lost: true`, `tartci pool status` prints
+    `self-update: LAUNCHER CONSENT LOST ...` with the remedy and the ack
+    command (fleet-liveness alerts on it), and an issue opens
+    (`[tartci] <host>: launcher auto-apply rolled back; ...`). It does not
+    retry that target; a newer target is tried automatically once. To take the
+    held target by hand: write the printed ack, and once it installs grant
+    Removable Volumes and run `tartci pool on`.
+  - A slow store volume is not a lost grant: that probe failure still stops
+    with the host off, as below.
+  - Owner override: `[launcher] auto_apply = false` in
+    `~/.config/tartci/self-update.toml` makes every launcher change wait for
+    the manual ack again; `tartci fleet-macos self-update --pause <reason>`
+    stops all updates.
+- With auto-apply off, or when it does not apply, self-update refuses, before
+  any drain, to install a commit that would replace the launcher until an
+  operator acknowledges that commit, and opens
   `[tartci] <host>: grant Removable Volumes to TartCI Launcher before
   self-update installs <commit>` (`launcher_consent_needed`). Every TartCI
-  commit seals a new bundle, so each update on these hosts needs this step:
+  commit seals a new bundle, so each such update needs this step:
 
   ```sh
   echo <commit> > ~/.config/tartci/launcher-change-ack   # allow this one update
@@ -4040,7 +4073,8 @@ the app, and replacing the app can reset it. Without it the helper blocks in
   installs nothing unsigned and stops with the host off and the reason. A
   failed volume probe after a v2 update that did not change the app rolls back
   normally; stopping with the host off instead of rolling back applies only
-  after a launcher change.
+  after a launcher change a person acknowledged (an automatic one rolls back,
+  above).
 - When the launch-helper volume probe times out, it times the same small write
   from its own (parent) process as a control. A fast control is reported as
   `helper blocked in open(); same-dir write from parent took N ms` with the
