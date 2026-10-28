@@ -20,7 +20,7 @@ A git checkout of this repository is not what a host's supervisors run.
 | `governor.toml` | per-host governor settings (`tartci governor set`) |
 | `macos-fleet-profile.toml` | the host's fleet profile (`TARTCI_FLEET_PROFILE`) |
 | `macos-fleet-install.json` | install receipt: the services `pool on` restores |
-| `self-update.toml` | self-update settings |
+| `self-update.toml` | self-update settings (`[launcher] auto_apply = false` requires the manual launcher ack) |
 | `native-build-participation` | `1` participating, `0` opted out (`TARTCI_POOL_PARTICIPATION_FILE`) |
 | `pool-state` | `on`, `draining` or `off` (`TARTCI_POOL_STATE_FILE`) |
 | `macos-vm-cap` | live macOS guest cap, clamped to 1 to 2 (`TARTCI_MACOS_CAP_FILE`) |
@@ -35,7 +35,7 @@ A git checkout of this repository is not what a host's supervisors run.
 | `state/macos/`, `state/linux/` | per-lane state files and heartbeats; macOS JIT denial receipts (`TARTCI_STATE_DIR`) |
 | `state/job-claims/` | live boot claims |
 | `state/pool-log/events.jsonl` | pool status history |
-| `state/self-update/` | last attempt, waiting ticket |
+| `state/self-update/` | last attempt, waiting ticket, `launcher-auto-apply.json` (a launcher target whose automatic apply failed and is held) |
 | `state/gh-identity.json` | cached GitHub credential identity probe |
 | `state/vm-dhcp/breaker.json` | VM DHCP breaker |
 | `runtime/` | runtime records when `TARTCI_RUNTIME_MEASURE=1` (`TARTCI_RUNTIME_STORE`) |
