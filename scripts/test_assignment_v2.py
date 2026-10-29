@@ -2350,7 +2350,7 @@ elif "/actions/workflows/99/runs" in p.path:
     else:
         print(json.dumps({"total_count": 1, "workflow_runs": [{"id": 101, "name": "Build and Test"}]}))
 elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
-    labels = %s if MATCH else []
+    labels = (%s + [label for label in os.environ.get("FAKE_GH_EXTRA_LABELS", "").split(",") if label]) if MATCH else []
     print(json.dumps({"total_count": 1, "jobs": [
         {"id": 1, "status": "queued" if MATCH else "in_progress", "labels": labels}]}))
 else:
@@ -2373,6 +2373,7 @@ else:
                 FAKE_GH_LEDGER=str(ledger),
                 FAKE_GH_MODE=mode,
                 FAKE_GH_MATCH=str(match),
+                FAKE_GH_EXTRA_LABELS=os.environ.get("FAKE_GH_EXTRA_LABELS", ""),
             )
             result = subprocess.run(
                 [
@@ -2387,6 +2388,39 @@ else:
                 text=True, capture_output=True, check=False, env=environment,
             )
             return result, ledger.read_text().splitlines()
+
+    def test_configured_class_labels_are_allowed_alongside_selected_class(self) -> None:
+        """A merge-group job may carry the sibling PR-head routing label."""
+        environment_extra = "pulp-build-pr-head"
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fake = root / "fake-gh"
+            ledger = root / "ledger"
+            ledger.write_text("")
+            _write_exec(fake, self._GH)
+            environment = dict(
+                os.environ,
+                FAKE_GH_FAIL_ON="never",
+                FAKE_GH_FAIL_TIMES="0",
+                FAKE_GH_LEDGER=str(ledger),
+                FAKE_GH_MODE="transport",
+                FAKE_GH_MATCH="1",
+                FAKE_GH_EXTRA_LABELS=environment_extra,
+            )
+            result = subprocess.run(
+                [
+                    "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                    "--workflow", "Build and Test",
+                    "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
+                    "--require-label", "pulp-build-merge-group",
+                    "--class-labels", "pulp-build-merge-group,pulp-build-pr-head",
+                    "--gh-cli", str(fake), "--retry-backoff", "0",
+                    "--observation-lock-file", str(root / "observation.lock"),
+                ],
+                text=True, capture_output=True, check=False, env=environment,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
 
     def test_a_transient_call_fault_is_retried_rather_than_ending_the_scan(self) -> None:
         """The production defect: one dropped call must not discard the scan."""

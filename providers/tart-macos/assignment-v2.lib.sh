@@ -184,6 +184,7 @@ tartci_assignment_v2_tier_demand(){
     ${tier_args[@]+"${tier_args[@]}"} \
     --labels "$selected_labels" \
     --require-label "$tier_label" \
+    --class-labels "$ASSIGNMENT_V2_CLASS_LABELS" \
     --require-head-repo "$REPO" \
     --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \

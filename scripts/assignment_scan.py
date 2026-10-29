@@ -287,6 +287,17 @@ class AssignmentScanner:
         self.runner_labels = {
             label.strip().lower() for label in args.labels.split(",") if label.strip()
         }
+        # GitHub jobs can carry every configured assignment-class label even
+        # though a runner is selected for one class at a time. Those labels
+        # are valid routing metadata, not an additional capability requirement
+        # for the selected tier. Keep the selected class requirement below,
+        # while allowing the complete configured class set in subset matching.
+        self.class_labels = {
+            label.strip().lower()
+            for label in args.class_labels.split(",")
+            if label.strip()
+        }
+        self.admitted_labels = self.runner_labels | self.class_labels
         self.required_label = args.require_label.strip().lower()
         self.require_head_repo = str(getattr(args, "require_head_repo", "") or "").strip().lower()
         if not self.workflows:
@@ -802,7 +813,7 @@ class AssignmentScanner:
             # generic-only job from being mistaken for event-class demand.
             if self.required_label not in job_labels:
                 continue
-            if not job_labels.issubset(self.runner_labels):
+            if not job_labels.issubset(self.admitted_labels):
                 continue
             if self.args.min_age_seconds:
                 timestamp = str(
@@ -904,6 +915,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workflow", required=True, action="append")
     parser.add_argument("--labels", required=True)
     parser.add_argument("--require-label", required=True)
+    parser.add_argument(
+        "--class-labels",
+        default=os.environ.get("TARTCI_ASSIGNMENT_V2_CLASS_LABELS", ""),
+        help="all configured assignment-class labels accepted as routing metadata",
+    )
     parser.add_argument(
         "--require-head-repo",
         default=os.environ.get("TARTCI_ASSIGNMENT_REQUIRE_HEAD_REPO", ""),
