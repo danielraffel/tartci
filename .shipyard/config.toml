@@ -7,3 +7,9 @@
 # the `review-verdict` status read only this list, never a host file, and
 # refuse every App approval in a review-required repository that has none.
 reviewer_signers = ["pulp-review", "infra-review2"]
+
+[validation]
+# TartCI has no repository skill-sync or version-bump gates. Declare that
+# boundary explicitly so Shipyard does not mistake absent scripts for a valid
+# pass or require placeholder gates.
+pr_gates = false
