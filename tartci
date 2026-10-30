@@ -32,6 +32,7 @@
 #   tartci update [--yes|--plan|--status|--wait] [--json]
 #                              # bring THIS host's tartci current (asks y/N; hosts
 #                              # take turns); --status one line, --wait until done
+#   tartci fleet capacity --repo OWNER/REPO --target LABEL [--profile ABS] [--json] # digest-bound observation-only capacity sample
 #   tartci fleet-macos <validate|render|install> CONFIG # manage dormant generic VM lanes
 #   tartci fleet-macos tool-freshness [--refresh] [--json] # tool freshness vs latest release
 #   tartci fleet-macos tart-pin [--check|--json] # discover the upstream Tart pin (read-only)
@@ -342,6 +343,17 @@ cmd_governor() {
 
 cmd_profile() {
   tartci_toml_exec "$HERE/scripts/profile.py" "$@"
+}
+
+cmd_fleet() {
+  local sub="${1:-help}"; shift || true
+  case "$sub" in
+    capacity) tartci_toml_exec "$HERE/scripts/fleet_capacity.py" "$@" ;;
+    -h|--help|help)
+      echo "usage: tartci fleet capacity --repo OWNER/REPO --target LABEL [--profile ABS] [--json]"
+      ;;
+    *) echo "usage: tartci fleet <capacity> ..." >&2; return 2 ;;
+  esac
 }
 
 cmd_fleet_macos() {
@@ -1659,6 +1671,7 @@ case "${1:-help}" in
   up)      shift; cmd_up "$@" ;;
   serve)   shift; cmd_serve "$@" ;;
   pool)    shift; cmd_pool "$@" ;;
+  fleet)   shift; cmd_fleet "$@" ;;
   launchd) shift; cmd_launchd "$@" ;;
   hooks)   shift; cmd_hooks "$@" ;;
   help|-h|--help) usage ;;

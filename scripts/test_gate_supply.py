@@ -15,6 +15,7 @@ import testing_support  # noqa: E402
 import argparse
 import contextlib
 import datetime as dt
+import hashlib
 import json
 import io
 import re
@@ -231,7 +232,20 @@ class BuildReportTests(unittest.TestCase):
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "booting", "labels": ""}),
                  "b": (lane_env(2), {"ts": stamp(5), "phase": "job-running"})}
         report = self._report(lanes)
-        self.assertEqual((report["free"], report["in_flight"]), (0, 1))
+        self.assertEqual((report["free"], report["in_flight"], report["occupied"]), (0, 1, 1))
+
+    def test_blocked_only_lanes_preserve_fallback_grant(self) -> None:
+        for phase, expected in (("draining", "grant"), ("inventory-unavailable", "grant"),
+                                ("waiting", "hold")):
+            with self.subTest(phase=phase):
+                report = self._report({"a": (lane_env(1), {"ts": stamp(5), "phase": phase})})
+                self.assertEqual(report["verdict"], "ok")
+                self.assertEqual(report["free"], int(phase == "waiting"))
+                decision, _ = gate_supply.decide(
+                    1, [report], {"verdict": "ok", "lanes": []}, own_slot=1,
+                    own_state_dir="/state/me", repo=REPO, class_label=MERGE,
+                    max_age=60, now=time.time())
+                self.assertEqual(decision, expected)
 
     def test_an_unreadable_inventory_advertises_no_new_vm_slots(self) -> None:
         lanes = {"a": (lane_env(1), {"ts": stamp(5), "phase": "waiting"})}
@@ -425,6 +439,46 @@ class HostReportCliTests(unittest.TestCase):
         self.assertEqual([row["state"] for row in report["lanes"]], ["blocked", "free"])
         control = self._report(used_cores=0)
         self.assertEqual(control["free"], 1, control)
+
+
+class ReceiptProfileIsolationTests(unittest.TestCase):
+    def test_placement_reports_do_not_snapshot_receipt_profile(self) -> None:
+        for lanes_only in (False, True):
+            with self.subTest(lanes_only=lanes_only), \
+                    mock.patch("host_profile.fleet_profile_path", side_effect=AssertionError("receipt-only read")), \
+                    mock.patch.object(gate_supply.fleet_lane_discovery, "discover_lanes", return_value=([], [])), \
+                    mock.patch.object(gate_supply, "build_report", return_value={"verdict": "ok", "free": 0}):
+                report = gate_supply.host_report(REPO, MERGE, lanes_only=lanes_only)
+            self.assertEqual(report, {"verdict": "ok", "free": 0})
+
+    def test_receipt_profile_drift_does_not_change_placement_verdict(self) -> None:
+        for change in (False, True):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                profile = Path(directory) / "profile.toml"
+                profile.write_bytes(b"original")
+
+                def build(*args, **kwargs):
+                    if change:
+                        profile.write_bytes(b"changed")
+                    return {"verdict": "ok", "reason": None, "free": 0}
+
+                with mock.patch("host_profile.fleet_profile_path", return_value=profile), \
+                        mock.patch.object(gate_supply.fleet_lane_discovery, "discover_lanes", return_value=([], [])), \
+                        mock.patch.object(gate_supply, "build_report", side_effect=build):
+                    report = gate_supply.host_report(REPO, MERGE, receipt_profile=True)
+                self.assertEqual((report["verdict"], report["reason"], report["free"]), ("ok", None, 0))
+                self.assertEqual(report["profile_sha256"],
+                                 None if change else hashlib.sha256(b"original").hexdigest())
+
+    def test_missing_receipt_profile_does_not_change_placement_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            profile = Path(directory) / "missing.toml"
+            with mock.patch("host_profile.fleet_profile_path", return_value=profile), \
+                    mock.patch.object(gate_supply.fleet_lane_discovery, "discover_lanes", return_value=([], [])), \
+                    mock.patch.object(gate_supply, "build_report", return_value={"verdict": "ok", "free": 0}):
+                report = gate_supply.host_report(REPO, MERGE, receipt_profile=True)
+            self.assertEqual(report["verdict"], "ok")
+            self.assertIsNone(report["profile_sha256"])
 
 
 class FallbackSupervisorTests(RunnerFixture, unittest.TestCase):

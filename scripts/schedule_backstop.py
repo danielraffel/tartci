@@ -106,8 +106,12 @@ def validate_manifest(value: object) -> Dict[str, Any]:
     seen = set()
     workflows = []
     for row in rows:
-        if not isinstance(row, dict) or set(row) != {"file", "cadence_minutes"}:
-            raise BackstopError("manifest workflow rows need exactly file and cadence_minutes")
+        if not isinstance(row, dict) or not set(row).issubset(
+            {"file", "cadence_minutes", "dispatch_inputs"}
+        ) or not {"file", "cadence_minutes"}.issubset(row):
+            raise BackstopError(
+                "manifest workflow rows need file and cadence_minutes, with optional dispatch_inputs"
+            )
         name, cadence = row["file"], row["cadence_minutes"]
         if (
             not isinstance(name, str)
@@ -119,8 +123,20 @@ def validate_manifest(value: object) -> Dict[str, Any]:
             raise BackstopError(f"manifest workflow {name!r} is not a unique bare workflow file")
         if type(cadence) is not int or not (1 <= cadence <= 60 or cadence == DAILY_MINUTES):
             raise BackstopError(f"{name}: cadence_minutes must be an integer in 1..60, or {DAILY_MINUTES}")
+        dispatch_inputs = row.get("dispatch_inputs", {})
+        if not isinstance(dispatch_inputs, dict) or any(
+            not isinstance(key, str)
+            or not key
+            or not isinstance(value, str)
+            or not value
+            for key, value in dispatch_inputs.items()
+        ):
+            raise BackstopError(f"{name}: dispatch_inputs must map non-empty strings")
         seen.add(name)
-        workflows.append({"file": name, "cadence_minutes": cadence})
+        normalized = {"file": name, "cadence_minutes": cadence}
+        if dispatch_inputs:
+            normalized["dispatch_inputs"] = dict(dispatch_inputs)
+        workflows.append(normalized)
     return {"ref": ref, "workflows": workflows}
 
 
@@ -249,8 +265,17 @@ def tick(gh: GhCall, repo: str, state: Dict[str, Any], now: float, apply: bool,
                     report["workflows"].append(entry)
                     continue
                 else:
-                    gh(["api", "-X", "POST",
-                        f"repos/{repo}/actions/workflows/{name}/dispatches", "-f", f"ref={ref}"])
+                    dispatch = [
+                        "api",
+                        "-X",
+                        "POST",
+                        f"repos/{repo}/actions/workflows/{name}/dispatches",
+                        "-f",
+                        f"ref={ref}",
+                    ]
+                    for key, value in row.get("dispatch_inputs", {}).items():
+                        dispatch.extend(["-f", f"inputs[{key}]={value}"])
+                    gh(dispatch)
                     record["last_dispatch"] = now
                     dispatched += 1
             # Dry-run paces its reads exactly as apply would, so its log shows
