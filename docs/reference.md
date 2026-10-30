@@ -42,6 +42,27 @@ bound and the report says so. Per-job VM CPU and IO are not sampled by tartci
 and are omitted. `--peer` pipes the script to the peer's `python3`, so a peer
 needs no tartci update to be read.
 
+**Current eligible capacity** can be exported as a digest-bound, observation-only
+receipt with `tartci fleet capacity --repo OWNER/REPO --target LABEL --json`.
+The `tartci.fleet-capacity/v1` record binds the counts to the exact host boot,
+TartCI generation, the profile digest used by the measured gate-supply report,
+and the embedded gate-supply evidence/census. It has a short `valid_until`
+interval and fails closed when the pool, heartbeat, lease store, or Tart
+inventory cannot be verified; an unknown report is never treated as zero
+capacity. If the command itself cannot read a report it emits an explicit
+unknown receipt with the same identity and digest fields, so downstream
+metrics can retain the gap. A readable inventory still applies the VM cap,
+live reservations, and lease-fit limit; `free` is the minimum of those
+verified bounds, not a promise that a later admission will succeed. The
+record is an integrity-bound local observation, not an
+authenticated attestation (`auth_method` is explicitly `untrusted_local`). The
+command only reads local state. It does not route jobs, change leases, or open
+admission. Shipyard can import these receipts later to measure fleet capacity
+without inferring it from queue behavior.
+Profile snapshots and the stricter blocked-lane checks apply only to capacity
+receipts. Placement supply still reports known blocked lanes as zero free
+slots; profile snapshot drift does not change its fallback decision.
+
 **Where a VM's slot time went** is the report's `lifecycle` block. A macOS
 lane writes one `vm_lifecycle` event per VM that reached a runner, at teardown
 (`providers/tart-macos/lifecycle.lib.sh`), with each phase in seconds:

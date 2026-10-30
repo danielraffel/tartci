@@ -48,6 +48,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import datetime as dt
+import hashlib
 import json
 import os
 import subprocess
@@ -299,7 +300,8 @@ def build_report(
     report: dict[str, Any] = {
         "schema": SCHEMA, "host": host or os.uname().nodename.split(".")[0],
         "now": int(now), "repo": repo, "class": class_label,
-        "verdict": "ok", "reason": None, "free": 0, "in_flight": 0, "lanes": [],
+        "verdict": "ok", "reason": None, "free": 0, "in_flight": 0,
+        "occupied": 0, "lanes": [],
     }
 
     def unknown(reason: str) -> dict[str, Any]:
@@ -330,6 +332,11 @@ def build_report(
             return unknown(f"lane {lane.identity}: {detail}")
         if state == "in_flight":
             report["in_flight"] += 1
+        elif state == "blocked" and str(heartbeat.get("phase") or "") == "job-running":
+            # A healthy lane serving a job is occupied capacity.  It cannot
+            # take another job now, but it remains part of the eligible
+            # fleet-hour denominator for an observation receipt.
+            report["occupied"] += 1
         elif state == "free":
             default_cores = (default_cores_reader or (lambda: 1))()
             free_lanes.append(lane_request(env, default_cores, share_cores_reader))
@@ -377,13 +384,23 @@ def _launchctl_listing() -> str | None:
     return fleet_lane_discovery._launchctl_list()  # noqa: SLF001
 
 
-def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dict[str, Any]:
+def host_report(repo: str, class_label: str, *, lanes_only: bool = False,
+                receipt_profile: bool = False) -> dict[str, Any]:
     """The report for this host, from the real readers.
 
     lanes_only classifies this host's lanes without reading capacity: the
     fallback host needs only its siblings' states, not its own free slots.
+    receipt_profile binds a full report to the canonical profile for capacity
+    receipts without changing the placement verdict.
     """
     home = Path.home()
+    if receipt_profile and not lanes_only:
+        import host_profile  # noqa: PLC0415
+        profile = host_profile.fleet_profile_path()
+        try:
+            profile_before = profile.read_bytes()
+        except OSError:
+            profile_before = None
     agents_dir = Path(os.environ.get("TARTCI_LANE_AGENTS_DIR") or home / "Library/LaunchAgents")
     lanes, problems = fleet_lane_discovery.discover_lanes(agents_dir, list_reader=_launchctl_listing)
     if lanes_only:
@@ -424,7 +441,7 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
         import host_profile  # noqa: PLC0415
         return gate_reserve_fit.share_cores(host_profile.build_profile(), slots)
 
-    return build_report(
+    report = build_report(
         repo, class_label, lanes=lanes, lane_problems=problems,
         env_reader=lambda label: lane_busy.lane_environment(label, agents_dir),
         capacity_reader=capacity, running_reader=running,
@@ -440,6 +457,20 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
             Path(os.environ.get("TARTCI_MACOS_RESV_DIR") or config / "macos-vm-reservations"),
             time.time()),
     )
+    if not receipt_profile:
+        return report
+    # Keep profile provenance beside the report that was measured.  A capacity
+    # receipt must never hash an arbitrary caller-supplied file and call it the
+    # profile that produced these counts.
+    try:
+        profile_after = profile.read_bytes()
+    except (OSError, TypeError):
+        profile_after = None
+    if profile_before is None or profile_after is None or profile_after != profile_before:
+        report["profile_sha256"] = None
+    else:
+        report["profile_sha256"] = hashlib.sha256(profile_before).hexdigest()
+    return report
 
 
 # ── decision (fallback host) ────────────────────────────────────────────────
