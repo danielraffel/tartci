@@ -29,7 +29,13 @@ NOW = sb.parse_time("2026-10-02T17:00:00Z")
 
 def manifest(*rows, ref="main"):
     return {"schema_version": 1, "ref": ref,
-            "workflows": [{"file": f, "cadence_minutes": c} for f, c in rows],
+            "workflows": [
+                ({"file": f, "cadence_minutes": c}
+                 if len(row) == 2 else
+                 {"file": f, "cadence_minutes": c, "dispatch_inputs": row[2]})
+                for row in rows
+                for f, c in [row[:2]]
+            ],
             "excluded": []}
 
 
@@ -111,6 +117,17 @@ class TickTests(unittest.TestCase):
         post = [c for c in gh.calls if c[1] == "-X"][0]
         self.assertEqual(post[-2:], ["-f", "ref=main"])
 
+    def test_apply_dispatches_declared_workflow_inputs(self):
+        gh = FakeGitHub(
+            manifest(("shipyard-merge-steward.yml", 10, {"apply": "true"})),
+            {"shipyard-merge-steward.yml": run_at(11)},
+        )
+        sb.tick(gh, REPO, fresh_state(), NOW, apply=True)
+        post = [c for c in gh.calls if c[1] == "-X"][0]
+        self.assertEqual(
+            post[-4:], ["-f", "ref=main", "-f", "inputs[apply]=true"]
+        )
+
     def test_cadence_is_kept_across_ticks_without_extra_reads(self):
         gh = FakeGitHub(manifest(("a.yml", 30)), {"a.yml": run_at(40)})
         state = fresh_state()
@@ -160,6 +177,19 @@ class ManifestTests(unittest.TestCase):
     def test_rejects_unknown_fields(self):
         bad = manifest(("a.yml", 30))
         bad["extra"] = 1
+        with self.assertRaises(sb.BackstopError):
+            sb.validate_manifest(bad)
+
+    def test_accepts_and_normalizes_dispatch_inputs(self):
+        value = sb.validate_manifest(
+            manifest(("shipyard-merge-steward.yml", 10, {"apply": "true"}))
+        )
+        self.assertEqual(
+            value["workflows"][0]["dispatch_inputs"], {"apply": "true"}
+        )
+
+    def test_rejects_non_string_dispatch_inputs(self):
+        bad = manifest(("shipyard-merge-steward.yml", 10, {"apply": True}))
         with self.assertRaises(sb.BackstopError):
             sb.validate_manifest(bad)
 
