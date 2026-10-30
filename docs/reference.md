@@ -59,6 +59,9 @@ authenticated attestation (`auth_method` is explicitly `untrusted_local`). The
 command only reads local state. It does not route jobs, change leases, or open
 admission. Shipyard can import these receipts later to measure fleet capacity
 without inferring it from queue behavior.
+Profile snapshots and the stricter blocked-lane checks apply only to capacity
+receipts. Placement supply still reports known blocked lanes as zero free
+slots; profile snapshot drift does not change its fallback decision.
 
 **Where a VM's slot time went** is the report's `lifecycle` block. A macOS
 lane writes one `vm_lifecycle` event per VM that reached a runner, at teardown

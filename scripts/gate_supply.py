@@ -344,11 +344,6 @@ def build_report(
         report["reason"] = f"pool {pool}"
         return report
     if not free_lanes:
-        if report["lanes"] and report["in_flight"] == 0 and report["occupied"] == 0:
-            # Known refusal/drain/blind phases do not prove zero capacity.
-            # Keep the report unknown so a receipt cannot turn them into a
-            # verified zero denominator.
-            return unknown("all matching lanes are blocked")
         return report
     running = (running_reader or (lambda: 0))()
     cap = (cap_reader or (lambda: DEFAULT_VM_CAP))()
@@ -389,19 +384,23 @@ def _launchctl_listing() -> str | None:
     return fleet_lane_discovery._launchctl_list()  # noqa: SLF001
 
 
-def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dict[str, Any]:
+def host_report(repo: str, class_label: str, *, lanes_only: bool = False,
+                receipt_profile: bool = False) -> dict[str, Any]:
     """The report for this host, from the real readers.
 
     lanes_only classifies this host's lanes without reading capacity: the
     fallback host needs only its siblings' states, not its own free slots.
+    receipt_profile binds a full report to the canonical profile for capacity
+    receipts without changing the placement verdict.
     """
     home = Path.home()
-    import host_profile  # noqa: PLC0415
-    profile = host_profile.fleet_profile_path()
-    try:
-        profile_before = profile.read_bytes()
-    except OSError:
-        profile_before = None
+    if receipt_profile and not lanes_only:
+        import host_profile  # noqa: PLC0415
+        profile = host_profile.fleet_profile_path()
+        try:
+            profile_before = profile.read_bytes()
+        except OSError:
+            profile_before = None
     agents_dir = Path(os.environ.get("TARTCI_LANE_AGENTS_DIR") or home / "Library/LaunchAgents")
     lanes, problems = fleet_lane_discovery.discover_lanes(agents_dir, list_reader=_launchctl_listing)
     if lanes_only:
@@ -458,6 +457,8 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
             Path(os.environ.get("TARTCI_MACOS_RESV_DIR") or config / "macos-vm-reservations"),
             time.time()),
     )
+    if not receipt_profile:
+        return report
     # Keep profile provenance beside the report that was measured.  A capacity
     # receipt must never hash an arbitrary caller-supplied file and call it the
     # profile that produced these counts.
@@ -465,13 +466,8 @@ def host_report(repo: str, class_label: str, *, lanes_only: bool = False) -> dic
         profile_after = profile.read_bytes()
     except (OSError, TypeError):
         profile_after = None
-    if profile_before is None or profile_after is None:
+    if profile_before is None or profile_after is None or profile_after != profile_before:
         report["profile_sha256"] = None
-    elif profile_after != profile_before:
-        report["profile_sha256"] = None
-        if report.get("verdict") == "ok":
-            report["verdict"] = "unknown"
-            report["reason"] = "fleet profile changed during observation"
     else:
         report["profile_sha256"] = hashlib.sha256(profile_before).hexdigest()
     return report

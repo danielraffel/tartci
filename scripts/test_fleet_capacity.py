@@ -69,6 +69,24 @@ class FleetCapacityTests(unittest.TestCase):
         self.assertGreaterEqual(value["unknown_slots"], 1)
         fc.validate_sample(value)
 
+    def test_blocked_placement_supply_is_unknown_only_in_receipt(self):
+        for detail, verification in (("draining", "unknown"),
+                                     ("inventory-unavailable", "unknown"),
+                                     ("job-running", "verified")):
+            with self.subTest(detail=detail):
+                supply = report(free=0, occupied=int(detail == "job-running"),
+                                lanes=[{"lane": "a", "state": "blocked", "detail": detail}])
+                value = self.sample(report=supply)
+                self.assertEqual(supply["verdict"], "ok")
+                self.assertEqual(value["verification"], verification)
+                if verification == "unknown":
+                    self.assertIsNone(value["eligible_slots"])
+                    self.assertIsNone(value["free_slots"])
+                else:
+                    self.assertEqual(value["eligible_slots"], 1)
+                    self.assertEqual(value["occupied_slots"], 1)
+                fc.validate_sample(value)
+
     def test_unavailable_inventory_never_becomes_verified_zero_capacity(self):
         value = self.sample(report=report(inventory="unavailable", free=0,
                                           reason=None))
@@ -242,7 +260,7 @@ class FleetCapacityTests(unittest.TestCase):
             profile = pathlib.Path(directory) / "profile.toml"
             profile.write_text("[host]\nname = 'test'\n")
             output = io.StringIO()
-            with mock.patch.object(fc.gate_supply, "host_report", return_value=report()), \
+            with mock.patch.object(fc.gate_supply, "host_report", return_value=report()) as host_report, \
                  mock.patch.object(fc, "profile_digest", return_value="a" * 64), \
                  contextlib.redirect_stdout(output):
                 result = fc.main([
@@ -251,11 +269,45 @@ class FleetCapacityTests(unittest.TestCase):
                     "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
                 ])
             self.assertEqual(result, 0)
+            host_report.assert_called_once_with("Generous-Corp/pulp", "macos", receipt_profile=True)
             value = json.loads(output.getvalue())
             self.assertEqual(value["verification"], "verified")
             self.assertEqual(value["repo"], "Generous-Corp/pulp")
             self.assertEqual(value["target"], "macos")
             fc.validate_sample(value)
+
+    def test_cli_profile_snapshot_drift_is_receipt_only(self):
+        for change, expected in ((False, "verified"), (True, "unknown")):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                profile = pathlib.Path(directory) / "profile.toml"
+                profile.write_bytes(b"original")
+                supply = report()
+
+                def build(*args, **kwargs):
+                    if change:
+                        profile.write_bytes(b"changed")
+                    return supply
+
+                output = io.StringIO()
+                with mock.patch("host_profile.fleet_profile_path", return_value=profile), \
+                     mock.patch.object(fc.gate_supply.fleet_lane_discovery, "discover_lanes", return_value=([], [])), \
+                     mock.patch.object(fc.gate_supply, "build_report", side_effect=build), \
+                     contextlib.redirect_stdout(output):
+                    result = fc.main([
+                        "--repo", "Generous-Corp/pulp", "--target", "macos",
+                        "--profile", str(profile), "--host-id", "m3",
+                        "--host-boot-id", "boot-1", "--generation", "gen-1", "--json",
+                    ])
+                self.assertEqual(supply["verdict"], "ok")
+                self.assertEqual(result, 2 if change else 0)
+                value = json.loads(output.getvalue())
+                self.assertEqual(value["verification"], expected)
+                if change:
+                    self.assertIsNone(value["eligible_slots"])
+                    self.assertEqual(value["reason"], "profile changed during capacity observation")
+                else:
+                    self.assertEqual(value["profile_sha256"], hashlib.sha256(b"original").hexdigest())
+                fc.validate_sample(value)
 
     def test_cli_returns_unknown_for_unverified_supply(self):
         with tempfile.TemporaryDirectory() as directory:

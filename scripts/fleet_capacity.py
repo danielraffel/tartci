@@ -354,7 +354,7 @@ def main(argv: list[str] | None = None) -> int:
         profile_sha = profile_digest(profile)
         host_boot = args.host_boot_id or host_boot_id() or "unknown"
         generation = args.generation or generation_id() or "unknown"
-        report = gate_supply.host_report(args.repo, args.target)
+        report = gate_supply.host_report(args.repo, args.target, receipt_profile=True)
     except Exception as exc:  # noqa: BLE001 - emit an importable unknown receipt
         # Keep an observation failure useful to the metrics importer.  The
         # sentinel identities are explicit unknowns, never evidence of a
