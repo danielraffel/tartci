@@ -3,10 +3,12 @@
 # landings sent through ghapp. GitHub-native auto-merge armed before a HOLD
 # never reaches that guard; a required review-verdict status would stop it.
 #
-# Report-only: branch protection does not require this status. The rule runs
-# from a pinned Shipyard commit, never from the pull request's code, on
-# triggers that all run the default branch's definition of this file. See
-# Shipyard's docs/review-verdict-status.md.
+# The job is also the `review-verdict` check run and fails unless the head is
+# allowed (the pinned script exits non-zero on a refusal or any read error),
+# so a required check cannot be green on a refused head. The rule runs from a
+# pinned Shipyard commit, never from the pull request's code, on triggers that
+# all run the default branch's definition of this file. See Shipyard's
+# docs/review-verdict-status.md.
 name: Review verdict
 
 on:
@@ -22,6 +24,9 @@ permissions:
   contents: read
   pull-requests: read
   statuses: write
+  # The script re-runs the head's own run when a comment or review changes the
+  # verdict, so the head's check run follows it without a new push.
+  actions: write
 
 # One group per pull request on every path, so a review's run and a comment's
 # run queue behind each other; a fork's review lists no pull request and
@@ -40,9 +45,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: danielraffel/Shipyard
-          # Shipyard v0.344.1: refuses an App APPROVE stamped `unattributed`,
-          # signers only from the base config, and the rebase carry.
-          ref: 76e5c7032351b4445a8dcad133002eaa8f1887e6
+          # Shipyard PR 1068 (fail the check when the verdict is not allowed
+          # and re-run the head's check on a verdict comment), on top of
+          # v0.344.1's unattributed-APPROVE refusal, base-config signers and
+          # rebase carry. Re-pin to the merge commit once that PR lands.
+          ref: 49cf7f97460401673a67bbf8456254b81aea2fa3
           persist-credentials: false
       - name: Set up Python
         id: python
