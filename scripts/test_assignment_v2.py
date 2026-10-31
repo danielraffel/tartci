@@ -2389,8 +2389,8 @@ else:
             )
             return result, ledger.read_text().splitlines()
 
-    def test_configured_class_labels_are_allowed_alongside_selected_class(self) -> None:
-        """A merge-group job may carry the sibling PR-head routing label."""
+    def test_dual_class_job_is_unservable_and_not_counted_as_demand(self) -> None:
+        """No runner holds two classes, so such a job is never demand."""
         environment_extra = "pulp-build-pr-head"
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -2420,7 +2420,7 @@ else:
                 text=True, capture_output=True, check=False, env=environment,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "1")
+        self.assertEqual(result.stdout.strip(), "0")
 
     def test_a_transient_call_fault_is_retried_rather_than_ending_the_scan(self) -> None:
         """The production defect: one dropped call must not discard the scan."""

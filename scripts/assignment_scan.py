@@ -815,6 +815,12 @@ class AssignmentScanner:
                 continue
             if not job_labels.issubset(self.admitted_labels):
                 continue
+            # A V2 runner registers exactly one assignment class, and GitHub
+            # assigns a job only to a runner holding every label it asks for.
+            # A job carrying two or more classes can therefore never be served
+            # and must not be counted as demand.
+            if len(job_labels & self.class_labels) > 1:
+                continue
             if self.args.min_age_seconds:
                 timestamp = str(
                     job.get("created_at")
