@@ -49,7 +49,7 @@ jobs:
           # and re-run the head's check on a verdict comment), on top of
           # v0.344.1's unattributed-APPROVE refusal, base-config signers and
           # rebase carry. Re-pin to the merge commit once that PR lands.
-          ref: 1b1881357865334f9ded46cd62010855c1fef8d1
+          ref: 49cf7f97460401673a67bbf8456254b81aea2fa3
           persist-credentials: false
       - name: Set up Python
         id: python
