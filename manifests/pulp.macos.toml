@@ -1,5 +1,5 @@
 # Pulp — macOS build lane (Tart, ARM64 guest). The golden is a layered macOS
-# runner image with Xcode, Homebrew build tools, a rustup-managed stable Rust
+# runner image with Xcode, Homebrew build tools, a rustup-managed Rust 1.97.1
 # toolchain (cargo/rustc for the release-cli lane), actions-runner, baked Skia,
 # and env parity for the stock Build and Test workflow.
 
@@ -23,7 +23,7 @@ manifest   = "tools/deps/manifest.json"
 clang_format = "required"
 tart = "homebrew"
 rust_targets = ["x86_64-apple-darwin"]
-rust = "stable"
+rust = "1.97.1"
 node = "26.10.0"
 python = "3.12"
 ninja = "homebrew"
@@ -47,7 +47,7 @@ packages = [
   "rustup",
   "clang-format",
 ]
-# Homebrew's `rustup` is keg-only. The bake must run `rustup default stable`,
+# Homebrew's `rustup` is keg-only. The bake must run `rustup default 1.97.1`,
 # add the Darwin target, and expose ~/.cargo/bin. clang-format is required:
 # without it, the pulp fmt shell-out test hangs until its timeout.
 
