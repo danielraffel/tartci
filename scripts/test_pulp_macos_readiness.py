@@ -31,14 +31,14 @@ class PulpMacosReadinessTests(unittest.TestCase):
         self.assertEqual(payload["status"], "unready")
         required = payload["required"]
         self.assertRegex(required["pulp_commit"], r"^[0-9a-f]{40}$")
-        self.assertEqual(required["skia_release"], "chrome/m157")
+        self.assertEqual(required["skia_release"], "chrome/m153")
         self.assertEqual(required["v8_disposition"], "baked-provider-only")
 
     def test_pin_bump_remains_unready_instead_of_accepting_stale_golden(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             changed = Path(temp) / "pulp.macos.toml"
             source = MANIFEST.read_text().replace(
-                'commit     = "951cdd9042909575d0d6ffc6751b9f7279c4200b"',
+                'commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"',
                 'commit     = "2222222222222222222222222222222222222222"',
             )
             changed.write_text(source)
@@ -70,7 +70,7 @@ class PulpMacosReadinessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "unready")
-        self.assertEqual(payload["required"]["skia_release"], "chrome/m157")
+        self.assertEqual(payload["required"]["skia_release"], "chrome/m153")
 
 
 if __name__ == "__main__":
