@@ -1,0 +1,106 @@
+name: Tart pin update
+
+# Discovery is intentionally separate from rollout. This job opens a normal
+# PR; merging it is the reviewed release gate. Fleet hosts consume the merged
+# pin through their existing drained, canary-first self-update engine.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: tart-pin-update
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Discover and verify the upstream Tart release
+        id: discover
+        run: |
+          set -euo pipefail
+          python3 scripts/tart_pin_update.py --check --json > tart-pin-report.json
+          cat tart-pin-report.json
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          value = json.loads(Path("tart-pin-report.json").read_text())
+          candidate = value["candidate"]
+          print(f"changed={str(value['changed']).lower()}")
+          print(f"version={candidate['version']}")
+          print(f"softnet_version={candidate['softnet_version']}")
+          print(f"release_url={candidate['release_url']}")
+          print(f"checksums_url={candidate['checksums_url']}")
+          print(f"tart_sha256={candidate['tart_sha256']}")
+          print(f"softnet_sha256={candidate['softnet_sha256']}")
+          PY
+
+      - name: Stop when the checked-in pin is current
+        if: steps.discover.outputs.changed != 'true'
+        run: echo "fleet/tart.toml is current; no PR needed"
+
+      - name: Create the reviewed pin branch
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.discover.outputs.version }}
+          BRANCH: tart-pin-update
+        run: |
+          set -euo pipefail
+          git checkout -B "$BRANCH" origin/main
+          python3 scripts/tart_pin_update.py --write --json > tart-pin-report.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add fleet/tart.toml
+          git commit -m "chore: update Tart fleet pin to $VERSION"
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git push --force-with-lease origin "$BRANCH"
+          else
+            git push origin "$BRANCH"
+          fi
+
+      - name: Open or refresh the pin PR
+        if: steps.discover.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.discover.outputs.version }}
+          SOFTNET_VERSION: ${{ steps.discover.outputs.softnet_version }}
+          RELEASE_URL: ${{ steps.discover.outputs.release_url }}
+          CHECKSUMS_URL: ${{ steps.discover.outputs.checksums_url }}
+          TART_SHA256: ${{ steps.discover.outputs.tart_sha256 }}
+          SOFTNET_SHA256: ${{ steps.discover.outputs.softnet_sha256 }}
+          BRANCH: tart-pin-update
+        run: |
+          set -euo pipefail
+          cat > tart-pin-pr-body.md <<EOF
+          This PR updates the reviewed fleet Tart pin to **$VERSION** and Softnet **$SOFTNET_VERSION**.
+
+          Discovery and verification:
+          - Tart release: $RELEASE_URL
+          - Tart checksums: $CHECKSUMS_URL
+          - Tart SHA-256: $TART_SHA256
+          - Softnet formula SHA-256: $SOFTNET_SHA256
+          - Tart's version, asset URL and sha256 are cross-checked against its release feed and checksums asset. Softnet's version and sha256 come from the OpenAI tools tap formula only (format and release-URL checks, not compared with upstream Softnet checksums); verify them by hand.
+
+          After merge, the existing TartCI self-update agent performs the rollout one host at a time: pool drain/off, no running Tart VM, Homebrew upgrade with the previous keg retained, a real golden VM boot check, pool-on verification, and a canary soak before the remaining hosts. The PR does not change host admission or bypass the canary gate.
+          EOF
+          number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "$BRANCH" --base main --state open --json number --jq '.[0].number // empty')"
+          if [ -n "$number" ]; then
+            gh pr edit "$number" --title "chore: update Tart fleet pin to $VERSION" --body-file tart-pin-pr-body.md
+          else
+            gh pr create --repo "$GITHUB_REPOSITORY" --base main --head "$BRANCH" \
+              --title "chore: update Tart fleet pin to $VERSION" \
+              --body-file tart-pin-pr-body.md
+          fi

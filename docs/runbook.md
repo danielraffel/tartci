@@ -125,6 +125,26 @@ and its Softnet dependency (brew upgrades Softnet with Tart), each with the
 sha256 the tap's formula must carry. Moving it is a reviewed commit. A host
 reads the pin of the TartCI commit it is installing in that turn.
 
+The pin is checked automatically by `.github/workflows/tart-pin-update.yml`
+each day (and on manual dispatch). `scripts/tart_pin_update.py` reads the
+quota-free `openai/tart` releases feed, verifies the release checksum asset
+against the `openai/tools` Tart formula, verifies the matching Softnet formula,
+and opens or refreshes one PR when either pin changes. It never installs Tart,
+changes pool admission, or merges the PR. For a read-only local check run:
+
+```sh
+tartci fleet-macos tart-pin --json
+```
+
+The workflow deliberately keeps Homebrew as the install channel. Homebrew
+provides the Tart/Softnet dependency pair and leaves the previous kegs
+available for the existing drained rollback. The upstream GitHub binary is
+still the source of truth for release discovery and checksum verification; a
+`mise` pin would not provide those macOS package/rollback semantics. Merging a
+pin PR is followed by the existing one-host-at-a-time Tart rollout: the
+configured canary drains first, boots a real golden VM, publishes its verified
+pin, and only then allows the other hosts after the soak window.
+
 `tartci fleet-macos tool-freshness` and `self-update --status` report a host
 whose Tart is behind the pin. That is information only, not a doctor problem,
 unless the host has opted in and is past the canary gate for that pin.
