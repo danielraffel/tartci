@@ -92,7 +92,7 @@ jobs:
           - Tart checksums: $CHECKSUMS_URL
           - Tart SHA-256: $TART_SHA256
           - Softnet formula SHA-256: $SOFTNET_SHA256
-          - Homebrew formulas are read from the OpenAI tools tap and must match the upstream release bytes.
+          - Tart's version, asset URL and sha256 are cross-checked against its release feed and checksums asset. Softnet's version and sha256 come from the OpenAI tools tap formula only (format and release-URL checks, not compared with upstream Softnet checksums); verify them by hand.
 
           After merge, the existing TartCI self-update agent performs the rollout one host at a time: pool drain/off, no running Tart VM, Homebrew upgrade with the previous keg retained, a real golden VM boot check, pool-on verification, and a canary soak before the remaining hosts. The PR does not change host admission or bypass the canary gate.
           EOF

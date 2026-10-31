@@ -148,14 +148,21 @@ def discover(fetch: Fetch = fetch_url) -> Candidate:
         raise DiscoveryError("Tart formula sha256 does not match the release checksums asset")
     if not SHA256.fullmatch(softnet_sha):
         raise DiscoveryError("Softnet formula sha256 is not a lowercase SHA-256 digest")
-    if not softnet_url.startswith("https://github.com/openai/softnet/releases/download/"):
+    softnet_prefix = "https://github.com/openai/softnet/releases/download/"
+    if not softnet_url.startswith(softnet_prefix):
         raise DiscoveryError(f"Softnet formula URL is not an OpenAI release: {softnet_url}")
+    # The tap is the only source for Softnet: the version must at least be the
+    # release the URL names, but the digest is not compared with upstream.
+    if not softnet_url.startswith(f"{softnet_prefix}{softnet_version}/"):
+        raise DiscoveryError(
+            f"Softnet formula URL does not point at release {softnet_version}: {softnet_url}"
+        )
     return Candidate(version, tart_sha, softnet_version, softnet_sha,
                      release_url, published, checksums_url)
 
 
 def _replace_field(block: str, field: str, value: str, table: str) -> str:
-    pattern = re.compile(rf"^(\s*{re.escape(field)}\s*=\s*)\"[^\"]*\"\s*$", re.MULTILINE)
+    pattern = re.compile(rf"^(\s*{re.escape(field)}\s*=\s*)\"[^\"]*\"[ \t]*$", re.MULTILINE)
     result, count = pattern.subn(rf'\1"{value}"', block)
     if count != 1:
         raise DiscoveryError(f"fleet/tart.toml [{table}] must contain exactly one {field}")

@@ -104,6 +104,74 @@ class TartPinUpdateTests(unittest.TestCase):
             self.assertFalse(value["changed"])
             self.assertEqual(tart_pin.load_pin(root).version, "2.41.1")
 
+    def refused(self, values) -> str:
+        with self.assertRaises(updater.DiscoveryError) as ctx:
+            updater.discover(values.__getitem__)
+        return str(ctx.exception)
+
+    def test_discovery_refuses_softnet_url_outside_openai_release(self) -> None:
+        values = self.fake_fetch()
+        values[updater.SOFTNET_FORMULA] = values[updater.SOFTNET_FORMULA].replace(
+            "openai/softnet", "evil/softnet")
+        self.assertIn("not an OpenAI release", self.refused(values))
+
+    def test_discovery_refuses_malformed_softnet_sha(self) -> None:
+        self.assertIn("Softnet formula sha256", self.refused(self.fake_fetch(softnet_sha="B" * 10)))
+
+    def test_discovery_refuses_softnet_version_url_mismatch(self) -> None:
+        values = self.fake_fetch()
+        values[updater.SOFTNET_FORMULA] = values[updater.SOFTNET_FORMULA].replace(
+            "download/0.24.1/", "download/0.23.0/")
+        self.assertIn("does not point at release 0.24.1", self.refused(values))
+
+    def test_discovery_refuses_non_atom_and_empty_feeds(self) -> None:
+        for body in ("not xml <", '<feed xmlns="http://www.w3.org/2005/Atom"></feed>'):
+            values = self.fake_fetch()
+            values[updater.TART_RELEASES_ATOM] = body
+            self.refused(values)
+
+    def test_discovery_refuses_feed_with_only_prerelease_or_non_numeric_tags(self) -> None:
+        values = self.fake_fetch()
+        values[updater.TART_RELEASES_ATOM] = self.feed("2.41.1-rc1", "nightly")
+        self.assertIn("no stable numeric", self.refused(values))
+
+    def test_discovery_refuses_duplicate_or_missing_tarball_checksum(self) -> None:
+        key = next(k for k in self.fake_fetch() if k.endswith("checksums.txt"))
+        for body in (f"{TART_SHA}  tart.tar.gz\n{TART_SHA}  tart.tar.gz\n",
+                     f"{TART_SHA}  other.tar.gz\n"):
+            values = self.fake_fetch()
+            values[key] = body
+            self.assertIn("one valid tart.tar.gz", self.refused(values))
+
+    def test_main_exits_2_on_discovery_error_and_write_updates_pin(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "fleet").mkdir()
+            pin = root / "fleet" / "tart.toml"
+            original = (f'[tart]\nversion = "2.40.1"\nsha256 = "{"c" * 64}"\n'
+                        f'[softnet]\nversion = "0.24.0"\nsha256 = "{"d" * 64}"\n')
+            pin.write_text(original)
+            real = updater.discover
+            try:
+                def boom(*_a, **_k):
+                    raise updater.DiscoveryError("boom")
+                updater.discover = boom
+                self.assertEqual(2, updater.main(["--root", str(root), "--write"]))
+                self.assertEqual(original, pin.read_text())
+                updater.discover = lambda *_a, **_k: self.candidate()
+                self.assertEqual(0, updater.main(["--root", str(root), "--write"]))
+            finally:
+                updater.discover = real
+            loaded = tart_pin.load_pin(root)
+            self.assertEqual(("2.41.1", TART_SHA, "0.24.1", SOFTNET_SHA),
+                             (loaded.version, loaded.sha256, loaded.softnet_version, loaded.softnet_sha256))
+
+    def test_workflow_text_does_not_claim_softnet_matches_upstream_bytes(self) -> None:
+        workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" /
+                    "tart-pin-update.yml").read_text()
+        self.assertNotIn("upstream release bytes", workflow)
+        self.assertIn("Softnet's version and sha256 come from the OpenAI tools tap", workflow)
+
     def test_workflow_is_scheduled_review_only_and_does_not_auto_merge(self) -> None:
         workflow = (Path(__file__).resolve().parents[1] / ".github" / "workflows" /
                     "tart-pin-update.yml").read_text()
