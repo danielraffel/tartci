@@ -184,6 +184,26 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertEqual(summary["problem"], "shipyard 20 h behind v0.221.1")
         self.assertIn("STALE", "\n".join(summary["lines"]))
 
+    def test_atom_feed_draft_is_excluded_from_published_release_channel(self) -> None:
+        releases = [(tf._version("0.364.0"), "v0.364.0", NOW - HOUR),
+                    (tf._version("0.372.0"), "v0.372.0", NOW)]
+        tool = dict(tf.DEFAULT_TOOLS["shipyard"])
+        calls: list[tuple[str, str, list[str]]] = []
+
+        def readiness(repo: str, tag: str, assets: list[str]) -> dict:
+            calls.append((repo, tag, assets))
+            return {"ready": tag == "v0.364.0"}
+
+        published = tf.published_releases(tool, releases, readiness)
+        self.assertEqual(published, [releases[0]])
+        self.assertEqual([call[1] for call in calls], ["v0.364.0", "v0.372.0"])
+        self.assertEqual(calls[0][2], ["shipyard-macos-arm64.dmg", "checksums.sha256"])
+
+    def test_atom_feed_prerelease_is_excluded_from_published_release_channel(self) -> None:
+        releases = tf.parse_releases(feed(("v0.372.0-rc.1", NOW),
+                                           ("v0.371.0", NOW - HOUR)))
+        self.assertEqual(releases, [(tf._version("0.371.0"), "v0.371.0", NOW - HOUR)])
+
     def test_an_install_older_than_the_feed_is_a_lower_bound_that_never_moves_later(self) -> None:
         no_apply = settings(tools={name: dict(tool, enabled=True, auto_apply=False)
                                    for name, tool in tf.DEFAULT_TOOLS.items()})
