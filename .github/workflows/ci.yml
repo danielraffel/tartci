@@ -119,6 +119,37 @@ jobs:
           python --version
           git ls-files -z '*.py' | xargs -0 python -m py_compile
 
+  # The single aggregate check the ruleset requires. It is reported for every
+  # PR head: this workflow has no workflow-level path filters and none of the
+  # aggregated jobs has a job-level `if`, so it always triggers, and `always()`
+  # makes this job run even when a needed job failed, was cancelled or was
+  # skipped. It fails unless EVERY needed job succeeded; no skip is permitted.
+  # Add any new CI job to `needs` here AND to the gate step's argument list.
+  # ci-cause is advisory and deliberately not aggregated.
+  ci-required:
+    name: ci-required
+    needs: [lint, python-39-tests, python-floor]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/ci_required_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Require every CI job to have succeeded
+        env:
+          LINT: ${{ needs.lint.result }}
+          PY39: ${{ needs.python-39-tests.result }}
+          PYFLOOR: ${{ needs.python-floor.result }}
+        run: |
+          bash scripts/ci_required_gate.sh \
+            "lint=$LINT" \
+            "python-39-tests=$PY39" \
+            "python-floor=$PYFLOOR"
+
   # Names the cause of each failed job in this run as a `ci.cause/v1` record,
   # printed as a `::notice title=ci-cause::` annotation. A job's own log can be
   # downloaded only once it has finished, so this job reads the failed jobs'
