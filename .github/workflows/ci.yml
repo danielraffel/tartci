@@ -124,7 +124,8 @@ jobs:
   # aggregated jobs has a job-level `if`, so it always triggers, and `always()`
   # makes this job run even when a needed job failed, was cancelled or was
   # skipped. It fails unless EVERY needed job succeeded; no skip is permitted.
-  # Add any new CI job to `needs` here AND to the gate step's argument list.
+  # The gate derives its job list from toJSON(needs). Add any new CI job to
+  # `needs` here; scripts/test_ci_required_workflow.py fails if one is missing.
   # ci-cause is advisory and deliberately not aggregated.
   ci-required:
     name: ci-required
@@ -141,14 +142,8 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Require every CI job to have succeeded
         env:
-          LINT: ${{ needs.lint.result }}
-          PY39: ${{ needs.python-39-tests.result }}
-          PYFLOOR: ${{ needs.python-floor.result }}
-        run: |
-          bash scripts/ci_required_gate.sh \
-            "lint=$LINT" \
-            "python-39-tests=$PY39" \
-            "python-floor=$PYFLOOR"
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: bash scripts/ci_required_gate.sh "$NEEDS_JSON"
 
   # Names the cause of each failed job in this run as a `ci.cause/v1` record,
   # printed as a `::notice title=ci-cause::` annotation. A job's own log can be
