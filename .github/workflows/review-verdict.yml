@@ -45,11 +45,11 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: danielraffel/Shipyard
-          # Shipyard PR 1068 (fail the check when the verdict is not allowed
-          # and re-run the head's check on a verdict comment), on top of
-          # v0.344.1's unattributed-APPROVE refusal, base-config signers and
-          # rebase carry. Re-pin to the merge commit once that PR lands.
-          ref: 49cf7f97460401673a67bbf8456254b81aea2fa3
+          # Shipyard main at the merge of PR 1086 (a counted HOLD is sticky
+          # for its head, so a later APPROVE from another session cannot
+          # clear it), on top of PR 1068 (fail the check when the verdict is
+          # not allowed and re-run the head's check on a verdict comment).
+          ref: e7dc77e866a63ba829aaac0daa0abdbbae374468
           persist-credentials: false
       - name: Set up Python
         id: python
