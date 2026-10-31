@@ -122,6 +122,12 @@ per-job GitHub runners, host resource budgets, warm caches, Windows through
 QEMU, and coordination with [Shipyard](https://github.com/danielraffel/Shipyard).
 TartCI is not affiliated with Tart or its maintainers.
 
+With Shipyard, TartCI is the testing half of a loop that drains a repository on
+its own: TartCI runs each pull request's checks in a fresh VM, and Shipyard
+hands every approved, green head to GitHub to merge. Shipyard's
+[Draining pull requests automatically](https://github.com/danielraffel/Shipyard/blob/main/docs/automated-draining.md)
+explains how the pieces fit, including GitHub-hosted runners as overflow.
+
 ## Learn more
 
 - [Runbook](docs/runbook.md): set up a host, build images, and serve jobs.
@@ -134,6 +140,8 @@ TartCI is not affiliated with Tart or its maintainers.
 - [LaunchAgents](launchd/README.md) and the
   [published label table](fleet/README.md).
 - [AGENTS.md](AGENTS.md): a dense reference for coding agents.
+- [Draining pull requests automatically](https://github.com/danielraffel/Shipyard/blob/main/docs/automated-draining.md)
+  (in Shipyard): TartCI, Shipyard and GitHub merging agent pull requests together.
 
 ## Contributing
 
