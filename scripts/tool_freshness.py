@@ -17,7 +17,7 @@ launchd watchdog, and optionally applies the update itself:
             and `auto_apply`, a behind tool is updated once its newest
             release is `apply_after_minutes` old, at most once per target per
             `apply_retry_hours`, and the result is re-read and verified.
-            A tool with `release_assets` (pulp) is first checked for readiness:
+            A tool with `release_assets` (Shipyard or pulp) is first checked for readiness:
             every asset listed on the GitHub release and HEAD 200. A release
             that is not ready, or an apply that exits NOT_READY_EXIT (75: a
             download failed, nothing installed), is "not ready yet": re-checked
@@ -413,9 +413,44 @@ def parse_releases(feed: str) -> list[tuple[tuple[int, int, int], str, float]]:
     return sorted(releases)
 
 
+def published_releases(tool: dict, releases: list[tuple[tuple[int, int, int], str, float]],
+                       probe: Callable[[str, str, list[str]], dict] | None = None
+                       ) -> list[tuple[tuple[int, int, int], str, float]]:
+    """Keep only releases whose required assets are publicly downloadable.
+
+    GitHub's public Atom feed includes tags while their Release objects are
+    still drafts (and can include prereleases).  A draft has no downloadable
+    release assets, so treating the feed's newest entry as published makes a
+    host report false skew against a release it cannot install.  Asset HEADs
+    are the same quota-free readiness check used before applying Shipyard
+    updates and are authoritative for the fleet's release channel.
+
+    Tools without a release-asset contract keep the Atom-feed behavior; their
+    release feeds do not provide an equivalent portable publication signal.
+    """
+    assets = tool.get("release_assets")
+    if not assets:
+        return releases
+    if probe is None:
+        probe = probe_release
+    expanded = [str(asset).replace("{platform}", host_platform()) for asset in assets]
+    published = []
+    for version, tag, published_at in releases:
+        try:
+            ready = probe(str(tool["repo"]), tag, expanded)
+        except Exception:  # noqa: BLE001 - an unreadable candidate is not published
+            continue
+        if ready.get("ready") is True:
+            published.append((version, tag, published_at))
+    return published
+
+
 def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None,
             run: Callable[[list[str], float], tuple[int, str]],
-            feed: Callable[[str], str], stale_hours: float) -> dict:
+            feed: Callable[[str], str], stale_hours: float,
+            release_probe: Callable[[dict, list[tuple[tuple[int, int, int], str, float]]],
+                                    list[tuple[tuple[int, int, int], str, float]]] | None = None
+            ) -> dict:
     row: dict[str, Any] = {"tool": name, "repo": tool.get("repo"), "measured_at": _iso(now)}
     versions = read_versions(tool, home, run)
     rc, out, installed = versions["rc"], versions["out"], versions["installed"]
@@ -438,6 +473,8 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     try:
         releases = (pin_releases(tool, now, previous) if tool.get("pin_file")
                     else parse_releases(feed(str(tool["repo"]))))
+        if release_probe is not None and not tool.get("pin_file"):
+            releases = release_probe(tool, releases)
     except Exception as exc:  # noqa: BLE001 - an unreadable feed is unknown, never current
         row.update(state="unknown", reason=f"releases unreadable: {type(exc).__name__}: {exc}")
         return row
@@ -704,14 +741,20 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
         if not tool.get("enabled", True):
             continue
         prior = previous.get(name) if isinstance(previous.get(name), dict) else None
-        row = measure(name, tool, home, now, prior, run, feed, float(settings["stale_hours"]))
+        # An injected probe supplies hermetic release-readiness results for
+        # tests; production refreshes use the quota-free asset publication
+        # filter above before selecting the newest release.
+        publication_filter = None if probe is not None else published_releases
+        row = measure(name, tool, home, now, prior, run, feed, float(settings["stale_hours"]),
+                      publication_filter)
         before = {key: prior.get(key) for key in ("installed", "generation")} if prior else {}
         applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run,
                               pending, probe(name, str(row.get("latest_tag"))) if probe else None)
         if applied and applied.get("installed"):
             before = {key: row.get(key) for key in ("installed", "generation")}
             note = row.get("apply")
-            row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]))
+            row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
+                          publication_filter)
             row["apply"] = note
         for key, component in (("installed", "cli"), ("generation", "auth_generation")):
             old, new = before.get(key), row.get(key)
