@@ -968,6 +968,10 @@ tartci_storage_health_check(){
     --timeout "$STORAGE_HEALTH_TIMEOUT"
     --failure-threshold "${TARTCI_STORAGE_HEALTH_FAILURE_THRESHOLD:-2}"
     --recovery-threshold "${TARTCI_STORAGE_HEALTH_RECOVERY_THRESHOLD:-3}"
+    # Hysteresis is per lane: one lane whose own probe keeps timing out must
+    # not hold every sibling lane on the host in quarantine. A store-wide
+    # failure (an unreapable probe) still quarantines every lane.
+    --observer "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}"
   )
   if [ -n "${TARTCI_STORAGE_HEALTH_STATE:-}" ]; then
     probe_args+=(--state "$TARTCI_STORAGE_HEALTH_STATE")

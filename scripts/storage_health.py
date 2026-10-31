@@ -283,9 +283,96 @@ def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
         return False, "probe_failed" if child.returncode else "probe_malformed", 0.0
 
 
+# Reasons that are evidence about the store itself rather than about the
+# process that observed it. A probe child that SIGKILL could not reap is stuck
+# in an uninterruptible kernel wait on the volume, so every lane must stop
+# admitting until it has seen the store answer again for itself.
+STORE_WIDE_FAILURES = frozenset({"probe_timeout_unreaped"})
+# Observer records older than this are dropped so the shared state stays small.
+OBSERVER_RETENTION_SECONDS = 7 * 24 * 3600
+
+
+def _marker_epoch(marker: Path) -> int | None:
+    try:
+        return marker.stat().st_mtime_ns
+    except FileNotFoundError:
+        return None
+
+
+def _observer_record(document: dict, observer: str) -> dict:
+    """This observer's hysteresis record from a shared state document.
+
+    Every admitting lane on a host probes the same store and shares one state
+    file. Hysteresis is kept per observer: one lane whose own probe keeps
+    timing out must not reset the healthy streak of a lane whose probe the
+    store answers in milliseconds. The legacy (unnamed) observer keeps
+    reading the top-level fields, so an older state file keeps its streaks.
+    """
+    observers = document.get("observers")
+    if isinstance(observers, dict) and isinstance(observers.get(observer), dict):
+        record = dict(observers[observer])
+    elif observer == "" and document:
+        record = {key: document[key] for key in
+                  ("status", "failure_streak", "healthy_streak", "marker_ack")
+                  if key in document}
+    else:
+        record = {}
+    for key in ("failure_streak", "healthy_streak"):
+        if not isinstance(record.get(key), int) or record[key] < 0:
+            record[key] = 0
+    if record.get("status") not in {"healthy", "degraded", "quarantined"}:
+        record["status"] = "healthy" if not record.get("failure_streak") else "degraded"
+    return record
+
+
+def _prune_observers(observers: dict, now: float) -> dict:
+    kept = {}
+    for name, record in observers.items():
+        if not isinstance(name, str) or not isinstance(record, dict):
+            continue
+        try:
+            checked = time.mktime(time.strptime(str(record.get("checked_at", "")),
+                                                "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        except ValueError:
+            continue
+        if now - checked <= OBSERVER_RETENTION_SECONDS:
+            kept[name] = record
+    return kept
+
+
+def next_observer_state(record: dict, ok: bool, reason: str, *, marker_epoch: int | None,
+                        failure_threshold: int, recovery_threshold: int) -> tuple[dict, str]:
+    """Advance one observer's hysteresis; return (record, reason).
+
+    A host quarantine marker the observer has not yet acknowledged forces it
+    into quarantine and restarts its recovery window, so a store-wide failure
+    seen by any lane is honoured by every lane until each sees the store
+    answer `recovery_threshold` consecutive times itself.
+    """
+    failures = int(record.get("failure_streak", 0))
+    healthy = int(record.get("healthy_streak", 0))
+    prior_status = str(record.get("status", "healthy"))
+    ack = record.get("marker_ack")
+    if marker_epoch is not None and ack != marker_epoch:
+        prior_status, healthy, ack = "quarantined", 0, marker_epoch
+    if ok:
+        failures, healthy = 0, healthy + 1
+        if prior_status == "quarantined" and healthy < recovery_threshold:
+            status, reason = "quarantined", "recovery_check_pending"
+        else:
+            status = "healthy"
+    else:
+        failures, healthy = failures + 1, 0
+        status = ("quarantined" if failures >= failure_threshold
+                  or prior_status == "quarantined" else "degraded")
+    return ({"status": status, "failure_streak": failures, "healthy_streak": healthy,
+             "marker_ack": ack}, reason)
+
+
 def run_worker(args: argparse.Namespace) -> int:
     path = Path(args.path)
     state_path = Path(args.state) if args.state else default_state(path)
+    observer = str(getattr(args, "observer", "") or "")
     if not state_path_is_safe(state_path, path):
         print(json.dumps(quarantine_result(path, state_path, args,
                                             "health_state_path_unsafe"),
@@ -296,41 +383,56 @@ def run_worker(args: argparse.Namespace) -> int:
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         with lock_path.open("a+") as lock:
+            # Read under the lock, then release it for the probe: a lane whose
+            # probe runs to its timeout must not hold every other lane's
+            # worker past the supervisor deadline.
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            previous = load_state(state_path, path)
-            if quarantine_marker.exists():
-                if not previous:
-                    previous = {
-                        "failure_streak": args.failure_threshold,
-                        "healthy_streak": 0,
-                    }
-                elif previous.get("status") != "quarantined":
-                    # A marker left by an exceptional failure invalidates any
-                    # prior healthy streak; require the full recovery window.
-                    previous["healthy_streak"] = 0
-                previous["status"] = "quarantined"
-            if previous.get("state_unreadable"):
+            unreadable = load_state(state_path, path).get("state_unreadable")
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            if unreadable:
                 result = {"schema": 1, "status": "quarantined", "reason": "health_state_unreadable", "path": str(path), "state": str(state_path), "failure_streak": args.failure_threshold, "healthy_streak": 0}
                 print(json.dumps(result, sort_keys=True))
                 return QUARANTINED
             ok, reason, elapsed = run_probe_bounded(path, args.timeout)
-            failures = int(previous.get("failure_streak", 0))
-            healthy = int(previous.get("healthy_streak", 0))
-            prior_status = str(previous.get("status", "healthy"))
-            if ok:
-                failures, healthy = 0, healthy + 1
-                status = "healthy" if prior_status != "quarantined" or healthy >= args.recovery_threshold else "quarantined"
-                if prior_status == "quarantined" and healthy < args.recovery_threshold:
-                    reason = "recovery_check_pending"
-            else:
-                failures, healthy = failures + 1, 0
-                status = "quarantined" if failures >= args.failure_threshold or prior_status == "quarantined" else "degraded"
-            result = {"schema": 1, "status": status, "reason": reason, "path": str(path), "state": str(state_path), "failure_streak": failures, "healthy_streak": healthy, "elapsed_seconds": round(elapsed, 3), "checked_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            document = load_state(state_path, path)
+            if document.get("state_unreadable"):
+                result = {"schema": 1, "status": "quarantined", "reason": "health_state_unreadable", "path": str(path), "state": str(state_path), "failure_streak": args.failure_threshold, "healthy_streak": 0}
+                print(json.dumps(result, sort_keys=True))
+                return QUARANTINED
+            record = _observer_record(document, observer)
+            # The legacy single observer raises the host marker whenever it
+            # quarantines, as before (below). A named observer raises it only
+            # on evidence about the store itself, at once.
+            raise_marker = (not ok) and observer != "" and reason in STORE_WIDE_FAILURES
+            if raise_marker:
+                quarantine_marker.touch(exist_ok=True)
+            record, reason = next_observer_state(
+                record, ok, reason, marker_epoch=_marker_epoch(quarantine_marker),
+                failure_threshold=args.failure_threshold,
+                recovery_threshold=args.recovery_threshold)
+            if raise_marker:
+                record["status"] = "quarantined"
+            status = record["status"]
+            checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            result = {"schema": 1, "status": status, "reason": reason, "path": str(path), "state": str(state_path), "failure_streak": record["failure_streak"], "healthy_streak": record["healthy_streak"], "elapsed_seconds": round(elapsed, 3), "checked_at": checked_at}
+            if observer:
+                result["observer"] = observer
+            observers = document.get("observers") if isinstance(document.get("observers"), dict) else {}
+            observers = _prune_observers(observers, time.time())
+            observers[observer] = dict(record, reason=reason, checked_at=checked_at)
+            saved = dict(result, observers=observers, marker_ack=record["marker_ack"])
             try:
-                save_state(state_path, result)
-                if status == "quarantined":
+                save_state(state_path, saved)
+                if status == "quarantined" and observer == "":
                     quarantine_marker.touch(exist_ok=True)
-                elif quarantine_marker.exists():
+                    observers[observer]["marker_ack"] = _marker_epoch(quarantine_marker)
+                    save_state(state_path, dict(saved, observers=observers,
+                                                marker_ack=observers[observer]["marker_ack"]))
+                elif (status == "healthy" and record["marker_ack"] is not None
+                      and _marker_epoch(quarantine_marker) == record["marker_ack"]):
+                    # This observer completed a full recovery window after the
+                    # marker it acknowledged; nobody has raised a newer one.
                     quarantine_marker.unlink()
             except OSError:
                 result = durable_quarantine(path, state_path, args, "health_state_write_failed")
@@ -411,6 +513,8 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--path", required=True)
     parser.add_argument("--state", default="")
+    parser.add_argument("--observer", default="",
+                        help="stable id of the admitting lane; hysteresis is kept per observer")
     parser.add_argument("--timeout", type=float, default=5.0)
     parser.add_argument("--failure-threshold", type=int, default=2)
     parser.add_argument("--recovery-threshold", type=int, default=3)
