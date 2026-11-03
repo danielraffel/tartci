@@ -26,7 +26,7 @@ COMMON = ROOT / "providers" / "common"
 
 def toml_helpers() -> list[str]:
     return sorted(path.name for path in COMMON.glob("*.py")
-                  if re.search(r"^import tomllib\b", path.read_text(), re.M))
+                  if re.search(r"^\s*import tomllib\b", path.read_text(), re.M))
 
 
 def provider_scripts() -> list[Path]:
