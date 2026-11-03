@@ -473,6 +473,22 @@ organization permission that TartCI's ordinary repository polling does not:
 endpoints to fail closed unless the selected repositories, selected workflows,
 and live runner membership still match the intended trust boundary.
 
+### JIT denial receipt: self-clearing and manual cases
+
+`jit-admission-denied.<key>` in the lane state directory has a `cause=` line.
+
+- `cause=repository_access`: the repository-access precheck said "deny" (for
+  example runner group 8 disallowing public repositories). After the owner fixes
+  the group, the lane re-runs that read-only precheck at most every
+  `TARTCI_JIT_DENIAL_RECHECK_SECS` (default 900) while the key is being served
+  and removes the receipt itself. Look for `jit_denial_cleared` (with the
+  verdict as evidence) or `jit_denial_recheck_still_denied` in the lane events.
+  Set the variable to `0` to require a manual clear. The `.recheck` file next
+  to the receipt holds the time of the last attempt.
+- `cause=credential`, or no `cause=` line (written by an older lane): a 401, 403
+  or 404 from GitHub. Repair the auth route, then clear the receipt by hand.
+  The lane never retries these.
+
 ### JIT registration preflight (all macOS fleet hosts)
 
 Keep `TARTCI_GH_CLI=ghapp` for every M1, M3, and M5 lane. For runner group `1`,

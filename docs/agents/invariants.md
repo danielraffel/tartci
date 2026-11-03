@@ -49,6 +49,14 @@ parentheses.
   receipt (`jit-admission-denied.<key>` in the lane's state directory) keyed by repo,
   runner group, labels and CLI. The lane boots no further VM for that key until
   the route is repaired and the receipt cleared.
+- The receipt records its `cause=`. Only `cause=repository_access` (the
+  repository-access precheck answered "deny", e.g. a runner group that
+  disallows public repositories) is re-read by the lane: while that key is
+  being served it re-runs the same read-only precheck at most every
+  `TARTCI_JIT_DENIAL_RECHECK_SECS` (default 900, `0` disables) and removes the
+  receipt, logging `jit_denial_cleared` with the verdict, only when the check
+  passes. `cause=credential` receipts (a 401, 403 or 404) and receipts with no
+  `cause=` line never clear themselves.
 
 ## Deletion
 

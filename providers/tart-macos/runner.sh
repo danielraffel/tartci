@@ -649,21 +649,69 @@ jit_denial_file_for(){
   key="$(printf '%s' "$REPO|$runner_group_id|$labels|$JIT_GH_CLI" | shasum -a 256 | awk '{print $1}')"
   printf '%s/jit-admission-denied.%s\n' "$STATE_DIR" "$key"
 }
+# A receipt records WHY it was written (`cause=`). Only `repository_access`
+# (the runner-group repository-access precheck answered "deny") is a condition
+# the lane may re-read; `credential` (GitHub rejected the auth route) and any
+# receipt without a cause (written before the field existed) stay manual-only.
+JIT_DENIAL_RECHECK_SECS="${TARTCI_JIT_DENIAL_RECHECK_SECS:-900}"
+case "$JIT_DENIAL_RECHECK_SECS" in ''|*[!0-9]*) JIT_DENIAL_RECHECK_SECS=900;; esac
+jit_denial_cause(){
+  sed -n 's/^cause=//p' "$1" 2>/dev/null | head -n 1
+}
+# Re-run the cheap read-only precheck for a repository_access receipt, at most
+# once per JIT_DENIAL_RECHECK_SECS (0 disables), and remove the receipt only
+# when the precheck now passes. The stamp is written BEFORE the check, so a
+# failing or hanging check is still spaced by the interval. Returns 0 when the
+# receipt was cleared.
+jit_denial_recheck(){
+  local runner_group_id="$1" file="$2" stamp last now_s verdict recheck_json rc
+  [ "$JIT_DENIAL_RECHECK_SECS" -gt 0 ] || return 1
+  [ "$(jit_denial_cause "$file")" = repository_access ] || return 1
+  stamp="$file.recheck"
+  now_s="$(now_epoch)"
+  last="$(cat "$stamp" 2>/dev/null)"
+  case "$last" in ''|*[!0-9]*) last=0;; esac
+  [ $((now_s - last)) -ge "$JIT_DENIAL_RECHECK_SECS" ] || return 1
+  printf '%s\n' "$now_s" >"$stamp"
+  if recheck_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
+      python3 "$TARTCI_ROOT/scripts/runner_group_repository_access.py" \
+      --repo "$REPO" --runner-group-id "$runner_group_id" \
+      --gh-cli "$JIT_GH_CLI" 2>/dev/null)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    event jit_denial_recheck_still_denied \
+      "repo=$REPO group=$runner_group_id rc=$rc next_in=${JIT_DENIAL_RECHECK_SECS}s"
+    return 1
+  fi
+  verdict="$(printf '%s' "$recheck_json" | tr '\n' ' ' | cut -c1-300)"
+  event jit_denial_cleared \
+    "repo=$REPO group=$runner_group_id cause=repository_access evidence=$verdict"
+  note "JIT denial receipt cleared: repository access now passes for repo=$REPO group=$runner_group_id ($verdict)"
+  rm -f "$file" "$stamp"
+  return 0
+}
 jit_admission_denied(){
   local runner_group_id="$1" labels="$2"
   JIT_DENIAL_FILE="$(jit_denial_file_for "$runner_group_id" "$labels")"
-  [ -f "$JIT_DENIAL_FILE" ]
+  [ -f "$JIT_DENIAL_FILE" ] || return 1
+  jit_denial_recheck "$runner_group_id" "$JIT_DENIAL_FILE" && return 1
+  return 0
 }
 record_jit_admission_denied(){
-  local runner_group_id="$1" labels="$2" detail="$3"
+  local runner_group_id="$1" labels="$2" detail="$3" cause="${4:-credential}"
   JIT_DENIAL_FILE="$(jit_denial_file_for "$runner_group_id" "$labels")"
   umask 077
-  printf 'repo=%s\nrunner_group_id=%s\nlabels=%s\ngh_cli=%s\ndetail=%s\n' \
-    "$REPO" "$runner_group_id" "$labels" "$JIT_GH_CLI" "$detail" >"$JIT_DENIAL_FILE"
+  printf 'repo=%s\nrunner_group_id=%s\nlabels=%s\ngh_cli=%s\ncause=%s\ndetail=%s\n' \
+    "$REPO" "$runner_group_id" "$labels" "$JIT_GH_CLI" "$cause" "$detail" >"$JIT_DENIAL_FILE"
+  rm -f "$JIT_DENIAL_FILE.recheck"
 }
 clear_jit_admission_denied(){
-  local runner_group_id="$1" labels="$2"
-  rm -f "$(jit_denial_file_for "$runner_group_id" "$labels")"
+  local runner_group_id="$1" labels="$2" file
+  file="$(jit_denial_file_for "$runner_group_id" "$labels")"
+  rm -f "$file" "$file.recheck"
 }
 
 # -- Scan diagnostics -------------------------------------------------------
@@ -2571,8 +2619,13 @@ run_one(){
     || printf '%s\n' "$access_json" >"$STATE_DIR/$vm.repository-access.json"
   if [ "$access_rc" -ne 0 ]; then
     if tartci_repository_access_denied "$access_rc" "$access_error"; then
+      # rc 3 is the precheck's own policy verdict (runner-group boundary), the
+      # only cause the lane may later re-read; an HTTP 401/403/404 stays manual.
+      access_cause=credential
+      [ "$access_rc" -eq 3 ] && access_cause=repository_access
       record_jit_admission_denied "$selected_group_id" "$selected_labels" \
-        "repository access denied before JIT registration; inspect $access_error"
+        "repository access denied before JIT registration; inspect $access_error" \
+        "$access_cause"
       event jit_repository_access_denied \
         "repo=$REPO group=$selected_group_id labels=$selected_labels"
     else
