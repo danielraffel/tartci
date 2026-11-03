@@ -204,6 +204,16 @@ def effective_cap(cap_file: Path, default: int = DEFAULT_VM_CAP) -> int:
     return max(1, min(cap, HARD_MAX_VMS))
 
 
+def _pid_token(pid: int) -> str:
+    """Start time of `pid` with spaces removed (as macos-vm-cap.lib.sh stores it)."""
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
+                             text=True, timeout=5, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return "".join(out.split())
+
+
 def live_reservations(resv_dir: Path, now: float) -> int:
     """Read-only count of macos-vm-cap.lib.sh reservations with a live owner."""
     count = 0
@@ -213,9 +223,13 @@ def live_reservations(resv_dir: Path, now: float) -> int:
         return 0
     for path in entries:
         try:
-            pid_text, _, ts_text = path.read_text().strip().partition(" ")
+            fields = path.read_text().split()
         except OSError:
             continue
+        # "<pid> <start-token> <epoch>", or the older "<pid> <epoch>".
+        pid_text = fields[0] if fields else ""
+        token = fields[1] if len(fields) >= 3 else ""
+        ts_text = fields[-1] if len(fields) >= 2 else ""
         if not pid_text.isdigit():
             continue
         try:
@@ -224,6 +238,8 @@ def live_reservations(resv_dir: Path, now: float) -> int:
             continue
         except PermissionError:
             pass
+        if token and _pid_token(int(pid_text)) not in ("", token):
+            continue
         if ts_text.isdigit() and now - int(ts_text) > RESERVATION_TTL:
             continue
         count += 1
