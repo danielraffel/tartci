@@ -67,10 +67,28 @@ class PulpMacosReadinessTests(unittest.TestCase):
                 "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin",
             },
         )
-        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.returncode, 3, result.stderr)
         payload = json.loads(result.stdout)
         self.assertEqual(payload["status"], "unready")
         self.assertEqual(payload["required"]["skia_release"], "chrome/m153")
+
+    def test_missing_tomllib_is_undetermined_not_unready(self) -> None:
+        code = (
+            "import sys; sys.modules['tomllib'] = None; "
+            "import runpy; sys.argv = ['x', sys.argv[1]]; "
+            f"runpy.run_path({str(MODULE)!r}, run_name='__main__')"
+        )
+        result = subprocess.run([sys.executable, "-c", code, str(MANIFEST)],
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("tomllib", result.stderr)
+
+    def test_unreadable_manifest_is_undetermined(self) -> None:
+        self.assertEqual(readiness.main(["/nonexistent/pulp.macos.toml"]), 2)
+
+    def test_determined_unready_has_its_own_exit_code(self) -> None:
+        self.assertEqual(readiness.main([str(MANIFEST)]), 3)
 
 
 if __name__ == "__main__":

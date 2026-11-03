@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""Fail-closed preparation report for the not-yet-receipted Pulp macOS golden."""
+"""Fail-closed preparation report for the not-yet-receipted Pulp macOS golden.
+
+Exit codes: 3 = determined unready (the report is on stdout); 2 = could not
+determine (no tomllib, unreadable or invalid manifest, any unexpected failure;
+nothing on stdout, the reason on stderr). 0 is reserved for a future ready
+verdict, and 1 is never used so an uncaught crash cannot read as "unready".
+"""
 
 from __future__ import annotations
 
@@ -8,7 +14,14 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
-import tomllib
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11; main() reports it as "cannot determine"
+    tomllib = None
+
+EXIT_UNDETERMINED = 2
+EXIT_UNREADY = 3
 
 
 def load_source_resolver():
@@ -22,6 +35,8 @@ def load_source_resolver():
 
 
 def report(manifest_path: Path) -> dict[str, object]:
+    if tomllib is None:
+        raise RuntimeError("this Python has no tomllib (needs 3.11+)")
     with manifest_path.open("rb") as handle:
         manifest = tomllib.load(handle)
     source_pin = load_source_resolver()
@@ -64,11 +79,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         payload = report(args.manifest)
-    except (OSError, RuntimeError, ValueError, tomllib.TOMLDecodeError) as error:
+    except Exception as error:  # noqa: BLE001 - any failure to decide is "undetermined"
         print(f"pulp-macos-readiness: ERROR: {error}", file=sys.stderr)
-        return 2
+        return EXIT_UNDETERMINED
     print(json.dumps(payload, indent=2, sort_keys=True))
-    return 1  # An unready preparation report is intentionally never green.
+    return EXIT_UNREADY  # An unready preparation report is intentionally never green.
 
 
 if __name__ == "__main__":

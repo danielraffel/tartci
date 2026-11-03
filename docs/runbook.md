@@ -1019,7 +1019,7 @@ golden contains it. The manifest therefore says `golden_readiness.status =
 alias are not provider evidence.
 
 Run `providers/tart-macos/provision.sh pulp-readiness` for the exact preparation
-report. It prints the required Pulp, Skia, and V8 identities and exits nonzero.
+report. It prints the required Pulp, Skia, and V8 identities and exits 3 (determined unready; 2 means it could not decide).
 A future implementation may turn this green only after it binds a deep render
 receipt to the exact golden being promoted; changing the manifest status alone
 fails closed.
