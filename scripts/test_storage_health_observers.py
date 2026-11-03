@@ -126,6 +126,34 @@ class ObserverHysteresisTests(unittest.TestCase):
                 os.environ["TZ"] = saved
             time.tzset()
 
+    def test_worker_persists_a_fresh_verdict_under_a_daylight_saving_zone(self):
+        import time
+        from unittest.mock import patch
+        at = "2026-07-03T10:05:00Z"
+        epoch = calendar.timegm(time.strptime(at, "%Y-%m-%dT%H:%M:%SZ"))
+        real_gmtime = time.gmtime
+        saved = os.environ.get("TZ")
+        os.environ["TZ"] = "America/Los_Angeles"
+        time.tzset()
+        try:
+            with tempfile.TemporaryDirectory() as temp:
+                host = Host(temp)
+                with patch.object(storage_health.time, "time", return_value=float(epoch + 5)), \
+                        patch.object(storage_health.time, "gmtime",
+                                     lambda *a: real_gmtime(*(a or (epoch,)))):
+                    rc, result = host.probe("gate", OK)
+                document = json.loads(host.state.read_text())
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+        self.assertEqual(rc, storage_health.HEALTHY, result)
+        self.assertEqual(document["status"], "healthy")
+        self.assertEqual(document["checked_at"], at)
+        self.assertEqual(storage_health.host_verdict(document, now=epoch + 5)[:1], ("healthy",))
+
     def test_fallback_never_reports_status_none(self):
         self.assertEqual(storage_health.host_verdict({})[0], "unknown")
         self.assertEqual(storage_health.host_verdict({"status": None, "observers": {}})[0], "unknown")
