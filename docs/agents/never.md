@@ -56,7 +56,10 @@ Each rule names the safe alternative.
 - Never delete a golden, a bench VM or a `held-` VM by hand. Use
   `tartci held delete NAME` for held VMs.
 - Never clear a JIT denial receipt before repairing the credential route it
-  names.
+  names. The lane clears only a `cause=repository_access` receipt, and only
+  after its own precheck passes; never add a self-clearing path for
+  `cause=credential` or a receipt without a cause, and never shorten the recheck
+  interval into a loop.
 - Never read zero online runners, a `0` queue count or an empty observation as
   proof that a host is down or idle. Check the exit code: unknown has its own.
 - Never commit VM images or anything under `TARTCI_HOME` to this repository.

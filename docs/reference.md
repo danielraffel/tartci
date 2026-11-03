@@ -430,6 +430,15 @@ the fleet in a retry loop. Repair the named auth route (or intentionally change
 the route, which changes the key) before clearing the receipt and dispatching
 another gate.
 
+The receipt carries a `cause=` line. When the repository-access precheck itself
+answered "deny" (`cause=repository_access`, for example a runner group that
+disallows public repositories), the lane re-runs that read-only precheck while
+the key is being served, at most every `TARTCI_JIT_DENIAL_RECHECK_SECS` seconds
+(default 900; `0` turns it off), and removes the receipt only when the check
+passes, logging a `jit_denial_cleared` event with the verdict. A
+`cause=credential` receipt, or an older receipt with no `cause=` line, is never
+cleared by the lane.
+
 If a Shipyard deployment also runs an external organization runner-group policy
 verifier, the App installation needs **Self-hosted runners: Read-only** at the
 organization level. Repository `Actions` access does not grant this. A host-side
