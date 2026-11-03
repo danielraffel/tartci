@@ -365,8 +365,7 @@ class System:
             return "unknown", f"no storage-health record at {state_path}", ""
         if state.get("state_unreadable"):
             return "unknown", "its state is unreadable", ""
-        return (str(state.get("status")), str(state.get("reason") or ""),
-                str(state.get("checked_at") or ""))
+        return storage_health.host_verdict(state)
 
     def process_start(self, pid: int) -> str | None:
         """The process's start time (identity across pid reuse), or None if gone."""

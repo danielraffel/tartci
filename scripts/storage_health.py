@@ -340,6 +340,52 @@ def _prune_observers(observers: dict, now: float) -> dict:
     return kept
 
 
+def _observer_epoch(record: dict) -> float | None:
+    try:
+        return time.mktime(time.strptime(str(record.get("checked_at", "")),
+                                         "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+    except ValueError:
+        return None
+
+
+def host_verdict(document: dict, *, marker_present: bool = False,
+                 now: float | None = None) -> tuple[str, str, str]:
+    """(status, reason, checked_at) for the whole host from per-lane records.
+
+    The top-level fields of a state file reflect whichever lane wrote last, so
+    a healthy lane writing after a quarantined one would hide the quarantine.
+    Quarantined if the marker is set or any fresh observer is quarantined;
+    healthy only if every fresh observer is healthy; otherwise degraded.
+    checked_at is the newest observer timestamp. With no usable observer
+    records (an older state file) the top-level fields stand.
+    """
+    now = time.time() if now is None else now
+    observers = document.get("observers")
+    fresh = []
+    if isinstance(observers, dict):
+        for record in observers.values():
+            if not isinstance(record, dict):
+                continue
+            epoch = _observer_epoch(record)
+            if epoch is not None and now - epoch <= OBSERVER_RETENTION_SECONDS:
+                fresh.append((epoch, record))
+    if not fresh:
+        status = "quarantined" if marker_present else str(document.get("status"))
+        return (status, str(document.get("reason") or ""),
+                str(document.get("checked_at") or ""))
+    newest = max(fresh, key=lambda pair: pair[0])[1]
+    checked_at = str(newest.get("checked_at") or "")
+    if marker_present:
+        return "quarantined", "a quarantine marker is present", checked_at
+    for _, record in fresh:
+        if record.get("status") == "quarantined":
+            return "quarantined", str(record.get("reason") or ""), checked_at
+    if all(record.get("status") == "healthy" for _, record in fresh):
+        return "healthy", str(newest.get("reason") or ""), checked_at
+    degraded = next(r for _, r in fresh if r.get("status") != "healthy")
+    return "degraded", str(degraded.get("reason") or ""), checked_at
+
+
 def next_observer_state(record: dict, ok: bool, reason: str, *, marker_epoch: int | None,
                         failure_threshold: int, recovery_threshold: int) -> tuple[dict, str]:
     """Advance one observer's hysteresis; return (record, reason).
@@ -422,6 +468,9 @@ def run_worker(args: argparse.Namespace) -> int:
             observers = _prune_observers(observers, time.time())
             observers[observer] = dict(record, reason=reason, checked_at=checked_at)
             saved = dict(result, observers=observers, marker_ack=record["marker_ack"])
+            host_status, host_reason, host_checked = host_verdict(
+                {"observers": observers}, marker_present=quarantine_marker.exists())
+            saved.update(status=host_status, reason=host_reason, checked_at=host_checked)
             try:
                 save_state(state_path, saved)
                 if status == "quarantined" and observer == "":

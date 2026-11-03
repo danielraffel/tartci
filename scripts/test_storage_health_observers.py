@@ -66,6 +66,36 @@ class ObserverHysteresisTests(unittest.TestCase):
             self.assertFalse(host.marker.exists(),
                              "a lane-local timeout must not quarantine the host")
 
+    def test_host_verdict_is_not_the_last_lane_to_write(self):
+        """A healthy lane writing after a quarantined one must not turn the
+        host-level fields healthy."""
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(temp)
+            host.probe("slot2", LANE_TIMEOUT)
+            host.probe("slot2", LANE_TIMEOUT)
+            rc, _ = host.probe("gate", OK)
+            self.assertEqual(rc, storage_health.HEALTHY)
+            document = json.loads(host.state.read_text())
+            self.assertEqual(document["status"], "quarantined")
+            self.assertEqual(storage_health.host_verdict(document)[0], "quarantined")
+
+    def test_host_verdict_rules(self):
+        def obs(status, at, reason="r"):
+            return {"status": status, "reason": reason, "checked_at": at}
+        a, b = "2026-11-03T10:00:00Z", "2026-11-03T10:05:00Z"
+        now = 1793700600.0  # 10:10Z
+        verdict = lambda doc, **kw: storage_health.host_verdict(doc, now=now, **kw)
+        self.assertEqual(verdict({"observers": {"x": obs("healthy", a), "y": obs("healthy", b)}}),
+                         ("healthy", "r", b))
+        self.assertEqual(verdict({"observers": {"x": obs("healthy", a), "y": obs("degraded", b, "d")}}),
+                         ("degraded", "d", b))
+        self.assertEqual(verdict({"observers": {"x": obs("quarantined", a, "q"), "y": obs("healthy", b)}}),
+                         ("quarantined", "q", b))
+        self.assertEqual(verdict({"observers": {"x": obs("healthy", a)}}, marker_present=True)[0],
+                         "quarantined")
+        legacy = {"status": "degraded", "reason": "old", "checked_at": a}
+        self.assertEqual(verdict(legacy), ("degraded", "old", a))
+
     def test_unknown_recovers_to_ok_after_a_full_window(self):
         with tempfile.TemporaryDirectory() as temp:
             host = Host(temp)
