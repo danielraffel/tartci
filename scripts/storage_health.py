@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import errno
 import fcntl
 import hashlib
@@ -290,6 +291,9 @@ def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
 STORE_WIDE_FAILURES = frozenset({"probe_timeout_unreaped"})
 # Observer records older than this are dropped so the shared state stays small.
 OBSERVER_RETENTION_SECONDS = 7 * 24 * 3600
+# Only observers checked this recently vote on the host verdict; older records
+# are kept for pruning but cannot hold the host quarantined after a lane stops.
+HOST_VERDICT_WINDOW_SECONDS = 30 * 60
 
 
 def _marker_epoch(marker: Path) -> int | None:
@@ -331,13 +335,63 @@ def _prune_observers(observers: dict, now: float) -> dict:
         if not isinstance(name, str) or not isinstance(record, dict):
             continue
         try:
-            checked = time.mktime(time.strptime(str(record.get("checked_at", "")),
-                                                "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            checked = calendar.timegm(time.strptime(str(record.get("checked_at", "")),
+                                                    "%Y-%m-%dT%H:%M:%SZ"))
         except ValueError:
             continue
         if now - checked <= OBSERVER_RETENTION_SECONDS:
             kept[name] = record
     return kept
+
+
+def _observer_epoch(record: dict) -> float | None:
+    try:
+        return calendar.timegm(time.strptime(str(record.get("checked_at", "")),
+                                             "%Y-%m-%dT%H:%M:%SZ"))
+    except ValueError:
+        return None
+
+
+def host_verdict(document: dict, *, marker_present: bool = False,
+                 now: float | None = None) -> tuple[str, str, str]:
+    """(status, reason, checked_at) for the whole host from per-lane records.
+
+    The top-level fields of a state file reflect whichever lane wrote last, so
+    a healthy lane writing after a quarantined one would hide the quarantine.
+    Quarantined if the marker is set or any fresh observer is quarantined;
+    healthy only if every fresh observer is healthy; otherwise degraded.
+    checked_at is the newest observer timestamp. Only observers checked within
+    HOST_VERDICT_WINDOW_SECONDS vote. With none inside the window (or an older
+    state file) the top-level fields stand, and the marker still overrides.
+    """
+    now = time.time() if now is None else now
+    observers = document.get("observers")
+    fresh = []
+    if isinstance(observers, dict):
+        for record in observers.values():
+            if not isinstance(record, dict):
+                continue
+            epoch = _observer_epoch(record)
+            if epoch is not None and now - epoch <= HOST_VERDICT_WINDOW_SECONDS:
+                fresh.append((epoch, record))
+    if not fresh:
+        status = document.get("status")
+        status = str(status) if status in ("healthy", "degraded", "quarantined") else "unknown"
+        if marker_present:
+            status = "quarantined"
+        return (status, str(document.get("reason") or ""),
+                str(document.get("checked_at") or ""))
+    newest = max(fresh, key=lambda pair: pair[0])[1]
+    checked_at = str(newest.get("checked_at") or "")
+    if marker_present:
+        return "quarantined", "a quarantine marker is present", checked_at
+    for _, record in fresh:
+        if record.get("status") == "quarantined":
+            return "quarantined", str(record.get("reason") or ""), checked_at
+    if all(record.get("status") == "healthy" for _, record in fresh):
+        return "healthy", str(newest.get("reason") or ""), checked_at
+    degraded = next(r for _, r in fresh if r.get("status") != "healthy")
+    return "degraded", str(degraded.get("reason") or ""), checked_at
 
 
 def next_observer_state(record: dict, ok: bool, reason: str, *, marker_epoch: int | None,
@@ -422,6 +476,9 @@ def run_worker(args: argparse.Namespace) -> int:
             observers = _prune_observers(observers, time.time())
             observers[observer] = dict(record, reason=reason, checked_at=checked_at)
             saved = dict(result, observers=observers, marker_ack=record["marker_ack"])
+            host_status, host_reason, host_checked = host_verdict(
+                {"observers": observers}, marker_present=quarantine_marker.exists())
+            saved.update(status=host_status, reason=host_reason, checked_at=host_checked)
             try:
                 save_state(state_path, saved)
                 if status == "quarantined" and observer == "":
