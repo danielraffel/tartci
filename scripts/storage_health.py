@@ -290,6 +290,9 @@ def run_probe_bounded(path: Path, timeout: float) -> tuple[bool, str, float]:
 STORE_WIDE_FAILURES = frozenset({"probe_timeout_unreaped"})
 # Observer records older than this are dropped so the shared state stays small.
 OBSERVER_RETENTION_SECONDS = 7 * 24 * 3600
+# Only observers checked this recently vote on the host verdict; older records
+# are kept for pruning but cannot hold the host quarantined after a lane stops.
+HOST_VERDICT_WINDOW_SECONDS = 30 * 60
 
 
 def _marker_epoch(marker: Path) -> int | None:
@@ -356,8 +359,9 @@ def host_verdict(document: dict, *, marker_present: bool = False,
     a healthy lane writing after a quarantined one would hide the quarantine.
     Quarantined if the marker is set or any fresh observer is quarantined;
     healthy only if every fresh observer is healthy; otherwise degraded.
-    checked_at is the newest observer timestamp. With no usable observer
-    records (an older state file) the top-level fields stand.
+    checked_at is the newest observer timestamp. Only observers checked within
+    HOST_VERDICT_WINDOW_SECONDS vote. With none inside the window (or an older
+    state file) the top-level fields stand, and the marker still overrides.
     """
     now = time.time() if now is None else now
     observers = document.get("observers")
@@ -367,7 +371,7 @@ def host_verdict(document: dict, *, marker_present: bool = False,
             if not isinstance(record, dict):
                 continue
             epoch = _observer_epoch(record)
-            if epoch is not None and now - epoch <= OBSERVER_RETENTION_SECONDS:
+            if epoch is not None and now - epoch <= HOST_VERDICT_WINDOW_SECONDS:
                 fresh.append((epoch, record))
     if not fresh:
         status = "quarantined" if marker_present else str(document.get("status"))

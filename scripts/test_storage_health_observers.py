@@ -96,6 +96,19 @@ class ObserverHysteresisTests(unittest.TestCase):
         legacy = {"status": "degraded", "reason": "old", "checked_at": a}
         self.assertEqual(verdict(legacy), ("degraded", "old", a))
 
+    def test_only_recent_observers_vote(self):
+        def obs(status, at):
+            return {"status": status, "reason": "r", "checked_at": at}
+        old, recent = "2026-11-03T09:00:00Z", "2026-11-03T10:05:00Z"
+        now = 1793700600.0  # 10:10Z
+        stale_q = {"observers": {"gone": obs("quarantined", old), "live": obs("healthy", recent)}}
+        self.assertEqual(storage_health.host_verdict(stale_q, now=now)[0], "healthy")
+        live_q = {"observers": {"gone": obs("quarantined", recent), "live": obs("healthy", recent)}}
+        self.assertEqual(storage_health.host_verdict(live_q, now=now)[0], "quarantined")
+        only_old = {"observers": {"gone": obs("healthy", old)}}
+        self.assertEqual(storage_health.host_verdict(only_old, marker_present=True, now=now)[0],
+                         "quarantined")
+
     def test_unknown_recovers_to_ok_after_a_full_window(self):
         with tempfile.TemporaryDirectory() as temp:
             host = Host(temp)
