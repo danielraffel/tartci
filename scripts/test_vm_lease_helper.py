@@ -1626,6 +1626,61 @@ fi
         self.assertEqual(proc.stdout.strip(), "1")
 
 
+class ActiveReservationsPidReuseTests(unittest.TestCase):
+    """A reservation is owned by a process, not just a pid number."""
+
+    CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
+
+    def _count(self, files: dict) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            resv = tmp / "resv"
+            resv.mkdir()
+            for name, body in files.items():
+                (resv / name).write_text(body)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={resv}
+                source {self.CAP_LIB}
+                live="$(tartci_pid_token $$)"
+                now="$(date +%s)"
+                {{
+                  printf '%s %s %s' "$$" "$live" "$now" > {resv}/resv.current
+                  printf '%s %s %s' "$$" "WrongStart2001" "$now" > {resv}/resv.reused
+                  printf '%s %s' "$$" "$now" > {resv}/resv.legacy
+                }}
+                tartci_active_reservations
+                for f in current reused legacy; do [ -e {resv}/resv.$f ] && printf ' %s' "$f"; done
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+    def test_reused_pid_with_different_start_token_is_pruned(self) -> None:
+        self.assertEqual(self._count({}), "2 current legacy")
+
+    def test_claim_writes_pid_token_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={tmp}/resv TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/none
+                source {ClaimMacosSlotUnknownInventoryTests.CAP_LIB}
+                f="$(tartci_claim_macos_slot 2 0)"
+                cat "$f"
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            fields = proc.stdout.split()
+            self.assertEqual(len(fields), 3, proc.stdout)
+            self.assertTrue(fields[0].isdigit() and fields[2].isdigit())
+
+
 class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
     """An unreadable inventory cannot authorize another clone."""
 

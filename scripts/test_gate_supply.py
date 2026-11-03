@@ -662,5 +662,19 @@ class ProfileRenderTests(unittest.TestCase):
         self.assertEqual(self._run((ROOT / "profiles" / "m1-macos-fleet.toml").read_text()).returncode, 0)
 
 
+
+class LiveReservationsPidReuseTests(unittest.TestCase):
+    def test_reused_pid_token_mismatch_is_not_counted(self) -> None:
+        now = int(time.time())
+        mine = gate_supply._pid_token(os.getpid())
+        self.assertTrue(mine)
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "resv.current").write_text(f"{os.getpid()} {mine} {now}")
+            (d / "resv.reused").write_text(f"{os.getpid()} WrongStart2001 {now}")
+            (d / "resv.legacy").write_text(f"{os.getpid()} {now}")
+            self.assertEqual(gate_supply.live_reservations(d, now), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

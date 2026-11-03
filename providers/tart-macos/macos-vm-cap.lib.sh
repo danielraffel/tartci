@@ -28,21 +28,33 @@ tartci_effective_cap(){
   printf '%s' "$c"
 }
 
+# A process's start time with the spaces removed ("Mon Nov  3 10:00:00 2026" →
+# "MonNov310:00:002026"), or empty when the process is gone. Paired with the pid
+# it identifies a process across pid reuse.
+tartci_pid_token(){ ps -o lstart= -p "$1" 2>/dev/null | tr -d ' \t'; }
+
 # Count live reservations = macOS slots claimed by in-flight boots/jobs. Each
-# reservation file holds "<owner-supervisor-pid> <epoch>". Prune any whose owner
-# process is dead (crash / reload-mid-job → the VM is already gone) or that is
-# older than the TTL backstop, or that is empty/garbage — so an orphaned
+# reservation file holds "<owner-supervisor-pid> <start-token> <epoch>" (an older
+# "<pid> <epoch>" file has no token and is still read). Prune any whose owner
+# process is dead (crash / reload-mid-job → the VM is already gone), whose pid
+# now belongs to a different process (start token differs: the pid was reused),
+# that is older than the TTL backstop, or that is empty/garbage — so an orphaned
 # reservation can't dark the gate (critical at cap=1).
 tartci_active_reservations(){
-  local now line pid ts n=0 f
+  local now line pid tok ts extra live n=0 f
   now="$(date +%s)"
   [ -d "$TARTCI_MACOS_RESV_DIR" ] || { printf 0; return; }
   for f in "$TARTCI_MACOS_RESV_DIR"/resv.*; do
     [ -e "$f" ] || continue
     line="$(cat "$f" 2>/dev/null || echo)"
     if [ -z "$line" ]; then rm -f "$f" 2>/dev/null; continue; fi
-    pid="${line%% *}"; ts="${line##* }"
+    read -r pid tok ts extra <<<"$line"
+    if [ -z "$ts" ]; then ts="$tok"; tok=""; fi
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f" 2>/dev/null; continue; fi
+    if [ -n "$pid" ] && [ -n "$tok" ]; then
+      live="$(tartci_pid_token "$pid")"
+      if [ -n "$live" ] && [ "$live" != "$tok" ]; then rm -f "$f" 2>/dev/null; continue; fi
+    fi
     case "$ts" in ""|*[!0-9]*) ts=0;; esac
     if [ $(( now - ts )) -gt "$TARTCI_MACOS_RESV_TTL" ]; then rm -f "$f" 2>/dev/null; continue; fi
     n=$((n+1))
@@ -97,7 +109,7 @@ tartci_claim_macos_slot(){
     # command-substitution subshell) so a dead owner's slot can be reclaimed.
     resv="$(mktemp "$TARTCI_MACOS_RESV_DIR/resv.XXXXXX" 2>/dev/null)"
     if [ -n "$resv" ]; then
-      printf '%s %s' "$$" "$(date +%s)" > "$resv" 2>/dev/null || true
+      printf '%s %s %s' "$$" "$(tartci_pid_token "$$")" "$(date +%s)" > "$resv" 2>/dev/null || true
       printf '%s' "$resv"
     else
       # FS failure (disk full / unwritable config dir): fail OPEN. Never dark a
