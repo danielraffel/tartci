@@ -41,14 +41,14 @@ tartci_pid_token(){ ps -o lstart= -p "$1" 2>/dev/null | tr -d ' \t'; }
 # that is older than the TTL backstop, or that is empty/garbage — so an orphaned
 # reservation can't dark the gate (critical at cap=1).
 tartci_active_reservations(){
-  local now line pid tok ts extra live n=0 f
+  local now line pid tok ts live n=0 f
   now="$(date +%s)"
   [ -d "$TARTCI_MACOS_RESV_DIR" ] || { printf 0; return; }
   for f in "$TARTCI_MACOS_RESV_DIR"/resv.*; do
     [ -e "$f" ] || continue
     line="$(cat "$f" 2>/dev/null || echo)"
     if [ -z "$line" ]; then rm -f "$f" 2>/dev/null; continue; fi
-    read -r pid tok ts extra <<<"$line"
+    read -r pid tok ts _ <<<"$line"
     if [ -z "$ts" ]; then ts="$tok"; tok=""; fi
     if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -f "$f" 2>/dev/null; continue; fi
     if [ -n "$pid" ] && [ -n "$tok" ]; then
