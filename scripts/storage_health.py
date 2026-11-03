@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import errno
 import fcntl
 import hashlib
@@ -334,8 +335,8 @@ def _prune_observers(observers: dict, now: float) -> dict:
         if not isinstance(name, str) or not isinstance(record, dict):
             continue
         try:
-            checked = time.mktime(time.strptime(str(record.get("checked_at", "")),
-                                                "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+            checked = calendar.timegm(time.strptime(str(record.get("checked_at", "")),
+                                                    "%Y-%m-%dT%H:%M:%SZ"))
         except ValueError:
             continue
         if now - checked <= OBSERVER_RETENTION_SECONDS:
@@ -345,8 +346,8 @@ def _prune_observers(observers: dict, now: float) -> dict:
 
 def _observer_epoch(record: dict) -> float | None:
     try:
-        return time.mktime(time.strptime(str(record.get("checked_at", "")),
-                                         "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        return calendar.timegm(time.strptime(str(record.get("checked_at", "")),
+                                             "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return None
 
@@ -374,7 +375,10 @@ def host_verdict(document: dict, *, marker_present: bool = False,
             if epoch is not None and now - epoch <= HOST_VERDICT_WINDOW_SECONDS:
                 fresh.append((epoch, record))
     if not fresh:
-        status = "quarantined" if marker_present else str(document.get("status"))
+        status = document.get("status")
+        status = str(status) if status in ("healthy", "degraded", "quarantined") else "unknown"
+        if marker_present:
+            status = "quarantined"
         return (status, str(document.get("reason") or ""),
                 str(document.get("checked_at") or ""))
     newest = max(fresh, key=lambda pair: pair[0])[1]

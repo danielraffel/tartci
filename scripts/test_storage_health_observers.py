@@ -12,7 +12,9 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import calendar
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -95,6 +97,40 @@ class ObserverHysteresisTests(unittest.TestCase):
                          "quarantined")
         legacy = {"status": "degraded", "reason": "old", "checked_at": a}
         self.assertEqual(verdict(legacy), ("degraded", "old", a))
+
+    def test_host_verdict_is_independent_of_the_local_timezone(self):
+        """A just-written UTC timestamp must be fresh under any TZ, including
+        a daylight-saving one (the old mktime parse was an hour off there)."""
+        import time
+        at = "2026-07-03T10:05:00Z"
+        now = calendar.timegm(time.strptime("2026-07-03T10:05:05Z", "%Y-%m-%dT%H:%M:%SZ"))
+        doc = {"observers": {"a": {"status": "healthy", "reason": "ok", "checked_at": at}}}
+        saved = os.environ.get("TZ")
+        try:
+            for zone in ("UTC", "America/Los_Angeles", "Asia/Kolkata"):
+                os.environ["TZ"] = zone
+                time.tzset()
+                with self.subTest(zone=zone):
+                    self.assertEqual(storage_health.host_verdict(doc, now=now),
+                                     ("healthy", "ok", at))
+            for winter in ("2026-01-03T10:05:00Z",):
+                os.environ["TZ"] = "America/Los_Angeles"
+                time.tzset()
+                w = {"observers": {"a": {"status": "healthy", "reason": "ok", "checked_at": winter}}}
+                wn = calendar.timegm(time.strptime("2026-01-03T10:05:05Z", "%Y-%m-%dT%H:%M:%SZ"))
+                self.assertEqual(storage_health.host_verdict(w, now=wn)[0], "healthy")
+        finally:
+            if saved is None:
+                os.environ.pop("TZ", None)
+            else:
+                os.environ["TZ"] = saved
+            time.tzset()
+
+    def test_fallback_never_reports_status_none(self):
+        self.assertEqual(storage_health.host_verdict({})[0], "unknown")
+        self.assertEqual(storage_health.host_verdict({"status": None, "observers": {}})[0], "unknown")
+        self.assertEqual(storage_health.host_verdict({"status": "degraded"})[0], "degraded")
+        self.assertEqual(storage_health.host_verdict({}, marker_present=True)[0], "quarantined")
 
     def test_only_recent_observers_vote(self):
         def obs(status, at):
