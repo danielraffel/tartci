@@ -74,7 +74,7 @@ FREE_PHASES = frozenset({"waiting", "loop", "backoff", "warm-parking", "warm-par
 # Past admission, not yet assigned: this lane is already reaching for a job.
 IN_FLIGHT_PHASES = frozenset({
     "cloning", "admission-precheck", "booting", "ensuring-runner", "aqua-preflight",
-    "chrome-preflight", "admission-check", "minting-jit", "idle-wait",
+    "chrome-preflight", "cft-preflight", "admission-check", "minting-jit", "idle-wait",
     "idle-retarget-check", "warm-handoff",
     # A booted VM held before the pre-mint discard. Unlike the other phases
     # it may serve ANY class when the hold ends, so it counts in flight for

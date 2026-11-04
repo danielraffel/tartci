@@ -102,7 +102,8 @@ WORKTREE_CLEANUP_KEYS = {
 LANE_KEYS = {
     "id", "repo", "golden", "priority", "vm_cores", "vm_cores_from", "labels", "workflows", "tier",
     "runner_group_id", "registration_scope", "min_queued_age_seconds", "replaces_launchd_labels",
-    "jit_github_cli", "chrome_app_dir", "assignment_mode", "cache_root",
+    "jit_github_cli", "chrome_app_dir",
+    "chrome_for_testing_dir", "chrome_for_testing_version", "chrome_for_testing_sha256", "assignment_mode", "cache_root",
     "ccache_write_isolation",
     "runtime_measure", "runtime_gh_enrich", "runtime_tags",
     "assignment_omit_labels", "supervisors", "process_type",
@@ -1058,6 +1059,22 @@ def load(path: Path) -> dict:
                     or normalized_chrome.name != "Google Chrome.app"
                     or any(char in chrome_app_dir for char in ":\r\n")):
                 fail(f"lane {lane_id}: chrome_app_dir must be an absolute Google Chrome.app path")
+        cft = [lane.get(k) for k in (
+            "chrome_for_testing_dir", "chrome_for_testing_version", "chrome_for_testing_sha256")]
+        if any(value is not None for value in cft):
+            if lane["repo"] != "Generous-Corp/vellum":
+                fail(f"lane {lane_id}: chrome_for_testing_* is restricted to the Vellum lane")
+            cft_dir, cft_version, cft_sha = cft
+            if (not all(isinstance(value, str) for value in cft)
+                    or not posixpath.isabs(cft_dir)
+                    or posixpath.normpath(cft_dir) != cft_dir
+                    or any(char in cft_dir for char in ":\r\n")
+                    or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", cft_version)
+                    or not re.fullmatch(r"[0-9a-f]{64}", cft_sha)):
+                fail(
+                    f"lane {lane_id}: chrome_for_testing_dir, _version and _sha256 must all be set "
+                    "(absolute normalized dir, four-part version, 64 lowercase hex digest)"
+                )
         workflows = lane.get("workflows") or []
         tiers = lane.get("tier") or []
         if workflows and (not isinstance(workflows, list)
@@ -2997,6 +3014,10 @@ def lane_plist(
         env["TARTCI_HOST_CI_CACHE"] = host["cache_root"]
     if "chrome_app_dir" in lane:
         env["TARTCI_RUNNER_CHROME_APP_DIR"] = lane["chrome_app_dir"]
+    if "chrome_for_testing_dir" in lane:
+        env["TARTCI_RUNNER_CFT_DIR"] = lane["chrome_for_testing_dir"]
+        env["TARTCI_RUNNER_CFT_VERSION"] = lane["chrome_for_testing_version"]
+        env["TARTCI_RUNNER_CFT_SHA256"] = lane["chrome_for_testing_sha256"]
     if "assignment_mode" in lane:
         omit = ",".join(lane.get("assignment_omit_labels", []))
         class_labels = ",".join(dict.fromkeys(row["label"] for row in lane["tier"]))
