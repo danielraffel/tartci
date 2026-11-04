@@ -105,6 +105,30 @@ class HttpConnectSshRelayConfigTests(unittest.TestCase):
         self.assertTrue(relay.host_is_allowed("search.sigstore.dev", suffixes))
         self.assertFalse(relay.host_is_allowed("evilsigstore.dev", suffixes))
 
+    def test_launchd_allows_chrome_for_testing_version_index(self) -> None:
+        template = (
+            ROOT / "launchd/com.danielraffel.tartci.http-connect-ssh-relay.plist.template"
+        ).read_text()
+        self.assertIn("<string>googlechromelabs.github.io</string>", template)
+        suffixes = ("googlechromelabs.github.io",)
+        self.assertTrue(relay.host_is_allowed("googlechromelabs.github.io", suffixes))
+        self.assertFalse(relay.host_is_allowed("github.io", suffixes))
+        self.assertFalse(relay.host_is_allowed("evil.github.io", suffixes))
+
+    def test_denied_connect_is_logged_with_its_target(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        handler = relay.ConnectHandler.__new__(relay.ConnectHandler)
+        sent: list[bytes] = []
+        handler.request = type("S", (), {"sendall": lambda self, b: sent.append(b)})()
+        handler.config = type("C", (), {"allowed_host_suffixes": ("github.com",)})()
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            handler.relay(b"CONNECT unlisted.example:443 HTTP/1.1\r\n\r\n")
+        self.assertEqual(sent, [b"HTTP/1.1 403 Forbidden\r\n\r\n"])
+        self.assertIn('"event": "connect_denied"', buf.getvalue())
+        self.assertIn("unlisted.example:443", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
