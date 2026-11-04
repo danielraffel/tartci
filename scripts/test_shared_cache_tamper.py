@@ -288,6 +288,7 @@ note(){ echo "note $*" >>"$calls"; }
 event(){ echo "event $*" >>"$calls"; }
 heartbeat(){ :; }
 CHROME_MOUNT_ARG=""
+verify_cft_mount(){ return 0; }
 """
 
 
