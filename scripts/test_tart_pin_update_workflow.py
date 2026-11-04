@@ -53,9 +53,16 @@ class TartPinUpdateWorkflow(unittest.TestCase):
     def test_app_token_is_pinned_and_narrowly_scoped(self):
         mint = self.steps["Mint the pin-update App token"]
         self.assertIn("uses: " + APP_TOKEN_ACTION, mint)
-        self.assertIn("repositories: ${{ github.event.repository.name }}", mint)
+        # No owner/repositories input: the token covers this repository only.
+        # A schedule event carries no repository object, so an
+        # `github.event.repository.name` value would be empty and, with owner
+        # set, widen the token to every repository of the owner.
+        self.assertNotIn("owner:", mint)
+        self.assertNotIn("repositories:", mint)
+        self.assertIn("client-id: Iv23liTCzDQWqmMjkDTI", mint)
         permissions = sorted(re.findall(r"permission-([a-z-]+): (\w+)", mint))
-        self.assertEqual(permissions, [("contents", "write"), ("pull-requests", "write")])
+        self.assertEqual(permissions, [("contents", "write"), ("pull-requests", "write"),
+                                       ("workflows", "write")])
 
     def test_missing_app_credentials_fail_before_minting(self):
         names = list(self.steps)

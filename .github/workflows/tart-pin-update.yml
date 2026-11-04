@@ -5,7 +5,7 @@ name: Tart pin update
 # pin through their existing drained, canary-first self-update engine.
 #
 # The pin branch is pushed and the PR opened with a shipyard-local GitHub App
-# installation token (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY),
+# installation token (secret SHIPYARD_APP_PRIVATE_KEY),
 # never the default workflow token: pushes and PRs made with that token start
 # no workflows, so the PR's required checks would never run. The default token
 # stays read-only and is not persisted for git.
@@ -59,11 +59,10 @@ jobs:
       - name: Require the pin-update App credentials
         if: steps.discover.outputs.changed == 'true'
         env:
-          SHIPYARD_APP_ID: ${{ secrets.SHIPYARD_APP_ID }}
           SHIPYARD_APP_PRIVATE_KEY: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
         run: |
-          if [ -z "$SHIPYARD_APP_ID" ] || [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
-            echo '::error::The pin-update App credentials are required (secrets SHIPYARD_APP_ID and SHIPYARD_APP_PRIVATE_KEY); refusing to open a PR whose required checks would never run.' >&2
+          if [ -z "$SHIPYARD_APP_PRIVATE_KEY" ]; then
+            echo '::error::The pin-update App credentials are required (secret SHIPYARD_APP_PRIVATE_KEY); refusing to open a PR whose required checks would never run.' >&2
             exit 1
           fi
 
@@ -72,13 +71,17 @@ jobs:
         id: app-token
         uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
-          app-id: ${{ secrets.SHIPYARD_APP_ID }}
+          # The shipyard-local App's public client ID. With no owner or
+          # repositories input the token is scoped to this repository only.
+          client-id: Iv23liTCzDQWqmMjkDTI
           private-key: ${{ secrets.SHIPYARD_APP_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
-          repositories: ${{ github.event.repository.name }}
-          # Push the pin branch; open or refresh its PR.
+          # Push the pin branch; open or refresh its PR. The branch is rebuilt
+          # from origin/main and force-pushed; when main changed
+          # .github/workflows since the last pin PR, GitHub refuses that ref
+          # update from an App token without workflows write.
           permission-contents: write
           permission-pull-requests: write
+          permission-workflows: write
 
       - name: Create the reviewed pin branch
         if: steps.discover.outputs.changed == 'true'
