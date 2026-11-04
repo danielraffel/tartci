@@ -249,6 +249,9 @@ workflows = ["Locked macOS GPU proof"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
 # every host (31 of 65 Vellum boots got no job, 2026-11-01..04).
 assignment_fleet_claim_peers = true
+# Claims are keyed by the labels the Vellum job requests, not the host pin,
+# so every host's lane shares one key.
+job_claim_labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos"]
 runner_idle_timeout_seconds = 60
 replaces_launchd_labels = ["com.danielraffel.vellum.tart-runner-macos"]
 # Tear a VM down once its guest stops heartbeating for this long; a

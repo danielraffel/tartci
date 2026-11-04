@@ -110,6 +110,7 @@ LANE_KEYS = {
     "assignment_top_tier_receipt_max_age_seconds", "assignment_feed_rescue",
     "assignment_idle_retarget_seconds", "assignment_slot_tier_order",
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
+    "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
     "yield_max_wait_seconds", "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -899,6 +900,23 @@ def load(path: Path) -> dict:
         fleet_peers = lane.get("assignment_fleet_claim_peers")
         if fleet_peers is not None and type(fleet_peers) is not bool:
             fail(f"lane {lane_id}: assignment_fleet_claim_peers must be a boolean")
+        # The labels a boot claim is keyed by, when the lane's own labels
+        # carry a per-host pin: without it no two hosts share a claim key, so
+        # peers' claims never match. Only the labels every host's lane shares
+        # for the same jobs belong here.
+        claim_labels = lane.get("job_claim_labels")
+        if claim_labels is not None and (
+                assignment_mode == "event-class-v2"
+                or not isinstance(claim_labels, list)
+                or not claim_labels
+                or any(not isinstance(value, str) or not value.strip()
+                       or "," in value for value in claim_labels)
+                or len(claim_labels) != len(set(claim_labels))
+                or not set(claim_labels) <= set(lane.get("labels") or [])):
+            fail(
+                f"lane {lane_id}: job_claim_labels must be unique labels the lane "
+                "advertises, on a lane that is not event-class-v2"
+            )
         idle_retarget = lane.get("assignment_idle_retarget_seconds")
         if idle_retarget is not None and (
                 assignment_mode != "event-class-v2"
@@ -3004,6 +3022,8 @@ def lane_plist(
         env["TARTCI_ASSIGNMENT_V2_PRE_CLONE_CHECK"] = "1"
     if lane.get("assignment_fleet_claim_peers"):
         env["TARTCI_JOB_CLAIM_FLEET_PEERS"] = "1"
+    if lane.get("job_claim_labels"):
+        env["TARTCI_JOB_CLAIM_LABELS"] = ",".join(lane["job_claim_labels"])
     if lane.get("assignment_idle_retarget_seconds"):
         env["TARTCI_ASSIGNMENT_V2_IDLE_RETARGET_SECS"] = str(
             lane["assignment_idle_retarget_seconds"]

@@ -19,6 +19,7 @@ from pathlib import Path
 import tartci_support_manifest as support_manifest
 import network_profile as network
 import macos_fleet_lanes as fleet
+import job_claim
 import macos_launcher_probe
 
 
@@ -2158,7 +2159,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         key = "assignment_fleet_claim_peers"
         base = CONFIG.read_text()
         # Shipped only on the vellum-gate lane (see the test below).
-        self.assertEqual(base.count(f"{key} = true"), 1)
+        self.assertEqual(len(re.findall(rf"^{key}\s*=", base, re.M)), 1)
         anchor = "assignment_feed_rescue = true"
         self.assertEqual(base.count(anchor), 1)
         with tempfile.TemporaryDirectory() as td:
@@ -2181,18 +2182,44 @@ class MacosFleetLaneTests(unittest.TestCase):
         # every host. Every other lane stays off until its own canary.
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
-        vellum_slots = 0
+        vellum_keys: dict[str, str] = {}
         for profile in profiles:
             for body in fleet.rendered_plists(fleet.load(profile)).values():
                 env = plistlib.loads(body)["EnvironmentVariables"]
-                is_vellum = env.get("TARTCI_RUNNER_REPO") == "Generous-Corp/vellum"
-                vellum_slots += is_vellum
-                with self.subTest(profile=profile.name, lane=env.get("TARTCI_QUEUE_LANE_ID")):
-                    if is_vellum:
-                        self.assertEqual(env.get("TARTCI_JOB_CLAIM_FLEET_PEERS"), "1")
-                    else:
+                lane = env.get("TARTCI_QUEUE_LANE_ID")
+                is_vellum = "vellum-build-macos" in env.get("TARTCI_RUNNER_LABELS", "").split(",")
+                with self.subTest(profile=profile.name, lane=lane):
+                    if not is_vellum:
                         self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env)
-        self.assertEqual(vellum_slots, 4)
+                        self.assertNotIn("TARTCI_JOB_CLAIM_LABELS", env)
+                        continue
+                    self.assertEqual(env.get("TARTCI_JOB_CLAIM_FLEET_PEERS"), "1")
+                    claim_labels = env["TARTCI_JOB_CLAIM_LABELS"]
+                    # The claim labels are what every Vellum job requests and
+                    # what every host's runner advertises.
+                    self.assertTrue(set(claim_labels.split(",")) <= set(
+                        env["TARTCI_RUNNER_LABELS"].split(",")))
+                    vellum_keys[lane] = job_claim.claim_key(env["TARTCI_RUNNER_REPO"], claim_labels)
+        # Peers' claims only count when the keys match: one key on every host.
+        # Keyed by the lane's own labels, each host's per-host pin would give
+        # four different keys and the setting would do nothing.
+        self.assertGreaterEqual(len(vellum_keys), len(profiles))
+        self.assertEqual(len(set(vellum_keys.values())), 1, vellum_keys)
+
+    def test_job_claim_labels_must_be_shared_advertised_labels(self) -> None:
+        base = CONFIG.read_text()
+        good = 'job_claim_labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos"]'
+        self.assertEqual(base.count(good), 1)
+        with tempfile.TemporaryDirectory() as td:
+            for value in ('["self-hosted", "not-advertised"]', "[]", '"self-hosted"',
+                          '["self-hosted", "self-hosted"]', '["a,b"]'):
+                with self.subTest(value=value):
+                    bad = Path(td) / "bad.toml"
+                    bad.write_text(base.replace(good, f"job_claim_labels = {value}", 1))
+                    result = subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(bad)],
+                                            text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("job_claim_labels", result.stderr)
 
     def test_job_claim_max_age_is_bounded_and_m1_declares_the_ttl(self) -> None:
         base = CONFIG.read_text()

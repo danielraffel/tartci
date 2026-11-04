@@ -351,11 +351,23 @@ refuse one job; two hosts that both read before either writes can still both
 boot (a window of seconds), and the pre-mint check catches the loser.
 
 m1 declares 1800 s: its lanes wait for a VM lease after claiming, so its claims
-live about 26 min on average against 4-5 min elsewhere. The key is on for the
-`vellum-gate` lane on every host (2026-11-04: 31 of its 65 boots got no job,
-because each free host booted for the same queued proof) and off on every other
-lane. Canary: m1, once it has had the pre-clone check for 72 h, with m3, m5 and
-m5studio as same-window controls; m5 joins after its ranked-lease canary read.
+live about 26 min on average against 4-5 min elsewhere.
+
+A claim is keyed by the repository and the lane's selected labels, so a lane
+whose labels pin it to one host (`vellum-host-<id>`) shares no key with its
+peers, and their claims never count. Such a lane names the labels its jobs
+request in `job_claim_labels` (env `TARTCI_JOB_CLAIM_LABELS`); the validator
+requires them to be labels the lane advertises, and refuses the key on an
+event-class-v2 lane, whose class labels already match across hosts.
+
+The `vellum-gate` lane runs with both keys on every host: in the ~67 h before
+the change, 31 of its 65 boots got no job, because each free host booted for
+the same queued proof. A host's claim counts for its declared age, so a peer
+whose boot hangs holds the job back until its claim expires or its VM is torn
+down (`guest_heartbeat_stale_seconds`); m1's 600 s queue age keeps it last.
+Every other lane keeps the key off. The Pulp gate canary remains: m1, once it
+has had the pre-clone check for 72 h, with m3, m5 and m5studio as same-window
+controls; m5 joins after its ranked-lease canary read.
 
 ## Per-slot class preference (merge-group first)
 
