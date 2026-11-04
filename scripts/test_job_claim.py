@@ -544,6 +544,27 @@ class LibraryTests(unittest.TestCase):
         calls = (self.tmp / "ssh-calls").read_text()
         self.assertNotIn(" me ", " " + calls.replace("\n", " ") + " ", "this host never reads itself")
 
+    def test_a_host_pinned_lane_matches_peers_through_its_claim_labels(self) -> None:
+        # The lane advertises a per-host pin label, so its own labels key a
+        # claim no peer shares. The peer published its claim under the shared
+        # labels; only TARTCI_JOB_CLAIM_LABELS makes the two keys meet.
+        shared = LABELS
+        pinned = f"{LABELS},lane-host-me"
+        published = json.dumps({"host": "m3", "max_age_s": None, "claims": [
+            {"key": key(shared), "vm": "studio-vm-9", "age_s": 30}]})
+        line = (f"rc=0; tartci_job_claim_acquire vm-me {pinned!r} 1 1 repos/x/actions/runners || rc=$?\n"
+                "echo \"rc=$rc contended=$JOB_CLAIM_CONTENDED id=$JOB_CLAIM_ID\"\n")
+        base = {**self.peer_env(f"echo {published!r}\n"), "TARTCI_JOB_CLAIM_FLEET_PEERS": "1"}
+        for name, extra, expected in (
+            ("control: keyed by the pinned labels", {}, "rc=0 contended=0"),
+            ("keyed by the shared labels", {"TARTCI_JOB_CLAIM_LABELS": shared}, "rc=75 contended=1"),
+        ):
+            with self.subTest(case=name):
+                self.events.unlink(missing_ok=True)
+                self.gh("exit 0\n")
+                proc = self.run_bash(self.script(line, mode="legacy"), env={**base, **extra})
+                self.assertIn(expected, proc.stdout, proc.stderr)
+
     def test_knob_off_reads_no_peer_at_all(self) -> None:
         # Negative control: without the lane opting in there is no outbound
         # read and no fleet_booting, whatever the peers hold.
