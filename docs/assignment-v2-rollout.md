@@ -351,7 +351,9 @@ refuse one job; two hosts that both read before either writes can still both
 boot (a window of seconds), and the pre-mint check catches the loser.
 
 m1 declares 1800 s: its lanes wait for a VM lease after claiming, so its claims
-live about 26 min on average against 4-5 min elsewhere. The key is off on every
+live about 26 min on average against 4-5 min elsewhere. The key is on for the
+`vellum-gate` lane on every host (2026-11-04: 31 of its 65 boots got no job,
+because each free host booted for the same queued proof) and off on every other
 lane. Canary: m1, once it has had the pre-clone check for 72 h, with m3, m5 and
 m5studio as same-window controls; m5 joins after its ranked-lease canary read.
 

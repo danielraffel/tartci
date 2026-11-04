@@ -2157,7 +2157,8 @@ class MacosFleetLaneTests(unittest.TestCase):
     def test_fleet_claim_peers_is_a_lane_boolean_wired_to_the_env(self) -> None:
         key = "assignment_fleet_claim_peers"
         base = CONFIG.read_text()
-        self.assertNotIn(key, base)
+        # Shipped only on the vellum-gate lane (see the test below).
+        self.assertEqual(base.count(f"{key} = true"), 1)
         anchor = "assignment_feed_rescue = true"
         self.assertEqual(base.count(anchor), 1)
         with tempfile.TemporaryDirectory() as td:
@@ -2172,15 +2173,26 @@ class MacosFleetLaneTests(unittest.TestCase):
             envs = [plistlib.loads(b)["EnvironmentVariables"]
                     for b in fleet.rendered_plists(fleet.load(ok)).values()]
             wired = [e["TARTCI_QUEUE_LANE_ID"] for e in envs if e.get("TARTCI_JOB_CLAIM_FLEET_PEERS") == "1"]
-            self.assertEqual(sorted(wired), ["m1-pulp-gate", "m1-pulp-gate-slot2"])
+            self.assertEqual(sorted(wired), ["m1-pulp-gate", "m1-pulp-gate-slot2", "m1-vellum-gate"])
 
-    def test_no_shipped_lane_reads_peers_yet(self) -> None:
+    def test_only_the_vellum_lane_reads_peers(self) -> None:
+        # Vellum's single-job demand booted a VM on every free host (31 of 65
+        # boots got no job, 2026-11-01..04), so its lane reads peers' claims on
+        # every host. Every other lane stays off until its own canary.
         profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
         self.assertGreaterEqual(len(profiles), 4)
+        vellum_slots = 0
         for profile in profiles:
             for body in fleet.rendered_plists(fleet.load(profile)).values():
                 env = plistlib.loads(body)["EnvironmentVariables"]
-                self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env, profile.name)
+                is_vellum = env.get("TARTCI_RUNNER_REPO") == "Generous-Corp/vellum"
+                vellum_slots += is_vellum
+                with self.subTest(profile=profile.name, lane=env.get("TARTCI_QUEUE_LANE_ID")):
+                    if is_vellum:
+                        self.assertEqual(env.get("TARTCI_JOB_CLAIM_FLEET_PEERS"), "1")
+                    else:
+                        self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env)
+        self.assertEqual(vellum_slots, 4)
 
     def test_job_claim_max_age_is_bounded_and_m1_declares_the_ttl(self) -> None:
         base = CONFIG.read_text()

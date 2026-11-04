@@ -227,6 +227,9 @@ min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5studio"]
 priority = "vm"
 workflows = ["Locked macOS GPU proof"]
+# Count peers' in-flight boots, so one queued job no longer boots a VM on
+# every host (31 of 65 Vellum boots got no job, 2026-11-01..04).
+assignment_fleet_claim_peers = true
 runner_idle_timeout_seconds = 60
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
