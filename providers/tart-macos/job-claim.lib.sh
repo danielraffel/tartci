@@ -17,6 +17,8 @@
 #
 # TARTCI_JOB_CLAIM=0 disables claims; TARTCI_JOB_CLAIM_FLEET=0 keeps them
 # host-local (no runner listing); TARTCI_JOB_CLAIM_TTL_SECS bounds a claim.
+# TARTCI_JOB_CLAIM_LABELS (profile `job_claim_labels`) replaces the selected
+# labels as the claim key on a lane whose labels pin it to one host.
 # TARTCI_JOB_CLAIM_FLEET_PEERS=1 (profile `assignment_fleet_claim_peers`) also
 # reads every other published host's live claims over SSH before acquiring,
 # within TARTCI_JOB_CLAIM_FLEET_READ_SECS (default 5); an unread peer counts
@@ -135,6 +137,9 @@ _tartci_job_claim_call(){
 tartci_job_claim_acquire(){
   local vm="$1" selected_labels="$2" selected_tier="$3" queued="$4" runner_api_root="$5"
   local runners peers out="" rc=0 lower=() exact detail
+  # A lane whose labels carry a per-host pin keys its claims by the labels
+  # every host shares (profile `job_claim_labels`), so peers' claims match.
+  [ -z "${TARTCI_JOB_CLAIM_LABELS:-}" ] || selected_labels="$TARTCI_JOB_CLAIM_LABELS"
   JOB_CLAIM_CONTENDED=0
   JOB_CLAIM_ID=""
   tartci_job_claim_enabled || return 0

@@ -244,6 +244,18 @@ class Deferred(Refused):
     """Refused only because another host holds, or has waited longer for, a turn."""
 
 
+class SteppedAside(Refused):
+    """The capacity floor refused, so this host could not take a turn if it
+    had one. Its place is kept privately and no ticket is published: peers
+    must not yield to a host that cannot go. `quiet` is set when a peer was
+    also out of service, the usual cause of a floor refusal that clears by
+    itself once that peer is back."""
+
+    def __init__(self, message: str, *, quiet: bool = False) -> None:
+        super().__init__(message)
+        self.quiet = quiet
+
+
 class WriterDomainBusy(Refused):
     """A Shipyard Sandbox E2E audit holds the writer domain this install writes."""
 
@@ -1628,19 +1640,50 @@ def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str
             if (since, peer) < (my_since, me)]
 
 
+# Where a host that stepped aside keeps its place. Peers read only
+# waiting.json, so a place kept here holds no turn.
+STEPPED_ASIDE_NAME = "waiting-aside.json"
+
+
 def waiting_ticket(cfg: Config) -> dict | None:
-    value = _read_json(cfg.state_dir / "waiting.json")
-    return value if isinstance(value, dict) else None
+    """This host's place in the queue, published (waiting.json) or kept
+    privately while it steps aside."""
+    for name in ("waiting.json", STEPPED_ASIDE_NAME):
+        value = _read_json(cfg.state_dir / name)
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _place(cfg: Config, me: str, target: str, reason: str, now: float) -> dict:
+    ticket = waiting_ticket(cfg) or {}
+    since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
+    return {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
+            "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue"),
+            "issue_body": ticket.get("issue_body")}
 
 
 def note_waiting(cfg: Config, me: str, target: str, reason: str, now: float) -> dict:
     """Keep this host's place in the queue: `since` survives new targets."""
-    ticket = waiting_ticket(cfg) or {}
-    since = ticket.get("since") if isinstance(ticket.get("since"), (int, float)) else now
-    ticket = {"host_id": me, "target": target, "since": since, "ts": now, "reason": reason[:300],
-              "starved_evented": ticket.get("starved_evented"), "issue": ticket.get("issue"),
-              "issue_body": ticket.get("issue_body")}
+    ticket = _place(cfg, me, target, reason, now)
     _write_json(cfg.state_dir / "waiting.json", ticket)
+    (cfg.state_dir / STEPPED_ASIDE_NAME).unlink(missing_ok=True)
+    return ticket
+
+
+def step_aside(cfg: Config, me: str, target: str, reason: str, now: float) -> dict:
+    """Withdraw this host's published ticket and keep its place privately.
+
+    A refreshed ticket from a host the capacity floor refuses held the turn
+    while that host could never take it: on 2026-11-04 m5studio, the last
+    host whose fleet was ready, refused on its peers' disk pressure, and
+    m1, m3 and m5 yielded to its ticket for hours. The place (`since`) is
+    kept, and is published again by the first run that can take a turn.
+    """
+    ticket = _place(cfg, me, target, reason, now)
+    ticket["stepped_aside"] = True
+    _write_json(cfg.state_dir / STEPPED_ASIDE_NAME, ticket)
+    (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
     return ticket
 
 
@@ -1668,6 +1711,7 @@ def clear_waiting(cfg: Config, now: float | None = None) -> None:
                         "fixed_at": fixed_at, "patched": fixed_body is None})
         _write_json(cfg.state_dir / PENDING_FIX_NAME, {"fixes": pending})
     (cfg.state_dir / "waiting.json").unlink(missing_ok=True)
+    (cfg.state_dir / STEPPED_ASIDE_NAME).unlink(missing_ok=True)
     finish_pending_fixes(cfg)
 
 
@@ -3646,17 +3690,23 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         my_since = (float(ticket["since"]) if ticket and isinstance(ticket.get("since"), (int, float))
                     else sys_.now())
         ahead = queue_ahead(me, my_since, waiting)
-        if busy:
-            refusal = "another fleet host is not serving normally: " + "; ".join(busy)
-            if apply:
-                raise Deferred(refusal)
-            refusals.append(refusal)
-            receipt.step("peers", refusal, ok=False)
-        elif ahead:
-            refusal = ("yielding the update turn to a host that has waited longer: "
+        # The floor is read before deferring: a host it refuses cannot take a
+        # turn, so it steps aside rather than publish a ticket peers yield to.
+        allow = False
+        floor_refusal: Refused | None = None
+        try:
+            allow, rule = floor_decision(cfg, sys_, me)
+        except Refused as exc:
+            floor_refusal = exc
+        if busy or ahead:
+            refusal = ("another fleet host is not serving normally: " + "; ".join(busy) if busy
+                       else "yielding the update turn to a host that has waited longer: "
                        + ", ".join(ahead))
-            if apply:
+            if apply and floor_refusal is None:
                 raise Deferred(refusal)
+            if apply:
+                raise SteppedAside(f"{floor_refusal}; stepped aside so peers do not "
+                                   f"yield to it (also: {refusal})", quiet=bool(busy))
             refusals.append(refusal)
             receipt.step("peers", refusal, ok=False)
         else:
@@ -3666,15 +3716,13 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                          + (f"; unreachable, so no longer holding the turn and counted as "
                             f"serving nothing by the capacity floor: {'; '.join(survey.notes)}"
                             if survey.excluded else ""))
-        allow = False
-        try:
-            allow, rule = floor_decision(cfg, sys_, me)
+        if floor_refusal is None:
             receipt.step("capacity-floor", rule)
-        except Refused as exc:
-            if apply:
-                raise
-            refusals.append(str(exc))
-            receipt.step("capacity-floor", str(exc), ok=False)
+        elif apply:
+            raise SteppedAside(f"{floor_refusal}; stepped aside so peers do not yield to it")
+        else:
+            refusals.append(str(floor_refusal))
+            receipt.step("capacity-floor", str(floor_refusal), ok=False)
         if (helper is not None and (not refresh or layout == "v2")
                 and (layout != "v2" or change.changed)):
             # A new launcher must pass its volume probe after the install, and
@@ -3742,6 +3790,13 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.value["deferred"] = True
         receipt.finish("refused", str(exc))
         return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
+    except SteppedAside as exc:
+        step_aside(cfg, me, target, str(exc), now)
+        receipt.step("refused", str(exc), ok=False)
+        receipt.value["stepped_aside"] = True
+        receipt.finish("refused", str(exc))
+        print(f"self-update: STEPPED ASIDE {exc}", file=sys.stderr)
+        return EXIT_DEFERRED if exc.quiet else EXIT_REFUSED
     except HostFault as exc:
         # A pre-drain refusal must not retain an old queue ticket forever.
         # Leave the turn available to peers; the next scheduled attempt gets
@@ -5218,6 +5273,13 @@ def progress_line(state_dir: Path, now: float | None = None) -> str | None:
 def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
     """This host's place in the update queue, when it has one."""
     ticket = _read_json(state_dir / "waiting.json")
+    if not isinstance(ticket, dict):
+        aside = _read_json(state_dir / STEPPED_ASIDE_NAME)
+        if isinstance(aside, dict) and isinstance(aside.get("since"), (int, float)):
+            seen = (f" (as of {_iso(float(aside['ts']))})"
+                    if isinstance(aside.get("ts"), (int, float)) else "")
+            return (f"self-update: stepped aside, holding no update turn (queued since "
+                    f"{_iso(float(aside['since']))}){seen}: {aside.get('reason')}")
     if not isinstance(ticket, dict) or not isinstance(ticket.get("since"), (int, float)):
         return None
     now = time.time() if now is None else now
