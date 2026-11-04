@@ -234,6 +234,13 @@ def opt_links(names: tuple[str, ...]) -> dict[str, str | None]:
     return links
 
 
+def installed_softnet() -> str | None:
+    """The version of the Softnet keg currently linked into the host."""
+    link = opt_links(("softnet",))["softnet"]
+    match = VERSION.search(link or "")
+    return match.group(0) if match else None
+
+
 CLEANUP_TRIES = 3
 CLEANUP_RETRY_S = 10
 
@@ -321,18 +328,32 @@ def roll_back(run: Run, formula: str) -> str | None:
 
 
 def published_verified(state_dir: Path, pin: Pin, now: float) -> None:
-    _write_json(state_dir / VERIFIED, {"version": pin.version, "sha256": pin.sha256,
-                                       "verified_at": now})
+    _write_json(state_dir / VERIFIED, {
+        "version": pin.version,
+        "sha256": pin.sha256,
+        "softnet_version": pin.softnet_version,
+        "softnet_sha256": pin.softnet_sha256,
+        "verified_at": now,
+    })
 
 
 def read_verified(value: dict | None, clock: float) -> dict | None:
-    """{"version", "sha256", "age"} from a canary's tart-verified.json, aged
-    on the canary's clock."""
+    """The full Tart+Softnet identity and age from a canary receipt.
+
+    Older Tart-only receipts deliberately do not qualify as proof for a pin
+    whose dependency changed; callers can see the missing fields and require
+    a fresh canary run.
+    """
     if (not isinstance(value, dict) or not isinstance(value.get("verified_at"), (int, float))
             or not VERSION.fullmatch(str(value.get("version", "")))):
         return None
-    return {"version": value["version"], "sha256": str(value.get("sha256") or ""),
-            "age": clock - float(value["verified_at"])}
+    return {
+        "version": value["version"],
+        "sha256": str(value.get("sha256") or ""),
+        "softnet_version": str(value.get("softnet_version") or ""),
+        "softnet_sha256": str(value.get("softnet_sha256") or ""),
+        "age": clock - float(value["verified_at"]),
+    }
 
 
 def record_failure(state_dir: Path, pin: Pin, now: float, reason: str) -> None:
