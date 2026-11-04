@@ -35,7 +35,7 @@ A git checkout of this repository is not what a host's supervisors run.
 | `state/macos/`, `state/linux/` | per-lane state files and heartbeats; macOS JIT denial receipts (`TARTCI_STATE_DIR`) |
 | `state/job-claims/` | live boot claims |
 | `state/pool-log/events.jsonl` | pool status history |
-| `state/self-update/` | last attempt, waiting ticket, `launcher-auto-apply.json` (a launcher target whose automatic apply failed and is held) |
+| `state/self-update/` | last attempt, waiting ticket (`waiting-aside.json` while the capacity floor refuses), `launcher-auto-apply.json` (a launcher target whose automatic apply failed and is held) |
 | `state/gh-identity.json` | cached GitHub credential identity probe |
 | `state/vm-dhcp/breaker.json` | VM DHCP breaker |
 | `runtime/` | runtime records when `TARTCI_RUNTIME_MEASURE=1` (`TARTCI_RUNTIME_STORE`) |

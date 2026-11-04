@@ -1712,6 +1712,78 @@ class UpdateQueueTests(Base):
         self.assertEqual(self.issues, [])
 
 
+class StepAsideTests(Base):
+    """A host the capacity floor refuses must not hold the update turn.
+
+    2026-11-04: m5studio held the oldest ticket and was the last host whose
+    fleet was ready (m1, m3 and m5 reported disk_pressure), so its floor
+    refused every run; m1, m3 and m5 yielded to its ticket and nobody
+    updated."""
+
+    LABEL = "pulp-build-pr-head"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sys.floor = {"allowed": False, "reason": "last_serving_host", "findings": [
+            {"repo": "Generous-Corp/pulp", "label": self.LABEL, "verdict": "last_serving_host"}]}
+        self.sys.published["registrations"] = [
+            {"host_id": "m5", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+            {"host_id": "studio", "repo": "Generous-Corp/pulp", "labels": ["pulp-build", self.LABEL]},
+        ]
+        pressured = healthy_peer(fleet_ready=False, problems=[
+            {"code": "disk_pressure", "label": "/Users/x/VMs", "detail": "93.0% used"}])
+        self.sys.peers["m5"] = pressured
+        self.sys.peers["m3"] = json.loads(json.dumps(pressured))
+        self.since = NOW - 2 * 3600
+        su._write_json(self.cfg.state_dir / "waiting.json", {
+            "host_id": "m1", "target": T_OLD, "since": self.since, "ts": NOW - 1800,
+            "reason": "another fleet host is not serving normally: peer m5 (m5) SSH transport "
+                      "failed (exit 255)"})
+
+    def test_a_floor_refusal_withdraws_the_published_ticket(self) -> None:
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        # Peers read waiting.json: with it gone they no longer yield to this host.
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        # The place is kept, privately.
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.since)
+        self.assertIn("fleet not ready", su.waiting_ticket(self.cfg)["reason"])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertTrue(json.loads(receipts[-1].read_text()).get("stepped_aside"))
+        line = su.waiting_line(self.cfg.state_dir, NOW)
+        self.assertIn("stepped aside, holding no update turn", line)
+
+    def test_a_floor_refusal_while_a_peer_is_out_does_not_republish_the_ticket(self) -> None:
+        # Deferring on the busy peer refreshed the ticket, so the host the
+        # floor refuses took the head of the queue again after every peer
+        # update.
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.since)
+
+    def test_a_host_the_floor_admits_still_defers_and_publishes(self) -> None:
+        # Control: with a peer that can mint the label, the busy peer defers
+        # this host as before and its ticket stays visible.
+        self.sys.peers["m3"] = healthy_peer()
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], self.since)
+        self.assertFalse((self.cfg.state_dir / "waiting-aside.json").exists())
+
+    def test_the_kept_place_is_used_once_the_floor_admits_the_host(self) -> None:
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        # m3 joined the queue after this host did; once a peer can mint the
+        # label again, this host's kept place goes first.
+        self.sys.peers["m3"] = healthy_peer()
+        self.sys.peer_waiting["m3"] = {"host_id": "studio", "since": self.since + 600,
+                                       "ts": NOW - 60}
+        self.sys.clock += 3600
+        self.assertUpdated(self.apply())
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+
 class RefusedTurnTests(Base):
     sealed = True
 
