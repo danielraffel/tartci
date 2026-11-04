@@ -2139,6 +2139,17 @@ boot_vm_to_ssh(){
     runtime_emit_complete fail cache_setup_failed 1 "" "$logdir"
     return 1
   fi
+  # The supervisor may have been alive while the host CFT tree changed. Recheck
+  # at the shared per-VM boot boundary so the mount never exposes unverified
+  # bytes, including for a warm-VM parking boot.
+  if ! verify_cft_mount; then
+    note "[$i] Chrome for Testing tree changed after configuration — refusing to boot"
+    event cft_digest_failed "phase=boot unregistered=true"
+    discard_current_vm
+    tartci_release_vm_lease
+    runtime_emit_complete fail cft_digest_failed 1 "" "$logdir"
+    return 1
+  fi
   CURRENT_GUEST_CORES="$lease_cores"
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp -t "tart-run-$vm")"
@@ -2516,6 +2527,14 @@ run_one(){
       tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" pre_clone_error
       return "$lease_rc"
     fi
+  fi
+  if ! verify_cft_mount; then
+    note "[$i] Chrome for Testing tree changed before warm handoff or preflight — discarding unregistered VM"
+    event cft_digest_failed "phase=handoff unregistered=true"
+    runtime_emit_complete fail cft_digest_failed 1 "" "$logdir"
+    discard_current_vm
+    tartci_release_vm_lease
+    return 1
   fi
   ip="$CURRENT_IP"
   t_booted="$(now_epoch)"

@@ -64,6 +64,28 @@ class CftMountTests(unittest.TestCase):
             (d / APP / "Contents" / "MacOS" / "Google Chrome for Testing").write_text("evil\n")
             self.assertNotEqual(self.probe(d, sha).returncode, 0)
 
+    def test_digest_is_rechecked_across_boot_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            d = make_tree(Path(td))
+            sha = digest(d).stdout.strip()
+            script = f"""
+set -eu
+export TARTCI_ROOT={ROOT!s}
+export TARTCI_RUNNER_CFT_DIR={d!s}
+export TARTCI_RUNNER_CFT_SHA256={sha}
+source {ROOT / 'providers' / 'tart-macos' / 'cft-mount.lib.sh'!s}
+boot_attempt() {{ verify_cft_mount; }}
+boot_attempt
+printf 'tampered\\n' > "$CFT_DIR/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+if boot_attempt; then
+  echo 'tampered tree was accepted on the second boot' >&2
+  exit 1
+fi
+"""
+            r = subprocess.run(["/bin/bash", "-c", script], text=True,
+                               capture_output=True, check=False)
+            self.assertEqual(r.returncode, 0, r.stderr)
+
     def test_extra_top_level_entry_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             d = make_tree(Path(td))
@@ -107,6 +129,13 @@ class CftMountTests(unittest.TestCase):
                         run_one.index("generate-jitconfig"))
         self.assertIn('tart_dirs+=(--dir="$CFT_MOUNT_ARG")', source)
         self.assertIn("cft_preflight_failed", source)
+        boot_start = source.index("boot_vm_to_ssh(){")
+        run_one_start = source.index("run_one(){")
+        boot = source[boot_start:run_one_start]
+        self.assertLess(boot.index("verify_cft_mount"),
+                        boot.index("tartci_vm_lease_guard_exec tart run"))
+        cft = (ROOT / "providers" / "tart-macos" / "cft-mount.lib.sh").read_text()
+        self.assertLess(cft.index("verify_cft_mount || return 1"), cft.index("ssh -n"))
 
 
 if __name__ == "__main__":
