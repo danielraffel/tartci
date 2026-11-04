@@ -997,3 +997,15 @@ Roots with live `subagent` or `teammate` descendants are protected. Confirmed
 victims are recorded in `${AH_VICTIMS_LOG:-~/.local/state/agent-hygiene/victims.log}`
 with a resume command. The command is guarded by the launchd PreToolUse policy
 when invoked from an agent.
+
+## Vellum Chrome for Testing mount (opt-in per lane)
+
+A `vellum-gate` lane may set `chrome_for_testing_dir`, `chrome_for_testing_version`
+and `chrome_for_testing_sha256` (all three, Vellum lane only). The host directory
+must hold exactly one `Google Chrome for Testing.app`. Before each VM boot the runner
+verifies the tree digest (`scripts/cft_tree_digest.py digest DIR` prints it); a
+mismatch refuses to start the lane. The directory is shared read-only. Preflight
+links `/Applications/Google Chrome for Testing.app` to the mount and writes
+`/Users/Shared/tartci/chrome-for-testing.env` (`TARTCI_CHROME_FOR_TESTING_PATH`,
+`_VERSION`, `_SHA256`). A preflight failure discards the unregistered VM
+(`cft_preflight_failed`). A lane without the keys is unchanged.

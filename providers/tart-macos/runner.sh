@@ -253,6 +253,7 @@ PRINT_SELECTION=0
 PRINT_RUNNER_API_ROOT=0
 PRINT_RUNNER_CONTRACT=""
 PRINT_CHROME_MOUNT=0
+PRINT_CFT_MOUNT=0
 PRINT_ASSIGNMENT_PARITY=0
 PRINT_PRE_MINT_SELECTION=""
 PRINT_PRE_CLONE_SELECTION=""
@@ -475,6 +476,8 @@ source "$TARTCI_ROOT/providers/tart-macos/heartbeat-keepalive.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/interval-guard.lib.sh"
 # shellcheck source=providers/tart-macos/chrome-mount.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/chrome-mount.lib.sh"
+# shellcheck source=providers/tart-macos/cft-mount.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/cft-mount.lib.sh"
 # shellcheck source=providers/tart-macos/pip-wheelhouse.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/pip-wheelhouse.lib.sh"
 # shellcheck source=providers/tart-macos/artifact-cache.lib.sh
@@ -563,6 +566,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
   --print-chrome-mount) PRINT_CHROME_MOUNT=1; shift;;
+  --print-cft-mount) PRINT_CFT_MOUNT=1; shift;;
   --yield-to-workflow) YIELD_WORKFLOW="$2"; shift 2;;
   --yield-to-labels) YIELD_LABELS="$2"; shift 2;;
   -h|--help) usage; exit 0;;
@@ -573,6 +577,12 @@ configure_runner_api_root
 CURRENT_RUNNER_API_ROOT="$RUNNER_API_ROOT"
 [ "$PRINT_RUNNER_API_ROOT" = 1 ] && { printf '%s\n' "$RUNNER_API_ROOT"; exit 0; }
 configure_chrome_mount
+configure_cft_mount
+[ "$PRINT_CFT_MOUNT" = 1 ] && {
+  [ -n "$CFT_MOUNT_ARG" ] || die "TARTCI_RUNNER_CFT_DIR is not configured"
+  printf '%s\n' "$CFT_MOUNT_ARG"
+  exit 0
+}
 [ "$PRINT_CHROME_MOUNT" = 1 ] && {
   [ -n "$CHROME_MOUNT_ARG" ] || die "TARTCI_RUNNER_CHROME_APP_DIR is not configured"
   printf '%s\n' "$CHROME_MOUNT_ARG"
@@ -2138,6 +2148,7 @@ boot_vm_to_ssh(){
   [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks")
   [ "$CURRENT_SHARED_CACHE" = 1 ] || event shared_cache_skipped "labels=$labels"
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
+  [ -z "$CFT_MOUNT_ARG" ] || tart_dirs+=(--dir="$CFT_MOUNT_ARG")
   CURRENT_PIP_WHEELHOUSE=0
   if pip_wheelhouse_ready "$PIP_WHEELHOUSE_ROOT"; then
     tart_dirs+=(--dir="pip-wheelhouse:$PIP_WHEELHOUSE_ROOT:ro")
@@ -2546,6 +2557,18 @@ run_one(){
       note "[$i] governed read-only Google Chrome mount failed preflight — discarding unregistered VM"
       event chrome_preflight_failed "unregistered=true"
       runtime_emit_complete fail chrome_preflight_failed 1 "" "$logdir"
+      discard_current_vm
+      tartci_release_vm_lease
+      return 1
+    fi
+  fi
+
+  if [ -n "$CFT_MOUNT_ARG" ]; then
+    heartbeat cft-preflight
+    if ! install_and_preflight_cft "$ip"; then
+      note "[$i] governed read-only Chrome for Testing mount failed preflight — discarding unregistered VM"
+      event cft_preflight_failed "unregistered=true"
+      runtime_emit_complete fail cft_preflight_failed 1 "" "$logdir"
       discard_current_vm
       tartci_release_vm_lease
       return 1

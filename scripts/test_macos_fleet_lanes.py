@@ -2644,7 +2644,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         mounts = re.findall(r'--dir="([^"]+)"', body)
         self.assertIn("ccache:$CACHE_ROOT/ccache", mounts)
         self.assertIn("configure-checks:$CACHE_ROOT/configure-checks", mounts)
-        writable = [m for m in mounts if not m.endswith(":ro") and m != "$CHROME_MOUNT_ARG"]
+        writable = [m for m in mounts if not m.endswith(":ro") and m not in ("$CHROME_MOUNT_ARG", "$CFT_MOUNT_ARG")]
         self.assertEqual(
             [m for m in writable if not m.split(":", 1)[1].startswith("$CACHE_ROOT/")], [],
             "a writable VM mount outside $CACHE_ROOT escapes a lane-owned cache_root")
@@ -2698,6 +2698,45 @@ class MacosFleetLaneTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
                     self.assertIn("chrome_app_dir", result.stderr)
+
+    def test_chrome_for_testing_is_vellum_only_and_fully_specified(self) -> None:
+        base = CONFIG.read_text()
+        sha = "a" * 64
+        block = (
+            'chrome_for_testing_dir = "/opt/cft/151.0.7922.47"\n'
+            'chrome_for_testing_version = "151.0.7922.47"\n'
+            f'chrome_for_testing_sha256 = "{sha}"\n'
+        )
+        anchor = 'id = "vellum-gate"\nrepo = "Generous-Corp/vellum"\n'
+        if anchor not in base:
+            self.skipTest("config has no vellum-gate lane")
+        ok = base.replace(anchor, anchor + block, 1)
+        fixtures = {
+            "non-vellum": base.replace(
+                'golden = "pulp-build-runner:latest"',
+                'golden = "pulp-build-runner:latest"\n' + block, 1),
+            "missing-digest": ok.replace(f'chrome_for_testing_sha256 = "{sha}"\n', ""),
+            "short-digest": ok.replace(sha, "abc"),
+            "relative-dir": ok.replace("/opt/cft/151", "opt/cft/151"),
+            "bad-version": ok.replace('= "151.0.7922.47"\nchrome_for_testing_sha', '= "latest"\nchrome_for_testing_sha'),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            good = Path(td) / "ok.toml"
+            good.write_text(ok)
+            result = subprocess.run(
+                [str(ROOT / "tartci"), "fleet-macos", "validate", str(good)],
+                text=True, capture_output=True, check=False)
+            self.assertNotIn("chrome_for_testing", result.stderr, result.stderr)
+            for name, body in fixtures.items():
+                with self.subTest(name=name):
+                    self.assertNotEqual(body, base)
+                    path = Path(td) / f"{name}.toml"
+                    path.write_text(body)
+                    result = subprocess.run(
+                        [str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                        text=True, capture_output=True, check=False)
+                    self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                    self.assertIn("chrome_for_testing", result.stderr)
 
     def test_stacked_images_cannot_activate_before_graduation(self) -> None:
         body = CONFIG.read_text().replace("enabled = false", "enabled = true", 1)
