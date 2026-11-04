@@ -2577,6 +2577,16 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A host the capacity floor refuses steps aside.** The floor is read
+  before a host defers. When it refuses (the host is the last server of a
+  required label and no peer can mint it on demand), the host cannot take a
+  turn, so it withdraws `waiting.json` and keeps its place in
+  `waiting-aside.json`, which peers do not read. The next host in line goes;
+  the first attempt the floor admits publishes the kept `since` again. On
+  2026-11-04 m5studio, the only host whose fleet was ready while m1, m3 and
+  m5 reported `disk_pressure`, kept its ticket and every peer yielded to it.
+  `pool status` reports the host as `stepped aside, holding no update turn`.
+  It exits 0 when a peer was also out of service, otherwise 3.
 - **A peer that stays unreachable stops holding the turn.** An unreadable
   peer counts as busy, because it may be mid-update. Each survey records the
   peers it could not read in `~/.tartci/state/self-update/peer-unreadable.json`
