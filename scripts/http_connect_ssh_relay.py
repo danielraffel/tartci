@@ -366,6 +366,7 @@ class ConnectHandler(socketserver.BaseRequestHandler):
         if target[1] != 443 or not host_is_allowed(
             target[0], self.config.allowed_host_suffixes
         ):
+            emit_event("connect_denied", target=f"{target[0]}:{target[1]}")
             self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             return
         host, port = target

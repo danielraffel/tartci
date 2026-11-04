@@ -46,6 +46,8 @@
         <string>crates.io</string>
         <string>--allow-host-suffix</string>
         <string>sigstore.dev</string>
+        <string>--allow-host-suffix</string>
+        <string>googlechromelabs.github.io</string>
         <string>--log-path</string>
         <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     </array>
