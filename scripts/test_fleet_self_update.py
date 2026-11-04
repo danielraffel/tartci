@@ -4450,7 +4450,8 @@ class TartUpgradeTests(Base):
         self.cfg.tart_canary = "studio"
         # The canary's clock is 2 h ahead: its record is aged on its clock.
         self.sys.peer_tart_clock = NOW + 7200
-        record = {"version": "2.40.1", "sha256": TART_SHA}
+        record = {"version": "2.40.1", "sha256": TART_SHA,
+                  "softnet_version": "0.24.0", "softnet_sha256": SOFTNET_SHA}
         self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - (self.SOAK - 1))
         self.assertIn("soaking for 240 min", self.decide().refusal)
         self.sys.peer_tart["m3"] = dict(record, verified_at=NOW + 7200 - self.SOAK)
@@ -4459,6 +4460,8 @@ class TartUpgradeTests(Base):
     def test_another_host_adopts_after_the_soak(self) -> None:
         self.cfg.tart_canary = "studio"
         self.sys.peer_tart["m3"] = {"version": "2.40.1", "sha256": TART_SHA,
+                                    "softnet_version": "0.24.0",
+                                    "softnet_sha256": SOFTNET_SHA,
                                     "verified_at": NOW - 5 * 3600}
         self.assertUpdated(self.apply())
         self.assertEqual("2.40.1", self.sys.tart)
@@ -4467,7 +4470,30 @@ class TartUpgradeTests(Base):
     def test_a_non_canary_already_on_the_pin_does_nothing(self) -> None:
         self.cfg.tart_canary = "studio"
         self.sys.set_tart("2.40.1")
+        self.sys.set_softnet("0.24.0")
         self.assertIsNone(self.decide())
+
+    def test_a_current_tart_with_old_softnet_waits_for_a_full_canary_receipt(self) -> None:
+        self.cfg.tart_canary = "studio"
+        self.sys.set_tart("2.40.1")
+        self.assertIn("with Softnet 0.24.0", self.decide().refusal)
+        self.sys.peer_tart["m3"] = {
+            "version": "2.40.1", "sha256": TART_SHA,
+            "softnet_version": "0.24.0", "softnet_sha256": SOFTNET_SHA,
+            "verified_at": NOW - 5 * 3600,
+        }
+        self.assertIsNone(self.decide().refusal)
+        self.assertUpdated(self.apply())
+        self.assertEqual("0.24.0", self.sys.softnet)
+
+    def test_a_canary_current_tart_with_old_softnet_upgrades_and_publishes_pair(self) -> None:
+        self.sys.set_tart("2.40.1")
+        self.assertUpdated(self.apply())
+        self.assertEqual("0.24.0", self.sys.softnet)
+        self.assertEqual({"version": "2.40.1", "sha256": TART_SHA,
+                          "softnet_version": "0.24.0", "softnet_sha256": SOFTNET_SHA},
+                         {k: self.verified()[k] for k in
+                          ("version", "sha256", "softnet_version", "softnet_sha256")})
 
     def test_a_newer_tart_than_the_pin_is_never_touched_and_never_drains(self) -> None:
         self.sys.set_tart("2.41.1")
@@ -4783,11 +4809,16 @@ class TartUpgradeTests(Base):
 
     def test_the_canary_s_own_record_must_match_the_pin_s_sha(self) -> None:
         self.sys.set_tart("2.40.1")
+        self.sys.set_softnet("0.24.0")
         su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
-                       {"version": "2.40.1", "sha256": "c" * 64, "verified_at": NOW - 99999})
+                       {"version": "2.40.1", "sha256": "c" * 64,
+                        "softnet_version": "0.24.0", "softnet_sha256": SOFTNET_SHA,
+                        "verified_at": NOW - 99999})
         self.assertTrue(self.decide().prove_only)
         su._write_json(self.cfg.state_dir / tart_pin.VERIFIED,
-                       {"version": "2.40.1", "sha256": TART_SHA, "verified_at": NOW - 99999})
+                       {"version": "2.40.1", "sha256": TART_SHA,
+                        "softnet_version": "0.24.0", "softnet_sha256": SOFTNET_SHA,
+                        "verified_at": NOW - 99999})
         self.assertIsNone(self.decide())
 
     def test_a_host_without_a_golden_refuses_before_the_drain(self) -> None:
@@ -4923,6 +4954,7 @@ class TartUpgradeTests(Base):
     def test_a_canary_already_on_the_pin_boot_checks_it_once_and_publishes(self) -> None:
         self.sys.log_lines = ""
         self.sys.set_tart("2.40.1")
+        self.sys.set_softnet("0.24.0")
         self.assertEqual(su.EXIT_OK, self.apply(), self.last())
         self.assertEqual([], self.upgrades())
         self.assertIn("canary boot check of Tart 2.40.1: booted",

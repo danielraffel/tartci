@@ -3944,6 +3944,7 @@ def _tart_decision(cfg: Config, sys_: System, root: Path, fresh: bool = False
     if deferred:
         return TartDecision(installed, pin, f"Tart {pin.version} deferred until "
                             f"{_iso(float(deferred['until']))}: {str(deferred.get('reason'))[:200]}")
+    softnet = tart_pin.installed_softnet()
     if installed != pin.version and tart_boot_target(cfg) is None:
         # Checked before the drain: a turn that could only refuse after it
         # would drain the host for nothing every attempt.
@@ -3954,23 +3955,57 @@ def _tart_decision(cfg: Config, sys_: System, root: Path, fresh: bool = False
         refusal = "no canary: set [tart] canary in self-update.toml"
         return None if installed == pin.version else TartDecision(installed, pin, refusal)
     if installed == pin.version:
+        local_softnet_current = softnet == pin.softnet_version
+        if local_softnet_current and me != cfg.tart_canary:
+            return None
+        if local_softnet_current:
+            proven = tart_pin.read_verified(_read_json(cfg.state_dir / tart_pin.VERIFIED),
+                                            sys_.now())
+            if (proven and (proven["version"], proven["sha256"],
+                            proven["softnet_version"], proven["softnet_sha256"])
+                    == (pin.version, pin.sha256, pin.softnet_version, pin.softnet_sha256)):
+                return None
+            return TartDecision(installed, pin, prove_only=True)
+        # Tart is already current, but its dependency is not. The canary must
+        # upgrade and prove the complete pair before peers move Softnet.
         if me != cfg.tart_canary:
-            return None
-        proven = tart_pin.read_verified(_read_json(cfg.state_dir / tart_pin.VERIFIED), sys_.now())
-        if proven and (proven["version"], proven["sha256"]) == (pin.version, pin.sha256):
-            return None
-        return TartDecision(installed, pin, prove_only=True)
+            verified = read_tart_verified(cfg, sys_, cfg.tart_canary)
+            if verified and "unreachable" in verified:
+                return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary}: "
+                                    f"unreachable or unknown ({verified['unreachable']})")
+            if (not verified or
+                    (verified["version"], verified["sha256"],
+                     verified["softnet_version"], verified["softnet_sha256"])
+                    != (pin.version, pin.sha256, pin.softnet_version, pin.softnet_sha256)):
+                return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary} to "
+                                    f"boot and serve Tart {pin.version} with Softnet "
+                                    f"{pin.softnet_version}")
+            if verified["age"] < cfg.tart_soak_seconds:
+                return TartDecision(installed, pin, f"soaking for {cfg.tart_soak_seconds // 60} min: "
+                                    f"canary {cfg.tart_canary} verified Tart {pin.version} "
+                                    f"and Softnet {pin.softnet_version} "
+                                    f"{int(verified['age'] // 60)} min ago")
+        try:
+            refusal = tart_pin.tap_refusal(pin, tart_pin.tap_offer(run, pin, cfg.state_dir,
+                                                                   sys_.now(), fresh=fresh))
+        except tart_pin.PinError as exc:
+            refusal = f"tap unreadable: {exc}"
+        return TartDecision(installed, pin, refusal)
     if me != cfg.tart_canary:
         verified = read_tart_verified(cfg, sys_, cfg.tart_canary)
         if verified and "unreachable" in verified:
             return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary}: "
                                 f"unreachable or unknown ({verified['unreachable']})")
-        if not verified or (verified["version"], verified["sha256"]) != (pin.version, pin.sha256):
+        if (not verified or
+                (verified["version"], verified["sha256"],
+                 verified["softnet_version"], verified["softnet_sha256"])
+                != (pin.version, pin.sha256, pin.softnet_version, pin.softnet_sha256)):
             return TartDecision(installed, pin, f"waiting for canary {cfg.tart_canary} to boot "
-                                f"and serve Tart {pin.version}")
+                                f"and serve Tart {pin.version} with Softnet {pin.softnet_version}")
         if verified["age"] < cfg.tart_soak_seconds:
             return TartDecision(installed, pin, f"soaking for {cfg.tart_soak_seconds // 60} min: "
-                                f"canary {cfg.tart_canary} verified Tart {pin.version} "
+                                f"canary {cfg.tart_canary} verified Tart {pin.version} and Softnet "
+                                f"{pin.softnet_version} "
                                 f"{int(verified['age'] // 60)} min ago")
     try:
         refusal = tart_pin.tap_refusal(pin, tart_pin.tap_offer(run, pin, cfg.state_dir,
@@ -4378,8 +4413,8 @@ class Run:
         _write_json(self.cfg.state_dir / tart_pin.PENDING,
                     {"installed": decision.installed, "pin": pin.version,
                      "before": self.tart_before[1], "at": self.sys.now()})
-        upgrade = self.sys.run([tart_pin.BREW, "upgrade", pin.formula], env=tart_pin.BREW_ENV,
-                               timeout=tart_pin.UPGRADE_TIMEOUT_S)
+        upgrade = self.sys.run([tart_pin.BREW, "upgrade", pin.formula, pin.softnet_formula],
+                               env=tart_pin.BREW_ENV, timeout=tart_pin.UPGRADE_TIMEOUT_S)
         after = tart_pin.installed_tart(run)
         softnet = tart_pin.opt_links(names[1:])[names[1]] or ""
         if upgrade.rc != 0:
