@@ -64,6 +64,16 @@ class TartPinUpdateWorkflow(unittest.TestCase):
         self.assertEqual(permissions, [("contents", "write"), ("pull-requests", "write"),
                                        ("workflows", "write")])
 
+    def test_app_key_is_read_only_inside_the_main_only_environment(self):
+        # The key is an environment secret of `automation` (deployment policy:
+        # branch main). A job outside that environment would read a repo-level
+        # copy from any branch, so the only job that names the secret must
+        # declare the environment.
+        job = re.search(r"(?ms)^  discover:\n(.*)", self.text).group(1)
+        self.assertRegex(job, r"(?m)^    environment: automation$")
+        self.assertEqual(self.text.count("secrets."), 2)
+        self.assertEqual(len(re.findall(r"(?m)^  [a-z][a-z-]*:$", self.text.split("\njobs:\n", 1)[1])), 1)
+
     def test_missing_app_credentials_fail_before_minting(self):
         names = list(self.steps)
         require = names.index("Require the pin-update App credentials")
