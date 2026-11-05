@@ -9,11 +9,6 @@ name: Tart pin update
 # never the default workflow token: pushes and PRs made with that token start
 # no workflows, so the PR's required checks would never run. The default token
 # stays read-only and is not persisted for git.
-#
-# The App key lives only in the `automation` environment, whose deployment
-# policy admits branch `main` alone. A run from any other ref (a pushed branch
-# that edits this file, or a dispatch on a branch) is refused the environment
-# and never sees the key; the credential check below then fails the run.
 on:
   schedule:
     - cron: "17 6 * * *"
@@ -29,7 +24,6 @@ permissions:
 jobs:
   discover:
     runs-on: ubuntu-latest
-    environment: automation
     timeout-minutes: 10
     steps:
       - name: Check out main
