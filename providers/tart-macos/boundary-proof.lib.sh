@@ -166,12 +166,29 @@ tartci_boundary_proof_take_access(){
   return 0
 }
 
+# 0 when a GitHub error file shows a rate limit: the primary limit ("API rate
+# limit exceeded"), a secondary or abuse limit, an HTTP 429, or a Retry-After.
+# GitHub answers a primary-limit hit with HTTP 403, so this must be asked
+# before any 403 is read as an auth refusal: a rate limit is transient and
+# clears by itself, an auth refusal does not.
+tartci_github_rate_limited(){
+  grep -Eiq 'rate limit|abuse detection|HTTP 429|retry-after' "$1" 2>/dev/null
+}
+
+# 0 when GitHub refused the auth route itself (401/403/404 or an integration
+# permission error) and the refusal is not a rate limit.
+tartci_github_auth_rejected(){
+  local error_file="$1"
+  tartci_github_rate_limited "$error_file" && return 1
+  grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$error_file" 2>/dev/null
+}
+
 # 0 when a failed repository-access proof is a real denial (the proof said
 # deny, or GitHub refused the App), 1 when it only could not be answered.
 tartci_repository_access_denied(){
   local rc="$1" error_file="$2"
   [ "$rc" -eq 3 ] && return 0
-  grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$error_file" 2>/dev/null
+  tartci_github_auth_rejected "$error_file"
 }
 
 # One short, single-line cause for an event detail.
@@ -180,6 +197,7 @@ tartci_repository_access_reason(){
   line="$(head -c 400 "$error_file" 2>/dev/null | tr '\n\t' '  ')" || line=""
   case "$line" in
     *"timed out"*) printf 'reason=timeout' ;;
+    *[Rr]"ate limit"*|*"abuse detection"*|*"HTTP 429"*|*[Rr]"etry-"[Aa]"fter"*) printf 'reason=rate_limited' ;;
     "") printf 'reason=unknown' ;;
     *) printf 'reason=error detail=%s' "$(printf '%s' "$line" | cut -c1-160)" ;;
   esac

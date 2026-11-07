@@ -62,6 +62,43 @@ class StorageHealthProcessGroupTests(unittest.TestCase):
                 if process_exists(worker.pid):
                     storage_health.reap_after_kill(worker)
 
+    def test_timeout_reaps_descendant_in_its_own_session(self) -> None:
+        """The real probe child runs in its own session, outside the worker's
+        group. Killing only the worker's group orphaned it to launchd, still
+        blocked in open(); m3 held five such probes for up to 24 minutes."""
+        with tempfile.TemporaryDirectory() as raw:
+            pid_file = Path(raw) / "grandchild.pid"
+            program = (
+                "import subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'], start_new_session=True)\n"
+                "open(sys.argv[1], 'w').write(str(child.pid))\n"
+                "time.sleep(60)\n"
+            )
+            worker = subprocess.Popen(
+                [sys.executable, "-c", program, str(pid_file)],
+                start_new_session=True,
+            )
+            grandchild = 0
+            try:
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and (not pid_file.exists() or not pid_file.read_text()):
+                    time.sleep(0.01)
+                self.assertTrue(pid_file.exists() and pid_file.read_text(), "worker did not start its descendant")
+                grandchild = int(pid_file.read_text())
+                self.assertEqual(os.getpgid(grandchild), grandchild, "descendant is not in its own session")
+
+                self.assertTrue(storage_health.reap_after_kill(worker))
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline and process_exists(grandchild):
+                    time.sleep(0.01)
+                self.assertFalse(process_exists(grandchild), "probe in its own session survived the worker timeout")
+            finally:
+                if process_exists(worker.pid):
+                    storage_health.reap_after_kill(worker)
+                if grandchild and process_exists(grandchild):
+                    os.kill(grandchild, 9)
+
     def test_timeout_spawns_private_session(self) -> None:
         source = (ROOT / "scripts" / "storage_health.py").read_text()
         self.assertGreaterEqual(source.count("start_new_session=True"), 2)

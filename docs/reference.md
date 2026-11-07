@@ -437,7 +437,14 @@ the key is being served, at most every `TARTCI_JIT_DENIAL_RECHECK_SECS` seconds
 (default 900; `0` turns it off), and removes the receipt only when the check
 passes, logging a `jit_denial_cleared` event with the verdict. A
 `cause=credential` receipt, or an older receipt with no `cause=` line, is never
-cleared by the lane.
+cleared by the lane, unless the error file its `detail=` names shows a GitHub
+rate limit; that receipt takes the same bounded recheck.
+
+A GitHub rate limit at the JIT boundary (primary, secondary or abuse limit, HTTP
+429, Retry-After) is transient and writes no receipt. The lane instead boots no
+VM until a doubling backoff expires (`TARTCI_GITHUB_RATE_LIMIT_BACKOFF_SECS`,
+default 120, capped by `TARTCI_GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS`, default
+1800, and raised to any Retry-After), logging `jit_github_rate_limited`.
 
 If a Shipyard deployment also runs an external organization runner-group policy
 verifier, the App installation needs **Self-hosted runners: Read-only** at the
