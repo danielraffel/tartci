@@ -671,6 +671,23 @@ class ToolFreshnessTests(unittest.TestCase):
         self.refresh(host, now=later, settings=self.held_settings(self.HOLD, later))
         self.assertTrue(any("fleet-update" in call for call in host.calls))
 
+    def test_removing_a_bare_hold_clears_its_start_before_readding(self) -> None:
+        host = self.behind_shipyard()
+        self.refresh(host, settings=self.held_settings(self.HOLD, NOW))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("shipyard", json.loads((self.state / "holds.json").read_text()))
+
+        current = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(current, now=NOW + HOUR, settings=settings())
+        self.assertNotIn("shipyard", json.loads((self.state / "holds.json").read_text()))
+
+        readded_at = NOW + 169 * HOUR
+        host = self.behind_shipyard()
+        row = self.refresh(host, now=readded_at,
+                           settings=self.held_settings(self.HOLD, readded_at))["tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("HELD: auto_apply = false", row["apply"])
+
     def test_the_documented_permanent_opt_out_says_hold_until_never(self) -> None:
         doc = tf.__doc__ or ""
         block = doc[doc.index("[tools.pulp]"):doc.index("[tools.pulp]") + 200]

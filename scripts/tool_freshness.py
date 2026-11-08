@@ -331,6 +331,21 @@ def _hold_time(raw: Any) -> float | None:
     return None
 
 
+def _clear_seen_hold(name: str, state: Path | None) -> None:
+    """Forget a cached bare-hold start when that hold is no longer bare."""
+    if state is None:
+        return
+    path = state / "holds.json"
+    seen = _read_json(path)
+    if not isinstance(seen, dict) or name not in seen:
+        return
+    del seen[name]
+    try:
+        _write_json(path, seen)
+    except OSError:
+        pass
+
+
 def resolve_hold(name: str, tool: dict, now: float, settings: dict,
                  state: Path | None = None) -> tuple[bool, str | None, str | None]:
     """(whether a settings-file hold blocks applying, its note, a problem).
@@ -343,9 +358,12 @@ def resolve_hold(name: str, tool: dict, now: float, settings: dict,
     """
     hold = tool.get("hold")
     if not isinstance(hold, dict):
+        _clear_seen_hold(name, state)
         return False, None, None
     where = hold.get("file") or "tool-freshness.toml"
     raw = tool.get("hold_until")
+    if raw is not None or tool.get("held_since") is not None:
+        _clear_seen_hold(name, state)
     if isinstance(raw, str) and raw.strip().lower() == "never":
         return True, f"HELD: auto_apply = false in {where} (hold_until = never)", None
     if raw is not None:
