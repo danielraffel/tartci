@@ -65,7 +65,8 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   the rest are answered `backoff` with `blocked_by`, which the lane logs and
   heartbeats as a refused lease. The first probe that clones settles it the
   way verifying would (`ip` closes, `no_ip` opens); a cancel for any other
-  reason returns it to verifying. On m1 on 2026-11-08 a self-update's verify
+  reason returns it to verifying. The doctor calls a disk refusal a problem
+  at once and a cores or memory refusal only after it has held 10 min. On m1 on 2026-11-08 a self-update's verify
   met a disk-denied host: the probe could never clone, the breaker sat in
   verifying for hours, and the idle slot reported a DHCP outage that was a
   full disk. An open breaker whose probe is refused the same way keeps its
@@ -143,6 +144,10 @@ ADMISSION_BLOCK_REASONS = frozenset({
     "disk_capacity_exceeded", "home_volume_below_floor", "memory_exceeded",
     "capacity_exceeded", "deferred_to_waiter",
 })
+DISK_BLOCK_REASONS = frozenset({"disk_capacity_exceeded", "home_volume_below_floor"})
+# Cores and memory refusals are ordinary contention that clears by itself when a
+# running job finishes; the doctor reports them only once they have held this long.
+CONTENTION_PROBLEM_AFTER_S = 600
 BLOCKED_KEYS = ("blocked_reason", "blocked_since", "blocked_at", "blocked_lane",
                 "blocked_count")
 MAX_STREAK = 50
@@ -715,7 +720,7 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
             "cause": value.get("cause")})]]}
 
 
-def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
+def doctor_code(value: dict[str, Any], now: float | None = None) -> tuple[str, str, str]:
     """(state, code, detail) for tartci doctor fleet and the outage alert:
     "ok" | "problem" | "unknown", most fundamental failing layer first."""
     if value.get("state") == "open":
@@ -759,13 +764,18 @@ def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
         return ("problem", "vm_dhcp_unanswered",
                 "VM DHCP is not answering on this host: " + spent)
     if value.get("state") == "admission_blocked":
+        now = time.time() if now is None else now
         since = value.get("blocked_since")
-        held = (f"{int(time.time() - float(since))}s" if isinstance(since, (int, float))
-                else "an unknown time")
+        held_s = now - float(since) if isinstance(since, (int, float)) else None
+        held = f"{int(held_s)}s" if held_s is not None else "an unknown time"
         reason = value.get("blocked_reason")
-        axis = ("disk" if reason in ("disk_capacity_exceeded", "home_volume_below_floor")
+        axis = ("disk" if reason in DISK_BLOCK_REASONS
                 else "memory" if reason == "memory_exceeded" else "cores")
-        return ("problem", "vm_dhcp_probe_blocked_by_admission",
+        # A full disk does not clear by itself; busy cores or memory usually
+        # do within one job, so they are only a problem once they persist.
+        problem = (reason in DISK_BLOCK_REASONS or held_s is None
+                   or held_s >= CONTENTION_PROBLEM_AFTER_S)
+        return ("problem" if problem else "ok", "vm_dhcp_probe_blocked_by_admission",
                 f"not a DHCP failure: the VM-network probe after {value.get('verify_reason')} "
                 f"cannot clone because VM admission refuses it ({reason}, {axis}) for {held}, "
                 f"{value.get('blocked_count')} refused probe turns; free {axis} on this host "

@@ -301,6 +301,18 @@ class AdmissionBlocked(Case):
         self.assertEqual(self.check(T0 + 403, lane="c").get("probe_blocked_by"),
                          "disk_capacity_exceeded")
 
+    def test_cores_or_memory_contention_is_a_problem_only_once_it_persists(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2, blocked_by="capacity_exceeded")
+        state = self.state()
+        self.assertEqual(state["state"], "admission_blocked")
+        self.assertEqual(vb.doctor_code(state, now=T0 + 300)[0], "ok")
+        self.assertEqual(vb.doctor_code(state, now=T0 + 2 + 600)[0], "problem")
+        # A full disk does not clear by itself: a problem at once.
+        disk = dict(state, blocked_reason="disk_capacity_exceeded")
+        self.assertEqual(vb.doctor_code(disk, now=T0 + 3)[0], "problem")
+
     def test_the_cli_accepts_blocked_by(self):
         vb.verify("self_update", now=T0)
         self.check(T0 + 1, lane="probe-lane")

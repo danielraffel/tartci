@@ -1953,7 +1953,10 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   under heartbeat `vm-lease-denied`, and their serving cause is `disk`. Lanes
   still try admission one at a time, so a freed disk cannot let two clone
   before the network is proven; the first probe that clones settles it the
-  way `verifying` would. A cancel for any other reason returns it to
+  way `verifying` would. A disk refusal is a doctor problem at once; a cores
+  or memory refusal (`capacity_exceeded`, `deferred_to_waiter`,
+  `memory_exceeded`) is ordinary contention and reads ok until it has held
+  10 min. A cancel for any other reason returns it to
   `verifying`. An `open` breaker whose probe is refused keeps its DHCP cause
   and records `probe_blocked` beside it. On m1 on 2026-11-08 a self-update's
   verify met a disk-refused host: the probe never cloned, the breaker sat in
@@ -3320,12 +3323,19 @@ memory-bound/OOM — before this existed). Three pieces tie together:
     receipts excluded), LaunchAgent plist, or checkout profile/manifest names.
     The digest a referenced tag points at is kept; an image accessed in the
     last 24 h or running is kept; nothing is deleted while a `tart pull` or
-    `tart clone` runs. A name must carry a registry path, so a local VM can
-    never be deleted.
+    `tart clone` runs, checked again before every delete (the first one seen
+    stops the deletes). A store is touched only after its bounded
+    storage-health probe reads healthy (the watchdog's rule before its own
+    `tart list`), so a hung kernel open cannot hang the lane. A name must carry
+    a registry path, so a local VM can never be deleted.
 
   At most once per `denial_reclaim_interval_minutes` (default 30, 5..1440) per
-  host, stamped at start, under a non-blocking lock; one 600 s budget for every
-  step (`TARTCI_DISK_DENIAL_RECLAIM_BUDGET_SECS`). The lane logs
+  host, stamped at start, under a non-blocking lock; one 300 s budget for every
+  step (`TARTCI_DISK_DENIAL_RECLAIM_BUDGET_SECS`), of which the reference scan
+  gets at most half (a scan that runs out deletes no image). The lane first
+  heartbeats `disk-denial-reclaim`: a stale-boot phase for the launchd
+  watchdog (900 s), a blocked lane for gate_supply and a busy one for
+  lane_busy. The lane logs
   `disk_denial_reclaim status=… freed_gib=… ccache=… oci_deleted=…` and
   `disk_denial_reclaim_retry rc=…`; the run appends `reclaim_on_lease_denial`
   to `~/.tartci/state/reclaim/events.jsonl`. Fail open: a cooldown, a held lock,

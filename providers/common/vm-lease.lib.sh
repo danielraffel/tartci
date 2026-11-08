@@ -519,6 +519,12 @@ print(r if type(r) is int else "")
   [ -z "$required" ] || reclaim_args+=(--required-bytes "$required")
   [ -z "$measure" ] || reclaim_args+=(--measure-path "$measure")
   tartci_vm_lease_note "disk admission refused for $lane; running the lease-denial reclaim (regenerable caches only)"
+  # A fresh phase before up to 300 s of reclaim: the launchd watchdog treats
+  # it as a boot phase that must finish inside its stale-boot bound, and
+  # gate_supply / lane_busy read it as a lane at work, not idle or unknown.
+  if declare -F heartbeat >/dev/null 2>&1; then
+    heartbeat disk-denial-reclaim
+  fi
   if ! out="$(python3 "$TARTCI_ROOT/scripts/denial_reclaim.py" ${reclaim_args[@]+"${reclaim_args[@]}"} 2>/dev/null)"; then
     tartci_vm_lease_note "lease-denial reclaim failed (ignored; the disk denial stands)"
     return 1

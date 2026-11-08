@@ -120,6 +120,8 @@ DEFAULT_STALE_BOOT_S = 900  # 15 minutes: a boot/admission phase should make pro
 STALE_BOOT_PHASES = frozenset({
     "booting", "admission-precheck", "cloning", "registering",
     "ensuring-runner", "aqua-preflight", "chrome-preflight", "minting-jit",
+    # vm-lease.lib.sh: the lease-denial reclaim, bounded at 300 s.
+    "disk-denial-reclaim",
 })
 # Exit codes with which a tartci agent reports APPLICATION state: the program
 # ran to completion and is reporting a condition a reload cannot fix. Treating

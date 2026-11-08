@@ -30,10 +30,17 @@ Bounded:
   * at most one run per `denial_reclaim_interval_minutes` (default 30) per
     host, stamped when a run STARTS so a crashed run also counts, under a
     non-blocking lock so two lanes refused at once run it once;
-  * one overall budget (default 600 s) shared by every step;
+  * one overall budget (default 300 s) shared by every step, the reference
+    scan included, so a reclaiming lane stays well inside the launchd
+    watchdog's 900 s stale-boot bound (the lane heartbeats
+    `disk-denial-reclaim` first);
+  * a Tart store is touched (`tart list`, `tart delete`) only after its
+    bounded storage-health probe says healthy, as the watchdog requires
+    before its own `tart list`, so a hung kernel open cannot hang the lane;
   * an OCI image is kept while it runs, while it was accessed in the last
     `--oci-min-idle-hours` (default 24), and while any `tart pull` or
-    `tart clone` is running on the host.
+    `tart clone` is running on the host, checked again before EVERY
+    delete: the first one seen stops the deletes.
 
 Fail open: the lane retries admission only when this prints status `ran`.
 Every other outcome, including an exception or a non-zero exit, leaves the
@@ -66,6 +73,7 @@ from typing import Any, Callable, Iterable, Iterator
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import gate_ccache_trim  # noqa: E402
+import store_health  # noqa: E402
 import tart_image_prune  # noqa: E402
 
 try:
@@ -84,7 +92,7 @@ GIB = 1024 ** 3
 DEFAULT_INTERVAL_MINUTES = 30
 MIN_INTERVAL_MINUTES = 5
 MAX_INTERVAL_MINUTES = 1440
-DEFAULT_BUDGET_S = 600.0
+DEFAULT_BUDGET_S = 300.0
 DEFAULT_OCI_MIN_IDLE_HOURS = 24.0
 STAMP_NAME = "denial-reclaim.json"
 LOCK_NAME = "denial-reclaim.lock"
@@ -172,7 +180,12 @@ def profile_values(data: dict[str, Any]) -> set[str]:
     return found
 
 
-def reference_files(roots: Iterable[pathlib.Path], skip: Iterable[pathlib.Path]) -> list[pathlib.Path]:
+class ScanDeadline(Exception):
+    """The reference scan ran out of budget: nothing can be proven unreferenced."""
+
+
+def reference_files(roots: Iterable[pathlib.Path], skip: Iterable[pathlib.Path],
+                    deadline: float | None = None) -> list[pathlib.Path]:
     """Configuration-like files under roots: never logs, event journals, or our own receipts.
 
     A log that once printed an image name is history, not a reference; the
@@ -189,12 +202,46 @@ def reference_files(roots: Iterable[pathlib.Path], skip: Iterable[pathlib.Path])
         else:
             continue
         for path in candidates:
+            if deadline is not None and time.monotonic() > deadline:
+                raise ScanDeadline("reference scan ran out of budget")
             text = str(path)
             if path.suffix in (".log", ".jsonl") or any(
                     text == s or text.startswith(s + os.sep) for s in skipped):
                 continue
             files.append(path)
     return files
+
+
+def reference_text(files: list[pathlib.Path], deadline: float) -> str:
+    """tart_image_prune.reference_text, one file at a time against the deadline."""
+    chunks = []
+    for path in files:
+        if time.monotonic() > deadline:
+            raise ScanDeadline("reference scan ran out of budget")
+        chunks.append(tart_image_prune.reference_text([path]))
+    return "\n".join(chunks)
+
+
+StoreProbe = Callable[[pathlib.Path], "str | None"]
+
+
+def store_unhealthy(home: pathlib.Path, state_path: pathlib.Path | None = None,
+                    timeout_s: float = store_health.DEFAULT_TIMEOUT_S) -> str | None:
+    """Why this Tart store must not be touched, or None when it is proven healthy.
+
+    The same rule the launchd watchdog applies before its `tart list`: the
+    bounded metadata probe, folded into the persisted health state for that
+    store, must read `healthy`. Anything else (a timeout, a device change, an
+    earlier failure still on record) keeps every Tart call off the store.
+    """
+    previous = store_health.load(str(state_path)) if state_path else {}
+    if previous.get("path") not in (None, str(home)):
+        previous = {}
+    result = store_health.probe(str(home), timeout_s=timeout_s)
+    state = store_health.next_state(previous, result)
+    if state.get("state") == "healthy":
+        return None
+    return str((state.get("last_result") or {}).get("reason") or state.get("state"))
 
 
 def split_oci(name: str) -> tuple[str, str | None, str | None]:
@@ -354,7 +401,8 @@ def append_event(state_dir: pathlib.Path, report: dict[str, Any]) -> None:
 
 
 def run_oci(*, tart_homes: list[pathlib.Path], values: set[str], text: str, now: float,
-            min_idle_hours: float, fix: bool, deadline: float, runner: Runner) -> dict[str, Any]:
+            min_idle_hours: float, fix: bool, deadline: float, runner: Runner,
+            store_probe: StoreProbe | None = None) -> dict[str, Any]:
     """Plan, then (with fix) delete, unreferenced OCI cache images. Never raises."""
     report: dict[str, Any] = {"deleted": 0, "planned": 0, "stores": []}
     busy = tart_busy(runner)
@@ -362,6 +410,8 @@ def run_oci(*, tart_homes: list[pathlib.Path], values: set[str], text: str, now:
         return {**report, "status": "skipped", "reason": busy}
     errors: list[str] = []
     for home in tart_homes:
+        if report.get("stopped"):
+            break
         store: dict[str, Any] = {"tart_home": str(home)}
         report["stores"].append(store)
         env = {**os.environ, "TART_HOME": str(home)}
@@ -369,6 +419,11 @@ def run_oci(*, tart_homes: list[pathlib.Path], values: set[str], text: str, now:
         if remaining <= 5:
             store["status"] = "skipped"
             store["reason"] = "budget spent"
+            continue
+        sick = (store_probe or store_unhealthy)(home)
+        if sick:
+            store["status"] = "skipped"
+            store["reason"] = f"Tart store health is not healthy: {sick}"
             continue
         try:
             listing = runner(["tart", "list", "--source", "oci", "--format", "json"],
@@ -399,6 +454,13 @@ def run_oci(*, tart_homes: list[pathlib.Path], values: set[str], text: str, now:
                 row["deleted"] = False
                 errors.append("budget spent before deleting " + row["name"])
                 break
+            # A pull or clone that started after the plan may be writing (or
+            # reading) the very entry about to go: look again every time.
+            busy = tart_busy(runner)
+            if busy:
+                row["deleted"] = False
+                report["stopped"] = busy
+                break
             try:
                 proc = runner(["tart", "delete", row["name"]], capture_output=True, text=True,
                               timeout=min(300.0, remaining), check=False, env=env)
@@ -412,6 +474,8 @@ def run_oci(*, tart_homes: list[pathlib.Path], values: set[str], text: str, now:
             else:
                 errors.append(f"tart delete {row['name']}: {(proc.stderr or '').strip()[:200]}")
     report["status"] = "applied" if fix else "planned"
+    if report.get("stopped"):
+        report["status"] = "stopped"
     if errors:
         report["errors"] = errors
     return report
@@ -433,7 +497,8 @@ def default_tart_homes(data: dict[str, Any], env: dict[str, str]) -> list[pathli
 def run(args: argparse.Namespace, *, env: dict[str, str] | None = None,
         runner: Runner = subprocess.run, now: float | None = None,
         busy_probe: Callable[[], str | None] | None = None,
-        ccache: str | None = None) -> dict[str, Any]:
+        ccache: str | None = None,
+        store_probe: StoreProbe | None = None) -> dict[str, Any]:
     """One lease-denial reclaim. Never raises; the caller retries only on status `ran`."""
     env = dict(os.environ if env is None else env)
     now = time.time() if now is None else now
@@ -460,19 +525,33 @@ def run(args: argparse.Namespace, *, env: dict[str, str] | None = None,
         report["free_before"] = free_bytes(measure_path) if measure_path else None
         home = pathlib.Path.home()
         tartci_root = pathlib.Path(__file__).resolve().parents[1]
-        files = reference_files(
-            [home / ".config/tartci", home / ".tartci/state", home / "Library/LaunchAgents",
-             tartci_root / "profiles", tartci_root / "manifests",
-             pathlib.Path(args.profile).expanduser()],
-            skip=[state_dir])
-        text = tart_image_prune.reference_text(files)
+        if store_probe is None:
+            health_state = pathlib.Path(env.get("TARTCI_HOME", str(home / ".tartci"))
+                                        ).expanduser() / "state" / "store-health.json"
+            store_probe = lambda path: store_unhealthy(path, health_state)  # noqa: E731
         try:
+            # Half the budget at most: the ccache step after it needs the rest.
+            scan_deadline = min(deadline, started + float(args.budget_seconds) / 2)
+            files = reference_files(
+                [home / ".config/tartci", home / ".tartci/state", home / "Library/LaunchAgents",
+                 tartci_root / "profiles", tartci_root / "manifests",
+                 pathlib.Path(args.profile).expanduser()],
+                skip=[state_dir], deadline=scan_deadline)
+            text = reference_text(files, scan_deadline)
+        except ScanDeadline as exc:
+            text = None
+            report["oci"] = {"status": "skipped", "reason": str(exc), "deleted": 0}
+        try:
+            if text is None:
+                raise ScanDeadline("skipped")
             report["oci"] = run_oci(
                 tart_homes=[pathlib.Path(p) for p in args.tart_home] if args.tart_home
                 else default_tart_homes(data, env),
                 values=profile_values(data), text=text, now=now,
                 min_idle_hours=args.oci_min_idle_hours, fix=args.fix, deadline=deadline,
-                runner=runner)
+                runner=runner, store_probe=store_probe)
+        except ScanDeadline:
+            pass
         except Exception as exc:  # noqa: BLE001 - one step must not take the run down
             report["oci"] = {"status": "error", "reason": f"{type(exc).__name__}: {exc}"}
         remaining = deadline - time.monotonic()

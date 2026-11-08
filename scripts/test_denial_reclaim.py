@@ -114,17 +114,23 @@ class Plan(unittest.TestCase):
 class FakeHost:
     """Answers ps, tart list/delete and ccache like a disk-full host would."""
 
-    def __init__(self, entries: list[dict], *, tart_running: bool = False) -> None:
+    def __init__(self, entries: list[dict], *, tart_running: bool = False,
+                 busy_after_ps: int | None = None) -> None:
         self.entries = entries
         self.calls: list[list[str]] = []
         self.tart_running = tart_running
+        self.busy_after_ps = busy_after_ps
+        self.ps_calls = 0
 
     def __call__(self, argv, **kwargs) -> subprocess.CompletedProcess:
         self.calls.append(list(argv))
         out = ""
         if argv[0] == "ps":
+            self.ps_calls += 1
+            busy = self.tart_running or (self.busy_after_ps is not None
+                                         and self.ps_calls > self.busy_after_ps)
             out = "/usr/sbin/sshd\n" + ("/opt/homebrew/bin/tart pull ghcr.io/x/y:1\n"
-                                        if self.tart_running else "")
+                                        if busy else "")
         elif argv[:2] == ["tart", "list"]:
             out = json.dumps(self.entries)
         return subprocess.CompletedProcess(argv, 0, out, "")
@@ -158,9 +164,10 @@ class Run(unittest.TestCase):
         return argparse.Namespace(**values)
 
     def run_once(self, host: FakeHost, *, now: float = NOW, env: dict | None = None,
-                 busy: str | None = None, **over) -> dict:
+                 busy: str | None = None, store_probe=lambda path: None, **over) -> dict:
         return dr.run(self.args(**over), env={**self.env, **(env or {})}, runner=host,
-                      now=now, busy_probe=lambda: busy, ccache="/bin/echo")
+                      now=now, busy_probe=lambda: busy, ccache="/bin/echo",
+                      store_probe=store_probe)
 
     # The profile's cache_root is read with tomllib; under 3.9 the lane's
     # TARTCI_CI_CACHE (rendered into every runner plist) names the cache.
@@ -197,6 +204,44 @@ class Run(unittest.TestCase):
         report = self.run_once(host)
         self.assertEqual(report["oci"]["status"], "skipped")
         self.assertEqual(host.deleted(), [])
+
+    def test_a_pull_that_starts_mid_run_stops_the_deletes(self):
+        # ps #1 is the pre-plan check, #2 precedes the first delete; a pull
+        # that starts after that must stop the second delete.
+        host = FakeHost([oci("ghcr.io/org/stale:1"), oci("ghcr.io/org/stale:2")],
+                        busy_after_ps=2)
+        report = self.run_once(host)
+        self.assertEqual(host.deleted(), ["ghcr.io/org/stale:1"])
+        self.assertEqual(report["oci"]["status"], "stopped")
+        self.assertIn("tart pull", report["oci"]["stopped"])
+
+    def test_an_unhealthy_store_gets_no_tart_call(self):
+        host = FakeHost([oci("ghcr.io/org/stale:1")])
+        report = self.run_once(host, store_probe=lambda path: "timeout after 10s")
+        self.assertEqual([c for c in host.calls if c[0] == "tart"], [])
+        self.assertIn("timeout after 10s", report["oci"]["stores"][0]["reason"])
+
+    def test_the_real_store_gate_refuses_a_store_it_cannot_open(self):
+        self.assertIsNone(dr.store_unhealthy(self.store, timeout_s=10))
+        self.assertTrue(dr.store_unhealthy(self.tmp / "missing", timeout_s=10))
+        failing = self.tmp / "store-health.json"
+        failing.write_text(json.dumps({"path": str(self.store), "state": "draining",
+                                       "consecutive_failures": 3}))
+        # One good probe clears a recorded failure, as the watchdog's state does.
+        self.assertIsNone(dr.store_unhealthy(self.store, failing, timeout_s=10))
+
+    def test_a_reference_scan_past_its_budget_deletes_nothing(self):
+        host = FakeHost([oci("ghcr.io/org/stale:1")])
+        report = self.run_once(host, budget_seconds=1e-6)
+        self.assertEqual(report["oci"]["status"], "skipped")
+        self.assertIn("reference scan", report["oci"]["reason"])
+        self.assertEqual(host.deleted(), [])
+
+    def test_the_default_budget_fits_the_stale_boot_bound(self):
+        import tartci_launchd_watchdog as watchdog
+        self.assertEqual(dr.DEFAULT_BUDGET_S, 300.0)
+        self.assertLess(dr.DEFAULT_BUDGET_S * 2, watchdog.DEFAULT_STALE_BOOT_S)
+        self.assertIn("disk-denial-reclaim", watchdog.STALE_BOOT_PHASES)
 
     def test_at_most_once_per_interval(self):
         first = self.run_once(FakeHost([]))
@@ -283,6 +328,7 @@ print('{{"ok":true,"reason":"acquired","disk":{{"free_bytes":60,"required_bytes"
             result = subprocess.run(["bash", "-c", f'''
               source {HELPER}; tartci_start_vm_lease_heartbeat() {{ :; }}
               event() {{ printf '%s %s\\n' "$1" "$2" >> {str(root / "events")!r}; }}
+              heartbeat() {{ printf 'heartbeat %s\\n' "$1" >> {str(root / "events")!r}; }}
               export TARTCI_ROOT={root} TARTCI_HOME_VOLUME_FLOOR=0
               rc=0; tartci_acquire_vm_lease unit 1 test-vm gate labels '' {store} provider lane runner || rc=$?
               echo "rc=$rc calls=$(cat {count})"
@@ -307,6 +353,20 @@ print('{{"ok":true,"reason":"acquired","disk":{{"free_bytes":60,"required_bytes"
             with self.subTest(body=body):
                 rc, calls, reclaimed, log = self.acquire(DISK_DENIAL, body)
                 self.assertEqual((rc, calls, reclaimed), (75, 1, True), log)
+
+    def test_the_lane_heartbeats_before_it_reclaims(self):
+        rc, _, _, log = self.acquire(DISK_DENIAL, 'print(\'{"status":"cooldown"}\')\n')
+        self.assertEqual(rc, 75)
+        self.assertIn("heartbeat disk-denial-reclaim", log)
+        self.assertLess(log.index("heartbeat disk-denial-reclaim"),
+                        log.index("disk_denial_reclaim lane=lane status=cooldown"))
+
+    def test_a_reclaiming_lane_is_busy_and_blocked_not_idle_or_unknown(self):
+        import gate_supply
+        import lane_busy
+        self.assertIn("disk-denial-reclaim", lane_busy.BUSY_PHASES)
+        self.assertNotIn("disk-denial-reclaim", lane_busy.IDLE_PHASES)
+        self.assertIn("disk-denial-reclaim", gate_supply.BLOCKED_PHASES)
 
     def test_a_non_disk_refusal_never_reclaims(self):
         rc, calls, reclaimed, log = self.acquire(
