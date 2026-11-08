@@ -57,6 +57,7 @@ from typing import Any, Callable, Iterable
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import boot_usage  # noqa: E402
+import denial_reclaim  # noqa: E402
 import gate_ccache_trim  # noqa: E402
 import scratch_dirs  # noqa: E402
 import tmp_checkouts  # noqa: E402
@@ -80,6 +81,9 @@ SETTINGS_KEYS = frozenset({"pulp_worktree_builds", "repo", "worktrees_root",
                            # read by gate_ccache_trim.py
                            "gate_ccache_trim", "gate_ccache_max_age_days",
                            "gate_ccache_trim_interval_hours",
+                           # read by denial_reclaim.py
+                           "denial_reclaim", "denial_reclaim_interval_minutes",
+                           "denial_reclaim_ccache_max_age_days",
                            # read by boot_usage.py
                            "boot_usage", "boot_usage_warn_gb",
                            "boot_usage_growth_gb_per_day"})
@@ -207,6 +211,7 @@ def validate_table(table: Any) -> list[str]:
     problems.extend(scratch_dirs.validate(table))
     problems.extend(gate_ccache_trim.validate(table))
     problems.extend(boot_usage.validate(table))
+    problems.extend(denial_reclaim.validate(table))
     return problems
 
 

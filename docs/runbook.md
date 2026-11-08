@@ -1941,6 +1941,27 @@ Each host keeps one breaker (`scripts/vm_dhcp_breaker.py`,
   self-update. **On first deploy every host verifies once** (no boot time is
   recorded yet). The self-update trigger runs from the installed
   orchestrator, so it takes effect one update after deploy.
+- **A probe refused by VM admission** (`admission_blocked`, doctor
+  `vm_dhcp_probe_blocked_by_admission`): when the probe lane's lease (or the
+  disk-floor precheck) is refused before it clones, the lane cancels its turn
+  with `--blocked-by <reason>` (`disk_capacity_exceeded`, `memory_exceeded`,
+  `capacity_exceeded`, `home_volume_below_floor`, `deferred_to_waiter`). That
+  turn never reached the address wait, so it is no DHCP evidence: nothing is
+  counted, nothing opens, and no alert is due. The breaker leaves `verifying`
+  for `admission_blocked` and says what blocks it; the other lanes back off
+  with `blocked_by` and log `VM admission on this host refuses VMs (<reason>)`
+  under heartbeat `vm-lease-denied`, and their serving cause is `disk`. Lanes
+  still try admission one at a time, so a freed disk cannot let two clone
+  before the network is proven; the first probe that clones settles it the
+  way `verifying` would. A disk refusal is a doctor problem at once; a cores
+  or memory refusal (`capacity_exceeded`, `deferred_to_waiter`,
+  `memory_exceeded`) is ordinary contention and reads ok until it has held
+  10 min. A cancel for any other reason returns it to
+  `verifying`. An `open` breaker whose probe is refused keeps its DHCP cause
+  and records `probe_blocked` beside it. On m1 on 2026-11-08 a self-update's
+  verify met a disk-refused host: the probe never cloned, the breaker sat in
+  `verifying` for hours and the idle slot reported "VM DHCP on this host is not
+  answering (breaker open)" for what was a full disk.
 - **The 960 s bound** is twice the slowest probe report on current lane code
   (clone_start to `boot_failed no_ip`, which ends the 120 s address wait),
   rounded up to the minute. `TARTCI_VM_DHCP_VERIFY_SECS` overrides it. Measured
@@ -3286,6 +3307,49 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   disk before and after. Never run a bare `ccache -c` on that cache from the host: the host's
   `ccache` has no `ccache.conf` there and treats its 5 GiB default as the cap,
   not the guests' 40G; once the counters are recounted that evicts by size.
+
+  **On a disk-refused lease** the lane does not wait for this pass. A VM lease
+  (or the disk-floor precheck before it) refused `disk_capacity_exceeded`
+  with only the disk axis exceeded runs `scripts/denial_reclaim.py` once
+  (`tartci reclaim --on-lease-denial --fix` is the same step by hand) and, only
+  when it ran, retries admission exactly once:
+  - gate ccache entries unused for `denial_reclaim_ccache_max_age_days`
+    (default: `gate_ccache_max_age_days`, else 14), through the same
+    `gate_ccache_trim.evict` (the same busy gate and guard lock, without the
+    opt-in or the 24 h interval);
+  - OCI cache images (`tart list --source oci`, in `$TART_HOME`, the profile's
+    `[host].tart_home` and `~/.tart`) that no profile value, file under
+    `~/.config/tartci` or `~/.tartci/state` (logs, journals and the reclaim
+    receipts excluded), LaunchAgent plist, or checkout profile/manifest names.
+    The digest a referenced tag points at is kept; an image accessed in the
+    last 24 h or running is kept; nothing is deleted while a `tart pull` or
+    `tart clone` runs, checked again before every delete (the first one seen
+    stops the deletes). A store is touched only after its bounded
+    storage-health probe reads healthy (the watchdog's rule before its own
+    `tart list`), so a hung kernel open cannot hang the lane. A name must carry
+    a registry path, so a local VM can never be deleted.
+
+  At most once per `denial_reclaim_interval_minutes` (default 30, 5..1440) per
+  host, stamped at start, under a non-blocking lock; one 300 s budget for every
+  step (`TARTCI_DISK_DENIAL_RECLAIM_BUDGET_SECS`), of which the reference scan
+  gets at most half (a scan that runs out deletes no image). The lane first
+  heartbeats `disk-denial-reclaim`: a stale-boot phase for the launchd
+  watchdog (900 s), a blocked lane for gate_supply and a busy one for
+  lane_busy. The lane logs
+  `disk_denial_reclaim status=… freed_gib=… ccache=… oci_deleted=…` and
+  `disk_denial_reclaim_retry rc=…`; the run appends `reclaim_on_lease_denial`
+  to `~/.tartci/state/reclaim/events.jsonl`. Fail open: a cooldown, a held lock,
+  a non-zero exit or unreadable output leaves the refusal as it was. Off:
+  `[reclaim] denial_reclaim = false`, or `TARTCI_DISK_DENIAL_RECLAIM=0`.
+
+  **Before it blocks:** `tartci doctor fleet` reports `vm_disk_headroom_low`
+  when the Tart store admits one more VM but not two (free space under the
+  lease's floor + live reservations + one VM's growth, plus one more growth),
+  and `vm_disk_headroom_refusing` when the next lease is refused for disk
+  (`scripts/disk_headroom.py`, read-only). A granted lease that leaves no room
+  for the next VM logs `disk_headroom_low … next_vm=refused` in the lane log.
+  m1 sat at about 56 GiB against a 49 GiB per-VM need after its 2026-11-08
+  manual reclaim, one VM from refusing again, with nothing reporting it.
 
   The same origin/main checkout carries Pulp's host-vitals sensor. Its
   installer copies `host_vitals.sh` and `host_vitals_sensor.sh` into

@@ -2717,6 +2717,12 @@ def fleet_readiness(
                         str(matching_state.get("runner", "") or ""),
                         blocked_at,
                     )
+                    # A lane the DHCP breaker holds back while the host's VM
+                    # admission refuses its verification probe for disk has
+                    # no lease attempt of its own to read: the supervisor
+                    # names the cause itself (runner.sh, VM_DHCP_BLOCKED_BY).
+                    if disk_reason is None and blocked_cause == "disk":
+                        disk_reason = "disk_capacity_insufficient"
                     if disk_reason is not None:
                         serving_blocked_lanes.append({
                             "label": label,

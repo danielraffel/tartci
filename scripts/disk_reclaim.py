@@ -1151,7 +1151,14 @@ def main(argv: list[str] | None = None) -> int:
     that does not leave a fresh receipt is now the signal, whatever launchd
     believes.
     """
-    args = build_parser().parse_args(argv)
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if "--on-lease-denial" in raw:
+        # The lease-denial reclaim (denial_reclaim.py): regenerable caches only,
+        # rate limited per host, with its own receipt so it never stands in for
+        # the hourly pass that reclaim_status judges.
+        import denial_reclaim  # noqa: PLC0415 - only this mode needs it
+        return denial_reclaim.main([item for item in raw if item != "--on-lease-denial"])
+    args = build_parser().parse_args(raw)
     receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run"}
     code: int | None = None
     try:

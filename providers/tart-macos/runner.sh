@@ -2436,12 +2436,18 @@ run_one(){
   if ! declare -F tartci_vm_dhcp_cancel >/dev/null; then
     tartci_vm_dhcp_cancel(){ :; }
   fi
+  if ! declare -F tartci_vm_dhcp_refusal_reason >/dev/null; then
+    tartci_vm_dhcp_refusal_reason(){ :; }
+  fi
   # Before the first early return, not beside the other CURRENT_* resets: the
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
   JOB_CLAIM_CONTENDED=0
   PRE_CLONE_DEMAND_GONE=0
   VM_DHCP_BACKOFF=0
+  VM_DHCP_BLOCKED_BY=""
+  # shellcheck disable=SC2034 # read by tartci_vm_dhcp_cancel (vm-dhcp.lib.sh)
+  VM_DHCP_PROBE_BLOCKED_BY=""
   LAST_RUN_LEASE_DENIED=0
   tartci_lifecycle_reset
   vm="$(ephemeral_boot_name "$i")"
@@ -2477,8 +2483,18 @@ run_one(){
   # checks: this breaker, then the job claim, then (after the admission
   # precheck) the pre-clone demand check. See vm-dhcp.lib.sh.
   if ! tartci_vm_dhcp_check "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}"; then
-    heartbeat vm-dhcp-breaker-open
-    note "[$i] VM DHCP on this host is not answering (breaker open) — not cloning; one probe every ${TARTCI_VM_DHCP_PROBE_SECS:-300}s"
+    if [ -n "${VM_DHCP_BLOCKED_BY:-}" ]; then
+      # Not DHCP: the verification probe cannot clone because VM admission
+      # refuses it. Name the refusal, as a refused lease does.
+      heartbeat vm-lease-denied
+      note "[$i] VM admission on this host refuses VMs ($VM_DHCP_BLOCKED_BY) — the VM-network verification probe cannot clone, so this lane waits; not a DHCP failure"
+    elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then
+      heartbeat vm-dhcp-breaker-open
+      note "[$i] VM DHCP on this host is not answering (breaker open) — not cloning; one probe every ${TARTCI_VM_DHCP_PROBE_SECS:-300}s"
+    else
+      heartbeat vm-dhcp-breaker-open
+      note "[$i] VM network verification in progress on another lane — not cloning until it reports"
+    fi
     return 75
   fi
   # One booting VM per queued job: a lane whose class's queued jobs are all
@@ -2545,8 +2561,14 @@ run_one(){
     tartci_prepare_and_check_disk_root_observed "$logdir" "" "" tart-macos \
       "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   fi
+  local floor_rc=0
   tartci_check_macos_disk_floor_with_cleanup_once "$TART_HOME" \
-    "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
+    "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || floor_rc=$?
+  if [ "$floor_rc" -ne 0 ]; then
+    # shellcheck disable=SC2034 # read by tartci_vm_dhcp_cancel (vm-dhcp.lib.sh)
+    VM_DHCP_PROBE_BLOCKED_BY="$(tartci_vm_dhcp_refusal_reason "${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}")"
+    return "$floor_rc"
+  fi
   tartci_prepare_and_check_disk_root_observed "$CACHE_ROOT" "" "" tart-macos \
     "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" "$RUNNER_NAME" || return $?
   CLEANED_UP=0
@@ -2578,7 +2600,8 @@ run_one(){
       LAST_RUN_LEASE_DENIED=1
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" warm_lease_denied
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" warm_lease_denied \
+        "$(tartci_vm_dhcp_refusal_reason "${TARTCI_LAST_VM_LEASE_DENIAL:-}")"
       heartbeat vm-lease-denied
       return 75
     fi
@@ -2614,7 +2637,8 @@ run_one(){
       # can only see heartbeat age has no choice but to call it stale.
       [ -n "$SERVING_BLOCKED_SINCE" ] \
         || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" lease_denied
+      tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" lease_denied \
+        "$(tartci_vm_dhcp_refusal_reason "${TARTCI_LAST_VM_LEASE_DENIAL:-}")"
       heartbeat vm-lease-denied
       tartci_warm_note_lease_denial
       return "$lease_rc"
@@ -3198,6 +3222,8 @@ if [ "$LOOP" = 1 ]; then
       run_rc=0
       CURRENT_SELECTED_QUEUED="$q"
       VM_DHCP_PROBE_REPORTED=0
+      # shellcheck disable=SC2034 # read by tartci_vm_dhcp_cancel (vm-dhcp.lib.sh)
+      VM_DHCP_PROBE_BLOCKED_BY=""
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # Release per-turn ownership proofs immediately after run_one, before
       # the serving accounting grows. This keeps every early-return proof
@@ -3210,12 +3236,24 @@ if [ "$LOOP" = 1 ]; then
       # accumulates, while a lane that only fails accumulates every cycle.
       # Demand another lane already covers is not demand this lane failed.
       if [ "$CURRENT_SERVED" = 1 ] || [ "${JOB_CLAIM_CONTENDED:-0}" = 1 ] \
-         || { [ "${VM_DHCP_BACKOFF:-0}" = 1 ] && [ "${VM_DHCP_BREAKER_OPEN:-0}" != 1 ]; } \
+         || { [ "${VM_DHCP_BACKOFF:-0}" = 1 ] && [ "${VM_DHCP_BREAKER_OPEN:-0}" != 1 ] \
+              && [ -z "${VM_DHCP_BLOCKED_BY:-}" ]; } \
          || [ "${PRE_CLONE_DEMAND_GONE:-0}" = 1 ]; then
         SERVING_BLOCKED_SINCE=""
         SERVING_BLOCKED_STREAK=0
         SERVING_BLOCKED_LAST_PHASE=""
         SERVING_BLOCKED_CAUSE=""
+      elif [ -n "${VM_DHCP_BLOCKED_BY:-}" ]; then
+        # The breaker waits on a probe VM admission refuses: the lane is
+        # blocked by that refusal (disk on m1 2026-11-08), not by DHCP.
+        SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
+        SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"
+        case "$VM_DHCP_BLOCKED_BY" in
+          disk_capacity_exceeded|home_volume_below_floor) SERVING_BLOCKED_CAUSE="disk" ;;
+          *) SERVING_BLOCKED_CAUSE="unserved" ;;
+        esac
+        [ -n "$SERVING_BLOCKED_SINCE" ] \
+          || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       elif [ "${VM_DHCP_BREAKER_OPEN:-0}" = 1 ]; then
         SERVING_BLOCKED_STREAK=$((SERVING_BLOCKED_STREAK + 1))
         SERVING_BLOCKED_LAST_PHASE="$LAST_HEARTBEAT_PHASE"

@@ -195,6 +195,161 @@ class PreCloneCancellation(Case):
         self.assertEqual(after["last_probe_at"], before["opened_at"])
         self.assertIsNone(after.get("probe_lane"))
 
+class AdmissionBlocked(Case):
+    """m1 2026-11-08: a verification probe refused by VM admission (disk) is
+    not DHCP evidence, and the breaker names the refusal instead of sitting
+    in verifying while the idle lane reports a DHCP outage."""
+
+    def blocked_cancel(self, at: float, lane: str = "probe-lane",
+                       blocked_by: str = "disk_capacity_exceeded") -> dict:
+        return vb.cancel(argparse.Namespace(lane=lane, reason="lease_denied",
+                                            blocked_by=blocked_by), now=at)
+
+    def test_a_disk_refused_probe_leaves_verifying_and_names_disk(self):
+        vb.verify("self_update", now=T0)
+        self.assertEqual(self.check(T0 + 1, lane="probe-lane")["action"], "probe")
+        result = self.blocked_cancel(T0 + 2)
+        self.assertEqual(self.names(result),
+                         ["vm_dhcp_probe_cancelled", "vm_dhcp_probe_blocked"])
+        self.assertIn("blocked_by=disk_capacity_exceeded", result["events"][1][1])
+        state = self.state()
+        self.assertEqual(state["state"], "admission_blocked")
+        self.assertEqual(state["blocked_reason"], "disk_capacity_exceeded")
+        # Not a DHCP failure: nothing opened, no VM spent, no unreported probe.
+        self.assertIsNone(state.get("cause"))
+        self.assertIsNone(state.get("consecutive_unreported"))
+        self.assertFalse(vb.alert_due(state, T0 + 3600)[0])
+        code = vb.doctor_code(state)
+        self.assertEqual(code[1], "vm_dhcp_probe_blocked_by_admission")
+        self.assertIn("not a DHCP failure", code[2])
+        self.assertIn("disk", code[2])
+
+    def test_the_other_lane_backs_off_with_the_real_blocker(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2)
+        # One lane at a time still tries admission (a freed disk must not
+        # let two lanes clone before the network is proven) ...
+        self.assertEqual(self.check(T0 + 3, lane="probe-lane")["action"], "probe")
+        other = self.check(T0 + 4, lane="slot2")
+        self.assertEqual(other["action"], "backoff")
+        self.assertFalse(other["breaker_open"])
+        self.assertEqual(other["blocked_by"], "disk_capacity_exceeded")
+
+    def test_repeated_refusals_stay_blocked_without_counting(self):
+        vb.verify("self_update", now=T0)
+        for turn in range(5):
+            at = T0 + 10 * turn
+            self.assertEqual(self.check(at + 1, lane="probe-lane")["action"], "probe")
+            self.blocked_cancel(at + 2)
+        state = self.state()
+        self.assertEqual(state["state"], "admission_blocked")
+        self.assertEqual(state["blocked_count"], 5)
+        self.assertEqual(state["blocked_since"], T0 + 2)
+        self.assertEqual(int(state.get("vms_spent") or 0), 0)
+
+    def test_once_admitted_the_probe_settles_it_like_verifying(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2)
+        self.assertEqual(self.check(T0 + 3, lane="probe-lane")["action"], "probe")
+        events = self.record("ip", T0 + 200, lane="probe-lane")
+        self.assertIn("vm_dhcp_verified", self.names(events))
+        state = self.state()
+        self.assertEqual(state["state"], "closed")
+        self.assertNotIn("blocked_reason", state)
+        # And a real DHCP failure after admission still opens it at once.
+        vb.verify("self_update", now=T0 + 300)
+        self.check(T0 + 301, lane="probe-lane")
+        self.blocked_cancel(T0 + 302)
+        self.check(T0 + 303, lane="probe-lane")
+        self.record("no_ip", T0 + 500, lane="probe-lane")
+        state = self.state()
+        self.assertEqual(state["state"], "open")
+        self.assertNotIn("blocked_reason", state)
+
+    def test_a_cancel_for_another_reason_returns_to_verifying(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2)
+        self.check(T0 + 3, lane="probe-lane")
+        vb.cancel(argparse.Namespace(lane="probe-lane", reason="job_claim_covered"), now=T0 + 4)
+        state = self.state()
+        self.assertEqual(state["state"], "verifying")
+        self.assertNotIn("blocked_reason", state)
+
+    def test_an_unknown_blocked_reason_is_an_ordinary_cancel(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2, blocked_by="dhcp_silent")
+        self.assertEqual(self.state()["state"], "verifying")
+
+    def test_an_open_breaker_keeps_its_dhcp_cause_and_notes_the_blocker(self):
+        self.record("no_ip", T0)
+        self.record("no_ip", T0 + 60)
+        self.assertEqual(self.check(T0 + 400, lane="probe-lane")["action"], "probe")
+        self.blocked_cancel(T0 + 401)
+        state = self.state()
+        self.assertEqual(state["state"], "open")
+        self.assertEqual(state["probes"], 0)
+        self.assertEqual(state["probe_blocked"]["reason"], "disk_capacity_exceeded")
+        self.assertIn("VM admission refused it (disk_capacity_exceeded)",
+                      vb.doctor_code(state)[2])
+        # The refused turn did not use up the cadence: the next lane probes,
+        # and a lane backed off meanwhile is told what blocked the last one.
+        self.assertEqual(self.check(T0 + 402, lane="b")["action"], "probe")
+        self.assertEqual(self.check(T0 + 403, lane="c").get("probe_blocked_by"),
+                         "disk_capacity_exceeded")
+
+    def test_cores_or_memory_contention_is_a_problem_only_once_it_persists(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        self.blocked_cancel(T0 + 2, blocked_by="capacity_exceeded")
+        state = self.state()
+        self.assertEqual(state["state"], "admission_blocked")
+        self.assertEqual(vb.doctor_code(state, now=T0 + 300)[0], "ok")
+        self.assertEqual(vb.doctor_code(state, now=T0 + 2 + 600)[0], "problem")
+        # A full disk does not clear by itself: a problem at once.
+        disk = dict(state, blocked_reason="disk_capacity_exceeded")
+        self.assertEqual(vb.doctor_code(disk, now=T0 + 3)[0], "problem")
+
+    def test_the_cli_accepts_blocked_by(self):
+        vb.verify("self_update", now=T0)
+        self.check(T0 + 1, lane="probe-lane")
+        out = subprocess.run([sys.executable, str(BREAKER), "cancel", "--lane", "probe-lane",
+                              "--reason", "lease_denied", "--blocked-by",
+                              "disk_capacity_exceeded"],
+                             capture_output=True, text=True, check=False)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(self.state()["state"], "admission_blocked")
+
+    def test_the_shell_exports_the_blocker_and_passes_it_on_cancel(self):
+        vb.verify("self_update", now=T0)
+        script = (f"TARTCI_ROOT={str(ROOT)!r}\nsource {str(LIB)!r}\n"
+                  "event(){ :; }\n"
+                  "tartci_vm_dhcp_check probe-lane; echo probe=$VM_DHCP_PROBE\n"
+                  "r=$(tartci_vm_dhcp_refusal_reason "
+                  "'{\"ok\":false,\"reason\":\"disk_capacity_exceeded\"}')\n"
+                  "tartci_vm_dhcp_cancel probe-lane lease_denied \"$r\"\n"
+                  "tartci_vm_dhcp_check probe-lane >/dev/null\n"
+                  "rc=0; tartci_vm_dhcp_check slot2 || rc=$?\n"
+                  "echo \"rc=$rc open=$VM_DHCP_BREAKER_OPEN blocked=$VM_DHCP_BLOCKED_BY\"\n")
+        env = {**os.environ, "TARTCI_VM_DHCP_BOOT_TIME": str(T0 - 86400)}
+        out = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True,
+                             env=env, check=False)
+        self.assertIn("probe=1", out.stdout, out.stderr)
+        self.assertIn("rc=75 open=0 blocked=disk_capacity_exceeded", out.stdout, out.stderr)
+
+    def test_the_runner_names_disk_not_dhcp_and_counts_the_block(self):
+        body = RUNNER.read_text()
+        check_at = body.index('if ! tartci_vm_dhcp_check "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}"; then')
+        block = body[check_at:body.index("return 75", check_at)]
+        self.assertIn('if [ -n "${VM_DHCP_BLOCKED_BY:-}" ]; then\n      # Not DHCP', block)
+        self.assertIn("heartbeat vm-lease-denied", block)
+        self.assertIn('lease_denied \\\n        "$(tartci_vm_dhcp_refusal_reason "${TARTCI_LAST_VM_LEASE_DENIAL:-}")"',
+                      body)
+
+
 class Open(Case):
     def open(self) -> None:
         self.record("no_ip", T0)
