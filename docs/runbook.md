@@ -2926,16 +2926,21 @@ arrive, and a host that did not get it is loud:
       host_class = "studio"
       [tools.shipyard]
       auto_apply = false     # stop automatic Shipyard updates on this host
-      hold_until = "2026-11-10T00:00:00Z"   # optional; "never" keeps it
+      held_since = "2026-11-08T12:00:00Z"   # the hold lasts hold_max_hours from here
+      # hold_until = "2026-11-10T00:00:00Z" # or an explicit end; "never" = permanent
 
   Turning `auto_apply` off there for a tool that applies by default is a
   hold, and a hold expires: at `hold_until`, else `hold_max_hours` (168)
-  after the file was last written. While it holds, the tool's line reads
-  `HELD: auto_apply = false in <file> until <time>` and the stale problem in
-  `tartci doctor fleet` and the watchdog WARN names it. A Shipyard hold written
-  on 2026-10-23 for a failed v0.345.0 canary never came off and kept m1, m3 and
-  m5s off every Shipyard release for 16 days, with the doctor reporting only
-  "behind".
+  after `held_since`. With neither key, the start is when tool-freshness first
+  saw the hold (`~/.tartci/state/tool-freshness/holds.json`, taken once from
+  the file's time, and the line says so), so `cp -p`/`rsync -a` or a touch
+  never expires or renews a hold. An unreadable `hold_until` or `held_since`
+  keeps the hold and is a doctor problem until fixed. While it holds, the
+  tool's line reads `HELD: auto_apply = false in <file> until <time>` and the
+  stale problem in `tartci doctor fleet` and the watchdog WARN names it. A
+  Shipyard hold written on 2026-10-23 for a failed v0.345.0 canary never came
+  off and kept m1, m3 and m5s off every Shipyard release for 16 days, with the
+  doctor reporting only "behind".
 
 - **A fleet host must carry its maintenance agents.** `tartci doctor fleet`
   reports `host_agents_missing` (a problem) when a host with an installed

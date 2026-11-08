@@ -590,7 +590,7 @@
     "tool_freshness_stale": {
       "summary": "Shipyard or the pulp CLI has been behind its latest release for longer than the stale window, or its version or releases could not be read.",
       "why": "An installed CLI can sit months behind its releases unnoticed, so every agent build and gate on the host runs without merged fixes.",
-      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; a line marked HELD is an `auto_apply = false` hold in ~/.config/tartci/tool-freshness.toml: remove it once its reason is gone (it also lifts by itself at `hold_until`, or `hold_max_hours` after the file was written). Otherwise update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`.",
+      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; a line marked HELD is an `auto_apply = false` hold in ~/.config/tartci/tool-freshness.toml: remove it once its reason is gone (it also lifts by itself at `hold_until`, or `hold_max_hours` after `held_since`; an unreadable value keeps the hold and is reported until fixed). Otherwise update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`.",
       "do_not": "Do not install from a working copy's build directory; install the published release so every host runs the same bytes."
     },
     "tool_freshness_unmeasured": {

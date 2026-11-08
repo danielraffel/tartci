@@ -622,11 +622,59 @@ class ToolFreshnessTests(unittest.TestCase):
         self.assertFalse(any("fleet-update" in call for call in host.calls))
         self.assertIn("hold_until = never", row["apply"])
 
-    def test_a_malformed_hold_until_falls_back_to_the_default_expiry(self) -> None:
+    def test_a_malformed_hold_until_keeps_the_hold_and_is_a_problem(self) -> None:
         host = self.behind_shipyard()
         body = self.HOLD + 'hold_until = "next tuesday"\n'
-        self.refresh(host, settings=self.held_settings(body, NOW - 8 * 24 * HOUR))
+        row = self.refresh(host, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("unreadable", row["apply"])
+        self.assertIn("shipyard hold_until = 'next tuesday'", tf.summary(self.home)["problem"])
+        # Still a problem while the tool is current: the typo must be seen.
+        current = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(current, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))
+        self.assertIn("is unreadable; the hold is kept", tf.summary(self.home)["problem"])
+
+    def test_a_malformed_held_since_keeps_the_hold_and_is_a_problem(self) -> None:
+        host = self.behind_shipyard()
+        body = self.HOLD + 'held_since = "2026-13-45"\n'
+        self.refresh(host, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("held_since = '2026-13-45'", tf.summary(self.home)["problem"])
+
+    def test_held_since_sets_the_start_whatever_the_file_time(self) -> None:
+        # cp -p / rsync -a: an old file time on a new hold does not expire it.
+        recent = self.HOLD + 'held_since = "%s"\n' % iso(NOW - HOUR)
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(recent, NOW - 60 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("until " + iso(NOW - HOUR + 168 * HOUR), row["apply"])
+        self.assertNotIn("file's time", row["apply"])
+        # A touched file does not renew an old held_since.
+        old = self.HOLD + "held_since = %s\n" % iso(NOW - 8 * 24 * HOUR)
+        host = self.behind_shipyard()
+        self.refresh(host, settings=self.held_settings(old, NOW))
         self.assertTrue(any("fleet-update" in call for call in host.calls))
+
+    def test_without_held_since_the_file_time_is_taken_once_and_reported(self) -> None:
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(self.HOLD, NOW - 6 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("start taken once from the file's time; set held_since", row["apply"])
+        recorded = json.loads((self.state / "holds.json").read_text())["shipyard"]
+        self.assertEqual(recorded["since"], iso(NOW - 6 * 24 * HOUR))
+        # Touching the file two days later neither renews nor moves the start.
+        later = NOW + 2 * 24 * HOUR
+        host = self.behind_shipyard()
+        self.refresh(host, now=later, settings=self.held_settings(self.HOLD, later))
+        self.assertTrue(any("fleet-update" in call for call in host.calls))
+
+    def test_the_documented_permanent_opt_out_says_hold_until_never(self) -> None:
+        doc = tf.__doc__ or ""
+        block = doc[doc.index("[tools.pulp]"):doc.index("[tools.pulp]") + 200]
+        self.assertIn('hold_until = "never"', block)
 
     def test_a_hold_on_a_tool_that_is_off_by_default_is_not_a_hold(self) -> None:
         settings_ = self.held_settings("[tools.tart]\nauto_apply = false\n", NOW - 30 * 24 * HOUR)
