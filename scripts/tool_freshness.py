@@ -40,12 +40,23 @@ Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
 
     stale_hours = 12
     host_class = "studio"         # default: the installed fleet profile's host.id
+    hold_max_hours = 168          # how long an auto_apply = false hold lasts (default 7 days)
     [tools.shipyard]
     auto_apply = false            # stop automatic Shipyard updates here
+    hold_until = "2026-11-10T00:00:00Z"   # optional: when this hold lifts; "never" keeps it
     [tools.pulp]
     auto_apply = false            # measure the pulp CLI but never install it here
     local_archive_dir = "{home}/pulp-archives"   # optional <tag>/pulp-<platform>.tar.gz,
                                   # used only when its sha256 matches the release
+
+A settings file that turns `auto_apply` off for a tool that applies by default
+is a HOLD, and a hold expires: at `hold_until` when given, otherwise
+`hold_max_hours` after the settings file was last written. `hold_until =
+"never"` keeps an intentional opt-out. While a hold is in force a behind tool
+says so (`HELD: ...` on its line, and the held file in the stale problem), so a
+hold left behind by a rollout session can neither silently pin a host to an old
+release nor outlive its reason: the Shipyard hold written for a failed canary
+on 2026-10-23 kept m1, m3 and m5s on old releases, unnoticed, for 16 days.
 
 `{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
@@ -90,6 +101,7 @@ except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
 STALE_HOURS = 12.0
 APPLY_AFTER_MINUTES = 30.0
 APPLY_RETRY_HOURS = 6.0
+HOLD_MAX_HOURS = 168.0
 REFRESH_INTERVAL_S = 1800
 COMMAND_TIMEOUT_S = 30
 APPLY_TIMEOUT_S = 300
@@ -268,7 +280,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
     """Defaults merged with ~/.config/tartci/tool-freshness.toml when present."""
     settings: dict[str, Any] = {
         "stale_hours": STALE_HOURS, "apply_after_minutes": APPLY_AFTER_MINUTES,
-        "apply_retry_hours": APPLY_RETRY_HOURS,
+        "apply_retry_hours": APPLY_RETRY_HOURS, "hold_max_hours": HOLD_MAX_HOURS,
         "tools": {name: dict(tool, enabled=True) for name, tool in DEFAULT_TOOLS.items()},
     }
     path = path or home / ".config" / "tartci" / "tool-freshness.toml"
@@ -276,7 +288,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
         for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours",
-                    "not_ready_alert_hours"):
+                    "not_ready_alert_hours", "hold_max_hours"):
             if key in data:
                 settings[key] = float(data[key])
         if isinstance(data.get("host_class"), str):
@@ -284,8 +296,49 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         for name, override in (data.get("tools") or {}).items():
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
+            default_on = bool(settings["tools"][name].get("auto_apply"))
             settings["tools"][name].update(override)
+            if default_on and override.get("auto_apply") is False:
+                try:
+                    written = path.stat().st_mtime
+                except OSError:
+                    written = None
+                settings["tools"][name]["hold"] = {"file": str(path), "written": written}
     return settings
+
+
+def resolve_hold(tool: dict, now: float, settings: dict) -> tuple[bool, str | None]:
+    """(whether a settings-file hold still blocks applying, how to describe it).
+
+    Never raises: an unreadable `hold_until` or file time falls back to the
+    default expiry, so a malformed hold lifts rather than pinning the host.
+    """
+    hold = tool.get("hold")
+    if not isinstance(hold, dict):
+        return False, None
+    where = hold.get("file") or "tool-freshness.toml"
+    raw = tool.get("hold_until")
+    if isinstance(raw, str) and raw.strip().lower() == "never":
+        return True, f"HELD: auto_apply = false in {where} (hold_until = never)"
+    until = None
+    if isinstance(raw, (dt.datetime, dt.date)):
+        if not isinstance(raw, dt.datetime):
+            raw = dt.datetime(raw.year, raw.month, raw.day)
+        if raw.tzinfo is None:
+            raw = raw.replace(tzinfo=dt.timezone.utc)
+        until = raw.timestamp()
+    elif isinstance(raw, str):
+        until = _epoch(raw.strip())
+    if until is None:
+        try:
+            max_hours = float(settings.get("hold_max_hours", HOLD_MAX_HOURS))
+        except (TypeError, ValueError):
+            max_hours = HOLD_MAX_HOURS
+        written = hold.get("written")
+        until = (float(written) if isinstance(written, (int, float)) else now) + max_hours * 3600
+    if now >= until:
+        return False, f"hold in {where} expired {_iso(until)}"
+    return True, f"HELD: auto_apply = false in {where} until {_iso(until)}"
 
 
 def _expand(argv: list[str] | None, home: Path, tag: str = "",
@@ -661,8 +714,16 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     replaces the release check in tests ({"platform", "result"}).
     """
     pending = {} if pending is None else pending
-    if row.get("state") != "behind" or not tool.get("auto_apply") or not tool.get("apply_command"):
+    if row.get("state") != "behind" or not tool.get("apply_command"):
         return None
+    held, hold_note = resolve_hold(tool, now, settings)
+    if held:
+        row["apply"] = row["held"] = hold_note
+        return None
+    if not tool.get("auto_apply") and hold_note is None:
+        return None
+    if hold_note:
+        row["hold_expired"] = hold_note
     candidate, waiting = soaked_candidate(row, now, float(settings["apply_after_minutes"]))
     if candidate is None:
         row["apply"] = waiting
@@ -809,6 +870,7 @@ def summary(home: Path | None = None) -> dict:
                                 "launchd watchdog (tartci launchd heal)")
     problems = [f"tool freshness {aged}"] if aged else []
     problems += [f"{row['tool']} {row['behind_hours']:g} h behind {row['latest_tag']}"
+                 + (f" ({row['held']})" if row.get("held") else "")
                  for row in rows if row.get("stale")]
     problems += [f"{row['tool']} freshness unknown" for row in rows
                  if row.get("state") == "unknown"]
