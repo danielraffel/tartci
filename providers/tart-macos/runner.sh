@@ -91,6 +91,14 @@
 # CRITICAL by default; TARTCI_HOST_VITALS_YIELD_ON_WARN=1 also drains on WARN.
 # `--print-host-health` reports the yield decision (0 boot / 1 yield) as a safe
 # preflight, mirroring `--print-priority-demand`.
+# Claim delay (opt-in): TARTCI_CLAIM_DELAY_SECONDS=N (N>0) makes a slower host
+# prefer a faster one. Once this lane would claim a slot for queued work it
+# sleeps N seconds, then re-runs its own queue scan ONCE; if the work is gone (a
+# faster host took it) it backs off, otherwise it claims. One scan per claim
+# attempt, none while the delay is 0. Unset/0 = byte-for-byte today's behavior.
+# A failed re-scan fails OPEN (claim), so the delay can never wedge a gate.
+# The host VM cap is untouched. `--print-claim-delay` runs the gate and prints
+# `claim` or `backoff` as a safe preflight.
 set -euo pipefail
 
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -204,6 +212,11 @@ YIELD_MAX_WAIT="${TARTCI_YIELD_MAX_WAIT_SECONDS:-0}"
 case "$YIELD_MAX_WAIT" in
   ''|*[!0-9]*) printf 'invalid TARTCI_YIELD_MAX_WAIT_SECONDS: %s\n' "$YIELD_MAX_WAIT" >&2; exit 1 ;;
 esac
+# Claim delay (opt-in; see header). 0 = off.
+CLAIM_DELAY="${TARTCI_CLAIM_DELAY_SECONDS:-0}"
+case "$CLAIM_DELAY" in
+  ''|*[!0-9]*) printf 'invalid TARTCI_CLAIM_DELAY_SECONDS: %s\n' "$CLAIM_DELAY" >&2; exit 1 ;;
+esac
 # Host-health auto-yield (opt-in; see header): the decision lives in the shared
 # providers/common/host-health.lib.sh, reading TARTCI_HOST_VITALS_YIELD[_ON_WARN]
 # / TARTCI_HOST_VITALS_BIN directly. Empty/0 = OFF (no host_vitals call).
@@ -267,6 +280,7 @@ PRINT_FALLBACK_DECISION=""
 PRINT_HIGHER_PRIORITY=""
 PRINT_PRIORITY=0
 PRINT_YIELD_BOUND=0
+PRINT_CLAIM_DELAY=0
 PRINT_HOST_HEALTH=0
 PRINT_STORAGE_HEALTH=0
 PRINT_RUNNER_VERSION=0
@@ -564,6 +578,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-higher-priority-demand) PRINT_HIGHER_PRIORITY="$2"; shift 2;;
   --print-priority-demand) PRINT_PRIORITY=1; shift;;
   --print-yield-bound) PRINT_YIELD_BOUND=1; shift;;
+  --print-claim-delay) PRINT_CLAIM_DELAY=1; shift;;
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-storage-health) PRINT_STORAGE_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
@@ -1164,7 +1179,7 @@ queued_work(){
     local tier_labels q total=0
     while IFS= read -r tier_labels; do
       [ -n "$tier_labels" ] || continue
-      q="$(tier_queued_work "$tier_labels")" || { printf '%s\n' ERR; return 0; }
+      q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")" || { printf '%s\n' ERR; return 0; }
       printf '%s' "$q" | grep -qxE '[0-9]+' || { printf '%s\n' ERR; return 0; }
       total=$((total + q))
     done <<< "$TIER_LABELS_CONFIG"
@@ -1181,6 +1196,7 @@ queued_work(){
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE" \
+    ${SCAN_FORCE_REFRESH:+--force-refresh} \
     --match-labels 1 || echo ERR
 }
 
@@ -1249,7 +1265,7 @@ select_work(){
   fi
   while IFS= read -r tier_labels; do
     [ -n "$tier_labels" ] || continue
-    if ! q="$(tier_queued_work "$tier_labels")"; then
+    if ! q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")"; then
       printf 'ERR|%s|%s\n' "$LABELS" "$tier"
       return 0
     fi
@@ -1264,6 +1280,29 @@ select_work(){
     tier=$((tier + 1))
   done <<< "$TIER_LABELS_CONFIG"
   printf '0|%s|%s\n' "$LABELS" "$tier"
+}
+
+# claim_delay_gate <labels> <tier> — prints `claim` or `backoff`. Off (delay 0):
+# prints `claim` with no sleep and no scan. On: sleeps CLAIM_DELAY seconds, then
+# re-runs the lane's own select_work exactly once. The selection must be the
+# SAME class (labels and tier) the caller chose: a count of 0 means a faster
+# host took the work, and a different class (the original tier drained while a
+# lower one remains) would boot the wrong class, so both back off and the next
+# poll reselects. A scan error claims (fail open).
+claim_delay_gate(){
+  local orig_labels="${1:-}" orig_tier="${2:-0}" selection q labels tier
+  [ "$CLAIM_DELAY" -gt 0 ] || { printf '%s\n' claim; return 0; }
+  sleep "$CLAIM_DELAY"
+  # Bypass the shared queue cache: a cached count predates the delay and could
+  # not show that a faster host took the work.
+  selection="$(SCAN_FORCE_REFRESH=1 select_work)"
+  IFS='|' read -r q labels tier <<< "$selection"
+  if printf '%s' "$q" | grep -qxE '[0-9]+'; then
+    if [ "$q" -eq 0 ] || [ "$labels" != "$orig_labels" ] || [ "$tier" != "$orig_tier" ]; then
+      printf '%s\n' backoff; return 0
+    fi
+  fi
+  printf '%s\n' claim
 }
 
 higher_priority_demand(){
@@ -2958,6 +2997,17 @@ i=0
   yield_bound_reached "$selected_labels"
   exit 0
 }
+[ "$PRINT_CLAIM_DELAY" = 1 ] && {
+  # Preflight: the class selected now is the one the delay must still see.
+  if [ "$CLAIM_DELAY" -gt 0 ]; then
+    selection="$(select_work)"
+    IFS='|' read -r _ selected_labels selected_tier <<< "$selection"
+    claim_delay_gate "$selected_labels" "$selected_tier"
+  else
+    claim_delay_gate
+  fi
+  exit 0
+}
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 [ "$PRINT_STORAGE_HEALTH" = 1 ] && { tartci_storage_health_check "$TART_HOME"; exit $?; }
 trap 'handle_supervisor_signal' INT TERM
@@ -2980,7 +3030,7 @@ source "${BASH_SOURCE[0]%/*}/warm-vm.lib.sh"
 tartci_warm_configure
 
 if [ "$LOOP" = 1 ]; then
-  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} yield_max_wait=${YIELD_MAX_WAIT}s host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
+  note "ephemeral macOS runner LOOP; golden=$GOLDEN labels=$LABELS workflows=$WORKFLOW_DISPLAY tiers=${TIER_LABELS_CONFIG:-<off>} assignment_mode=$ASSIGNMENT_MODE assignment_v2_base=${ASSIGNMENT_V2_BASE_LABELS:-<off>} tier_order=${ASSIGNMENT_V2_TIER_ORDER:-<configured>} cap=$CAP yield_to=${YIELD_WORKFLOW:-<off>} yield_max_wait=${YIELD_MAX_WAIT}s claim_delay=${CLAIM_DELAY}s host_vitals_yield=${TARTCI_HOST_VITALS_YIELD:-<off>}"
   # Scan-blindness self-heal: `queued_work` prints `ERR` (not a count) when the gh queue scan fails.
   # Treating that as 0 silently idles the supervisor while jobs pile up (the observed multi-hour
   # wedge). Count consecutive blind polls; after ~this many seconds of continuous blindness,
@@ -3168,6 +3218,19 @@ if [ "$LOOP" = 1 ]; then
     ws=0
     if [ "${q:-0}" -gt 0 ] && [ -z "$WARM_VM" ] && tartci_warm_sibling_defer; then
       ws=1
+    fi
+    # Claim delay (opt-in): a slower host waits, re-checks once, and backs off
+    # if a faster host took the work. Only when this poll would otherwise claim.
+    if [ "$CLAIM_DELAY" -gt 0 ] && [ "${q:-0}" -gt 0 ] \
+       && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
+       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$r" -lt "$cap" ]; then
+      heartbeat yielding
+      if [ "$(claim_delay_gate "$selected_labels" "$selected_tier")" = backoff ]; then
+        note "claim delay ${CLAIM_DELAY}s: queued work (class $selected_labels) was taken by another host — not claiming"
+        event claim_delay_backoff "delay=${CLAIM_DELAY}s labels=$selected_labels"
+        sleep "$POLL"
+        continue
+      fi
     fi
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
