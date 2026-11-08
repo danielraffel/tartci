@@ -188,6 +188,68 @@ class GateTests(Fixture):
         self.assertEqual(report["kept"], {"unpushed": 1})
         self.assertTrue(wt.exists())
 
+    def _push_from_elsewhere(self, ref: str, message: str) -> str:
+        """Publish a new commit to origin from a second clone; return its sha."""
+        other = self.base / "other"
+        if not other.exists():
+            subprocess.run(["git", "clone", "-q", str(self.origin), str(other)], check=True)
+        (other / "a.txt").write_text(message + "\n")
+        git(other, "commit", "-qam", message)
+        git(other, "push", "-q", "origin", f"HEAD:{ref}")
+        return git(other, "rev-parse", "HEAD").strip()
+
+    def test_a_worktree_merged_upstream_is_reclaimed_despite_stale_tracking_refs(self) -> None:
+        wt = self.worktree("merged-stale")
+        sha = self._push_from_elsewhere("main", "merged")
+        # The worktree's checkout of that commit exists locally but the parent
+        # never fetched, so only origin can say it was published.
+        git(self.parent, "fetch", "-q", str(self.base / "other"), "HEAD")
+        git(wt, "checkout", "-q", "--detach", sha)
+        age(wt, 3)
+        self.assertEqual(git(wt, "rev-list", "-1", "HEAD", "--not", "--remotes").strip(), sha)
+        report = self.scan()
+        self.assertEqual(report["removed"], 1, report)
+        self.assertFalse(wt.exists())
+
+    def test_a_worktree_on_a_pull_ref_only_is_reclaimed(self) -> None:
+        wt = self.worktree("pr-only")
+        sha = self._push_from_elsewhere("refs/pull/7/head", "pr work")
+        git(self.parent, "fetch", "-q", str(self.base / "other"), "HEAD")
+        git(wt, "checkout", "-q", "--detach", sha)
+        age(wt, 3)
+        report = self.scan()
+        self.assertEqual(report["removed"], 1, report)
+
+    def test_a_commit_origin_has_never_seen_is_still_kept(self) -> None:
+        wt = self.worktree("local-only")
+        (wt / "a.txt").write_text("mine\n")
+        git(wt, "commit", "-qam", "local only")
+        self._push_from_elsewhere("main", "someone else")
+        age(wt, 3)
+        report = self.scan()
+        self.assertEqual(report["kept"], {"unpushed": 1})
+        self.assertTrue(wt.exists())
+
+    def test_an_unreachable_origin_keeps_the_checkout(self) -> None:
+        wt = self.worktree("offline")
+        (wt / "a.txt").write_text("mine\n")
+        git(wt, "commit", "-qam", "local only")
+        age(wt, 3)
+        git(self.parent, "remote", "set-url", "origin", str(self.base / "gone.git"))
+        report = self.scan()
+        self.assertEqual(report["kept"], {"unpushed": 1})
+        self.assertTrue(wt.exists())
+
+    def test_a_dirty_worktree_on_published_work_is_kept(self) -> None:
+        wt = self.worktree("dirty-published")
+        sha = self._push_from_elsewhere("main", "merged")
+        git(self.parent, "fetch", "-q", str(self.base / "other"), "HEAD")
+        git(wt, "checkout", "-q", "--detach", sha)
+        (wt / "scratch.txt").write_text("x")
+        age(wt, 3)
+        report = self.scan()
+        self.assertEqual(report["kept"], {"dirty": 1})
+
     def test_remove_never_forces_a_worktree(self) -> None:
         # The gates above stop a dirty worktree first; remove() must still not
         # override git if it is ever reached with one.

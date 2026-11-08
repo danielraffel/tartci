@@ -13,7 +13,9 @@ A checkout directly under the scan root is removed only when every gate holds:
   * it has been idle for `tmp_checkout_idle_hours` (default 48): the newest
     mtime of the directory, its top-level entries, and its git index/HEAD;
   * `git status --porcelain` is empty (untracked files count as dirty);
-  * HEAD is reachable from a remote-tracking ref, and for a plain clone so is
+  * HEAD is reachable from a remote-tracking ref (or, when those are stale,
+    `git fetch origin main` makes it so, or `git ls-remote origin` advertises its
+    exact SHA, pull refs included; any failure keeps it), and for a plain clone so is
     every local branch, and the clone has no stash;
   * a worktree is removed with `git worktree remove` WITHOUT --force, so git's
     own refusals (submodules, locks, dirt) stand and are reported;
@@ -271,6 +273,38 @@ def newest_mtime(checkout: pathlib.Path, gitdir: pathlib.Path) -> float | None:
     return newest
 
 
+def head_is_on_origin(checkout: pathlib.Path, runner: Runner) -> bool:
+    """True only when origin itself proves HEAD is published.
+
+    The local remote-tracking refs go stale on a host that never fetches, so a
+    worktree whose branch merged long ago looks unpushed. Two read-mostly
+    checks settle it, and any failure or doubt answers False (keep):
+
+      * `git fetch origin main`, then HEAD is reachable from a remote-tracking
+        ref (an ancestor of origin/main, or still on a fetched branch);
+      * `git ls-remote origin` advertises HEAD's exact SHA on some ref (a
+        pushed branch whose tracking ref was never fetched, or refs/pull/N/head).
+
+    Work that exists only in this checkout appears in neither, so it stays.
+    A timeout propagates to the caller, which keeps the checkout.
+    """
+    sha = _git(checkout, "rev-parse", "HEAD", runner=runner)
+    if sha.returncode != 0 or not sha.stdout.strip():
+        return False
+    # Without --no-optional-locks: fetch only touches the shared object store
+    # and refs, never this checkout's index/HEAD, so the idle gate is unaffected.
+    fetched = _git(checkout, "fetch", "-q", "origin", "main", runner=runner)
+    if fetched.returncode == 0:
+        again = _git(checkout, "rev-list", "-1", "HEAD", "--not", "--remotes", runner=runner)
+        if again.returncode == 0 and not again.stdout.strip():
+            return True
+    listed = _git(checkout, "ls-remote", "origin", runner=runner)
+    if listed.returncode != 0:
+        return False
+    target = sha.stdout.strip()
+    return any(line.split("\t", 1)[0] == target for line in listed.stdout.splitlines())
+
+
 def unpushed_reason(checkout: pathlib.Path, kind: str, runner: Runner) -> str | None:
     """Why this checkout still holds work the remotes do not, or None.
 
@@ -285,7 +319,7 @@ def unpushed_reason(checkout: pathlib.Path, kind: str, runner: Runner) -> str | 
     head = _git(checkout, "rev-list", "-1", "HEAD", "--not", "--remotes", runner=runner)
     if head.returncode != 0:
         return "git_error"
-    if head.stdout.strip():
+    if head.stdout.strip() and not head_is_on_origin(checkout, runner):
         return "unpushed"
     if kind == "clone":
         # A worktree's other branches and stash live in its parent repository,
