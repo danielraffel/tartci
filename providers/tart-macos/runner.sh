@@ -1179,7 +1179,7 @@ queued_work(){
     local tier_labels q total=0
     while IFS= read -r tier_labels; do
       [ -n "$tier_labels" ] || continue
-      q="$(tier_queued_work "$tier_labels")" || { printf '%s\n' ERR; return 0; }
+      q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")" || { printf '%s\n' ERR; return 0; }
       printf '%s' "$q" | grep -qxE '[0-9]+' || { printf '%s\n' ERR; return 0; }
       total=$((total + q))
     done <<< "$TIER_LABELS_CONFIG"
@@ -1196,6 +1196,7 @@ queued_work(){
     --shared-cache-file "${TARTCI_SHARED_QUEUE_CACHE:-$HOME/.tartci/state/queue-discovery.json}" \
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE" \
+    ${SCAN_FORCE_REFRESH:+--force-refresh} \
     --match-labels 1 || echo ERR
 }
 
@@ -1264,7 +1265,7 @@ select_work(){
   fi
   while IFS= read -r tier_labels; do
     [ -n "$tier_labels" ] || continue
-    if ! q="$(tier_queued_work "$tier_labels")"; then
+    if ! q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")"; then
       printf 'ERR|%s|%s\n' "$LABELS" "$tier"
       return 0
     fi
@@ -1281,17 +1282,27 @@ select_work(){
   printf '0|%s|%s\n' "$LABELS" "$tier"
 }
 
-# claim_delay_gate — prints `claim` or `backoff`. Off (delay 0): prints `claim`
-# with no sleep and no scan. On: sleeps CLAIM_DELAY seconds, then re-runs the
-# lane's own select_work exactly once; a count of 0 means a faster host took the
-# work (`backoff`). A scan error or any other count claims (fail open).
+# claim_delay_gate <labels> <tier> — prints `claim` or `backoff`. Off (delay 0):
+# prints `claim` with no sleep and no scan. On: sleeps CLAIM_DELAY seconds, then
+# re-runs the lane's own select_work exactly once. The selection must be the
+# SAME class (labels and tier) the caller chose: a count of 0 means a faster
+# host took the work, and a different class (the original tier drained while a
+# lower one remains) would boot the wrong class, so both back off and the next
+# poll reselects. A scan error claims (fail open).
 claim_delay_gate(){
-  local selection q
+  local orig_labels="${1:-}" orig_tier="${2:-0}" selection q labels tier
   [ "$CLAIM_DELAY" -gt 0 ] || { printf '%s\n' claim; return 0; }
   sleep "$CLAIM_DELAY"
-  selection="$(select_work)"
-  IFS='|' read -r q _ <<< "$selection"
-  if [ "$q" = 0 ]; then printf '%s\n' backoff; else printf '%s\n' claim; fi
+  # Bypass the shared queue cache: a cached count predates the delay and could
+  # not show that a faster host took the work.
+  selection="$(SCAN_FORCE_REFRESH=1 select_work)"
+  IFS='|' read -r q labels tier <<< "$selection"
+  if printf '%s' "$q" | grep -qxE '[0-9]+'; then
+    if [ "$q" -eq 0 ] || [ "$labels" != "$orig_labels" ] || [ "$tier" != "$orig_tier" ]; then
+      printf '%s\n' backoff; return 0
+    fi
+  fi
+  printf '%s\n' claim
 }
 
 higher_priority_demand(){
@@ -2986,7 +2997,17 @@ i=0
   yield_bound_reached "$selected_labels"
   exit 0
 }
-[ "$PRINT_CLAIM_DELAY" = 1 ] && { claim_delay_gate; exit 0; }
+[ "$PRINT_CLAIM_DELAY" = 1 ] && {
+  # Preflight: the class selected now is the one the delay must still see.
+  if [ "$CLAIM_DELAY" -gt 0 ]; then
+    selection="$(select_work)"
+    IFS='|' read -r _ selected_labels selected_tier <<< "$selection"
+    claim_delay_gate "$selected_labels" "$selected_tier"
+  else
+    claim_delay_gate
+  fi
+  exit 0
+}
 [ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
 [ "$PRINT_STORAGE_HEALTH" = 1 ] && { tartci_storage_health_check "$TART_HOME"; exit $?; }
 trap 'handle_supervisor_signal' INT TERM
@@ -3204,7 +3225,7 @@ if [ "$LOOP" = 1 ]; then
        && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
        && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$r" -lt "$cap" ]; then
       heartbeat yielding
-      if [ "$(claim_delay_gate)" = backoff ]; then
+      if [ "$(claim_delay_gate "$selected_labels" "$selected_tier")" = backoff ]; then
         note "claim delay ${CLAIM_DELAY}s: queued work (class $selected_labels) was taken by another host — not claiming"
         event claim_delay_backoff "delay=${CLAIM_DELAY}s labels=$selected_labels"
         sleep "$POLL"

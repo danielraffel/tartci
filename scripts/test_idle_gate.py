@@ -312,7 +312,8 @@ class ClaimDelayTests(unittest.TestCase):
 
     LABELS = "self-hosted,macOS,ARM64,pulp-build-vm-release"
 
-    def _run(self, *, delay, taken_during_sleep=False, gh_fails_after_sleep=False):
+    def _run(self, *, delay, taken_during_sleep=False, gh_fails_after_sleep=False,
+             tier_drains_during_sleep=False):
         import json
         import stat
         import tempfile
@@ -324,6 +325,11 @@ class ClaimDelayTests(unittest.TestCase):
             "id": 201, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
             "labels": self.LABELS.split(",") + ["pulp-release-tagged"],
         }]}
+        run2 = dict(run, id=102, name="Release-path PR gate")
+        jobs2 = {"jobs": [{
+            "id": 202, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
+            "labels": self.LABELS.split(",") + ["pulp-release-pr-gate"],
+        }]}
         tmp = Path(tempfile.mkdtemp())
         self.tmp = tmp
         gh = f"""#!/usr/bin/env bash
@@ -333,9 +339,13 @@ case "$*" in
   *rate_limit*) printf '%s\\n' '{{"resources":{{"core":{{"limit":15000,"remaining":14999}}}}}}' ;;
   *actions/workflows?per_page=100*) printf '%s\\n' '{json.dumps({"workflows": [{"id": 77, "name": "Release CLI"}, {"id": 78, "name": "Release-path PR gate"}]})}' ;;
   *actions/workflows/77/runs*status=queued*)
-    if [ -e "{tmp}/taken" ]; then printf '%s\\n' '{{"workflow_runs":[]}}'
+    if [ -e "{tmp}/taken" ] || [ -e "{tmp}/tier0gone" ]; then printf '%s\\n' '{{"workflow_runs":[]}}'
     else printf '%s\\n' '{json.dumps({"workflow_runs": [run]})}'; fi ;;
+  *actions/workflows/78/runs*status=queued*)
+    if [ -e "{tmp}/tier0gone" ]; then printf '%s\\n' '{json.dumps({"workflow_runs": [run2]})}'
+    else printf '%s\\n' '{{"workflow_runs":[]}}'; fi ;;
   *actions/workflows/*/runs*) printf '%s\\n' '{{"workflow_runs":[]}}' ;;
+  *actions/runs/102/jobs*) printf '%s\\n' '{json.dumps(jobs2)}' ;;
   *actions/runs/101/jobs*) printf '%s\\n' '{json.dumps(jobs)}' ;;
   *) exit 1 ;;
 esac
@@ -344,6 +354,7 @@ esac
 printf '%s\\n' "$*" >>"{tmp}/sleep.log"
 {f': >"{tmp}/taken"' if taken_during_sleep else ':'}
 {f': >"{tmp}/fail"' if gh_fails_after_sleep else ':'}
+{f': >"{tmp}/tier0gone"' if tier_drains_during_sleep else ':'}
 """
         for name, body in (("tart", "#!/usr/bin/env bash\nexit 0\n"),
                            ("stubgh", gh), ("sleep", sleep)):
@@ -399,15 +410,24 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
         self.assertEqual(r.stdout.strip(), "claim")
         self.assertEqual(self._sleeps(), ["15"])
         # Control: the fixture really serves the queued job, and the delay
-        # costs exactly one queue read, not one per second or per poll.
-        self.assertEqual(self._queued_reads(), 1)
+        # costs exactly one queue read beyond the preflight's own
+        # selection, not one per second or per poll.
+        self.assertEqual(self._queued_reads(), 2)
 
     def test_job_taken_during_the_delay_means_no_claim(self) -> None:
         r = self._run(delay="15", taken_during_sleep=True)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "backoff")
         self.assertEqual(self._sleeps(), ["15"])
-        self.assertEqual(self._queued_reads(), 1)
+        self.assertEqual(self._queued_reads(), 2)
+
+    def test_original_tier_drained_while_lower_tier_remains_means_no_claim(self) -> None:
+        # The refreshed count is positive, but for a different class than the
+        # one the caller selected; claiming would boot the wrong class.
+        r = self._run(delay="15", tier_drains_during_sleep=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "backoff")
+        self.assertEqual(self._sleeps(), ["15"])
 
     def test_a_failed_recheck_fails_open(self) -> None:
         r = self._run(delay="15", gh_fails_after_sleep=True)
@@ -425,7 +445,7 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
         body = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('if [ "$CLAIM_DELAY" -gt 0 ] && [ "${q:-0}" -gt 0 ]', body)
         self.assertIn('[ "$r" -lt "$cap" ]', body)
-        self.assertLess(body.index('"$(claim_delay_gate)" = backoff'),
+        self.assertLess(body.index('"$(claim_delay_gate "$selected_labels" "$selected_tier")" = backoff'),
                         body.index("# Idle gate: boot only when (1)"))
 
 
