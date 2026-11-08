@@ -107,6 +107,8 @@ IDLE_PHASES = frozenset({
     "waiting", "loop", "yielding", "draining", "stopped",
     "scan_blind", "scan_blind_escalated", "jit-admission-denied",
     "github-rate-limited", "vm-lease-denied", "admission-precheck-deferred", "admission-precheck-error",
+    # No VM exists while the pinned Actions Runner retirement backoff runs.
+    "runner-version-deprecated",
     "yielded-storage-health",
     # Before the lease: no VM exists yet. The clone that follows is covered
     # by the VM lease and the `tart clone` descendant.

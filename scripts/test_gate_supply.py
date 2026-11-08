@@ -62,6 +62,7 @@ class ClassifyAndFitTests(unittest.TestCase):
             "booting": "in_flight", "minting-jit": "in_flight", "idle-wait": "in_flight",
             "job-running": "blocked", "vm-lease-denied": "blocked", "scan_blind": "blocked",
             "draining": "blocked", "yielded-storage-health": "blocked",
+            "runner-version-deprecated": "blocked",
             "yielded_storage_health": "blocked", "something-new": "unknown",
         }
         for phase, expected in cases.items():
