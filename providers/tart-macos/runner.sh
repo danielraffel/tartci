@@ -802,6 +802,27 @@ clear_github_rate_limited(){
   rm -f "$GITHUB_RATE_LIMIT_FILE"
 }
 
+# A retired Actions Runner makes every minted listener exit at start. Record it
+# against the pinned version so the lane backs off instead of booting a fresh
+# VM per second; bumping the pin ends the backoff at once.
+RUNNER_VERSION_DEPRECATED_FILE="$STATE_DIR/runner-version-deprecated"
+runner_version_note_deprecated(){
+  local runner_log="$1" secs="${TARTCI_RUNNER_DEPRECATED_BACKOFF_SECS:-900}"
+  grep -qE 'Runner version v?[0-9.]+ is deprecated and cannot receive messages' "$runner_log" 2>/dev/null || return 0
+  printf 'until=%s\nrequired=%s\n' "$(( $(now_epoch) + secs ))" "$RUNNER_VERSION" >"$RUNNER_VERSION_DEPRECATED_FILE" 2>/dev/null || true
+  event runner_version_deprecated "pinned runner v$RUNNER_VERSION is deprecated and cannot receive messages; backing off ${secs}s" "required=$RUNNER_VERSION" "backoff_secs=$secs"
+}
+# 0 while a recorded retirement backoff applies to the CURRENT pin.
+runner_version_backoff_active(){
+  local until_s req
+  until_s="$(sed -n 's/^until=//p' "$RUNNER_VERSION_DEPRECATED_FILE" 2>/dev/null | head -n 1)"
+  req="$(sed -n 's/^required=//p' "$RUNNER_VERSION_DEPRECATED_FILE" 2>/dev/null | head -n 1)"
+  case "$until_s" in ''|*[!0-9]*) return 1;; esac
+  [ "$req" = "$RUNNER_VERSION" ] || return 1
+  RUNNER_VERSION_BACKOFF_REMAINING=$((until_s - $(now_epoch)))
+  [ "$RUNNER_VERSION_BACKOFF_REMAINING" -gt 0 ]
+}
+
 # -- Scan diagnostics -------------------------------------------------------
 # A queue/assignment scanner reports WHY it failed on stderr; its stdout is only
 # a count. Discarding that stderr leaves the supervisor able to report that it is
@@ -2117,6 +2138,7 @@ run_runner_until_done_unlayered(){
     sleep 5
   done
   wait "$ssh_pid" || rc=$?
+  [ "$rc" = 0 ] || [ "$assigned" = 1 ] || runner_version_note_deprecated "$runner_log"
   finalize_listener_receipt "$rc" "$assigned" "$runner_log"
   sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
   return "$rc"
@@ -2478,6 +2500,11 @@ run_one(){
   if github_rate_limit_backoff_active; then
     note "[$i] GitHub rate limit backoff — no VM will boot for another ${GITHUB_RATE_LIMIT_REMAINING}s; inspect $GITHUB_RATE_LIMIT_FILE"
     heartbeat github-rate-limited
+    return 75
+  fi
+  if runner_version_backoff_active; then
+    note "[$i] pinned Actions Runner v$RUNNER_VERSION is deprecated — no VM will boot for another ${RUNNER_VERSION_BACKOFF_REMAINING}s; bump DEFAULT_RUNNER_VERSION or set TARTCI_RUNNER_VERSION"
+    heartbeat runner-version-deprecated
     return 75
   fi
   if ! tartci_pool_lock_absent; then
