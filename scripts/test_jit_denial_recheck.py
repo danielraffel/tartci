@@ -264,6 +264,55 @@ class JitDenialRecheck(unittest.TestCase):
         self.drive(f"record_github_rate_limited {err}")
         self.assertEqual(self.rate_state()["backoff_secs"], "600")
 
+    def test_successful_access_keeps_mint_backoff_until_mint_succeeds(self) -> None:
+        """Run the provider's mint block through repeated access/mint attempts.
+
+        Access proofs succeed, the first three JIT mints hit a rate limit, and
+        the fourth mint succeeds.  The production block must leave the shared
+        backoff untouched across those successful access proofs, then clear it
+        only after the successful mint.
+        """
+        fake = self.tmp / "fake-gh"
+        count = self.tmp / "mint-count"
+        fake.write_text(
+            "#!/bin/sh\n"
+            f"n=$(cat {count} 2>/dev/null || echo 0); n=$((n + 1)); echo $n >{count}\n"
+            "case $n in 1|2|3) echo 'API rate limit exceeded (HTTP 403)' >&2; exit 1;; esac\n"
+            "echo encoded-jit\n"
+        )
+        fake.chmod(0o755)
+        src = RUNNER.read_text()
+        start = src.index("  event mint_jit")
+        end = src.index('  note "[$i] vm', start)
+        mint_block = src[start:end]
+        script = f'''\
+mint_once() {{
+{mint_block}
+}}
+access_success() {{ ! tartci_repository_access_denied 0 /dev/null; }}
+i=1; vm=vm-1; ip=127.0.0.1; selected_labels=macOS; selected_tier=1
+selected_group_id=8; selected_runner_api_root=https://example.test
+label_args=(); ASSIGNMENT_MODE=legacy; CURRENT_REGISTERED_RUNNER=""
+ASSIGNMENT_V2_IDLE_RETARGET_SECS=0; IDLE_TIMEOUT=900; JOB_TIMEOUT=1
+tartci_lifecycle_mark() {{ :; }}
+tartci_pool_lock_release() {{ :; }}
+clear_jit_admission_denied() {{ :; }}
+cleanup() {{ :; }}
+for expected in 120 240 480; do
+  access_success || exit 70
+  mint_once || :
+  actual="$(sed -n 's/^backoff_secs=//p' "$GITHUB_RATE_LIMIT_FILE")"
+  [ "$actual" = "$expected" ] || exit 71
+  echo "BACKOFF=$actual"
+done
+access_success || exit 70
+mint_once
+if [ -e "$GITHUB_RATE_LIMIT_FILE" ]; then echo STALE; else echo RESET; fi
+'''
+        r = self.drive(script, env=f"JIT_GH_CLI={fake}")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.splitlines(), ["BACKOFF=120", "BACKOFF=240", "BACKOFF=480", "RESET"], r.stderr)
+
     def test_provider_never_latches_a_rate_limit(self) -> None:
         src = RUNNER.read_text()
         access = src[src.index('if tartci_repository_access_denied "$access_rc" "$access_error"; then'):]
@@ -277,7 +326,10 @@ class JitDenialRecheck(unittest.TestCase):
         self.assertIn("elif tartci_github_auth_rejected", mint)
         self.assertNotIn("grep -Eq 'HTTP (401|403|404)", mint)
         self.assertIn("if github_rate_limit_backoff_active; then", src)
-        self.assertIn('rm -f "$access_error"\n  clear_github_rate_limited', src)
+        access_success = src.index('  rm -f "$access_error"\n')
+        mint_start = src.index('  local jit_error=', access_success)
+        mint_success = src.index('  rm -f "$jit_error"\n  clear_github_rate_limited', mint_start)
+        self.assertNotIn("clear_github_rate_limited", src[access_success:mint_success])
 
 if __name__ == "__main__":
     unittest.main()

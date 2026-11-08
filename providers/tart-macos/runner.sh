@@ -2756,7 +2756,6 @@ run_one(){
     return "$access_rc"
   fi
   rm -f "$access_error"
-  clear_github_rate_limited
 
   heartbeat minting-jit
   if ! tartci_pool_lock_acquire; then
@@ -2806,6 +2805,7 @@ run_one(){
     return 1
   }
   rm -f "$jit_error"
+  clear_github_rate_limited
   clear_jit_admission_denied "$selected_group_id" "$selected_labels"
   if [ -z "$jit" ]; then
     tartci_pool_lock_release
