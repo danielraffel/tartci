@@ -76,6 +76,7 @@ class PhaseTests(unittest.TestCase):
         self.assertGreater(len(phases), 15)
         both = lane_busy.BUSY_PHASES & lane_busy.IDLE_PHASES
         self.assertEqual(both, set())
+        self.assertIn("runner-version-deprecated", lane_busy.IDLE_PHASES)
         self.assertEqual(phases - (lane_busy.BUSY_PHASES | lane_busy.IDLE_PHASES), set())
 
     def test_cloning_heartbeat_precedes_tart_clone(self) -> None:

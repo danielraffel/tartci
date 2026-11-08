@@ -89,6 +89,9 @@ BLOCKED_PHASES = frozenset({
     "scan_blind_escalated", "jit-admission-denied", "vm-lease-denied",
     # runner.sh: backing off a GitHub rate limit; boots no VM until it ends.
     "github-rate-limited",
+    # runner.sh: the pinned Actions Runner is retired; no VM can boot until
+    # the pin changes, so this lane must not advertise free capacity.
+    "runner-version-deprecated",
     "vm-lease-infeasible", "admission-precheck-deferred",
     "admission-precheck-error", "teardown-pending",
     # Tart store liveness is an independent admission axis.  A fresh

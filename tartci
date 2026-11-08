@@ -204,6 +204,20 @@ check_shipyard_auth() {
   fi
 }
 
+# check_runner_version — warn when the pinned Actions Runner trails upstream,
+# PROBLEM when a lane log says it is retired. Read-only and fail-open.
+check_runner_version() {
+  echo "actions runner:"
+  local pinned out
+  pinned="$("$HERE/providers/tart-macos/runner.sh" --print-runner-version 2>/dev/null)" || pinned=""
+  if [ -z "$pinned" ]; then c_warn "pinned runner version unreadable — skipped"; return 0; fi
+  out="$(tartci_verified_python_run "$HERE/scripts/runner_version.py" check --pinned "$pinned" \
+    --state-dir "${TARTCI_STATE_DIR:-$HOME/.tartci/state/macos}" 2>/dev/null)" || {
+    case "$out" in PROBLEM*) c_miss "${out#PROBLEM: }"; return 0;; esac
+    c_warn "runner version check unavailable — skipped"; return 0; }
+  case "$out" in OK*) c_ok "${out#OK: }";; *) c_warn "${out#*: }";; esac
+}
+
 cmd_doctor() {
   tartci_resolve_tart_home
   if [ "${1:-}" = "--reap" ]; then
@@ -272,6 +286,7 @@ cmd_doctor() {
     echo "goldens: $n"; find "$TARTCI_GOLDENS" -maxdepth 1 -name '*.qcow2' 2>/dev/null | sed 's/^/  - /'
   fi
   check_shipyard_auth
+  check_runner_version
   # shellcheck source=providers/common/pool.lib.sh
   . "$HERE/providers/common/pool.lib.sh"
   echo "pool transition lock:"
