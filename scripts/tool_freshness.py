@@ -40,12 +40,29 @@ Settings (optional) live in ~/.config/tartci/tool-freshness.toml:
 
     stale_hours = 12
     host_class = "studio"         # default: the installed fleet profile's host.id
+    hold_max_hours = 168          # how long an auto_apply = false hold lasts (default 7 days)
     [tools.shipyard]
-    auto_apply = false            # stop automatic Shipyard updates here
+    auto_apply = false            # hold automatic Shipyard updates here...
+    held_since = "2026-11-08T12:00:00Z"   # ...from this time, for hold_max_hours
+    # hold_until = "2026-11-10T00:00:00Z" # or until an explicit time
     [tools.pulp]
-    auto_apply = false            # measure the pulp CLI but never install it here
+    auto_apply = false            # never install the pulp CLI here (permanent opt-out)
+    hold_until = "never"
     local_archive_dir = "{home}/pulp-archives"   # optional <tag>/pulp-<platform>.tar.gz,
                                   # used only when its sha256 matches the release
+
+A settings file that turns `auto_apply` off for a tool that applies by default
+is a HOLD, and a hold expires: at `hold_until` when given, otherwise
+`hold_max_hours` after `held_since`. `hold_until = "never"` keeps an
+intentional opt-out. A hold with neither key starts when tool-freshness first
+saw it (state holds.json; on that first sight the settings file's time is
+taken, once, and the line says so), so copying the file or touching it never
+expires or renews a hold. An unreadable `hold_until` or `held_since` keeps the
+hold (a typo never lifts a safety hold) and is reported as a problem. While a hold is in force a behind tool
+says so (`HELD: ...` on its line, and the held file in the stale problem), so a
+hold left behind by a rollout session can neither silently pin a host to an old
+release nor outlive its reason: the Shipyard hold written for a failed canary
+on 2026-10-23 kept m1, m3 and m5s on old releases, unnoticed, for 16 days.
 
 `{home}`, `{tag}` and `{host_class}` are substituted in commands. A tool whose binary is
 absent is `not_installed`, which is reported but is never a problem.
@@ -90,6 +107,7 @@ except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
 STALE_HOURS = 12.0
 APPLY_AFTER_MINUTES = 30.0
 APPLY_RETRY_HOURS = 6.0
+HOLD_MAX_HOURS = 168.0
 REFRESH_INTERVAL_S = 1800
 COMMAND_TIMEOUT_S = 30
 APPLY_TIMEOUT_S = 300
@@ -268,7 +286,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
     """Defaults merged with ~/.config/tartci/tool-freshness.toml when present."""
     settings: dict[str, Any] = {
         "stale_hours": STALE_HOURS, "apply_after_minutes": APPLY_AFTER_MINUTES,
-        "apply_retry_hours": APPLY_RETRY_HOURS,
+        "apply_retry_hours": APPLY_RETRY_HOURS, "hold_max_hours": HOLD_MAX_HOURS,
         "tools": {name: dict(tool, enabled=True) for name, tool in DEFAULT_TOOLS.items()},
     }
     path = path or home / ".config" / "tartci" / "tool-freshness.toml"
@@ -276,7 +294,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
         for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours",
-                    "not_ready_alert_hours"):
+                    "not_ready_alert_hours", "hold_max_hours"):
             if key in data:
                 settings[key] = float(data[key])
         if isinstance(data.get("host_class"), str):
@@ -284,9 +302,110 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         for name, override in (data.get("tools") or {}).items():
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
+            default_on = bool(settings["tools"][name].get("auto_apply"))
             settings["tools"][name].update(override)
+            if default_on and override.get("auto_apply") is False:
+                try:
+                    written = path.stat().st_mtime
+                except OSError:
+                    written = None
+                settings["tools"][name]["hold"] = {"file": str(path), "written": written}
     return settings
 
+
+def _hold_time(raw: Any) -> float | None:
+    """Epoch for a TOML datetime/date or an ISO string; None when unreadable."""
+    if isinstance(raw, (dt.datetime, dt.date)):
+        if not isinstance(raw, dt.datetime):
+            raw = dt.datetime(raw.year, raw.month, raw.day)
+        if raw.tzinfo is None:
+            raw = raw.replace(tzinfo=dt.timezone.utc)
+        return raw.timestamp()
+    if isinstance(raw, str):
+        text = raw.strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+            text += "T00:00:00"
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]00:?00)?", text):
+            return None
+        return _epoch(text)
+    return None
+
+
+def _clear_seen_hold(name: str, state: Path | None) -> None:
+    """Forget a cached bare-hold start when that hold is no longer bare."""
+    if state is None:
+        return
+    path = state / "holds.json"
+    seen = _read_json(path)
+    if not isinstance(seen, dict) or name not in seen:
+        return
+    del seen[name]
+    try:
+        _write_json(path, seen)
+    except OSError:
+        pass
+
+
+def resolve_hold(name: str, tool: dict, now: float, settings: dict,
+                 state: Path | None = None) -> tuple[bool, str | None, str | None]:
+    """(whether a settings-file hold blocks applying, its note, a problem).
+
+    Fails closed: an unreadable `hold_until` or `held_since` keeps the hold and
+    returns a problem, so a typo never lifts a safety hold. Without either key
+    the start is the first time this host saw the hold (recorded in
+    holds.json), taken once from the settings file's time, so copying or
+    touching the file neither expires nor renews it.
+    """
+    hold = tool.get("hold")
+    if not isinstance(hold, dict):
+        _clear_seen_hold(name, state)
+        return False, None, None
+    where = hold.get("file") or "tool-freshness.toml"
+    raw = tool.get("hold_until")
+    if raw is not None or tool.get("held_since") is not None:
+        _clear_seen_hold(name, state)
+    if isinstance(raw, str) and raw.strip().lower() == "never":
+        return True, f"HELD: auto_apply = false in {where} (hold_until = never)", None
+    if raw is not None:
+        until = _hold_time(raw)
+        if until is None:
+            problem = (f"{name} hold_until = {raw!r} in {where} is unreadable; "
+                       "the hold is kept until it is fixed")
+            return True, f"HELD: {problem}", problem
+        if now >= until:
+            return False, f"hold in {where} expired {_iso(until)}", None
+        return True, f"HELD: auto_apply = false in {where} until {_iso(until)}", None
+    note = ""
+    since_raw = tool.get("held_since")
+    if since_raw is not None:
+        since = _hold_time(since_raw)
+        if since is None:
+            problem = (f"{name} held_since = {since_raw!r} in {where} is unreadable; "
+                       "the hold is kept until it is fixed")
+            return True, f"HELD: {problem}", problem
+    else:
+        path = (state / "holds.json") if state is not None else None
+        seen = (_read_json(path) or {}) if path is not None else {}
+        entry = seen.get(name) if isinstance(seen.get(name), dict) else None
+        since = _epoch(entry.get("since")) if entry and entry.get("file") == where else None
+        if since is None:
+            written = hold.get("written")
+            since = float(written) if isinstance(written, (int, float)) else now
+            seen[name] = {"file": where, "since": _iso(since), "source": "file_mtime_once"}
+            if path is not None:
+                try:
+                    _write_json(path, seen)
+                except OSError:
+                    pass
+        note = " (no held_since: start taken once from the file's time; set held_since)"
+    try:
+        max_hours = float(settings.get("hold_max_hours", HOLD_MAX_HOURS))
+    except (TypeError, ValueError):
+        max_hours = HOLD_MAX_HOURS
+    until = since + max_hours * 3600
+    if now >= until:
+        return False, f"hold in {where} expired {_iso(until)}{note}", None
+    return True, f"HELD: auto_apply = false in {where} until {_iso(until)}{note}", None
 
 def _expand(argv: list[str] | None, home: Path, tag: str = "",
             host_class: str = "", platform: str = "", local_archive: str = "") -> list[str] | None:
@@ -661,8 +780,22 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     replaces the release check in tests ({"platform", "result"}).
     """
     pending = {} if pending is None else pending
-    if row.get("state") != "behind" or not tool.get("auto_apply") or not tool.get("apply_command"):
+    if not tool.get("apply_command"):
         return None
+    # Resolved on every pass, behind or not: a malformed hold is a problem even
+    # while the tool is current, and the first sighting is recorded once.
+    held, hold_note, hold_problem = resolve_hold(name, tool, now, settings, state)
+    if hold_problem:
+        row["hold_problem"] = hold_problem
+    if row.get("state") != "behind":
+        return None
+    if held:
+        row["apply"] = row["held"] = hold_note
+        return None
+    if not tool.get("auto_apply") and hold_note is None:
+        return None
+    if hold_note:
+        row["hold_expired"] = hold_note
     candidate, waiting = soaked_candidate(row, now, float(settings["apply_after_minutes"]))
     if candidate is None:
         row["apply"] = waiting
@@ -809,10 +942,12 @@ def summary(home: Path | None = None) -> dict:
                                 "launchd watchdog (tartci launchd heal)")
     problems = [f"tool freshness {aged}"] if aged else []
     problems += [f"{row['tool']} {row['behind_hours']:g} h behind {row['latest_tag']}"
+                 + (f" ({row['held']})" if row.get("held") else "")
                  for row in rows if row.get("stale")]
     problems += [f"{row['tool']} freshness unknown" for row in rows
                  if row.get("state") == "unknown"]
     problems += [row["release_incomplete"] for row in rows if row.get("release_incomplete")]
+    problems += [row["hold_problem"] for row in rows if row.get("hold_problem")]
     lines = [render_row(row) for row in rows]
     if aged:
         lines.append(f"tools: freshness {aged}")

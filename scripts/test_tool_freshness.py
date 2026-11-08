@@ -557,6 +557,147 @@ class ToolFreshnessTests(unittest.TestCase):
         self.refresh(host, settings=off)
         self.assertFalse(any("fleet-update" in call for call in host.calls))
 
+    def held_settings(self, body: str, written: float) -> dict:
+        """Settings loaded from a real tool-freshness.toml written at `written`."""
+        if tf.tomllib is None:
+            self.skipTest("needs tomllib")
+        path = self.home / "tool-freshness.toml"
+        path.write_text(body)
+        os.utime(path, (written, written))
+        value = tf.load_settings(self.home, path)
+        value["host_class"] = "studio"
+        return value
+
+    HOLD = "[tools.shipyard]\n# held: canary failed\nauto_apply = false\n"
+
+    def behind_shipyard(self) -> Host:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+        return host
+
+    def test_a_settings_file_hold_is_named_on_the_line_and_in_the_problem(self) -> None:
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(self.HOLD, NOW - 2 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertTrue(row["apply"].startswith("HELD: auto_apply = false in "), row["apply"])
+        self.assertIn("tool-freshness.toml until " + iso(NOW - 2 * HOUR + 168 * HOUR),
+                      row["apply"])
+        summary = tf.summary(self.home)
+        self.assertIn("shipyard 20 h behind v0.221.1 (HELD: auto_apply = false in ",
+                      summary["problem"])
+        self.assertIn("[HELD: auto_apply = false", "\n".join(summary["lines"]))
+
+    def test_a_hold_older_than_hold_max_hours_lifts_and_the_tool_applies(self) -> None:
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(self.HOLD, NOW - 16 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertIn([str(self.home / ".local/bin/shipyard"), "runner", "fleet-update", "--to",
+                       "v0.221.1", "--host-class", "studio", "--apply", "--json"], host.calls)
+        self.assertEqual(row["state"], "current")
+        self.assertEqual(row["apply"], "applied v0.221.1: ok")
+        self.assertNotIn("HELD", tf.summary(self.home)["problem"] or "")
+
+    def test_hold_max_hours_is_configurable(self) -> None:
+        host = self.behind_shipyard()
+        body = "hold_max_hours = 1\n" + self.HOLD
+        self.refresh(host, settings=self.held_settings(body, NOW - 2 * HOUR))
+        self.assertTrue(any("fleet-update" in call for call in host.calls))
+
+    def test_hold_until_lifts_the_hold_at_that_time_and_never_keeps_it(self) -> None:
+        later = self.HOLD + 'hold_until = "%s"\n' % iso(NOW + HOUR)
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(later, NOW - 30 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("until " + iso(NOW + HOUR), row["apply"])
+        passed = self.HOLD + "hold_until = 2026-01-01T00:00:00Z\n"  # a TOML datetime
+        host = self.behind_shipyard()
+        self.refresh(host, settings=self.held_settings(passed, NOW - HOUR))
+        self.assertTrue(any("fleet-update" in call for call in host.calls))
+        never = self.HOLD + 'hold_until = "never"\n'
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(never, NOW - 365 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("hold_until = never", row["apply"])
+
+    def test_a_malformed_hold_until_keeps_the_hold_and_is_a_problem(self) -> None:
+        host = self.behind_shipyard()
+        body = self.HOLD + 'hold_until = "next tuesday"\n'
+        row = self.refresh(host, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("unreadable", row["apply"])
+        self.assertIn("shipyard hold_until = 'next tuesday'", tf.summary(self.home)["problem"])
+        # Still a problem while the tool is current: the typo must be seen.
+        current = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(current, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))
+        self.assertIn("is unreadable; the hold is kept", tf.summary(self.home)["problem"])
+
+    def test_a_malformed_held_since_keeps_the_hold_and_is_a_problem(self) -> None:
+        host = self.behind_shipyard()
+        body = self.HOLD + 'held_since = "2026-13-45"\n'
+        self.refresh(host, settings=self.held_settings(body, NOW - 30 * 24 * HOUR))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("held_since = '2026-13-45'", tf.summary(self.home)["problem"])
+
+    def test_held_since_sets_the_start_whatever_the_file_time(self) -> None:
+        # cp -p / rsync -a: an old file time on a new hold does not expire it.
+        recent = self.HOLD + 'held_since = "%s"\n' % iso(NOW - HOUR)
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(recent, NOW - 60 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("until " + iso(NOW - HOUR + 168 * HOUR), row["apply"])
+        self.assertNotIn("file's time", row["apply"])
+        # A touched file does not renew an old held_since.
+        old = self.HOLD + "held_since = %s\n" % iso(NOW - 8 * 24 * HOUR)
+        host = self.behind_shipyard()
+        self.refresh(host, settings=self.held_settings(old, NOW))
+        self.assertTrue(any("fleet-update" in call for call in host.calls))
+
+    def test_without_held_since_the_file_time_is_taken_once_and_reported(self) -> None:
+        host = self.behind_shipyard()
+        row = self.refresh(host, settings=self.held_settings(self.HOLD, NOW - 6 * 24 * HOUR))[
+            "tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("start taken once from the file's time; set held_since", row["apply"])
+        recorded = json.loads((self.state / "holds.json").read_text())["shipyard"]
+        self.assertEqual(recorded["since"], iso(NOW - 6 * 24 * HOUR))
+        # Touching the file two days later neither renews nor moves the start.
+        later = NOW + 2 * 24 * HOUR
+        host = self.behind_shipyard()
+        self.refresh(host, now=later, settings=self.held_settings(self.HOLD, later))
+        self.assertTrue(any("fleet-update" in call for call in host.calls))
+
+    def test_removing_a_bare_hold_clears_its_start_before_readding(self) -> None:
+        host = self.behind_shipyard()
+        self.refresh(host, settings=self.held_settings(self.HOLD, NOW))
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("shipyard", json.loads((self.state / "holds.json").read_text()))
+
+        current = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        self.refresh(current, now=NOW + HOUR, settings=settings())
+        self.assertNotIn("shipyard", json.loads((self.state / "holds.json").read_text()))
+
+        readded_at = NOW + 169 * HOUR
+        host = self.behind_shipyard()
+        row = self.refresh(host, now=readded_at,
+                           settings=self.held_settings(self.HOLD, readded_at))["tools"]["shipyard"]
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        self.assertIn("HELD: auto_apply = false", row["apply"])
+
+    def test_the_documented_permanent_opt_out_says_hold_until_never(self) -> None:
+        doc = tf.__doc__ or ""
+        block = doc[doc.index("[tools.pulp]"):doc.index("[tools.pulp]") + 200]
+        self.assertIn('hold_until = "never"', block)
+
+    def test_a_hold_on_a_tool_that_is_off_by_default_is_not_a_hold(self) -> None:
+        settings_ = self.held_settings("[tools.tart]\nauto_apply = false\n", NOW - 30 * 24 * HOUR)
+        self.assertNotIn("hold", settings_["tools"]["tart"])
+        self.assertIn("hold", self.held_settings(self.HOLD, NOW)["tools"]["shipyard"])
+
     def test_a_deployment_made_elsewhere_is_observed_and_recorded(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.305.0"})
         off = settings(tools={name: dict(tool, enabled=True, auto_apply=False)
