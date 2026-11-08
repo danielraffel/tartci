@@ -108,14 +108,23 @@ PY
 }
 
 tartci_check_macos_disk_floor_with_cleanup_once(){
-  local path="$1" lane="$2" runner="$3" rc=0
+  local path="$1" lane="$2" runner="$3" rc=0 attempt=""
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner" || rc=$?
   [ "$rc" -ne 0 ] || return 0
-  # Only the Tart store the cleanup authority was rendered for (host.tart_home).
-  [ -n "${TARTCI_WORKTREE_CLEANUP_TART_HOME:-}" ] || return "$rc"
-  [ "$path" = "$TARTCI_WORKTREE_CLEANUP_TART_HOME" ] || return "$rc"
-  [ -n "${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}" ] || return "$rc"
-  tartci_try_worktree_cleanup "$TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON" || return "$rc"
+  attempt="${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}"
+  [ -n "$attempt" ] || return "$rc"
+  # Worktree cleanup: only the Tart store the cleanup authority was rendered
+  # for (host.tart_home). The lease-denial reclaim: only the lane's own store.
+  if [ -n "${TARTCI_WORKTREE_CLEANUP_TART_HOME:-}" ] \
+     && [ "$path" = "$TARTCI_WORKTREE_CLEANUP_TART_HOME" ] \
+     && tartci_try_worktree_cleanup "$attempt"; then
+    :
+  elif [ -n "${TART_HOME:-}" ] && [ "$path" = "$TART_HOME" ] \
+       && tartci_try_disk_denial_reclaim "$attempt" "$lane" "$path"; then
+    :
+  else
+    return "$rc"
+  fi
   # One exact remeasurement only. A second denial remains authoritative.
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner"
 }
@@ -463,6 +472,107 @@ finally:
 PY
 }
 
+# One `leases.py acquire` with the caller's arguments. Reads the locals of
+# tartci_acquire_vm_lease (bash dynamic scope), so a retry asks for exactly
+# what the first attempt asked for, including a memory-only warm lease.
+_tartci_vm_lease_acquire_call(){
+  python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
+    --id "$lease_id" \
+    ${core_args[@]+"${core_args[@]}"} \
+    ${mem_args[@]+"${mem_args[@]}"} \
+    ${disk_args[@]+"${disk_args[@]}"} \
+    --priority "$priority" \
+    --pid "$$" \
+    --kind "$kind" \
+    --owner "$(tartci_vm_lease_owner)" \
+    --label "$labels" \
+    --job-id "${GITHUB_RUN_ID:-}" \
+    --vm-name "$vm_name" \
+    ${waiter_args[@]+"${waiter_args[@]}"} \
+    --json 2>&1
+}
+
+# A refusal for disk alone (`disk_capacity_exceeded` with only the disk axis
+# exceeded) runs the lease-denial reclaim once: old gate ccache entries and
+# OCI cache images nothing references (scripts/denial_reclaim.py, at most once
+# per denial_reclaim_interval_minutes per host). 0 only when it RAN, so the
+# caller retries admission exactly once; a cooldown, a busy lock, a disabled
+# knob, a non-disk refusal or any error returns 1 and the denial stands as
+# it would have without this.
+tartci_try_disk_denial_reclaim(){
+  local attempt_json="$1" lane="${2:-}" measure="${3:-}" required="" out="" summary=""
+  local status="" detail=""
+  [ "${TARTCI_DISK_DENIAL_RECLAIM:-1}" = 1 ] || return 1
+  [ -n "${TARTCI_ROOT:-}" ] || return 1
+  required="$(printf '%s' "$attempt_json" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+disk=d.get("disk"); axis=d.get("exceeded_axis")
+if d.get("ok") is not False or d.get("reason")!="disk_capacity_exceeded": raise SystemExit(1)
+if not isinstance(axis,dict) or axis.get("disk") is not True or axis.get("cores") or axis.get("memory"): raise SystemExit(1)
+if not isinstance(disk,dict): raise SystemExit(1)
+r=disk.get("required_bytes")
+print(r if type(r) is int else "")
+' 2>/dev/null)" || return 1
+  local reclaim_args=(--fix --json --lane "$lane")
+  [ -z "$required" ] || reclaim_args+=(--required-bytes "$required")
+  [ -z "$measure" ] || reclaim_args+=(--measure-path "$measure")
+  tartci_vm_lease_note "disk admission refused for $lane; running the lease-denial reclaim (regenerable caches only)"
+  if ! out="$(python3 "$TARTCI_ROOT/scripts/denial_reclaim.py" ${reclaim_args[@]+"${reclaim_args[@]}"} 2>/dev/null)"; then
+    tartci_vm_lease_note "lease-denial reclaim failed (ignored; the disk denial stands)"
+    return 1
+  fi
+  summary="$(printf '%s' "$out" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+gib=1024**3
+freed=d.get("freed_bytes")
+fields=["status=%s" % d.get("status")]
+if d.get("reason"): fields.append("reason=%s" % str(d["reason"]).replace(" ","_")[:120])
+if isinstance(freed,int): fields.append("freed_gib=%.1f" % (freed/gib))
+for key,label in (("free_before","free_before_gib"),("free_after","free_after_gib")):
+    if isinstance(d.get(key),int): fields.append("%s=%.1f" % (label,d[key]/gib))
+cc=d.get("ccache") or {}
+if cc: fields.append("ccache=%s" % cc.get("status"))
+oci=d.get("oci") or {}
+if oci: fields.append("oci=%s oci_deleted=%s" % (oci.get("status"), oci.get("deleted",0)))
+if d.get("elapsed_s") is not None: fields.append("elapsed_s=%s" % d["elapsed_s"])
+print("%s\t%s" % (d.get("status"), " ".join(fields)))
+' 2>/dev/null)" || summary=""
+  IFS=$'\t' read -r status detail <<<"$summary"
+  [ -n "$status" ] || { tartci_vm_lease_note "lease-denial reclaim output unreadable (ignored)"; return 1; }
+  tartci_vm_lease_note "lease-denial reclaim: $detail"
+  if declare -F event >/dev/null 2>&1; then
+    event disk_denial_reclaim "lane=$lane $detail"
+  fi
+  [ "$status" = ran ]
+}
+
+# After a granted disk-axis lease: when what is left would refuse the NEXT
+# VM (free space minus this grant's requirement is under one VM's growth),
+# say so now, while the host still serves, instead of at the first refusal.
+tartci_vm_lease_disk_headroom_event(){
+  local headroom
+  headroom="$(printf '%s' "$1" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)["disk"]
+except Exception: raise SystemExit(0)
+free,req,growth=d.get("free_bytes"),d.get("required_bytes"),d.get("requested_bytes")
+if not all(type(v) is int for v in (free,req,growth)) or growth<=0: raise SystemExit(0)
+if free-req<growth:
+    g=1024**3
+    print("free_gib=%.1f required_gib=%.1f growth_gib=%.1f next_vm=refused" % (free/g,req/g,growth/g))
+' 2>/dev/null)" || headroom=""
+  [ -n "$headroom" ] || return 0
+  tartci_vm_lease_note "disk headroom low: the next VM lease on this store would be refused for disk ($headroom)"
+  if declare -F event >/dev/null 2>&1; then
+    event disk_headroom_low "$headroom"
+  fi
+  return 0
+}
+
 tartci_start_vm_lease_heartbeat(){
   local lease_id="$1"
   (
@@ -756,32 +866,25 @@ tartci_acquire_vm_lease(){
   TARTCI_LAST_VM_LEASE_DENIAL=""
   local waiter_args=()
   [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
-  out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
-    --id "$lease_id" \
-    ${core_args[@]+"${core_args[@]}"} \
-    ${mem_args[@]+"${mem_args[@]}"} \
-    ${disk_args[@]+"${disk_args[@]}"} \
-    --priority "$priority" \
-    --pid "$$" \
-    --kind "$kind" \
-    --owner "$(tartci_vm_lease_owner)" \
-    --label "$labels" \
-    --job-id "${GITHUB_RUN_ID:-}" \
-    --vm-name "$vm_name" \
-    ${waiter_args[@]+"${waiter_args[@]}"} \
-    --json 2>&1)" || rc=$?
+  out="$(_tartci_vm_lease_acquire_call)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
     if tartci_try_worktree_cleanup "$out"; then
       rc=0
-      out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
-        --id "$lease_id" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
-        ${disk_args[@]+"${disk_args[@]}"} --priority "$priority" --pid "$$" \
-        --kind "$kind" --owner "$(tartci_vm_lease_owner)" --label "$labels" \
-        --job-id "${GITHUB_RUN_ID:-}" --vm-name "$vm_name" \
-        ${waiter_args[@]+"${waiter_args[@]}"} --json 2>&1)" || rc=$?
+      out="$(_tartci_vm_lease_acquire_call)" || rc=$?
       tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
       tartci_record_worktree_cleanup_retry "$out" "$rc"
+    fi
+  fi
+  # Still refused for disk alone: free regenerable caches once (rate limited
+  # per host) and retry exactly once. Any reclaim failure leaves the denial.
+  if [ "$rc" -ne 0 ] && [ -n "$disk_path" ] \
+     && tartci_try_disk_denial_reclaim "$out" "$receipt_lane" "$disk_path"; then
+    rc=0
+    out="$(_tartci_vm_lease_acquire_call)" || rc=$?
+    tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
+    if declare -F event >/dev/null 2>&1; then
+      event disk_denial_reclaim_retry "rc=$rc lane=$receipt_lane"
     fi
   fi
   if [ "$rc" -ne 0 ]; then
@@ -810,6 +913,7 @@ tartci_acquire_vm_lease(){
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  [ -z "$disk_path" ] || tartci_vm_lease_disk_headroom_event "$out"
   tartci_vm_lease_home_unread_event "$out"
   if declare -F event >/dev/null 2>&1; then
     event lease_acquired "kind=$kind priority=$priority lease_cores=$cores" \

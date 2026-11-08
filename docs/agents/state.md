@@ -37,7 +37,8 @@ A git checkout of this repository is not what a host's supervisors run.
 | `state/pool-log/events.jsonl` | pool status history |
 | `state/self-update/` | last attempt, waiting ticket (`waiting-aside.json` while the capacity floor refuses), `launcher-auto-apply.json` (a launcher target whose automatic apply failed and is held) |
 | `state/gh-identity.json` | cached GitHub credential identity probe |
-| `state/vm-dhcp/breaker.json` | VM DHCP breaker |
+| `state/vm-dhcp/breaker.json` | VM DHCP breaker (`admission_blocked` while its verification probe is refused by VM admission) |
+| `state/reclaim/denial-reclaim.json`, `denial-reclaim.lock` | last lease-denial reclaim (its start time is the per-host cooldown) and its single-runner lock; each run also appends `reclaim_on_lease_denial` to `state/reclaim/events.jsonl` |
 | `runtime/` | runtime records when `TARTCI_RUNTIME_MEASURE=1` (`TARTCI_RUNTIME_STORE`) |
 
 ## VM images

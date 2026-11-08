@@ -45,7 +45,7 @@ SELF_DECLARED = "3.9-safe"
 # dropping the declaration is a visible edit here rather than a silent change
 # to which tests must run on 3.9.
 EXPECTED_SELF_DECLARED = frozenset({
-    "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
+    "denial_reclaim", "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
     "pool_log", "state_age", "vm_dhcp_breaker",
 })
 
@@ -63,6 +63,16 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_denial_reclaim.py",
+     "Run.test_a_run_deletes_unreferenced_images_and_evicts_old_ccache"):
+        ("3.11-only: reads [host].cache_root from the fleet profile with tomllib; on 3.9 the "
+         "lane's rendered TARTCI_CI_CACHE names the cache instead"),
+    ("test_denial_reclaim.py", "Run.test_the_ccache_age_is_configurable"):
+        ("3.11-only: [reclaim] denial_reclaim_ccache_max_age_days is read with tomllib; "
+         "3.9 uses the 14-day default"),
+    ("test_denial_reclaim.py", "Run.test_off_switches"):
+        ("3.11-only: the [reclaim] denial_reclaim = false half is read with tomllib; the "
+         "TARTCI_DISK_DENIAL_RECLAIM=0 half runs on 3.9"),
     ("test_fleet_source.py",
      "FleetSourceTests.test_a_profile_that_is_not_toml_is_refused"):
         ("3.11-only: source resolution parses profile TOML when the interpreter provides "

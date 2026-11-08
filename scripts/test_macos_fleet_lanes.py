@@ -3592,6 +3592,21 @@ class ServingBlockedTests(unittest.TestCase):
                          ("disk", "disk_capacity_insufficient"))
         self.assertEqual(value["verified_running_supervisors"], 1)
 
+    def test_a_lane_held_back_by_a_disk_refused_dhcp_probe_is_disk_blocked(self) -> None:
+        """m1, 2026-11-08: the idle slot never attempted a lease of its own (the
+        DHCP verification held it back), so it has no disk receipt; its
+        supervisor names the cause, and readiness must say disk, not DHCP."""
+        value = self._readiness({
+            "serving_blocked_since": self._ago(60),
+            "serving_blocked_streak": 1,
+            "serving_blocked_last_phase": "vm-lease-denied",
+            "serving_blocked_cause": "disk",
+        })
+        self.assertTrue(self._blocked(value))
+        lane = value["serving"]["blocked_lanes"][0]
+        self.assertEqual((lane["cause"], lane["reason"]),
+                         ("disk", "disk_capacity_insufficient"))
+
     def test_a_resolved_disk_receipt_does_not_block(self) -> None:
         value = self._readiness({
             "serving_blocked_since": self._ago(1200),

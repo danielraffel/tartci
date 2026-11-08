@@ -15,6 +15,13 @@
 VM_DHCP_BACKOFF=0
 VM_DHCP_PROBE=0
 VM_DHCP_BREAKER_OPEN=0
+# Set when the breaker backs this lane off because the verification probe was
+# refused by VM admission (disk, memory, cores), not by DHCP: the lease
+# refusal reason, e.g. disk_capacity_exceeded. Empty otherwise.
+VM_DHCP_BLOCKED_BY=""
+# Set by the lane when its own probe turn was refused by VM admission; the
+# cancel then tells the breaker so (vm_dhcp_breaker.py admission_blocked).
+VM_DHCP_PROBE_BLOCKED_BY=""
 
 tartci_vm_dhcp_enabled(){
   [ "${TARTCI_VM_DHCP_BREAKER:-1}" = 1 ]
@@ -49,6 +56,7 @@ tartci_vm_dhcp_check(){
   VM_DHCP_BACKOFF=0
   VM_DHCP_PROBE=0
   VM_DHCP_BREAKER_OPEN=0
+  VM_DHCP_BLOCKED_BY=""
   tartci_vm_dhcp_enabled || return 0
   out="$(python3 "$TARTCI_ROOT/scripts/vm_dhcp_breaker.py" check --lane "$lane" 2>/dev/null)" || return 0
   _tartci_vm_dhcp_emit "$out"
@@ -61,6 +69,12 @@ tartci_vm_dhcp_check(){
   if [ "$(printf '%s' "$out" | python3 -c 'import json,sys; print(1 if json.load(sys.stdin).get("breaker_open") else 0)' 2>/dev/null)" = 1 ]; then
     VM_DHCP_BREAKER_OPEN=1
   fi
+  if [ "$action" = backoff ]; then
+    VM_DHCP_BLOCKED_BY="$(printf '%s' "$out" | python3 -c '
+import json,re,sys
+v=json.load(sys.stdin).get("blocked_by") or ""
+print(v if re.fullmatch(r"[a-z_]{1,64}", str(v)) else "")' 2>/dev/null)" || VM_DHCP_BLOCKED_BY=""
+  fi
   [ "$action" = backoff ] && return 75
   return 0
 }
@@ -68,12 +82,25 @@ tartci_vm_dhcp_check(){
 # Release a granted probe when the lane returns before cloning (for example
 # admission or lease refusal). Such a turn never had a VM to report and must
 # not become probe_unreported.
+# A third argument (or VM_DHCP_PROBE_BLOCKED_BY) names the lease refusal that
+# ended the turn; the breaker records it as admission-blocked, not as DHCP.
 tartci_vm_dhcp_cancel(){
-  local lane="$1" reason="${2:-pre_clone}" out
+  local lane="$1" reason="${2:-pre_clone}" blocked="${3:-${VM_DHCP_PROBE_BLOCKED_BY:-}}" out
   tartci_vm_dhcp_enabled || return 0
   out="$(python3 "$TARTCI_ROOT/scripts/vm_dhcp_breaker.py" cancel \
-    --lane "$lane" --reason "$reason" 2>/dev/null)" || return 0
+    --lane "$lane" --reason "$reason" --blocked-by "$blocked" 2>/dev/null)" || return 0
   _tartci_vm_dhcp_emit "$out"
+}
+
+# The lease refusal reason in a leases.py denial (or a disk-floor precheck
+# frame), for tartci_vm_dhcp_cancel. Empty when it is not a refusal.
+tartci_vm_dhcp_refusal_reason(){
+  printf '%s' "${1:-}" | python3 -c '
+import json,re,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(0)
+r=d.get("reason") if isinstance(d,dict) and d.get("ok") is False else ""
+print(r if re.fullmatch(r"[a-z_]{1,64}", str(r or "")) else "")' 2>/dev/null || true
 }
 
 # Record a boot's DHCP outcome: ip or no_ip.
