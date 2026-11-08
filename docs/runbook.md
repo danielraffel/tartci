@@ -429,6 +429,16 @@ each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
 sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
 the lane as blocked/unknown; active guests continue to finish.
 
+"unknown" here means any non-healthy verdict from `scripts/storage_health.py`,
+the lane's own per-observer probe. It is a different program from the
+watchdog's `store_health.py` that `tartci doctor` reports, and it runs inside
+the lane's launchd context, so the two can disagree. Read the `reason` inside
+the event's `fields.reason` (`probe_timeout`, `health_supervisor_timeout`,
+`recovery_check_pending`) and the per-lane `observers` in
+`~/.tartci/state/storage-health-<host>-<digest>.json`, not the doctor line. A
+timed-out probe is killed together with any child it started in its own
+session, so a probe stuck in `open()` is not left behind as an orphan.
+
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
 token — the `[github.auth]` `source = "command"` block (the
@@ -487,7 +497,18 @@ and live runner membership still match the intended trust boundary.
   to the receipt holds the time of the last attempt.
 - `cause=credential`, or no `cause=` line (written by an older lane): a 401, 403
   or 404 from GitHub. Repair the auth route, then clear the receipt by hand.
-  The lane never retries these.
+  The lane never retries these, with one exception: a `cause=credential`
+  receipt whose `detail=` names an error file that shows a GitHub rate limit
+  (older lanes filed a rate-limit 403 as a credential refusal) takes the same
+  bounded recheck and clears with `jit_denial_cleared cause=credential_rate_limited`.
+
+A GitHub rate limit (primary "API rate limit exceeded", a secondary or abuse
+limit, HTTP 429, or a Retry-After) never writes a receipt. The lane logs
+`jit_github_rate_limited`, writes `github-rate-limited` in the state directory,
+and boots no VM until it expires: `TARTCI_GITHUB_RATE_LIMIT_BACKOFF_SECS`
+(default 120), doubling per consecutive hit up to
+`TARTCI_GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS` (default 1800), raised to any
+Retry-After. The next answered proof removes it.
 
 ### JIT registration preflight (all macOS fleet hosts)
 
@@ -1656,8 +1677,9 @@ which answer was used (`source=parallel age=Ns` or `source=boundary`).
 A repository-access proof that GitHub could not answer (a timed-out or failed
 API call, not a denial) is asked once more, synchronously, before the booted VM
 is discarded; each retry logs `jit_repository_access_retry` with a `reason=`.
-A denial (`rc=3`, HTTP 401/403/404) is never retried and still logs
-`jit_repository_access_denied`. A proof that still cannot be answered logs
+A denial (`rc=3`, HTTP 401/403/404 that is not a rate limit) is never retried
+and still logs `jit_repository_access_denied`. A rate limit is not retried at
+once either; it backs off and logs `jit_github_rate_limited`. A proof that still cannot be answered logs
 `jit_repository_access_error`, so every discard at this boundary names its
 cause in the lane's event log.
 

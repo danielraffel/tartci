@@ -216,6 +216,46 @@ def _group_exists(pgid: int) -> bool:
     return True
 
 
+def _descendants(pid: int) -> list[int]:
+    """Every live descendant of ``pid``, read from one bounded ``ps`` call.
+
+    Read before the kill: once a parent dies its children are reparented to
+    launchd and can no longer be traced back to it.
+    """
+    try:
+        listing = subprocess.run(["ps", "-Ao", "pid=,ppid="], capture_output=True,
+                                 text=True, timeout=2, check=False).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) == 2 and fields[0].isdigit() and fields[1].isdigit():
+            children.setdefault(int(fields[1]), []).append(int(fields[0]))
+    found, pending = [], [pid]
+    while pending:
+        for kid in children.get(pending.pop(), []):
+            if kid not in found:
+                found.append(kid)
+                pending.append(kid)
+    return found
+
+
+def _kill_session_leaders(pids: list[int]) -> None:
+    """SIGKILL each descendant that leads its own process group.
+
+    The bounded probe starts its child in a private session, so killing the
+    worker's group does not reach it; without this, a probe blocked in open()
+    outlives the worker as an orphan.
+    """
+    for pid in pids:
+        try:
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def reap_after_kill(child: subprocess.Popen[object]) -> bool:
     """Kill and boundedly reap a child process group.
 
@@ -226,6 +266,7 @@ def reap_after_kill(child: subprocess.Popen[object]) -> bool:
     disappeared before returning.
     """
     pgid = child.pid
+    descendants = _descendants(pgid)
     try:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
@@ -259,6 +300,7 @@ def reap_after_kill(child: subprocess.Popen[object]) -> bool:
             os.killpg(pgid, signal.SIGKILL)
         except OSError:
             pass
+    _kill_session_leaders(descendants)
     return not _group_exists(pgid)
 
 

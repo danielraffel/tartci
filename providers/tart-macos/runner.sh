@@ -667,10 +667,30 @@ jit_denial_file_for(){
 # (the runner-group repository-access precheck answered "deny") is a condition
 # the lane may re-read; `credential` (GitHub rejected the auth route) and any
 # receipt without a cause (written before the field existed) stay manual-only.
+# One exception: a `credential` receipt whose recorded source error is a rate
+# limit was written before rate limits were told apart from auth refusals. It
+# is not a credential fault, so it takes the same bounded recheck.
 JIT_DENIAL_RECHECK_SECS="${TARTCI_JIT_DENIAL_RECHECK_SECS:-900}"
 case "$JIT_DENIAL_RECHECK_SECS" in ''|*[!0-9]*) JIT_DENIAL_RECHECK_SECS=900;; esac
 jit_denial_cause(){
   sed -n 's/^cause=//p' "$1" 2>/dev/null | head -n 1
+}
+# The error file a receipt's `detail=` names ("... inspect <path> ..."), if any.
+jit_denial_source(){
+  sed -n 's/^detail=.*inspect \([^ ]*\).*$/\1/p' "$1" 2>/dev/null | head -n 1
+}
+# Prints the recheckable cause of a receipt, or fails when it is manual-only.
+jit_denial_recheck_cause(){
+  local file="$1" cause source
+  cause="$(jit_denial_cause "$file")"
+  case "$cause" in
+    repository_access) printf 'repository_access' ;;
+    credential)
+      source="$(jit_denial_source "$file")"
+      [ -n "$source" ] && tartci_github_rate_limited "$source" || return 1
+      printf 'credential_rate_limited' ;;
+    *) return 1 ;;
+  esac
 }
 # Re-run the cheap read-only precheck for a repository_access receipt, at most
 # once per JIT_DENIAL_RECHECK_SECS (0 disables), and remove the receipt only
@@ -678,9 +698,9 @@ jit_denial_cause(){
 # failing or hanging check is still spaced by the interval. Returns 0 when the
 # receipt was cleared.
 jit_denial_recheck(){
-  local runner_group_id="$1" file="$2" stamp last now_s verdict recheck_json rc
+  local runner_group_id="$1" file="$2" stamp last now_s verdict recheck_json rc cause
   [ "$JIT_DENIAL_RECHECK_SECS" -gt 0 ] || return 1
-  [ "$(jit_denial_cause "$file")" = repository_access ] || return 1
+  cause="$(jit_denial_recheck_cause "$file")" || return 1
   stamp="$file.recheck"
   now_s="$(now_epoch)"
   last="$(cat "$stamp" 2>/dev/null)"
@@ -702,7 +722,7 @@ jit_denial_recheck(){
   fi
   verdict="$(printf '%s' "$recheck_json" | tr '\n' ' ' | cut -c1-300)"
   event jit_denial_cleared \
-    "repo=$REPO group=$runner_group_id cause=repository_access evidence=$verdict"
+    "repo=$REPO group=$runner_group_id cause=$cause evidence=$verdict"
   note "JIT denial receipt cleared: repository access now passes for repo=$REPO group=$runner_group_id ($verdict)"
   rm -f "$file" "$stamp"
   return 0
@@ -726,6 +746,45 @@ clear_jit_admission_denied(){
   local runner_group_id="$1" labels="$2" file
   file="$(jit_denial_file_for "$runner_group_id" "$labels")"
   rm -f "$file" "$file.recheck"
+}
+
+# A GitHub rate limit on the JIT boundary is transient: it never writes a
+# denial receipt. It holds the lane off booting VMs for a doubling interval
+# (TARTCI_GITHUB_RATE_LIMIT_BACKOFF_SECS, capped at ..._MAX_SECS, raised to any
+# Retry-After the error carries) and is cleared by the next proof GitHub answers.
+GITHUB_RATE_LIMIT_FILE="$STATE_DIR/github-rate-limited"
+GITHUB_RATE_LIMIT_BACKOFF_SECS="${TARTCI_GITHUB_RATE_LIMIT_BACKOFF_SECS:-120}"
+case "$GITHUB_RATE_LIMIT_BACKOFF_SECS" in ''|*[!0-9]*) GITHUB_RATE_LIMIT_BACKOFF_SECS=120;; esac
+GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS="${TARTCI_GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS:-1800}"
+case "$GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS" in ''|*[!0-9]*) GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS=1800;; esac
+record_github_rate_limited(){
+  local error_file="$1" hits secs retry_after now_s
+  hits="$(sed -n 's/^hits=//p' "$GITHUB_RATE_LIMIT_FILE" 2>/dev/null | head -n 1)"
+  case "$hits" in ''|*[!0-9]*) hits=0;; esac
+  hits=$((hits + 1))
+  secs="$GITHUB_RATE_LIMIT_BACKOFF_SECS"
+  local n=1
+  while [ "$n" -lt "$hits" ] && [ "$secs" -lt "$GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS" ]; do
+    secs=$((secs * 2)); n=$((n + 1))
+  done
+  [ "$secs" -le "$GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS" ] || secs="$GITHUB_RATE_LIMIT_BACKOFF_MAX_SECS"
+  retry_after="$(grep -Eio 'retry-after:? *[0-9]+' "$error_file" 2>/dev/null | head -n 1 | grep -Eo '[0-9]+$')"
+  case "$retry_after" in ''|*[!0-9]*) ;; *) [ "$retry_after" -le "$secs" ] || secs="$retry_after" ;; esac
+  now_s="$(now_epoch)"
+  printf 'until=%s\nhits=%s\nbackoff_secs=%s\nsource=%s\n' \
+    "$((now_s + secs))" "$hits" "$secs" "$error_file" >"$GITHUB_RATE_LIMIT_FILE"
+  GITHUB_RATE_LIMIT_SECS="$secs"
+}
+# 0 while a recorded rate-limit backoff has not yet elapsed.
+github_rate_limit_backoff_active(){
+  local until_s
+  until_s="$(sed -n 's/^until=//p' "$GITHUB_RATE_LIMIT_FILE" 2>/dev/null | head -n 1)"
+  case "$until_s" in ''|*[!0-9]*) return 1;; esac
+  GITHUB_RATE_LIMIT_REMAINING=$((until_s - $(now_epoch)))
+  [ "$GITHUB_RATE_LIMIT_REMAINING" -gt 0 ]
+}
+clear_github_rate_limited(){
+  rm -f "$GITHUB_RATE_LIMIT_FILE"
 }
 
 # -- Scan diagnostics -------------------------------------------------------
@@ -2371,6 +2430,11 @@ run_one(){
     note "[$i] JIT admission remains blocked for this exact repository/group/class contract — no VM will boot; inspect $JIT_DENIAL_FILE"
     return 75
   fi
+  if github_rate_limit_backoff_active; then
+    note "[$i] GitHub rate limit backoff — no VM will boot for another ${GITHUB_RATE_LIMIT_REMAINING}s; inspect $GITHUB_RATE_LIMIT_FILE"
+    heartbeat github-rate-limited
+    return 75
+  fi
   if ! tartci_pool_lock_absent; then
     note "[$i] pool transition lock exists before VM allocation — deferring without boot"
     return 75
@@ -2649,7 +2713,10 @@ run_one(){
   # is not a denial, and the VM is already booted: ask once more before
   # throwing it away. A denial is never retried. On m1 on 2026-09-27 eight
   # booted forge VMs were discarded in a day on a single 20-second timeout.
-  if [ "$access_rc" -ne 0 ] && ! tartci_repository_access_denied "$access_rc" "$access_error"; then
+  # A rate limit is not retried at once: another call spends the same exhausted
+  # quota. It backs off below instead.
+  if [ "$access_rc" -ne 0 ] && ! tartci_repository_access_denied "$access_rc" "$access_error" \
+     && ! tartci_github_rate_limited "$access_error"; then
     event jit_repository_access_retry \
       "repo=$REPO group=$selected_group_id rc=$access_rc $(tartci_repository_access_reason "$access_error")"
     if access_json="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" \
@@ -2674,6 +2741,10 @@ run_one(){
         "$access_cause"
       event jit_repository_access_denied \
         "repo=$REPO group=$selected_group_id labels=$selected_labels"
+    elif tartci_github_rate_limited "$access_error"; then
+      record_github_rate_limited "$access_error"
+      event jit_github_rate_limited \
+        "repo=$REPO group=$selected_group_id stage=repository_access backoff=${GITHUB_RATE_LIMIT_SECS}s"
     else
       # Every discard of a booted VM names its cause in the event log.
       event jit_repository_access_error \
@@ -2718,7 +2789,12 @@ run_one(){
         -f "name=$vm" -F "runner_group_id=$selected_group_id" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config' 2>"$jit_error")" || {
     tartci_pool_lock_release
-    if grep -Eq 'HTTP (401|403|404)|Resource not accessible by integration' "$jit_error"; then
+    if tartci_github_rate_limited "$jit_error"; then
+      record_github_rate_limited "$jit_error"
+      event jit_github_rate_limited \
+        "repo=$REPO group=$selected_group_id stage=mint backoff=${GITHUB_RATE_LIMIT_SECS}s"
+      note "[$i] GitHub rate limit at JIT mint — backing off ${GITHUB_RATE_LIMIT_SECS}s, no denial recorded"
+    elif tartci_github_auth_rejected "$jit_error"; then
       record_jit_admission_denied "$selected_group_id" "$selected_labels" \
         "GitHub rejected JIT registration; inspect $jit_error and change the explicit JIT auth route before retrying"
       event jit_admission_denied "repo=$REPO group=$selected_group_id gh_cli=$JIT_GH_CLI"
@@ -2729,6 +2805,7 @@ run_one(){
     return 1
   }
   rm -f "$jit_error"
+  clear_github_rate_limited
   clear_jit_admission_denied "$selected_group_id" "$selected_labels"
   if [ -z "$jit" ]; then
     tartci_pool_lock_release
