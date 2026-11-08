@@ -12,6 +12,8 @@
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
+#   tartci reclaim --on-lease-denial [--fix] [--json]
+#                              # free regenerable caches (old gate ccache, unreferenced OCI images)
 #   tartci scratch-vm create --owner AGENT --ttl HOURS [--from IMAGE]
 #                                        # a test VM the watchdog deletes on its TTL
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images

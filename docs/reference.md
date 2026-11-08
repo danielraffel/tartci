@@ -412,7 +412,8 @@ Two things a lane root costs that lane:
   `scripts/pip-wheelhouse.sh` fill only the host root), so the lane boots
   without them.
 - **No age-based ccache eviction.** `gate_ccache_trim.py` trims only the host
-  root's ccache. A lane root's ccache relies on the per-boot ccache guard and
+  root's ccache (so does the lease-denial reclaim, `denial_reclaim.py`). A
+  lane root's ccache relies on the per-boot ccache guard and
   `TARTCI_CCACHE_MAX_SIZE`.
 
 **Registry tooling is not runner tooling.** A registry credential (for GHCR

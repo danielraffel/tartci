@@ -182,11 +182,17 @@ CODES: tuple[str, ...] = (
     "vm_dhcp_bootpd_not_loaded",
     "vm_dhcp_config_disabled",
     "vm_dhcp_ok",
+    "vm_dhcp_probe_blocked_by_admission",
     "vm_dhcp_pfd_crash_loop",
     "vm_dhcp_unanswered",
     "vm_dhcp_unreadable",
     "vm_dhcp_verifying",
     "vm_dhcp_vm_network_missing",
+    "vm_disk_headroom_low",
+    "vm_disk_headroom_not_applicable",
+    "vm_disk_headroom_ok",
+    "vm_disk_headroom_refusing",
+    "vm_disk_headroom_unmeasured",
     "warm_vm_none",
     "warm_vm_overdue",
     "warm_vm_parked",
@@ -895,6 +901,34 @@ def check_home_volume(value: dict | None, *, lanes: int, now: float | None = Non
                        f"volume, or the floor is wrong", facts)
     return Finding("home_volume", OK, "home_volume_floor_ok",
                    f"{text}; {streak} consecutive refusals", facts)
+
+
+def check_vm_disk_headroom(value: dict | None) -> Finding:
+    """Free space on the Tart store against what the next VM lease needs
+    (scripts/disk_headroom.py): a problem one VM's growth BEFORE the lease is
+    refused for disk, so it is seen while the host still serves."""
+    import disk_headroom  # noqa: PLC0415 - sibling module; owns the arithmetic
+    value = value or {"state": "unknown", "error": "no status"}
+    facts = {"vm_disk_headroom": value}
+    state = value.get("state")
+    if state == "not_applicable":
+        return Finding("vm_disk_headroom", NOT_APPLICABLE, "vm_disk_headroom_not_applicable",
+                       str(value.get("reason") or "no Tart store"), facts)
+    if state == "refusing":
+        return Finding("vm_disk_headroom", PROBLEM, "vm_disk_headroom_refusing",
+                       "the next VM lease is refused for disk: " + disk_headroom.detail(value)
+                       + "; the lease-denial reclaim frees regenerable caches, the rest "
+                       "needs `tartci reclaim --fix` or a human", facts)
+    if state == "low":
+        return Finding("vm_disk_headroom", PROBLEM, "vm_disk_headroom_low",
+                       "within one VM's growth of refusing VMs for disk: "
+                       + disk_headroom.detail(value), facts)
+    if state == "ok":
+        return Finding("vm_disk_headroom", OK, "vm_disk_headroom_ok",
+                       disk_headroom.detail(value), facts)
+    return Finding("vm_disk_headroom", UNKNOWN, "vm_disk_headroom_unmeasured",
+                   f"the Tart store's free space could not be measured: {value.get('error')}",
+                   facts)
 
 
 def check_tool_freshness(summary: dict | None) -> Finding:
@@ -1664,6 +1698,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             pf_value: dict | None = None,
             signing_prompts_value: dict | None = None,
             tmp_worktrees_probe: Callable[[Path], tuple[dict | None, str]] | None = None,
+            disk_headroom_value: dict | None = None,
             ) -> list[Finding]:
     """Run every check against this host."""
     agents_dir = agents_dir or (home / "Library" / "LaunchAgents")
@@ -1759,6 +1794,22 @@ def collect(*, home: Path, agents_dir: Path | None = None,
     except Exception:  # noqa: BLE001 - an unreadable state reads as not judged
         home_value = {}
     findings.append(check_home_volume(home_value, lanes=len(fit_records)))
+    if disk_headroom_value is None:
+        try:
+            import disk_headroom
+            tart_home = None
+            try:
+                import tomllib
+                with config.open("rb") as handle:
+                    tart_home = (tomllib.load(handle).get("host") or {}).get("tart_home")
+            except (OSError, ValueError, ImportError):
+                tart_home = None
+            disk_headroom_value = disk_headroom.status(
+                agents_dir=agents_dir,
+                tart_home=tart_home if isinstance(tart_home, str) else None)
+        except Exception as exc:  # noqa: BLE001 - reported as unmeasured
+            disk_headroom_value = {"state": "unknown", "error": str(exc)}
+    findings.append(check_vm_disk_headroom(disk_headroom_value))
     try:
         import warm_vm_status
         warm_value = warm_vm_status.status(home / ".tartci/state/warm-vm")

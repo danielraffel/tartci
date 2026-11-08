@@ -188,6 +188,35 @@ class ServeLessStreakTests(unittest.TestCase):
                                     text=True, check=True)
             self.assertEqual(result.stdout.strip().splitlines()[-1], "admission deferred")
 
+    def test_a_verification_wait_on_a_disk_refused_probe_counts_as_disk(self) -> None:
+        # m1 2026-11-08: the idle slot backed off on a DHCP verification whose
+        # probe could never clone for disk. That is a blocked lane, and its
+        # cause is disk, not "not blocked" and not dhcp_breaker.
+        block = self.accounting.accounting
+
+        def run(blocked_by: str) -> dict:
+            script = (
+                "set -euo pipefail\n"
+                "tartci_boundary_proof_abandon(){ :; }\n"
+                "tartci_job_claim_release(){ :; }\n"
+                'SERVING_BLOCKED_SINCE=""\nSERVING_BLOCKED_STREAK=0\n'
+                'SERVING_BLOCKED_LAST_PHASE=""\nSERVING_BLOCKED_CAUSE=""\n'
+                'LAST_HEARTBEAT_PHASE="vm-lease-denied"\nCURRENT_SERVED=0\n'
+                'JOB_CLAIM_CONTENDED=0\nPRE_CLONE_DEMAND_GONE=0\n'
+                'VM_DHCP_BACKOFF=1\nVM_DHCP_BREAKER_OPEN=0\nVM_DHCP_BLOCKED_BY="%s"\n'
+                'run_rc=75\n%s\n'
+                'printf "{\\"streak\\":%%s,\\"cause\\":\\"%%s\\"}\\n" '
+                '"$SERVING_BLOCKED_STREAK" "$SERVING_BLOCKED_CAUSE"\n'
+            ) % (blocked_by, block)
+            result = subprocess.run(["/bin/bash", "-c", script], capture_output=True,
+                                    text=True, check=True)
+            return json.loads(result.stdout.strip().splitlines()[-1])
+
+        self.assertEqual(run("disk_capacity_exceeded"), {"streak": 1, "cause": "disk"})
+        self.assertEqual(run("memory_exceeded"), {"streak": 1, "cause": "unserved"})
+        # Without a blocker it stays the ordinary verification backoff.
+        self.assertEqual(run(""), {"streak": 0, "cause": ""})
+
     def test_runner_loop_produces_dhcp_breaker_cause_only_for_a_real_open_breaker(self) -> None:
         block = self.accounting.accounting
 

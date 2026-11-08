@@ -55,6 +55,23 @@ One breaker per host, in BREAKER_DIR/breaker.json, shared by every lane:
   overrides it. The runner now logs `boot_ip clone_to_ip_s=` at the address;
   `boot-times` re-derives the bound from both reports once 30 days exist.
 
+* admission_blocked: a verification probe (verifying, or admission_blocked
+  itself) whose lane was refused by VM admission before it could clone
+  (`cancel --blocked-by disk_capacity_exceeded|memory_exceeded|...`). That
+  probe never reached the DHCP address wait, so it is no DHCP evidence at
+  all: it is not counted, it opens nothing, and the breaker names the real
+  blocker instead of saying "verifying" or "DHCP". It behaves like verifying
+  otherwise: one lane at a time is answered `probe` (and tries admission),
+  the rest are answered `backoff` with `blocked_by`, which the lane logs and
+  heartbeats as a refused lease. The first probe that clones settles it the
+  way verifying would (`ip` closes, `no_ip` opens); a cancel for any other
+  reason returns it to verifying. The doctor calls a disk refusal a problem
+  at once and a cores or memory refusal only after it has held 10 min. On m1 on 2026-11-08 a self-update's verify
+  met a disk-denied host: the probe could never clone, the breaker sat in
+  verifying for hours, and the idle slot reported a DHCP outage that was a
+  full disk. An open breaker whose probe is refused the same way keeps its
+  real DHCP cause and records `probe_blocked` beside it.
+
 Someone is told: the launchd watchdog's 300 s pass (scripts/vm_boot_alert.py)
 opens one GitHub issue per outage when `alert_due` here says so (a post-boot no_ip at once;
 open PROBE_SECS with a failed probe or no probe at all; two consecutive
@@ -121,7 +138,18 @@ OUTAGES_KEEP = 50
 # outage that is still running across a reboot.
 CARRIED_KEYS = ("boot_time", "hourly", "outages", "outage")
 VERIFY_REPORT_SECS = 960
-STATES = ("open", "closed", "verifying")
+STATES = ("open", "closed", "verifying", "admission_blocked")
+# Lease refusals that mean the host refused the VM, not that DHCP failed.
+ADMISSION_BLOCK_REASONS = frozenset({
+    "disk_capacity_exceeded", "home_volume_below_floor", "memory_exceeded",
+    "capacity_exceeded", "deferred_to_waiter",
+})
+DISK_BLOCK_REASONS = frozenset({"disk_capacity_exceeded", "home_volume_below_floor"})
+# Cores and memory refusals are ordinary contention that clears by itself when a
+# running job finishes; the doctor reports them only once they have held this long.
+CONTENTION_PROBLEM_AFTER_S = 600
+BLOCKED_KEYS = ("blocked_reason", "blocked_since", "blocked_at", "blocked_lane",
+                "blocked_count")
 MAX_STREAK = 50
 
 
@@ -450,6 +478,8 @@ def open_breaker(value: dict[str, Any], now: float, *, streak: list[dict[str, An
                  extra: dict[str, Any] | None = None) -> list[str]:
     """Open it; the `vm_dhcp_unanswered` event."""
     first = float(streak[0]["ts"]) if streak else now
+    for key in BLOCKED_KEYS:
+        value.pop(key, None)
     value.update({"state": "open", "opened_at": now, "vms_spent": len(streak),
                   "probes": 0, "last_probe_at": now, "chain": chain(),
                   "bootpd_runs": readout.get("runs"), "bootpd_moved_at": None,
@@ -497,10 +527,13 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if booted is not None and (recorded is None or abs(float(recorded) - booted) > 1):
             events += enter_verifying(value, now, "first_run" if recorded is None
                                       else "host_reboot", booted)
-        if value["state"] == "verifying":
+        if value["state"] in ("verifying", "admission_blocked"):
             action, more = verifying_check(value, args.lane, now)
             save(path, value)
-            return {"action": action, "breaker_open": False, "events": events + more}
+            result = {"action": action, "breaker_open": False, "events": events + more}
+            if value["state"] == "admission_blocked" and action == "backoff":
+                result["blocked_by"] = value.get("blocked_reason")
+            return result
         if value["state"] != "open":
             if events:
                 save(path, value)
@@ -520,7 +553,11 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         if not (due or moved or asked):
             if not isinstance(seen, dict) or moved:
                 save(path, value)
-            return {"action": "backoff", "breaker_open": True, "events": events}
+            result = {"action": "backoff", "breaker_open": True, "events": events}
+            blocked = value.get("probe_blocked")
+            if isinstance(blocked, dict) and blocked.get("reason"):
+                result["probe_blocked_by"] = blocked.get("reason")
+            return result
         if value.get("probe_lane"):
             value["consecutive_unreported"] = int(value.get("consecutive_unreported") or 0) + 1
         value["probe_prev_probes"] = int(value.get("probes") or 0)
@@ -536,14 +573,22 @@ def check(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
         return {"action": "probe", "breaker_open": True, "events": events}
 
 
+def blocked_reason(raw: Any) -> str | None:
+    """A lease refusal reason this breaker accepts as admission-blocked, else None."""
+    reason = str(raw or "").strip()
+    return reason if reason in ADMISSION_BLOCK_REASONS else None
+
+
 def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     """Release a probe that never cloned or reached the DHCP address wait."""
     now = time.time() if now is None else now
     with locked(breaker_dir()) as path:
         value = load(path)
         lane = value.get("probe_lane")
-        if lane != args.lane or value.get("state") not in ("open", "verifying"):
+        if lane != args.lane or value.get("state") not in ("open", "verifying",
+                                                           "admission_blocked"):
             return {"action": "noop", "events": []}
+        blocked = blocked_reason(getattr(args, "blocked_by", None))
         if value.get("state") == "open":
             value["probes"] = int(value.get("probe_prev_probes") or 0)
             previous_last = value.get("probe_prev_last_probe_at")
@@ -557,10 +602,34 @@ def cancel(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         value.pop("probe_prev_last_probe_at", None)
         # A cancelled admission/lease turn never cloned a VM and therefore is
         # not an unanswered DHCP probe. Preserve any earlier unreported streak.
-        save(path, value)
-        return {"action": "cancelled", "events": [["vm_dhcp_probe_cancelled", fmt({
+        events = [["vm_dhcp_probe_cancelled", fmt({
             "lane": args.lane, "reason": getattr(args, "reason", "pre_clone"),
-        })]]}
+            "blocked_by": blocked,
+        })]]
+        if value.get("state") == "open":
+            if blocked:
+                value["probe_blocked"] = {"reason": blocked, "at": now, "lane": args.lane}
+                events.append(["vm_dhcp_probe_blocked", fmt({
+                    "lane": args.lane, "blocked_by": blocked, "state": "open"})])
+        elif blocked:
+            first = value.get("state") != "admission_blocked"
+            value["state"] = "admission_blocked"
+            value["blocked_reason"] = blocked
+            value["blocked_at"] = now
+            value["blocked_lane"] = args.lane
+            value["blocked_count"] = int(value.get("blocked_count") or 0) + 1
+            if first or value.get("blocked_since") is None:
+                value["blocked_since"] = now
+                events.append(["vm_dhcp_probe_blocked", fmt({
+                    "lane": args.lane, "blocked_by": blocked,
+                    "verify_reason": value.get("verify_reason")})])
+        elif value.get("state") == "admission_blocked":
+            # The blocker is no longer known: prove the network as before.
+            value["state"] = "verifying"
+            for key in BLOCKED_KEYS:
+                value.pop(key, None)
+        save(path, value)
+        return {"action": "cancelled", "events": events}
 
 def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]:
     now = time.time() if now is None else now
@@ -570,9 +639,10 @@ def record(args: argparse.Namespace, now: float | None = None) -> dict[str, Any]
         value = load(path)
         events: list[list[str]] = []
         count_boot(value, args.outcome, now)
-        verifying = value.get("state") == "verifying"
-        probe = (value.get("state") in ("open", "verifying")
+        verifying = value.get("state") in ("verifying", "admission_blocked")
+        probe = (value.get("state") in ("open", "verifying", "admission_blocked")
                  and value.get("probe_lane") == args.lane)
+        value.pop("probe_blocked", None)
         if probe:
             events.append(["vm_dhcp_probe", fmt({"lane": args.lane, "vm": args.vm,
                                                  "result": args.outcome})])
@@ -650,13 +720,17 @@ def probe_now(now: float | None = None) -> dict[str, Any]:
             "cause": value.get("cause")})]]}
 
 
-def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
+def doctor_code(value: dict[str, Any], now: float | None = None) -> tuple[str, str, str]:
     """(state, code, detail) for tartci doctor fleet and the outage alert:
     "ok" | "problem" | "unknown", most fundamental failing layer first."""
     if value.get("state") == "open":
         opened = value.get("opened_at")
         spent = (f"no lane clones except one probe every 300 s (open since {opened}, "
                  f"{value.get('vms_spent')} VMs spent, {value.get('probes')} probes)")
+        blocked = value.get("probe_blocked")
+        if isinstance(blocked, dict) and blocked.get("reason"):
+            spent += (f"; its last probe could not clone: VM admission refused it "
+                      f"({blocked.get('reason')})")
         # Most fundamental layer first: the cause read while the last VM that
         # got no address was still up, then bootpd's live launchd state.
         cause = value.get("cause")
@@ -688,9 +762,24 @@ def doctor_code(value: dict[str, Any]) -> tuple[str, str, str]:
                     "VM DHCP is not answering because /etc/bootpd.plist does not enable "
                     "DHCP on the VM network while a VM ran: " + spent)
         return ("problem", "vm_dhcp_unanswered",
-                "VM DHCP is not answering on this host: no lane clones except one probe "
-                f"every 300 s (open since {opened}, {value.get('vms_spent')} VMs spent, "
-                f"{value.get('probes')} probes)")
+                "VM DHCP is not answering on this host: " + spent)
+    if value.get("state") == "admission_blocked":
+        now = time.time() if now is None else now
+        since = value.get("blocked_since")
+        held_s = now - float(since) if isinstance(since, (int, float)) else None
+        held = f"{int(held_s)}s" if held_s is not None else "an unknown time"
+        reason = value.get("blocked_reason")
+        axis = ("disk" if reason in DISK_BLOCK_REASONS
+                else "memory" if reason == "memory_exceeded" else "cores")
+        # A full disk does not clear by itself; busy cores or memory usually
+        # do within one job, so they are only a problem once they persist.
+        problem = (reason in DISK_BLOCK_REASONS or held_s is None
+                   or held_s >= CONTENTION_PROBLEM_AFTER_S)
+        return ("problem" if problem else "ok", "vm_dhcp_probe_blocked_by_admission",
+                f"not a DHCP failure: the VM-network probe after {value.get('verify_reason')} "
+                f"cannot clone because VM admission refuses it ({reason}, {axis}) for {held}, "
+                f"{value.get('blocked_count')} refused probe turns; free {axis} on this host "
+                f"and the next probe proves the network")
     if value.get("state") == "verifying":
         since = value.get("verifying_since")
         held = (f"{int(time.time() - float(since))}s" if isinstance(since, (int, float))
@@ -873,6 +962,8 @@ def main(argv: list[str] | None = None) -> int:
     x = sub.add_parser("cancel")
     x.add_argument("--lane", required=True)
     x.add_argument("--reason", default="pre_clone")
+    x.add_argument("--blocked-by", default="",
+                   help="the lease refusal reason when admission refused the probe")
     sub.add_parser("probe-now")
     v = sub.add_parser("verify")
     v.add_argument("--reason", default="operator")

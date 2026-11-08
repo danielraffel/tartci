@@ -1068,6 +1068,25 @@ first; list it only when what it asserts really needs tomllib.
   resolved `pipelines*.actions.githubusercontent.com` endpoint and
   `broker.actions.githubusercontent.com` over HTTPS from the guest, record
   both in the proof, and keep hosted fallback enabled until they pass.
+## A disk-refused lease reclaims caches, not trees
+
+A VM lease refused `disk_capacity_exceeded` (only the disk axis) runs the
+lease-denial reclaim once (`scripts/denial_reclaim.py`) and retries admission
+exactly once. It frees only what is regenerable: gate ccache entries unused
+for `denial_reclaim_ccache_max_age_days` (default 14) and OCI cache images no
+profile, lane plist, tartci config or state file references. It never deletes
+a local VM, a worktree or a checkout; the hourly `tartci reclaim` pass owns
+build trees. It runs at most once per `denial_reclaim_interval_minutes`
+(default 30) per host; a cooldown, a held lock or any error leaves the denial
+exactly as it was. Before it existed, m1 refused every lease for hours on
+2026-11-08 while 9 GB of two-week-old ccache and unreferenced OCI images sat
+on the store, and `tartci reclaim --fix` freed nothing.
+
+A lane the DHCP breaker holds back while the verification probe is refused
+for disk logs `vm-lease-denied` and the refusal, not a DHCP outage, and the
+breaker reads `admission_blocked` (doctor `vm_dhcp_probe_blocked_by_admission`).
+Free the disk; do not kickstart bootpd.
+
 ## Worktree cleanup is not a generic low-disk hook
 
 The optional cleanup provider is M3/Pulp-only and accepts only a fresh,

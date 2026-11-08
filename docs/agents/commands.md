@@ -64,6 +64,7 @@ would do; **write** changes host state.
 | `tartci tart-image-sync` | resumable, checksum-verified Tart image transfer | |
 | `tartci doctor --reap --fix` | deletes owned stale residue (see invariants) | |
 | `tartci reclaim --fix`, `image-prune --apply`, `retention --apply` | deletes idle build dirs, unreferenced images, old state | |
+| `tartci reclaim --on-lease-denial --fix` | evicts gate ccache entries unused for 14 days and deletes OCI cache images nothing references (the step a lane runs by itself on a disk-refused lease); never a local VM, worktree or checkout | cooldown (30 min per host), another lane running it, a VM running or leased (ccache only), a `tart pull`/`clone` running (OCI only) |
 | `tartci ccache quarantine`, `ccache reset` | moves suspect manifests aside; resets a cache | reset: a VM runs or holds a lease (exit 3) |
 | `tartci held stop\|delete\|expire\|inspect NAME` | manages failed gate VMs kept for debugging | inspect: no free slot |
 | `tartci fleet-macos install CONFIG` | installs generated fleet lanes | |

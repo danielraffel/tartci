@@ -189,8 +189,15 @@ def counters(ccache: str, cache: pathlib.Path, runner: Runner) -> dict[str, int]
 
 
 def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | None,
-          busy_probe: Callable[[], str | None], runner: Runner) -> dict[str, Any]:
-    """One eviction under every gate except the interval. Never raises."""
+          busy_probe: Callable[[], str | None], runner: Runner,
+          timeout: float = EVICT_TIMEOUT_S, measure_entries: bool = True) -> dict[str, Any]:
+    """One eviction under every gate except the interval. Never raises.
+
+    `timeout` bounds the ccache run (the lease-denial reclaim passes what is
+    left of its budget). `measure_entries=False` skips the two full walks of
+    the cache, which on a 400k-entry cache take minutes; that caller measures
+    freed space from the volume instead.
+    """
     report: dict[str, Any] = {"cache": str(cache), "max_age_days": max_age_days}
     if not cache.is_dir():
         return {**report, "status": "skipped", "reason": "cache directory does not exist"}
@@ -207,10 +214,11 @@ def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | No
     if not lock.acquire(0.0):
         return {**report, "status": "skipped", "reason": "the pre-boot ccache guard holds its lock"}
     try:
-        report["before"] = measure(cache)
+        if measure_entries:
+            report["before"] = measure(cache)
         started = time.monotonic()
         try:
-            proc = runner(command, capture_output=True, text=True, timeout=EVICT_TIMEOUT_S,
+            proc = runner(command, capture_output=True, text=True, timeout=timeout,
                           env=ccache_guard.host_ccache_env())
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {**report, "status": "error", "reason": f"ccache eviction failed: {exc}"}
@@ -218,6 +226,8 @@ def evict(*, cache: pathlib.Path, max_age_days: int, fix: bool, ccache: str | No
         if proc.returncode != 0:
             return {**report, "status": "error",
                     "reason": f"ccache exited {proc.returncode}: {proc.stderr.strip()[:300]}"}
+        if not measure_entries:
+            return {**report, "status": "evicted"}
         report["after"] = measure(cache)
         # The eviction recounted every directory, so ccache's counters should
         # now match the walk; a mismatch here means they drifted again.

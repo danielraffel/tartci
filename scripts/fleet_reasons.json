@@ -748,6 +748,38 @@
       "summary": "A lane pins an interpreter path that no longer exists.",
       "why": "The sealed or managed lane cannot start its verified helper interpreter, so GitHub reads and fleet supervision are unavailable.",
       "remedy": "Restore the pinned interpreter at the recorded path or reinstall the generation with a verified interpreter, then rerun fleet doctor."
+    },
+    "vm_dhcp_probe_blocked_by_admission": {
+      "summary": "This host's VM-network verification probe cannot clone because VM admission refuses it (disk, memory or cores). It is not a DHCP failure.",
+      "why": "After a reboot or self-update one lane probes the VM network before the others clone. On m1 on 2026-11-08 every lease was refused for disk, so the probe never cloned, the breaker stayed in verifying for hours, and the idle slot reported a DHCP outage that was a full disk. A probe refused before it clones is now recorded as admission_blocked with the real reason: it is not counted as DHCP evidence and opens nothing.",
+      "remedy": "Free what the reason names (disk: the lease-denial reclaim runs on its own; else `tartci reclaim --fix`, or remove what fills the Tart store's volume). The next probe that clones proves the network and closes the breaker.",
+      "do_not": "Do not treat this as a DHCP outage or kickstart bootpd for it."
+    },
+    "vm_disk_headroom_low": {
+      "summary": "The Tart store's volume admits one more VM but not two: it is within one VM's disk growth of refusing every VM lease for disk.",
+      "why": "A VM lease needs the free-space floor plus each live VM's reserved growth plus its own growth (25 + 24 GiB by default). m1 refused every lease for hours on 2026-11-08 at 27 GiB free, and after a manual reclaim sat at about 56 GiB, one VM from the same refusal, with nothing reporting it.",
+      "remedy": "Reclaim before it blocks: `tartci reclaim --fix`, `tartci reclaim --on-lease-denial --fix` (old gate ccache entries and unreferenced OCI images), `tartci image-prune`, or remove what fills the volume."
+    },
+    "vm_disk_headroom_not_applicable": {
+      "summary": "No Tart store is declared, or the lease disk axis is disabled, so there is no VM disk headroom to judge.",
+      "why": "The check reads TART_HOME from the installed lane plists or the fleet profile.",
+      "remedy": "Nothing, unless this host should run VMs."
+    },
+    "vm_disk_headroom_ok": {
+      "summary": "The Tart store has more than one VM's growth of headroom above what the next VM lease needs.",
+      "why": "Judged the way a VM lease is: floor plus live reservations plus one VM's growth.",
+      "remedy": "Nothing."
+    },
+    "vm_disk_headroom_refusing": {
+      "summary": "The Tart store's free space is below what the next VM lease needs: the host refuses new VMs for disk (disk_capacity_exceeded).",
+      "why": "A full store does not slow a host, it stops it: every lease is refused and the queue moves to whatever host is left.",
+      "remedy": "The lease-denial reclaim frees regenerable caches on the next refused lease (at most every 30 min). If that is not enough, run `tartci reclaim --fix` and `tartci image-prune`, or free the volume by hand."
+    },
+    "vm_disk_headroom_unmeasured": {
+      "summary": "The Tart store's free space could not be measured.",
+      "why": "The store path does not exist or statvfs failed, so the headroom is unknown rather than fine.",
+      "remedy": "Check that the Tart store exists and its volume is mounted, then re-run.",
+      "do_not": "Do not read an unmeasured store as one with headroom."
     }
   }
 }

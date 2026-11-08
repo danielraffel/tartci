@@ -100,6 +100,8 @@ BLOCKED_PHASES = frozenset({
     # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.
     "vm-dhcp-breaker-open",
     "inventory-unavailable",
+    # vm-lease.lib.sh: refused for disk, freeing caches before one retry.
+    "disk-denial-reclaim",
 })
 # A heartbeat older than this many polls (floor below) is not current.
 HEARTBEAT_STALE_POLLS = 6
