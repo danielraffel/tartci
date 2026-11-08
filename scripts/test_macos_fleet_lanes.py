@@ -1283,6 +1283,37 @@ class MacosFleetLaneTests(unittest.TestCase):
             self.assertNotIn("TARTCI_YIELD_MAX_WAIT_SECONDS", env)
             self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
 
+    def test_claim_delay_exports_only_a_positive_value(self) -> None:
+        marker = 'yield_to_workflow = "Build and Test"\n'
+        base = HOST_CONFIGS["m5"].read_text()
+        self.assertEqual(base.count(marker), 1)
+        for value, expected in (("30", "30"), ("0", None)):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m5.toml"
+                path.write_text(base.replace(
+                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                env = self._release_env(fleet.load(path))
+                if expected is None:
+                    self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env)
+                else:
+                    self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], expected)
+        # Never enabled by an upgrade: no shipped profile sets it.
+        for host, profile in HOST_CONFIGS.items():
+            for name, body in fleet.rendered_plists(fleet.load(profile)).items():
+                env = plistlib.loads(body)["EnvironmentVariables"]
+                self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env, (host, name))
+
+    def test_claim_delay_rejects_invalid_values(self) -> None:
+        marker = 'yield_to_workflow = "Build and Test"\n'
+        base = HOST_CONFIGS["m5"].read_text()
+        for value in ("-1", "1.5", '"30"', "true"):
+            with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m5.toml"
+                path.write_text(base.replace(
+                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                with self.assertRaisesRegex(ValueError, "claim_delay_seconds"):
+                    fleet.load(path)
+
     def test_yield_bound_rejects_invalid_values(self) -> None:
         for value in ("-1", "45.5", '"2700"', "true"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:

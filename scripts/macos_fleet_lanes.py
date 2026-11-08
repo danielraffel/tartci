@@ -113,7 +113,8 @@ LANE_KEYS = {
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
-    "yield_max_wait_seconds", "fallback_preferred_hosts",
+    "yield_max_wait_seconds", "claim_delay_seconds",
+    "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "v2_gate_classes",
@@ -1014,6 +1015,15 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: yield_max_wait_seconds must be a "
                 "non-negative integer on a lane with yield_to_workflow and "
                 "without event-class-v2"
+            )
+        # Claim delay: seconds this lane waits before claiming queued work so a
+        # faster host wins it first. 0/unset = off.
+        claim_delay = lane.get("claim_delay_seconds")
+        if claim_delay is not None and (
+                type(claim_delay) is not int or claim_delay < 0):
+            fail(
+                f"lane {lane_id}: claim_delay_seconds must be a "
+                "non-negative integer"
             )
         # Per-job ccache write layers, promoted into the shared store only on a
         # green job (providers/tart-macos/ccache-layer.lib.sh). Off unless true.
@@ -3079,6 +3089,8 @@ def lane_plist(
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
     if lane.get("yield_max_wait_seconds"):
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
+    if lane.get("claim_delay_seconds"):
+        env["TARTCI_CLAIM_DELAY_SECONDS"] = str(lane["claim_delay_seconds"])
     if lane.get("ccache_write_isolation"):
         env["TARTCI_CCACHE_WRITE_ISOLATION"] = "1"
     launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")

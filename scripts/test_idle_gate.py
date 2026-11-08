@@ -301,6 +301,134 @@ esac
         self.assertIn('note "yield bound reached:', body)
 
 
+class ClaimDelayTests(unittest.TestCase):
+    """TARTCI_CLAIM_DELAY_SECONDS makes a slower host wait, re-check its own
+    queue ONCE, and back off when a faster host took the work.
+
+    Driven through the real `--print-claim-delay` hook. `sleep` is a PATH stub
+    that records its argument and can flip the stub GitHub to "job taken", which
+    is what a faster host claiming during the delay looks like.
+    """
+
+    LABELS = "self-hosted,macOS,ARM64,pulp-build-vm-release"
+
+    def _run(self, *, delay, taken_during_sleep=False, gh_fails_after_sleep=False):
+        import json
+        import stat
+        import tempfile
+
+        run = {"id": 101, "name": "Release CLI",
+               "created_at": "2026-01-01T00:00:00Z",
+               "updated_at": "2026-01-01T00:00:00Z"}
+        jobs = {"jobs": [{
+            "id": 201, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
+            "labels": self.LABELS.split(",") + ["pulp-release-tagged"],
+        }]}
+        tmp = Path(tempfile.mkdtemp())
+        self.tmp = tmp
+        gh = f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"{tmp}/gh.log"
+if [ -e "{tmp}/fail" ]; then exit 1; fi
+case "$*" in
+  *rate_limit*) printf '%s\\n' '{{"resources":{{"core":{{"limit":15000,"remaining":14999}}}}}}' ;;
+  *actions/workflows?per_page=100*) printf '%s\\n' '{json.dumps({"workflows": [{"id": 77, "name": "Release CLI"}, {"id": 78, "name": "Release-path PR gate"}]})}' ;;
+  *actions/workflows/77/runs*status=queued*)
+    if [ -e "{tmp}/taken" ]; then printf '%s\\n' '{{"workflow_runs":[]}}'
+    else printf '%s\\n' '{json.dumps({"workflow_runs": [run]})}'; fi ;;
+  *actions/workflows/*/runs*) printf '%s\\n' '{{"workflow_runs":[]}}' ;;
+  *actions/runs/101/jobs*) printf '%s\\n' '{json.dumps(jobs)}' ;;
+  *) exit 1 ;;
+esac
+"""
+        sleep = f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"{tmp}/sleep.log"
+{f': >"{tmp}/taken"' if taken_during_sleep else ':'}
+{f': >"{tmp}/fail"' if gh_fails_after_sleep else ':'}
+"""
+        for name, body in (("tart", "#!/usr/bin/env bash\nexit 0\n"),
+                           ("stubgh", gh), ("sleep", sleep)):
+            path = tmp / name
+            path.write_text(body, encoding="utf-8")
+            path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
+                if Path(b).exists()]
+        env = {
+            "HOME": str(tmp),
+            "PATH": os.pathsep.join([str(tmp), *base]),
+            "TART_HOME": str(tmp / "vms"),
+            "TARTCI_STATE_DIR": str(tmp / "state"),
+            "TARTCI_GH_CLI": "stubgh",
+            "TARTCI_QUEUE_STAGGER_MAX_SECS": "0",
+            "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS": "0",
+            "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+            "TARTCI_RUNNER_LABELS": self.LABELS,
+            "TARTCI_RUNNER_WORKFLOW_TIERS":
+                "pulp-release-tagged|Release CLI\n"
+                "pulp-release-pr-gate|Release-path PR gate",
+        }
+        if delay is not None:
+            env["TARTCI_CLAIM_DELAY_SECONDS"] = delay
+        return subprocess.run(
+            ["bash", str(SCRIPT), "--print-claim-delay"],
+            capture_output=True, text=True, check=False, env=env,
+        )
+
+    def _queued_reads(self) -> int:
+        log = self.tmp / "gh.log"
+        if not log.exists():
+            return 0
+        return sum(1 for line in log.read_text().splitlines()
+                   if "workflows/77/runs" in line and "status=queued" in line)
+
+    def _sleeps(self) -> list:
+        log = self.tmp / "sleep.log"
+        return log.read_text().split() if log.exists() else []
+
+    def test_delay_zero_or_unset_claims_without_sleeping_or_scanning(self) -> None:
+        for delay in (None, "0"):
+            with self.subTest(delay=delay):
+                r = self._run(delay=delay)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.strip(), "claim")
+                self.assertEqual(self._sleeps(), [])
+                self.assertEqual(self._queued_reads(), 0)
+
+    def test_delay_waits_then_rechecks_once_and_claims_when_still_queued(self) -> None:
+        r = self._run(delay="15")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), ["15"])
+        # Control: the fixture really serves the queued job, and the delay
+        # costs exactly one queue read, not one per second or per poll.
+        self.assertEqual(self._queued_reads(), 1)
+
+    def test_job_taken_during_the_delay_means_no_claim(self) -> None:
+        r = self._run(delay="15", taken_during_sleep=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "backoff")
+        self.assertEqual(self._sleeps(), ["15"])
+        self.assertEqual(self._queued_reads(), 1)
+
+    def test_a_failed_recheck_fails_open(self) -> None:
+        r = self._run(delay="15", gh_fails_after_sleep=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+
+    def test_an_invalid_delay_refuses_to_start(self) -> None:
+        for delay in ("-5", "15s", "1.5"):
+            with self.subTest(delay=delay):
+                r = self._run(delay=delay)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("TARTCI_CLAIM_DELAY_SECONDS", r.stderr)
+
+    def test_loop_delays_only_at_the_claim_point(self) -> None:
+        body = SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('if [ "$CLAIM_DELAY" -gt 0 ] && [ "${q:-0}" -gt 0 ]', body)
+        self.assertIn('[ "$r" -lt "$cap" ]', body)
+        self.assertLess(body.index('"$(claim_delay_gate)" = backoff'),
+                        body.index("# Idle gate: boot only when (1)"))
+
+
 class HostHealthYieldTests(unittest.TestCase):
     """host_health_yield must FAIL OPEN (the deliberate opposite of
     priority_demand): a missing/broken host_vitals probe → boot (0), never a

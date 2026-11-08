@@ -637,6 +637,15 @@ takes a free slot anyway and logs `yield bound reached`. The host VM cap and
 host-health yield still apply, and a failed age scan keeps yielding. Tier and
 single-label lanes only. Preview with `serve macos --print-yield-bound`.
 
+To make slower hosts prefer faster ones, `TARTCI_CLAIM_DELAY_SECONDS=N` (fleet
+lane key `claim_delay_seconds`; unset or `0` = off, today's behavior) makes a
+lane that is about to claim queued work sleep `N` seconds, re-run its own queue
+scan **once**, and back off (`claim_delay_backoff` event) if a faster host took
+the work. The cost is one queue read per claim attempt, none when off; a failed
+re-scan claims anyway (fail open). It never changes the host VM cap. Preview
+with `serve macos --print-claim-delay`. Set it on the gate lanes of slower
+hosts only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
+
 Install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep
 Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave
