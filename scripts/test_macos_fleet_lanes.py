@@ -1392,6 +1392,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     delay, peers = expected[host]
                     if peers is None:
                         self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env)
+                        self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env)
                         continue
                     self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], delay)
                     self.assertEqual(
