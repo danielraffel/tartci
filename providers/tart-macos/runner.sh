@@ -3342,9 +3342,7 @@ if [ "$LOOP" = 1 ]; then
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # Release per-turn ownership proofs immediately after run_one, before
       # the serving accounting grows. This keeps every early-return proof
-      # within the loop's bounded post-run window. An overlapped turn that left
-      # before its boundary still records a refusal its proof already holds.
-      tartci_precheck_overlap_note_unconsumed
+      # within the loop's bounded post-run window.
       tartci_boundary_proof_abandon
       tartci_job_claim_release
       # Every cause of clone-without-serve returns through here, so the streak

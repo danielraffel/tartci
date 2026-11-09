@@ -62,6 +62,9 @@ _tartci_boundary_proof_kill_tree(){
 # Drop any in-flight or unconsumed proof. Safe to call at any time and from
 # every exit path; a no-op when nothing was started.
 tartci_boundary_proof_abandon(){
+  # A refusal the proof already holds still counts for the overlap backoff,
+  # even though nothing consumed it (see tartci_precheck_overlap_note_unconsumed).
+  tartci_precheck_overlap_note_unconsumed
   if [ -n "$BOUNDARY_PROOF_PID" ]; then
     _tartci_boundary_proof_kill_tree "$BOUNDARY_PROOF_PID"
     wait "$BOUNDARY_PROOF_PID" 2>/dev/null || true
@@ -139,8 +142,8 @@ tartci_boundary_proof_start(){
 # long as the authority refuses and only an admit re-enables the overlap. A
 # lane whose authority is down boots one VM per refusal episode, not one per
 # window. The refusal is recorded at the boundary, or, when the run left
-# before reaching it, from the unconsumed proof (the main loop calls
-# tartci_precheck_overlap_note_unconsumed before dropping the proof).
+# before reaching it, from the unconsumed proof when it is dropped
+# (tartci_boundary_proof_abandon calls tartci_precheck_overlap_note_unconsumed).
 #
 # 2026-11-07..09 replay of this policy over the lane logs: 1086 prechecks a
 # day, 214 of them refused (m3 steward-in-progress defers, m5s observation

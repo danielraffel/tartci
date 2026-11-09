@@ -241,7 +241,7 @@ class UnconsumedProofTests(unittest.TestCase):
             f"PRECHECK_OVERLAP_RUN={overlapped}\nPRECHECK_OVERLAP_NOTED={noted}\n"
             "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 1\n"
             "_tartci_boundary_proof_join\n"
-            "tartci_precheck_overlap_note_unconsumed\n"
+            # Dropping the proof is what records it: every exit path drops it.
             "tartci_boundary_proof_abandon\n",
             env={"TARTCI_ADMISSION_PRECHECK_OVERLAP": "1"},
         )
