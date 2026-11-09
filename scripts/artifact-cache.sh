@@ -24,9 +24,15 @@
 #          and creates none, so a host that never ran git-sync is untouched; an
 #          absent cache is a no-op. With --compact-above N it also folds a
 #          mirror holding more than N packs, only when Tart reports no running
-#          VM at that moment, and skips (never fails) otherwise. This is what
-#          the scheduled com.danielraffel.tartci.artifact-cache-refresh agent
-#          runs. One failed mirror does not stop the others; the exit is 1.
+#          VM at that moment, and skips (never fails) otherwise. Then, for every
+#          line of the pin list (--pins FILE, default
+#          manifests/artifact-cache-pins.tsv) whose repository is mirrored
+#          here, it reads the pinned url and sha256 from the mirror's own copy
+#          of that repository's dependency manifest and adds the blob, so a
+#          pin bump reaches the cache within one refresh instead of never.
+#          This is what the scheduled com.danielraffel.tartci.artifact-cache-
+#          refresh agent runs. One failed mirror or pin does not stop the
+#          others; the exit is 1.
 #
 # A running guest may have the directory mounted, so nothing is ever rewritten
 # in place: a blob lands in a private staging file on the same filesystem and
@@ -36,7 +42,7 @@
 set -euo pipefail
 
 usage(){
-  sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
 }
 
@@ -52,6 +58,8 @@ esac
 cache_root="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
 dir="${TARTCI_ARTIFACT_CACHE_DIR:-$cache_root/artifact-cache}"
 url="" sha="" repo="" branch="main" days="" compact_above=""
+# Which pinned archives `refresh` keeps in the cache (see the file's header).
+pins="${TARTCI_ARTIFACT_CACHE_PINS:-$(cd "$(dirname "$0")/.." && pwd)/manifests/artifact-cache-pins.tsv}"
 # Where mirrors fetch from; tests point it at a local repository.
 git_base="${TARTCI_ARTIFACT_CACHE_GIT_BASE:-https://github.com}"
 while [ "$#" -gt 0 ]; do
@@ -62,6 +70,7 @@ while [ "$#" -gt 0 ]; do
     --branch) branch="${2:-}"; shift 2;;
     --older-than-days) days="${2:-}"; shift 2;;
     --compact-above) compact_above="${2:-}"; shift 2;;
+    --pins) pins="${2:-}"; shift 2;;
     --dir) dir="${2:-}"; shift 2;;
     -h|--help) usage 0;;
     *) die "unknown argument: $1";;
@@ -125,35 +134,81 @@ lock_cache(){
   trap cleanup EXIT
 }
 
+# Store <url>'s bytes as sha256/<sha> when they hash to <sha>. Caller holds
+# the lock. Returns non-zero with a message on stderr; never exits, so refresh
+# can carry on with the next pin.
+add_blob(){
+  local url="$1" sha="$2" dest actual
+  [[ "$sha" =~ ^[0-9a-f]{64}$ ]] \
+    || { printf 'artifact-cache: --sha256 must be 64 lowercase hex digits\n' >&2; return 1; }
+  case "$url" in
+    https://*) ;;
+    *) printf 'artifact-cache: --url must be https: %s\n' "$url" >&2; return 1;;
+  esac
+  mkdir -p "$dir/sha256"
+  dest="$dir/sha256/$sha"
+  if [ -f "$dest" ]; then
+    [ "$(sha256_of "$dest")" = "$sha" ] || {
+      printf 'artifact-cache: %s does not hash to its name; remove it by hand and re-add\n' "$dest" >&2
+      return 1
+    }
+    touch "$dest"
+    printf 'artifact-cache: sha256/%s already present (verified, age refreshed)\n' "$sha"
+    return 0
+  fi
+  staging="$(mktemp "$dir/sha256/.staging.XXXXXX")"
+  if ! curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
+      --retry-delay 5 --connect-timeout 30 --output "$staging" "$url"; then
+    rm -f "$staging"; staging=""
+    printf 'artifact-cache: download failed: %s\n' "$url" >&2
+    return 1
+  fi
+  actual="$(sha256_of "$staging")"
+  if [ "$actual" != "$sha" ]; then
+    rm -f "$staging"; staging=""
+    printf 'artifact-cache: SHA-256 mismatch for %s: expected %s, got %s\n' "$url" "$sha" "$actual" >&2
+    return 1
+  fi
+  chmod 0644 "$staging"
+  mv "$staging" "$dest"
+  staging=""
+  printf 'artifact-cache: added sha256/%s (%s bytes) from %s\n' \
+    "$sha" "$(wc -c <"$dest" | tr -d ' ')" "$url"
+}
+
+# Print "<url> <sha256>" for one pin: the release asset <asset> of the
+# dependency named <dependency> in <path> on <branch> of the local mirror. The
+# manifest is read from the mirror, never from the network or a guest, so the
+# digest is exactly the one the repository's own jobs pin and re-verify.
+pin_asset(){
+  local mirror="$1" pin_branch="$2" path="$3" dependency="$4" asset="$5"
+  git -C "$mirror" show "refs/heads/$pin_branch:$path" 2>/dev/null \
+    | python3 -c '
+import json, re, sys
+dependency, asset = sys.argv[1], sys.argv[2]
+try:
+    manifest = json.load(sys.stdin)
+except ValueError:
+    sys.exit("manifest is not JSON")
+for entry in manifest.get("dependencies", []):
+    if isinstance(entry, dict) and str(entry.get("name", "")).lower() == dependency.lower():
+        found = ((entry.get("determinism") or {}).get("release_assets") or {}).get(asset)
+        if not isinstance(found, dict):
+            sys.exit(f"{dependency} has no release asset {asset}")
+        url, sha = str(found.get("url", "")), str(found.get("sha256", ""))
+        if not url.startswith("https://") or re.fullmatch(r"[0-9a-f]{64}", sha) is None or " " in url:
+            sys.exit(f"{dependency} {asset}: unusable url or sha256")
+        print(url, sha)
+        sys.exit(0)
+sys.exit(f"no dependency named {dependency}")
+' "$dependency" "$asset"
+}
+
 case "$cmd" in
   add)
     [ -n "$url" ] || die "--url is required"
-    [[ "$sha" =~ ^[0-9a-f]{64}$ ]] || die "--sha256 must be 64 lowercase hex digits"
-    case "$url" in
-      https://*) ;;
-      *) die "--url must be https: $url";;
-    esac
     lock_cache
-    mkdir -p "$dir/sha256"
-    dest="$dir/sha256/$sha"
-    if [ -f "$dest" ]; then
-      [ "$(sha256_of "$dest")" = "$sha" ] \
-        || die "$dest does not hash to its name; remove it by hand and re-add"
-      touch "$dest"
-      printf 'artifact-cache: sha256/%s already present (verified, age refreshed)\n' "$sha"
-      exit 0
-    fi
-    staging="$(mktemp "$dir/sha256/.staging.XXXXXX")"
-    curl --fail --location --silent --show-error --retry 5 --retry-all-errors \
-      --retry-delay 5 --connect-timeout 30 --output "$staging" "$url" \
-      || die "download failed: $url"
-    actual="$(sha256_of "$staging")"
-    [ "$actual" = "$sha" ] || die "SHA-256 mismatch for $url: expected $sha, got $actual"
-    chmod 0644 "$staging"
-    mv "$staging" "$dest"
-    staging=""
-    printf 'artifact-cache: added sha256/%s (%s bytes) from %s\n' \
-      "$sha" "$(wc -c <"$dest" | tr -d ' ')" "$url"
+    add_blob "$url" "$sha" || exit 1
     ;;
 
   git-sync)
@@ -247,6 +302,30 @@ case "$cmd" in
         fi
       fi
     done
+    # Pinned archives: one tab-separated line per blob, for mirrored repos only.
+    if [ -n "$pins" ] && [ -f "$pins" ]; then
+      while IFS=$'\t' read -r pin_repo pin_branch pin_path pin_dep pin_asset || [ -n "$pin_repo" ]; do
+        case "$pin_repo" in ''|'#'*) continue;; esac
+        mirror="$dir/git/$pin_repo.git"
+        # A pin for a repository this host does not mirror is not this host's.
+        [ -d "$mirror" ] || continue
+        if ! [[ "$pin_branch" =~ ^[A-Za-z0-9_./-]+$ ]] || [ -z "$pin_path" ] \
+           || [ -z "$pin_dep" ] || [ -z "$pin_asset" ]; then
+          printf 'artifact-cache: malformed pin line for %s in %s\n' "$pin_repo" "$pins" >&2
+          failed=1
+          continue
+        fi
+        if ! pinned="$(pin_asset "$mirror" "$pin_branch" "$pin_path" "$pin_dep" "$pin_asset")"; then
+          printf 'artifact-cache: pin %s %s %s: could not read it from %s:%s\n' \
+            "$pin_repo" "$pin_dep" "$pin_asset" "$pin_branch" "$pin_path" >&2
+          failed=1
+          continue
+        fi
+        if ! add_blob "${pinned% *}" "${pinned##* }"; then
+          failed=1
+        fi
+      done <"$pins"
+    fi
     exit "$failed"
     ;;
 

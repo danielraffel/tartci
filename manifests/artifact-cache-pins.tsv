@@ -1,0 +1,13 @@
+# Pinned archives `tartci artifact-cache refresh` keeps in the host artifact
+# cache that macOS gate VMs mount read-only (scripts/artifact-cache.sh).
+# One tab-separated line per blob:
+#   <owner/repo>  <branch>  <manifest path>  <dependency name>  <release asset>
+# The url and sha256 are read from the mirror's copy of that manifest, so a
+# pin bump in the repository reaches the cache at the next refresh. A line
+# whose repository is not mirrored on a host is skipped there.
+#
+# Pulp gate jobs fetch the Skia archive through
+# tools/scripts/fetch_skia_for_release.py, which copies sha256/<pin> from
+# TARTCI_ARTIFACT_CACHE when present and re-verifies it. Without this line the
+# blob for the current pin was never added, so every job downloaded it.
+Generous-Corp/pulp	main	tools/deps/manifest.json	Skia	mac-arm64
