@@ -1674,6 +1674,26 @@ synchronous call the boundary always made. The `admission_check` event says
 which answer was used (`source=parallel age=Ns` or `source=boundary`).
 `TARTCI_BOUNDARY_PROOF_PARALLEL=0` restores the fully sequential boundary.
 
+The pre-clone precheck asks the same admission question before the lease, so
+on a served job the verdict is asked twice and the first ask holds the VM slot
+for its whole duration (p50 37-48 s per served job, about 6 slot-hours a day
+across the four hosts in the 2026-11-07..09 lane logs). A lane profile can opt
+in to `admission_precheck_overlap = true` (`TARTCI_ADMISSION_PRECHECK_OVERLAP=1`):
+run_one then skips the serial precheck, logs `admission_precheck_overlap`, and
+the parallel proof above answers the question beside the clone, boot and guest
+preflights. Nothing is admitted that would not have been: the boundary still
+refuses, discards the unregistered VM and returns the same code. What changes
+is the price of a refusal, which now costs a clone and a boot. So a refusal at
+the boundary of an overlapped run logs `precheck_overlap_backoff` and brings
+the serial precheck back for `admission_precheck_overlap_backoff_seconds`
+(default 600, range 0..3600, 0 = never); the first serial admit ends the
+backoff early (`precheck_overlap_backoff_cleared`). The state is one file,
+`$STATE_DIR/<runner>.precheck-overlap-backoff` (an epoch); an unreadable or
+future-dated file counts as an open backoff. The overlap is inactive while
+parallel proofs are off or a warm VM is parked. To turn it off on one host
+without a re-render, write a current epoch into that file before each window
+expires, or remove the profile key and reload at an idle boundary.
+
 A repository-access proof that GitHub could not answer (a timed-out or failed
 API call, not a denial) is asked once more, synchronously, before the booted VM
 is discarded; each retry logs `jit_repository_access_retry` with a `reason=`.
