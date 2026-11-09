@@ -76,6 +76,7 @@ def wait_for_proof(h: precheck.RunOneHarness) -> None:
         if done and list(h.state.glob("*.boundary-proof/admission.rc")):
             return
         time.sleep(0.1)
+    raise AssertionError("the overlapped run never finished its parallel proof")
 
 
 def backoff_file(h: precheck.RunOneHarness) -> Path:
@@ -127,14 +128,17 @@ class BackoffTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             h = precheck.RunOneHarness(Path(raw))
             counting_shipyard(h, "defer", "stale_compatible_runs", 3)
-            backoff_file(h).write_text(f"{int(time.time())}\n")
+            opened = int(time.time()) - 300
+            backoff_file(h).write_text(f"{opened}\n")
             result = h.run(env_overrides=OVERLAP_ON)
             self.assertEqual(result.returncode, 3, result.stderr)
             names = h.event_names()
             self.assertIn("admission_precheck_deferred", names)
             self.assertNotIn("clone_start", names)
-            # A serial refusal does not close the backoff.
-            self.assertTrue(backoff_file(h).exists())
+            # A serial refusal keeps the backoff open: it re-stamps it, so the
+            # overlap comes back only after an admit.
+            self.assertGreater(int(backoff_file(h).read_text()), opened)
+            self.assertIn("stage=serial", h.detail_for("precheck_overlap_backoff"))
 
     def test_control_expired_backoff_overlaps_again(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -192,7 +196,7 @@ class BoundaryOpensTheBackoffTests(unittest.TestCase):
         result = h.run(
             boundary.boundary_function()
             + "RUNNER_NAME=lane-01\n"
-            + f"precheck_overlap={overlapped}\n"
+            + f"PRECHECK_OVERLAP_RUN={overlapped}\n"
             + "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 1\n"
             + "rc=0; boundary || rc=$?\nexit $rc\n",
             env={"TARTCI_ADMISSION_PRECHECK_OVERLAP": "1"},
@@ -204,6 +208,7 @@ class BoundaryOpensTheBackoffTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertEqual(h.discards.read_text().split(), ["discard"])
         self.assertIn("precheck_overlap_backoff", h.event_names())
+        self.assertIn("stage=boundary", h.events.read_text())
         stamp = (h.state / "lane-01.precheck-overlap-backoff").read_text().strip()
         self.assertLessEqual(abs(int(stamp) - time.time()), 30)
 
@@ -219,6 +224,44 @@ class BoundaryOpensTheBackoffTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(h.discards.exists())
         self.assertFalse((h.state / "lane-01.precheck-overlap-backoff").exists())
+
+
+class UnconsumedProofTests(unittest.TestCase):
+    """A run that left before its boundary still records its proof's refusal."""
+
+    def _run(self, verdict: tuple[str, str, int], overlapped: int, noted: int = 0
+             ) -> tuple[subprocess.CompletedProcess, boundary.Harness]:
+        raw = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, raw, True)
+        h = boundary.Harness(Path(raw))
+        h.stub_shipyard([verdict])
+        h.stub_gh()
+        result = h.run(
+            "RUNNER_NAME=lane-01\n"
+            f"PRECHECK_OVERLAP_RUN={overlapped}\nPRECHECK_OVERLAP_NOTED={noted}\n"
+            "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 1\n"
+            "_tartci_boundary_proof_join\n"
+            "tartci_precheck_overlap_note_unconsumed\n"
+            "tartci_boundary_proof_abandon\n",
+            env={"TARTCI_ADMISSION_PRECHECK_OVERLAP": "1"},
+        )
+        return result, h
+
+    def test_an_unconsumed_refusal_opens_the_backoff(self) -> None:
+        result, h = self._run(("error", "observation_failed", 1), overlapped=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((h.state / "lane-01.precheck-overlap-backoff").exists())
+        self.assertIn("stage=pre_boundary", h.events.read_text())
+
+    def test_controls_admit_serial_run_or_already_noted_record_nothing(self) -> None:
+        for verdict, overlapped, noted in ((("admit", "clean", 0), 1, 0),
+                                           (("error", "observation_failed", 1), 0, 0),
+                                           (("error", "observation_failed", 1), 1, 1)):
+            with self.subTest(verdict=verdict[0], overlapped=overlapped, noted=noted):
+                result, h = self._run(verdict, overlapped, noted)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertFalse((h.state / "lane-01.precheck-overlap-backoff").exists())
+                self.assertNotIn("precheck_overlap_backoff", h.event_names())
 
 
 class LibraryTests(unittest.TestCase):
@@ -239,6 +282,23 @@ class LibraryTests(unittest.TestCase):
         self.assertEqual(on.stdout.strip(), "yes", on.stderr)
         warm = self._bash("WARM_VM=parked-vm\ntartci_precheck_overlap_active && echo yes || echo no\n", OVERLAP_ON)
         self.assertEqual(warm.stdout.strip(), "no", warm.stderr)
+
+    def test_the_backoff_is_shared_by_the_lane_slots(self) -> None:
+        script = ("RUNNER_NAME=lane-02\n"
+                  "tartci_precheck_overlap_note_refusal 3\n"
+                  "RUNNER_NAME=lane-01\n"
+                  "WARM_VM=''\ntartci_precheck_overlap_active && echo yes || echo no\n")
+        shared = self._bash(script, {**OVERLAP_ON, "TARTCI_RUNNER_NAME_PREFIX": "lane"})
+        self.assertEqual(shared.stdout.strip(), "no", shared.stderr)
+        # Control: without the lane prefix each slot keeps its own file.
+        alone = self._bash(script, OVERLAP_ON)
+        self.assertEqual(alone.stdout.strip(), "yes", alone.stderr)
+
+    def test_a_leading_zero_stamp_is_decimal(self) -> None:
+        script = ("printf '0%s\\n' \"$(date +%s)\" >\"$STATE_DIR/lane-01.precheck-overlap-backoff\"\n"
+                  "WARM_VM=''\ntartci_precheck_overlap_active && echo yes || echo no\n")
+        result = self._bash(script, OVERLAP_ON)
+        self.assertEqual(result.stdout.strip(), "no", result.stderr)
 
     def test_default_is_off(self) -> None:
         env = {k: v for k, v in os.environ.items() if not k.startswith("TARTCI_ADMISSION_PRECHECK_OVERLAP")}

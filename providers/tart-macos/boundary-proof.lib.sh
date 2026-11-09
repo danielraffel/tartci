@@ -132,11 +132,20 @@ tartci_boundary_proof_start(){
 #
 # What changes is the price of a refusal: a VM is cloned and booted before it
 # is discarded, where the precheck would have skipped the clone. So a refusal
-# seen at the boundary of an overlapped run opens a backoff: for
-# TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS (default 600, 0 = none) this
-# lane runs the serial precheck again, and the first serial admit closes the
-# backoff early. A lane whose admission authority is down therefore boots at
-# most one VM per backoff window instead of one per poll.
+# of an overlapped run opens a backoff, kept per lane (both supervisor slots
+# share it): for TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS (default 600,
+# 0 = none) the lane runs the serial precheck again. A serial refusal during
+# the backoff re-stamps it and a serial admit ends it, so the backoff lasts as
+# long as the authority refuses and only an admit re-enables the overlap. A
+# lane whose authority is down boots one VM per refusal episode, not one per
+# window. The refusal is recorded at the boundary, or, when the run left
+# before reaching it, from the unconsumed proof (the main loop calls
+# tartci_precheck_overlap_note_unconsumed before dropping the proof).
+#
+# 2026-11-07..09 replay of this policy over the lane logs: 1086 prechecks a
+# day, 214 of them refused (m3 steward-in-progress defers, m5s observation
+# errors). 885 a day would have overlapped, saving 5.4 slot-h; 77 a day would
+# have been refused after a boot, costing about 0.9 slot-h and 77 clones.
 
 TARTCI_PRECHECK_OVERLAP_BACKOFF_DEFAULT=600
 
@@ -153,8 +162,14 @@ tartci_precheck_overlap_validate(){
     || { printf 'invalid TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS: expected 0-3600\n' >&2; return 2; }
 }
 
+# Set by run_one for the current turn; read by the boundary and the loop.
+PRECHECK_OVERLAP_RUN=0
+PRECHECK_OVERLAP_NOTED=0
+
+# One file per lane: the rendered name prefix is shared by the lane's slots
+# (RUNNER_NAME adds the slot number), and so is STATE_DIR.
 tartci_precheck_overlap_backoff_file(){
-  printf '%s/%s.precheck-overlap-backoff' "$STATE_DIR" "$RUNNER_NAME"
+  printf '%s/%s.precheck-overlap-backoff' "$STATE_DIR" "${TARTCI_RUNNER_NAME_PREFIX:-$RUNNER_NAME}"
 }
 
 # Seconds left in this lane's backoff, or nothing when none is open. An
@@ -173,7 +188,8 @@ tartci_precheck_overlap_backoff_remaining(){
     printf '%s' "$window"
     return 0
   fi
-  left=$((at + window - now))
+  # Base 10: a hand-edited stamp with a leading zero is not octal.
+  left=$((10#$at + window - now))
   [ "$left" -le 0 ] || printf '%s' "$left"
 }
 
@@ -190,19 +206,32 @@ tartci_precheck_overlap_active(){
   [ -z "$(tartci_precheck_overlap_backoff_remaining)" ]
 }
 
-# Called at the boundary when an overlapped run was refused: open the backoff.
+# Open (or re-stamp) the backoff. Args: rc stage (boundary|pre_boundary|serial).
 tartci_precheck_overlap_note_refusal(){
-  local rc="$1" file tmp window
+  local rc="$1" stage="${2:-boundary}" file tmp window
+  PRECHECK_OVERLAP_NOTED=1
   window="${TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS:-$TARTCI_PRECHECK_OVERLAP_BACKOFF_DEFAULT}"
   [ "$window" -gt 0 ] || return 0
   file="$(tartci_precheck_overlap_backoff_file)"
   tmp="$file.tmp.$$"
   if printf '%s\n' "$(date +%s)" >"$tmp" 2>/dev/null && mv -f "$tmp" "$file" 2>/dev/null; then
-    event precheck_overlap_backoff "rc=$rc backoff=${window}s"
+    event precheck_overlap_backoff "rc=$rc stage=$stage backoff=${window}s"
   else
     rm -f "$tmp" 2>/dev/null || true
-    event precheck_overlap_backoff_unrecorded "rc=$rc"
+    event precheck_overlap_backoff_unrecorded "rc=$rc stage=$stage"
   fi
+}
+
+# An overlapped run that left before the boundary (a preflight failure, a
+# yield) never consumed its proof. If that proof had already refused, the
+# refusal still counts. Non-blocking: a proof still running records nothing.
+tartci_precheck_overlap_note_unconsumed(){
+  local rc
+  [ "${PRECHECK_OVERLAP_RUN:-0}" = 1 ] || return 0
+  [ "${PRECHECK_OVERLAP_NOTED:-0}" = 0 ] || return 0
+  [ -n "$BOUNDARY_PROOF_DIR" ] || return 0
+  rc="$(_tartci_boundary_proof_read_rc "$BOUNDARY_PROOF_DIR/admission.rc")" || return 0
+  [ "$rc" -eq 0 ] || tartci_precheck_overlap_note_refusal "$rc" pre_boundary
 }
 
 # Called after a serial precheck admits: the authority answers again, so the

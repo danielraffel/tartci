@@ -1683,13 +1683,21 @@ run_one then skips the serial precheck, logs `admission_precheck_overlap`, and
 the parallel proof above answers the question beside the clone, boot and guest
 preflights. Nothing is admitted that would not have been: the boundary still
 refuses, discards the unregistered VM and returns the same code. What changes
-is the price of a refusal, which now costs a clone and a boot. So a refusal at
-the boundary of an overlapped run logs `precheck_overlap_backoff` and brings
-the serial precheck back for `admission_precheck_overlap_backoff_seconds`
-(default 600, range 0..3600, 0 = never); the first serial admit ends the
-backoff early (`precheck_overlap_backoff_cleared`). The state is one file,
-`$STATE_DIR/<runner>.precheck-overlap-backoff` (an epoch); an unreadable or
-future-dated file counts as an open backoff until a serial admit removes it.
+is the price of a refusal, which now costs a clone and a boot. So a refusal of
+an overlapped run (at the boundary, or found in the unconsumed proof of a run
+that left earlier) logs `precheck_overlap_backoff stage=...` and brings the
+serial precheck back for `admission_precheck_overlap_backoff_seconds`
+(default 600, range 0..3600, 0 = never). A serial refusal during the backoff
+re-stamps it (`stage=serial`) and a serial admit ends it
+(`precheck_overlap_backoff_cleared`), so a down authority costs one booted VM
+per refusal episode. The state is one file per lane, shared by its slots,
+`$STATE_DIR/<runner-name-prefix>.precheck-overlap-backoff` (an epoch); an
+unreadable or future-dated file counts as an open backoff until a serial admit
+removes it. Replaying the 2026-11-07..09 lane logs through this policy: 1086
+prechecks a day, 214 refused; 885 would have overlapped (5.4 slot-h saved) and
+77 would have been refused after a boot (about 0.9 slot-h and 77 clones, 35 of
+them on m3, whose refusals are mostly `stewardship_in_progress` defers). Enable
+it first where refusals are rare (m5: 10 a day).
 The overlap is inactive while parallel proofs are off or a warm VM is parked.
 To turn it off, remove the profile key, re-render and reload the lane at an
 idle boundary.

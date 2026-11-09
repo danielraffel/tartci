@@ -2604,15 +2604,20 @@ run_one(){
   # parallel proof, started once the lease is held, answers the same question
   # beside the clone and boot. The boundary below still refuses exactly as
   # before; a refusal there opens a backoff that brings this precheck back.
-  local precheck_overlap=0
-  if tartci_admission_clean_enabled && tartci_precheck_overlap_active; then
-    precheck_overlap=1
+  PRECHECK_OVERLAP_RUN=0
+  # shellcheck disable=SC2034 # read by tartci_precheck_overlap_note_unconsumed
+  PRECHECK_OVERLAP_NOTED=0
+  # Without a runner group the cold boot starts no proof; skipping the
+  # precheck would then save nothing and lose its early bail.
+  if tartci_admission_clean_enabled && [ -n "$selected_group_id" ] \
+     && tartci_precheck_overlap_active; then
+    PRECHECK_OVERLAP_RUN=1
     # Same in-flight phase every reader already knows (gate_supply, lane_busy,
     # the launchd watchdog): this lane is reaching for a job before its clone.
     heartbeat admission-precheck
     event admission_precheck_overlap "repo=$REPO labels=$selected_labels"
   fi
-  if tartci_admission_clean_enabled && [ "$precheck_overlap" = 0 ]; then
+  if tartci_admission_clean_enabled && [ "$PRECHECK_OVERLAP_RUN" = 0 ]; then
     local precheck_json="" precheck_rc=0
     heartbeat admission-precheck
     event admission_precheck "repo=$REPO labels=$selected_labels"
@@ -2635,6 +2640,10 @@ run_one(){
       event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
         "rc=$precheck_rc pre_clone=true $precheck_detail"
       tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" admission_precheck
+      # With the overlap on, a serial refusal keeps the lane's backoff open:
+      # only an admit may re-enable the overlap.
+      [ "${TARTCI_ADMISSION_PRECHECK_OVERLAP:-0}" != 1 ] \
+        || tartci_precheck_overlap_note_refusal "$precheck_rc" serial
       note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
       return "$precheck_rc"
     fi
@@ -2824,7 +2833,7 @@ run_one(){
       heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
         "rc=$admission_rc unregistered=true $admission_detail"
-      [ "${precheck_overlap:-0}" != 1 ] || tartci_precheck_overlap_note_refusal "$admission_rc"
+      [ "${PRECHECK_OVERLAP_RUN:-0}" != 1 ] || tartci_precheck_overlap_note_refusal "$admission_rc" boundary
       note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_vm
       tartci_release_vm_lease
@@ -3333,7 +3342,9 @@ if [ "$LOOP" = 1 ]; then
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # Release per-turn ownership proofs immediately after run_one, before
       # the serving accounting grows. This keeps every early-return proof
-      # within the loop's bounded post-run window.
+      # within the loop's bounded post-run window. An overlapped turn that left
+      # before its boundary still records a refusal its proof already holds.
+      tartci_precheck_overlap_note_unconsumed
       tartci_boundary_proof_abandon
       tartci_job_claim_release
       # Every cause of clone-without-serve returns through here, so the streak
