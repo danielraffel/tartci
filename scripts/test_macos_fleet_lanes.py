@@ -1287,32 +1287,135 @@ class MacosFleetLaneTests(unittest.TestCase):
         marker = 'yield_to_workflow = "Build and Test"\n'
         base = HOST_CONFIGS["m5"].read_text()
         self.assertEqual(base.count(marker), 1)
+        peers = 'claim_delay_peers = ["m5studio"]\n'
         for value, expected in (("30", "30"), ("0", None)):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
                 path = Path(td) / "m5.toml"
+                extra = peers if expected is not None else ""
                 path.write_text(base.replace(
-                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                    marker, marker + f"claim_delay_seconds = {value}\n" + extra))
                 env = self._release_env(fleet.load(path))
                 if expected is None:
                     self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env)
+                    self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env)
                 else:
                     self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], expected)
+                    self.assertEqual(
+                        env["TARTCI_CLAIM_DELAY_PEERS"],
+                        f"m5studio={fleet.fallback_peer_target('m5studio')}")
         # Never enabled by an upgrade: no shipped profile sets it.
         for host, profile in HOST_CONFIGS.items():
             for name, body in fleet.rendered_plists(fleet.load(profile)).items():
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env, (host, name))
+                self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env, (host, name))
 
     def test_claim_delay_rejects_invalid_values(self) -> None:
         marker = 'yield_to_workflow = "Build and Test"\n'
         base = HOST_CONFIGS["m5"].read_text()
+        peers = 'claim_delay_peers = ["m5studio"]\n'
         for value in ("-1", "1.5", '"30"', "true"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
                 path = Path(td) / "m5.toml"
                 path.write_text(base.replace(
-                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                    marker, marker + f"claim_delay_seconds = {value}\n" + peers))
                 with self.assertRaisesRegex(ValueError, "claim_delay_seconds"):
                     fleet.load(path)
+
+    def _ranked_profiles(self, td: str, ranks: dict[str, int | None]) -> Path:
+        """Copies of the four shipped profiles with pulp-gate ranked as given."""
+        root = Path(td) / "profiles"
+        root.mkdir()
+        marker = 'id = "pulp-gate"\n'
+        for host, profile in HOST_CONFIGS.items():
+            body = profile.read_text()
+            self.assertEqual(body.count(marker), 1, host)
+            rank = ranks.get(host)
+            if rank is not None:
+                body = body.replace(marker, marker + f"claim_rank = {rank}\n")
+            (root / profile.name).write_text(body)
+        return root
+
+    def _gate_env(self, profiles: Path, host: str) -> dict:
+        name = (f"com.danielraffel.tartci.tart-runner-macos-fleet."
+                f"{host}.pulp-gate.plist")
+        with mock.patch.object(fleet, "DEFAULT_PROFILES_DIR", profiles):
+            data = fleet.load(profiles / HOST_CONFIGS[host].name)
+            return plistlib.loads(fleet.rendered_plists(data)[name])["EnvironmentVariables"]
+
+    def test_claim_rank_orders_the_gate_by_host_speed(self) -> None:
+        """m5studio, then studio (m3), then m5, then m1 last."""
+        ranks = {"m5studio": 0, "studio": 1, "m5": 2, "m1": 3}
+        with tempfile.TemporaryDirectory() as td:
+            profiles = self._ranked_profiles(td, ranks)
+            self.assertEqual(
+                fleet.claim_rank_peers("m1", "pulp-gate", 3, profiles),
+                ["m5studio", "studio", "m5"])
+            fastest = self._gate_env(profiles, "m5studio")
+            self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", fastest)
+            self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", fastest)
+            expected = {"studio": ("30", ["m5studio"]),
+                        "m5": ("60", ["m5studio", "studio"]),
+                        "m1": ("90", ["m5studio", "studio", "m5"])}
+            for host, (delay, peers) in expected.items():
+                with self.subTest(host=host):
+                    env = self._gate_env(profiles, host)
+                    self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], delay)
+                    self.assertEqual(
+                        [item.split("=", 1)[0]
+                         for item in env["TARTCI_CLAIM_DELAY_PEERS"].split(",")],
+                        peers)
+
+    def test_an_unranked_peer_is_never_waited_for(self) -> None:
+        # Only m1 ranked: nobody faster is ranked, so m1 renders no delay, which
+        # is today's behaviour. Ranking is opt-in per host.
+        with tempfile.TemporaryDirectory() as td:
+            profiles = self._ranked_profiles(td, {"m1": 3})
+            env = self._gate_env(profiles, "m1")
+            self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env)
+            # Control: rank one faster host and m1 waits for exactly it.
+            other = Path(td) / "two"
+            other.mkdir()
+            profiles = self._ranked_profiles(str(other), {"m1": 3, "m5studio": 0})
+            env = self._gate_env(profiles, "m1")
+            self.assertEqual(env["TARTCI_CLAIM_DELAY_PEERS"].split("=", 1)[0], "m5studio")
+
+    def test_claim_rank_rejects_invalid_values(self) -> None:
+        marker = 'id = "pulp-gate"\n'
+        base = HOST_CONFIGS["m5"].read_text()
+        for extra in ("claim_rank = 10\n", "claim_rank = -1\n", 'claim_rank = "1"\n',
+                      'claim_rank = 2\nclaim_delay_seconds = 30\nclaim_delay_peers = ["m5studio"]\n'):
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m5.toml"
+                path.write_text(base.replace(marker, marker + extra))
+                with self.assertRaisesRegex(ValueError, "claim_"):
+                    fleet.load(path)
+
+    def test_claim_delay_needs_peers_and_peers_need_a_delay(self) -> None:
+        """A delay with nothing to wait for never sleeps, so it is refused."""
+        marker = 'yield_to_workflow = "Build and Test"\n'
+        base = HOST_CONFIGS["m5"].read_text()
+        cases = (
+            ("claim_delay_seconds = 30\n", "claim_delay_peers"),
+            ('claim_delay_peers = ["m5studio"]\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = []\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["m5"]\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["m5studio", "m5studio"]\n',
+             "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["Bad Host"]\n', "claim_delay_peers"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m5.toml"
+                path.write_text(base.replace(marker, marker + extra))
+                with self.assertRaisesRegex(ValueError, message):
+                    fleet.load(path)
+        # Control: the valid pair loads.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(base.replace(
+                marker, marker + 'claim_delay_seconds = 30\nclaim_delay_peers = ["m5studio"]\n'))
+            fleet.load(path)
 
     def test_yield_bound_rejects_invalid_values(self) -> None:
         for value in ("-1", "45.5", '"2700"', "true"):

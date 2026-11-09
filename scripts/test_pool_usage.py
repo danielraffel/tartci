@@ -127,6 +127,24 @@ class IdleWithDemandFixture(unittest.TestCase):
         self.assertEqual(host["idle_with_demand_by_reason"],
                          {"demand_waiting:slot_full": 10.0, "yielded_to_priority": 15.0})
 
+    def test_a_slot_held_by_a_sibling_reservation_is_full_not_idle(self) -> None:
+        # One guest of two, but both slots reserved: a sibling lane is between
+        # its job claim and its guest appearing. That is a full host (queueing
+        # behind a boot), not idle capacity. The guest-count-only reading of the
+        # same sample is what reported these waits as a free slot.
+        write_lane(self.root, "a", [ev("11:10:00", "demand_waiting", queued=1, running=1,
+                                       cap=2, poll=20, reason="slot_full", reserved=2)])
+        write_lane(self.root, "b", [ev("11:20:00", "demand_waiting", queued=1, running=1,
+                                       cap=2, poll=20, reason="slot_full", reserved=1)],
+                   runner="lane-b")
+        host = report(self.root)["hosts"][0]
+        lanes = {l["lane"]: l for l in host["lanes"]}
+        self.assertEqual(lanes["a"]["idle_with_demand_seconds"], 0.0)
+        self.assertEqual(lanes["a"]["full_host_wait_seconds"], 20.0)
+        # Control: reservations below the cap leave the slot genuinely free.
+        self.assertEqual(lanes["b"]["idle_with_demand_seconds"], 20.0)
+        self.assertEqual(lanes["b"]["full_host_wait_seconds"], 0.0)
+
     def test_unknown_guest_count_is_neither_idle_nor_full(self) -> None:
         write_lane(self.root, "a", [ev("11:10:00", "demand_waiting", queued=1, running="unknown",
                                        cap=2, poll=20, reason="slot_full")])
@@ -308,6 +326,11 @@ class Wiring(unittest.TestCase):
         branch = branch[:branch.index("\n      fi")]
         self.assertRegex(branch, r'event demand_waiting "[^"]*" \\\n\s+queued="\$q" running="\$r" '
                                  r'cap="\$cap" poll="\$POLL" reason=slot_full')
+        # The sample carries the reservations the claim counted, and the log
+        # line says so, so a reader can tell a booting sibling from a free slot.
+        self.assertIn('reserved="$reserved"', branch)
+        self.assertIn('reserved="$(tartci_count_reservations)"', src)
+        self.assertIn("reserved=$reserved priority_demand=$p)", src)
 
     def test_pool_status_dispatches_usage_and_prints_a_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

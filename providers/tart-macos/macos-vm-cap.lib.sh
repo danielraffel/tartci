@@ -62,6 +62,33 @@ tartci_active_reservations(){
   printf '%s' "$n"
 }
 
+# Count live reservations WITHOUT pruning, for reporting and for decisions taken
+# outside the host lock. tartci_claim_macos_slot creates a reservation empty
+# (mktemp) and writes it a moment later, so an unlocked pruner could delete a
+# sibling's reservation in that window; this reader only skips what it cannot
+# read. The same liveness rules as tartci_active_reservations otherwise.
+tartci_count_reservations(){
+  local now line pid tok ts live n=0 f
+  now="$(date +%s)"
+  [ -d "$TARTCI_MACOS_RESV_DIR" ] || { printf 0; return; }
+  for f in "$TARTCI_MACOS_RESV_DIR"/resv.*; do
+    [ -e "$f" ] || continue
+    line="$(cat "$f" 2>/dev/null || echo)"
+    [ -n "$line" ] || continue
+    read -r pid tok ts _ <<<"$line"
+    if [ -z "$ts" ]; then ts="$tok"; tok=""; fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then continue; fi
+    if [ -n "$pid" ] && [ -n "$tok" ]; then
+      live="$(tartci_pid_token "$pid")"
+      if [ -n "$live" ] && [ "$live" != "$tok" ]; then continue; fi
+    fi
+    case "$ts" in ""|*[!0-9]*) ts=0;; esac
+    [ $(( now - ts )) -le "$TARTCI_MACOS_RESV_TTL" ] || continue
+    n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
 # Atomic host-wide lock via mkdir. Steals a dead holder's lock. Returns 1 (fail
 # open) after the timeout so a pathological lock never blocks booting forever.
 tartci_lock(){

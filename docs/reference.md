@@ -639,13 +639,42 @@ host-health yield still apply, and a failed age scan keeps yielding. Tier and
 single-label lanes only. Preview with `serve macos --print-yield-bound`.
 
 To make slower hosts prefer faster ones, `TARTCI_CLAIM_DELAY_SECONDS=N` (fleet
-lane key `claim_delay_seconds`; unset or `0` = off, today's behavior) makes a
-lane that is about to claim queued work sleep `N` seconds, re-run its own queue
-scan **once**, and back off (`claim_delay_backoff` event) if a faster host took
-the work. The cost is one queue read per claim attempt, none when off; a failed
-re-scan claims anyway (fail open). It never changes the host VM cap. Preview
-with `serve macos --print-claim-delay`. Set it on the gate lanes of slower
-hosts only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
+lane key `claim_delay_seconds`, which requires `claim_delay_peers`; unset or
+`0` = off; capped at 90) makes a lane that is about to claim queued work first
+read the published supply of the faster hosts in `TARTCI_CLAIM_DELAY_PEERS`
+(fleet lane key `claim_delay_peers`, a list of host ids) with
+`scripts/gate_supply.py`, the report the fallback lane uses. It sleeps only when
+that decision is `hold` (every peer report fresh and readable, at most
+`TARTCI_CLAIM_DELAY_PEER_MAX_AGE_SECS`, default 60) and the peers' free, healthy
+lanes alone cover every queued job of the class; it then sleeps `N` seconds,
+re-runs its own selection **once**, live, and backs off (`claim_delay_backoff`
+event) if a faster host took the work. With no peers, unreadable supply, more
+queued jobs than free faster slots, or every local slot already reserved, it
+claims at once (`claim_delay_skipped` event, with the reason), so the delay
+never idles a free slot that no faster host can fill. A failed re-scan claims
+anyway (fail open). Cost per claim decision: one ssh per peer, and on an
+event-class-v2 lane whose peers have a free slot one exhaustive scan for the
+class magnitude, plus the live recheck after a sleep. Only tier and
+event-class-v2 lanes have a class to ask about; a single-label lane never
+sleeps. The delay is re-read on every decision from `TARTCI_CLAIM_DELAY_FILE`
+(default `~/.config/tartci/claim-delay-seconds`) when that file holds an
+integer from 0 to 90, so it can be changed or set to 0 without a pool drain;
+the file cannot enable a lane that has no `TARTCI_CLAIM_DELAY_PEERS`. The cap
+exists because the lane writes no heartbeat while it sleeps and readers treat a
+heartbeat older than 120 s as a dead supervisor. `TARTCI_CLAIM_DELAY_SSH`
+overrides the ssh client (tests). It never changes the host VM cap. Preview with
+`serve macos --print-claim-delay`. Set it on the gate lanes of slower hosts
+only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
+
+To order a lane across hosts by speed, give the same lane id a `claim_rank` on
+every host instead (0 = fastest, integers 0-9; not combined with
+`claim_delay_peers`). At render time a lane with rank N > 0 gets
+`TARTCI_CLAIM_DELAY_PEERS` = every other host whose same-id lane has a lower
+rank, fastest first, and `TARTCI_CLAIM_DELAY_SECONDS` = `claim_delay_seconds`
+if set, else 30 x N capped at 90. It then defers exactly as above: only while a
+faster host has a free, healthy slot for the job's class, and never when the
+faster hosts are full, blind, or do not serve the class. A host whose lane has
+no rank is never waited for, so an unset rank everywhere is today's behaviour.
 
 Install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep

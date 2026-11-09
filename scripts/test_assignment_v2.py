@@ -53,6 +53,9 @@ os.environ.setdefault(
     str(Path(tempfile.mkdtemp(prefix="tartci-test-workflow-ids-")) / "workflow-ids.json"),
 )
 os.environ.setdefault("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS", "0")
+# The job-listing cache is a channel between scans for the same reason, so it
+# defaults OFF here too; JobListingCacheTests turns it on with its own file.
+os.environ.setdefault("TARTCI_ASSIGNMENT_JOB_CACHE_TTL_SECS", "0")
 HOST_WORKFLOW_ID_CACHE = Path.home() / ".tartci/state/assignment-workflow-ids.json"
 
 
@@ -135,6 +138,9 @@ if state.get("merge"):
 if state.get("pr"):
     jobs.append({"id": 202, "status": "queued", "created_at": stamp("fresh_pr"),
                  "labels": %s + ["pulp-build-pr-head"]})
+if state.get("merge2"):
+    jobs.append({"id": 207, "status": "queued", "created_at": stamp("fresh_merge"),
+                 "labels": %s + ["pulp-build-merge-group"]})
 if state.get("legacy"):
     jobs.append({"id": 203, "status": "queued", "labels": %s + ["pulp-gate-fast"]})
 if state.get("malformed"):
@@ -200,7 +206,7 @@ elif any("/actions/runs/%%d/jobs" %% run in parsed.path for run in (101, 102, 10
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
-''' % ((repr(BASE),) * 7)
+''' % ((repr(BASE),) * 8)
 
 
 class RunnerFixture:
@@ -678,6 +684,99 @@ class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
         result = self._runner("--print-name")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("retained required legacy selector", result.stderr)
+
+
+class ClaimDelayV2Tests(RunnerFixture, unittest.TestCase):
+    """The claim delay on an event-class-v2 lane, the shape every fleet lane has.
+
+    The faster host is a stub ssh answering `tartci pool supply` for whatever
+    class it is asked about; the sleep stub can empty the queue, which is what
+    a faster host taking the job during the delay looks like.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        listing = self.root / "launchctl-list.txt"
+        listing.write_text("PID\tStatus\tLabel\n", encoding="utf-8")
+        (self.root / "agents").mkdir()
+        self.calls = self.root / "calls.log"
+        self.env.update({
+            "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+            "TARTCI_CLAIM_DELAY_SECONDS": "15",
+            "TARTCI_CLAIM_DELAY_PEERS": "m5studio=tartci-m5studio",
+            "TARTCI_CLAIM_DELAY_SSH": str(self.root / "stubssh"),
+            "TARTCI_FLEET_LAUNCHCTL_LIST_FILE": str(listing),
+            "TARTCI_LANE_AGENTS_DIR": str(self.root / "agents"),
+            "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS": "0",
+            "ASSIGNMENT_CALLS": str(self.calls),
+        })
+
+    def _stubs(self, *, peer_free: int, taken_during_sleep: bool = False) -> None:
+        _write_exec(self.root / "stubssh", f"""#!/usr/bin/env bash
+cls=$(printf '%s\\n' "$*" | sed -n 's/.*--class \\([^ ]*\\).*/\\1/p')
+printf '{{"schema":"tartci.gate-supply/v1","verdict":"ok","host":"m5studio","repo":"Generous-Corp/pulp","class":"%s","free":{peer_free},"in_flight":0}}\\n' "$cls"
+""")
+        empty = f'printf "{{}}" > "{self.state}"' if taken_during_sleep else ":"
+        _write_exec(self.root / "sleep", f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{self.root}/sleep.log"
+{empty}
+""")
+
+    def _sleeps(self) -> list[str]:
+        log = self.root / "sleep.log"
+        return log.read_text().split() if log.exists() else []
+
+    def _job_reads(self) -> int:
+        if not self.calls.exists():
+            return 0
+        return sum(1 for line in self.calls.read_text().splitlines() if line.endswith("/jobs"))
+
+    def test_recheck_after_the_delay_is_live_not_the_selection_cache(self) -> None:
+        # The preflight's own selection warms the 120 s cache with demand. If the
+        # recheck replayed it, the job a faster host took would still be claimed.
+        self._state(merge=True)
+        self._stubs(peer_free=1, taken_during_sleep=True)
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._sleeps(), ["15"])
+        self.assertEqual(result.stdout.strip(), "backoff")
+        # Control: the job still queued after the delay is claimed.
+        self._state(merge=True)
+        (self.root / "sleep.log").unlink()
+        self._stubs(peer_free=1)
+        kept = self._runner("--print-claim-delay")
+        self.assertEqual(kept.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_the_magnitude_not_the_witness_is_compared_with_free_slots(self) -> None:
+        # Two queued jobs, one free faster slot: the witness says 1, which one
+        # slot would cover. The exhaustive count says 2, so it claims now.
+        self._state(merge=True, merge2=True)
+        self._stubs(peer_free=1)
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.stdout.strip(), "claim", result.stderr)
+        self.assertEqual(self._sleeps(), [])
+        # Control: two free faster slots cover both jobs, so it sleeps.
+        self._state(merge=True, merge2=True)
+        self._stubs(peer_free=2)
+        slept = self._runner("--print-claim-delay")
+        self.assertEqual(slept.stdout.strip(), "claim", slept.stderr)
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_no_free_faster_slot_skips_the_exhaustive_scan(self) -> None:
+        self._state(merge=True)
+        self._stubs(peer_free=0)
+        self._runner("--print-selection")
+        before = self._job_reads()
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.stdout.strip(), "claim", result.stderr)
+        self.assertEqual(self._sleeps(), [])
+        # Only the preflight's own (cached) selection: no magnitude scan.
+        self.assertEqual(self._job_reads(), before)
+        # Control: with a free faster slot the magnitude scan is paid.
+        self._stubs(peer_free=1)
+        self._runner("--print-claim-delay")
+        self.assertGreater(self._job_reads(), before)
 
 
 class PreCloneProbeTests(RunnerFixture, unittest.TestCase):
@@ -1746,6 +1845,8 @@ class AssignmentScannerPaginationTests(unittest.TestCase):
                 stale_demand_quarantine_file=os.devnull,
             ),
         )
+        scanner.job_cache = module.JobListingCache(
+            Namespace(job_cache_ttl=0, job_cache_file=os.devnull, repo="o/r"))
         scanner._observation_lock = lambda: contextlib.nullcontext()
         # This test is about worker parallelism; identity is proven elsewhere.
         scanner._preflight_identity = lambda: None
@@ -2290,6 +2391,294 @@ class StaleDemandTests(RunnerFixture, unittest.TestCase):
         # ...and the pass still happened, rather than being short-circuited
         # somewhere that would make the absence meaningless.
         self.assertIn("/actions/workflows", second)
+
+
+class JobListingCacheTests(unittest.TestCase):
+    """A run's job listing is reused only to stand in for an absence.
+
+    Every case runs a first scan that fills the cache and a second that may
+    use it, against one fake GitHub whose runs carry `updated_at`. The census
+    counts job-listing calls, which is the saving, and the stdout verdict,
+    which must never change because of the cache.
+    """
+
+    _GH = """#!/usr/bin/env python3
+import json, os, sys
+from urllib.parse import parse_qs, urlparse
+
+LEDGER = os.environ["LEDGER"]
+STATE = json.load(open(os.environ["STATE"]))
+target = sys.argv[-1]
+with open(LEDGER, "a") as handle:
+    handle.write(target + "\\n")
+if target == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
+p = urlparse("https://x/" + target)
+status = parse_qs(p.query).get("status", [""])[0]
+if p.path.endswith("/actions/workflows"):
+    print(json.dumps({"total_count": 1, "workflows": [
+        {"id": STATE.get("workflow_id", 99), "name": "Build and Test"}]}))
+elif "/actions/workflows/" in p.path and p.path.endswith("/runs"):
+    workflow = int(p.path.split("/actions/workflows/", 1)[1].split("/", 1)[0])
+    if workflow != STATE.get("workflow_id", 99):
+        sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+        raise SystemExit(1)
+    runs = [r for r in STATE["runs"] if r["status"] == status]
+    print(json.dumps({"total_count": len(runs), "workflow_runs": [
+        {"id": r["id"], "name": "Build and Test", "status": r["status"],
+         **({"updated_at": r["updated_at"]} if r.get("updated_at") else {})}
+        for r in runs]}))
+elif "/actions/runs/" in p.path and p.path.endswith("/jobs"):
+    run_id = int(p.path.split("/actions/runs/", 1)[1].split("/", 1)[0])
+    if STATE.get("rate_limited"):
+        sys.stderr.write("gh: API rate limit exceeded for installation ID 1. (HTTP 403)\\n")
+        raise SystemExit(1)
+    run = next(r for r in STATE["runs"] if r["id"] == run_id)
+    labels = %s + [run.get("class", "pulp-build-merge-group")]
+    print(json.dumps({"total_count": 1, "jobs": [
+        {"id": run_id, "status": "queued" if run.get("queued") else "in_progress",
+         "labels": labels}]}))
+else:
+    raise SystemExit(4)
+""" % repr(BASE)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.fake = self.root / "fake-gh"
+        _write_exec(self.fake, self._GH)
+        self.state = self.root / "state.json"
+        self.cache = self.root / "job-cache.json"
+        self.runs = [
+            {"id": 1001 + n, "status": "in_progress", "updated_at": "2026-11-08T10:00:00Z"}
+            for n in range(4)
+        ]
+        self._write()
+
+    def _write(self, **extra) -> None:
+        self.state.write_text(json.dumps({"runs": self.runs, **extra}))
+
+    def _scan(self, require: str = "pulp-build-merge-group", ttl: str = "30",
+              extra: list[str] | None = None):
+        ledger = self.root / f"ledger-{len(list(self.root.glob('ledger-*')))}"
+        ledger.write_text("")
+        environment = dict(
+            os.environ, LEDGER=str(ledger), STATE=str(self.state),
+            TARTCI_GH_IDENTITY_RECEIPT_FILE=str(self.root / f"{ledger.name}-identity.json"),
+        )
+        result = subprocess.run(
+            [
+                "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                "--workflow", "Build and Test",
+                "--labels", ",".join(BASE + [require]),
+                "--require-label", require,
+                "--class-labels", "pulp-build-merge-group,pulp-build-pr-head",
+                "--gh-cli", str(self.fake), "--max-workers", "1",
+                "--retry-backoff", "0",
+                "--observation-lock-file", str(self.root / "observation.lock"),
+                "--workflow-id-cache-file", str(self.root / "workflow-ids.json"),
+                "--workflow-id-cache-ttl", "0",
+                "--job-cache-file", str(self.cache),
+                "--job-cache-ttl", ttl,
+                *(extra or []),
+            ],
+            text=True, capture_output=True, check=False, env=environment,
+        )
+        calls = [line for line in ledger.read_text().splitlines() if line]
+        jobs = [int(c.split("/actions/runs/", 1)[1].split("/", 1)[0])
+                for c in calls if "/jobs?" in c]
+        return result, jobs, calls
+
+    def test_an_unchanged_run_with_no_queued_job_is_not_read_again(self) -> None:
+        first, first_jobs, _ = self._scan()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(first.stdout.strip(), "0")
+        self.assertEqual(sorted(first_jobs), [1001, 1002, 1003, 1004])
+        second, second_jobs, _ = self._scan()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(second.stdout.strip(), "0")
+        self.assertEqual(second_jobs, [])
+        self.assertIn("assignment-scan-job-cache hits=4", second.stderr)
+        # Control: with the cache off the same second scan pays every read.
+        off, off_jobs, _ = self._scan(ttl="0")
+        self.assertEqual(off.stdout.strip(), "0")
+        self.assertEqual(sorted(off_jobs), [1001, 1002, 1003, 1004])
+
+    def test_one_read_serves_every_class_on_the_host(self) -> None:
+        """The merge-group scan's absence is the PR-head scan's absence too."""
+        self._scan(require="pulp-build-merge-group")
+        pr_head, jobs, _ = self._scan(require="pulp-build-pr-head")
+        self.assertEqual(pr_head.returncode, 0, pr_head.stderr)
+        self.assertEqual(pr_head.stdout.strip(), "0")
+        self.assertEqual(jobs, [])
+
+    def test_a_changed_run_is_read_again_and_its_new_job_is_found(self) -> None:
+        self._scan()
+        self.runs[2] = dict(self.runs[2], updated_at="2026-11-08T10:05:00Z", queued=True)
+        self._write()
+        found, jobs, _ = self._scan()
+        self.assertEqual(found.returncode, 0, found.stderr)
+        self.assertEqual(found.stdout.strip(), "1")
+        self.assertEqual(jobs, [1003])
+
+    def test_a_job_queued_without_touching_the_run_waits_out_only_the_ttl(self) -> None:
+        """The documented cost, bounded: an expired entry is read live."""
+        self._scan()
+        self.runs[0] = dict(self.runs[0], queued=True)
+        self._write()
+        hidden, _, _ = self._scan()
+        self.assertEqual(hidden.stdout.strip(), "0")
+        payload = json.loads(self.cache.read_text())
+        for record in payload["runs"].values():
+            record["checked_at"] -= 31
+        self.cache.write_text(json.dumps(payload))
+        found, jobs, _ = self._scan()
+        self.assertEqual(found.stdout.strip(), "1")
+        self.assertIn(1001, jobs)
+
+    def test_a_run_carrying_a_queued_job_is_never_cached(self) -> None:
+        self.runs[0] = dict(self.runs[0], queued=True)
+        self._write()
+        for _ in range(2):
+            found, jobs, _ = self._scan()
+            self.assertEqual(found.stdout.strip(), "1")
+            self.assertEqual(jobs[0], 1001)
+        cached = json.loads(self.cache.read_text())["runs"] if self.cache.exists() else {}
+        self.assertNotIn("Generous-Corp/pulp#1001", cached)
+
+    def test_a_run_without_updated_at_is_always_read(self) -> None:
+        self.runs = [dict(r) for r in self.runs]
+        for run in self.runs:
+            run.pop("updated_at")
+        self._write()
+        self._scan()
+        _, jobs, _ = self._scan()
+        self.assertEqual(sorted(jobs), [1001, 1002, 1003, 1004])
+
+    def test_an_unreadable_cache_is_a_miss_not_a_failure(self) -> None:
+        for corrupt in (b"{not json", b"\xff\xfe\x00"):
+            with self.subTest(corrupt=corrupt):
+                self.cache.write_bytes(corrupt)
+                result, jobs, _ = self._scan()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "0")
+                self.assertEqual(sorted(jobs), [1001, 1002, 1003, 1004])
+
+    def test_the_ttl_is_bounded_below_the_selection_cache(self) -> None:
+        for ttl in ("61", "-1", "nan"):
+            with self.subTest(ttl=ttl):
+                result, _, _ = self._scan(ttl=ttl)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("--job-cache-ttl", result.stderr)
+
+    def test_a_rate_limited_call_is_not_retried(self) -> None:
+        """An allowance does not refill in a retry backoff."""
+        self._write(rate_limited=True)
+        limited, jobs, _ = self._scan(ttl="0", extra=["--api-retries", "2"])
+        self.assertEqual(limited.returncode, 2, limited.stdout)
+        self.assertIn("rate_limited", limited.stderr)
+        # Every run's listing was asked for at most once: no retry. (The
+        # executor may already have started the next run before the first
+        # failure surfaced; that is a different call, not a retry.)
+        self.assertIn(1001, jobs)
+        self.assertEqual(len(jobs), len(set(jobs)), jobs)
+        self.assertNotEqual(limited.stdout.strip(), "0")
+        # Control: a transport fault on the same call IS retried.
+        retried = self.root / "fake-gh-transport"
+        _write_exec(retried, self._GH.replace(
+            'sys.stderr.write("gh: API rate limit exceeded for installation ID 1. (HTTP 403)\\n")',
+            'sys.stderr.write("net/http: TLS handshake timeout\\n")'))
+        self.fake = retried
+        _, transport_jobs, _ = self._scan(ttl="0", extra=["--api-retries", "2"])
+        self.assertEqual(transport_jobs.count(1001), 3, transport_jobs)
+
+
+class WorkflowIdRecoveryTests(unittest.TestCase):
+    """A long-lived workflow id that stops resolving is re-resolved once."""
+
+    _GH = JobListingCacheTests._GH
+    setUp = JobListingCacheTests.setUp
+    _write = JobListingCacheTests._write
+
+    def _scan_ids(self, *, ttl: str = "3600"):
+        ledger = self.root / f"ledger-{len(list(self.root.glob('ledger-*')))}"
+        ledger.write_text("")
+        environment = dict(
+            os.environ, LEDGER=str(ledger), STATE=str(self.state),
+            TARTCI_GH_IDENTITY_RECEIPT_FILE=str(self.root / f"{ledger.name}-identity.json"),
+        )
+        result = subprocess.run(
+            [
+                "python3", str(SCANNER), "--repo", "Generous-Corp/pulp",
+                "--workflow", "Build and Test",
+                "--labels", ",".join(BASE + ["pulp-build-merge-group"]),
+                "--require-label", "pulp-build-merge-group",
+                "--gh-cli", str(self.fake), "--retry-backoff", "0",
+                "--observation-lock-file", str(self.root / "observation.lock"),
+                "--workflow-id-cache-file", str(self.root / "workflow-ids.json"),
+                "--workflow-id-cache-ttl", ttl, "--job-cache-ttl", "0",
+            ],
+            text=True, capture_output=True, check=False, env=environment,
+        )
+        calls = [line for line in ledger.read_text().splitlines() if line]
+        return result, calls
+
+    def test_a_replaced_workflow_is_resolved_live_and_the_scan_succeeds(self) -> None:
+        self.runs[1] = dict(self.runs[1], queued=True)
+        self._write()
+        warm, _ = self._scan_ids()
+        self.assertEqual(warm.stdout.strip(), "1", warm.stderr)
+        # The workflow is replaced: the cached id 99 now answers 404.
+        self._write(workflow_id=123)
+        recovered, calls = self._scan_ids()
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertEqual(recovered.stdout.strip(), "1")
+        self.assertEqual(len([c for c in calls if "/actions/workflows?" in c]), 1, calls)
+        cached = json.loads((self.root / "workflow-ids.json").read_text())
+        self.assertEqual(cached["Generous-Corp/pulp"]["workflows"]["Build and Test"], 123)
+        # And the fresh id is now served from the cache again.
+        again, again_calls = self._scan_ids()
+        self.assertEqual(again.stdout.strip(), "1")
+        self.assertEqual(len([c for c in again_calls if "/actions/workflows?" in c]), 0)
+
+    def test_a_jobs_404_does_not_trigger_workflow_recovery(self) -> None:
+        """A run deleted mid-scan 404s its jobs; that is not a replaced workflow."""
+        self.runs[1] = dict(self.runs[1], queued=True)
+        self._write()
+        self._scan_ids()
+        gone = self.root / "fake-gh-jobs-gone"
+        _write_exec(gone, self._GH.replace(
+            '    run = next(r for r in STATE["runs"] if r["id"] == run_id)',
+            '    sys.stderr.write("gh: Not Found (HTTP 404)\\n")\n    raise SystemExit(1)'))
+        self.fake = gone
+        result, calls = self._scan_ids()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(len([c for c in calls if "/actions/workflows?" in c]), 0, calls)
+        self.assertIn("Generous-Corp/pulp",
+                      json.loads((self.root / "workflow-ids.json").read_text()))
+
+    def test_a_live_lookup_that_still_404s_fails_closed(self) -> None:
+        """Control: recovery is one live resolution, never a way around a 404."""
+        self.runs[1] = dict(self.runs[1], queued=True)
+        self._write()
+        self._scan_ids()
+        # The listing still names the cached id, but its runs answer 404.
+        self._write(workflow_id=123)
+        (self.root / "workflow-ids.json").write_text(json.dumps({
+            "Generous-Corp/pulp": {"fetched_at": time.time(),
+                                   "workflows": {"Build and Test": 77}}}))
+        state = json.loads(self.state.read_text())
+        self.state.write_text(json.dumps(state))
+        broken = self.root / "fake-gh-broken"
+        _write_exec(broken, self._GH.replace(
+            'if workflow != STATE.get("workflow_id", 99):', 'if True:'))
+        self.fake = broken
+        result, calls = self._scan_ids()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertNotEqual(result.stdout.strip(), "0")
+        self.assertEqual(len([c for c in calls if "/actions/workflows?" in c]), 1, calls)
 
 
 class AssignmentScannerTransientFaultTests(unittest.TestCase):
