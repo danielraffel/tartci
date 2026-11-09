@@ -1285,7 +1285,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_claim_delay_exports_only_a_positive_value(self) -> None:
         marker = 'yield_to_workflow = "Build and Test"\n'
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         self.assertEqual(base.count(marker), 1)
         peers = 'claim_delay_peers = ["m5studio"]\n'
         for value, expected in (("30", "30"), ("0", None)):
@@ -1303,16 +1303,20 @@ class MacosFleetLaneTests(unittest.TestCase):
                     self.assertEqual(
                         env["TARTCI_CLAIM_DELAY_PEERS"],
                         f"m5studio={fleet.fallback_peer_target('m5studio')}")
-        # Never enabled by an upgrade: no shipped profile sets it.
+        # Only the pulp-gate lane is ranked in the shipped profiles
+        # (test_shipped_profiles_rank_only_the_pulp_gate); every other lane
+        # still renders no claim delay.
         for host, profile in HOST_CONFIGS.items():
             for name, body in fleet.rendered_plists(fleet.load(profile)).items():
+                if ".pulp-gate." in name:
+                    continue
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env, (host, name))
                 self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env, (host, name))
 
     def test_claim_delay_rejects_invalid_values(self) -> None:
         marker = 'yield_to_workflow = "Build and Test"\n'
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         peers = 'claim_delay_peers = ["m5studio"]\n'
         for value in ("-1", "1.5", '"30"', "true"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
@@ -1328,7 +1332,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         root.mkdir()
         marker = 'id = "pulp-gate"\n'
         for host, profile in HOST_CONFIGS.items():
-            body = profile.read_text()
+            body = re.sub(r"^claim_rank = \d+\n", "", profile.read_text(), flags=re.M)
             self.assertEqual(body.count(marker), 1, host)
             rank = ranks.get(host)
             if rank is not None:
@@ -1366,6 +1370,34 @@ class MacosFleetLaneTests(unittest.TestCase):
                          for item in env["TARTCI_CLAIM_DELAY_PEERS"].split(",")],
                         peers)
 
+    def test_shipped_profiles_rank_only_the_pulp_gate(self) -> None:
+        expected = {"m5studio": ("0", None), "studio": ("30", ["m5studio"]),
+                    "m5": ("60", ["m5studio", "studio"]),
+                    "m1": ("90", ["m5studio", "studio", "m5"])}
+        profiles = ROOT / "profiles"
+        for host, profile in HOST_CONFIGS.items():
+            with self.subTest(host=host):
+                data = fleet.load(profile)
+                ranked = {lane["id"]: lane.get("claim_rank") for lane in data["lane"]}
+                self.assertEqual(
+                    {k: v for k, v in ranked.items() if v is not None},
+                    {"pulp-gate": {"m5studio": 0, "studio": 1, "m5": 2, "m1": 3}[host]})
+                for lane in data["lane"]:
+                    with mock.patch.object(fleet, "DEFAULT_PROFILES_DIR", profiles):
+                        env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+                    if lane["id"] != "pulp-gate":
+                        self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env, lane["id"])
+                        self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env, lane["id"])
+                        continue
+                    delay, peers = expected[host]
+                    if peers is None:
+                        self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env)
+                        continue
+                    self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], delay)
+                    self.assertEqual(
+                        [i.split("=", 1)[0]
+                         for i in env["TARTCI_CLAIM_DELAY_PEERS"].split(",")], peers)
+
     def test_an_unranked_peer_is_never_waited_for(self) -> None:
         # Only m1 ranked: nobody faster is ranked, so m1 renders no delay, which
         # is today's behaviour. Ranking is opt-in per host.
@@ -1382,7 +1414,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_claim_rank_rejects_invalid_values(self) -> None:
         marker = 'id = "pulp-gate"\n'
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         for extra in ("claim_rank = 10\n", "claim_rank = -1\n", 'claim_rank = "1"\n',
                       'claim_rank = 2\nclaim_delay_seconds = 30\nclaim_delay_peers = ["m5studio"]\n'):
             with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td:
@@ -1394,7 +1426,7 @@ class MacosFleetLaneTests(unittest.TestCase):
     def test_claim_delay_needs_peers_and_peers_need_a_delay(self) -> None:
         """A delay with nothing to wait for never sleeps, so it is refused."""
         marker = 'yield_to_workflow = "Build and Test"\n'
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         cases = (
             ("claim_delay_seconds = 30\n", "claim_delay_peers"),
             ('claim_delay_peers = ["m5studio"]\n', "claim_delay_peers"),
@@ -1591,7 +1623,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                 fleet.load(path)
 
     def test_m5_release_lane_rejects_org_scope_and_auxiliary_authority(self) -> None:
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         fixtures = {
             "group-3": base.replace(
                 'id = "pulp-release"\nrepo = "Generous-Corp/pulp"\nrunner_group_id = 1',
@@ -3063,7 +3095,7 @@ workflows=["Product acceptance"]
 
     def test_pulp_pr_head_contract_cannot_omit_class_or_repository_scope(self) -> None:
         # m5 serves both gate classes; m1 (CONFIG) serves PR-head only.
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         fixtures = {
             "missing-pr-head": base.replace(
                 '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n',
@@ -3390,7 +3422,7 @@ replaces_launchd_labels=REPLACEMENT
     )
 
     def _m5_release_enabled(self, tiers: str | None = None, order: str | None = None) -> str:
-        base = HOST_CONFIGS["m5"].read_text()
+        base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
         # The shipped m5 profile declares the classes; start from its gate-only
         # form so each fixture states its own release declaration.
         # The legacy pulp-release lane repeats the same tier rows; pulp-gate's
@@ -3607,7 +3639,7 @@ replaces_launchd_labels=REPLACEMENT
                     self.assertIn(reasons[name], result.stderr)
                     self.assertNotIn("Traceback", result.stderr)
             # Release rows ahead of the gate tiers break the gate-first contract.
-            base = HOST_CONFIGS["m5"].read_text()
+            base = re.sub(r"^claim_rank = \d+\n", "", HOST_CONFIGS["m5"].read_text(), flags=re.M)
             first_gate = ('\n[[lane.tier]]\nlabel = "pulp-build-merge-group"\n'
                           'workflow = "Build and Test"\nrunner_group_id = 1\n')
             self.assertEqual(base.count(first_gate), 1)
