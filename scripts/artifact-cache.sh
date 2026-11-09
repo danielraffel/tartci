@@ -30,8 +30,10 @@
 #          here, it reads the pinned url and sha256 from the mirror's own copy
 #          of that repository's dependency manifest and adds the blob, so a
 #          pin bump reaches the cache within one refresh instead of never.
-#          This is what the scheduled com.danielraffel.tartci.artifact-cache-
-#          refresh agent runs. One failed mirror or pin does not stop the
+#          It also adds the GitHub Actions Runner archive the macOS lane pins
+#          (url and digest from `runner.sh --print-runner-archive`), so a VM
+#          copies it instead of downloading it. This is what the scheduled
+#          com.danielraffel.tartci.artifact-cache-refresh agent runs. One failed mirror or pin does not stop the
 #          others; the exit is 1.
 #
 # A running guest may have the directory mounted, so nothing is ever rewritten
@@ -42,7 +44,7 @@
 set -euo pipefail
 
 usage(){
-  sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,43p' "$0" | sed 's/^# \{0,1\}//'
   exit "${1:-2}"
 }
 
@@ -62,6 +64,8 @@ url="" sha="" repo="" branch="main" days="" compact_above=""
 pins="${TARTCI_ARTIFACT_CACHE_PINS:-$(cd "$(dirname "$0")/.." && pwd)/manifests/artifact-cache-pins.tsv}"
 # Where mirrors fetch from; tests point it at a local repository.
 git_base="${TARTCI_ARTIFACT_CACHE_GIT_BASE:-https://github.com}"
+# Source of the pinned Actions Runner archive (url and digest). Set empty, it is skipped.
+runner_sh="${TARTCI_ARTIFACT_CACHE_RUNNER_SH-$(cd "$(dirname "$0")/.." && pwd)/providers/tart-macos/runner.sh}"
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --url) url="${2:-}"; shift 2;;
@@ -325,6 +329,16 @@ case "$cmd" in
           failed=1
         fi
       done <"$pins"
+    fi
+    # The Actions Runner archive the lane installs into every VM.
+    if [ -f "$runner_sh" ]; then
+      if archive="$(bash "$runner_sh" --print-runner-archive 2>/dev/null)" \
+         && [[ "$archive" =~ ^https://[^\ ]+\ [0-9a-f]{64}$ ]]; then
+        add_blob "${archive% *}" "${archive##* }" || failed=1
+      else
+        printf 'artifact-cache: could not read the pinned runner archive from %s\n' "$runner_sh" >&2
+        failed=1
+      fi
     fi
     exit "$failed"
     ;;

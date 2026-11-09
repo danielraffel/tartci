@@ -289,6 +289,7 @@ PRINT_CLAIM_DELAY=0
 PRINT_HOST_HEALTH=0
 PRINT_STORAGE_HEALTH=0
 PRINT_RUNNER_VERSION=0
+PRINT_RUNNER_ARCHIVE=0
 CURRENT_VM=""
 CURRENT_RPID=""
 CURRENT_RUN_ID=""
@@ -589,6 +590,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --print-host-health) PRINT_HOST_HEALTH=1; shift;;
   --print-storage-health) PRINT_STORAGE_HEALTH=1; shift;;
   --print-runner-version) PRINT_RUNNER_VERSION=1; shift;;
+  --print-runner-archive) PRINT_RUNNER_ARCHIVE=1; shift;;
   --print-runner-api-root) PRINT_RUNNER_API_ROOT=1; shift;;
   --print-runner-contract) PRINT_RUNNER_CONTRACT="$2"; shift 2;;
   --print-chrome-mount) PRINT_CHROME_MOUNT=1; shift;;
@@ -623,6 +625,10 @@ case "$RUNNER_SHA256" in
   ''|*[!0-9a-fA-F]*) die "set a 64-character TARTCI_RUNNER_SHA256 when overriding Actions Runner version $RUNNER_VERSION";;
 esac
 [ "${#RUNNER_SHA256}" -eq 64 ] || die "TARTCI_RUNNER_SHA256 must contain 64 hexadecimal characters"
+# Where the pinned archive comes from and the digest it must have. `artifact-cache.sh
+# refresh` reads this pair so the host cache holds exactly the bytes a guest verifies.
+RUNNER_ARCHIVE_URL="https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-osx-arm64-${RUNNER_VERSION}.tar.gz"
+[ "$PRINT_RUNNER_ARCHIVE" = 1 ] && { printf '%s %s\n' "$RUNNER_ARCHIVE_URL" "$(printf '%s' "$RUNNER_SHA256" | tr 'A-F' 'a-f')"; exit 0; }
 
 configure_workflows
 configure_workflow_tier_groups
@@ -1941,13 +1947,18 @@ cancel_current_run(){
 }
 
 ensure_runner_version(){
-  local ip="$1"
+  local ip="$1" runner_cache_dir=""
+  # The host artifact cache, when this VM mounted it, may hold the archive under
+  # its digest. The guest re-hashes the copy and downloads when it is absent or wrong.
+  [ "$CURRENT_ARTIFACT_CACHE" != 1 ] || runner_cache_dir="$GUEST_ARTIFACT_CACHE"
   ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY'" <<'GUEST'
+    "bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY' '$RUNNER_ARCHIVE_URL' '$runner_cache_dir'" <<'GUEST'
 set -euo pipefail
 desired="$1"
-expected_sha256="$2"
+expected_sha256="$(printf '%s' "$2" | tr 'A-F' 'a-f')"
 guest_http_proxy="$3"
+archive_url="$4"
+cache_dir="$5"
 if [ -n "$guest_http_proxy" ]; then
   export HTTP_PROXY="$guest_http_proxy" HTTPS_PROXY="$guest_http_proxy"
   export http_proxy="$guest_http_proxy" https_proxy="$guest_http_proxy"
@@ -1965,9 +1976,21 @@ if [ "$current" != "$desired" ]; then
   backup_dir="$HOME/actions-runner.tartci-backup"
   cleanup_update(){ rm -rf "$update_dir"; }
   trap cleanup_update EXIT
-  curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
-    "https://github.com/actions/runner/releases/download/v${desired}/actions-runner-osx-arm64-${desired}.tar.gz" \
-    -o "$update_dir/runner.tar.gz"
+  have_archive=0
+  cached="$cache_dir/sha256/$expected_sha256"
+  if [ -n "$cache_dir" ] && [ -f "$cached" ] \
+     && cp "$cached" "$update_dir/runner.tar.gz" 2>/dev/null \
+     && [ "$(shasum -a 256 "$update_dir/runner.tar.gz" | awk '{print $1}')" = "$expected_sha256" ]; then
+    have_archive=1
+    printf 'TARTCI_DIAG actions-runner-archive=cache\n'
+  else
+    rm -f "$update_dir/runner.tar.gz"
+  fi
+  if [ "$have_archive" != 1 ]; then
+    curl -fsSL --retry 3 --retry-all-errors --connect-timeout 15 --max-time 300 \
+      "$archive_url" -o "$update_dir/runner.tar.gz"
+    printf 'TARTCI_DIAG actions-runner-archive=download\n'
+  fi
   actual_sha256="$(shasum -a 256 "$update_dir/runner.tar.gz" | awk '{print $1}')"
   [ "$actual_sha256" = "$expected_sha256" ] || {
     printf 'Actions Runner archive SHA-256 %s does not match expected %s\n' "$actual_sha256" "$expected_sha256" >&2
