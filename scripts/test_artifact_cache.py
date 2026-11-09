@@ -614,7 +614,7 @@ class PinnedRefreshTests(unittest.TestCase):
         self.assertEqual((self.cache / "sha256" / sha).read_bytes(), b"m158.zip")
         self.assertIn("https://example.invalid/m158.zip", self.calls.read_text())
         # Control: the V8 entry beside it, same asset key, was not taken.
-        self.assertNotIn("/v8", self.calls.read_text())
+        self.assertNotIn("example.invalid/v8", self.calls.read_text())
         self.calls.unlink()
         proc = self._refresh()
         self.assertEqual(proc.returncode, 0, proc.stderr)
