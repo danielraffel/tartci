@@ -1214,6 +1214,21 @@ class MultiVolumeTests(TwoRootHarness):
         self.assertFalse(report_ctl["pressure"])
         self.assertEqual(report_ctl["min_age_days"], 30)
 
+    def test_a_pressured_pass_returns_to_the_foreground(self):
+        def priority_for(free_b):
+            receipts = []
+            with unittest.mock.patch.object(dr, "enter_background",
+                                            return_value="darwin_background"), \
+                    unittest.mock.patch.object(dr, "leave_background", return_value=True), \
+                    unittest.mock.patch.object(
+                        dr, "record_pass", side_effect=lambda a, r, c: receipts.append(r)):
+                self.run_json("--fix", "--pressure-free-gb", "200",
+                              free={str(self.a): 900 * dr.GIB, str(self.b): free_b},
+                              devices=self.separate_volumes())
+            return receipts[0]["priority"]
+        self.assertEqual(priority_for(10 * dr.GIB), "foreground: a volume is under pressure")
+        self.assertEqual(priority_for(900 * dr.GIB), "darwin_background")   # control
+
     def test_one_unreadable_volume_cannot_certify_the_floor(self):
         code, _ = self.run_json(
             "--fail-below-gb", "60",
@@ -1829,6 +1844,23 @@ class BackgroundPriorityTests(unittest.TestCase):
                          ["darwin_background", "unchanged: dry-run"])
         self.assertEqual(dr.pass_summary(receipts[0], 0)["priority"], "darwin_background")
 
+    def test_the_ccache_trim_runs_in_the_foreground_then_returns(self) -> None:
+        calls = []
+        with unittest.mock.patch.object(dr, "leave_background",
+                                        side_effect=lambda: calls.append("fg") or True), \
+                unittest.mock.patch.object(dr, "enter_background",
+                                           side_effect=lambda: calls.append("bg")):
+            with dr.foreground_while({"priority": "darwin_background"}):
+                calls.append("trim")
+            with dr.foreground_while({"priority": "unchanged: dry-run"}):
+                calls.append("trim")
+        self.assertEqual(calls, ["fg", "trim", "bg", "trim"])
+
+    def test_leave_background_restores_normal_priority(self) -> None:
+        calls = []
+        self.assertTrue(dr.leave_background(lambda *a: calls.append(a)))
+        self.assertEqual(calls, [(dr.PRIO_DARWIN_PROCESS, 0, 0)])
+
     @unittest.skipUnless(sys.platform == "darwin", "macOS task policy")
     def test_children_inherit_the_background_priority(self) -> None:
         # Run in a child so this test runner keeps its own priority.
@@ -1836,7 +1868,7 @@ class BackgroundPriorityTests(unittest.TestCase):
             "import os, subprocess, sys; sys.path.insert(0, sys.argv[1]);"
             "import disk_reclaim as dr; os.environ.pop(dr.FOREGROUND_ENV, None);"
             "print(dr.enter_background());"
-            "print(subprocess.run(['ps', '-o', 'pri=', '-p', str(os.getpid())],"
+            "print(subprocess.run(['/bin/sh', '-c', 'ps -o pri= -p $$'],"
             " capture_output=True, text=True).stdout.strip())")
         out = subprocess.run([sys.executable, "-c", script,
                               str(pathlib.Path(dr.__file__).resolve().parent)],

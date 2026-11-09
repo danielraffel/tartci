@@ -62,6 +62,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import functools
 import json
@@ -73,7 +74,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import boot_usage
 import pulp_reapers
@@ -153,6 +154,33 @@ def enter_background(platform: str | None = None,
     except OSError as exc:
         return f"unchanged: setpriority failed: {exc}"
     return "darwin_background"
+
+
+def leave_background(setpriority: Any = None) -> bool:
+    """Undo `enter_background` for a step that must not be throttled."""
+    setpriority = os.setpriority if setpriority is None else setpriority
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def foreground_while(receipt: dict[str, Any]) -> Iterator[None]:
+    """Run one step at normal priority, then return to background.
+
+    The gate ccache eviction holds the guard lock that VM boots wait on, and it
+    only runs with no VM up, so throttling it only widens that window.
+    """
+    demoted = receipt.get("priority") == "darwin_background"
+    if demoted:
+        leave_background()
+    try:
+        yield
+    finally:
+        if demoted:
+            enter_background()
 
 
 def bounded_fs_call(operation: Any, *, description: str,
@@ -1300,6 +1328,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
             pressure_used_percent=args.pressure_used_percent)
     }
     pressure = bool(pressured_devices)
+    # A volume below its floor needs space now: reclaim at normal priority.
+    if (pressure or boot_pressure) and receipt.get("priority") == "darwin_background" \
+            and leave_background():
+        receipt["priority"] = "foreground: a volume is under pressure"
 
     def min_age_for(path: pathlib.Path) -> float:
         device = device_id(path)
@@ -1409,8 +1441,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # Gate ccache entries unused for N days (gate_ccache_trim.py for the
     # gates): only with no VM running or leased, under the guard's lock.
     progress.emit("gate ccache: checking the fleet profile", force=True)
-    gate_ccache = gate_ccache_trim.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
-                                       state_dir=state_dir(args))
+    with foreground_while(receipt):
+        gate_ccache = gate_ccache_trim.run(fix=args.fix,
+                                           profile=pulp_reapers.default_profile_path(),
+                                           state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
     # Which CI and agent paths hold the boot volume, sampled once a day after
     # the reapers above (boot_usage.py). Read-only.

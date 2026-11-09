@@ -609,7 +609,9 @@ def run(*, fix: bool, profile: pathlib.Path,
     next_cache: dict = {}
     cursors_path = verdicts.with_name(CURSORS_FILE)
     cursors = _load_json_dict(cursors_path)
-    next_cursors: dict = {}
+    # Roots this pass does not scan keep their cursors.
+    next_cursors: dict = {key: value for key, value in cursors.items()
+                          if key not in {str(one) for one in roots}}
     reports = []
     try:
         cwds = process_cwds(runner)
@@ -620,12 +622,17 @@ def run(*, fix: bool, profile: pathlib.Path,
                           cache=cache, next_cache=next_cache,
                           worktrees_only=str(one) in settings.get("worktrees_only", []),
                           resume_after=previous if isinstance(previous, str) else None)
-            if report.get("next_cursor") is not None:
+            if report.get("error") and isinstance(previous, str):
+                # An unlisted root or a blind pass examined nothing for real.
+                next_cursors[str(one)] = previous
+            elif report.get("next_cursor") is not None:
                 next_cursors[str(one)] = report["next_cursor"]
             reports.append(report)
     except Exception as exc:  # noqa: BLE001 - a janitor must not take the pass down
         return {"enabled": True, "error": f"checkout scan failed: {exc}"}
-    for path, body in ((verdicts, next_cache), (cursors_path, next_cursors)):
+    # A dry run must not move the cursor past checkouts a --fix pass never saw.
+    writes = [(verdicts, next_cache)] + ([(cursors_path, next_cursors)] if fix else [])
+    for path, body in writes:
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")

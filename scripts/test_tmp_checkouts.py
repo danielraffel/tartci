@@ -413,6 +413,41 @@ class ResumeCursorTests(Fixture):
         self.assertEqual(cursors, {str(self.tmp): "d"})
 
 
+class CursorPersistenceTests(Fixture):
+    """When run() keeps, moves or leaves the saved cursor."""
+
+    def run_pass(self, fix: bool, cursors: dict, cwds=("/",)) -> dict:
+        profile = self.base / "profile.toml"
+        profile.write_text("[reclaim]\ntmp_checkouts = true\n")
+        verdicts = self.base / "state" / "verdicts.json"
+        verdicts.parent.mkdir(exist_ok=True)
+        path = verdicts.parent / tc.CURSORS_FILE
+        path.write_text(json.dumps(cursors))
+        with mock.patch.dict(os.environ, {"TARTCI_TMP_CHECKOUT_ROOT": str(self.tmp)}), \
+                mock.patch.object(tc, "process_cwds",
+                                  return_value=list(cwds) if cwds else None):
+            tc.run(fix=fix, profile=profile, in_use=lambda p: False, verdicts=verdicts)
+        return json.loads(path.read_text())
+
+    @testing_support.requires_tomllib
+    def test_a_dry_run_leaves_the_cursor_alone(self) -> None:
+        self.clone("a")
+        self.assertEqual(self.run_pass(False, {str(self.tmp): "zzz"}), {str(self.tmp): "zzz"})
+        self.assertEqual(self.run_pass(True, {str(self.tmp): "zzz"}), {})   # control
+
+    @testing_support.requires_tomllib
+    def test_a_root_this_pass_did_not_scan_keeps_its_cursor(self) -> None:
+        self.clone("a")
+        other = str(self.base / "elsewhere")
+        self.assertEqual(self.run_pass(True, {other: "m"}), {other: "m"})
+
+    @testing_support.requires_tomllib
+    def test_a_blind_pass_keeps_the_cursor(self) -> None:
+        self.clone("a")
+        self.assertEqual(self.run_pass(True, {str(self.tmp): "zzz"}, cwds=None),
+                         {str(self.tmp): "zzz"})
+
+
 class MultiRootTests(Fixture):
     def profile(self, body: str) -> pathlib.Path:
         path = self.base / "profile.toml"
