@@ -530,5 +530,172 @@ class RefreshAgentTests(unittest.TestCase):
             self.assertFalse(calls.exists(), "launchctl was called from a temp HOME")
 
 
+class PinnedRefreshTests(unittest.TestCase):
+    """`refresh` adds the archives a mirrored repository's manifest pins.
+
+    Pulp gate jobs copy the pinned Skia archive from sha256/<pin> when the
+    cache holds it; nothing ever added the current pin, so every job
+    downloaded 58 MB from GitHub (24 of 24 sampled jobs, 2026-11-07..09) and
+    a GitHub 504 failed the gate. These drive the real script against a local
+    "remote", a stub curl and a pin file.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.base = self.tmp / "remote"
+        self.cache = self.tmp / "cache"
+        origin = self.base / "owner/repo.git"
+        origin.mkdir(parents=True)
+        _git("init", "--quiet", "--bare", "-b", "main", str(origin))
+        self.work = self.tmp / "work"
+        _git("clone", "--quiet", str(origin), str(self.work))
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.calls = self.tmp / "curl.calls"
+        curl = self.bin / "curl"
+        curl.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            echo "$*" >> {self.calls}
+            out=""
+            url=""
+            while [ "$#" -gt 0 ]; do
+              case "$1" in --output) out="$2"; shift;; https://*) url="$1";; esac
+              shift
+            done
+            [ -n "${{STUB_FAIL:-}}" ] && exit 22
+            # The bytes are the URL's last path segment, so a test controls
+            # which digest a download produces.
+            printf '%s' "${{STUB_BYTES:-${{url##*/}}}}" > "$out"
+            """))
+        curl.chmod(0o755)
+        self.pins = self.tmp / "pins.tsv"
+        self.pins.write_text("# comment\n\nowner/repo\tmain\tdeps/manifest.json\tSkia\tmac-arm64\n")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _manifest(self, name: str, *, asset: str = "mac-arm64", sha: str | None = None) -> str:
+        sha = sha or hashlib.sha256(name.encode()).hexdigest()
+        manifest = {"dependencies": [
+            {"name": "V8", "determinism": {"release_assets": {asset: {
+                "url": "https://example.invalid/v8", "sha256": "0" * 64}}}},
+            {"name": "Skia", "determinism": {"release_assets": {asset: {
+                "url": f"https://example.invalid/{name}", "sha256": sha}}}},
+        ]}
+        (self.work / "deps").mkdir(exist_ok=True)
+        (self.work / "deps/manifest.json").write_text(__import__("json").dumps(manifest))
+        _git("add", "deps/manifest.json", cwd=self.work)
+        _git("commit", "--quiet", "-m", name, cwd=self.work)
+        _git("push", "--quiet", "origin", "HEAD:main", cwd=self.work)
+        return sha
+
+    def _run(self, *args: str, env: dict | None = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SYNC), *args, "--dir", str(self.cache)],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
+                 "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base), **(env or {})},
+        )
+
+    def _refresh(self, **env: str) -> subprocess.CompletedProcess:
+        return self._run("refresh", "--pins", str(self.pins), env=env)
+
+    def _blobs(self) -> list[str]:
+        root = self.cache / "sha256"
+        return sorted(p.name for p in root.iterdir() if not p.name.startswith(".")) if root.exists() else []
+
+    def test_the_current_pin_is_added_then_only_reverified(self) -> None:
+        sha = self._manifest("m158.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._blobs(), [sha])
+        self.assertEqual((self.cache / "sha256" / sha).read_bytes(), b"m158.zip")
+        self.assertIn("https://example.invalid/m158.zip", self.calls.read_text())
+        # Control: the V8 entry beside it, same asset key, was not taken.
+        self.assertNotIn("example.invalid/v8", self.calls.read_text())
+        self.calls.unlink()
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("already present", proc.stdout)
+        self.assertFalse(self.calls.exists(), "an existing blob was downloaded again")
+
+    def test_a_pin_bump_reaches_the_cache_at_the_next_refresh(self) -> None:
+        old = self._manifest("m157.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        self.assertEqual(self._refresh().returncode, 0)
+        new = self._manifest("m158.zip")
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._blobs(), sorted([old, new]))
+
+    def test_bytes_that_miss_the_pin_never_land_and_the_mirror_still_refreshes(self) -> None:
+        self._manifest("m158.zip", sha=hashlib.sha256(b"genuine").hexdigest())
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        head = self._manifest("m158b.zip", sha=hashlib.sha256(b"genuine").hexdigest())
+        del head
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("SHA-256 mismatch", proc.stderr)
+        self.assertEqual(self._blobs(), [])
+        self.assertEqual(list((self.cache / "sha256").glob(".staging.*")), [])
+        self.assertEqual(_git("rev-parse", "refs/heads/main", cwd=self.cache / "git/owner/repo.git"),
+                         _git("rev-parse", "HEAD", cwd=self.work))
+        self.assertFalse((self.cache / ".lock").exists())
+
+    def test_a_failed_download_is_reported_and_leaves_nothing(self) -> None:
+        self._manifest("m158.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        proc = self._refresh(STUB_FAIL="1")
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertIn("download failed", proc.stderr)
+        self.assertEqual(self._blobs(), [])
+
+    def test_an_unmirrored_repository_is_not_this_hosts_pin(self) -> None:
+        self._manifest("m158.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        self.pins.write_text("other/repo\tmain\tdeps/manifest.json\tSkia\tmac-arm64\n")
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._blobs(), [])
+        self.assertFalse(self.calls.exists())
+
+    def test_an_unreadable_pin_fails_the_pass_without_downloading(self) -> None:
+        self._manifest("m158.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        for line in ("owner/repo\tmain\tdeps/missing.json\tSkia\tmac-arm64\n",
+                     "owner/repo\tmain\tdeps/manifest.json\tSkia\twin-x64\n",
+                     "owner/repo\tmain\tdeps/manifest.json\tDawn\tmac-arm64\n",
+                     "owner/repo\tmain\tdeps/manifest.json\n"):
+            with self.subTest(line=line):
+                self.pins.write_text(line)
+                proc = self._refresh()
+                self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+                self.assertEqual(self._blobs(), [])
+                self.assertFalse(self.calls.exists())
+
+    def test_a_plain_http_or_malformed_digest_is_refused(self) -> None:
+        self._manifest("m158.zip", sha="NOTAHEX")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+        self.assertFalse(self.calls.exists())
+
+    def test_no_pin_file_changes_nothing(self) -> None:
+        self._manifest("m158.zip")
+        self.assertEqual(self._run("git-sync", "--repo", "owner/repo").returncode, 0)
+        proc = self._run("refresh", "--pins", str(self.tmp / "absent.tsv"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._blobs(), [])
+
+    def test_the_checked_in_pin_list_names_pulps_skia_archive(self) -> None:
+        rows = [line.split("\t") for line in
+                (ROOT / "manifests/artifact-cache-pins.tsv").read_text().splitlines()
+                if line and not line.startswith("#")]
+        self.assertIn(["Generous-Corp/pulp", "main", "tools/deps/manifest.json", "Skia", "mac-arm64"], rows)
+        self.assertTrue(all(len(row) == 5 for row in rows), rows)
+
+
 if __name__ == "__main__":
     unittest.main()
