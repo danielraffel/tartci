@@ -11,6 +11,11 @@ Run:  python3 -m unittest scripts.test_disk_reclaim   (or via discover)
 
 from __future__ import annotations
 
+import os as _os
+
+# disk_reclaim.main demotes a --fix pass to macOS background priority; the
+# suite must not demote the test runner itself.
+_os.environ.setdefault("TARTCI_RECLAIM_FOREGROUND", "1")
 import testing_support  # noqa: E402
 import errno
 import io
@@ -1786,6 +1791,62 @@ class HomeRootGuardTests(unittest.TestCase):
         with self.assertRaises(OSError) as raised:
             dr.bounded_scandir(self.home / "Library" / "Mail")
         self.assertEqual(raised.exception.errno, errno.EPERM)
+
+class BackgroundPriorityTests(unittest.TestCase):
+    """The hourly --fix pass yields CPU, disk and network to the gate VMs."""
+
+    def test_a_macos_pass_enters_darwin_background(self) -> None:
+        calls = []
+        result = dr.enter_background("darwin", {}, lambda *a: calls.append(a))
+        self.assertEqual(result, "darwin_background")
+        self.assertEqual(calls, [(dr.PRIO_DARWIN_PROCESS, 0, dr.PRIO_DARWIN_BG)])
+
+    def test_the_operator_can_keep_it_in_the_foreground(self) -> None:
+        calls = []
+        result = dr.enter_background("darwin", {dr.FOREGROUND_ENV: "1"},
+                                     lambda *a: calls.append(a))
+        self.assertEqual((result, calls), (f"unchanged: {dr.FOREGROUND_ENV}=1", []))
+
+    def test_other_platforms_and_failures_are_reported_not_raised(self) -> None:
+        self.assertEqual(dr.enter_background("linux", {}, None), "unchanged: not macOS")
+
+        def refuse(*_a):
+            raise PermissionError("EPERM")
+        self.assertIn("setpriority failed", dr.enter_background("darwin", {}, refuse))
+
+    def test_only_a_fix_pass_is_demoted_and_the_receipt_says_so(self) -> None:
+        receipts = []
+        for argv, want_calls in ((["--fix"], 1), ([], 0)):
+            calls = []
+            with unittest.mock.patch.object(dr, "enter_background",
+                                   side_effect=lambda: calls.append(1) or "darwin_background"), \
+                    unittest.mock.patch.object(dr, "_run", return_value=0), \
+                    unittest.mock.patch.object(dr, "record_pass",
+                                      side_effect=lambda a, r, c: receipts.append(r)):
+                self.assertEqual(dr.main(["--roots", "/nonexistent", *argv]), 0)
+            self.assertEqual(len(calls), want_calls, argv)
+        self.assertEqual([r["priority"] for r in receipts],
+                         ["darwin_background", "unchanged: dry-run"])
+        self.assertEqual(dr.pass_summary(receipts[0], 0)["priority"], "darwin_background")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS task policy")
+    def test_children_inherit_the_background_priority(self) -> None:
+        # Run in a child so this test runner keeps its own priority.
+        script = (
+            "import os, subprocess, sys; sys.path.insert(0, sys.argv[1]);"
+            "import disk_reclaim as dr; os.environ.pop(dr.FOREGROUND_ENV, None);"
+            "print(dr.enter_background());"
+            "print(subprocess.run(['ps', '-o', 'pri=', '-p', str(os.getpid())],"
+            " capture_output=True, text=True).stdout.strip())")
+        out = subprocess.run([sys.executable, "-c", script,
+                              str(pathlib.Path(dr.__file__).resolve().parent)],
+                             capture_output=True, text=True, timeout=300,
+                             env={k: v for k, v in os.environ.items()
+                                  if k != dr.FOREGROUND_ENV})
+        lines = out.stdout.split()
+        self.assertEqual(lines[0], "darwin_background", out.stderr)
+        self.assertEqual(lines[1], "4", out.stdout)   # macOS reports background as 4
+
 
 if __name__ == "__main__":
     unittest.main()

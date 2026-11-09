@@ -118,6 +118,42 @@ ROOT_PROBE_TIMEOUT_S = 15.0
 PASS_TIMEOUT_S = 900.0
 PASS_DEADLINE: float | None = None
 
+# The hourly pass runs as a macOS background process: low CPU priority on the
+# efficiency cores, throttled disk I/O and network, inherited by every git,
+# du, lsof and ccache child it starts. Its `git status`, `git fetch` and
+# ccache eviction walks share the Workshop volume with the gate VMs, and on m3
+# a pass ran 36 min to 1 h 45 min of every 96: GitHub reads by the steward on
+# that host timed out in 13% of passes while it ran against 5% otherwise, and
+# the VM store read unhealthy twice as often. launchd's LowPriorityIO throttles
+# disk I/O only; this also yields the CPU. A background pass runs longer, and
+# its per-command timeouts then keep a checkout rather than remove it, which
+# is the safe direction. The lease-denial reclaim is not demoted: a VM waits.
+PRIO_DARWIN_PROCESS = 4
+PRIO_DARWIN_BG = 0x1000
+FOREGROUND_ENV = "TARTCI_RECLAIM_FOREGROUND"
+
+
+def enter_background(platform: str | None = None,
+                     environ: Any = None,
+                     setpriority: Any = None) -> str:
+    """Demote this process (and its future children) to macOS background.
+
+    Returns what happened, for the receipt. Never raises: a pass that cannot
+    lower its priority still runs, at the priority launchd gave it.
+    """
+    platform = sys.platform if platform is None else platform
+    environ = os.environ if environ is None else environ
+    setpriority = os.setpriority if setpriority is None else setpriority
+    if platform != "darwin":
+        return "unchanged: not macOS"
+    if environ.get(FOREGROUND_ENV) == "1":
+        return f"unchanged: {FOREGROUND_ENV}=1"
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)
+    except OSError as exc:
+        return f"unchanged: setpriority failed: {exc}"
+    return "darwin_background"
+
 
 def bounded_fs_call(operation: Any, *, description: str,
                     timeout: float = ROOT_PROBE_TIMEOUT_S,
@@ -924,6 +960,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         # None is "the pass raised"; a receipt must still say it ran and failed.
         "result": "ok" if code == 0 else "failed",
         "mode": receipt.get("mode"),
+        "priority": receipt.get("priority"),
         "pressure": report.get("pressure"),
         "free_bytes_before": report.get("free_bytes_before"),
         "free_bytes_after": report.get("free_bytes_after"),
@@ -1159,7 +1196,9 @@ def main(argv: list[str] | None = None) -> int:
         import denial_reclaim  # noqa: PLC0415 - only this mode needs it
         return denial_reclaim.main([item for item in raw if item != "--on-lease-denial"])
     args = build_parser().parse_args(raw)
-    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run"}
+    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run",
+                               "priority": (enter_background() if args.fix
+                                            else "unchanged: dry-run")}
     code: int | None = None
     try:
         code = _run(args, receipt)

@@ -49,6 +49,13 @@ after its worktree root moved to /Volumes/<data-volume>) names it in
 gate above; a plain clone is always kept (`clone_in_shared_root`), because in
 a developer's Code directory a clone is someone's checkout, not scratch.
 
+A pass that runs out of budget resumes where it stopped. The checkouts are
+walked in name order starting just after the last one the previous pass
+examined (`scan-cursors.json` next to the verdict cache), wrapping around, so
+the ones a pass deferred are the first the next pass reaches. Without it every
+pass restarted at the top of the alphabet: on m3 each hourly pass re-examined
+the same ~160 of 1,384 checkouts and never reached the other 1,226.
+
 Keep-verdicts that only a change to the checkout can reverse are cached
 (~/.tartci/state/reclaim/checkout-verdicts.json) while the checkout's newest
 mtime is unchanged, for at most a day, so hundreds of idle checkouts are not
@@ -418,11 +425,15 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
          runner: Runner = subprocess.run, now: float | None = None,
          budget_s: float = PASS_BUDGET_S, cwds: list[str] | None | bool = True,
          cache: dict | None = None, next_cache: dict | None = None,
-         worktrees_only: bool = False,
+         worktrees_only: bool = False, resume_after: str | None = None,
          ) -> dict[str, Any]:
     """One pass over the git checkouts directly under `root`.
 
     `worktrees_only` keeps every plain clone (an extra_worktree_roots root).
+    `resume_after` is the name of the last checkout the previous pass
+    examined; this pass starts at the next name and wraps around. The report's
+    `next_cursor` is the value to hand the next pass: the last checkout this
+    pass examined when the budget deferred some, else None (a full sweep).
 
     `in_use` is the caller's live-build test (None when the process table
     could not be read, which removes nothing). `cwds` defaults to lsof.
@@ -435,6 +446,7 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
         "checkouts": 0, "removed": 0, "removed_bytes": 0, "removed_paths": [],
         "kept": {}, "deferred": 0, "orphaned_worktrees": 0, "orphaned_paths": [],
         "broken_checkouts": 0, "broken_paths": [],
+        "resumed_after": resume_after, "next_cursor": None,
     }
     if cwds is True:
         cwds = process_cwds(runner)
@@ -451,6 +463,10 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
     except OSError as exc:
         report["error"] = f"cannot list {root}: {exc}"
         return report
+    if resume_after is not None:
+        entries = ([e for e in entries if e.name > resume_after]
+                   + [e for e in entries if e.name <= resume_after])
+    last_examined: str | None = None
     for entry in entries:
         checkout = pathlib.Path(entry.path)
         if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
@@ -460,7 +476,12 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
         report["checkouts"] += 1
         if time.monotonic() - started > budget_s:
             report["deferred"] += 1
+            if report["next_cursor"] is None:
+                # Resume here next pass. Nothing examined yet (a zero budget)
+                # keeps the previous cursor rather than restarting at the top.
+                report["next_cursor"] = last_examined or resume_after or ""
             continue
+        last_examined = entry.name
         kind, gitdir = gitdir_of(checkout)
         if kind == "orphan":
             report["orphaned_worktrees"] += 1
@@ -535,6 +556,17 @@ SUMMED = ("checkouts", "removed", "removed_bytes", "deferred", "orphaned_worktre
 LISTED = ("removed_paths", "orphaned_paths", "broken_paths")
 
 
+CURSORS_FILE = "scan-cursors.json"
+
+
+def _load_json_dict(path: pathlib.Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
 def state_dir() -> pathlib.Path:
     home = os.environ.get("TARTCI_HOME", str(pathlib.Path.home() / ".tartci"))
     return pathlib.Path(home).expanduser() / "state" / "reclaim"
@@ -555,7 +587,8 @@ def combine(reports: list[dict[str, Any]], fix: bool, idle_hours: int) -> dict[s
         if report.get("error"):
             errors.append(f"{report.get('root')}: {report['error']}")
         out["by_root"][str(report.get("root"))] = {
-            key: report.get(key) for key in (*SUMMED, "kept", "error")}
+            key: report.get(key) for key in (*SUMMED, "kept", "error", "resumed_after",
+                                             "next_cursor")}
     if errors:
         out["error"] = "; ".join(errors)
     out["root"] = ", ".join(str(r.get("root")) for r in reports)
@@ -572,29 +605,34 @@ def run(*, fix: bool, profile: pathlib.Path,
         return {"enabled": False, "reason": why}
     roots = [root] if root is not None else [pathlib.Path(r) for r in settings["roots"]]
     verdicts = verdicts or state_dir() / "checkout-verdicts.json"
-    try:
-        cache = json.loads(verdicts.read_text())
-        cache = cache if isinstance(cache, dict) else {}
-    except (OSError, ValueError):
-        cache = {}
+    cache = _load_json_dict(verdicts)
     next_cache: dict = {}
+    cursors_path = verdicts.with_name(CURSORS_FILE)
+    cursors = _load_json_dict(cursors_path)
+    next_cursors: dict = {}
     reports = []
     try:
         cwds = process_cwds(runner)
         for one in roots:
-            reports.append(scan(one, fix=fix, idle_hours=settings["idle_hours"],
-                                in_use=in_use, runner=runner, cwds=cwds,
-                                cache=cache, next_cache=next_cache,
-                                worktrees_only=str(one) in settings.get("worktrees_only", [])))
+            previous = cursors.get(str(one))
+            report = scan(one, fix=fix, idle_hours=settings["idle_hours"],
+                          in_use=in_use, runner=runner, cwds=cwds,
+                          cache=cache, next_cache=next_cache,
+                          worktrees_only=str(one) in settings.get("worktrees_only", []),
+                          resume_after=previous if isinstance(previous, str) else None)
+            if report.get("next_cursor") is not None:
+                next_cursors[str(one)] = report["next_cursor"]
+            reports.append(report)
     except Exception as exc:  # noqa: BLE001 - a janitor must not take the pass down
         return {"enabled": True, "error": f"checkout scan failed: {exc}"}
-    try:
-        verdicts.parent.mkdir(parents=True, exist_ok=True)
-        tmp = verdicts.with_name(f".{verdicts.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(next_cache, sort_keys=True))
-        os.replace(tmp, verdicts)
-    except OSError:
-        pass
+    for path, body in ((verdicts, next_cache), (cursors_path, next_cursors)):
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(body, sort_keys=True))
+            os.replace(tmp, path)
+        except OSError:
+            pass
     report = combine(reports, fix, settings["idle_hours"])
     report["enabled"] = True
     return report

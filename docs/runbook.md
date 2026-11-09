@@ -3280,7 +3280,18 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   checkout never refreshes its index and makes it look recently used.
   Keep-verdicts are cached in `~/.tartci/state/reclaim/checkout-verdicts.json`
   while the checkout's newest mtime is unchanged, for at most a day. The
-  event's `by_root` gives each root's counts.
+  event's `by_root` gives each root's counts, plus `resumed_after` and
+  `next_cursor`: a pass that runs out of budget records the last checkout it
+  examined in `~/.tartci/state/reclaim/scan-cursors.json`, and the next pass
+  starts just after it (wrapping around), so deferred checkouts are reached
+  first instead of the same alphabetical head being re-examined every hour.
+
+  A `--fix` pass runs as a macOS background process (efficiency cores,
+  throttled disk I/O and network, inherited by its git, du, lsof and ccache
+  children); the receipt's `priority` says `darwin_background`. It takes
+  longer, and a per-command timeout then keeps a checkout rather than
+  removing it. `TARTCI_RECLAIM_FOREGROUND=1` keeps a manual pass at normal
+  priority. The `--on-lease-denial` reclaim is never demoted.
 
   Exit 3 means the pass ran and a scanned volume is still below the
   `--fail-below-gb` floor. `pool status` and `doctor fleet`
