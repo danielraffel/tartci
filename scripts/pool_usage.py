@@ -324,7 +324,8 @@ def lease_fit_holds(events: List[Dict[str, Any]], now: float) -> List[Tuple[floa
             if start is None:
                 start = ev["t"]
         elif start is not None and e in ("lease_fit_restored", "job_claim", "admission_precheck",
-                                         "clone_start", "supervisor_signal", "demand_waiting"):
+                                         "admission_precheck_overlap", "clone_start",
+                                         "supervisor_signal", "demand_waiting"):
             spans.append((start, ev["t"]))
             start = None
     if start is not None:

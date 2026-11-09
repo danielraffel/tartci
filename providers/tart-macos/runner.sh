@@ -2599,7 +2599,25 @@ run_one(){
   # This is an early bail, not the gate. The authoritative check still runs at
   # the JIT boundary below, where freshness is what matters; nothing here can
   # admit a VM that the boundary check would refuse.
-  if tartci_admission_clean_enabled; then
+  #
+  # Opt-in overlap (boundary-proof.lib.sh): skip this serial precheck so the
+  # parallel proof, started once the lease is held, answers the same question
+  # beside the clone and boot. The boundary below still refuses exactly as
+  # before; a refusal there opens a backoff that brings this precheck back.
+  PRECHECK_OVERLAP_RUN=0
+  # shellcheck disable=SC2034 # read by tartci_precheck_overlap_note_unconsumed
+  PRECHECK_OVERLAP_NOTED=0
+  # Without a runner group the cold boot starts no proof; skipping the
+  # precheck would then save nothing and lose its early bail.
+  if tartci_admission_clean_enabled && [ -n "$selected_group_id" ] \
+     && tartci_precheck_overlap_active; then
+    PRECHECK_OVERLAP_RUN=1
+    # Same in-flight phase every reader already knows (gate_supply, lane_busy,
+    # the launchd watchdog): this lane is reaching for a job before its clone.
+    heartbeat admission-precheck
+    event admission_precheck_overlap "repo=$REPO labels=$selected_labels"
+  fi
+  if tartci_admission_clean_enabled && [ "$PRECHECK_OVERLAP_RUN" = 0 ]; then
     local precheck_json="" precheck_rc=0
     heartbeat admission-precheck
     event admission_precheck "repo=$REPO labels=$selected_labels"
@@ -2622,9 +2640,14 @@ run_one(){
       event "$([ "$precheck_rc" -eq 3 ] && printf admission_precheck_deferred || printf admission_precheck_error)" \
         "rc=$precheck_rc pre_clone=true $precheck_detail"
       tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" admission_precheck
+      # With the overlap on, a serial refusal keeps the lane's backoff open:
+      # only an admit may re-enable the overlap.
+      [ "${TARTCI_ADMISSION_PRECHECK_OVERLAP:-0}" != 1 ] \
+        || tartci_precheck_overlap_note_refusal "$precheck_rc" serial
       note "[$i] Shipyard admission $([ "$precheck_rc" -eq 3 ] && printf deferred || printf failed) before clone — no VM will be cloned; backing off ($precheck_detail)"
       return "$precheck_rc"
     fi
+    tartci_precheck_overlap_clear
   fi
   if [ "${TARTCI_RUNTIME_MEASURE:-0}" = 1 ]; then
     logdir="$MACOS_LOGROOT/$vm"
@@ -2803,6 +2826,10 @@ run_one(){
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     tartci_admission_contention_event "$admission_json" boundary
     tartci_admission_reuse_event "$admission_json" boundary
+    # The boundary has its answer, from whichever source; an unconsumed
+    # parallel refusal must not open the overlap backoff after an admit.
+    # shellcheck disable=SC2034 # read by tartci_precheck_overlap_note_unconsumed
+    PRECHECK_OVERLAP_NOTED=1
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
@@ -2810,6 +2837,7 @@ run_one(){
       heartbeat "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
       event "$([ "$admission_rc" -eq 3 ] && printf admission_deferred || printf admission_error)" \
         "rc=$admission_rc unregistered=true $admission_detail"
+      [ "${PRECHECK_OVERLAP_RUN:-0}" != 1 ] || tartci_precheck_overlap_note_refusal "$admission_rc" boundary
       note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) at the JIT boundary — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_vm
       tartci_release_vm_lease
@@ -3075,6 +3103,8 @@ tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 tartci_boundary_proof_validate \
   || die "invalid parallel boundary-proof configuration"
+tartci_precheck_overlap_validate \
+  || die "invalid admission precheck overlap configuration"
 tartci_job_claim_validate || die "invalid job-claim configuration"
 tartci_vm_dhcp_validate || die "invalid VM DHCP breaker configuration"
 tartci_lease_fit_validate || die "invalid lease-fit configuration"
