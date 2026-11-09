@@ -12,6 +12,11 @@ Run:  python3 -m unittest scripts.test_pulp_reapers
 
 from __future__ import annotations
 
+import os as _os
+
+# disk_reclaim.main demotes a --fix pass to macOS background priority; the
+# suite must not demote the test runner itself.
+_os.environ.setdefault("TARTCI_RECLAIM_FOREGROUND", "1")
 import testing_support  # noqa: E402
 import io
 import json

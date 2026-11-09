@@ -321,6 +321,15 @@ ALLOWED = {
         "with tomllib; without it the store comes from TART_HOME only "
         "(test_no_tomllib_fallbacks)",
     ("test_tmp_checkouts.py",
+     "CursorPersistenceTests.test_a_blind_pass_keeps_the_cursor"):
+        reads_profile("tmp_checkouts.run()"),
+    ("test_tmp_checkouts.py",
+     "CursorPersistenceTests.test_a_dry_run_leaves_the_cursor_alone"):
+        reads_profile("tmp_checkouts.run()"),
+    ("test_tmp_checkouts.py",
+     "CursorPersistenceTests.test_a_root_this_pass_did_not_scan_keeps_its_cursor"):
+        reads_profile("tmp_checkouts.run()"),
+    ("test_tmp_checkouts.py",
      "MultiRootTests.test_an_extra_root_reaps_worktrees_and_keeps_every_clone"):
         reads_profile("tmp_checkouts.run()"),
     ("test_tmp_checkouts.py",
@@ -328,6 +337,9 @@ ALLOWED = {
         reads_profile("tmp_checkouts.run()"),
     ("test_tmp_checkouts.py",
      "MultiRootTests.test_worktree_root_is_opt_in_and_needs_a_root"):
+        reads_profile("tmp_checkouts.run()"),
+    ("test_tmp_checkouts.py",
+     "ResumeCursorTests.test_run_persists_the_cursor_between_passes"):
         reads_profile("tmp_checkouts.run()"),
     ("test_vm_dhcp_breaker.py",
      "Wiring.test_the_profile_key_turns_it_off_and_nothing_else"):
