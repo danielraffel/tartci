@@ -7,6 +7,7 @@ import hashlib
 import os
 import plistlib
 import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -712,7 +713,18 @@ class RunnerArchiveRefreshTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.cache = self.tmp / "cache"
-        (self.cache / "git/owner/repo.git").mkdir(parents=True)
+        origin = self.tmp / "remote/owner/repo.git"
+        origin.mkdir(parents=True)
+        _git("init", "--quiet", "--bare", "-b", "main", str(origin))
+        work = self.tmp / "work"
+        _git("clone", "--quiet", str(origin), str(work))
+        (work / "f").write_text("f")
+        _git("add", "f", cwd=work)
+        _git("commit", "--quiet", "-m", "f", cwd=work)
+        _git("push", "--quiet", "origin", "HEAD:main", cwd=work)
+        subprocess.run(["bash", str(SYNC), "git-sync", "--repo", "owner/repo", "--dir", str(self.cache)],
+                       check=True, capture_output=True,
+                       env={**os.environ, "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.tmp / "remote")})
         self.payload = b"runner-archive-bytes"
         self.sha = hashlib.sha256(self.payload).hexdigest()
         self.bin = self.tmp / "bin"
@@ -753,12 +765,14 @@ class RunnerArchiveRefreshTests(unittest.TestCase):
 
     def test_the_pinned_runner_archive_is_added_then_only_reverified(self) -> None:
         proc = self._refresh()
-        self.assertEqual(proc.returncode, 1, "the fixture mirror is not a real repository")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self._blobs(), [self.sha])
         self.assertEqual((self.cache / "sha256" / self.sha).read_bytes(), self.payload)
         self.assertIn("https://example.invalid/runner.tar.gz", self.calls.read_text())
         self.calls.unlink()
-        self._refresh()
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("already present", proc.stdout)
         self.assertFalse(self.calls.exists(), "an existing blob was downloaded again")
 
     def test_runner_bytes_that_miss_the_pin_never_land(self) -> None:
@@ -784,7 +798,7 @@ class RunnerArchiveRefreshTests(unittest.TestCase):
                 self.assertFalse(self.calls.exists())
 
     def test_a_host_that_mirrors_nothing_is_untouched(self) -> None:
-        (self.cache / "git/owner/repo.git").rmdir()
+        shutil.rmtree(self.cache / "git/owner/repo.git")
         proc = self._refresh()
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(self._blobs(), [])
