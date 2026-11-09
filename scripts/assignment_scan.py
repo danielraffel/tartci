@@ -27,11 +27,25 @@ empty listing believable, so it is enforced whenever a listing is walked to its
 end, and skipped only where a witness has already made absence moot.
 
 Resolving a workflow name to its id is the one input that does not change
-between polls, so it is read from a short-lived host-shared cache instead of
+between polls, so it is read from a host-shared cache (one hour) instead of
 being re-fetched every time. An id that no longer resolves fails the scan
 closed on its own listing call, so the cache cannot turn a broken lookup into
 an empty queue; the bounded lifetime covers the narrower case of a second
-workflow appearing under an already-cached display name.
+workflow appearing under an already-cached display name. Ids resolved by name
+almost never change, so the window is long; a cached id whose run listing
+answers 404 is dropped and resolved live once before the scan fails closed.
+
+A run's job listing is the call the scan makes most: every queued or
+in-progress run, for every class, on every lane. Each lane's merge-group and
+PR-head classes read the same `Build and Test` runs one after the other, and
+the two gate lanes on a host read them again. So a listing that showed NO
+queued job is kept in a short-lived host-shared cache, keyed by the run's id and
+its `updated_at`, and reused instead of re-read. Only absence is cached, and
+only for a run whose `updated_at` is unchanged: a run carrying a queued job is
+always read live, so the cache can never manufacture demand, and a run that
+changed is always read again. The one thing it can do is report a queued job
+up to its TTL late when GitHub queues one without touching the run, which is
+bounded below the per-lane selection cache the supervisor already replays.
 """
 from __future__ import annotations
 
@@ -54,6 +68,7 @@ from observation_lock import FairObservationLock, ObservationBackoff, Observatio
 from gh_identity import (
     CLI_REFUSED,
     NO_VALID_CREDENTIALS,
+    RATE_LIMITED,
     AuthPreflightError,
     GitHubIdentity,
     ScanFailure,
@@ -280,6 +295,130 @@ class StaleDemandClassifier:
         return self.scanner.ref_exists(f"heads/{branch.strip()}")
 
 
+class JobListingCache:
+    """Host-shared memo of runs whose job listing showed no queued job.
+
+    Absence only. A run is skipped when this host read its jobs less than
+    `ttl` seconds ago, saw no queued job of any class, and the run still
+    carries the same `updated_at` and `status`. Anything else is read live:
+    an unknown run, a changed run, a run without an `updated_at` to compare,
+    an expired entry, and every run that was carrying a queued job. So a hit
+    can only stand in for a read that would itself have contributed nothing,
+    and the scan's verdict can never gain demand from the cache.
+
+    Stored per run, not per class: "no queued job at all" holds for every
+    class, which is what lets the merge-group and PR-head scans, and the two
+    lanes beside each other, reuse one read. Unreadable state is an empty
+    cache and an unwritable file skips the publish: the cache only ever saves
+    calls, so it never fails a scan.
+    """
+
+    def __init__(self, args: argparse.Namespace) -> None:
+        self.ttl = float(args.job_cache_ttl)
+        self.path = Path(args.job_cache_file)
+        self.repo = args.repo
+        self.lock = threading.Lock()
+        self.fresh: dict[str, dict[str, Any]] = {}
+        self.present: set[str] = set()
+        self.hits = 0
+        self.entries = self._load() if self.ttl > 0 else {}
+
+    def _key(self, run: dict[str, Any]) -> str:
+        return f"{self.repo}#{run.get('id')}"
+
+    @staticmethod
+    def _stamp(run: dict[str, Any]) -> tuple[str, str] | None:
+        updated = run.get("updated_at")
+        status = run.get("status")
+        if not isinstance(updated, str) or not updated.strip():
+            return None
+        return updated, str(status or "")
+
+    def _live(self, record: Any, now: float) -> bool:
+        if not isinstance(record, dict):
+            return False
+        at = record.get("checked_at")
+        if not isinstance(at, (int, float)) or isinstance(at, bool):
+            return False
+        return 0 <= now - at < self.ttl
+
+    def _load(self) -> dict[str, dict[str, Any]]:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        runs = payload.get("runs") if isinstance(payload, dict) else None
+        if not isinstance(runs, dict):
+            return {}
+        now = time.time()
+        return {str(key): value for key, value in runs.items() if self._live(value, now)}
+
+    def absent(self, run: dict[str, Any]) -> bool:
+        """True when a recent read of this unchanged run found no queued job."""
+        if self.ttl <= 0:
+            return False
+        stamp = self._stamp(run)
+        if stamp is None:
+            return False
+        record = self.entries.get(self._key(run))
+        if not self._live(record, time.time()):
+            return False
+        if (record.get("updated_at"), record.get("status")) != stamp:
+            return False
+        with self.lock:
+            self.hits += 1
+        return True
+
+    def record_absent(self, run: dict[str, Any]) -> None:
+        if self.ttl <= 0:
+            return
+        stamp = self._stamp(run)
+        if stamp is None:
+            return
+        with self.lock:
+            self.fresh[self._key(run)] = {
+                "checked_at": time.time(), "updated_at": stamp[0], "status": stamp[1],
+            }
+
+    def record_present(self, run: dict[str, Any]) -> None:
+        """A queued job was seen: no lane may skip this run on an older read."""
+        if self.ttl <= 0:
+            return
+        with self.lock:
+            self.present.add(self._key(run))
+            self.fresh.pop(self._key(run), None)
+
+    def persist(self) -> None:
+        if self.ttl <= 0 or (not self.fresh and not self.present):
+            return
+        lock_path = self.path.with_name(self.path.name + ".lock")
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with lock_path.open("a+", encoding="utf-8") as lock:
+                deadline = time.monotonic() + _CACHE_LOCK_WAIT_SECS
+                while True:
+                    try:
+                        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            return
+                        time.sleep(0.05)
+                runs = self._load()
+                for key in self.present:
+                    runs.pop(key, None)
+                runs.update(self.fresh)
+                tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.tmp")
+                try:
+                    tmp.write_text(json.dumps({"runs": runs}), encoding="utf-8")
+                    os.replace(tmp, self.path)
+                finally:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink()
+        except OSError:
+            return
+
+
 class AssignmentScanner:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -324,6 +463,7 @@ class AssignmentScanner:
         self.identity: GitHubIdentity | None = None
         self.workflow_id_cache_path = Path(args.workflow_id_cache_file)
         self.stale_demand = StaleDemandClassifier(self, args)
+        self.job_cache = JobListingCache(args)
 
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
@@ -382,6 +522,12 @@ class AssignmentScanner:
             if reason.reason_code == CLI_REFUSED:
                 # The request never reached GitHub, so another attempt only
                 # collects the same local refusal.
+                raise ScanError(str(reason))
+            if reason.reason_code == RATE_LIMITED:
+                # An allowance does not refill within a retry's sub-second
+                # backoff, so another attempt only adds a refused request to a
+                # limit GitHub also enforces on request rate. Every lane on
+                # every host made three of these per poll for the same answer.
                 raise ScanError(str(reason))
             raise TransientApiFault(str(reason))
         try:
@@ -667,12 +813,13 @@ class AssignmentScanner:
             resolved[name] = workflow_id
         return resolved
 
-    def _store_workflow_ids(self, resolved: dict[str, int]) -> None:
+    def _store_workflow_ids(self, resolved: dict[str, int] | None) -> None:
         """Publish the resolved ids for the other lanes sharing this host.
 
-        Best effort by construction: the cache only ever saves a call, so a
-        host that cannot write one keeps scanning correctly and pays for the
-        listing on every poll.
+        `None` drops this repository's entry instead. Best effort by
+        construction: the cache only ever saves a call, so a host that cannot
+        write one keeps scanning correctly and pays for the listing on every
+        poll.
         """
         if self.args.workflow_id_cache_ttl <= 0:
             return
@@ -704,10 +851,13 @@ class AssignmentScanner:
                     payload = {}
                 if not isinstance(payload, dict):
                     payload = {}
-                payload[self.args.repo] = {
-                    "fetched_at": time.time(),
-                    "workflows": dict(resolved),
-                }
+                if resolved is None:
+                    payload.pop(self.args.repo, None)
+                else:
+                    payload[self.args.repo] = {
+                        "fetched_at": time.time(),
+                        "workflows": dict(resolved),
+                    }
                 tmp = self.workflow_id_cache_path.with_name(
                     f"{self.workflow_id_cache_path.name}.{os.getpid()}.tmp"
                 )
@@ -789,6 +939,10 @@ class AssignmentScanner:
         # past its API timeout and blinds the host.
         if self.stale_demand.remembered(run):
             return 0
+        # A recent read of this same, unchanged run found no queued job at all,
+        # so it cannot contribute demand to any class; see JobListingCache.
+        if self.job_cache.absent(run):
+            return 0
         prefix = (
             f"repos/{self.args.repo}/actions/runs/{run_id}"
             "/jobs?filter=latest"
@@ -846,12 +1000,17 @@ class AssignmentScanner:
             matches.add(job_id)
             if not self.args.exhaustive_count:
                 # One witness settles the question the caller actually asks.
+                self.job_cache.record_present(run)
                 self.witness.set()
                 return len(matches)
         # Reached only when the loop ran to the end, so `queued_jobs` is the
         # run's complete count. A run that produced a witness returned above
         # and is never classified, which is correct: a matching queued job is
         # demand whatever its queue branch says.
+        if queued_jobs:
+            self.job_cache.record_present(run)
+        else:
+            self.job_cache.record_absent(run)
         if self.stale_demand.classify(run, queued_jobs):
             return 0
         return len(matches)
@@ -861,17 +1020,48 @@ class AssignmentScanner:
         # is a claim/coordination primitive, not a network mutex: holding it
         # over pagination lets one slow API call starve every other lane.
         workflow_ids = self._cached_workflow_ids()
-        total = 0
+        from_cache = workflow_ids is not None
         self._preflight_identity()
-        if workflow_ids is None:
-            workflow_ids = self._workflow_ids()
-            # Published under the cache's own file lock, never the host
-            # observation lock. That lock carries the repository's timeout
-            # backoff, so publishing under it failed a scan whose reads had all
-            # succeeded, and the cache it would have refreshed stayed expired:
-            # on 2026-10-25 every gate lane on m3 went SCAN BLIND this way on
-            # most polls, each one after a successful workflow listing.
-            self._store_workflow_ids(workflow_ids)
+        try:
+            if workflow_ids is None:
+                workflow_ids = self._resolve_and_publish_workflow_ids()
+            try:
+                return self._walk(workflow_ids)
+            except ScanError as error:
+                if not from_cache or not self._cached_id_vanished(error, workflow_ids):
+                    raise
+                # The long-lived id no longer resolves (the workflow was
+                # replaced). Drop it, resolve live once, and walk again; a
+                # second failure fails closed exactly as before.
+                self._store_workflow_ids(None)
+                self.witness.clear()
+                return self._walk(self._resolve_and_publish_workflow_ids())
+        finally:
+            self.job_cache.persist()
+
+    def _resolve_and_publish_workflow_ids(self) -> dict[str, int]:
+        workflow_ids = self._workflow_ids()
+        # Published under the cache's own file lock, never the host
+        # observation lock. That lock carries the repository's timeout
+        # backoff, so publishing under it failed a scan whose reads had all
+        # succeeded, and the cache it would have refreshed stayed expired:
+        # on 2026-10-25 every gate lane on m3 went SCAN BLIND this way on
+        # most polls, each one after a successful workflow listing.
+        self._store_workflow_ids(workflow_ids)
+        return workflow_ids
+
+    @staticmethod
+    def _cached_id_vanished(error: BaseException, workflow_ids: dict[str, int]) -> bool:
+        text = str(error)
+        if "404" not in text and "not found" not in text.lower():
+            return False
+        return any(
+            f"/actions/workflows/{workflow_id}/runs" in text
+            for workflow_id in workflow_ids.values()
+        )
+
+    def _walk(self, workflow_ids: dict[str, int]) -> int:
+        total = 0
         scanned: set[int] = set()
 
         # Concurrency remains opt-in for a measured host. The reliable fleet
@@ -907,6 +1097,8 @@ class AssignmentScanner:
         # proved stale before the witness landed is still worth remembering.
         self.stale_demand.persist()
         self.stale_demand.emit()
+        if self.job_cache.hits:
+            print(f"assignment-scan-job-cache hits={self.job_cache.hits}", file=sys.stderr)
         if self.witness.is_set():
             # Deliberately not the running total: the scan stopped early, so the
             # total is a partial count and reporting it would invent precision
@@ -1008,8 +1200,14 @@ def parse_args() -> argparse.Namespace:
         "--workflow-id-cache-ttl",
         type=float,
         default=float(
-            os.environ.get("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS", "300")
+            os.environ.get("TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS", "3600")
         ),
+    )
+    parser.add_argument("--job-cache-file", default=None)
+    parser.add_argument(
+        "--job-cache-ttl",
+        type=float,
+        default=float(os.environ.get("TARTCI_ASSIGNMENT_JOB_CACHE_TTL_SECS", "30")),
     )
     parser.add_argument(
         "--observation-lock-file",
@@ -1086,6 +1284,14 @@ def parse_args() -> argparse.Namespace:
         )
     if not math.isfinite(args.workflow_id_cache_ttl):
         parser.error("--workflow-id-cache-ttl must be finite")
+    # Bounded well below the supervisor's 120 s selection cache, so reusing an
+    # absence never makes a verdict older than one the lane already replays.
+    if not math.isfinite(args.job_cache_ttl) or not 0 <= args.job_cache_ttl <= 60:
+        parser.error("--job-cache-ttl must be between 0 and 60 seconds")
+    if args.job_cache_file is None:
+        args.job_cache_file = str(
+            Path(args.observation_lock_file).parent / "assignment-job-cache.json"
+        )
     return args
 
 

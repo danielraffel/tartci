@@ -13,7 +13,11 @@ scanned or written. Per host and fleet-wide over a window (default 24h):
   samples are the per-poll demand_waiting (slot_full branch),
   yielded_to_priority and yielded_host_health events. Demand while the host
   was full is reported separately as full-host wait: that is queueing, not
-  waste. A lane in a lease-fit hold does not scan the queue, so its demand is
+  waste. A sample that also carries `reserved` (live slot reservations) is
+  full when the reservations fill the cap even though fewer guests exist: a
+  sibling lane between its claim and its guest appearing (admission precheck,
+  clone, boot) already holds that slot. Older samples without the field keep
+  the guest-count rule. A lane in a lease-fit hold does not scan the queue, so its demand is
   not observed; those holds are reported as their own count and duration.
 * JIT discards: VMs that were cloned and torn down without being assigned a
   job, by the event that named the cause.
@@ -295,7 +299,11 @@ def demand_spans(events: List[Dict[str, Any]], default_poll: int) -> List[Dict[s
             if m:
                 running, cap = m.group(1), m.group(2)
         try:
-            state = "idle" if int(running) < int(cap) else "full"
+            held = int(running)
+            reserved = f.get("reserved")
+            if isinstance(reserved, int) and not isinstance(reserved, bool):
+                held = max(held, reserved)
+            state = "idle" if held < int(cap) else "full"
         except (TypeError, ValueError):
             state = "unknown"
         if ev["event"] == "demand_waiting":

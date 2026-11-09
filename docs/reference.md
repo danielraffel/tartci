@@ -639,13 +639,24 @@ host-health yield still apply, and a failed age scan keeps yielding. Tier and
 single-label lanes only. Preview with `serve macos --print-yield-bound`.
 
 To make slower hosts prefer faster ones, `TARTCI_CLAIM_DELAY_SECONDS=N` (fleet
-lane key `claim_delay_seconds`; unset or `0` = off, today's behavior) makes a
-lane that is about to claim queued work sleep `N` seconds, re-run its own queue
-scan **once**, and back off (`claim_delay_backoff` event) if a faster host took
-the work. The cost is one queue read per claim attempt, none when off; a failed
-re-scan claims anyway (fail open). It never changes the host VM cap. Preview
-with `serve macos --print-claim-delay`. Set it on the gate lanes of slower
-hosts only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
+lane key `claim_delay_seconds`, which requires `claim_delay_peers`; unset or
+`0` = off) makes a lane that is about to claim queued work first read the
+published supply of the faster hosts in `TARTCI_CLAIM_DELAY_PEERS` (fleet lane
+key `claim_delay_peers`, a list of host ids) with `scripts/gate_supply.py`, the
+report the fallback lane uses. It sleeps only when that decision is `hold`
+(every peer report fresh and readable) and the peers' free, healthy lanes alone
+cover every queued job of the class; it then sleeps `N` seconds, re-runs its own
+selection **once**, live, and backs off (`claim_delay_backoff` event) if a
+faster host took the work. With no peers, unreadable supply, or more queued
+jobs than free faster slots it claims at once (`claim_delay_skipped` event,
+with the reason), so the delay never idles a free slot that no faster host can
+fill. A failed re-scan claims anyway (fail open). The delay is re-read on every
+decision from `TARTCI_CLAIM_DELAY_FILE` (default
+`~/.config/tartci/claim-delay-seconds`) when that file holds an integer from 0
+to 600, so it can be changed or set to 0 without a pool drain. It never changes
+the host VM cap. Preview with `serve macos --print-claim-delay`. Set it on the
+gate lanes of slower hosts only, e.g. 0 / 15 / 30 / 60 from fastest to
+slowest.
 
 Install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep

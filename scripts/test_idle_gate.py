@@ -302,18 +302,22 @@ esac
 
 
 class ClaimDelayTests(unittest.TestCase):
-    """TARTCI_CLAIM_DELAY_SECONDS makes a slower host wait, re-check its own
-    queue ONCE, and back off when a faster host took the work.
+    """TARTCI_CLAIM_DELAY_SECONDS lets a slower host leave queued work to a
+    faster one, but only when the faster hosts' published supply can take it.
 
     Driven through the real `--print-claim-delay` hook. `sleep` is a PATH stub
     that records its argument and can flip the stub GitHub to "job taken", which
-    is what a faster host claiming during the delay looks like.
+    is what a faster host claiming during the delay looks like. The faster host
+    is a stub `ssh` that answers `tartci pool supply` with a fixed report, read
+    by the real scripts/gate_supply.py.
     """
 
     LABELS = "self-hosted,macOS,ARM64,pulp-build-vm-release"
+    REPO = "Generous-Corp/pulp"
 
     def _run(self, *, delay, taken_during_sleep=False, gh_fails_after_sleep=False,
-             tier_drains_during_sleep=False):
+             tier_drains_during_sleep=False, peer_free=1, peer_in_flight=0,
+             peer_verdict="ok", queued_jobs=1, delay_file=None):
         import json
         import stat
         import tempfile
@@ -322,9 +326,9 @@ class ClaimDelayTests(unittest.TestCase):
                "created_at": "2026-01-01T00:00:00Z",
                "updated_at": "2026-01-01T00:00:00Z"}
         jobs = {"jobs": [{
-            "id": 201, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
+            "id": 201 + n, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
             "labels": self.LABELS.split(",") + ["pulp-release-tagged"],
-        }]}
+        } for n in range(queued_jobs)]}
         run2 = dict(run, id=102, name="Release-path PR gate")
         jobs2 = {"jobs": [{
             "id": 202, "status": "queued", "created_at": "2026-01-01T00:00:00Z",
@@ -356,11 +360,22 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
 {f': >"{tmp}/fail"' if gh_fails_after_sleep else ':'}
 {f': >"{tmp}/tier0gone"' if tier_drains_during_sleep else ':'}
 """
+        report = {"schema": "tartci.gate-supply/v1", "verdict": peer_verdict,
+                  "reason": None if peer_verdict == "ok" else "lane blind",
+                  "host": "m5studio", "repo": self.REPO, "class": "pulp-release-tagged",
+                  "free": peer_free, "in_flight": peer_in_flight}
+        ssh = f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >>"{tmp}/ssh.log"
+printf '%s\\n' '{json.dumps(report)}'
+"""
         for name, body in (("tart", "#!/usr/bin/env bash\nexit 0\n"),
-                           ("stubgh", gh), ("sleep", sleep)):
+                           ("stubgh", gh), ("sleep", sleep), ("stubssh", ssh)):
             path = tmp / name
             path.write_text(body, encoding="utf-8")
             path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        listing = tmp / "launchctl-list.txt"
+        listing.write_text("PID\tStatus\tLabel\n", encoding="utf-8")
+        (tmp / "agents").mkdir()
         base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
                 if Path(b).exists()]
         env = {
@@ -371,14 +386,22 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
             "TARTCI_GH_CLI": "stubgh",
             "TARTCI_QUEUE_STAGGER_MAX_SECS": "0",
             "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS": "0",
-            "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+            "TARTCI_RUNNER_REPO": self.REPO,
             "TARTCI_RUNNER_LABELS": self.LABELS,
             "TARTCI_RUNNER_WORKFLOW_TIERS":
                 "pulp-release-tagged|Release CLI\n"
                 "pulp-release-pr-gate|Release-path PR gate",
+            "TARTCI_CLAIM_DELAY_SSH": str(tmp / "stubssh"),
+            "TARTCI_FLEET_LAUNCHCTL_LIST_FILE": str(listing),
+            "TARTCI_LANE_AGENTS_DIR": str(tmp / "agents"),
         }
+        if peer_free is not None:
+            env["TARTCI_CLAIM_DELAY_PEERS"] = "m5studio=tartci-m5studio"
         if delay is not None:
             env["TARTCI_CLAIM_DELAY_SECONDS"] = delay
+        if delay_file is not None:
+            (tmp / "claim-delay").write_text(delay_file, encoding="utf-8")
+            env["TARTCI_CLAIM_DELAY_FILE"] = str(tmp / "claim-delay")
         return subprocess.run(
             ["bash", str(SCRIPT), "--print-claim-delay"],
             capture_output=True, text=True, check=False, env=env,
@@ -395,6 +418,18 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
         log = self.tmp / "sleep.log"
         return log.read_text().split() if log.exists() else []
 
+    def _events(self) -> list:
+        import json
+        log = self.tmp / "state" / "events.jsonl"
+        if not log.exists():
+            return []
+        return [json.loads(line) for line in log.read_text().splitlines() if line]
+
+    def _event(self, kind: str) -> dict:
+        matches = [e for e in self._events() if e["event"] == kind]
+        self.assertEqual(len(matches), 1, self._events())
+        return matches[0]
+
     def test_delay_zero_or_unset_claims_without_sleeping_or_scanning(self) -> None:
         for delay in (None, "0"):
             with self.subTest(delay=delay):
@@ -403,6 +438,7 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
                 self.assertEqual(r.stdout.strip(), "claim")
                 self.assertEqual(self._sleeps(), [])
                 self.assertEqual(self._queued_reads(), 0)
+                self.assertFalse((self.tmp / "ssh.log").exists())
 
     def test_delay_waits_then_rechecks_once_and_claims_when_still_queued(self) -> None:
         r = self._run(delay="15")
@@ -413,6 +449,7 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
         # costs exactly one queue read beyond the preflight's own
         # selection, not one per second or per poll.
         self.assertEqual(self._queued_reads(), 2)
+        self.assertIn("peer_free=1", self._event("claim_delay_wait")["detail"])
 
     def test_job_taken_during_the_delay_means_no_claim(self) -> None:
         r = self._run(delay="15", taken_during_sleep=True)
@@ -434,6 +471,68 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "claim")
 
+    def test_no_faster_host_configured_never_sleeps(self) -> None:
+        # The NO-GO shape: a delay with nothing to wait for. It must claim at
+        # once and say why, with no extra queue read.
+        r = self._run(delay="15", peer_free=None)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), [])
+        self.assertEqual(self._queued_reads(), 1)
+        self.assertIn("reason=no_faster_hosts_configured",
+                      self._event("claim_delay_skipped")["detail"])
+
+    def test_no_free_faster_slot_never_sleeps(self) -> None:
+        # The faster host is busy reaching for work (in flight) but has no free
+        # slot. gate_supply counts that as cover (`hold`); the delay must not,
+        # because nothing there is free to take this job.
+        r = self._run(delay="15", peer_free=0, peer_in_flight=1)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), [])
+        detail = self._event("claim_delay_skipped")["detail"]
+        self.assertIn("reason=supply_hold", detail)
+        self.assertIn("peer_free=0", detail)
+        # Control: the same supply with the slot free does sleep.
+        r = self._run(delay="15", peer_free=1, peer_in_flight=0)
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_more_queued_jobs_than_free_faster_slots_never_sleeps(self) -> None:
+        r = self._run(delay="15", peer_free=1, queued_jobs=2)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), [])
+        detail = self._event("claim_delay_skipped")["detail"]
+        self.assertIn("demand=2", detail)
+        self.assertIn("peer_free=1", detail)
+        # Control: as many free faster slots as queued jobs sleeps.
+        self._run(delay="15", peer_free=2, queued_jobs=2)
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_unreadable_or_unhealthy_faster_host_never_sleeps(self) -> None:
+        r = self._run(delay="15", peer_free=1, peer_verdict="unknown")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), [])
+        self.assertIn("reason=supply_unknown",
+                      self._event("claim_delay_skipped")["detail"])
+
+    def test_the_delay_file_overrides_the_startup_value_every_decision(self) -> None:
+        # Off by file although the LaunchAgent says 15: no sleep, no scan.
+        r = self._run(delay="15", delay_file="0\n")
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), [])
+        self.assertEqual(self._queued_reads(), 0)
+        # On by file although the LaunchAgent says nothing.
+        r = self._run(delay=None, delay_file="20")
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), ["20"])
+        # A file that is not a bounded integer is ignored, not trusted.
+        for junk in ("abc", "601", "-5", "1.5"):
+            with self.subTest(junk=junk):
+                self._run(delay="15", delay_file=junk)
+                self.assertEqual(self._sleeps(), ["15"])
+
     def test_an_invalid_delay_refuses_to_start(self) -> None:
         for delay in ("-5", "15s", "1.5"):
             with self.subTest(delay=delay):
@@ -443,10 +542,22 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
 
     def test_loop_delays_only_at_the_claim_point(self) -> None:
         body = SCRIPT.read_text(encoding="utf-8")
-        self.assertIn('if [ "$CLAIM_DELAY" -gt 0 ] && [ "${q:-0}" -gt 0 ]', body)
+        self.assertIn('claim_delay_now="$(tartci_claim_delay_seconds)"', body)
+        self.assertIn('if [ "$claim_delay_now" -gt 0 ] && [ "${q:-0}" -gt 0 ]', body)
         self.assertIn('[ "$r" -lt "$cap" ]', body)
-        self.assertLess(body.index('"$(claim_delay_gate "$selected_labels" "$selected_tier")" = backoff'),
-                        body.index("# Idle gate: boot only when (1)"))
+        self.assertLess(
+            body.index('"$(claim_delay_gate "$selected_labels" "$selected_tier" "$q")" = backoff'),
+            body.index("# Idle gate: boot only when (1)"))
+
+    def test_v2_recheck_bypasses_the_selection_cache(self) -> None:
+        # select_work in event-class-v2 mode replays a 120 s selection cache, so
+        # re-running it after the delay could never see that a faster host took
+        # the work. The recheck must force a live selection.
+        body = SCRIPT.read_text(encoding="utf-8")
+        gate = body[body.index("claim_delay_gate(){"):body.index("higher_priority_demand(){")]
+        self.assertIn('selection="$(tartci_assignment_v2_select 1)"', gate)
+        self.assertLess(gate.index('sleep "$delay"'),
+                        gate.index('selection="$(tartci_assignment_v2_select 1)"'))
 
 
 class HostHealthYieldTests(unittest.TestCase):

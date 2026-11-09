@@ -113,7 +113,7 @@ LANE_KEYS = {
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
-    "yield_max_wait_seconds", "claim_delay_seconds",
+    "yield_max_wait_seconds", "claim_delay_seconds", "claim_delay_peers",
     "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
@@ -1024,6 +1024,27 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: claim_delay_seconds must be a "
                 "non-negative integer"
+            )
+        # The faster hosts whose free supply a claim delay waits for. Without
+        # them the delay never sleeps (claim-delay.lib.sh), so a delay with no
+        # peers is a configuration that does nothing and is refused.
+        claim_peers = lane.get("claim_delay_peers")
+        if claim_peers is not None and (
+                not isinstance(claim_peers, list)
+                or not claim_peers
+                or not all(isinstance(value, str) and SAFE_ID.fullmatch(value)
+                           for value in claim_peers)
+                or len(claim_peers) != len(set(claim_peers))
+                or host["id"] in claim_peers
+                or not claim_delay):
+            fail(
+                f"lane {lane_id}: claim_delay_peers must be a non-empty list "
+                "of other fleet host ids beside claim_delay_seconds > 0"
+            )
+        if claim_delay and claim_peers is None:
+            fail(
+                f"lane {lane_id}: claim_delay_seconds needs claim_delay_peers "
+                "(the faster hosts it waits for)"
             )
         # Per-job ccache write layers, promoted into the shared store only on a
         # green job (providers/tart-macos/ccache-layer.lib.sh). Off unless true.
@@ -3097,6 +3118,10 @@ def lane_plist(
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
     if lane.get("claim_delay_seconds"):
         env["TARTCI_CLAIM_DELAY_SECONDS"] = str(lane["claim_delay_seconds"])
+        env["TARTCI_CLAIM_DELAY_PEERS"] = ",".join(
+            f"{host_id}={fallback_peer_target(host_id)}"
+            for host_id in lane["claim_delay_peers"]
+        )
     if lane.get("ccache_write_isolation"):
         env["TARTCI_CCACHE_WRITE_ISOLATION"] = "1"
     launch = str(launch_entrypoint or Path(host["home"]) / ".local/bin/tartci")

@@ -1287,32 +1287,66 @@ class MacosFleetLaneTests(unittest.TestCase):
         marker = 'yield_to_workflow = "Build and Test"\n'
         base = HOST_CONFIGS["m5"].read_text()
         self.assertEqual(base.count(marker), 1)
+        peers = 'claim_delay_peers = ["m5studio"]\n'
         for value, expected in (("30", "30"), ("0", None)):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
                 path = Path(td) / "m5.toml"
+                extra = peers if expected is not None else ""
                 path.write_text(base.replace(
-                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                    marker, marker + f"claim_delay_seconds = {value}\n" + extra))
                 env = self._release_env(fleet.load(path))
                 if expected is None:
                     self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env)
+                    self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env)
                 else:
                     self.assertEqual(env["TARTCI_CLAIM_DELAY_SECONDS"], expected)
+                    self.assertEqual(
+                        env["TARTCI_CLAIM_DELAY_PEERS"],
+                        f"m5studio={fleet.fallback_peer_target('m5studio')}")
         # Never enabled by an upgrade: no shipped profile sets it.
         for host, profile in HOST_CONFIGS.items():
             for name, body in fleet.rendered_plists(fleet.load(profile)).items():
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 self.assertNotIn("TARTCI_CLAIM_DELAY_SECONDS", env, (host, name))
+                self.assertNotIn("TARTCI_CLAIM_DELAY_PEERS", env, (host, name))
 
     def test_claim_delay_rejects_invalid_values(self) -> None:
         marker = 'yield_to_workflow = "Build and Test"\n'
         base = HOST_CONFIGS["m5"].read_text()
+        peers = 'claim_delay_peers = ["m5studio"]\n'
         for value in ("-1", "1.5", '"30"', "true"):
             with self.subTest(value=value), tempfile.TemporaryDirectory() as td:
                 path = Path(td) / "m5.toml"
                 path.write_text(base.replace(
-                    marker, marker + f"claim_delay_seconds = {value}\n"))
+                    marker, marker + f"claim_delay_seconds = {value}\n" + peers))
                 with self.assertRaisesRegex(ValueError, "claim_delay_seconds"):
                     fleet.load(path)
+
+    def test_claim_delay_needs_peers_and_peers_need_a_delay(self) -> None:
+        """A delay with nothing to wait for never sleeps, so it is refused."""
+        marker = 'yield_to_workflow = "Build and Test"\n'
+        base = HOST_CONFIGS["m5"].read_text()
+        cases = (
+            ("claim_delay_seconds = 30\n", "claim_delay_peers"),
+            ('claim_delay_peers = ["m5studio"]\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = []\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["m5"]\n', "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["m5studio", "m5studio"]\n',
+             "claim_delay_peers"),
+            ('claim_delay_seconds = 30\nclaim_delay_peers = ["Bad Host"]\n', "claim_delay_peers"),
+        )
+        for extra, message in cases:
+            with self.subTest(extra=extra), tempfile.TemporaryDirectory() as td:
+                path = Path(td) / "m5.toml"
+                path.write_text(base.replace(marker, marker + extra))
+                with self.assertRaisesRegex(ValueError, message):
+                    fleet.load(path)
+        # Control: the valid pair loads.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(base.replace(
+                marker, marker + 'claim_delay_seconds = 30\nclaim_delay_peers = ["m5studio"]\n'))
+            fleet.load(path)
 
     def test_yield_bound_rejects_invalid_values(self) -> None:
         for value in ("-1", "45.5", '"2700"', "true"):

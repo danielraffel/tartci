@@ -829,12 +829,15 @@ first; list it only when what it asserts really needs tomllib.
   it rather than going blind, which on M3 is the `pagination ended before
   total_count` family, 235 of 956 blind polls.
   Workflow name to id is the one input that does not change between polls, so
-  it is cached in `~/.tartci/state/assignment-workflow-ids.json` for 300
+  it is cached in `~/.tartci/state/assignment-workflow-ids.json` for 3600
   seconds and shared by every lane on the host. That call alone was 240 of
-  those 956 blind polls. A cached id is only ever spent on its own workflow's
-  listing call, so an id that stops resolving fails the scan closed there and
-  the cache cannot turn a broken lookup into an empty queue; the lifetime
-  bounds the narrower case of a second workflow appearing under an
+  those 956 blind polls, and with the old 300 second lifetime it was still the
+  most common first failed call of a rate-limited scan on every host on
+  2026-11-08. A cached id is only ever spent on its own workflow's listing
+  call. When that listing answers 404 (the workflow was replaced) the scan
+  drops the entry, resolves the ids live once and walks again; a second failure
+  fails closed, so the cache cannot turn a broken lookup into an empty queue.
+  The lifetime bounds the narrower case of a second workflow appearing under an
   already-cached display name. Set
   `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS=0` to disable it and resolve
   the ids on every poll. The cache is published under its own file lock
@@ -848,6 +851,21 @@ first; list it only when what it asserts really needs tomllib.
   the lock path, and additionally because a cache shared between tests is a
   channel between them: one test's resolved id satisfies the next test's
   lookup, so the listing call that test exists to exercise is never made.
+  A run's job listing is the call an assignment scan makes most: one per
+  queued or in-progress run, for every class, on every lane. The merge-group
+  and PR-head classes of one lane read the same `Build and Test` runs a few
+  seconds apart, and the two gate lanes on a host read them again. A listing
+  that showed NO queued job is therefore kept for 30 seconds in
+  `assignment-job-cache.json` beside the observation lock, keyed by run id plus
+  the run's `updated_at` and `status`, and reused by every class and lane on
+  the host. Only absence is cached: a run that carries a queued job, changed,
+  or has no `updated_at` is always read live, so the cache can never create
+  demand. Its one cost is that a job GitHub queues without touching its run is
+  seen up to 30 seconds late, inside the 120 second selection cache the
+  supervisor already replays. `TARTCI_ASSIGNMENT_JOB_CACHE_TTL_SECS` (0-60,
+  0 = off) sets it. A `rate_limited` answer is no longer retried inside the
+  scan: an allowance does not refill in a sub-second backoff, and three
+  refused requests per poll per lane only pressed on the same limit.
 
 - **The Shipyard push feed can rescue a blind scan; it can never report an
   empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
