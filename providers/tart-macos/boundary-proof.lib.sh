@@ -158,8 +158,9 @@ tartci_precheck_overlap_backoff_file(){
 }
 
 # Seconds left in this lane's backoff, or nothing when none is open. An
-# unreadable or future-dated record counts as open for the whole window: the
-# safe side is the serial precheck, which is today's behaviour.
+# unreadable record counts as open for a whole window, and a future-dated one
+# as open until its stamp plus the window: the safe side is the serial
+# precheck, which is today's behaviour, and its first admit removes the file.
 tartci_precheck_overlap_backoff_remaining(){
   local file at now window left
   window="${TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS:-$TARTCI_PRECHECK_OVERLAP_BACKOFF_DEFAULT}"
@@ -168,7 +169,7 @@ tartci_precheck_overlap_backoff_remaining(){
   [ -e "$file" ] || return 0
   now="$(date +%s)"
   at="$(_tartci_boundary_proof_read_rc "$file")" || at=""
-  if [ -z "$at" ] || [ "$at" -gt "$now" ]; then
+  if [ -z "$at" ]; then
     printf '%s' "$window"
     return 0
   fi

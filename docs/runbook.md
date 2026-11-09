@@ -1689,10 +1689,10 @@ the serial precheck back for `admission_precheck_overlap_backoff_seconds`
 (default 600, range 0..3600, 0 = never); the first serial admit ends the
 backoff early (`precheck_overlap_backoff_cleared`). The state is one file,
 `$STATE_DIR/<runner>.precheck-overlap-backoff` (an epoch); an unreadable or
-future-dated file counts as an open backoff. The overlap is inactive while
-parallel proofs are off or a warm VM is parked. To turn it off on one host
-without a re-render, write a current epoch into that file before each window
-expires, or remove the profile key and reload at an idle boundary.
+future-dated file counts as an open backoff until a serial admit removes it.
+The overlap is inactive while parallel proofs are off or a warm VM is parked.
+To turn it off, remove the profile key, re-render and reload the lane at an
+idle boundary.
 
 A repository-access proof that GitHub could not answer (a timed-out or failed
 API call, not a denial) is asked once more, synchronously, before the booted VM
