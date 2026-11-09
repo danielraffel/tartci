@@ -135,7 +135,8 @@ class RunOneHarness:
 
     def run(self, *, source_override: str | None = None,
             inventory: str = "0", storage_health_rc: int = 0,
-            claim_dir: str | None = None) -> subprocess.CompletedProcess:
+            claim_dir: str | None = None,
+            env_overrides: dict[str, str] | None = None) -> subprocess.CompletedProcess:
         source = (
             MACOS_RUNNER.read_text(encoding="utf-8")
             if source_override is None
@@ -252,6 +253,7 @@ class RunOneHarness:
                 "TARTCI_BOUNDARY_PROOF_PARALLEL": "0",
             }
         )
+        env.update(env_overrides or {})
         return subprocess.run(
             ["/bin/bash", str(harness)],
             env=env,

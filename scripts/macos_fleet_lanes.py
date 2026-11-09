@@ -117,6 +117,7 @@ LANE_KEYS = {
     "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
+    "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
     "v2_gate_classes",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
@@ -963,6 +964,18 @@ def load(path: Path) -> dict:
             fail(
                 f"lane {lane_id}: warm_vm_max_park_seconds must be an integer "
                 "from 300 through 14400 beside warm_vm = true"
+            )
+        overlap = lane.get("admission_precheck_overlap")
+        if overlap is not None and type(overlap) is not bool:
+            fail(f"lane {lane_id}: admission_precheck_overlap must be a boolean")
+        overlap_backoff = lane.get("admission_precheck_overlap_backoff_seconds")
+        if overlap_backoff is not None and (
+                overlap is not True
+                or type(overlap_backoff) is not int
+                or not 0 <= overlap_backoff <= 3600):
+            fail(
+                f"lane {lane_id}: admission_precheck_overlap_backoff_seconds must be "
+                "an integer from 0 through 3600 beside admission_precheck_overlap = true"
             )
         guest_stale = lane.get("guest_heartbeat_stale_seconds")
         if guest_stale is not None and (
@@ -3147,6 +3160,14 @@ def lane_plist(
         env["TARTCI_WARM_VM_DIR"] = f"{host['home']}/.tartci/state/warm-vm"
         if "warm_vm_max_park_seconds" in lane:
             env["TARTCI_WARM_VM_MAX_PARK_SECS"] = str(lane["warm_vm_max_park_seconds"])
+    # Skip the serial pre-clone admission precheck; the parallel boundary
+    # proof answers it beside the clone and boot (boundary-proof.lib.sh).
+    if lane.get("admission_precheck_overlap"):
+        env["TARTCI_ADMISSION_PRECHECK_OVERLAP"] = "1"
+        if "admission_precheck_overlap_backoff_seconds" in lane:
+            env["TARTCI_ADMISSION_PRECHECK_OVERLAP_BACKOFF_SECS"] = str(
+                lane["admission_precheck_overlap_backoff_seconds"]
+            )
     slot_order = (lane.get("assignment_slot_tier_order") or {}).get(str(slot))
     if slot_order:
         env["TARTCI_ASSIGNMENT_V2_TIER_ORDER"] = ",".join(slot_order)
