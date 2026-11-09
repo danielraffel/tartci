@@ -666,6 +666,16 @@ overrides the ssh client (tests). It never changes the host VM cap. Preview with
 `serve macos --print-claim-delay`. Set it on the gate lanes of slower hosts
 only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
 
+To order a lane across hosts by speed, give the same lane id a `claim_rank` on
+every host instead (0 = fastest, integers 0-9; not combined with
+`claim_delay_peers`). At render time a lane with rank N > 0 gets
+`TARTCI_CLAIM_DELAY_PEERS` = every other host whose same-id lane has a lower
+rank, fastest first, and `TARTCI_CLAIM_DELAY_SECONDS` = `claim_delay_seconds`
+if set, else 30 x N capped at 90. It then defers exactly as above: only while a
+faster host has a free, healthy slot for the job's class, and never when the
+faster hosts are full, blind, or do not serve the class. A host whose lane has
+no rank is never waited for, so an unset rank everywhere is today's behaviour.
+
 Install the same golden qcow2 and the same
 tartci checkout/home copy on every participating Apple Silicon host, keep
 Homebrew's `/opt/homebrew/bin` in the LaunchAgent `PATH`, and leave

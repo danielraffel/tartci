@@ -1339,6 +1339,8 @@ claim_delay_gate(){
   # staleness floor (120 s), so the lane never reads as dead while it waits.
   heartbeat yielding
   sleep "$delay"
+  # Again before the live recheck, which can itself take a while.
+  heartbeat yielding
   # Bypass every cache: a cached count predates the delay and could not show
   # that a faster host took the work. An event-class-v2 selection keeps its
   # own cache, which only a forced selection skips.

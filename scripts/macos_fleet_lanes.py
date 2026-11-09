@@ -113,7 +113,7 @@ LANE_KEYS = {
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
-    "yield_max_wait_seconds", "claim_delay_seconds", "claim_delay_peers",
+    "yield_max_wait_seconds", "claim_delay_seconds", "claim_delay_peers", "claim_rank",
     "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
@@ -1041,10 +1041,22 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: claim_delay_peers must be a non-empty list "
                 "of other fleet host ids beside claim_delay_seconds > 0"
             )
-        if claim_delay and claim_peers is None:
+        # Host-speed rank for this lane: 0 is the fastest host. A lane with
+        # rank N > 0 defers to every other host whose same-id lane has a lower
+        # rank, and only while one of those has a free, healthy slot. Unset
+        # keeps today's behaviour (no deferral).
+        claim_rank = lane.get("claim_rank")
+        if claim_rank is not None and (
+                type(claim_rank) is not int or not 0 <= claim_rank <= 9
+                or claim_peers is not None):
+            fail(
+                f"lane {lane_id}: claim_rank must be an integer from 0 through 9 "
+                "and is not combined with claim_delay_peers (it derives them)"
+            )
+        if claim_delay and claim_peers is None and not claim_rank:
             fail(
                 f"lane {lane_id}: claim_delay_seconds needs claim_delay_peers "
-                "(the faster hosts it waits for)"
+                "or claim_rank (the faster hosts it waits for)"
             )
         # Per-job ccache write layers, promoted into the shared store only on a
         # green job (providers/tart-macos/ccache-layer.lib.sh). Off unless true.
@@ -2885,6 +2897,39 @@ def atomic_write_json(path: Path, value: dict) -> None:
         staged.unlink(missing_ok=True)
 
 
+# A ranked lane's default delay: one step per rank, capped at the supervisor's
+# own ceiling (claim-delay.lib.sh CLAIM_DELAY_MAX_SECONDS), so the slowest host
+# waits longest for a faster host to notice the job.
+CLAIM_RANK_STEP_SECONDS = 30
+CLAIM_RANK_MAX_DELAY = 90
+
+
+def claim_rank_peers(host_id: str, lane_id: str, rank: int,
+                     profiles_dir: Path | None = None) -> list[str]:
+    """Other hosts whose `lane_id` lane is ranked faster than `rank`, fastest first.
+
+    Read from the checked-in profiles at render time, like fallback_peer_target.
+    A host whose lane carries no claim_rank is unranked and never a faster
+    peer, so ranking one host alone changes nothing until its peers are ranked.
+    """
+    ranked: list[tuple[int, str]] = []
+    for path in sorted((profiles_dir or DEFAULT_PROFILES_DIR).glob("*-macos-fleet.toml")):
+        try:
+            data = tomllib.loads(path.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            continue
+        other = (data.get("host") or {}).get("id")
+        if not isinstance(other, str) or other == host_id:
+            continue
+        for lane in data.get("lane") or []:
+            peer_rank = lane.get("claim_rank") if isinstance(lane, dict) else None
+            if (lane.get("id") == lane_id and type(peer_rank) is int
+                    and peer_rank < rank):
+                ranked.append((peer_rank, other))
+                break
+    return [other for _rank, other in sorted(ranked)]
+
+
 def fallback_peer_target(host_id: str, profiles_dir: Path | None = None) -> str:
     """The SSH target a fallback lane reaches a preferred host by.
 
@@ -3116,7 +3161,16 @@ def lane_plist(
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
     if lane.get("yield_max_wait_seconds"):
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
-    if lane.get("claim_delay_seconds"):
+    if lane.get("claim_rank"):
+        faster = claim_rank_peers(host["id"], lane_id, lane["claim_rank"])
+        if faster:
+            delay = lane.get("claim_delay_seconds") or min(
+                CLAIM_RANK_MAX_DELAY, CLAIM_RANK_STEP_SECONDS * lane["claim_rank"])
+            env["TARTCI_CLAIM_DELAY_SECONDS"] = str(delay)
+            env["TARTCI_CLAIM_DELAY_PEERS"] = ",".join(
+                f"{host_id}={fallback_peer_target(host_id)}" for host_id in faster
+            )
+    elif lane.get("claim_delay_seconds"):
         env["TARTCI_CLAIM_DELAY_SECONDS"] = str(lane["claim_delay_seconds"])
         env["TARTCI_CLAIM_DELAY_PEERS"] = ",".join(
             f"{host_id}={fallback_peer_target(host_id)}"

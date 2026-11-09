@@ -212,14 +212,21 @@ class ScanAuthPreflight(ScannerHarness):
 
         self.call_log.write_text("", encoding="utf-8")
         self._scan(15000, AUTHENTICATED_403)
+        limited_attempts = len([p for p in self._calls() if "actions" in p])
+
+        self.call_log.write_text("", encoding="utf-8")
+        self._scan(15000, "net/http: TLS handshake timeout")
         retried_attempts = len([p for p in self._calls() if "actions" in p])
 
         self.assertEqual(anonymous_attempts, 1)
+        # An exhausted authenticated allowance does not refill within a retry
+        # backoff either, so it also stops on the first attempt.
+        self.assertEqual(limited_attempts, 1)
         self.assertGreater(
             retried_attempts,
             anonymous_attempts,
             "a transient fault is still retried; only the authentication "
-            "fault stops on the first attempt",
+            "and rate-limit faults stop on the first attempt",
         )
 
     def test_null_head_repository_is_not_lane_demand(self) -> None:

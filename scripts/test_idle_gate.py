@@ -317,7 +317,7 @@ class ClaimDelayTests(unittest.TestCase):
 
     def _run(self, *, delay, taken_during_sleep=False, gh_fails_after_sleep=False,
              tier_drains_during_sleep=False, peer_free=1, peer_in_flight=0,
-             peer_verdict="ok", queued_jobs=1, delay_file=None):
+             peer_verdict="ok", queued_jobs=1, delay_file=None, report=None):
         import json
         import stat
         import tempfile
@@ -360,10 +360,11 @@ printf '%s\\n' "$*" >>"{tmp}/sleep.log"
 {f': >"{tmp}/fail"' if gh_fails_after_sleep else ':'}
 {f': >"{tmp}/tier0gone"' if tier_drains_during_sleep else ':'}
 """
-        report = {"schema": "tartci.gate-supply/v1", "verdict": peer_verdict,
+        default_report = {"schema": "tartci.gate-supply/v1", "verdict": peer_verdict,
                   "reason": None if peer_verdict == "ok" else "lane blind",
                   "host": "m5studio", "repo": self.REPO, "class": "pulp-release-tagged",
                   "free": peer_free, "in_flight": peer_in_flight}
+        report = dict(report) if report is not None else default_report
         ssh = f"""#!/usr/bin/env bash
 printf '%s\\n' "$*" >>"{tmp}/ssh.log"
 printf '%s\\n' '{json.dumps(report)}'
@@ -516,6 +517,50 @@ printf '%s\\n' '{json.dumps(report)}'
         self.assertEqual(self._sleeps(), [])
         self.assertIn("reason=supply_unknown",
                       self._event("claim_delay_skipped")["detail"])
+
+    def _peer_report(self, phase: str, *, lane_classes: str = "pulp-release-tagged",
+                     running: int = 0) -> dict:
+        """A faster host's REAL gate_supply report for one lane in `phase`."""
+        import sys
+        import time
+        sys.path.insert(0, str(SCRIPT.parents[2] / "scripts"))
+        import gate_supply  # noqa: PLC0415
+        from fleet_lane_discovery import Lane  # noqa: PLC0415
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5))
+        env = {"TARTCI_RUNNER_REPO": self.REPO, "TARTCI_RUNNER_SLOT": "1",
+               "TARTCI_MACOS_VM_CORES": "8",
+               "TARTCI_RUNNER_WORKFLOW_TIERS": f"{lane_classes}|Release CLI"}
+        lane = Lane("gate", "gate", Path("/state/gate"), "")
+        report = gate_supply.build_report(
+            self.REPO, "pulp-release-tagged", lanes=[lane], env_reader=lambda _l: env,
+            heartbeat_reader=lambda _d: {"ts": stamp, "phase": phase,
+                                         "provider": "tart-macos", "storage_health": "ok"},
+            capacity_reader=lambda: {"total_cores": 26, "used_cores": 0},
+            running_reader=lambda: running, default_cores_reader=lambda: 8,
+            pool_reader=lambda: "on", cap_reader=lambda: 2,
+            reservations_reader=lambda: 0, host="m5studio")
+        return report
+
+    def test_fleet_order_defers_only_to_a_free_healthy_faster_host(self) -> None:
+        """Daniel's order: the slower host waits only while a faster one can serve."""
+        cases = (
+            # The faster host's lane is idle with a free VM slot: wait for it.
+            ("faster host free", self._peer_report("waiting"), ["15"]),
+            # Both its VM slots are taken: claim now, no added idle.
+            ("faster host full", self._peer_report("waiting", running=2), []),
+            # Its lane cannot see the queue: it cannot take the job, claim now.
+            ("faster host scan blind", self._peer_report("scan_blind"), []),
+            # A job only this host serves (the faster host has no lane for the
+            # class): claim now.
+            ("only this host serves the class",
+             self._peer_report("waiting", lane_classes="pulp-other-class"), []),
+        )
+        for name, report, sleeps in cases:
+            with self.subTest(case=name):
+                r = self._run(delay="15", report=report)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(r.stdout.strip(), "claim")
+                self.assertEqual(self._sleeps(), sleeps, (name, report))
 
     def test_the_delay_file_overrides_the_startup_value_every_decision(self) -> None:
         # Off by file although the LaunchAgent says 15: no sleep, no scan.
