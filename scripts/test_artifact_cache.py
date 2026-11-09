@@ -783,6 +783,7 @@ class RunnerArchiveRefreshTests(unittest.TestCase):
 
     def test_a_failed_runner_download_leaves_nothing(self) -> None:
         proc = self._refresh(STUB_FAIL="1")
+        self.assertEqual(proc.returncode, 1)
         self.assertIn("download failed", proc.stderr)
         self.assertEqual(self._blobs(), [])
 
@@ -936,6 +937,19 @@ class GuestRunnerInstallTests(unittest.TestCase):
         # A directory under the digest name: present, but not a readable file.
         (self.cache / "sha256" / self.sha).mkdir()
         proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+
+    def test_a_cached_file_the_guest_cannot_read_falls_back_to_the_download(self) -> None:
+        self._cache(self.archive)
+        blob = self.cache / "sha256" / self.sha
+        blob.chmod(0)
+        try:
+            proc = self._install()
+        finally:
+            blob.chmod(0o644)
+        if os.access(blob, os.R_OK) and blob.stat().st_mode & 0o777 == 0 and os.geteuid() == 0:
+            self.skipTest("root reads mode 0 files")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("actions-runner-archive=download", proc.stdout)
 

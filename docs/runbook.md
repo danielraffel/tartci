@@ -735,7 +735,14 @@ needed, and an empty or absent directory leaves boots unchanged.
   `--compact-above N` it also folds a mirror holding more than N packs, but only
   when Tart reports zero running VMs at that moment; a running or unknown VM
   count defers compaction to a later pass. A failed mirror does not stop the
-  others and the pass exits 1. The `com.danielraffel.tartci.artifact-cache-refresh`
+  others and the pass exits 1. After the mirrors and pins it also stores the
+  GitHub Actions Runner archive that `providers/tart-macos/runner.sh` pins (url
+  and digest from `runner.sh --print-runner-archive`), so a VM copies it from the
+  mount, re-hashes the copy, and downloads only when the entry is absent or does
+  not verify. Like the rest of `refresh` it runs only on a host that already has
+  a mirror, and a lane that overrides `TARTCI_RUNNER_VERSION` or
+  `TARTCI_RUNNER_SHA256` must give the refresh agent the same override or that
+  lane keeps downloading. The `com.danielraffel.tartci.artifact-cache-refresh`
   LaunchAgent (`launchd/com.danielraffel.tartci.artifact-cache-refresh.plist.template`)
   runs `refresh --compact-above 16` every 6 hours (`StartInterval`, so not
   aligned to the clock; `RunAtLoad` off) at `ProcessType=Background` with
