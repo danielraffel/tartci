@@ -127,6 +127,17 @@ GH_CLI="$TARTCI_GH_CLI"
 # host credential. Keep all polling and ordinary control-plane calls on GH_CLI
 # (normally ghapp); an explicit JIT override is never an implicit PAT fallback.
 JIT_GH_CLI="${TARTCI_JIT_GH_CLI:-$GH_CLI}"
+# Read-only queue scans may run as their own read-only App so their polling
+# draws on a separate rate-limit bucket. TARTCI_SCAN_GH_CLI names a CLI
+# explicitly; otherwise a host profile's github_scan_app (TARTCI_SCAN_APP_ID)
+# selects scripts/gh-scan-app. Writes (JIT, reclaim, cancel) stay on GH_CLI.
+if [ -n "${TARTCI_SCAN_GH_CLI:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_SCAN_GH_CLI"
+elif [ -n "${TARTCI_SCAN_APP_ID:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_ROOT/scripts/gh-scan-app"
+else
+  SCAN_GH_CLI="$GH_CLI"
+fi
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/pulp-ci}}"
@@ -1802,7 +1813,7 @@ capture_current_job(){
     "$TARTCI_ROOT/scripts/current_job_scan.py"
     --repo "$REPO"
     --runner "$runner_registration"
-    --gh-cli "$GH_CLI"
+    --gh-cli "$SCAN_GH_CLI"
     --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
     --mode "$scan_mode"
     --gh-timeout "${TARTCI_CAPTURE_CURRENT_JOB_GH_TIMEOUT_SECS:-4}"

@@ -188,7 +188,7 @@ tartci_assignment_v2_tier_demand(){
     --require-head-repo "$REPO" \
     --min-age-seconds "$min_age" \
     ${count_args[@]+"${count_args[@]}"} \
-    --gh-cli "$GH_CLI" \
+    --gh-cli "${SCAN_GH_CLI:-$GH_CLI}" \
     --lane-id "$RUNNER_NAME" \
     --generation "${TARTCI_GENERATION:-unknown}" </dev/null 2>"$error_file"; then
     rc=0

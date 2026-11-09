@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Run `gh` as a dedicated read-only GitHub App, for queue scans only.
+
+Usage (as a drop-in for TARTCI_SCAN_GH_CLI):  gh-scan-app api <path> ...
+
+The App installation token comes from `ghapp token --app-id ... --private-key
+... --repo OWNER/REPO` and is cached per repository under
+TARTCI_SCAN_APP_CACHE_DIR (0700 dir, 0600 file) until five minutes before it
+expires, so a scan costs one mint per hour rather than one per call. The token
+reaches `gh` only through GH_TOKEN in the child's environment.
+
+Fails closed: a missing key, a failed mint, or a missing repository is an
+error. It never falls back to ambient `gh` credentials, because that would put
+scan traffic back on the shared personal token without saying so.
+
+Environment: TARTCI_SCAN_APP_ID, TARTCI_SCAN_APP_PRIVATE_KEY_PATH,
+TARTCI_SCAN_APP_CACHE_DIR, SHIPYARD_GH_APP_REPO (or GH_REPO) for the
+repository; optional TARTCI_SCAN_APP_GHAPP and TARTCI_SCAN_APP_GH to name the
+mint and gh executables. Without TARTCI_SCAN_APP_GH it uses /opt/homebrew/bin/gh
+or /usr/local/bin/gh and refuses any gh script that hands off to ghapp.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+REFRESH_MARGIN_SECONDS = 300
+MINT_TIMEOUT_SECONDS = 30
+
+
+def die(message: str) -> "NoReturn":
+    print(f"gh-scan-app: {message}", file=sys.stderr)
+    raise SystemExit(75)
+
+
+def require(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        die(f"{name} is not set")
+    return value
+
+
+GH_CANDIDATES = ("/opt/homebrew/bin/gh", "/usr/local/bin/gh")
+TOKEN_LIFETIME_FALLBACK_SECONDS = 50 * 60
+STALE_TMP_SECONDS = 3600
+
+
+def is_shim(path: str) -> bool:
+    """A `gh` that hands off to ghapp would swap our token for the Shipyard App's."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4096)
+    except OSError:
+        return True
+    return head.startswith(b"#!") and b"ghapp" in head
+
+
+def resolve_gh() -> str:
+    explicit = os.environ.get("TARTCI_SCAN_APP_GH")
+    candidates = (explicit,) if explicit else GH_CANDIDATES
+    for candidate in candidates:
+        if candidate and os.access(candidate, os.X_OK) and not is_shim(candidate):
+            return candidate
+    die("no real gh found (set TARTCI_SCAN_APP_GH to a gh that is not a ghapp shim)")
+
+
+def parse_expiry(text: str) -> float:
+    return dt.datetime.strptime(text, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=dt.timezone.utc).timestamp()
+
+
+def cached_token(path: Path, now: float) -> str | None:
+    try:
+        payload = json.loads(path.read_text())
+        token = payload["token"]
+        if (isinstance(token, str) and token
+                and parse_expiry(payload["expires_at"]) - now > REFRESH_MARGIN_SECONDS):
+            return token
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return None
+
+
+def mint(app_id: str, key_path: str, repo: str) -> dict:
+    ghapp = os.environ.get("TARTCI_SCAN_APP_GHAPP") or "ghapp"
+    try:
+        result = subprocess.run(
+            [ghapp, "token", "--app-id", app_id, "--private-key", key_path, "--repo", repo],
+            capture_output=True, text=True, timeout=MINT_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        die(f"token mint failed to run: {type(error).__name__}")
+    if result.returncode != 0:
+        die(f"token mint failed (rc={result.returncode})")
+    try:
+        payload = json.loads(result.stdout)
+        if not isinstance(payload["token"], str) or not payload["token"]:
+            raise ValueError
+        if "expires_at" not in payload:
+            payload["expires_at"] = (
+                dt.datetime.now(dt.timezone.utc)
+                + dt.timedelta(seconds=TOKEN_LIFETIME_FALLBACK_SECONDS)
+            ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        parse_expiry(payload["expires_at"])
+    except (ValueError, KeyError, TypeError):
+        die("token mint returned an unusable record")
+    return payload
+
+
+def sweep_stale_tmp(cache_dir: Path, now: float) -> None:
+    """Drop temp files a killed wrapper left behind; they can hold a live token."""
+    try:
+        for entry in cache_dir.glob(".scan-token-*.tmp"):
+            try:
+                if now - entry.stat().st_mtime > STALE_TMP_SECONDS:
+                    entry.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def store(path: Path, payload: dict) -> None:
+    keep = {"token": payload["token"], "expires_at": payload["expires_at"]}
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")  # matches .scan-token-*.tmp
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as handle:
+            json.dump(keep, handle)
+        os.replace(tmp, path)
+    except OSError:
+        # A cache that cannot be written only costs a mint next call.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
+def main(argv: list[str]) -> int:
+    app_id = require("TARTCI_SCAN_APP_ID")
+    key_path = require("TARTCI_SCAN_APP_PRIVATE_KEY_PATH")
+    cache_dir = Path(require("TARTCI_SCAN_APP_CACHE_DIR"))
+    repo = os.environ.get("SHIPYARD_GH_APP_REPO") or os.environ.get("GH_REPO") or ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        die("SHIPYARD_GH_APP_REPO must be OWNER/REPO")
+    if not Path(key_path).is_file():
+        die("private key file is missing")
+    try:
+        cache_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(cache_dir, 0o700)
+    except OSError:
+        pass
+    path = cache_dir / ("scan-token-" + repo.replace("/", "_") + f"-{app_id}.json")
+    now = dt.datetime.now(dt.timezone.utc).timestamp()
+    token = cached_token(path, now)
+    if token is None:
+        sweep_stale_tmp(cache_dir, now)
+        payload = mint(app_id, key_path, repo)
+        store(path, payload)
+        token = payload["token"]
+    env = dict(os.environ)
+    env["GH_TOKEN"] = token
+    env.pop("GITHUB_TOKEN", None)
+    env.pop("GH_ENTERPRISE_TOKEN", None)
+    gh = resolve_gh()
+    try:
+        os.execvpe(gh, [gh, *argv], env)
+    except OSError as error:
+        die(f"cannot exec {gh}: {type(error).__name__}")
+    return 75
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
