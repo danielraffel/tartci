@@ -219,6 +219,28 @@ class BoundaryOpensTheBackoffTests(unittest.TestCase):
         self.assertNotIn("precheck_overlap_backoff", h.event_names())
         self.assertFalse((h.state / "lane-01.precheck-overlap-backoff").exists())
 
+    def test_a_stale_refusal_then_a_fresh_admit_opens_no_backoff(self) -> None:
+        raw = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, raw, True)
+        h = boundary.Harness(Path(raw))
+        # The parallel proof refuses; it is stale by the boundary, and the
+        # synchronous ask admits. The run is admitted: no backoff.
+        h.stub_shipyard([("defer", "stale_compatible_runs", 3), ("admit", "clean", 0)])
+        h.stub_gh()
+        result = h.run(
+            boundary.boundary_function()
+            + "RUNNER_NAME=lane-01\nPRECHECK_OVERLAP_RUN=1\nPRECHECK_OVERLAP_NOTED=0\n"
+            + "tartci_boundary_proof_start \"$vm\" \"$selected_labels\" 1\n"
+            + "sleep 3\n"
+            + "rc=0; boundary || rc=$?\n"
+            + "tartci_boundary_proof_abandon\nexit $rc\n",
+            env={"TARTCI_ADMISSION_PRECHECK_OVERLAP": "1", "TARTCI_BOUNDARY_PROOF_MAX_AGE_SECS": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("admission_parallel_stale", h.event_names())
+        self.assertFalse((h.state / "lane-01.precheck-overlap-backoff").exists())
+        self.assertNotIn("precheck_overlap_backoff", h.event_names())
+
     def test_control_an_overlapped_admit_opens_no_backoff(self) -> None:
         result, h = self._run(("admit", "clean", 0), overlapped=1)
         self.assertEqual(result.returncode, 0, result.stderr)

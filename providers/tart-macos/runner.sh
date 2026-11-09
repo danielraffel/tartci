@@ -2826,6 +2826,10 @@ run_one(){
       || printf '%s\n' "$admission_json" >"$STATE_DIR/$vm.admission-clean.json"
     tartci_admission_contention_event "$admission_json" boundary
     tartci_admission_reuse_event "$admission_json" boundary
+    # The boundary has its answer, from whichever source; an unconsumed
+    # parallel refusal must not open the overlap backoff after an admit.
+    # shellcheck disable=SC2034 # read by tartci_precheck_overlap_note_unconsumed
+    PRECHECK_OVERLAP_NOTED=1
     if [ "$admission_rc" -ne 0 ]; then
       local admission_detail
       admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
