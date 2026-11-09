@@ -16,17 +16,22 @@ import os
 import stat
 import subprocess
 import tempfile
-import tomllib
 import unittest
 from pathlib import Path
 
-import testing_support  # noqa: F401
-import macos_fleet_lanes as fleet
+import testing_support
+
+testing_support.skip_module_without_tomllib()
+
+import tomllib  # noqa: E402
+
+import macos_fleet_lanes as fleet  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "scripts" / "gh-scan-app"
 CONFIG = ROOT / "profiles" / "m1-macos-fleet.toml"
-HOME = "/Users/danielraffel/.config/shipyard"
+# The checked-in host profile owns the home directory the App paths must sit under.
+HOME = tomllib.loads(CONFIG.read_text())["host"]["home"] + "/.config/shipyard"
 SCAN_TABLE = (
     "[github_scan_app]\n"
     'id = "5665767"\n'
