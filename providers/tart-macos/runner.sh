@@ -101,7 +101,7 @@
 # jobs than free faster slots: it claims at once, with no sleep. Unset/0 = off.
 # A failed re-scan fails OPEN (claim), so the delay can never wedge a gate.
 # TARTCI_CLAIM_DELAY_FILE (default ~/.config/tartci/claim-delay-seconds) holding
-# an integer 0-600 overrides N on every decision, so the delay changes without a
+# an integer 0-90 (the cap for N too) overrides N on every decision, so the delay changes without a
 # pool drain. The host VM cap is untouched. `--print-claim-delay` runs the gate
 # and prints `claim` or `backoff` as a safe preflight.
 set -euo pipefail
@@ -1334,6 +1334,10 @@ claim_delay_gate(){
       ;;
   esac
   event claim_delay_wait "delay=${delay}s labels=$orig_labels ${decision#sleep }"
+  # Written here, just before the sleep, so the heartbeat is never older than
+  # the delay; CLAIM_DELAY_MAX_SECONDS keeps that below every reader's
+  # staleness floor (120 s), so the lane never reads as dead while it waits.
+  heartbeat yielding
   sleep "$delay"
   # Bypass every cache: a cached count predates the delay and could not show
   # that a faster host took the work. An event-class-v2 selection keeps its
@@ -3277,10 +3281,16 @@ if [ "$LOOP" = 1 ]; then
     # and only when a faster host's free slots can take the work (see
     # claim_delay_gate). Re-read every poll so it changes without a drain.
     claim_delay_now="$(tartci_claim_delay_seconds)"
+    # A slot a sibling has reserved (claimed, not yet a guest) is not free:
+    # asking peers and sleeping for it would only end in a refused claim.
+    slots_held="$r"
+    if [ "$claim_delay_now" -gt 0 ] && [ "${q:-0}" -gt 0 ]; then
+      reserved="$(tartci_count_reservations)"
+      [ "${reserved:-0}" -le "$slots_held" ] || slots_held="$reserved"
+    fi
     if [ "$claim_delay_now" -gt 0 ] && [ "${q:-0}" -gt 0 ] \
        && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
-       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$r" -lt "$cap" ]; then
-      heartbeat yielding
+       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$slots_held" -lt "$cap" ]; then
       if [ "$(claim_delay_gate "$selected_labels" "$selected_tier" "$q")" = backoff ]; then
         note "claim delay ${claim_delay_now}s: queued work (class $selected_labels) was taken by another host — not claiming"
         event claim_delay_backoff "delay=${claim_delay_now}s labels=$selected_labels"
@@ -3408,7 +3418,7 @@ if [ "$LOOP" = 1 ]; then
       # its job claim and its VM appearing in `tart list` (admission precheck,
       # clone, boot; about a minute) holds the slot without a guest. Report
       # both, or a host with every slot claimed reads as one with a free slot.
-      reserved="$(tartci_active_reservations)"
+      reserved="$(tartci_count_reservations)"
       note "waiting ${POLL}s (queued=$q running_macos_vms=$r/$cap reserved=$reserved priority_demand=$p)"
       # No queued work means nothing is being refused; only demand that the
       # lane took and did not serve counts as blocked, so an idle pass ends the

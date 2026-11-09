@@ -861,7 +861,7 @@ first; list it only when what it asserts really needs tomllib.
   the host. Only absence is cached: a run that carries a queued job, changed,
   or has no `updated_at` is always read live, so the cache can never create
   demand. Its one cost is that a job GitHub queues without touching its run is
-  seen up to 30 seconds late, inside the 120 second selection cache the
+  seen up to 30 seconds plus one scan's duration late, inside the 120 second selection cache the
   supervisor already replays. `TARTCI_ASSIGNMENT_JOB_CACHE_TTL_SECS` (0-60,
   0 = off) sets it. A `rate_limited` answer is no longer retried inside the
   scan: an allowance does not refill in a sub-second backoff, and three

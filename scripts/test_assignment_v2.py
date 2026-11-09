@@ -138,6 +138,9 @@ if state.get("merge"):
 if state.get("pr"):
     jobs.append({"id": 202, "status": "queued", "created_at": stamp("fresh_pr"),
                  "labels": %s + ["pulp-build-pr-head"]})
+if state.get("merge2"):
+    jobs.append({"id": 207, "status": "queued", "created_at": stamp("fresh_merge"),
+                 "labels": %s + ["pulp-build-merge-group"]})
 if state.get("legacy"):
     jobs.append({"id": 203, "status": "queued", "labels": %s + ["pulp-gate-fast"]})
 if state.get("malformed"):
@@ -203,7 +206,7 @@ elif any("/actions/runs/%%d/jobs" %% run in parsed.path for run in (101, 102, 10
     print(json.dumps({"total_count": len(jobs), "jobs": jobs if page == 1 else []}))
 else:
     raise SystemExit("unexpected API path: " + path)
-''' % ((repr(BASE),) * 7)
+''' % ((repr(BASE),) * 8)
 
 
 class RunnerFixture:
@@ -681,6 +684,99 @@ class AssignmentV2Tests(RunnerFixture, unittest.TestCase):
         result = self._runner("--print-name")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("retained required legacy selector", result.stderr)
+
+
+class ClaimDelayV2Tests(RunnerFixture, unittest.TestCase):
+    """The claim delay on an event-class-v2 lane, the shape every fleet lane has.
+
+    The faster host is a stub ssh answering `tartci pool supply` for whatever
+    class it is asked about; the sleep stub can empty the queue, which is what
+    a faster host taking the job during the delay looks like.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        listing = self.root / "launchctl-list.txt"
+        listing.write_text("PID\tStatus\tLabel\n", encoding="utf-8")
+        (self.root / "agents").mkdir()
+        self.calls = self.root / "calls.log"
+        self.env.update({
+            "TARTCI_RUNNER_REPO": "Generous-Corp/pulp",
+            "TARTCI_CLAIM_DELAY_SECONDS": "15",
+            "TARTCI_CLAIM_DELAY_PEERS": "m5studio=tartci-m5studio",
+            "TARTCI_CLAIM_DELAY_SSH": str(self.root / "stubssh"),
+            "TARTCI_FLEET_LAUNCHCTL_LIST_FILE": str(listing),
+            "TARTCI_LANE_AGENTS_DIR": str(self.root / "agents"),
+            "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS": "0",
+            "ASSIGNMENT_CALLS": str(self.calls),
+        })
+
+    def _stubs(self, *, peer_free: int, taken_during_sleep: bool = False) -> None:
+        _write_exec(self.root / "stubssh", f"""#!/usr/bin/env bash
+cls=$(printf '%s\\n' "$*" | sed -n 's/.*--class \\([^ ]*\\).*/\\1/p')
+printf '{{"schema":"tartci.gate-supply/v1","verdict":"ok","host":"m5studio","repo":"Generous-Corp/pulp","class":"%s","free":{peer_free},"in_flight":0}}\\n' "$cls"
+""")
+        empty = f'printf "{{}}" > "{self.state}"' if taken_during_sleep else ":"
+        _write_exec(self.root / "sleep", f"""#!/usr/bin/env bash
+printf '%s\\n' "$*" >> "{self.root}/sleep.log"
+{empty}
+""")
+
+    def _sleeps(self) -> list[str]:
+        log = self.root / "sleep.log"
+        return log.read_text().split() if log.exists() else []
+
+    def _job_reads(self) -> int:
+        if not self.calls.exists():
+            return 0
+        return sum(1 for line in self.calls.read_text().splitlines() if line.endswith("/jobs"))
+
+    def test_recheck_after_the_delay_is_live_not_the_selection_cache(self) -> None:
+        # The preflight's own selection warms the 120 s cache with demand. If the
+        # recheck replayed it, the job a faster host took would still be claimed.
+        self._state(merge=True)
+        self._stubs(peer_free=1, taken_during_sleep=True)
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self._sleeps(), ["15"])
+        self.assertEqual(result.stdout.strip(), "backoff")
+        # Control: the job still queued after the delay is claimed.
+        self._state(merge=True)
+        (self.root / "sleep.log").unlink()
+        self._stubs(peer_free=1)
+        kept = self._runner("--print-claim-delay")
+        self.assertEqual(kept.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_the_magnitude_not_the_witness_is_compared_with_free_slots(self) -> None:
+        # Two queued jobs, one free faster slot: the witness says 1, which one
+        # slot would cover. The exhaustive count says 2, so it claims now.
+        self._state(merge=True, merge2=True)
+        self._stubs(peer_free=1)
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.stdout.strip(), "claim", result.stderr)
+        self.assertEqual(self._sleeps(), [])
+        # Control: two free faster slots cover both jobs, so it sleeps.
+        self._state(merge=True, merge2=True)
+        self._stubs(peer_free=2)
+        slept = self._runner("--print-claim-delay")
+        self.assertEqual(slept.stdout.strip(), "claim", slept.stderr)
+        self.assertEqual(self._sleeps(), ["15"])
+
+    def test_no_free_faster_slot_skips_the_exhaustive_scan(self) -> None:
+        self._state(merge=True)
+        self._stubs(peer_free=0)
+        self._runner("--print-selection")
+        before = self._job_reads()
+        result = self._runner("--print-claim-delay")
+        self.assertEqual(result.stdout.strip(), "claim", result.stderr)
+        self.assertEqual(self._sleeps(), [])
+        # Only the preflight's own (cached) selection: no magnitude scan.
+        self.assertEqual(self._job_reads(), before)
+        # Control: with a free faster slot the magnitude scan is paid.
+        self._stubs(peer_free=1)
+        self._runner("--print-claim-delay")
+        self.assertGreater(self._job_reads(), before)
 
 
 class PreCloneProbeTests(RunnerFixture, unittest.TestCase):
@@ -2546,6 +2642,22 @@ class WorkflowIdRecoveryTests(unittest.TestCase):
         again, again_calls = self._scan_ids()
         self.assertEqual(again.stdout.strip(), "1")
         self.assertEqual(len([c for c in again_calls if "/actions/workflows?" in c]), 0)
+
+    def test_a_jobs_404_does_not_trigger_workflow_recovery(self) -> None:
+        """A run deleted mid-scan 404s its jobs; that is not a replaced workflow."""
+        self.runs[1] = dict(self.runs[1], queued=True)
+        self._write()
+        self._scan_ids()
+        gone = self.root / "fake-gh-jobs-gone"
+        _write_exec(gone, self._GH.replace(
+            '    run = next(r for r in STATE["runs"] if r["id"] == run_id)',
+            '    sys.stderr.write("gh: Not Found (HTTP 404)\\n")\n    raise SystemExit(1)'))
+        self.fake = gone
+        result, calls = self._scan_ids()
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertEqual(len([c for c in calls if "/actions/workflows?" in c]), 0, calls)
+        self.assertIn("Generous-Corp/pulp",
+                      json.loads((self.root / "workflow-ids.json").read_text()))
 
     def test_a_live_lookup_that_still_404s_fails_closed(self) -> None:
         """Control: recovery is one live resolution, never a way around a 404."""

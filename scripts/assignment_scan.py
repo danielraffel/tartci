@@ -44,7 +44,8 @@ its `updated_at`, and reused instead of re-read. Only absence is cached, and
 only for a run whose `updated_at` is unchanged: a run carrying a queued job is
 always read live, so the cache can never manufacture demand, and a run that
 changed is always read again. The one thing it can do is report a queued job
-up to its TTL late when GitHub queues one without touching the run, which is
+late when GitHub queues one without touching the run: by up to the TTL plus
+the scan's own duration (entries are loaded when the scan starts), which is
 bounded below the per-lane selection cache the supervisor already replays.
 """
 from __future__ import annotations
@@ -360,7 +361,9 @@ class JobListingCache:
         stamp = self._stamp(run)
         if stamp is None:
             return False
-        record = self.entries.get(self._key(run))
+        key = self._key(run)
+        with self.lock:
+            record = self.fresh.get(key) or self.entries.get(key)
         if not self._live(record, time.time()):
             return False
         if (record.get("updated_at"), record.get("status")) != stamp:
@@ -381,7 +384,13 @@ class JobListingCache:
             }
 
     def record_present(self, run: dict[str, Any]) -> None:
-        """A queued job was seen: no lane may skip this run on an older read."""
+        """A queued job was seen: no lane may skip this run on an older read.
+
+        Defensive: a run is read live only when its entry is missing, expired or
+        stamped differently, so normally there is nothing to remove. It covers
+        a run GitHub queued a job in without changing its stamp, whose fresh
+        entry another lane published while this one was reading it.
+        """
         if self.ttl <= 0:
             return
         with self.lock:
@@ -1035,6 +1044,7 @@ class AssignmentScanner:
                 # second failure fails closed exactly as before.
                 self._store_workflow_ids(None)
                 self.witness.clear()
+                self.stale_demand.evidence.clear()
                 return self._walk(self._resolve_and_publish_workflow_ids())
         finally:
             self.job_cache.persist()
@@ -1053,7 +1063,8 @@ class AssignmentScanner:
     @staticmethod
     def _cached_id_vanished(error: BaseException, workflow_ids: dict[str, int]) -> bool:
         text = str(error)
-        if "404" not in text and "not found" not in text.lower():
+        lowered = text.lower()
+        if "http 404" not in lowered and "not found" not in lowered:
             return False
         return any(
             f"/actions/workflows/{workflow_id}/runs" in text

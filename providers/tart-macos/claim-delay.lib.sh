@@ -24,11 +24,18 @@
 #
 # The delay is re-read on every decision from TARTCI_CLAIM_DELAY_FILE
 # (default ~/.config/tartci/claim-delay-seconds) when that file holds an
-# integer 0-600, so an operator can change or disable it without a pool drain
+# integer 0-90, so an operator can change or disable it without a pool drain
 # or a lane reload. Without a valid file the startup value
-# TARTCI_CLAIM_DELAY_SECONDS stands.
+# TARTCI_CLAIM_DELAY_SECONDS stands. Either is capped at 90 s: the lane writes
+# no heartbeat while it sleeps, and gate_supply, doctor and self-update read a
+# heartbeat older than 120 s as a dead supervisor.
+#
+# The file can only tune or disable a lane that already has
+# TARTCI_CLAIM_DELAY_PEERS; without peers the delay never sleeps. Only tier and
+# event-class-v2 lanes have a class to ask about; a single-label lane never
+# sleeps.
 
-CLAIM_DELAY_MAX_SECONDS=600
+CLAIM_DELAY_MAX_SECONDS=90
 
 tartci_claim_delay_seconds(){
   local file value=""
@@ -46,7 +53,19 @@ tartci_claim_delay_seconds(){
         ;;
     esac
   fi
-  printf '%s\n' "${value:-${CLAIM_DELAY:-0}}"
+  value="${value:-${CLAIM_DELAY:-0}}"
+  [ "$value" -le "$CLAIM_DELAY_MAX_SECONDS" ] || value="$CLAIM_DELAY_MAX_SECONDS"
+  printf '%s\n' "$value"
+}
+
+# One gate_supply decision line for <class> at <demand>, or empty.
+tartci_claim_delay_supply(){
+  python3 "$TARTCI_ROOT/scripts/gate_supply.py" decide \
+    --repo "$REPO" --class "$1" --demand "$2" \
+    --peers "$TARTCI_CLAIM_DELAY_PEERS" --slot "$SLOT" --state-dir "$STATE_DIR" \
+    --max-age-seconds "${TARTCI_CLAIM_DELAY_PEER_MAX_AGE_SECS:-60}" \
+    --ssh "${TARTCI_CLAIM_DELAY_SSH:-${TARTCI_FALLBACK_SSH:-ssh}}" \
+    </dev/null 2>/dev/null || true
 }
 
 # The class label configured at zero-based tier index <tier>, or nothing.
@@ -84,14 +103,25 @@ tartci_claim_delay_peer_free(){
 # faster host demonstrably can take every queued job of the class, else
 # `claim <reason>`.
 tartci_claim_delay_decision(){
-  local tier="$1" queued="${2:-}" peers class demand line verdict detail free
+  local tier="$1" queued="${2:-}" peers class demand="" line verdict detail free
   peers="${TARTCI_CLAIM_DELAY_PEERS:-}"
   [ -n "$peers" ] || { printf 'claim reason=no_faster_hosts_configured\n'; return 0; }
   class="$(tartci_claim_delay_class "$tier")" \
     || { printf 'claim reason=no_class_for_tier tier=%s\n' "$tier"; return 0; }
+  case "$queued" in ''|*[!0-9]*) queued=1 ;; esac
+  [ "$queued" -gt 0 ] || queued=1
   if [ "$ASSIGNMENT_MODE" = event-class-v2 ]; then
-    # The selection reports a witness (1), not a magnitude; the comparison
-    # with free slots needs the real count.
+    # The selection reports a witness (1), not a magnitude. Ask the peers at
+    # that lower bound first: when no faster slot is free, no count can make
+    # the delay pay, and the exhaustive scan is not spent.
+    line="$(tartci_claim_delay_supply "$class" "$queued")"
+    [ -n "$line" ] || line="unknown decision helper failed"
+    free="$(tartci_claim_delay_peer_free "${line#* }")"
+    if [ "${line%% *}" != hold ] || [ "$free" -lt 1 ]; then
+      printf 'claim reason=supply_%s class=%s demand>=%s peer_free=%s %s\n' \
+        "${line%% *}" "$class" "$queued" "$free" "${line#* }"
+      return 0
+    fi
     demand="$(tartci_assignment_v2_tier_demand "$class" 1 2>/dev/null)" || demand=""
   else
     demand="$queued"
@@ -100,12 +130,7 @@ tartci_claim_delay_decision(){
     ''|*[!0-9]*) printf 'claim reason=demand_unknown class=%s\n' "$class"; return 0 ;;
   esac
   [ "$demand" -gt 0 ] || { printf 'claim reason=no_demand class=%s\n' "$class"; return 0; }
-  line="$(python3 "$TARTCI_ROOT/scripts/gate_supply.py" decide \
-    --repo "$REPO" --class "$class" --demand "$demand" \
-    --peers "$peers" --slot "$SLOT" --state-dir "$STATE_DIR" \
-    --max-age-seconds "${TARTCI_CLAIM_DELAY_PEER_MAX_AGE_SECS:-60}" \
-    --ssh "${TARTCI_CLAIM_DELAY_SSH:-${TARTCI_FALLBACK_SSH:-ssh}}" \
-    </dev/null 2>/dev/null)" || line=""
+  line="$(tartci_claim_delay_supply "$class" "$demand")"
   verdict="${line%% *}"
   detail="${line#* }"
   [ -n "$line" ] || { verdict=unknown; detail="decision helper failed"; }

@@ -329,7 +329,7 @@ class Wiring(unittest.TestCase):
         # The sample carries the reservations the claim counted, and the log
         # line says so, so a reader can tell a booting sibling from a free slot.
         self.assertIn('reserved="$reserved"', branch)
-        self.assertIn('reserved="$(tartci_active_reservations)"', src)
+        self.assertIn('reserved="$(tartci_count_reservations)"', src)
         self.assertIn("reserved=$reserved priority_demand=$p)", src)
 
     def test_pool_status_dispatches_usage_and_prints_a_summary(self) -> None:

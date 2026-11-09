@@ -528,10 +528,17 @@ printf '%s\\n' '{json.dumps(report)}'
         self.assertEqual(r.stdout.strip(), "claim")
         self.assertEqual(self._sleeps(), ["20"])
         # A file that is not a bounded integer is ignored, not trusted.
-        for junk in ("abc", "601", "-5", "1.5"):
+        for junk in ("abc", "91", "-5", "1.5"):
             with self.subTest(junk=junk):
                 self._run(delay="15", delay_file=junk)
                 self.assertEqual(self._sleeps(), ["15"])
+
+    def test_the_delay_is_capped_below_the_heartbeat_staleness_floor(self) -> None:
+        # No heartbeat is written during the sleep; readers call one older than
+        # 120 s dead. A LaunchAgent value above the cap sleeps the cap.
+        r = self._run(delay="300")
+        self.assertEqual(r.stdout.strip(), "claim")
+        self.assertEqual(self._sleeps(), ["90"])
 
     def test_an_invalid_delay_refuses_to_start(self) -> None:
         for delay in ("-5", "15s", "1.5"):
@@ -544,7 +551,9 @@ printf '%s\\n' '{json.dumps(report)}'
         body = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('claim_delay_now="$(tartci_claim_delay_seconds)"', body)
         self.assertIn('if [ "$claim_delay_now" -gt 0 ] && [ "${q:-0}" -gt 0 ]', body)
-        self.assertIn('[ "$r" -lt "$cap" ]', body)
+        # A slot a sibling reserved is not a free slot to delay for.
+        self.assertIn('reserved="$(tartci_count_reservations)"', body)
+        self.assertIn('[ "$slots_held" -lt "$cap" ]', body)
         self.assertLess(
             body.index('"$(claim_delay_gate "$selected_labels" "$selected_tier" "$q")" = backoff'),
             body.index("# Idle gate: boot only when (1)"))
