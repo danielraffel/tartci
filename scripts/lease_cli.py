@@ -75,6 +75,16 @@ def parse_args(
             help="override the governor's dynamic_lending knob",
         )
         command_parser.add_argument(
+            "--vm-slot-lending",
+            choices=("on", "off"),
+            help="override the fleet profile's [leases] vm_slot_lending knob",
+        )
+        command_parser.add_argument(
+            "--macos-vm-cap",
+            type=int,
+            help="macOS guests this host can run at once (default: the role's cap)",
+        )
+        command_parser.add_argument(
             "--gate-prompt-reserve-cores",
             type=int,
             help="override cores kept free for the next gate job while lending",
