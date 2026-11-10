@@ -240,6 +240,32 @@ class LeaseFitTests(FairShareCase):
         rc, body = self.fit("110", PULP)
         self.assertEqual((rc, body["verdict"]), (0, "fits_now"), body)
 
+    def test_a_freed_vm_slot_is_not_reclaimed_ahead_of_a_starved_lane(self) -> None:
+        """m5s: a Pulp lane that just tore its VM down loops back before
+        Vellum's next poll. Cores fit both, so only the slot is contended; the
+        starved waiter in the lease store makes lease_fit (which runs before
+        the slot claim) answer `yield`, and acquire defers the same lease."""
+        self.knobs(fair=AFTER)
+        self.assertEqual(self.vm("vm-pulp-a", "110", PULP, cores=4)[0], 0)
+        self.assertEqual(self.vm("vm-pulp-b", "110", PULP, cores=4)[0], 0)
+        starved = self.now - 4 * 3600
+        self.assertEqual(self.wait("waiter-vellum", "vm", VELLUM, starved, cores=4)[0], 0)
+        self.release("vm-pulp-a")  # one slot frees; Pulp's lane loops back first
+        rc, body = self.fit("110", PULP, slot_cap=2, cores=4)
+        self.assertEqual((rc, body["verdict"]), (5, "yield"), body)
+        rc, body = self.vm("vm-pulp-c", "110", PULP, slot_cap=2, cores=4)
+        self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"), body)
+        rc, body = self.fit("vm", VELLUM, since=starved, slot_cap=2, cores=4)
+        self.assertEqual((rc, body["verdict"]), (0, "fits_now"), body)
+        rc, body = self.vm("vm-vellum", "vm", VELLUM, since=starved, waiter="waiter-vellum",
+                           slot_cap=2, cores=4)
+        self.assertEqual(rc, 0, body)
+        # Control: without the slot cap the cores alone would let Pulp reclaim it.
+        self.release("vm-vellum")
+        self.wait("waiter-vellum", "vm", VELLUM, starved, cores=4)
+        rc, body = self.fit("110", PULP, cores=4)
+        self.assertEqual((rc, body["verdict"]), (0, "fits_now"), body)
+
     def test_a_starved_lane_is_asked_about_at_gate_priority(self) -> None:
         self.knobs(fair=AFTER)
         self.contended_host()
