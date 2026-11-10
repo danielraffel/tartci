@@ -134,6 +134,21 @@ vm_slot_lending = true
 # re-render, restart the lanes at an idle boundary.
 # See docs/assignment-v2-rollout.md, "Slot priority".
 slot_priority = "on"
+# Canary: fair share between repositories (scripts/fair_share.py). Pulp's lanes
+# lease at 100/110 and Vellum's at vm (60), so while Pulp has a steady queue
+# every VM this host frees goes back to Pulp: on 2026-11-10 Vellum "Locked
+# macOS GPU proof" runs waited 1.5 to 4 h. A VM lane with work it could not
+# place for 30 min is admitted at gate priority while another repository uses
+# or waits for a VM here, and other repositories' lanes yield it the next VM;
+# the vellum-gate lane's last_slot_yield is lifted while it is starved.
+# Order within one repository is unchanged. 1800 s is under a third of the
+# observed Vellum waits and costs a Pulp job at most one Vellum job length.
+# Measure fair_share_granted / fair_share_yield and Vellum and Pulp
+# merge-group queue waits before m5studio, then m3, then m1.
+# Rollback: set 0 (or delete the key), re-render, restart the lanes at an
+# idle boundary. See docs/assignment-v2-rollout.md, "Fair share between
+# repositories".
+fair_share_after_secs = 1800
 
 [[lane]]
 id = "pulp-gate"

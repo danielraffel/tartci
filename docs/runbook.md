@@ -3236,6 +3236,9 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   claim that filled the last slot without that probe (two supervisors counting
   at once) probes after the claim and releases the slot on demand
   (`last_slot_yield_after_claim`). With two slots free it boots as before.
+  With `fair_share_after_secs` on, a starved supervisor skips the probe and
+  does not yield (`fair_share_yield_lifted`; see "Fair share between
+  repositories" below).
   (`rank_vm_waiters` cannot do this: a lane registers its lease waiter only
   after it holds a slot reservation.) Limits, by design: a Pulp job queued in
   the minute between the probe and the lease, or after both slots hold Vellum,
