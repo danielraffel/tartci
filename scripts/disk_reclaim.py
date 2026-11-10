@@ -77,6 +77,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 import boot_usage
+import checkout_outputs
 import pulp_reapers
 import gate_ccache_trim
 import scratch_dirs
@@ -283,6 +284,8 @@ RECHECK_MAXDEPTH = 4
 
 def nested_source_marker(
     path: pathlib.Path, maxdepth: int = NESTED_SOURCE_MAXDEPTH,
+    markers: tuple[str, ...] = SOURCE_MARKERS,
+    generated_dirs: tuple[str, ...] = GENERATED_SCRATCH_DIRS,
 ) -> tuple[str | None, bool]:
     """Look for a source checkout BELOW `path`. Returns (marker path, readable).
 
@@ -310,8 +313,11 @@ def nested_source_marker(
             continue
         for entry in entries:
             child = pathlib.Path(entry.path)
-            if depth > 0 and entry.name in SOURCE_MARKERS and \
-                    (not generated or entry.name == ".git"):
+            # Below a generated scratch directory a build tree's own rules
+            # count only a `.git`; an output kind's generated directories
+            # (SwiftPM's clones in DerivedData) hold no checkout of ours.
+            if depth > 0 and entry.name in markers and (
+                    not generated or (entry.name == ".git" and markers == SOURCE_MARKERS)):
                 # A linked worktree's `.git` is a regular file, and a
                 # `CMakeLists.txt` is never a directory, so this deliberately
                 # does not test the entry's type.
@@ -322,11 +328,12 @@ def nested_source_marker(
             except OSError:
                 continue
             stack.append((child, depth + 1,
-                          generated or (depth == 0 and entry.name in GENERATED_SCRATCH_DIRS)))
+                          generated or (depth == 0 and entry.name in generated_dirs)))
     return None, True
 
 
-def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Path]:
+def find_candidates(roots: list[pathlib.Path], maxdepth: int,
+                    output_kinds: bool = False) -> list[pathlib.Path]:
     """Directories under `roots` whose name looks like a build directory.
 
     Does not descend into a candidate (a nested `build/` inside a build tree is
@@ -356,7 +363,8 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
                 if not entry.is_dir(follow_symlinks=False):
                     continue
                 child = pathlib.Path(entry.path)
-                if is_build_dir_name(entry.name):
+                if is_build_dir_name(entry.name) or (
+                        output_kinds and checkout_outputs.kind_of(entry.name)):
                     found.append(child)
                     continue
                 stack.append((child, depth + 1))
@@ -619,6 +627,16 @@ def names_candidate(active: str, spellings: set[str]) -> bool:
     return False
 
 
+def nested_scan(path: pathlib.Path,
+                maxdepth: int = NESTED_SOURCE_MAXDEPTH) -> tuple[str | None, bool]:
+    """nested_source_marker with the rules of `path`'s kind (checkout_outputs)."""
+    rules = checkout_outputs.OUTPUT_KINDS.get(checkout_outputs.kind_of(path.name) or "")
+    if rules is None:
+        return nested_source_marker(path, maxdepth)
+    return nested_source_marker(path, maxdepth, markers=rules["nested"],
+                                generated_dirs=rules["generated"])
+
+
 def classify(
     path: pathlib.Path,
     *,
@@ -626,6 +644,7 @@ def classify(
     min_age_days: float,
     active: str | None,
 ) -> tuple[bool, str, float]:
+    kind = checkout_outputs.kind_of(path.name)
     """Decide one candidate. Returns (delete, reason, age_days).
 
     `active` is the live build command lines, or None when that scan failed.
@@ -640,10 +659,11 @@ def classify(
 
     if has_marker(path, SOURCE_MARKERS):
         return False, "source_tree", age_days
-    marker = has_marker(path, GENERATED_MARKERS)
+    rules = checkout_outputs.OUTPUT_KINDS.get(kind or "")
+    marker = has_marker(path, rules["markers"] if rules else GENERATED_MARKERS)
     if marker is None:
         return False, "not_a_build_tree", age_days
-    nested, readable = nested_source_marker(path)
+    nested, readable = nested_scan(path)
     if not readable:
         return False, "nested_scan_unreadable", age_days
     if nested is not None:
@@ -671,6 +691,18 @@ def classify(
 DEFAULT_ROOT_CANDIDATES = (
     "~/Code",
 )
+
+
+def checkout_output_settings() -> dict[str, Any] | None:
+    """The installed profile's checkout_outputs tier, or None when it is off."""
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return None
+    try:
+        with profile.open("rb") as handle:
+            return checkout_outputs.settings(tomllib.load(handle).get("reclaim"))
+    except (OSError, ValueError):
+        return None
 
 
 def profile_root_candidates() -> list[str]:
@@ -1333,11 +1365,28 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
             and leave_background():
         receipt["priority"] = "foreground: a volume is under pressure"
 
-    def min_age_for(path: pathlib.Path) -> float:
+    outputs = checkout_output_settings()
+    receipt["checkout_build_outputs"] = (
+        {"enabled": True, "idle_hours": outputs["idle_hours"], "selected": 0, "kept": {}}
+        if outputs else {"enabled": False})
+
+    def pressured(path: pathlib.Path) -> bool:
         device = device_id(path)
-        if device is None or device not in pressured_devices:
+        return device is not None and device in pressured_devices
+
+    def min_age_for(path: pathlib.Path) -> float:
+        if not pressured(path):
             return args.min_age_days
+        if outputs:
+            # The checkout tier (checkout_outputs.py): hours, not days, and only
+            # past its checkout gates, which the caller applies.
+            return min(short_gate, outputs["idle_hours"] / 24.0)
         return short_gate
+
+    def checkout_tier(path: pathlib.Path, gate_days: float) -> bool:
+        """Whether this candidate is judged by the checkout tier's rules."""
+        return bool(outputs) and (checkout_outputs.kind_of(path.name) is not None
+                                  or gate_days < short_gate)
 
     # Reported as the tightest gate any candidate can meet, so the summary
     # line still names a single number; the per-volume detail is in the JSON.
@@ -1349,7 +1398,8 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         f"{'fix' if args.fix else 'dry-run'}, min age {min_age}d", force=True)
 
     active = active_command_lines()
-    candidates = find_candidates(roots, args.maxdepth)
+    candidates = (find_candidates(roots, args.maxdepth, output_kinds=True) if outputs
+                  else find_candidates(roots, args.maxdepth))
     progress.emit(f"scanned {len(candidates)} candidate(s)", force=True)
 
     deleted: list[dict[str, Any]] = []
@@ -1361,11 +1411,28 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
             f"{index}/{len(candidates)} examined, "
             f"{reclaimed / GIB:.1f} GiB so far")
         candidate_min_age = min_age_for(path)
+        if checkout_outputs.kind_of(path.name) and not pressured(path):
+            # The output kinds belong to the checkout tier, which only runs on
+            # a volume under pressure.
+            kept.append({"path": str(path), "reason": "no_pressure", "age_days": 0.0})
+            continue
         delete, reason, age_days = classify(
             path, now=now, min_age_days=candidate_min_age, active=active)
+        if delete and checkout_tier(path, candidate_min_age):
+            refusal = checkout_outputs.checkout_gate(path, now=now)
+            if refusal is not None and age_days >= short_gate \
+                    and checkout_outputs.kind_of(path.name) is None:
+                refusal = None  # old enough for the day tier, which has no checkout gates
+            if refusal is not None:
+                delete, reason = False, f"checkout_gate ({refusal})"
+                tier = receipt["checkout_build_outputs"]["kept"]
+                tier[refusal] = tier.get(refusal, 0) + 1
+            else:
+                reason = f"{reason} [checkout tier]"
+                receipt["checkout_build_outputs"]["selected"] += 1
         if not delete:
             kept.append({"path": str(path), "reason": reason,
-                         "age_days": round(age_days, 1)})
+                         "age_days": round(age_days, 2)})
             continue
         size = dir_size_bytes(path)
         record = {"path": str(path), "reason": reason,
@@ -1385,7 +1452,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
                 continue
             # A checkout can be created inside the tree between the scan and
             # here, and this is the last moment it can still be saved.
-            nested_now, nested_readable = nested_source_marker(path)
+            nested_now, nested_readable = nested_scan(path)
             if not nested_readable:
                 record["reason"] = "nested_scan_unreadable"
                 kept.append(record)
@@ -1487,6 +1554,7 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         # in exactly this way until someone measured it by hand.
         "maxdepth": args.maxdepth,
         "candidates": len(candidates),
+        "checkout_build_outputs": receipt["checkout_build_outputs"],
         "deleted": deleted,
         "kept": kept,
         "reclaimed_bytes": reclaimed,
