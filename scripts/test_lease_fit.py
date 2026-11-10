@@ -405,5 +405,58 @@ class LoopGateTests(unittest.TestCase):
             self.assertNotIn(phase, lane_busy.BUSY_PHASES)
 
 
+
+class VmSlotLendingFitTests(unittest.TestCase):
+    """The probe agrees with acquisition under VM slot lending (m5: T=14, S=8)."""
+
+    def cfg(self, lending: bool) -> dict:
+        return {"total": 14, "reserved_gate_cores": 8, "gate_priority": 100,
+                "total_mem_mb": 0, "reserved_gate_mem_mb": 0, "per_job_mem_mb": 1536,
+                "vm_slot_lending": int(lending), "macos_vm_cap": 2}
+
+    @staticmethod
+    def guest(lease_id: str, cores: int, priority: int = 60, kind: str = "tart-macos-vm") -> dict:
+        return {"id": lease_id, "lease_size_cores": cores, "priority": priority,
+                "command_kind": kind}
+
+    def test_second_guest_fits_only_with_lending(self) -> None:
+        held = [self.guest("vellum-1", 6)]
+        off = lease_fit.evaluate(self.cfg(False), held, cores=6, mem_mb=0, priority=60)
+        on = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60)
+        self.assertEqual(off["verdict"], "not_now")
+        self.assertEqual(off["max_concurrent"], 1)
+        self.assertEqual(on["verdict"], "fits_now")
+        self.assertEqual(on["max_concurrent"], 2)
+        self.assertEqual(on["core_budget"], 14)
+
+    def test_gate_guest_in_the_other_slot_keeps_the_static_budget(self) -> None:
+        held = [self.guest("pulp", 4, priority=100), self.guest("agent", 1, kind="build")]
+        result = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60)
+        self.assertEqual(result["verdict"], "not_now")
+        self.assertEqual(result["core_budget"], 6)
+
+    def test_only_a_macos_guest_is_lent_and_parked_guests_count(self) -> None:
+        held = [self.guest("vellum-1", 6)]
+        linux = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60,
+                                   kind="tart-linux-vm")
+        self.assertEqual(linux["verdict"], "not_now")
+        parked = dict(self.guest("parked", 0), memory_only=True)
+        result = lease_fit.evaluate(self.cfg(True), [], cores=6, mem_mb=0, priority=60,
+                                    slot_records=[parked])
+        self.assertEqual(result["core_budget"], 14, "a parked guest holds a slot")
+        parked_gate = dict(self.guest("parked-gate", 0, priority=100), memory_only=True)
+        result = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60,
+                                    slot_records=[*held, parked_gate])
+        self.assertEqual(result["verdict"], "not_now", "a parked gate guest turns lending off")
+
+    def test_cap_that_does_not_fit_the_total_reports_the_static_count(self) -> None:
+        result = lease_fit.evaluate(self.cfg(True), [], cores=6, mem_mb=0, priority=60)
+        self.assertEqual(result["max_concurrent"], 2)
+        result = lease_fit.evaluate(self.cfg(True), [], cores=5, mem_mb=0, priority=60)
+        self.assertEqual(result["max_concurrent"], 2)
+        wide = dict(self.cfg(True), total=10, reserved_gate_cores=4)
+        result = lease_fit.evaluate(wide, [], cores=6, mem_mb=0, priority=60)
+        self.assertEqual(result["max_concurrent"], 1)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
