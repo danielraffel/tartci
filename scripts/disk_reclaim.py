@@ -1430,8 +1430,17 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
                 tier_cwds = tmp_checkouts.process_cwds()
             scan_root = next((root for root in roots
                               if root == path or root in path.parents), None)
-            refusal = checkout_outputs.checkout_gate(
-                path, now=now, root=scan_root, cwds=tier_cwds, status_cache=tier_status)
+            checkout = checkout_outputs.enclosing_checkout(path, scan_root)
+            if checkout is not None and active and names_candidate(
+                    active, path_spellings(checkout)):
+                # A live process names a file in this checkout (an MCP server
+                # run as `node /abs/proj/dist/index.js` from $HOME): its
+                # node_modules is in use though nothing names it.
+                refusal = "checkout_named_by_process"
+            else:
+                refusal = checkout_outputs.checkout_gate(
+                    path, now=now, root=scan_root, cwds=tier_cwds,
+                    status_cache=tier_status)
             if refusal is not None and age_days >= short_gate \
                     and checkout_outputs.kind_of(path.name) is None:
                 refusal = None  # old enough for the day tier, which has no checkout gates

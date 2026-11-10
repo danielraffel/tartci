@@ -265,6 +265,18 @@ class ReclaimPassTests(unittest.TestCase):
         self.assertFalse(derived.exists(), "SwiftPM's clones are regenerable")
         self.assertTrue(unmarked.is_dir(), "no lockfile marker, not proven generated")
 
+    def test_a_process_naming_a_file_in_the_checkout_keeps_its_output(self) -> None:
+        from unittest import mock
+        self.opt_in()
+        checkout = make_checkout(self.root)
+        target = make_target(checkout, hours=10)
+        server = f"123 node {checkout}/dist/index.js\n"
+        with mock.patch.object(dr, "active_command_lines", return_value=server):
+            report = self.run_pass(pressure=True)
+        self.assertTrue(target.is_dir())
+        self.assertEqual(report["checkout_build_outputs"]["kept"],
+                         {"checkout_named_by_process": 1})
+
     def test_a_git_checkout_inside_node_modules_is_kept(self) -> None:
         self.opt_in()
         checkout = make_checkout(self.root)
