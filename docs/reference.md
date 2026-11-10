@@ -362,6 +362,25 @@ credential solely for the GitHub runner-registration edge may set
 `generate-jitconfig` uses that override. Never put a token in a plist and never
 silently fall back from `ghapp` to ambient `gh`.
 
+**Read-only scan App (`[github_scan_app]`, `TARTCI_SCAN_GH_CLI`).** Queue
+scans (`assignment_scan.py`) and current-job reads (`current_job_scan.py`) only
+read, so a lane can run them as a separate read-only GitHub App and draw on its
+own rate-limit bucket instead of the Shipyard App's. A host profile declares
+`[github_scan_app]` with `id`, `private_key_path` and `cache_dir` (same
+host-local path rules as `[github_app]`); the renderer exports
+`TARTCI_SCAN_APP_ID`, `TARTCI_SCAN_APP_PRIVATE_KEY_PATH` and
+`TARTCI_SCAN_APP_CACHE_DIR` (references only), and the provider then runs scans
+through `scripts/gh-scan-app`, which mints and caches an installation token with
+`ghapp token --app-id` and execs `gh` with it. The provider binds the wrapper
+to the lane's repository through `TARTCI_SCAN_APP_REPO` (the wrapper falls back
+to `SHIPYARD_GH_APP_REPO`, then `GH_REPO`, when run by hand). It fails closed (exit 75) and
+never falls back to ambient `gh`. `TARTCI_SCAN_GH_CLI` names a different scan
+CLI explicitly. `queue_scan.py` (non-v2 lanes) still reads on `TARTCI_GH_CLI`. JIT registration, runner reclaim, cancel and every other write
+stay on `TARTCI_GH_CLI`. Rollback: delete the table (or unset the variable) and
+the next pass scans on `TARTCI_GH_CLI` again. Verify with
+`TARTCI_SCAN_APP_*` set: `scripts/gh-scan-app api rate_limit` must (run with a real `gh`, not the ghapp shim) show a reset
+time and `used` count that differ from `ghapp api rate_limit`.
+
 For a non-default organization runner group, TartCI mints through
 `orgs/<org>/actions/runners/generate-jitconfig`, not the repository endpoint.
 The normal Shipyard App route is therefore also the JIT route unless a fresh,
@@ -1004,8 +1023,18 @@ docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent o
 ```
 
 ## Contributing checks
-Run the same gate CI runs before you push: it's one script, portable to macOS's
-stock bash 3.2:
+Run `./scripts/prepush.sh` before you push. The default is fast: lint.sh,
+the tomllib-less 3.9 interpreter check, py_compile under 3.9 and 3.11, the
+skip-allowlist, leak-needle and public-path tests under the hosts'
+`/usr/bin/python3` 3.9, and only the unit-test modules that changed against
+`origin/main` plus those that import a changed module
+(`scripts/prepush_select.py`). **CI is the full run**: `--full` runs the same
+commands as the `lint` and `python-39-tests` jobs, including the whole suite
+under 3.9. Fast mode is not a substitute for CI; it exists to catch the
+failures that most often reach a PR. Both modes fail fast and name the CI job a
+failure maps to. `scripts/test_prepush_matches_ci.py` fails if the full run
+drifts from `ci.yml` or the fast mode stops covering those classes. The lint gate
+alone is one script, portable to macOS's stock bash 3.2:
 ```bash
 ./scripts/lint.sh    # shellcheck -S warning + bash -n on every shell script
                      # (incl. the extensionless `tartci` dispatcher), py_compile

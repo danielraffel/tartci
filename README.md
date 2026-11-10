@@ -145,10 +145,12 @@ explains how the pieces fit, including GitHub-hosted runners as overflow.
 
 ## Contributing
 
-Run the same check CI runs before you push:
+Run the same checks CI runs before you push:
 
 ```bash
-./scripts/lint.sh   # shellcheck, bash -n, py_compile and TOML parsing
+./scripts/prepush.sh          # fast: lint.sh, 3.9 checks, changed modules' tests
+./scripts/prepush.sh --full   # what CI runs: whole suite under 3.9 and python3, shell tests
+./scripts/lint.sh      # just shellcheck, bash -n, py_compile and TOML parsing
 ```
 
 ## License

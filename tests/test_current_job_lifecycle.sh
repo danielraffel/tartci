@@ -72,6 +72,10 @@ chmod +x "$TMP/fake-gh"
 
 export TARTCI_ROOT="$ROOT" STATE_DIR="$TMP/state" REPO="Generous-Corp/pulp"
 export GH_CLI="$TMP/fake-gh" WORKFLOW_CONFIG="Build and Test"
+# The production runner initializes this alongside GH_CLI before calling the
+# functions below.  This suite evals only the function definitions, so mirror
+# that initialization explicitly instead of tripping set -u on the scan path.
+export SCAN_GH_CLI="$GH_CLI"
 export CURRENT_REGISTERED_RUNNER="runner-1" RUNNER_NAME="lane-1"
 export LIFECYCLE_STATE="$TMP/api-state" LIFECYCLE_HANG=0
 export LIFECYCLE_POST_LOG="$TMP/posts"

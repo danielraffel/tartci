@@ -406,7 +406,12 @@ class RunnerAgentLoadedTests(unittest.TestCase):
                 # Shadow host-provided versioned interpreters so this fixture
                 # proves the unversioned-python3 branch rather than depending
                 # on the runner image.
-                {"PATH": f"{bindir}:/bin:/usr/bin", "TARTCI_PYTHON": ""},
+                # A fleet host has a python.pin, lane plists and a launchd
+                # label that resolve before PATH does; point them at nothing.
+                {"PATH": f"{bindir}:/bin:/usr/bin", "TARTCI_PYTHON": "",
+                 "TARTCI_HOME": str(Path(td) / "home"), "TARTCI_LAUNCHD": "",
+                 "XPC_SERVICE_NAME": "", "HOME": str(Path(td) / "home"),
+                 "TARTCI_LAUNCH_AGENTS_DIR": str(Path(td) / "agents")},
             )
             self.assertEqual(proc.stdout.strip(), "selected-marker", proc.stderr)
 

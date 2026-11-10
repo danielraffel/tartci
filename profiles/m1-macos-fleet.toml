@@ -104,6 +104,17 @@ scratch_dirs = true
 # rate held at 99.49% (99.51% before). Rollback: delete this key.
 gate_ccache_trim = true
 
+# Merge-group-first VM slot priority (scripts/slot_priority.py). Pulp's merge
+# queue waited an hour or more for macOS VM slots behind PR-head jobs on
+# 2026-11-09, because every lane claims a free slot first-come. "on" gives a
+# free slot to a merge_group job ahead of a pull_request job; non-preemptive,
+# bounded by TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS, no extra GitHub call. Owner
+# approved enabling it on all four hosts. Rollback: set "off" or delete the key,
+# re-render, restart the lanes at an idle boundary.
+# See docs/assignment-v2-rollout.md, "Slot priority".
+[leases]
+slot_priority = "on"
+
 [[lane]]
 id = "pulp-gate"
 repo = "Generous-Corp/pulp"

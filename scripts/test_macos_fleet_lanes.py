@@ -226,7 +226,8 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertIn(fleet.load(HOST_CONFIGS["m5"])["leases"]["rank_vm_waiters"], (True, False))
         for host, path in HOST_CONFIGS.items():
             if host != "m5":
-                self.assertNotIn("leases", fleet.load(path), host)
+                # Only slot_priority is shipped elsewhere; ranked waiters stay m5-only.
+                self.assertNotIn("rank_vm_waiters", fleet.load(path).get("leases", {}), host)
         body = HOST_CONFIGS["m5"].read_text()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m5.toml"
@@ -280,6 +281,30 @@ class MacosFleetLaneTests(unittest.TestCase):
             path = Path(td) / "m5.toml"
             path.write_text(mutated)
             with self.assertRaisesRegex(ValueError, "vm_slot_lending must be a boolean"):
+                fleet.load(path)
+
+    def test_every_host_profile_turns_slot_priority_on_and_the_reader_sees_it(self) -> None:
+        import host_profile
+        for host, path in HOST_CONFIGS.items():
+            self.assertEqual(fleet.load(path)["leases"]["slot_priority"], "on", host)
+            with tempfile.TemporaryDirectory() as td:
+                installed = Path(td) / "macos-fleet-profile.toml"
+                installed.write_text(path.read_text())
+                settings = host_profile.lease_policy_settings(str(installed))
+            self.assertEqual(settings["slot_priority"], "on", host)
+            self.assertEqual(settings["slot_priority_promote_after_secs"], 2700, host)
+        # Control: a profile without the key reads off.
+        with tempfile.TemporaryDirectory() as td:
+            bare = Path(td) / "p.toml"
+            bare.write_text("[host]\n")
+            self.assertEqual(host_profile.lease_policy_settings(str(bare))["slot_priority"], "off")
+        body = HOST_CONFIGS["m1"].read_text()
+        bad = body.replace('slot_priority = "on"', 'slot_priority = "maybe"', 1)
+        self.assertNotEqual(bad, body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m1.toml"
+            path.write_text(bad)
+            with self.assertRaisesRegex(ValueError, "slot_priority"):
                 fleet.load(path)
 
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:

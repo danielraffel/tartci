@@ -3246,6 +3246,19 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   one-supervisor baseline, so the Vellum queue wait on m5 is a canary
   guardrail. The key cannot be combined with `warm_vm`. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
   and Pulp `macos` queue wait on the canary host.
+- **Slot priority (opt-in, default off)** — `[leases] slot_priority =
+  "shadow"` or `"on"` ranks the lanes on a host that want the next FREE macOS
+  VM slot: merge_group jobs of any repo, then other events, then pull_request;
+  longest wait first within a class (the older of the job's `created_at` and
+  the lane's continuous `waiting_since`); a lower-class job queued
+  `slot_priority_promote_after_secs` (default 2700) ranks as merge-group. Only
+  intents whose VM lease would be admitted now count, and nothing running is
+  touched. Shadow logs `slot_priority_shadow` ("would have given slot to ...")
+  and still claims first-come; on logs `slot_priority_deferred` and skips the
+  claim for one poll, at most `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (default
+  300) in a row. Intents live in `slot-intents.json` beside `leases.json`
+  (`scripts/slot_priority.py status`). Full rules and limits:
+  `docs/assignment-v2-rollout.md`, "Slot priority".
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with

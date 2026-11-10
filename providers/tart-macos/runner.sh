@@ -154,6 +154,23 @@ ARTIFACT_CACHE_ROOT="${TARTCI_ARTIFACT_CACHE_DIR:-$CACHE_ROOT/artifact-cache}"
 GUEST_ARTIFACT_CACHE="/Volumes/My Shared Files/artifact-cache"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
+# Read-only queue scans may run as their own read-only App so their polling
+# draws on a separate rate-limit bucket. TARTCI_SCAN_GH_CLI names a CLI
+# explicitly; otherwise a host profile's github_scan_app (TARTCI_SCAN_APP_ID)
+# selects scripts/gh-scan-app. Writes (JIT, reclaim, cancel) stay on GH_CLI.
+# The wrapper mints its token for exactly one repository and refuses to guess
+# it, so bind it to this lane's repository: the same one every scan passes as
+# --repo. A dedicated variable keeps GH_CLI's own repository binding untouched.
+# scan-cli-selection: begin
+if [ -n "${TARTCI_SCAN_GH_CLI:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_SCAN_GH_CLI"
+elif [ -n "${TARTCI_SCAN_APP_ID:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_ROOT/scripts/gh-scan-app"
+  export TARTCI_SCAN_APP_REPO="$REPO"
+else
+  SCAN_GH_CLI="$GH_CLI"
+fi
+# scan-cli-selection: end
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 # GitHub retires old Actions Runner releases; a retired listener exits with
@@ -498,6 +515,8 @@ source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
 # shellcheck source=providers/tart-macos/claim-delay.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/claim-delay.lib.sh"
+# shellcheck source=providers/tart-macos/slot-priority.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/slot-priority.lib.sh"
 # shellcheck source=providers/tart-macos/vm-dhcp.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/vm-dhcp.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
@@ -639,6 +658,8 @@ RUNNER_ARCHIVE_URL="https://github.com/actions/runner/releases/download/v${RUNNE
 configure_workflows
 configure_workflow_tier_groups
 tartci_assignment_v2_configure
+# Resolve slot priority's mode once, in this shell (slot-priority.lib.sh).
+tartci_slot_priority_load
 # The retarget is a V2 decision: a legacy or observe lane registers with the
 # tier labels but never consults it, so those lanes stay byte-for-byte unchanged.
 [ "$ASSIGNMENT_MODE" = event-class-v2 ] || ASSIGNMENT_V2_IDLE_RETARGET_SECS=0
@@ -1226,9 +1247,15 @@ queued_work(){
     printf '%s\n' "$total"
     return 0
   fi
+  # Slot priority reads the event class and age of what this scan counted.
+  local detail_args=()
+  if declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+    detail_args=(--detail-file "$(tartci_slot_priority_detail_file lane)")
+  fi
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} \
+    ${detail_args[@]+"${detail_args[@]}"} \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -1276,6 +1303,10 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
+  if [ "$ASSIGNMENT_MODE" != event-class-v2 ] \
+     && declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+    scan_cmd+=(--detail-file "$(tartci_slot_priority_detail_file "$tier_labels")")
+  fi
   run_scan_capture ${scan_cmd[@]+"${scan_cmd[@]}"} --match-labels 1
 }
 
@@ -1832,7 +1863,7 @@ capture_current_job(){
     "$TARTCI_ROOT/scripts/current_job_scan.py"
     --repo "$REPO"
     --runner "$runner_registration"
-    --gh-cli "$GH_CLI"
+    --gh-cli "$SCAN_GH_CLI"
     --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
     --mode "$scan_mode"
     --gh-timeout "${TARTCI_CAPTURE_CURRENT_JOB_GH_TIMEOUT_SECS:-4}"
@@ -3230,6 +3261,7 @@ if [ "$LOOP" = 1 ]; then
     # storage gate is degraded or quarantined. A pending delete from an
     # already-active VM was reconciled above and remains the only exception.
     if ! tartci_storage_health_check "$TART_HOME"; then
+      tartci_slot_priority_withdraw
       sleep "$POLL"
       continue
     fi
@@ -3240,6 +3272,7 @@ if [ "$LOOP" = 1 ]; then
     tartci_warm_tick || true
     [ -z "$CURRENT_VM" ] || continue
     if ! tartci_pool_admission_open; then
+      tartci_slot_priority_withdraw
       note "pool $(tartci_pool_read_state) — no new macOS admission; waiting ${POLL}s"
       heartbeat draining
       sleep "$POLL"
@@ -3253,6 +3286,9 @@ if [ "$LOOP" = 1 ]; then
       # A lane whose acquire was denied is still waiting for exactly this
       # capacity: keep its ranked waiter alive (bounded; no-op when off).
       tartci_vm_lease_waiter_hold
+      # Waiting for lease capacity it still wants the next slot, so its slot
+      # priority intent stays fresh; a lease that never fits withdraws it.
+      tartci_slot_priority_lease_wait
       sleep "$POLL"
       continue
     fi
@@ -3267,6 +3303,7 @@ if [ "$LOOP" = 1 ]; then
         q=ERR
       elif jit_admission_denied "$selected_group_id" "$selected_labels"; then
         note "JIT admission remains blocked for repository=$REPO group=$selected_group_id class=$selected_labels — no VM will boot; inspect $JIT_DENIAL_FILE"
+        tartci_slot_priority_withdraw
         heartbeat jit-admission-denied
         sleep "$POLL"
         continue
@@ -3281,6 +3318,7 @@ if [ "$LOOP" = 1 ]; then
     # gh auth (the supervisor is idle at the loop top — run_one blocks — so cleanup discards no live
     # VM). Any successful poll resets the counter, so a transient blip costs nothing.
     if ! printf '%s' "$q" | grep -qxE '[0-9]+'; then
+      tartci_slot_priority_withdraw
       blind=$((blind + 1))
       scan_detail="$(scan_last_error)"
       # Report WHAT was observed. The old text named `gh`, a component this code
@@ -3324,6 +3362,7 @@ if [ "$LOOP" = 1 ]; then
     clear_scan_error
     if [ "$r" = unknown ]; then
       tartci_vm_lease_waiter_withdraw
+      tartci_slot_priority_withdraw
       note "Tart inventory unavailable — deferring new macOS VM clones; retrying in ${POLL}s"
       [ "${q:-0}" -le 0 ] || event demand_waiting \
         "queued=$q running=unknown/$cap reason=inventory_unknown" \
@@ -3374,19 +3413,32 @@ if [ "$LOOP" = 1 ]; then
        && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
        && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$slots_held" -lt "$cap" ]; then
       if [ "$(claim_delay_gate "$selected_labels" "$selected_tier" "$q")" = backoff ]; then
+        tartci_slot_priority_withdraw
         note "claim delay ${claim_delay_now}s: queued work (class $selected_labels) was taken by another host — not claiming"
         event claim_delay_backoff "delay=${claim_delay_now}s labels=$selected_labels"
         sleep "$POLL"
         continue
       fi
     fi
+    # Slot priority (opt-in, slot-priority.lib.sh): a lane about to claim a
+    # free slot asks whether a higher-ranked lane on this host (a merge-group
+    # job ahead of a PR-head one, then the longest-waiting job) can take it
+    # now. Off, the gate returns at once and sp stays 0; shadow only logs.
+    # A parked warm VM already holds its slot, so it is never ranked.
+    sp=0
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
+       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ -z "$WARM_VM" ]; then
+      tartci_slot_priority_gate "$cap" "$r" "$selected_labels" "$selected_tier" || sp=1
+    fi
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$sp" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
+      # Holding a slot now; this lane no longer competes for one.
+      tartci_slot_priority_withdraw
       # last_slot_yield: two supervisors can both read "a slot to spare" and
       # claim; whichever claim filled the last slot asks the priority queue
       # now (the claim is atomic, the count before it was not).
@@ -3486,18 +3538,33 @@ if [ "$LOOP" = 1 ]; then
         rm -f "$resv" 2>/dev/null || true
       fi
       CURRENT_RESV=""
+    elif [ "$sp" -eq 1 ]; then
+      # Outranked for the free slot by a lane that can boot now. Still demand
+      # this lane saw and did not place, so it is sampled like slot_full. Its
+      # lease waiter is withdrawn: kept, it would defer the very lane it just
+      # yielded the slot to (leases.py blocking_waiter).
+      tartci_vm_lease_waiter_withdraw
+      reserved="$(tartci_count_reservations)"
+      note "deferring ${POLL}s (queued=$q running_macos_vms=$r/$cap reserved=$reserved) — slot priority: a higher-ranked lane on this host takes the free slot"
+      event demand_waiting "queued=$q running=$r/$cap reserved=$reserved reason=slot_priority" \
+        queued="$q" running="$r" cap="$cap" poll="$POLL" reason=slot_priority reserved="$reserved"
+      heartbeat waiting
+      sleep "$POLL"
     elif [ "$ws" -eq 1 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "deferring ${POLL}s (queued=$q) — a sibling supervisor's warm VM is parked for $REPO; asked it to hand off"
       heartbeat waiting
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"
       event yielded_host_health "queued=$q host_health_yield=$hh running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && [ "${yb:-0}" -eq 0 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$cap) — priority lane '${YIELD_WORKFLOW}' has the slot"
       event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$cap"
@@ -3507,7 +3574,7 @@ if [ "$LOOP" = 1 ]; then
       # Demand this lane could not place (no macOS VM slot) is still demand;
       # no demand at all is not.
       case "${q:-0}" in
-        0) tartci_vm_lease_waiter_withdraw ;;
+        0) tartci_vm_lease_waiter_withdraw; tartci_slot_priority_withdraw ;;
         *) tartci_vm_lease_waiter_hold ;;
       esac
       # The claim counts reservations as well as guests: a sibling lane between

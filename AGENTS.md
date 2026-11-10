@@ -18,7 +18,7 @@ Deeper material: [docs/reference.md](docs/reference.md) (behavior and
 environment variables), [docs/runbook.md](docs/runbook.md) (procedures),
 [docs/gotchas.md](docs/gotchas.md) (known failure modes).
 
-Before pushing a change to this repository, run `./scripts/lint.sh`.
+Before pushing a change to this repository, run `./scripts/prepush.sh`. The default is a fast check (about 1-3 minutes): `scripts/lint.sh`, the 3.9 interpreter check, py_compile under 3.9 and 3.11, the skip-allowlist, leak-needle and public-path tests under `/usr/bin/python3` 3.9, and the unit tests of the modules you changed plus those that import them. CI is the full run; `./scripts/prepush.sh --full` runs the same commands as the `lint` and `python-39-tests` jobs (about half an hour on a loaded host). It fails fast and names the CI job that would go red.
 
 ## How a PR lands here
 
