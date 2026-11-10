@@ -86,6 +86,8 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
     tomllib = None  # type: ignore[assignment]
 
+import merged_checkouts  # noqa: E402
+
 DEFAULT_ROOT = "/private/tmp"
 DEFAULT_IDLE_HOURS = 48
 MIN_IDLE_HOURS = 24
@@ -104,7 +106,8 @@ CACHE_TTL_S = 24 * 3600
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
-def _bounded_git(argv: list[str], *, timeout: float) -> subprocess.CompletedProcess:
+def _bounded_git(argv: list[str], *, timeout: float,
+                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
     """Run git without letting timed-out metadata wedge the janitor.
 
     ``subprocess.run(timeout=...)`` kills the direct child and then waits for
@@ -114,7 +117,7 @@ def _bounded_git(argv: list[str], *, timeout: float) -> subprocess.CompletedProc
     kill the group on timeout, and return without a second unbounded wait.
     """
     proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True,
+                            text=True, env=env,
                             start_new_session=True)
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -157,6 +160,7 @@ def validate(table: dict[str, Any]) -> list[str]:
             and ".." not in r.split("/") for r in extra):
         problems.append("reclaim.extra_worktree_roots must be a list of absolute paths "
                         "other than /")
+    problems.extend(merged_checkouts.validate(table))
     return problems
 
 
@@ -171,12 +175,22 @@ def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
         return None, f"no installed fleet profile at {profile}"
     except (OSError, tomllib.TOMLDecodeError) as exc:
         return None, f"fleet profile unreadable: {exc}"
-    table = data.get("reclaim")
+    settings, why = settings_from_table(data.get("reclaim"), str(profile))
+    if settings is not None:
+        settings["scan_app_env"] = merged_checkouts.scan_app_env(data)
+    return settings, why
+
+
+def settings_from_table(table: Any, where: str) -> tuple[dict[str, Any] | None, str]:
+    """`load_settings` past the TOML read, so a test can hand it a table."""
+    merged = (merged_checkouts.settings(table) if isinstance(table, dict)
+              and not validate(table) else None)
     if not isinstance(table, dict) or (table.get("tmp_checkouts") is not True
                                        and table.get("worktree_root_checkouts") is not True
-                                       and not table.get("extra_worktree_roots")):
+                                       and not table.get("extra_worktree_roots")
+                                       and merged is None):
         return None, (f"neither [reclaim] tmp_checkouts nor worktree_root_checkouts "
-                      f"is true, and no extra_worktree_roots, in {profile}")
+                      f"is true, no extra_worktree_roots and no worktrees_root, in {where}")
     problems = validate(table)
     if problems:
         return None, "; ".join(problems)
@@ -187,7 +201,7 @@ def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
         roots.append(table["worktrees_root"])
     extra = [r for r in table.get("extra_worktree_roots", []) if r not in roots]
     return {"idle_hours": table.get("tmp_checkout_idle_hours", DEFAULT_IDLE_HOURS),
-            "roots": roots + extra, "worktrees_only": extra}, "enabled"
+            "roots": roots + extra, "worktrees_only": extra, "merged": merged}, "enabled"
 
 
 def process_cwds(runner: Runner = subprocess.run) -> list[str] | None:
@@ -426,6 +440,7 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
          budget_s: float = PASS_BUDGET_S, cwds: list[str] | None | bool = True,
          cache: dict | None = None, next_cache: dict | None = None,
          worktrees_only: bool = False, resume_after: str | None = None,
+         merged: "merged_checkouts.Proof | None" = None,
          ) -> dict[str, Any]:
     """One pass over the git checkouts directly under `root`.
 
@@ -438,6 +453,12 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
     `in_use` is the caller's live-build test (None when the process table
     could not be read, which removes nothing). `cwds` defaults to lsof.
     `cache` holds earlier keep-verdicts, `next_cache` receives this pass's.
+
+    `merged` switches the root to the merged rule (merged_checkouts.py): HEAD
+    must have landed rather than merely be pushed, any running command line
+    naming the checkout keeps it, and a squash-landed checkout is queued on
+    `merged.pending` for the pass's one PR read (tmp_checkouts.run finishes it).
+    `idle_hours` is then the merged rule's own gate.
     """
     now = time.time() if now is None else now
     started = time.monotonic()
@@ -448,9 +469,11 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
         "broken_checkouts": 0, "broken_paths": [],
         "resumed_after": resume_after, "next_cursor": None,
     }
+    if merged is not None:
+        report["rule"] = "merged"
     if cwds is True:
         cwds = process_cwds(runner)
-    blind = in_use is None or cwds is None
+    blind = in_use is None or cwds is None or (merged is not None and merged.commands is None)
     if blind:
         report["error"] = ("process table unreadable (lsof or pgrep), so no checkout "
                            "could be proven idle; removed nothing")
@@ -504,8 +527,12 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
             continue
         spellings = _spellings(checkout)
         assert isinstance(cwds, list)
+        if merged is not None:
+            merged.examined.add(str(checkout))
         if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
-                or build_marker_live(checkout):
+                or build_marker_live(checkout) \
+                or (merged is not None and merged_checkouts.named_by(
+                    merged.commands or "", spellings)):
             keep("in_use")
             continue
         newest = newest_mtime(checkout, gitdir)
@@ -525,9 +552,24 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
             if next_cache is not None:
                 next_cache[str(checkout)] = remembered
             continue
+        item = None
         try:
-            reason = holds_worktrees(gitdir, kind) or lineage_active(checkout, runner) \
-                or unpushed_reason(checkout, kind, runner)
+            reason = holds_worktrees(gitdir, kind) or lineage_active(checkout, runner)
+            if not reason and (merged is None or kind == "clone"):
+                # A clone's other branches and stash die with it, so the merged
+                # rule still needs every one of them pushed (and HEAD merged).
+                reason = unpushed_reason(checkout, kind, runner)
+            if not reason and merged is not None:
+                verdict, detail = merged_checkouts.judge(checkout, kind, merged, runner)
+                if verdict == "keep":
+                    reason = detail
+                elif verdict == "pending":
+                    merged.pending.append(dict(detail, root=str(root), newest=newest,
+                                               gitdir=gitdir))
+                    keep("awaiting_pr_proof")
+                    continue
+                else:
+                    item = detail
         except subprocess.TimeoutExpired:
             reason = "git_timeout"
         if reason:
@@ -536,19 +578,125 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
                 next_cache[str(checkout)] = {"newest": newest, "reason": reason, "at": now}
             continue
         size = size_bytes(checkout, runner)
+        if merged is not None:
+            # The judgement above took time (a fetch, status, du); ask again.
+            late = still_idle(checkout, kind, gitdir, newest, in_use, merged, runner)
+            if late:
+                keep(late)
+                continue
         if fix:
             try:
-                refusal = remove(checkout, kind, gitdir, runner)
+                refusal = (merged_checkouts.remove(item, merged, runner)
+                           if item is not None and kind == "worktree"
+                           else remove(checkout, kind, gitdir, runner))
             except subprocess.TimeoutExpired:
                 refusal = "git_timeout"
             if refusal:
                 keep(refusal)
                 continue
-        report["removed"] += 1
-        report["removed_bytes"] += size or 0
-        if len(report["removed_paths"]) < LIST_LIMIT:
-            report["removed_paths"].append(str(checkout))
+        count_removed(report, checkout, size, merged)
     return report
+
+
+def still_idle(checkout: pathlib.Path, kind: str, gitdir: pathlib.Path, newest: float,
+               in_use: Callable[[pathlib.Path], bool] | None,
+               merged: "merged_checkouts.Proof", runner: Runner) -> str | None:
+    """The in-use gates against a process table read NOW, just before removal.
+
+    Also: nothing at the top of the checkout or in its index/HEAD moved since
+    it was judged, and a clone still has no worktrees of its own.
+    """
+    cwds = merged.fresh_cwds()
+    merged.refresh_commands()
+    if in_use is None or cwds is None or merged.commands is None:
+        return "process_scan_unavailable"
+    spellings = _spellings(checkout)
+    if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
+            or build_marker_live(checkout) \
+            or merged_checkouts.named_by(merged.commands, spellings):
+        return "in_use"
+    if newest_mtime(checkout, gitdir) != newest:
+        return "changed_before_removal"
+    return holds_worktrees(gitdir, kind)
+
+
+def count_removed(report: dict[str, Any], checkout: pathlib.Path, size: int | None,
+                  merged: "merged_checkouts.Proof | None") -> None:
+    report["removed"] += 1
+    report["removed_bytes"] += size or 0
+    if len(report["removed_paths"]) < LIST_LIMIT:
+        report["removed_paths"].append(str(checkout))
+    if merged is not None:
+        merged.status["removed"] = merged.status.get("removed", 0) + 1
+        merged.status["removed_bytes"] = merged.status.get("removed_bytes", 0) + (size or 0)
+
+
+def finish_pending(merged: "merged_checkouts.Proof", reports: dict[str, dict[str, Any]], *,
+                   fix: bool, in_use: Callable[[pathlib.Path], bool] | None,
+                   runner: Runner = subprocess.run, cwds: list[str] | None | bool = True,
+                   lineage: Callable[..., str | None] | None = None) -> None:
+    """Settle the checkouts that waited for the pass's one PR read.
+
+    Minutes can pass between a checkout's first judgement and this point (the
+    scan of every root, then the read), so every gate is asked again against a
+    fresh process table: in use, unchanged since judged, lineage, clean, HEAD.
+    Only then is the PR answer allowed to remove it.
+    """
+    merged.resolve()
+    if not merged.pending:
+        return
+    if cwds is not True and merged.cwd_reader is None:
+        merged.cwd_reader = lambda: cwds  # a caller-supplied table (tests)
+    lineage = lineage or lineage_active
+    for item in merged.pending:
+        report = reports[item["root"]]
+        checkout, kind, gitdir = item["checkout"], item["kind"], item["gitdir"]
+
+        def settle(reason: str | None) -> None:
+            report["kept"]["awaiting_pr_proof"] -= 1
+            if not report["kept"]["awaiting_pr_proof"]:
+                del report["kept"]["awaiting_pr_proof"]
+            if reason:
+                report["kept"][reason] = report["kept"].get(reason, 0) + 1
+
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
+            continue
+        try:
+            reason = lineage(checkout, runner) or (
+                unpushed_reason(checkout, kind, runner) if kind == "clone" else None)
+            if not reason:
+                verdict, detail = merged_checkouts.judge(checkout, kind, merged, runner)
+                if verdict == "pending":
+                    reason = ("pr_proof_unavailable" if merged_checkouts.unmerged_reason(
+                        checkout, item["branch"], item["head"], merged, runner) == "unmerged"
+                        else "unpushed")
+                elif verdict == "keep":
+                    reason = detail
+                elif detail["head"] != item["head"]:
+                    reason = "changed_before_removal"
+        except subprocess.TimeoutExpired:
+            reason = "git_timeout"
+        if reason:
+            settle(reason)
+            continue
+        size = size_bytes(checkout, runner)
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
+            continue
+        if fix:
+            try:
+                refusal = (merged_checkouts.remove(detail, merged, runner) if kind == "worktree"
+                           else remove(checkout, kind, gitdir, runner))
+            except subprocess.TimeoutExpired:
+                refusal = "git_timeout"
+            if refusal:
+                settle(refusal)
+                continue
+        settle(None)
+        count_removed(report, checkout, size, merged)
 
 
 SUMMED = ("checkouts", "removed", "removed_bytes", "deferred", "orphaned_worktrees",
@@ -595,15 +743,61 @@ def combine(reports: list[dict[str, Any]], fix: bool, idle_hours: int) -> dict[s
     return out
 
 
+def merged_plan(settings: dict[str, Any],
+                pressured: Callable[[pathlib.Path], bool] | None
+                ) -> tuple[dict[str, bool], dict[str, Any]]:
+    """{root: clones_ok} for the roots the merged rule covers this pass, and why.
+
+    On by default only while the root's volume is under pressure; the profile
+    key `merged_worktrees = true` turns it on every pass, `false` off.
+    """
+    merged = settings.get("merged")
+    if not merged:
+        return {}, {"enabled": False, "reason": "merged_worktrees = false or no worktree root"}
+    active: dict[str, bool] = {}
+    why: dict[str, str] = {}
+    for root in merged["roots"]:
+        if merged["mode"] == "always":
+            why[root] = "merged_worktrees = true"
+        elif pressured is not None and pressured(pathlib.Path(root)):
+            why[root] = "volume under pressure"
+        else:
+            why[root] = "off: no disk pressure"
+            continue
+        active[root] = root in merged["clone_roots"]
+    return active, {"enabled": bool(active), "mode": merged["mode"],
+                    "idle_hours": merged["idle_hours"], "roots": why}
+
+
 def run(*, fix: bool, profile: pathlib.Path,
         in_use: Callable[[pathlib.Path], bool] | None,
         root: pathlib.Path | None = None, runner: Runner = subprocess.run,
-        verdicts: pathlib.Path | None = None) -> dict[str, Any]:
-    """One opted-in pass over every configured root. Never raises."""
-    settings, why = load_settings(profile)
+        verdicts: pathlib.Path | None = None,
+        pressured: Callable[[pathlib.Path], bool] | None = None,
+        table: dict[str, Any] | None = None,
+        proof: "merged_checkouts.Proof | None" = None) -> dict[str, Any]:
+    """One opted-in pass over every configured root. Never raises.
+
+    `pressured` says whether a root's volume is under disk pressure (the
+    merged rule's default trigger). `table` stands in for the profile's
+    `[reclaim]` table and `proof` for the pass's merge evidence, in tests.
+    """
+    if table is not None:
+        settings, why = settings_from_table(table, "the given table")
+    else:
+        settings, why = load_settings(profile)
     if settings is None:
         return {"enabled": False, "reason": why}
-    roots = [root] if root is not None else [pathlib.Path(r) for r in settings["roots"]]
+    plan, merged_report = merged_plan(settings, pressured)
+    if root is not None:
+        roots = [root]
+    else:
+        roots = [pathlib.Path(r) for r in settings["roots"]]
+        roots += [pathlib.Path(r) for r in plan if pathlib.Path(r) not in roots]
+    merged_roots = [one for one in roots if str(one) in plan]
+    if merged_roots and proof is None:
+        proof = merged_checkouts.Proof(runner=runner, app_env=settings.get("scan_app_env"),
+                                       roots=merged_roots)
     verdicts = verdicts or state_dir() / "checkout-verdicts.json"
     cache = _load_json_dict(verdicts)
     next_cache: dict = {}
@@ -617,17 +811,32 @@ def run(*, fix: bool, profile: pathlib.Path,
         cwds = process_cwds(runner)
         for one in roots:
             previous = cursors.get(str(one))
-            report = scan(one, fix=fix, idle_hours=settings["idle_hours"],
+            is_merged = str(one) in plan
+            report = scan(one, fix=fix,
+                          idle_hours=(merged_report["idle_hours"] if is_merged
+                                      else settings["idle_hours"]),
                           in_use=in_use, runner=runner, cwds=cwds,
                           cache=cache, next_cache=next_cache,
-                          worktrees_only=str(one) in settings.get("worktrees_only", []),
-                          resume_after=previous if isinstance(previous, str) else None)
+                          worktrees_only=(not plan[str(one)] if is_merged
+                                          else str(one) in settings.get("worktrees_only", [])),
+                          resume_after=previous if isinstance(previous, str) else None,
+                          merged=proof if is_merged else None)
             if report.get("error") and isinstance(previous, str):
                 # An unlisted root or a blind pass examined nothing for real.
                 next_cursors[str(one)] = previous
             elif report.get("next_cursor") is not None:
                 next_cursors[str(one)] = report["next_cursor"]
             reports.append(report)
+        if proof is not None and merged_roots:
+            finish_pending(proof, {r["root"]: r for r in reports}, fix=fix, in_use=in_use,
+                           runner=runner)
+            if fix:
+                merged_checkouts.prune(proof, runner)
+            report_path = verdicts.with_name(merged_checkouts.REPORT_FILE)
+            holding = merged_checkouts.write_report(report_path, proof, time.time())
+            merged_report.update(proof.status, holding_work=holding,
+                                 holding_paths=[e["path"] for e in proof.holding][:LIST_LIMIT],
+                                 report_path=str(report_path))
     except Exception as exc:  # noqa: BLE001 - a janitor must not take the pass down
         return {"enabled": True, "error": f"checkout scan failed: {exc}"}
     # A dry run must not move the cursor past checkouts a --fix pass never saw.
@@ -642,4 +851,5 @@ def run(*, fix: bool, profile: pathlib.Path,
             pass
     report = combine(reports, fix, settings["idle_hours"])
     report["enabled"] = True
+    report["merged_worktrees"] = merged_report
     return report

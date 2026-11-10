@@ -883,6 +883,9 @@ class DiskReclaimIntegration(Isolated):
         events = [json.loads(line) for line in
                   (state / "events.jsonl").read_text().splitlines()]
         # Under pressure (pressure_free_gb = 10000) both reapers run.
+        # The merged-worktree rule adds its own metrics line when it is enabled on the
+        # host (it is on CI, off elsewhere); this test is about the reclaim and reaper lines.
+        events = [e for e in events if e["event"] != "merged_worktrees"]
         self.assertEqual([e["event"] for e in events],
                          ["reclaim_pass", "pulp_reaper", "pulp_reaper"])
         self.assertEqual([e["fields"]["reaper"] for e in events[1:]],
