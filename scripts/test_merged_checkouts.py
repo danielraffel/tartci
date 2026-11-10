@@ -112,6 +112,7 @@ class Fixture(unittest.TestCase):
         kw.setdefault("app_env", {})
         kw.setdefault("graphql", self.fake_graphql)
         kw.setdefault("roots", [self.root])
+        kw.setdefault("cwd_reader", lambda: ["/"])
         return mc.Proof(**kw)
 
     def fake_graphql(self, slug: str, lookups: list) -> dict:
@@ -123,7 +124,7 @@ class Fixture(unittest.TestCase):
         for child in self.root.iterdir():
             if child.is_dir():
                 age(child, days)
-        proof = proof or self.proof()
+        proof = proof or self.proof(cwd_reader=lambda: list(cwds or ["/"]))
         in_use = in_use or (lambda path: False)
         report = tc.scan(self.root, fix=fix, idle_hours=24, in_use=in_use,
                          cwds=cwds or ["/"], merged=proof)
@@ -217,7 +218,8 @@ class MergedRule(Fixture):
         built = self.worktree("built")
         for name in ("cwd-inside", "named", "built"):
             self.merge(name, 30 + len(name))
-        proof = self.proof(commands=f"/usr/bin/vim {named}/a.txt\n")
+        proof = self.proof(commands=f"/usr/bin/vim {named}/a.txt\n",
+                           cwd_reader=lambda: ["/", str(inside / "sub")])
         report = self.sweep(proof=proof, cwds=["/", str(inside / "sub")],
                             in_use=lambda path: path == built)
         self.assertEqual((report["removed"], report["kept"]), (0, {"in_use": 3}), report)
@@ -278,6 +280,120 @@ class MergedRule(Fixture):
         report = self.sweep()
         self.assertFalse(wt.exists(), report)
         self.assertTrue(other.exists())
+
+
+class HiddenWork(Fixture):
+    def test_a_commit_only_its_detached_reflog_reaches_keeps_it(self) -> None:
+        wt = self.root / "detached"
+        git(self.parent, "worktree", "add", "-q", "--detach", str(wt), "origin/main")
+        (wt / "y.txt").write_text("y\n")
+        git(wt, "add", "y.txt")
+        git(wt, "commit", "-qm", "lost on a detached head")
+        git(wt, "checkout", "-q", "--detach", "origin/main")
+        report = self.sweep()
+        self.assertEqual(report["kept"], {"reflog_only": 1}, report)
+        self.assertTrue(wt.exists())
+
+    def test_a_per_worktree_ref_keeps_it(self) -> None:
+        wt = self.worktree("bisecting")
+        self.merge("bisecting")
+        git(wt, "update-ref", "refs/bisect/bad", "HEAD")
+        report = self.sweep()
+        self.assertEqual(report["kept"], {"worktree_refs": 1}, report)
+
+    def test_an_edit_hidden_by_assume_unchanged_keeps_it(self) -> None:
+        wt = self.worktree("hidden")
+        self.merge("hidden")
+        git(wt, "update-index", "--assume-unchanged", "a.txt")
+        (wt / "a.txt").write_text("invisible to git status\n")
+        report = self.sweep()
+        self.assertEqual(report["kept"], {"hidden_changes": 1}, report)
+        self.assertTrue(wt.exists())
+
+    def _ignore(self, wt: pathlib.Path, pattern: str) -> None:
+        exclude = pathlib.Path(git(wt, "rev-parse", "--git-path", "info/exclude").strip())
+        if not exclude.is_absolute():
+            exclude = wt / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a") as handle:
+            handle.write(pattern + "\n")
+
+    def test_ignored_notes_keep_it_but_build_output_does_not(self) -> None:
+        notes = self.worktree("notes")
+        built = self.worktree("built")
+        self.merge("notes", 40)
+        self.merge("built", 41)
+        for wt in (notes, built):
+            for pattern in ("/.private/", "/build/", "__pycache__/"):
+                self._ignore(wt, pattern)
+        (notes / ".private").mkdir()
+        (notes / ".private" / "notes.md").write_text("mine\n")
+        (built / "build" / "CMakeFiles").mkdir(parents=True)
+        (built / "build" / "CMakeCache.txt").write_text("cache\n")
+        (built / "tools" / "__pycache__").mkdir(parents=True)
+        report = self.sweep()
+        self.assertEqual((report["removed"], report["kept"]), (1, {"ignored_files": 1}), report)
+        self.assertTrue(notes.exists())
+        self.assertFalse(built.exists())
+
+    def test_an_ignored_nested_clone_with_local_commits_keeps_it(self) -> None:
+        wt = self.worktree("vendored")
+        self.merge("vendored")
+        self._ignore(wt, "/external-src/")
+        git(self.base, "clone", "-q", URL, str(wt / "external-src"))
+        nested = wt / "external-src"
+        (nested / "patch.txt").write_text("local patch\n")
+        git(nested, "add", "patch.txt")
+        git(nested, "commit", "-qm", "never pushed")
+        report = self.sweep()
+        self.assertEqual(report["kept"], {"nested_repo_unpushed": 1}, report)
+        self.assertTrue((nested / "patch.txt").exists())
+
+    def test_an_ignored_nested_clone_that_is_pushed_goes_with_it(self) -> None:
+        wt = self.worktree("vendored")
+        self.merge("vendored")
+        self._ignore(wt, "/external-src/")
+        git(self.base, "clone", "-q", URL, str(wt / "external-src"))
+        report = self.sweep()
+        self.assertEqual((report["removed"], report["kept"]), (1, {}), report)
+
+    def test_a_process_that_arrives_after_judgement_keeps_it(self) -> None:
+        wt = self.worktree("resumed")
+        self.merge("resumed")
+        reads = []
+
+        def reader() -> list[str]:
+            reads.append(1)
+            return ["/", str(wt)]  # an agent cd'd in while the pass ran
+        report = self.sweep(proof=self.proof(cwd_reader=reader))
+        self.assertEqual(report["kept"], {"in_use": 1}, report)
+        self.assertTrue(wt.exists())
+        self.assertTrue(reads)
+
+    def test_a_superseded_lineage_record_is_left_alone(self) -> None:
+        wt = self.worktree("moved-on")
+        self.merge("moved-on")
+        git(self.parent, "config", "branch.moved-on.pulpWorktreeStatus", "superseded")
+        git(self.parent, "config", "branch.moved-on.pulpWorktreeSuccessor", "other-branch")
+        report = self.sweep()
+        self.assertFalse(wt.exists(), report)
+        self.assertEqual(self.lineage("moved-on", "Status"), "superseded")
+        self.assertEqual(self.lineage("moved-on", "Successor"), "other-branch")
+
+    def test_a_clone_with_submodule_git_dirs_or_local_tags_is_kept(self) -> None:
+        clone = self.base / "clone"
+        git(self.base, "clone", "-q", URL, str(clone))
+        self.assertIsNone(mc.clone_reason(clone, subprocess.run))
+        git(clone, "tag", "local-only", "HEAD")
+        (clone / "t.txt").write_text("t\n")
+        git(clone, "add", "t.txt")
+        git(clone, "commit", "-qm", "tagged locally")
+        git(clone, "tag", "-f", "local-only", "HEAD")
+        git(clone, "reset", "-q", "--hard", "origin/main")
+        self.assertEqual(mc.clone_reason(clone, subprocess.run), "unpushed")
+        git(clone, "tag", "-d", "local-only")
+        (clone / ".git" / "modules" / "planning").mkdir(parents=True)
+        self.assertEqual(mc.clone_reason(clone, subprocess.run), "clone_submodules")
 
 
 class SquashMerged(Fixture):
@@ -423,12 +539,33 @@ class Submodules(Fixture):
 
 
 class Prune(Fixture):
+    def backdate_admin(self, name: str) -> None:
+        admin = self.parent / ".git" / "worktrees" / name
+        stamp = time.time() - 120 * DAY
+        for entry in [admin, *admin.rglob("*")]:
+            os.utime(entry, (stamp, stamp), follow_symlinks=False)
+
+    def test_a_renamed_live_worktree_keeps_its_admin_dir(self) -> None:
+        wt = self.worktree("done")
+        self.merge("done")
+        wip = self.worktree("wip", commit=False, push=False)
+        (wip / "a.txt").write_text("uncommitted\n")
+        renamed = self.root / "wip-renamed"
+        wip.rename(renamed)
+        self.sweep()
+        self.assertFalse(wt.exists())
+        status = subprocess.run(["git", "-C", str(renamed), "status", "--porcelain"],
+                                capture_output=True, text=True)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("a.txt", status.stdout)
+
     def test_prune_runs_only_when_every_stale_entry_is_under_a_root(self) -> None:
         wt = self.worktree("done")
         self.merge("done")
         elsewhere = self.base / "unmounted-volume" / "wt"
         git(self.parent, "worktree", "add", "-q", "--detach", str(elsewhere), "origin/main")
         shutil.rmtree(elsewhere)  # like a worktree on a volume that is not mounted
+        self.backdate_admin("wt")
         self.sweep()
         self.assertFalse(wt.exists())
         status = self.last_proof.status["pruned"]
@@ -440,6 +577,7 @@ class Prune(Fixture):
         self.merge("done")
         gone = self.worktree("gone", commit=False, push=False)
         shutil.rmtree(gone)
+        self.backdate_admin("gone")
         self.sweep()
         self.assertFalse(wt.exists())
         self.assertNotIn(str(gone), git(self.parent, "worktree", "list"))

@@ -3343,7 +3343,10 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   per pass) or a PR for its branch is MERGED or CLOSED with `headRefOid` equal
   to HEAD (one batched GraphQL read per pass, through the read-only scan App,
   `[github_scan_app]`; without it squash-landed checkouts stay); `git status
-  --porcelain --untracked-files=normal --ignore-submodules=none` is empty; no
+  --porcelain --untracked-files=normal --ignore-submodules=none` is empty and
+  no assume-unchanged/skip-worktree entry hides an edit; every ignored path is
+  build output, a tool cache, or a nested clone that is clean and pushed; no
+  commit is reachable only from its own HEAD reflog or per-worktree refs; no
   stash entry names its branch or sits on its HEAD; no process cwd is inside it
   and no running command line (`ps`, every command) names it; its lineage is not
   `active`; and it has been idle `merged_worktree_idle_hours` (24..720, default
@@ -3351,8 +3354,9 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   populated submodules (Pulp's `planning`) gets one `--force` after each
   submodule proves clean, stash-free and fully pushed. The local branch is kept
   and its lineage recorded `merged` (with the PR URL when known);
-  `git worktree prune` runs only when every stale entry lies under a scanned
-  root. Plain clones are eligible only where `worktree_root_checkouts` already
+  `git worktree prune --expire 3.months.ago` (git gc's own window) runs only
+  when every such entry lies under a root that exists. The in-use gates are
+  re-read against a fresh process table just before each removal. Plain clones are eligible only where `worktree_root_checkouts` already
   allows them, under the every-branch-pushed check plus a merged HEAD. A
   checkout holding work no remote has (dirty, a stash, or commits on no remote)
   is never removed and is listed in `~/.tartci/state/reclaim/merged-worktrees-report.json`.

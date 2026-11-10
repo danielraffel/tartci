@@ -578,6 +578,12 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
                 next_cache[str(checkout)] = {"newest": newest, "reason": reason, "at": now}
             continue
         size = size_bytes(checkout, runner)
+        if merged is not None:
+            # The judgement above took time (a fetch, status, du); ask again.
+            late = still_idle(checkout, kind, gitdir, newest, in_use, merged, runner)
+            if late:
+                keep(late)
+                continue
         if fix:
             try:
                 refusal = (merged_checkouts.remove(item, merged, runner)
@@ -590,6 +596,28 @@ def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
                 continue
         count_removed(report, checkout, size, merged)
     return report
+
+
+def still_idle(checkout: pathlib.Path, kind: str, gitdir: pathlib.Path, newest: float,
+               in_use: Callable[[pathlib.Path], bool] | None,
+               merged: "merged_checkouts.Proof", runner: Runner) -> str | None:
+    """The in-use gates against a process table read NOW, just before removal.
+
+    Also: nothing at the top of the checkout or in its index/HEAD moved since
+    it was judged, and a clone still has no worktrees of its own.
+    """
+    cwds = merged.fresh_cwds()
+    merged.refresh_commands()
+    if in_use is None or cwds is None or merged.commands is None:
+        return "process_scan_unavailable"
+    spellings = _spellings(checkout)
+    if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
+            or build_marker_live(checkout) \
+            or merged_checkouts.named_by(merged.commands, spellings):
+        return "in_use"
+    if newest_mtime(checkout, gitdir) != newest:
+        return "changed_before_removal"
+    return holds_worktrees(gitdir, kind)
 
 
 def count_removed(report: dict[str, Any], checkout: pathlib.Path, size: int | None,
@@ -617,9 +645,8 @@ def finish_pending(merged: "merged_checkouts.Proof", reports: dict[str, dict[str
     merged.resolve()
     if not merged.pending:
         return
-    if cwds is True:
-        cwds = process_cwds(runner)
-    merged.refresh_commands()
+    if cwds is not True and merged.cwd_reader is None:
+        merged.cwd_reader = lambda: cwds  # a caller-supplied table (tests)
     lineage = lineage or lineage_active
     for item in merged.pending:
         report = reports[item["root"]]
@@ -632,17 +659,9 @@ def finish_pending(merged: "merged_checkouts.Proof", reports: dict[str, dict[str
             if reason:
                 report["kept"][reason] = report["kept"].get(reason, 0) + 1
 
-        if in_use is None or cwds is None or merged.commands is None:
-            settle("process_scan_unavailable")
-            continue
-        spellings = _spellings(checkout)
-        if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
-                or build_marker_live(checkout) \
-                or merged_checkouts.named_by(merged.commands, spellings):
-            settle("in_use")
-            continue
-        if newest_mtime(checkout, gitdir) != item["newest"]:
-            settle("changed_before_removal")
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
             continue
         try:
             reason = lineage(checkout, runner) or (
@@ -663,6 +682,10 @@ def finish_pending(merged: "merged_checkouts.Proof", reports: dict[str, dict[str
             settle(reason)
             continue
         size = size_bytes(checkout, runner)
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
+            continue
         if fix:
             try:
                 refusal = (merged_checkouts.remove(detail, merged, runner) if kind == "worktree"

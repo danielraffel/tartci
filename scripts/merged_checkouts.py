@@ -21,8 +21,13 @@ while it is on. A checkout is removed only when every gate holds:
      App configured there is no PR proof and squash-landed checkouts stay.
   2. clean: `git status --porcelain --untracked-files=normal
      --ignore-submodules=none` is empty (untracked files of any kind count;
-     git's own `worktree remove` refuses them too), and no stash entry names its
-     branch or was made on its HEAD.
+     git's own `worktree remove` refuses them too); no assume-unchanged or
+     skip-worktree entry hides an edit; every IGNORED path is build output or a
+     tool cache (a CMake tree with its marker, target/, node_modules/,
+     __pycache__ ...) or a nested clone that is itself clean and fully pushed;
+     no stash entry names its branch or was made on its HEAD; and no commit is
+     reachable only from the worktree's own HEAD reflog or per-worktree refs
+     (refs/worktree/*, refs/bisect/*), which removal deletes.
   3. not in use: no process cwd is inside it, no running command line (any
      command, not only builds) names it, and no `.pulp-build-active` marker
      names a live pid. These are tmp_checkouts' gates plus a full `ps` scan.
@@ -37,8 +42,10 @@ when every populated submodule is itself clean, has no stash and has no commit
 its remotes lack. A locked worktree still needs a second --force, so it stays.
 The local branch ref is kept, the branch's lineage is recorded `merged` (with
 the PR URL when one is known: from the merge commit on main, or from the
-GraphQL read), and the repository's stale worktree entries are pruned when
-every one of them lies under a root this pass scanned.
+GraphQL read; a superseded or archived record is left as written), and stale
+worktree entries older than git gc's own 3-month expiry are pruned when every
+one of them lies under a root that exists. Every in-use gate is asked again
+against a fresh process table immediately before each removal.
 
 A plain clone is eligible only where tmp_checkouts already allows clones (the
 worktree root with `worktree_root_checkouts = true`); there it must pass
@@ -84,7 +91,21 @@ MERGE_TABLE_LIMIT = 20000
 LIST_LIMIT = 20
 REPORT_FILE = "merged-worktrees-report.json"
 # Kept for these reasons a checkout holds work no remote has.
-HOLDS_WORK = frozenset({"dirty", "stash", "unpushed", "submodule_unpushed"})
+HOLDS_WORK = frozenset({"dirty", "stash", "unpushed", "submodule_unpushed", "hidden_changes",
+                        "ignored_files", "nested_repo_unpushed", "reflog_only",
+                        "worktree_refs", "clone_submodules"})
+# Ignored content `git worktree remove` may take: regenerable build output and
+# tool caches only. Anything else ignored (.env, .private/, notes, a nested
+# clone) keeps the checkout, because ignored is not the same as disposable.
+BUILD_DIR_MARKERS = ("CMakeCache.txt", "build.ninja", "CMakeFiles")
+CACHE_DIRS = frozenset({"__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache"})
+DISPOSABLE_FILES = frozenset({".DS_Store", ".pulp-build-active"})
+DISPOSABLE_SUFFIXES = (".pyc", ".profraw")
+REFLOG_LIMIT = 500
+# Stale-entry prune follows git gc's own default (gc.worktreePruneExpire), so a
+# worktree that was renamed or moved is not forgotten while it is still in use.
+PRUNE_EXPIRE = "3.months.ago"
+LINEAGE_KEEP = frozenset({"superseded", "archived"})
 LINEAGE_PREFIX = "pulpWorktree"
 MAIN_BRANCHES = frozenset({"main", "master"})
 SCAN_APP = pathlib.Path(__file__).resolve().parent / "gh-scan-app"
@@ -243,7 +264,8 @@ class Proof:
                  app_env: dict[str, str] | None = None,
                  graphql: Callable[[str, list[dict[str, str]]], dict] | None = None,
                  commands: str | None | bool = True, fetch: bool = True,
-                 roots: list[pathlib.Path] | None = None) -> None:
+                 roots: list[pathlib.Path] | None = None,
+                 cwd_reader: Callable[[], list[str] | None] | None = None) -> None:
         self.runner = runner
         self.app_env = app_env
         self.graphql = graphql or self._graphql
@@ -251,6 +273,7 @@ class Proof:
         self.repos: dict[str, dict[str, Any]] = {}
         self.pending: list[dict[str, Any]] = []
         self.pr_heads: dict[tuple[str, str], list[dict[str, str]]] = {}
+        self.cwd_reader = cwd_reader
         self.auto_commands = commands is True
         self.commands = all_command_lines(runner) if commands is True else commands
         self.roots = [pathlib.Path(r) for r in (roots or [])]
@@ -265,6 +288,13 @@ class Proof:
     def refresh_commands(self) -> None:
         if self.auto_commands:
             self.commands = all_command_lines(self.runner)
+
+    def fresh_cwds(self) -> list[str] | None:
+        """Every process cwd now, for the check immediately before a removal."""
+        if self.cwd_reader is not None:
+            return self.cwd_reader()
+        import tmp_checkouts  # noqa: PLC0415 - avoids an import cycle
+        return tmp_checkouts.process_cwds(self.runner)
 
     # -- repository facts --
     def repo(self, common: pathlib.Path) -> dict[str, Any]:
@@ -283,8 +313,12 @@ class Proof:
         state = "not fetched"
         if self.fetch:
             env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+            # A key that needs a passphrase must fail, not wait on a prompt.
+            env.setdefault("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
             proc = _run(["git", "--git-dir", str(common), "fetch", "-q", "--no-tags",
                          "--no-recurse-submodules", "--no-write-fetch-head",
+                         # no gc/maintenance side effects (it prunes worktrees too)
+                         "--no-auto-maintenance",
                          info["remote"], f"+refs/heads/main:{tracking}"],
                         self.runner, FETCH_TIMEOUT_S, env=env)
             state = "fetched" if proc.returncode == 0 else f"fetch failed ({proc.returncode})"
@@ -419,7 +453,105 @@ def clean_reason(checkout: pathlib.Path, runner: Runner) -> str | None:
                  "--ignore-submodules=none", runner=runner)
     if status.returncode != 0:
         return "git_error"
-    return "dirty" if status.stdout.strip() else None
+    if status.stdout.strip():
+        return "dirty"
+    # assume-unchanged (lowercase tag) and skip-worktree (S) entries hide local
+    # edits from `git status`; `worktree remove` would delete them unseen.
+    hidden = git(checkout, "ls-files", "-v", runner=runner)
+    if hidden.returncode != 0:
+        return "git_error"
+    for line in hidden.stdout.splitlines():
+        tag = line[:1]
+        if tag == "S" or (tag.isalpha() and tag.islower()):
+            return "hidden_changes"
+    return None
+
+
+def disposable(checkout: pathlib.Path, rel: str) -> bool:
+    """Whether an ignored path is regenerable output `worktree remove` may take."""
+    name = rel.rstrip("/").rsplit("/", 1)[-1]
+    target = checkout / rel.rstrip("/")
+    if not rel.endswith("/"):
+        return name in DISPOSABLE_FILES or name.endswith(DISPOSABLE_SUFFIXES)
+    if name in CACHE_DIRS:
+        return True
+    if name in ("build", "out", "install") or name.startswith("build-"):
+        return any(os.path.lexists(target / marker) for marker in BUILD_DIR_MARKERS)
+    import checkout_outputs  # noqa: PLC0415 - avoids an import cycle
+    rules = checkout_outputs.OUTPUT_KINDS.get(checkout_outputs.kind_of(name) or "")
+    return bool(rules) and any(os.path.lexists(target / m) for m in rules["markers"])
+
+
+def repo_reason(repo: pathlib.Path, runner: Runner, reason: str) -> str | None:
+    """`reason` when a nested repository holds anything its remotes lack."""
+    if gitlinks(repo, runner):
+        return "nested_submodule"
+    if clean_reason(repo, runner):
+        return reason
+    stash = git(repo, "stash", "list", runner=runner)
+    if stash.returncode != 0 or stash.stdout.strip():
+        return reason
+    local = git(repo, "rev-list", "-1", "HEAD", "--branches", "--tags", "--not", "--remotes",
+                runner=runner)
+    if local.returncode != 0 or local.stdout.strip():
+        return reason
+    return None
+
+
+def ignored_reason(checkout: pathlib.Path, runner: Runner) -> str | None:
+    """Ignored content that is not build output keeps the checkout.
+
+    A nested clone (an ignored `external/<sdk>` checkout) may go only when it is
+    itself clean, stash-free and fully pushed; any other ignored path that is
+    not on the build-output list stays, since git would delete it unseen.
+    """
+    proc = git(checkout, "status", "--porcelain", "-z", "--ignored",
+               "--untracked-files=normal", "--ignore-submodules=none", runner=runner)
+    if proc.returncode != 0:
+        return "git_error"
+    for entry in proc.stdout.split("\0"):
+        if not entry.startswith("!! "):
+            continue
+        rel = entry[3:]
+        if disposable(checkout, rel):
+            continue
+        nested = checkout / rel.rstrip("/")
+        if rel.endswith("/") and os.path.lexists(nested / ".git"):
+            reason = repo_reason(nested, runner, "nested_repo_unpushed")
+            if reason:
+                return reason
+            continue
+        return "ignored_files"
+    return None
+
+
+def private_history_reason(checkout: pathlib.Path, runner: Runner) -> str | None:
+    """Commits only this worktree's own refs reach keep it.
+
+    Removing a worktree deletes its HEAD reflog and its per-worktree refs
+    (refs/worktree/*, refs/bisect/*). A commit made on a detached HEAD and then
+    left behind lives nowhere else. Amended or rebased-away commits that were
+    never pushed count too: keeping them is the safe direction.
+    """
+    refs = git(checkout, "for-each-ref", "--format=%(refname)", "refs/worktree/",
+               "refs/bisect/", runner=runner)
+    if refs.returncode != 0:
+        return "git_error"
+    if refs.stdout.strip():
+        return "worktree_refs"
+    log = git(checkout, "log", "-g", "--format=%H", "HEAD", runner=runner)
+    if log.returncode != 0:
+        return "git_error"
+    shas = sorted({line for line in log.stdout.split() if SHA.fullmatch(line)})
+    if not shas:
+        return None
+    if len(shas) > REFLOG_LIMIT:
+        return "reflog_only"
+    lost = git(checkout, "rev-list", "-1", *shas, "--not", "--remotes", "--branches",
+               "--tags", runner=runner)
+    if lost.returncode != 0:
+        return "git_error"
+    return "reflog_only" if lost.stdout.strip() else None
 
 
 def stash_reason(checkout: pathlib.Path, branch: str | None, head: str,
@@ -457,7 +589,12 @@ def judge(checkout: pathlib.Path, kind: str, proof: Proof,
     if head_proc.returncode != 0 or not SHA.fullmatch(head):
         return "keep", "git_error"
     branch = branch_of(checkout, runner)
-    reason = clean_reason(checkout, runner) or stash_reason(checkout, branch, head, runner)
+    reason = (clean_reason(checkout, runner) or stash_reason(checkout, branch, head, runner)
+              or ignored_reason(checkout, runner))
+    if not reason and kind == "worktree":
+        reason = private_history_reason(checkout, runner)
+    if not reason and kind == "clone":
+        reason = clone_reason(checkout, runner)
     if reason:
         if reason in HOLDS_WORK:
             proof.note_holding(checkout, reason, branch, head)
@@ -493,6 +630,20 @@ def unmerged_reason(checkout: pathlib.Path, branch: str | None, head: str, proof
     return "unmerged"
 
 
+def clone_reason(clone: pathlib.Path, runner: Runner) -> str | None:
+    """A clone takes its submodule git dirs and its tags with it when removed."""
+    modules = clone / ".git" / "modules"
+    try:
+        if modules.is_dir() and any(modules.iterdir()):
+            return "clone_submodules"
+    except OSError:
+        return "clone_submodules"
+    tags = git(clone, "rev-list", "-1", "--tags", "--not", "--remotes", runner=runner)
+    if tags.returncode != 0:
+        return "git_error"
+    return "unpushed" if tags.stdout.strip() else None
+
+
 # ── removal ─────────────────────────────────────────────────────────────────
 
 def gitlinks(checkout: pathlib.Path, runner: Runner) -> list[str] | None:
@@ -520,17 +671,9 @@ def submodule_reason(checkout: pathlib.Path, runner: Runner) -> str | None:
         sub = checkout / path
         if not os.path.lexists(sub / ".git"):
             continue  # not populated: nothing of it lives here
-        if gitlinks(sub, runner):
-            return "nested_submodule"
-        if clean_reason(sub, runner):
-            return "submodule_unpushed"
-        stash = git(sub, "stash", "list", runner=runner)
-        if stash.returncode != 0 or stash.stdout.strip():
-            return "submodule_unpushed"
-        local = git(sub, "rev-list", "-1", "HEAD", "--branches", "--not", "--remotes",
-                    runner=runner)
-        if local.returncode != 0 or local.stdout.strip():
-            return "submodule_unpushed"
+        reason = repo_reason(sub, runner, "submodule_unpushed")
+        if reason:
+            return reason
     return None
 
 
@@ -541,8 +684,11 @@ def record_lineage(item: dict[str, Any], runner: Runner) -> bool:
         return True
     base = ["git", "--git-dir", str(item["common"]), "config", "--local"]
     key = f"branch.{branch}.{LINEAGE_PREFIX}"
-    for field in ("Archive", "ArchiveSha256"):
-        _run([*base, "--unset-all", key + field], runner, GIT_TIMEOUT_S)
+    # A superseded or archived record points somewhere (a successor, a bundle);
+    # it already says more than "merged", so it is left as the owner wrote it.
+    current = _run([*base, "--get", key + "Status"], runner, GIT_TIMEOUT_S)
+    if current.stdout.strip() in LINEAGE_KEEP:
+        return True
     fields = [("Status", "merged"), ("DurableSha", item["head"]),
               ("UpdatedAt", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())),
               ("LastPath", str(item["checkout"])),
@@ -587,16 +733,18 @@ def remove(item: dict[str, Any], proof: Proof, runner: Runner) -> str | None:
 def prune(proof: Proof, runner: Runner) -> None:
     """`git worktree prune` each repository a removal touched, when it is safe.
 
-    Prune forgets every worktree whose directory is missing, including one on
-    a volume that is merely unmounted. So it runs only when every entry the
-    dry run would forget lies under a root this pass scanned (which exists, so
-    its volume is mounted); otherwise the entries are reported and kept.
+    Prune forgets a worktree whose directory is missing, including one that was
+    renamed while in use (its admin dir, index and reflog go with it) or sits
+    on a volume that is merely unmounted. So it only takes entries older than
+    git gc's own expiry (`--expire 3.months.ago`), and only when every such
+    entry lies under a root that exists right now; otherwise nothing is pruned
+    and the count is reported.
     """
     roots = sorted({str(spelling).rstrip("/") + "/" for root in proof.roots
-                    for spelling in (root, root.resolve())})
+                    if root.is_dir() for spelling in (root, root.resolve())})
     for common in sorted(proof.touched):
-        dry = _run(["git", "--git-dir", common, "worktree", "prune", "--dry-run", "-v"],
-                   runner, GIT_TIMEOUT_S)
+        dry = _run(["git", "--git-dir", common, "worktree", "prune", "--dry-run", "-v",
+                    f"--expire={PRUNE_EXPIRE}"], runner, GIT_TIMEOUT_S)
         if dry.returncode != 0:
             proof.status["pruned"][common] = "dry run failed"
             continue
@@ -618,7 +766,8 @@ def prune(proof: Proof, runner: Runner) -> None:
         if not ids:
             proof.status["pruned"][common] = "nothing stale"
             continue
-        done = _run(["git", "--git-dir", common, "worktree", "prune"], runner, GIT_TIMEOUT_S)
+        done = _run(["git", "--git-dir", common, "worktree", "prune",
+                     f"--expire={PRUNE_EXPIRE}"], runner, GIT_TIMEOUT_S)
         proof.status["pruned"][common] = (f"pruned {len(ids)}" if done.returncode == 0
                                           else "prune failed")
 
