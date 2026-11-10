@@ -491,6 +491,8 @@ source "$TARTCI_ROOT/providers/tart-macos/boundary-proof.lib.sh"
 source "$TARTCI_ROOT/providers/tart-macos/job-claim.lib.sh"
 # shellcheck source=providers/tart-macos/claim-delay.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/claim-delay.lib.sh"
+# shellcheck source=providers/tart-macos/slot-priority.lib.sh
+source "$TARTCI_ROOT/providers/tart-macos/slot-priority.lib.sh"
 # shellcheck source=providers/tart-macos/vm-dhcp.lib.sh
 source "$TARTCI_ROOT/providers/tart-macos/vm-dhcp.lib.sh"
 # shellcheck source=providers/tart-macos/lease-fit.lib.sh
@@ -1214,9 +1216,15 @@ queued_work(){
     printf '%s\n' "$total"
     return 0
   fi
+  # Slot priority reads the event class and age of what this scan counted.
+  local detail_args=()
+  if declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+    detail_args=(--detail-file "$(tartci_slot_priority_detail_file lane)")
+  fi
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
     --repo "$REPO" \
     ${WORKFLOW_ARGS[@]+"${WORKFLOW_ARGS[@]}"} \
+    ${detail_args[@]+"${detail_args[@]}"} \
     --labels "$LABELS" \
     --provider tart-macos \
     --lane-id "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" \
@@ -1264,6 +1272,9 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
+  if declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+    scan_cmd+=(--detail-file "$(tartci_slot_priority_detail_file "$tier_labels")")
+  fi
   run_scan_capture ${scan_cmd[@]+"${scan_cmd[@]}"} --match-labels 1
 }
 
@@ -3203,6 +3214,8 @@ if [ "$LOOP" = 1 ]; then
       # A lane whose acquire was denied is still waiting for exactly this
       # capacity: keep its ranked waiter alive (bounded; no-op when off).
       tartci_vm_lease_waiter_hold
+      # It cannot boot, so it must not hold a free slot back from others.
+      tartci_slot_priority_withdraw
       sleep "$POLL"
       continue
     fi
@@ -3330,13 +3343,25 @@ if [ "$LOOP" = 1 ]; then
         continue
       fi
     fi
+    # Slot priority (opt-in, slot-priority.lib.sh): a lane about to claim a
+    # free slot asks whether a higher-ranked lane on this host (a merge-group
+    # job ahead of a PR-head one, then the longest-waiting job) can take it
+    # now. Off, the gate returns at once and sp stays 0; shadow only logs.
+    # A parked warm VM already holds its slot, so it is never ranked.
+    sp=0
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } \
+       && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ -z "$WARM_VM" ]; then
+      tartci_slot_priority_gate "$cap" "$r" "$selected_labels" "$selected_tier" || sp=1
+    fi
     # Idle gate: boot only when (1) this lane has work, (2) a VM slot is free,
     # (3) no higher-priority lane is waiting/running, and (4) the host is healthy.
     # (3) is always satisfied when the priority feature is off (priority_demand
     # returns 0) and (4) when host-health yield is off (host_health_yield returns
     # 0), so this is a no-op for a runner with neither feature enabled.
-    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
+    if [ "${q:-0}" -gt 0 ] && { [ "${p:-0}" -eq 0 ] || [ "${yb:-0}" -gt 0 ]; } && [ "${hh:-0}" -eq 0 ] && [ "$ws" -eq 0 ] && [ "$sp" -eq 0 ] && resv="$(tartci_warm_or_claim_slot "$cap" "$r")" && [ -n "$resv" ]; then
       CURRENT_RESV="$resv"
+      # Holding a slot now; this lane no longer competes for one.
+      tartci_slot_priority_withdraw
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       CURRENT_SELECTED_QUEUED="$q"
@@ -3422,18 +3447,31 @@ if [ "$LOOP" = 1 ]; then
         rm -f "$resv" 2>/dev/null || true
       fi
       CURRENT_RESV=""
+    elif [ "$sp" -eq 1 ]; then
+      # Outranked for the free slot by a lane that can boot now. Still demand
+      # this lane saw and did not place, so it is sampled like slot_full.
+      tartci_vm_lease_waiter_hold
+      reserved="$(tartci_count_reservations)"
+      note "deferring ${POLL}s (queued=$q running_macos_vms=$r/$cap reserved=$reserved) — slot priority: a higher-ranked lane on this host takes the free slot"
+      event demand_waiting "queued=$q running=$r/$cap reserved=$reserved reason=slot_priority" \
+        queued="$q" running="$r" cap="$cap" poll="$POLL" reason=slot_priority reserved="$reserved"
+      heartbeat waiting
+      sleep "$POLL"
     elif [ "$ws" -eq 1 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "deferring ${POLL}s (queued=$q) — a sibling supervisor's warm VM is parked for $REPO; asked it to hand off"
       heartbeat waiting
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${hh:-0}" -gt 0 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q host_health_yield=$hh running_macos_vms=$r/$cap) — host saturated, deferring new VM boot"
       event yielded_host_health "queued=$q host_health_yield=$hh running=$r/$cap"
       heartbeat yielding
       sleep "$POLL"
     elif [ "${q:-0}" -gt 0 ] && [ "${p:-0}" -gt 0 ] && [ "${yb:-0}" -eq 0 ]; then
+      tartci_slot_priority_withdraw
       tartci_vm_lease_waiter_withdraw
       note "yielding ${POLL}s (queued=$q priority_demand=$p running_macos_vms=$r/$cap) — priority lane '${YIELD_WORKFLOW}' has the slot"
       event yielded_to_priority "workflow=$YIELD_WORKFLOW queued=$q priority_demand=$p running=$r/$cap"
@@ -3443,7 +3481,7 @@ if [ "$LOOP" = 1 ]; then
       # Demand this lane could not place (no macOS VM slot) is still demand;
       # no demand at all is not.
       case "${q:-0}" in
-        0) tartci_vm_lease_waiter_withdraw ;;
+        0) tartci_vm_lease_waiter_withdraw; tartci_slot_priority_withdraw ;;
         *) tartci_vm_lease_waiter_hold ;;
       esac
       # The claim counts reservations as well as guests: a sibling lane between

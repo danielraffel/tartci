@@ -65,6 +65,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from slot_demand import DemandDetail
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     CLI_REFUSED,
@@ -467,6 +468,10 @@ class AssignmentScanner:
         self.api_calls_lock = threading.Lock()
         self.observation_lock_fd: int | None = None
         self.witness = threading.Event()
+        # Event class and age of the jobs this scan counted, for slot priority.
+        # Only the witness when the scan stops at one, so its age is a lower
+        # bound on the class's oldest queued job.
+        self.detail = DemandDetail(witness_only=not args.exhaustive_count)
         # Measured by the preflight and carried into every failure, so a
         # refusal names which credential hit which ceiling.
         self.identity: GitHubIdentity | None = None
@@ -1007,6 +1012,7 @@ class AssignmentScanner:
             if not isinstance(job_id, int):
                 raise ScanError(f"matching queued job in run {run_id} has no integer id")
             matches.add(job_id)
+            self.detail.add(run, job)
             if not self.args.exhaustive_count:
                 # One witness settles the question the caller actually asks.
                 self.job_cache.record_present(run)
@@ -1135,6 +1141,11 @@ def parse_args() -> argparse.Namespace:
         help="count only runs whose head_repository.full_name is this exact OWNER/REPO",
     )
     parser.add_argument("--min-age-seconds", type=int, default=0)
+    parser.add_argument(
+        "--detail-file",
+        help="also write the counted jobs' event classes and oldest created_at here "
+        "(scripts/slot_demand.py); makes no extra API call",
+    )
     parser.add_argument(
         "--exhaustive-count",
         action="store_true",
@@ -1311,7 +1322,10 @@ def main() -> int:
     try:
         args = parse_args()
         scanner = AssignmentScanner(args)
-        print(scanner.scan())
+        count = scanner.scan()
+        if args.detail_file:
+            scanner.detail.write(args.detail_file)
+        print(count)
     except AuthPreflightError as error:
         print(f"assignment scan failed closed: {error}", file=sys.stderr)
         return 2
