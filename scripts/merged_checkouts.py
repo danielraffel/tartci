@@ -93,7 +93,11 @@ REPORT_FILE = "merged-worktrees-report.json"
 # Kept for these reasons a checkout holds work no remote has.
 HOLDS_WORK = frozenset({"dirty", "stash", "unpushed", "submodule_unpushed", "hidden_changes",
                         "ignored_files", "nested_repo_unpushed", "reflog_only",
-                        "worktree_refs", "clone_submodules"})
+                        "worktree_refs", "clone_submodules", "operation_in_progress"})
+# An operation git has paused in this worktree (its state is in the admin dir,
+# which removal deletes): the todo list and the stop point would be lost.
+IN_PROGRESS = ("rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD",
+               "REVERT_HEAD", "BISECT_LOG", "sequencer")
 # Ignored content `git worktree remove` may take: regenerable build output and
 # tool caches only. Anything else ignored (.env, .private/, notes, a nested
 # clone) keeps the checkout, because ignored is not the same as disposable.
@@ -471,6 +475,10 @@ def disposable(checkout: pathlib.Path, rel: str) -> bool:
     """Whether an ignored path is regenerable output `worktree remove` may take."""
     name = rel.rstrip("/").rsplit("/", 1)[-1]
     target = checkout / rel.rstrip("/")
+    if os.path.islink(target):
+        # `worktree remove` unlinks a symlink and never follows it; Pulp links
+        # external/<sdk> into a shared cache that way.
+        return True
     if not rel.endswith("/"):
         return name in DISPOSABLE_FILES or name.endswith(DISPOSABLE_SUFFIXES)
     if name in CACHE_DIRS:
@@ -533,6 +541,11 @@ def private_history_reason(checkout: pathlib.Path, runner: Runner) -> str | None
     left behind lives nowhere else. Amended or rebased-away commits that were
     never pushed count too: keeping them is the safe direction.
     """
+    gitdir = git(checkout, "rev-parse", "--absolute-git-dir", runner=runner)
+    if gitdir.returncode != 0 or not gitdir.stdout.strip():
+        return "git_error"
+    if any(os.path.lexists(os.path.join(gitdir.stdout.strip(), name)) for name in IN_PROGRESS):
+        return "operation_in_progress"
     refs = git(checkout, "for-each-ref", "--format=%(refname)", "refs/worktree/",
                "refs/bisect/", runner=runner)
     if refs.returncode != 0:

@@ -336,6 +336,33 @@ class HiddenWork(Fixture):
         self.assertTrue(notes.exists())
         self.assertFalse(built.exists())
 
+    def test_an_ignored_symlink_is_unlinked_and_its_target_survives(self) -> None:
+        wt = self.worktree("linked")
+        (wt / "external").mkdir()
+        (wt / "external" / "README").write_text("tracked\n")  # as in Pulp
+        git(wt, "add", "external/README")
+        git(wt, "commit", "-qm", "external")
+        git(wt, "push", "-q", "origin", "linked")
+        self.merge("linked")
+        cache = self.base / "fetchcontent-src" / "vst3sdk"
+        cache.mkdir(parents=True)
+        (cache / "keep.txt").write_text("shared\n")
+        (wt / "external" / "vst3sdk").symlink_to(cache)
+        self._ignore(wt, "/external/vst3sdk")
+        report = self.sweep()
+        self.assertEqual((report["removed"], report["kept"]), (1, {}), report)
+        self.assertTrue((cache / "keep.txt").exists())
+
+    def test_a_paused_rebase_keeps_it(self) -> None:
+        wt = self.worktree("rebasing")
+        self.merge("rebasing")
+        gitdir = pathlib.Path(git(wt, "rev-parse", "--absolute-git-dir").strip())
+        (gitdir / "rebase-merge").mkdir()
+        (gitdir / "rebase-merge" / "git-rebase-todo").write_text("pick abc\n")
+        report = self.sweep()
+        self.assertEqual(report["kept"], {"operation_in_progress": 1}, report)
+        self.assertTrue(wt.exists())
+
     def test_an_ignored_nested_clone_with_local_commits_keeps_it(self) -> None:
         wt = self.worktree("vendored")
         self.merge("vendored")
