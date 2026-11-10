@@ -240,25 +240,27 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
 
-    def test_second_slot_yield_renders_on_supervisor_two_only(self) -> None:
+    def test_last_slot_yield_renders_on_both_supervisors_with_the_sibling_dir(self) -> None:
         import plistlib
         rendered = fleet.rendered_plists(fleet.load(HOST_CONFIGS["m5"]))
         envs = {name: plistlib.loads(body)["EnvironmentVariables"]
                 for name, body in rendered.items() if ".m5.vellum-gate" in name}
         slot2 = next(env for name, env in envs.items() if name.endswith(".slot2.plist"))
         slot1 = next(env for name, env in envs.items() if not name.endswith(".slot2.plist"))
-        self.assertEqual(slot2["TARTCI_YIELD_TO_REPO"], "Generous-Corp/pulp")
-        self.assertEqual(slot2["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
-        self.assertIn("pulp-build-merge-group", slot2["TARTCI_YIELD_TO_LABELS"].split(","))
-        self.assertNotIn("TARTCI_YIELD_TO_REPO", slot1)
-        self.assertNotIn("TARTCI_YIELD_TO_WORKFLOW_NAME", slot1)
+        for env in (slot1, slot2):
+            self.assertEqual(env["TARTCI_YIELD_TO_REPO"], "Generous-Corp/pulp")
+            self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+            self.assertIn("pulp-build-merge-group", env["TARTCI_YIELD_TO_LABELS"].split(","))
+        # Each supervisor watches the OTHER one's heartbeats.
+        self.assertEqual(slot1["TARTCI_YIELD_SIBLING_STATE_DIR"], slot2["TARTCI_STATE_DIR"])
+        self.assertEqual(slot2["TARTCI_YIELD_SIBLING_STATE_DIR"], slot1["TARTCI_STATE_DIR"])
         body = HOST_CONFIGS["m5"].read_text()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m5.toml"
             for old, new, pattern in (
                     ('repo = "Generous-Corp/pulp", workflow = "Build and Test", labels',
-                     'repo = "pulp", workflow = "Build and Test", labels', "second_slot_yield must"),
-                    ("supervisors = 2\n# Supervisor 2 yields", "supervisors = 1\n# Supervisor 2 yields",
+                     'repo = "pulp", workflow = "Build and Test", labels', "last_slot_yield must"),
+                    ("supervisors = 2\n# A supervisor whose sibling", "supervisors = 1\n# A supervisor whose sibling",
                      "needs supervisors = 2")):
                 mutated = body.replace(old, new, 1)
                 self.assertNotEqual(mutated, body, f"control: {old!r} was rewritten")

@@ -212,8 +212,12 @@ TIER_GROUP_IDS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
-# Another repository's priority work (second_slot_yield); empty = this lane's own.
+# Another repository's priority work (last_slot_yield); empty = this lane's own.
 YIELD_REPO="${TARTCI_YIELD_TO_REPO:-}"
+# last_slot_yield: yield only while the sibling supervisor of this lane (its
+# state directory) holds a guest, i.e. when this boot would take the host's
+# last guest slot. Empty = always yield (the plain yield_to_workflow lanes).
+YIELD_SIBLING_STATE_DIR="${TARTCI_YIELD_SIBLING_STATE_DIR:-}"
 # Bounded yield (opt-in; see header). 0 = unbounded (today's behavior).
 YIELD_MAX_WAIT="${TARTCI_YIELD_MAX_WAIT_SECONDS:-0}"
 case "$YIELD_MAX_WAIT" in
@@ -1405,8 +1409,29 @@ higher_priority_demand(){
 # queue_scan budgets two shared workflows per host and serializes their refreshes.
 # Non-zero output means "a priority job needs a slot — do not boot the secondary
 # VM".
+# Succeeds (no sibling guest) only when every heartbeat in the sibling's state
+# directory names no VM. Any unreadable heartbeat, or one naming a VM however
+# old, counts as a guest: yielding is the safe direction.
+sibling_guest_absent(){
+  python3 - "$YIELD_SIBLING_STATE_DIR" <<'PY' 2>/dev/null || return 1
+import glob, json, os, sys
+for path in glob.glob(os.path.join(sys.argv[1], "*.state.json")):
+    try:
+        with open(path) as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        raise SystemExit(1)
+    if not isinstance(doc, dict) or doc.get("vm"):
+        raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
+
 priority_demand(){
   [ -n "$YIELD_WORKFLOW" ] || { printf '%s\n' 0; return 0; }
+  if [ -n "$YIELD_SIBLING_STATE_DIR" ] && sibling_guest_absent; then
+    printf '%s\n' 0; return 0
+  fi
   # FAIL CLOSED. If we cannot read priority-lane demand, assume there IS demand
   # (print 1 → the loop gate yields) rather than booting blind. gh errors
   # (rate-limit / 5xx) cluster during exactly the load spikes when the gate most

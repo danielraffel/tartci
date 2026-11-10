@@ -104,10 +104,7 @@ class IdleGateFailClosed(unittest.TestCase):
             capture_output=True, text=True, check=False, env=env,
         )
 
-    def test_second_slot_yield_scans_the_other_repository(self) -> None:
-        # A Vellum lane's supervisor 2 yields to Pulp's queue (second_slot_yield):
-        # the probe must ask Pulp, not the lane's own repository.
-        stub = """#!/usr/bin/env bash
+    STUB_PULP_DEMAND = """#!/usr/bin/env bash
 case "$*" in
   *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":15000,"remaining":14999}}}' ;;
   *repos/Generous-Corp/vellum/*workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":7,"name":"Build and Test"}]}' ;;
@@ -119,15 +116,44 @@ case "$*" in
   *) exit 1 ;;
 esac
 """
-        labels = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+    PULP_LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+
+    def test_last_slot_yield_scans_the_other_repository(self) -> None:
+        # A Vellum lane yields to Pulp's queue: the probe asks Pulp, not Vellum.
         lane = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum"}
-        r = self._run(stub, yield_labels=labels, extra_env=lane)
+        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=lane)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "0", "control: the lane's own repository is quiet")
-        r = self._run(stub, yield_labels=labels,
+        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS,
                       extra_env={**lane, "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp"})
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "1")
+
+    def test_last_slot_yield_applies_only_beside_a_sibling_guest(self) -> None:
+        # Whichever supervisor boots second takes the last slot, so the yield
+        # follows the sibling's heartbeat, not a fixed slot number.
+        import json
+        import tempfile
+        sibling = Path(tempfile.mkdtemp())
+        beat = sibling / "m5-vellum-gate-slot2-02.state.json"
+        env = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum",
+               "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp",
+               "TARTCI_YIELD_SIBLING_STATE_DIR": str(sibling)}
+        for doc, expected, why in (
+                (None, "0", "no sibling heartbeat: the first slot, boot as before"),
+                ({"vm": ""}, "0", "sibling idle: this boot leaves a slot free"),
+                ({"vm": "m5-vellum-gate-slot2-02-1-3"}, "1",
+                 "sibling holds a guest: this boot takes the last slot, so yield")):
+            if doc is None:
+                beat.unlink(missing_ok=True)
+            else:
+                beat.write_text(json.dumps(doc))
+            r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=env)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), expected, why)
+        beat.write_text("{not json")
+        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=env)
+        self.assertEqual(r.stdout.strip(), "1", "an unreadable heartbeat yields")
 
     def test_gh_error_reports_demand_not_zero(self) -> None:
         # Stub gh exits non-zero (simulates rate-limit / 5xx).

@@ -768,7 +768,7 @@ def lending_active(records: list[dict[str, Any]], cfg: dict[str, int]) -> bool:
 #     only T minus the lent guests: that is the one case lending admits a gate
 #     lease less often than the static model, and it is why lending is opt-in
 #     per host (m5 runs no gate-priority builds or Linux VMs). The lane-side
-#     guard (second_slot_yield) keeps the lending guest off the last slot while
+#     guard (last_slot_yield) keeps the lending guest off the last slot while
 #     a gate guest's job is queued;
 #   * only `tart-macos-vm` leases count as slot holders, and only a new one
 #     can be lent to: Linux and Windows VMs do not take Apple's guest slots.

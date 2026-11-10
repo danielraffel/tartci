@@ -3228,14 +3228,16 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Vellum supervisor whose VM fills N, so a host with a free slot and an idle
   Pulp queue could not start a second Vellum job (10.9 slot-hours/day idle
   while queued, fleet-wide). The canary profile pairs the key with
-  `supervisors = 2` on the vellum-gate lane and `second_slot_yield` on it:
-  supervisor 2 runs the priority probe (`priority_demand`, fail-closed) against
-  Pulp's `Build and Test` queue and does not boot while any Pulp gate job is
-  queued unassigned anywhere in the fleet, so the lent guest never takes the
-  last slot from a waiting required gate. (`rank_vm_waiters` cannot do this: a
-  lane registers its lease waiter only after it holds a slot reservation.) A
-  Pulp job that arrives after both slots hold Vellum still waits for one of
-  them to end. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
+  `supervisors = 2` on the vellum-gate lane and `last_slot_yield` on it: a
+  supervisor whose sibling's heartbeat names a guest (so this boot would take
+  the last slot, the one lending applies to) runs the fail-closed priority
+  probe against Pulp's `Build and Test` queue and does not boot while any Pulp
+  gate job is queued unassigned anywhere in the fleet. With no sibling guest it
+  boots as before. (`rank_vm_waiters` cannot do this: a lane registers its
+  lease waiter only after it holds a slot reservation.) Limits, by design: a
+  Pulp job queued in the minute between the probe and the lease, or after both
+  slots hold Vellum, waits for a Vellum job to end; forge-gate and spectr-gate
+  demand is not probed (almost none on m5). Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
   and Pulp `macos` queue wait on the canary host.
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
