@@ -14,8 +14,9 @@ error. It never falls back to ambient `gh` credentials, because that would put
 scan traffic back on the shared personal token without saying so.
 
 Environment: TARTCI_SCAN_APP_ID, TARTCI_SCAN_APP_PRIVATE_KEY_PATH,
-TARTCI_SCAN_APP_CACHE_DIR, SHIPYARD_GH_APP_REPO (or GH_REPO) for the
-repository; optional TARTCI_SCAN_APP_GHAPP and TARTCI_SCAN_APP_GH to name the
+TARTCI_SCAN_APP_CACHE_DIR, and the repository from TARTCI_SCAN_APP_REPO (the
+provider binds it to the lane's repository), else SHIPYARD_GH_APP_REPO, else
+GH_REPO; optional TARTCI_SCAN_APP_GHAPP and TARTCI_SCAN_APP_GH to name the
 mint and gh executables. Without TARTCI_SCAN_APP_GH it uses /opt/homebrew/bin/gh
 or /usr/local/bin/gh and refuses any gh script that hands off to ghapp.
 """
@@ -144,9 +145,10 @@ def main(argv: list[str]) -> int:
     app_id = require("TARTCI_SCAN_APP_ID")
     key_path = require("TARTCI_SCAN_APP_PRIVATE_KEY_PATH")
     cache_dir = Path(require("TARTCI_SCAN_APP_CACHE_DIR"))
-    repo = os.environ.get("SHIPYARD_GH_APP_REPO") or os.environ.get("GH_REPO") or ""
+    repo = (os.environ.get("TARTCI_SCAN_APP_REPO") or os.environ.get("SHIPYARD_GH_APP_REPO")
+            or os.environ.get("GH_REPO") or "")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
-        die("SHIPYARD_GH_APP_REPO must be OWNER/REPO")
+        die("TARTCI_SCAN_APP_REPO (or SHIPYARD_GH_APP_REPO / GH_REPO) must be OWNER/REPO")
     if not Path(key_path).is_file():
         die("private key file is missing")
     try:

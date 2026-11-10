@@ -371,7 +371,9 @@ host-local path rules as `[github_app]`); the renderer exports
 `TARTCI_SCAN_APP_ID`, `TARTCI_SCAN_APP_PRIVATE_KEY_PATH` and
 `TARTCI_SCAN_APP_CACHE_DIR` (references only), and the provider then runs scans
 through `scripts/gh-scan-app`, which mints and caches an installation token with
-`ghapp token --app-id` and execs `gh` with it. It fails closed (exit 75) and
+`ghapp token --app-id` and execs `gh` with it. The provider binds the wrapper
+to the lane's repository through `TARTCI_SCAN_APP_REPO` (the wrapper falls back
+to `SHIPYARD_GH_APP_REPO`, then `GH_REPO`, when run by hand). It fails closed (exit 75) and
 never falls back to ambient `gh`. `TARTCI_SCAN_GH_CLI` names a different scan
 CLI explicitly. `queue_scan.py` (non-v2 lanes) still reads on `TARTCI_GH_CLI`. JIT registration, runner reclaim, cancel and every other write
 stay on `TARTCI_GH_CLI`. Rollback: delete the table (or unset the variable) and
