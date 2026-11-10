@@ -11,7 +11,7 @@ os       = "macos"
 arch     = "arm64"
 cross    = false
 
-base    = "ghcr.io/cirruslabs/macos-tahoe-base:latest"
+base = "ghcr.io/cirruslabs/macos-golden-gate-base@sha256:4859ea9483a1f6e377301f23a5243798044266a373fc36635e9dcd045e09292f"
 disk_gb = 150
 
 [source]
@@ -19,16 +19,28 @@ repository = "https://github.com/Generous-Corp/pulp"
 commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
 
+# The revision of Pulp's tools/toolchain/manifest.toml that the generated
+# toolchain block below was copied from. It is separate from [source]: that
+# pin selects the render dependencies (tools/deps/manifest.json), which must
+# stay the chrome/m153 source shared with pulp.linux.toml.
+[toolchain_source]
+repository = "https://github.com/Generous-Corp/pulp"
+commit     = "fb55cb373d6b49b36182a65cc2a88269f17c3c31"
+manifest   = "tools/toolchain/manifest.toml"
+
 [toolchain]
-clang_format = "required"
-tart = "homebrew"
+macos_build = "26B123"
+macos = "27.2"
+xcode_build = "27B52"
+clang_format = "21.1.8"
+tart = "2.38.0"
 rust_targets = ["x86_64-apple-darwin"]
 rust = "1.97.1"
 node = "26.10.0"
-python = "3.12"
-ninja = "homebrew"
-cmake = "homebrew"
-xcode = "26.5"
+python = "3.14.4"
+ninja = "1.13.2"
+cmake = "4.3.3"
+xcode = "27.2"
 
 [brew]
 packages = [
@@ -52,7 +64,7 @@ packages = [
 # without it, the pulp fmt shell-out test hangs until its timeout.
 
 # BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
-# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# source_sha256 = 7b695d2cbaf8c4a0eb572c673416b76cd728c23ef50c4126ffb0f621d7926959
 # generated_platform = macos
 # END GENERATED PULP TOOLCHAIN
 

@@ -138,5 +138,38 @@ The only manual step is plugging in the cable. macOS/Linux Tart goldens (not
 portable qcow2 files) are out of scope for this MVP — they sync via tart
 export/clone.
 
+## Moving the Pulp macOS golden to a new Xcode
+
+The Xcode, the guest macOS and the base image come from Pulp's
+`tools/toolchain/manifest.toml`; `manifests/pulp.macos.toml` carries them
+(`xcode`, `xcode_build`, `macos`, `macos_build`, and `base` pinned by digest)
+and is regenerated with Pulp's `tools/toolchain/generate.py --tartci-root`,
+never hand-edited. The bake itself is still Pulp's operator-led
+`tools/ci/tart-provision.sh` tier chain (`base`, `apple-xcode`, `pulp`,
+`runner`, then the pinned mise layer from `.shipyard/vm-image.mise.toml`); each
+tier refuses a guest whose macOS build or Xcode build is not the pin, and the
+mise layer refuses the golden unless `check_env.py --require-tools` passes in
+the guest. A new Xcode that needs a newer macOS means a full Tier 0 rebake, not
+a Tier 1 swap.
+
+Roll it one host at a time, and never drain two hosts at once:
+
+1. Drain the host with the most headroom (`tartci pool drain`; the running
+   jobs finish, nothing new starts). The bake boots a VM, and Apple's
+   two-VM-per-host cap means a host running two gate VMs has no slot for it.
+   Bake there; the bake does not touch `:latest`. Tag the result with a dated
+   name, not `:latest`.
+2. Canary, still drained: serve one job from the dated golden on a pilot
+   label (`tartci serve macos --once --golden <dated> --labels <pilot labels>`)
+   and dispatch Pulp's `Build and Test` with `mise_candidate=true` on `main`.
+3. Promote on that host: point `pulp-build-runner:latest` at the dated golden,
+   `tartci pool undrain`, and confirm the next gate job passes. A red canary
+   means `tartci pool undrain` with `:latest` untouched.
+4. Copy the stopped dated golden to the next host (`rsync -aHS` of its
+   `vms/<name>` directory into that host's own `TART_HOME`), verify it boots
+   with `xcodebuild -version` and `sw_vers -buildVersion` matching the pins,
+   then repeat step 3 there. Keep the previous `:latest` as a dated rollback
+   until every host has run a green gate job on the new one.
+
 Origin: issue #24 — this reconciliation was the manual first run; the command
 automates it.
