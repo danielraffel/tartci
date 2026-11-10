@@ -65,6 +65,14 @@ approval_sha256_path = "/Users/danielraffel/.config/tartci/m5studio-launcher-app
 identifier = "com.danielraffel.tartci.launcher"
 team_id = "95CX6P84C4"
 
+# Read-only scan App: queue and current-job scans draw on its own rate-limit
+# bucket instead of the Shipyard App's. References only; the key stays a
+# private host file. Rollback: delete this table and re-render.
+[github_scan_app]
+id = "5665767"
+private_key_path = "/Users/danielraffel/.config/shipyard/github-apps/generous-admission-reader.private-key.pem"
+cache_dir = "/Users/danielraffel/.config/shipyard/ghapp-cache-reader"
+
 [stacked_images]
 enabled = false
 minimum_macos_major = 27
