@@ -1507,6 +1507,38 @@ priority_demand(){
     || { printf '%s\n' 1; return 0; }
 }
 
+# yield_demand — priority_demand, except that a lane
+# yielding to ANOTHER repository's work (last_slot_yield) stops yielding while
+# fair share calls it starved (scripts/fair_share.py). Without this a starved
+# Vellum lane whose boot would take m5's last slot still yields whenever any
+# Pulp gate job is queued, which is the steady-queue case fair share exists
+# for. A yield to this lane's own repository (yield_to_workflow) is untouched:
+# fair share never reorders one repository. Prints 0 (and never scans) when
+# lifted.
+fair_share_lifts_yield(){
+  [ -n "$YIELD_WORKFLOW" ] && [ -n "$YIELD_REPO" ] && [ "$YIELD_REPO" != "$REPO" ] \
+    && tartci_fair_share_starved
+}
+
+yield_demand(){
+  if fair_share_lifts_yield; then
+    printf '%s\n' 0
+    return 0
+  fi
+  priority_demand
+}
+
+# Logs `fair_share_yield_lifted` once per starved stretch. Must run in the
+# supervisor's own shell (yield_demand runs in a command substitution).
+FAIR_SHARE_YIELD_LIFTED_SINCE=0
+fair_share_note_yield_lifted(){
+  fair_share_lifts_yield || return 0
+  [ "$FAIR_SHARE_YIELD_LIFTED_SINCE" != "$TARTCI_FAIR_DEMAND_SINCE" ] || return 0
+  FAIR_SHARE_YIELD_LIFTED_SINCE="$TARTCI_FAIR_DEMAND_SINCE"
+  event fair_share_yield_lifted \
+    "yield_repo=$YIELD_REPO workflow=$YIELD_WORKFLOW demand_since=$TARTCI_FAIR_DEMAND_SINCE"
+}
+
 # yield_bound_reached <selected_labels> — how many of THIS lane's own queued
 # jobs, in the class the loop selected, have been queued for at least
 # YIELD_MAX_WAIT seconds. Non-zero lifts the priority yield for this poll.
@@ -3406,7 +3438,10 @@ if [ "$LOOP" = 1 ]; then
     # about) to decide whether to yield a slot we wouldn't use anyway. Stays 0
     # when there's no work, and the feature is off entirely for the gate runner.
     p=0
-    [ "${q:-0}" -gt 0 ] && p="$(priority_demand)"
+    if [ "${q:-0}" -gt 0 ]; then
+      p="$(yield_demand)"
+      fair_share_note_yield_lifted
+    fi
     # Bounded yield: only consulted when we would otherwise yield to priority
     # demand, so it costs no scan on a lane with the bound off or no demand.
     yb=0
@@ -3474,7 +3509,7 @@ if [ "$LOOP" = 1 ]; then
       # now (the claim is atomic, the count before it was not).
       if [ "$YIELD_LAST_SLOT_ONLY" = 1 ] && [ "${p:-0}" -eq 0 ] \
          && [ "$(last_slot_occupancy)" -ge "$cap" ] \
-         && [ "$(YIELD_LAST_SLOT_ONLY=0 priority_demand)" -gt 0 ]; then
+         && [ "$(YIELD_LAST_SLOT_ONLY=0 yield_demand)" -gt 0 ]; then
         note "last slot: priority work for '${YIELD_WORKFLOW}' is queued — releasing the slot just claimed"
         event last_slot_yield_after_claim "workflow=$YIELD_WORKFLOW running=$r/$cap"
         rm -f "$resv" 2>/dev/null || true

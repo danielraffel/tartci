@@ -348,6 +348,63 @@ class ShellClockTests(unittest.TestCase):
         self.assertIn("HEARTBEAT lease-wait", proc.stdout)
 
 
+class LastSlotYieldTests(unittest.TestCase):
+    """A starved lane stops yielding m5's last slot to another repository."""
+
+    bash = ShellClockTests.bash
+
+    def run_yield(self, *, yield_repo: str, starved: bool, knob: str = "1800") -> subprocess.CompletedProcess:
+        since = "$(( $(date +%s) - 3600 ))" if starved else "$(( $(date +%s) - 60 ))"
+        body = (
+            f"YIELD_WORKFLOW='Build and Test'; YIELD_REPO={yield_repo}\n"
+            "priority_demand(){ echo SCANNED >&2; echo 3; }\n"
+            + runner_function("fair_share_lifts_yield") + "\n"
+            + runner_function("yield_demand") + "\n"
+            + "FAIR_SHARE_YIELD_LIFTED_SINCE=0\n"
+            + runner_function("fair_share_note_yield_lifted") + "\n"
+            f"TARTCI_FAIR_DEMAND_SINCE={since}\n"
+            'p="$(yield_demand)"; fair_share_note_yield_lifted; echo "p=$p"\n'
+            'p="$(yield_demand)"; fair_share_note_yield_lifted; echo "p=$p"\n'
+        )
+        return self.bash(body, knob=knob)
+
+    def test_a_starved_lane_does_not_yield_to_another_repository(self) -> None:
+        proc = self.run_yield(yield_repo=PULP, starved=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("p=0"), 2, proc.stdout)
+        self.assertNotIn("SCANNED", proc.stderr)
+        # Logged once per starved stretch, not once per poll.
+        self.assertEqual(proc.stdout.count("EVENT fair_share_yield_lifted"), 1, proc.stdout)
+        self.assertIn(f"yield_repo={PULP}", proc.stdout)
+
+    def test_a_lane_not_yet_starved_still_yields(self) -> None:
+        proc = self.run_yield(yield_repo=PULP, starved=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("p=3"), 2, proc.stdout)
+        self.assertNotIn("fair_share_yield_lifted", proc.stdout)
+
+    def test_knob_off_still_yields(self) -> None:
+        proc = self.run_yield(yield_repo=PULP, starved=True, knob="0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("p=3"), 2, proc.stdout)
+
+    def test_a_yield_within_one_repository_is_never_lifted(self) -> None:
+        # The bash harness runs as REPO=vellum; yielding to vellum itself is a
+        # same-repository yield (as pulp-release yields to Pulp's gate).
+        proc = self.run_yield(yield_repo=VELLUM, starved=True)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.count("p=3"), 2, proc.stdout)
+        proc = self.run_yield(yield_repo='""', starved=True)
+        self.assertEqual(proc.stdout.count("p=3"), 2, proc.stdout)
+
+    def test_the_loop_and_the_post_claim_recheck_use_it(self) -> None:
+        text = RUNNER.read_text()
+        self.assertIn('p="$(yield_demand)"', text)
+        self.assertIn('[ "$(YIELD_LAST_SLOT_ONLY=0 yield_demand)" -gt 0 ]', text)
+        self.assertNotIn('p="$(priority_demand)"', text)
+        self.assertNotIn("YIELD_LAST_SLOT_ONLY=0 priority_demand)", text)
+
+
 class ShippedProfileTests(unittest.TestCase):
     """m5 is the canary: only its profile turns fair share on."""
 

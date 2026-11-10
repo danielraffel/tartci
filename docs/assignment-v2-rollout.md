@@ -723,6 +723,15 @@ could not place for that long (`scripts/fair_share.py`):
 - **Order**: among starved lanes of different repositories, the one starved
   longest goes first. A starved lane is not ranked below another repository's
   waiter on priority alone.
+- **Last-slot yield**: a lane with `last_slot_yield` (m5's Vellum lane, which
+  yields the host's last guest slot while any Pulp gate job is queued) stops
+  yielding to that other repository while it is starved: its priority scan
+  answers 0 without asking GitHub (`yield_demand` in
+  `providers/tart-macos/runner.sh`, event `fair_share_yield_lifted` once per
+  starved stretch), in the loop and in the post-claim recheck. Without this
+  the starved lane would still yield every time Pulp had queued work, which is
+  the steady-queue case fair share exists for. A `yield_to_workflow` lane
+  yields to its own repository and is unaffected.
 - **Within one repository nothing changes**: merge-group above PR-head, the
   priorities lanes lease at and ranked waiters all stay as they are.
 - **The clock**: per lane, in the supervisor. It starts at the first scan that
