@@ -3241,7 +3241,10 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   the minute between the probe and the lease, or after both slots hold Vellum,
   waits for a Vellum job to end; forge-gate and spectr-gate demand is not
   probed (almost none on m5). The yield also applies beside a Pulp guest, so
-  the last slot goes to Pulp first whenever Pulp work is queued. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
+  the last slot goes to Pulp first whenever Pulp work is queued; under a
+  steady Pulp backlog m5's Vellum throughput can fall below the
+  one-supervisor baseline, so the Vellum queue wait on m5 is a canary
+  guardrail. The key cannot be combined with `warm_vm`. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
   and Pulp `macos` queue wait on the canary host.
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure

@@ -259,7 +259,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                     ('repo = "Generous-Corp/pulp", workflow = "Build and Test", labels',
                      'repo = "pulp", workflow = "Build and Test", labels', "last_slot_yield must"),
                     ("supervisors = 2\n# A supervisor whose boot", "supervisors = 1\n# A supervisor whose boot",
-                     "needs supervisors = 2")):
+                     "needs supervisors = 2"),
+                    ("supervisors = 2\n# A supervisor whose boot", "supervisors = 2\nwarm_vm = true\n# A supervisor whose boot",
+                     "cannot be combined with warm_vm")):
                 mutated = body.replace(old, new, 1)
                 self.assertNotEqual(mutated, body, f"control: {old!r} was rewritten")
                 path.write_text(mutated)

@@ -1043,6 +1043,10 @@ def load(path: Path) -> dict:
             if lane.get("supervisors", 1) != 2 or yield_workflow is not None:
                 fail(f"lane {lane_id}: last_slot_yield needs supervisors = 2 and "
                      "no yield_to_workflow")
+            if lane.get("warm_vm") is True:
+                # A warm hand-off reuses the parked VM's own reservation, which
+                # the post-claim release would delete.
+                fail(f"lane {lane_id}: last_slot_yield cannot be combined with warm_vm")
         # Bounded yield: how long this lane's own oldest queued job may wait
         # behind priority demand before the lane stops yielding. 0 keeps the
         # unbounded behavior; the key means nothing without a yield target, and
