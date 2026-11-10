@@ -42,11 +42,18 @@ Python 3.9-safe.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import pathlib
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+import time
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - tartci hosts are POSIX
+    fcntl = None  # type: ignore[assignment]
 
 import host_profile
 import leases
@@ -56,7 +63,12 @@ MODES = ("off", "shadow", "on")
 CLASS_RANK = {slot_demand.MERGE_GROUP: 0, slot_demand.OTHER: 1, slot_demand.PULL_REQUEST: 2}
 UNKNOWN_CLASS = "unknown"
 DEFAULT_PROMOTE_AFTER_SECS = 2700
-DEFAULT_DETAIL_MAX_AGE_SECS = 900
+DEFAULT_DETAIL_MAX_AGE_SECS = 300
+# An intent outlives one loop pass: POLL plus a scan that may wait up to 120 s
+# for the observation lock. Lanes withdraw explicitly whenever they stop
+# wanting a slot, and a dead owner never counts.
+DEFAULT_INTENT_FRESH_SECS = 240
+DEFAULT_LOCK_TIMEOUT_SECS = 10.0
 
 
 def intents_file(store_dir: pathlib.Path) -> pathlib.Path:
@@ -90,6 +102,36 @@ def live_intents(
     return leases.live_waiters(intents, fresh_secs)
 
 
+@contextlib.contextmanager
+def store_lock(store_dir: pathlib.Path, timeout: float) -> Iterator[bool]:
+    """The lease store's own lock, but bounded: yields False when not got in time.
+
+    `leases.locked_store` blocks without limit, which is right for a lease but
+    not here: a ranker that cannot get the lock claims first-come instead of
+    holding the lane loop.
+    """
+    if fcntl is None:  # pragma: no cover - tartci hosts are POSIX
+        with leases.locked_store(store_dir):
+            yield True
+        return
+    store_dir.mkdir(parents=True, exist_ok=True)
+    with (store_dir / "leases.lock").open("a+", encoding="utf-8") as handle:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def mode_setting(override: Optional[str] = None) -> str:
     if override in MODES:
         return str(override)
@@ -116,27 +158,32 @@ def _epoch(value: Any) -> Optional[float]:
 
 def demand_from_detail(detail: Optional[Dict[str, Any]], promote_after: int, now: float
                        ) -> Tuple[str, Optional[str]]:
-    """(event class, oldest queued_at) of the best-ranked class in a detail file.
+    """(event class, queued_at) of the OLDEST job a detail file counted.
 
-    No usable detail is `unknown`, which ranks with pull_request: a lane only
-    moves ahead on positive evidence.
+    GitHub, not tartci, picks which matching job a new runner gets, and a lane
+    whose labels match jobs of several classes is likeliest to get the oldest.
+    Ranking such a lane by the best class it saw would let a fresh merge-group
+    job win the slot for an old PR job. A class's own promotion still lifts an
+    old job. No usable detail is `unknown`, which ranks with pull_request: a
+    lane only moves ahead on positive evidence.
     """
     if not detail:
         return UNKNOWN_CLASS, None
-    best: Optional[Tuple[Tuple[int, float], str, Optional[str]]] = None
+    oldest: Optional[Tuple[float, int, str, str]] = None
     for cls, row in (detail.get("classes") or {}).items():
         if not isinstance(row, dict) or int(row.get("count") or 0) <= 0:
             continue
         cls = cls if cls in CLASS_RANK else slot_demand.OTHER
-        queued_at = row.get("oldest_created_at")
-        stamp = _epoch(queued_at)
-        rank = effective_rank(cls, stamp, promote_after, now)
-        key = (rank, stamp if stamp is not None else now)
-        if best is None or key < best[0]:
-            best = (key, cls, queued_at if stamp is not None else None)
-    if best is None:
+        stamp = _epoch(row.get("oldest_created_at"))
+        if stamp is None:
+            continue
+        # Equal ages: the better class (a tie cannot be decided by assignment).
+        key = (stamp, CLASS_RANK[cls], cls, str(row.get("oldest_created_at")))
+        if oldest is None or key < oldest:
+            oldest = key
+    if oldest is None:
         return UNKNOWN_CLASS, None
-    return best[1], best[2]
+    return oldest[2], oldest[3]
 
 
 def effective_rank(cls: str, queued_epoch: Optional[float], promote_after: int,
@@ -153,11 +200,19 @@ def effective_rank(cls: str, queued_epoch: Optional[float], promote_after: int,
 
 
 def rank_key(intent: Dict[str, Any], promote_after: int, now: float) -> Tuple[Any, ...]:
-    """Smaller is better. Waiting longest first; unknown age = when the lane began waiting."""
+    """Smaller is better: class, then the longest wait, then when the lane began waiting.
+
+    The wait is the older of the job's queued_at and the lane's waiting_since
+    (when it began wanting a slot without a break). A scan that stopped at its
+    first witness reports that witness's age, a lower bound; waiting_since keeps
+    a lane that has been refused for a long time from looking young just
+    because a newer job is the one its scan happened to see, so it reaches the
+    promotion bound and cannot starve.
+    """
     since = _epoch(intent.get("waiting_since"))
     queued = _epoch(intent.get("queued_at"))
-    if queued is None:
-        queued = since if since is not None else now
+    if queued is None or (since is not None and since < queued):
+        queued = since if since is not None else (queued if queued is not None else now)
     rank = effective_rank(str(intent.get("event_class") or UNKNOWN_CLASS), queued,
                           promote_after, now)
     return (rank, queued, since if since is not None else now, str(intent.get("lane") or ""))
@@ -184,12 +239,17 @@ def ranked_ahead(
     me: Dict[str, Any],
     promote_after: int,
     now: float,
+    waiters: Optional[List[Dict[str, Any]]] = None,
 ) -> List[Dict[str, Any]]:
     """Intents ranked strictly ahead of `me` that could take a slot now.
 
     Each counts only if its VM lease is admitted on the current store with the
     intents ahead of it already granted, so the list never names more lanes
-    than the budget could boot at once.
+    than the budget could boot at once. With ranked VM lease waiters on, the
+    store would also defer an acquire that displaces a higher-priority live
+    waiter (leases.blocking_waiter); such an intent cannot boot either, so it
+    holds nothing back. This lane's own waiter is left out: a lane that defers
+    here withdraws it (slot-priority.lib.sh).
     """
     my_key = rank_key(me, promote_after, now)
     simulated = list(records)
@@ -202,6 +262,16 @@ def ranked_ahead(
         cores = leases.record_int(row, "lease_size_cores")
         mem = leases.record_int(row, "lease_size_mem_mb")
         if not leases.admits(cfg, simulated, priority, cores, mem):
+            continue
+        after = simulated + [{"lease_size_cores": cores, "lease_size_mem_mb": mem,
+                              "priority": priority}]
+        others_waiting = [
+            w for w in (waiters or [])
+            if str(w.get("id")) not in (f"waiter-{row.get('lane')}", f"waiter-{me.get('lane')}")
+        ]
+        if others_waiting and leases.blocking_waiter(
+            cfg, others_waiting, simulated, after, priority, f"waiter-{row.get('lane')}"
+        ) is not None:
             continue
         simulated.append({"lease_size_cores": cores, "lease_size_mem_mb": mem,
                           "priority": priority})
@@ -216,15 +286,18 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     cfg = leases.capacity_config(args)
     promote_after = promote_after_setting(args.promote_after_secs)
-    fresh = int(args.fresh_secs) if args.fresh_secs else int(cfg["waiter_fresh_secs"])
+    fresh = int(args.fresh_secs) if args.fresh_secs else max(
+        DEFAULT_INTENT_FRESH_SECS, int(cfg["waiter_fresh_secs"]))
     nowdt = slot_demand._utcnow()
     now = nowdt.timestamp()
+    witness_only = False
     if args.event_class:
         event_class = args.event_class
         queued_at = args.queued_at or None
     else:
         detail = slot_demand.read_detail(args.demand_file or "", args.detail_max_age_secs)
         event_class, queued_at = demand_from_detail(detail, promote_after, now)
+        witness_only = bool(detail and detail.get("witness_only"))
     priority, priority_class = leases.parse_priority(args.priority)
     cores = max(0, int(args.cores))
     mem = int(args.mem_mb) if args.mem_mb is not None else cores * cfg["per_job_mem_mb"]
@@ -233,7 +306,10 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         return {"ok": True, "mode": mode, "decision": "claim",
                 "reason": "intent_owner_not_alive"}, 0
     stamp = slot_demand.iso(nowdt)
-    with leases.locked_store(store_dir):
+    with store_lock(store_dir, args.lock_timeout_secs) as got:
+        if not got:
+            return {"ok": True, "mode": mode, "decision": "claim",
+                    "reason": "store_lock_timeout"}, 0
         intents, problems = load_intents(store_dir)
         live, _ = live_intents(intents, fresh)
         previous = next((row for row in live if str(row.get("lane")) == args.lane), None)
@@ -247,6 +323,7 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
             "labels": args.labels,
             "event_class": event_class,
             "queued_at": queued_at,
+            "queued_at_lower_bound": witness_only,
             "lease_size_cores": cores,
             "lease_size_mem_mb": mem,
             "priority": priority,
@@ -271,7 +348,11 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
             result.update(decision="full", reason="no_free_slot")
             return result, 0
         records = leases.load_records(store_dir)
-        ahead = ranked_ahead(cfg, records, kept, me, promote_after, now)
+        waiters: List[Dict[str, Any]] = []
+        if cfg.get("rank_vm_waiters"):
+            loaded, _ = leases.load_waiters(store_dir)
+            waiters, _ = leases.live_waiters(loaded, int(cfg["waiter_fresh_secs"]))
+        ahead = ranked_ahead(cfg, records, kept, me, promote_after, now, waiters)
     result["ahead"] = [intent_summary(row, promote_after, now) for row in ahead]
     if len(ahead) < int(args.free_slots):
         result.update(decision="claim", reason="ranked_first")
@@ -289,7 +370,9 @@ def withdraw(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     if not intents_file(store_dir).exists():
         return {"ok": True, "withdrawn": None}, 0
-    with leases.locked_store(store_dir):
+    with store_lock(store_dir, args.lock_timeout_secs) as got:
+        if not got:
+            return {"ok": False, "withdrawn": None, "reason": "store_lock_timeout"}, 0
         intents, problems = load_intents(store_dir)
         kept = [row for row in intents if str(row.get("lane")) != args.lane]
         removed = len(kept) != len(intents)
@@ -303,7 +386,8 @@ def status(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     cfg = leases.capacity_config(args)
     promote_after = promote_after_setting(args.promote_after_secs)
-    fresh = int(args.fresh_secs) if args.fresh_secs else int(cfg["waiter_fresh_secs"])
+    fresh = int(args.fresh_secs) if args.fresh_secs else max(
+        DEFAULT_INTENT_FRESH_SECS, int(cfg["waiter_fresh_secs"]))
     now = slot_demand._utcnow().timestamp()
     intents, problems = load_intents(store_dir)
     live, _ = live_intents(intents, fresh)
@@ -347,6 +431,7 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         p.add_argument("--capacity", type=int)
         p.add_argument("--capacity-mem-mb", type=int)
         p.add_argument("--reserved-gate-cores", type=int)
+        p.add_argument("--lock-timeout-secs", type=float, default=DEFAULT_LOCK_TIMEOUT_SECS)
         p.add_argument("--json", action="store_true")
 
     d = sub.add_parser("decide", help="record this lane's intent and say whether it may claim")

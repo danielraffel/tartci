@@ -9,8 +9,9 @@
 # a class. A lane that is outranked by a lane that can boot now steps aside for
 # one poll instead of claiming.
 #
-# * off (the default): nothing here runs, no scan gets a --detail-file, and the
-#   loop is byte-for-byte the first-come loop it was.
+# * off (the default): the mode is read once at startup (no per-poll process),
+#   no scan gets a --detail-file, no intent is written, and the loop takes
+#   exactly the first-come decisions it always did.
 # * shadow: intents are recorded and every claim that ranking would have given
 #   to another lane logs `slot_priority_shadow` ("would have given slot to
 #   ..."); the lane still claims first-come.
@@ -20,32 +21,51 @@
 #   lane it is waiting for is not taking the slot, and a free slot must not
 #   idle.
 #
+# An intent is a lane that would take a free slot now. It is refreshed at the
+# claim point and while the lane waits for lease capacity (lease-fit `not_now`:
+# the slot it wants is held by the lease budget, and it must still be ranked
+# when that frees), and withdrawn on every other path that stops wanting one.
+#
 # Non-preemptive: this only decides who takes a FREE slot; it never touches a
 # running VM, a lease or a reservation. It makes no GitHub call: the event class
 # and queue age come from the scan the lane already made (--detail-file).
 # Every failure claims first-come.
 
 SLOT_PRIORITY_DEFER_SINCE=0
+# 1 while this supervisor may have an intent in the store, so a withdraw on a
+# path that never registered one costs no process.
+SLOT_PRIORITY_HAS_INTENT=0
+SLOT_PRIORITY_LAST_LABELS=""
+SLOT_PRIORITY_LAST_TIER=0
 _tartci_slot_priority_mode=""
+case "${TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS:-300}" in
+  ''|*[!0-9]*) TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS=300 ;;
+esac
 : "${TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS:=300}"
 
-# off|shadow|on, read once per supervisor (TARTCI_SLOT_PRIORITY overrides).
+# Resolve the mode into this shell (TARTCI_SLOT_PRIORITY overrides the profile).
+# The supervisor calls this once at startup, in its own shell: a call made only
+# inside $(...) would set the cache in a subshell and lose it.
+tartci_slot_priority_load(){
+  [ -z "$_tartci_slot_priority_mode" ] || return 0
+  case "${TARTCI_SLOT_PRIORITY:-}" in
+    off|shadow|on) _tartci_slot_priority_mode="$TARTCI_SLOT_PRIORITY" ;;
+    *)
+      _tartci_slot_priority_mode="$(tartci_profile_value slot_priority 2>/dev/null)" \
+        || _tartci_slot_priority_mode=off
+      case "$_tartci_slot_priority_mode" in off|shadow|on) ;; *) _tartci_slot_priority_mode=off ;; esac
+      ;;
+  esac
+}
+
 tartci_slot_priority_mode(){
-  if [ -z "$_tartci_slot_priority_mode" ]; then
-    case "${TARTCI_SLOT_PRIORITY:-}" in
-      off|shadow|on) _tartci_slot_priority_mode="$TARTCI_SLOT_PRIORITY" ;;
-      *)
-        _tartci_slot_priority_mode="$(tartci_profile_value slot_priority 2>/dev/null)" \
-          || _tartci_slot_priority_mode=off
-        case "$_tartci_slot_priority_mode" in off|shadow|on) ;; *) _tartci_slot_priority_mode=off ;; esac
-        ;;
-    esac
-  fi
+  tartci_slot_priority_load
   printf '%s\n' "$_tartci_slot_priority_mode"
 }
 
 tartci_slot_priority_enabled(){
-  [ "$(tartci_slot_priority_mode)" != off ]
+  tartci_slot_priority_load
+  [ "$_tartci_slot_priority_mode" != off ]
 }
 
 # Detail file for one demand class of this lane (`lane` for a single-label lane,
@@ -72,8 +92,9 @@ tartci_slot_priority_lane_id(){
 
 # The value of key=<value> in a decide line, or `unknown`.
 tartci_slot_priority_token(){
-  local key="$1" token
-  for token in $2; do
+  local key="$1" token words=()
+  read -r -a words <<< "$2"
+  for token in ${words[@]+"${words[@]}"}; do
     case "$token" in "$key="*) printf '%s\n' "${token#*=}"; return 0 ;; esac
   done
   printf 'unknown\n'
@@ -81,9 +102,53 @@ tartci_slot_priority_token(){
 
 tartci_slot_priority_withdraw(){
   SLOT_PRIORITY_DEFER_SINCE=0
+  [ "$SLOT_PRIORITY_HAS_INTENT" = 1 ] || return 0
+  SLOT_PRIORITY_HAS_INTENT=0
   tartci_slot_priority_enabled || return 0
   python3 "$TARTCI_ROOT/scripts/slot_priority.py" withdraw \
     --lane "$(tartci_slot_priority_lane_id)" </dev/null >/dev/null 2>&1 || true
+}
+
+# Remember that this lane is about to hold an intent. Must run in the
+# supervisor's own shell (not inside $(...)), like tartci_slot_priority_load.
+_tartci_slot_priority_mark(){
+  SLOT_PRIORITY_HAS_INTENT=1
+  SLOT_PRIORITY_LAST_LABELS="$1"
+  SLOT_PRIORITY_LAST_TIER="$2"
+}
+
+# One decide call; prints its line (empty on helper failure), returns 1 when the
+# lane's VM size is unknown (then it is not ranked at all).
+_tartci_slot_priority_decide(){
+  local free="$1" labels="$2" tier="$3" cores mem priority detail_file mem_args=()
+  priority="$(tartci_vm_lease_priority "$labels")"
+  if ! cores="$(tartci_vm_lease_cores tart-macos 2>/dev/null)" \
+     || ! tartci_positive_int_or_empty "$cores"; then
+    return 1
+  fi
+  cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  mem="$(tartci_vm_lease_mem_mb tart-macos 2>/dev/null)" || mem=""
+  tartci_positive_int_or_empty "$mem" && mem_args=(--mem-mb "$mem")
+  detail_file="$(tartci_slot_priority_detail_file "$(tartci_slot_priority_key "$tier")")"
+  python3 "$TARTCI_ROOT/scripts/slot_priority.py" decide \
+    --lane "$(tartci_slot_priority_lane_id)" --repo "$REPO" --labels "$labels" \
+    --free-slots "$free" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
+    --priority "$priority" --pid "$$" --demand-file "$detail_file" \
+    </dev/null 2>/dev/null || true
+}
+
+# A lane waiting on lease capacity (lease-fit not_now) still wants the next slot
+# for the class it last asked for: keep its intent fresh, with no free slot to
+# decide on. Anything else the lease-fit gate says withdraws it.
+tartci_slot_priority_lease_wait(){
+  tartci_slot_priority_enabled || return 0
+  if [ "${LEASE_FIT_LAST_VERDICT:-}" = not_now ] && [ -n "$SLOT_PRIORITY_LAST_LABELS" ]; then
+    _tartci_slot_priority_mark "$SLOT_PRIORITY_LAST_LABELS" "$SLOT_PRIORITY_LAST_TIER"
+    _tartci_slot_priority_decide 0 "$SLOT_PRIORITY_LAST_LABELS" "$SLOT_PRIORITY_LAST_TIER" \
+      >/dev/null || tartci_slot_priority_withdraw
+    return 0
+  fi
+  tartci_slot_priority_withdraw
 }
 
 # tartci_slot_priority_gate <cap> <running> <selected_labels> <selected_tier>
@@ -93,7 +158,7 @@ tartci_slot_priority_withdraw(){
 # finds the host full exactly as before).
 tartci_slot_priority_gate(){
   local cap="$1" running="$2" labels="$3" tier="${4:-0}" reserved held free
-  local cores mem priority line verdict now detail_file sp_fields=()
+  local line verdict now sp_fields=()
   tartci_slot_priority_enabled || return 0
   case "$cap" in ''|*[!0-9]*) return 0 ;; esac
   case "$running" in ''|*[!0-9]*) return 0 ;; esac
@@ -103,24 +168,11 @@ tartci_slot_priority_gate(){
   [ "$reserved" -le "$held" ] || held="$reserved"
   free=$((cap - held))
   [ "$free" -ge 0 ] || free=0
-  priority="$(tartci_vm_lease_priority "$labels")"
-  if ! cores="$(tartci_vm_lease_cores tart-macos 2>/dev/null)" \
-     || ! tartci_positive_int_or_empty "$cores"; then
-    # Without a size the store cannot tell whether this lane would boot, so it
-    # is not ranked at all.
+  _tartci_slot_priority_mark "$labels" "$tier"
+  if ! line="$(_tartci_slot_priority_decide "$free" "$labels" "$tier")"; then
     tartci_slot_priority_withdraw
     return 0
   fi
-  cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
-  mem="$(tartci_vm_lease_mem_mb tart-macos 2>/dev/null)" || mem=""
-  detail_file="$(tartci_slot_priority_detail_file "$(tartci_slot_priority_key "$tier")")"
-  local mem_args=()
-  tartci_positive_int_or_empty "$mem" && mem_args=(--mem-mb "$mem")
-  line="$(python3 "$TARTCI_ROOT/scripts/slot_priority.py" decide \
-    --lane "$(tartci_slot_priority_lane_id)" --repo "$REPO" --labels "$labels" \
-    --free-slots "$free" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
-    --priority "$priority" --pid "$$" --demand-file "$detail_file" \
-    </dev/null 2>/dev/null)" || line=""
   verdict="${line%% *}"
   [ -n "$line" ] || { verdict=claim; line="claim reason=helper_failed"; }
   read -r -a sp_fields <<< "${line#* }"

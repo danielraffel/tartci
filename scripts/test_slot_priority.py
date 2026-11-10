@@ -207,6 +207,91 @@ class StarvationTests(Base):
         self.assertEqual([k[-1] for k in sorted(keys)], ["a", "b", "c"])
 
 
+class AgeFloorTests(Base):
+    def test_a_long_refused_lane_with_a_young_witness_still_ages(self) -> None:
+        # The lane's scan saw only a fresh PR job (a witness), but the lane has
+        # wanted a slot without a break for an hour: it is promoted.
+        pid = self.owner()
+        self.decide("starved-pr", event_class="pull_request", queued_ago=30, free=0, pid=pid)
+        intents = json.loads((self.store / "slot-intents.json").read_text())
+        for row in intents:
+            row["waiting_since"] = ago(3600)
+        (self.store / "slot-intents.json").write_text(json.dumps(intents))
+        mg = self.decide("fresh-mg", event_class="merge_group", queued_ago=10,
+                         extra=("--promote-after-secs", "2700"))
+        self.assertEqual(mg["decision"], "defer")
+        self.assertEqual(mg["winner"]["lane"], "starved-pr")
+
+
+class LeaseWaiterInterplayTests(Base):
+    def knob(self) -> None:
+        self.profile.write_text('schema = 1\n[host]\nid = "test"\n[leases]\n'
+                                'rank_vm_waiters = true\n', encoding="utf-8")
+
+    def waiter(self, lane: str, priority: str, cores: int) -> None:
+        proc = subprocess.run(
+            [sys.executable, str(SCRIPTS / "leases.py"), "wait", "--store-dir", str(self.store),
+             "--id", f"waiter-{lane}", "--cores", str(cores), "--mem-mb", "0",
+             "--priority", priority, "--kind", "tart-macos-vm", "--pid", str(self.owner()),
+             "--lane", lane, "--label", "x", "--capacity", "24", "--reserved-gate-cores", "12",
+             "--capacity-mem-mb", "0", "--json"],
+            text=True, capture_output=True, check=False, env=self.env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(json.loads(proc.stdout).get("registered"), proc.stdout)
+
+    def test_an_intent_the_lease_store_would_defer_holds_nothing_back(self) -> None:
+        self.knob()
+        # 24 cores, 18 in use: a gate lane (110) waits for 6. A vm-class
+        # merge-group intent wanting 6 fits, but its acquire would be deferred
+        # to that waiter, so it cannot boot and must not hold the slot back.
+        self.write_leases([{"id": "busy", "lease_size_cores": 18, "priority": 100,
+                            "lease_size_mem_mb": 0, "command_kind": "tart-macos-vm",
+                            "pid": os.getpid()}])
+        self.waiter("gate-lane", "110", 6)
+        self.decide("vellum-gate", event_class="merge_group", queued_ago=900, priority="vm",
+                    cores=6, free=0, reserved=0)
+        me = self.decide("pulp-pr", event_class="pull_request", queued_ago=10, priority="100",
+                         cores=6, reserved=0)
+        self.assertEqual(me["decision"], "claim", me)
+        self.assertEqual(me["ahead"], [])
+
+    def test_the_deciding_lanes_own_waiter_does_not_count(self) -> None:
+        self.knob()
+        self.write_leases([{"id": "busy", "lease_size_cores": 18, "priority": 100,
+                            "lease_size_mem_mb": 0, "command_kind": "tart-macos-vm",
+                            "pid": os.getpid()}])
+        # My own waiter (I will withdraw it when I defer) must not shield the
+        # higher-ranked intent.
+        self.waiter("pulp-pr", "110", 6)
+        self.decide("vellum-gate", event_class="merge_group", queued_ago=900, priority="vm",
+                    cores=6, free=0, reserved=0)
+        me = self.decide("pulp-pr", event_class="pull_request", queued_ago=10, priority="110",
+                         cores=6, reserved=0)
+        self.assertEqual(me["decision"], "defer", me)
+
+
+class LockTimeoutTests(Base):
+    def test_a_held_store_lock_claims_first_come(self) -> None:
+        self.store.mkdir(parents=True, exist_ok=True)
+        holder = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,sys,time\n"
+             "fh=open(sys.argv[1],'a+')\n"
+             "fcntl.flock(fh.fileno(), fcntl.LOCK_EX)\n"
+             "sys.stdout.write('held\\n'); sys.stdout.flush()\n"
+             "time.sleep(30)\n", str(self.store / "leases.lock")],
+            stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(holder.stdout.readline().strip(), "held")
+            result = self.decide("lane", event_class="merge_group",
+                                 extra=("--lock-timeout-secs", "0.5"))
+            self.assertEqual(result["decision"], "claim")
+            self.assertEqual(result["reason"], "store_lock_timeout")
+        finally:
+            holder.kill()
+            holder.wait()
+
+
 class WorkConservationTests(Base):
     def test_a_lane_whose_lease_would_be_denied_holds_nothing_back(self) -> None:
         # The non-gate budget (24 - 12 = 12) is full, so a non-gate Vellum
@@ -374,18 +459,24 @@ class ProfileValidatorTests(unittest.TestCase):
 
 
 class DemandDetailTests(unittest.TestCase):
-    def test_best_class_and_oldest_age_from_a_detail(self) -> None:
+    def test_a_lane_ranks_by_the_job_it_will_likely_get_the_oldest(self) -> None:
+        # GitHub hands a new runner whichever matching job it picks, likeliest
+        # the oldest; a fresh merge-group job must not win the slot for an old
+        # PR job on the same labels.
         detail = slot_demand.DemandDetail()
         detail.add({"event": "pull_request"}, {"created_at": ago(3000)})
         detail.add({"event": "merge_group"}, {"created_at": ago(100)})
         detail.add({"event": "merge_group"}, {"created_at": ago(400)})
         now = dt.datetime.now(dt.timezone.utc).timestamp()
         cls, queued = slot_priority.demand_from_detail(detail.as_dict(), 0, now)
+        self.assertEqual(cls, "pull_request")
+        self.assertAlmostEqual(slot_demand.parse_ts(queued).timestamp(), now - 3000, delta=5)
+        only_mg = slot_demand.DemandDetail()
+        only_mg.add({"event": "merge_group"}, {"created_at": ago(100)})
+        only_mg.add({"event": "merge_group"}, {"created_at": ago(400)})
+        cls, queued = slot_priority.demand_from_detail(only_mg.as_dict(), 0, now)
         self.assertEqual(cls, "merge_group")
         self.assertAlmostEqual(slot_demand.parse_ts(queued).timestamp(), now - 400, delta=5)
-        # With promotion the 3000 s PR job ranks as merge-group and is older.
-        cls, _ = slot_priority.demand_from_detail(detail.as_dict(), 2700, now)
-        self.assertEqual(cls, "pull_request")
 
     def test_stale_or_missing_detail_is_unknown(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -524,7 +615,8 @@ class Bash32GateTests(Base):
     """The lane glue under macOS /bin/bash 3.2, `set -euo pipefail`, empty arrays."""
 
     def gate(self, mode: str, *, cap: int = 2, running: int = 1, preset: str = "",
-             max_defer: str = "300", rounds: int = 1, detail: dict | None = None) -> tuple:
+             max_defer: str = "300", rounds: int = 1, detail: dict | None = None,
+             tail: str = "") -> tuple:
         if not Path(BASH32).exists():
             self.skipTest("no /bin/bash")
         state = self.root / "state"
@@ -557,10 +649,12 @@ for _ in $(seq 1 {rounds}); do
   rc=0
   tartci_slot_priority_gate {cap} {running} "self-hosted,x" 0 || rc=$?
 done
+{tail}
 echo "rc=$rc"
 """
-        env = {**self.env, "TARTCI_SLOT_PRIORITY": mode,
-               "TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS": max_defer}
+        env = {**self.env, "TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS": max_defer}
+        if mode:
+            env["TARTCI_SLOT_PRIORITY"] = mode
         proc = subprocess.run([BASH32, "-c", script], text=True, capture_output=True,
                               check=False, env=env)
         self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -593,6 +687,37 @@ echo "rc=$rc"
         rc, log = self.gate("off")
         self.assertEqual(rc, "rc=0")
         self.assertEqual(log, "")
+        lanes = {row["lane"] for row in json.loads((self.store / "slot-intents.json").read_text())}
+        self.assertNotIn("me-lane", lanes)
+
+    def test_mode_is_read_once_even_when_callers_run_in_subshells(self) -> None:
+        counter = self.root / "profile-reads"
+        rc, _ = self.gate("", preset=(
+            f"tartci_profile_value(){{ echo x >> {str(counter)!r}; echo shadow; }}\n"
+            "tartci_slot_priority_load\n"
+            "for _ in 1 2 3; do x=\"$(tartci_slot_priority_enabled && echo y)\"; done\n"
+            "[ \"$x\" = y ]"), rounds=3)
+        self.assertEqual(rc, "rc=0")
+        self.assertEqual(counter.read_text().count("x"), 1)
+
+    def test_lease_wait_keeps_the_intent_fresh_and_never_fit_withdraws_it(self) -> None:
+        self.outrank()
+        intents = self.store / "slot-intents.json"
+        rc, _ = self.gate("on", running=2, preset="", tail=(
+            "LEASE_FIT_LAST_VERDICT=not_now; tartci_slot_priority_lease_wait"))
+        lanes = {row["lane"] for row in json.loads(intents.read_text())}
+        self.assertIn("me-lane", lanes)
+        rc, _ = self.gate("on", running=2, preset="", tail=(
+            "LEASE_FIT_LAST_VERDICT=never; tartci_slot_priority_lease_wait"))
+        lanes = {row["lane"] for row in json.loads(intents.read_text())}
+        self.assertNotIn("me-lane", lanes)
+
+    def test_a_non_numeric_defer_bound_falls_back_to_300(self) -> None:
+        self.outrank()
+        rc, log = self.gate("on", max_defer="soon",
+                            preset="SLOT_PRIORITY_DEFER_SINCE=$(( $(date +%s) - 400 ))")
+        self.assertEqual(rc, "rc=0")
+        self.assertIn("slot_priority_defer_expired|", log)
 
     def test_on_defers_to_a_higher_ranked_lane(self) -> None:
         self.outrank()

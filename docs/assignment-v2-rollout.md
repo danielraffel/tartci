@@ -617,18 +617,34 @@ default `off`) ranks the lanes on one host that want the next free slot
 - **Order**: a `merge_group` job of any repository, then other events (push,
   release, schedule, dispatch), then `pull_request`. A merge-group job can land
   up to five PRs; a PR-head job only reports on one.
-- **Across repositories, oldest first**: within a class the job queued longest
-  (its GitHub `created_at`) ranks first, whatever its repository and whichever
-  lane asked first, so one repository cannot starve another.
+- **Across repositories, oldest first**: within a class the longest wait ranks
+  first, whatever its repository and whichever lane asked first, so one
+  repository cannot starve another. The wait is the older of the job's GitHub
+  `created_at` and the lane's `waiting_since` (when it began wanting a slot
+  without a break), so a lane refused for a long time keeps ageing even when
+  its scan only sees a newer job.
+- **A lane is ranked by the job it will likely get**: GitHub, not tartci,
+  picks which matching job a new runner takes, likeliest the oldest. A lane
+  whose labels match several classes (vellum-gate) ranks as the class of its
+  OLDEST counted job, so a fresh merge-group job cannot win the slot for an
+  old PR job.
 - **No class starves either**: a lower-class job queued
   `slot_priority_promote_after_secs` (default 2700, 300-14400) ranks as
   merge-group.
 - **Ties**: when the lane began waiting, then the lane id (a strict order).
 - **Only lanes that can boot now count**: an intent ahead of this lane holds a
   slot back only if its VM lease would be admitted on the store's current core
-  and memory budget, counting the intents ahead of it as granted. A lane
-  refused by the lease-fit gate withdraws its intent. Dead owners and intents
-  not refreshed within `waiter_fresh_secs` count for nothing.
+  and memory budget, counting the intents ahead of it as granted, and (with
+  ranked VM lease waiters on) only if that acquire would not be deferred to a
+  higher-priority live waiter. A lane that defers withdraws its own lease
+  waiter, so it never blocks the lane it yielded to.
+- **Intent lifecycle**: refreshed at the claim point, and while the lane waits
+  for lease capacity (lease-fit `not_now`), because that is exactly when the
+  next freed slot must find it ranked; withdrawn when it claims, when its lease
+  can never fit, and on every path that stops wanting a slot (yields, storage,
+  pool drain, JIT denial, claim-delay backoff, blind scan, unknown inventory).
+  Dead owners and intents not refreshed within 240 s count for nothing. The
+  store lock is taken with a 10 s bound; a timeout claims first-come.
 - **Non-preemptive and within the budgets**: it decides only who takes a FREE
   slot. It never reads or writes a lease, a reservation or a VM, never stops
   running work, and changes neither the cap nor any core or memory budget.
@@ -654,9 +670,10 @@ Known limits, so a reading is not over-interpreted:
   GitHub, not tartci, picks which matching job its runner gets. A Vellum lane
   that won the slot for its merge-group job may be handed its PR job instead.
 - An event-class-v2 scan stops at its first witness, so its age is a lower
-  bound on the class's oldest job (`witness_only` in the detail file). A
-  single-label scan counts every match, so its age is exact.
-- Unknown or stale detail (older than 900 s) ranks with `pull_request`: a lane
+  bound on the class's oldest job (`witness_only` in the detail file; the
+  intent records `queued_at_lower_bound`). A single-label scan counts every
+  match, so its age is exact. The `waiting_since` floor bounds the difference.
+- Unknown or stale detail (older than 300 s) ranks with `pull_request`: a lane
   moves ahead only on evidence.
 - It does not lift Vellum's lease-fit denials. On m5, Vellum leases at `vm` and
   is held to the non-gate budget ("cores=6 budget=6 used=10"); that is the

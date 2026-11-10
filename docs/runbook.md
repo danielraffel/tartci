@@ -3201,7 +3201,8 @@ memory-bound/OOM — before this existed). Three pieces tie together:
 - **Slot priority (opt-in, default off)** — `[leases] slot_priority =
   "shadow"` or `"on"` ranks the lanes on a host that want the next FREE macOS
   VM slot: merge_group jobs of any repo, then other events, then pull_request;
-  oldest queued job first within a class; a lower-class job queued
+  longest wait first within a class (the older of the job's `created_at` and
+  the lane's continuous `waiting_since`); a lower-class job queued
   `slot_priority_promote_after_secs` (default 2700) ranks as merge-group. Only
   intents whose VM lease would be admitted now count, and nothing running is
   touched. Shadow logs `slot_priority_shadow` ("would have given slot to ...")

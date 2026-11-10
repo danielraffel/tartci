@@ -174,7 +174,8 @@ tartci_assignment_v2_tier_demand(){
   # variable under `set -u`, so the expansion must be guarded, not just quoted.
   [ "$exhaustive" = 1 ] && count_args=(--exhaustive-count)
   # Slot priority reads the event class and age of what this scan counted.
-  if declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
+  if [ "${ASSIGNMENT_MODE:-}" = event-class-v2 ] \
+     && declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
     count_args+=(--detail-file "$(tartci_slot_priority_detail_file "$tier_label")")
   fi
   while IFS= read -r workflow; do
