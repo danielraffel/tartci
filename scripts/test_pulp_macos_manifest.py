@@ -51,11 +51,11 @@ class PulpMacosManifest(unittest.TestCase):
         # cannot claim new pins without naming the revision they came from.
         # That revision lives in [toolchain_source], never in [source]: [source]
         # selects the render dependencies, and moving it to the toolchain
-        # revision silently changes the baked Skia (c368b19e pins chrome/m158).
+        # revision silently changes the baked Skia (Pulp main at fb55cb37 pins chrome/m158).
         toolchain_source = self.manifest["toolchain_source"]
         self.assertEqual(
             toolchain_source["commit"],
-            "c368b19e47e334be8a29c59e7108794a5570e3f2",
+            "fb55cb373d6b49b36182a65cc2a88269f17c3c31",
         )
         self.assertEqual(toolchain_source["manifest"], "tools/toolchain/manifest.toml")
         self.assertEqual(

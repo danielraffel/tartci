@@ -25,7 +25,7 @@ manifest   = "tools/deps/manifest.json"
 # stay the chrome/m153 source shared with pulp.linux.toml.
 [toolchain_source]
 repository = "https://github.com/Generous-Corp/pulp"
-commit     = "c368b19e47e334be8a29c59e7108794a5570e3f2"
+commit     = "fb55cb373d6b49b36182a65cc2a88269f17c3c31"
 manifest   = "tools/toolchain/manifest.toml"
 
 [toolchain]
