@@ -114,6 +114,7 @@ repo = "Generous-Corp/pulp"
 runtime_measure = true
 runtime_tags = "pulp"
 runner_group_id = 1
+claim_rank = 0
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
 # 8, not 12: two 12-core gate VMs leased 24 of 28 cores and left agent builds the

@@ -735,7 +735,14 @@ needed, and an empty or absent directory leaves boots unchanged.
   `--compact-above N` it also folds a mirror holding more than N packs, but only
   when Tart reports zero running VMs at that moment; a running or unknown VM
   count defers compaction to a later pass. A failed mirror does not stop the
-  others and the pass exits 1. The `com.danielraffel.tartci.artifact-cache-refresh`
+  others and the pass exits 1. After the mirrors and pins it also stores the
+  GitHub Actions Runner archive that `providers/tart-macos/runner.sh` pins (url
+  and digest from `runner.sh --print-runner-archive`), so a VM copies it from the
+  mount, re-hashes the copy, and downloads only when the entry is absent or does
+  not verify. Like the rest of `refresh` it runs only on a host that already has
+  a mirror, and a lane that overrides `TARTCI_RUNNER_VERSION` or
+  `TARTCI_RUNNER_SHA256` must give the refresh agent the same override or that
+  lane keeps downloading. The `com.danielraffel.tartci.artifact-cache-refresh`
   LaunchAgent (`launchd/com.danielraffel.tartci.artifact-cache-refresh.plist.template`)
   runs `refresh --compact-above 16` every 6 hours (`StartInterval`, so not
   aligned to the clock; `RunAtLoad` off) at `ProcessType=Background` with
@@ -3308,7 +3315,18 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   checkout never refreshes its index and makes it look recently used.
   Keep-verdicts are cached in `~/.tartci/state/reclaim/checkout-verdicts.json`
   while the checkout's newest mtime is unchanged, for at most a day. The
-  event's `by_root` gives each root's counts.
+  event's `by_root` gives each root's counts, plus `resumed_after` and
+  `next_cursor`: a pass that runs out of budget records the last checkout it
+  examined in `~/.tartci/state/reclaim/scan-cursors.json`, and the next pass
+  starts just after it (wrapping around), so deferred checkouts are reached
+  first instead of the same alphabetical head being re-examined every hour.
+
+  A `--fix` pass runs as a macOS background process (efficiency cores,
+  throttled disk I/O and network, inherited by its git, du, lsof and ccache
+  children); the receipt's `priority` says `darwin_background`. It takes
+  longer, and a per-command timeout then keeps a checkout rather than
+  removing it. `TARTCI_RECLAIM_FOREGROUND=1` keeps a manual pass at normal
+  priority. The `--on-lease-denial` reclaim is never demoted.
 
   Exit 3 means the pass ran and a scanned volume is still below the
   `--fail-below-gb` floor. `pool status` and `doctor fleet`
