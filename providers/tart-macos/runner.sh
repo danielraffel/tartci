@@ -229,6 +229,12 @@ TIER_GROUP_IDS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
+# Another repository's priority work (last_slot_yield); empty = this lane's own.
+YIELD_REPO="${TARTCI_YIELD_TO_REPO:-}"
+# last_slot_yield: yield only when this boot would take the host's LAST macOS
+# guest slot (running guests or live reservations already hold cap - 1). Off =
+# always yield (the plain yield_to_workflow lanes).
+YIELD_LAST_SLOT_ONLY="${TARTCI_YIELD_LAST_SLOT_ONLY:-0}"
 # Bounded yield (opt-in; see header). 0 = unbounded (today's behavior).
 YIELD_MAX_WAIT="${TARTCI_YIELD_MAX_WAIT_SECONDS:-0}"
 case "$YIELD_MAX_WAIT" in
@@ -1458,8 +1464,26 @@ higher_priority_demand(){
 # queue_scan budgets two shared workflows per host and serializes their refreshes.
 # Non-zero output means "a priority job needs a slot — do not boot the secondary
 # VM".
+# Guest slots already held on this host: running guests or live reservations
+# (a reservation covers a sibling between its slot claim and its VM), whichever
+# is larger. Unreadable counts as full: yielding is the safe direction.
+last_slot_occupancy(){
+  local held reserved
+  held="${r:-}"
+  case "$held" in ''|*[!0-9]*) held="$(running_macos_vms 2>/dev/null)" ;; esac
+  case "$held" in ''|*[!0-9]*) printf '%s\n' 99; return 0 ;; esac
+  reserved="$(tartci_count_reservations 2>/dev/null)"
+  case "$reserved" in ''|*[!0-9]*) printf '%s\n' 99; return 0 ;; esac
+  [ "$reserved" -le "$held" ] || held="$reserved"
+  printf '%s\n' "$held"
+}
+
 priority_demand(){
   [ -n "$YIELD_WORKFLOW" ] || { printf '%s\n' 0; return 0; }
+  if [ "$YIELD_LAST_SLOT_ONLY" = 1 ] \
+     && [ "$(last_slot_occupancy)" -lt "$(( ${cap:-$(tartci_effective_cap)} - 1 ))" ]; then
+    printf '%s\n' 0; return 0
+  fi
   # FAIL CLOSED. If we cannot read priority-lane demand, assume there IS demand
   # (print 1 → the loop gate yields) rather than booting blind. gh errors
   # (rate-limit / 5xx) cluster during exactly the load spikes when the gate most
@@ -1469,7 +1493,7 @@ priority_demand(){
   # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
   # are declared first and assigned separately so `||` actually fires.)
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
-    --repo "$REPO" \
+    --repo "${YIELD_REPO:-$REPO}" \
     --workflow "$YIELD_WORKFLOW" \
     --labels "$YIELD_LABELS" \
     --job-statuses queued,in_progress \
@@ -3155,7 +3179,10 @@ i=0
   if higher_priority_demand "$PRINT_HIGHER_PRIORITY"; then printf '1\n'; else printf '0\n'; fi
   exit 0
 }
-[ "$PRINT_PRIORITY" = 1 ] && { priority_demand; exit 0; }
+# The slot-count helpers (macos-vm-cap.lib.sh) load below, after this hook;
+# last_slot_yield needs them here too.
+# shellcheck source=providers/tart-macos/macos-vm-cap.lib.sh
+[ "$PRINT_PRIORITY" = 1 ] && { source "${BASH_SOURCE[0]%/*}/macos-vm-cap.lib.sh"; priority_demand; exit 0; }
 [ "$PRINT_YIELD_BOUND" = 1 ] && {
   selection="$(select_work)"
   IFS='|' read -r _ selected_labels _ <<< "$selection"
@@ -3442,6 +3469,20 @@ if [ "$LOOP" = 1 ]; then
       CURRENT_RESV="$resv"
       # Holding a slot now; this lane no longer competes for one.
       tartci_slot_priority_withdraw
+      # last_slot_yield: two supervisors can both read "a slot to spare" and
+      # claim; whichever claim filled the last slot asks the priority queue
+      # now (the claim is atomic, the count before it was not).
+      if [ "$YIELD_LAST_SLOT_ONLY" = 1 ] && [ "${p:-0}" -eq 0 ] \
+         && [ "$(last_slot_occupancy)" -ge "$cap" ] \
+         && [ "$(YIELD_LAST_SLOT_ONLY=0 priority_demand)" -gt 0 ]; then
+        note "last slot: priority work for '${YIELD_WORKFLOW}' is queued — releasing the slot just claimed"
+        event last_slot_yield_after_claim "workflow=$YIELD_WORKFLOW running=$r/$cap"
+        rm -f "$resv" 2>/dev/null || true
+        CURRENT_RESV=""
+        tartci_job_claim_release 2>/dev/null || true
+        sleep "$POLL"
+        continue
+      fi
       i=$((i+1)); note "[$i] queued=$q running_macos_vms=$r/$cap priority_demand=$p yield_bound=$yb workflow_tier=$selected_tier labels=$selected_labels host_health_yield=$hh → booting ephemeral VM"
       run_rc=0
       CURRENT_SELECTED_QUEUED="$q"

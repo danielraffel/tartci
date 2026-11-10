@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "384d8644790473aa9e9d3ea9de22296ada9a82b5e176ea0b8bbdd181497544a2"
+    "profiles_sha256": "49a3469e227be5e8ca4417e62bea7c10ed76ef3f2beaf0f07d9a7d8edb4786f6"
   },
   "registrations": [
     {

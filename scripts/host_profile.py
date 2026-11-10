@@ -588,6 +588,13 @@ def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
 # neither reads nor writes waiters. waiter_fresh_secs bounds how long a waiter
 # counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
 # TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
+#
+# vm_slot_lending (default off): the non-gate macOS VM lease that takes the
+# host's LAST guest slot is admitted against the host totals instead of the
+# non-gate budget. All or nothing: while any slot is free for a gate guest,
+# every non-gate lease keeps the static budget (see leases.py, "VM slot
+# lending"). Agent builds always stay within the static budget.
+# TARTCI_VM_SLOT_LENDING (0/1) overrides the file for one shell.
 LEASE_POLICY_DEFAULT_FRESH_SECS = 90
 # `slot_priority` ranks the lanes that want the next free macOS VM slot
 # (scripts/slot_priority.py): "off" (default), "shadow" (log only) or "on".
@@ -631,7 +638,7 @@ def _parse_leases_table(text: str) -> dict[str, Any]:
 
 
 def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
-    """Return {rank_vm_waiters, vm_waiter_fresh_secs, lease_policy_source}."""
+    """Return {rank_vm_waiters, vm_waiter_fresh_secs, vm_slot_lending, lease_policy_source}."""
     enabled = False
     fresh = LEASE_POLICY_DEFAULT_FRESH_SECS
     source = "default"
@@ -652,6 +659,10 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     raw = os.environ.get("TARTCI_VM_WAITER_FRESH_SECS")
     if raw is not None and raw.strip().isdigit() and int(raw.strip()) > 0:
         fresh = int(raw.strip())
+    slot_lending = type(table.get("vm_slot_lending")) is bool and table["vm_slot_lending"]
+    raw = os.environ.get("TARTCI_VM_SLOT_LENDING")
+    if raw is not None and raw.strip() in ("0", "1"):
+        slot_lending = raw.strip() == "1"
     slot_priority = table.get("slot_priority")
     if slot_priority not in SLOT_PRIORITY_MODES:
         slot_priority = "off"
@@ -670,6 +681,7 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     return {
         "rank_vm_waiters": enabled,
         "vm_waiter_fresh_secs": fresh,
+        "vm_slot_lending": slot_lending,
         "lease_policy_source": source,
         "slot_priority": slot_priority,
         "slot_priority_promote_after_secs": promote,

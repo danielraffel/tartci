@@ -69,6 +69,8 @@ LEASES_KEYS = {
     "slot_priority", "slot_priority_promote_after_secs",
     # Rank a starved VM lane ahead of other repositories (scripts/fair_share.py).
     "fair_share_after_secs",
+    # A non-gate guest taking the last slot may use the gate reserve (leases.py).
+    "vm_slot_lending",
 }
 # Opt-in guest resolvers the runner configures inside each VM before it
 # registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
@@ -92,6 +94,7 @@ HOST_KEYS = {
     "home_volume_floor_mode",
     "vm_dhcp_breaker",
 }
+SCAN_APP_REPO_PREFIX = "Generous-Corp/"
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
@@ -119,6 +122,7 @@ LANE_KEYS = {
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
+    "last_slot_yield",
     "yield_max_wait_seconds", "claim_delay_seconds", "claim_delay_peers", "claim_rank",
     "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -686,6 +690,8 @@ def load(path: Path) -> dict:
             fail(f"unknown leases keys: {sorted(unknown)}")
         if type(lease_policy.get("rank_vm_waiters", False)) is not bool:
             fail("leases.rank_vm_waiters must be a boolean")
+        if type(lease_policy.get("vm_slot_lending", False)) is not bool:
+            fail("leases.vm_slot_lending must be a boolean")
         fresh = lease_policy.get("waiter_fresh_secs", 90)
         if type(fresh) is not int or not 30 <= fresh <= 600:
             fail("leases.waiter_fresh_secs must be an integer from 30 to 600")
@@ -1029,6 +1035,36 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: yield_to_labels must be unique and include "
                 f"{sorted(REQUIRED_BASE_LABELS)}"
             )
+        # Last-slot yield: on a two-supervisor lane, a supervisor whose boot
+        # would take the host's last guest slot (running guests or live
+        # reservations hold cap - 1; the slot VM slot lending lends the gate
+        # reserve to) yields while another repository's priority work is
+        # queued. Fails closed: an unreadable queue or count yields. With two
+        # slots free the supervisor boots as before.
+        second_yield = lane.get("last_slot_yield")
+        if second_yield is not None:
+            if (not isinstance(second_yield, dict)
+                    or set(second_yield) != {"repo", "workflow", "labels"}
+                    or not isinstance(second_yield["repo"], str)
+                    or not REPO.fullmatch(second_yield["repo"])
+                    or not isinstance(second_yield["workflow"], str)
+                    or not second_yield["workflow"].strip()
+                    or any(char in second_yield["workflow"] for char in "\r\n|")
+                    or not isinstance(second_yield["labels"], list)
+                    or not all(isinstance(v, str) and LABEL.fullmatch(v)
+                               for v in second_yield["labels"])
+                    or len(second_yield["labels"]) != len(set(second_yield["labels"]))
+                    or not REQUIRED_BASE_LABELS.issubset(second_yield["labels"])):
+                fail(f"lane {lane_id}: last_slot_yield must be a table of repo "
+                     "(OWNER/REPO), workflow and unique labels including "
+                     f"{sorted(REQUIRED_BASE_LABELS)}")
+            if lane.get("supervisors", 1) != 2 or yield_workflow is not None:
+                fail(f"lane {lane_id}: last_slot_yield needs supervisors = 2 and "
+                     "no yield_to_workflow")
+            if lane.get("warm_vm") is True:
+                # A warm hand-off reuses the parked VM's own reservation, which
+                # the post-claim release would delete.
+                fail(f"lane {lane_id}: last_slot_yield cannot be combined with warm_vm")
         # Bounded yield: how long this lane's own oldest queued job may wait
         # behind priority demand before the lane stops yielding. 0 keeps the
         # unbounded behavior; the key means nothing without a yield target, and
@@ -3074,7 +3110,9 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
     scan_app = data.get("github_scan_app")
-    if scan_app is not None:
+    # The reader App is installed on Generous-Corp repositories only; a lane on
+    # any other owner keeps scanning on GH_CLI instead of failing closed.
+    if scan_app is not None and str(lane.get("repo", "")).startswith(SCAN_APP_REPO_PREFIX):
         # Read-only App for queue scans; the lane resolves the wrapper itself
         # (providers/tart-macos/runner.sh). References only, never key bytes.
         env.update({
@@ -3204,6 +3242,12 @@ def lane_plist(
     if "yield_to_workflow" in lane:
         env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = lane["yield_to_workflow"]
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
+    second_yield = lane.get("last_slot_yield")
+    if second_yield:
+        env["TARTCI_YIELD_LAST_SLOT_ONLY"] = "1"
+        env["TARTCI_YIELD_TO_REPO"] = second_yield["repo"]
+        env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = second_yield["workflow"]
+        env["TARTCI_YIELD_TO_LABELS"] = ",".join(second_yield["labels"])
     if lane.get("yield_max_wait_seconds"):
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
     if lane.get("claim_rank"):
