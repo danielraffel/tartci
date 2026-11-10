@@ -589,12 +589,11 @@ def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
 # counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
 # TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
 #
-# vm_slot_lending (default off): a non-gate VM lease may use the part of the
-# gate reserve that belongs to the macOS guest slot it occupies. The reserve S
-# is sized for `macos_vm_cap` gate guests; while k non-gate guests hold slots,
-# at most cap - k gate guests can run, so only (cap - k) x S / cap of the
-# reserve is reachable by the gate. The rest is lent to the guests holding the
-# slots, and only to VM leases: agent builds stay within the static budget.
+# vm_slot_lending (default off): the non-gate macOS VM lease that takes the
+# host's LAST guest slot is admitted against the host totals instead of the
+# non-gate budget. All or nothing: while any slot is free for a gate guest,
+# every non-gate lease keeps the static budget (see leases.py, "VM slot
+# lending"). Agent builds always stay within the static budget.
 # TARTCI_VM_SLOT_LENDING (0/1) overrides the file for one shell.
 LEASE_POLICY_DEFAULT_FRESH_SECS = 90
 

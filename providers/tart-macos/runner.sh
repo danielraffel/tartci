@@ -212,6 +212,8 @@ TIER_GROUP_IDS_CONFIG=""
 # Priority-aware idle gate (opt-in; see header). YIELD_WORKFLOW empty = OFF.
 YIELD_WORKFLOW="${TARTCI_YIELD_TO_WORKFLOW_NAME:-}"
 YIELD_LABELS="${TARTCI_YIELD_TO_LABELS:-}"
+# Another repository's priority work (second_slot_yield); empty = this lane's own.
+YIELD_REPO="${TARTCI_YIELD_TO_REPO:-}"
 # Bounded yield (opt-in; see header). 0 = unbounded (today's behavior).
 YIELD_MAX_WAIT="${TARTCI_YIELD_MAX_WAIT_SECONDS:-0}"
 case "$YIELD_MAX_WAIT" in
@@ -1414,7 +1416,7 @@ priority_demand(){
   # required gate. (`local x=$(...)` masks the substitution's exit code, so vars
   # are declared first and assigned separately so `||` actually fires.)
   run_scan_capture python3 "$TARTCI_ROOT/scripts/queue_scan.py" \
-    --repo "$REPO" \
+    --repo "${YIELD_REPO:-$REPO}" \
     --workflow "$YIELD_WORKFLOW" \
     --labels "$YIELD_LABELS" \
     --job-statuses queued,in_progress \

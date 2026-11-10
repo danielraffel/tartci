@@ -113,6 +113,7 @@ LANE_KEYS = {
     "assignment_pre_clone_demand_check", "assignment_fleet_claim_peers",
     "job_claim_labels",
     "runner_idle_timeout_seconds", "yield_to_workflow", "yield_to_labels",
+    "second_slot_yield",
     "yield_max_wait_seconds", "claim_delay_seconds", "claim_delay_peers", "claim_rank",
     "fallback_preferred_hosts",
     "fallback_peer_max_age_seconds",
@@ -1016,6 +1017,31 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: yield_to_labels must be unique and include "
                 f"{sorted(REQUIRED_BASE_LABELS)}"
             )
+        # Second-slot yield: supervisor 2 of a two-supervisor lane yields while
+        # another repository's priority work is queued (fails closed: an
+        # unreadable queue yields). With VM slot lending the second supervisor
+        # is the one that can take a host's last guest slot, so this keeps it
+        # off that slot while a gate job waits. Supervisor 1 is unchanged.
+        second_yield = lane.get("second_slot_yield")
+        if second_yield is not None:
+            if (not isinstance(second_yield, dict)
+                    or set(second_yield) != {"repo", "workflow", "labels"}
+                    or not isinstance(second_yield["repo"], str)
+                    or not REPO.fullmatch(second_yield["repo"])
+                    or not isinstance(second_yield["workflow"], str)
+                    or not second_yield["workflow"].strip()
+                    or any(char in second_yield["workflow"] for char in "\r\n|")
+                    or not isinstance(second_yield["labels"], list)
+                    or not all(isinstance(v, str) and LABEL.fullmatch(v)
+                               for v in second_yield["labels"])
+                    or len(second_yield["labels"]) != len(set(second_yield["labels"]))
+                    or not REQUIRED_BASE_LABELS.issubset(second_yield["labels"])):
+                fail(f"lane {lane_id}: second_slot_yield must be a table of repo "
+                     "(OWNER/REPO), workflow and unique labels including "
+                     f"{sorted(REQUIRED_BASE_LABELS)}")
+            if lane.get("supervisors", 1) != 2 or yield_workflow is not None:
+                fail(f"lane {lane_id}: second_slot_yield needs supervisors = 2 and "
+                     "no yield_to_workflow")
         # Bounded yield: how long this lane's own oldest queued job may wait
         # behind priority demand before the lane stops yielding. 0 keeps the
         # unbounded behavior; the key means nothing without a yield target, and
@@ -3182,6 +3208,11 @@ def lane_plist(
     if "yield_to_workflow" in lane:
         env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = lane["yield_to_workflow"]
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
+    second_yield = lane.get("second_slot_yield")
+    if second_yield and slot == 2:
+        env["TARTCI_YIELD_TO_REPO"] = second_yield["repo"]
+        env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = second_yield["workflow"]
+        env["TARTCI_YIELD_TO_LABELS"] = ",".join(second_yield["labels"])
     if lane.get("yield_max_wait_seconds"):
         env["TARTCI_YIELD_MAX_WAIT_SECONDS"] = str(lane["yield_max_wait_seconds"])
     if lane.get("claim_rank"):

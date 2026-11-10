@@ -73,6 +73,7 @@ class IdleGateFailClosed(unittest.TestCase):
         gh_stub_body: str,
         *,
         yield_labels: str = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+        extra_env: dict | None = None,
     ) -> subprocess.CompletedProcess:
         import stat
         import tempfile
@@ -95,12 +96,38 @@ class IdleGateFailClosed(unittest.TestCase):
             # Idle gate ON so priority_demand actually probes.
             "TARTCI_YIELD_TO_WORKFLOW_NAME": "Build and Test",
             "TARTCI_YIELD_TO_LABELS": yield_labels,
+            **(extra_env or {}),
         }
         return subprocess.run(
             ["bash", str(SCRIPT), "--print-priority-demand",
              "--labels", "self-hosted,macOS,ARM64,pulp-coverage-vm-macos"],
             capture_output=True, text=True, check=False, env=env,
         )
+
+    def test_second_slot_yield_scans_the_other_repository(self) -> None:
+        # A Vellum lane's supervisor 2 yields to Pulp's queue (second_slot_yield):
+        # the probe must ask Pulp, not the lane's own repository.
+        stub = """#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":15000,"remaining":14999}}}' ;;
+  *repos/Generous-Corp/vellum/*workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":7,"name":"Build and Test"}]}' ;;
+  *repos/Generous-Corp/vellum/*) printf '%s\n' '{"workflow_runs":[]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows/99/runs*status=queued*) printf '%s\n' '{"workflow_runs":[{"id":101,"name":"Build and Test","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z"}]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows/99/runs*) printf '%s\n' '{"workflow_runs":[]}' ;;
+  *repos/Generous-Corp/pulp/actions/runs/101/jobs*) printf '%s\n' '{"jobs":[{"id":201,"status":"queued","created_at":"2099-01-01T00:00:00Z","labels":["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm","pulp-build-pr-head"]}]}' ;;
+  *) exit 1 ;;
+esac
+"""
+        labels = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+        lane = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum"}
+        r = self._run(stub, yield_labels=labels, extra_env=lane)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0", "control: the lane's own repository is quiet")
+        r = self._run(stub, yield_labels=labels,
+                      extra_env={**lane, "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
 
     def test_gh_error_reports_demand_not_zero(self) -> None:
         # Stub gh exits non-zero (simulates rate-limit / 5xx).

@@ -435,6 +435,20 @@ class VmSlotLendingFitTests(unittest.TestCase):
         self.assertEqual(result["verdict"], "not_now")
         self.assertEqual(result["core_budget"], 6)
 
+    def test_only_a_macos_guest_is_lent_and_parked_guests_count(self) -> None:
+        held = [self.guest("vellum-1", 6)]
+        linux = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60,
+                                   kind="tart-linux-vm")
+        self.assertEqual(linux["verdict"], "not_now")
+        parked = dict(self.guest("parked", 0), memory_only=True)
+        result = lease_fit.evaluate(self.cfg(True), [], cores=6, mem_mb=0, priority=60,
+                                    slot_records=[parked])
+        self.assertEqual(result["core_budget"], 14, "a parked guest holds a slot")
+        parked_gate = dict(self.guest("parked-gate", 0, priority=100), memory_only=True)
+        result = lease_fit.evaluate(self.cfg(True), held, cores=6, mem_mb=0, priority=60,
+                                    slot_records=[*held, parked_gate])
+        self.assertEqual(result["verdict"], "not_now", "a parked gate guest turns lending off")
+
     def test_cap_that_does_not_fit_the_total_reports_the_static_count(self) -> None:
         result = lease_fit.evaluate(self.cfg(True), [], cores=6, mem_mb=0, priority=60)
         self.assertEqual(result["max_concurrent"], 2)

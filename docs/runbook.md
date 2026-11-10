@@ -3214,9 +3214,12 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   reserve S. Everything else is unchanged: a non-gate guest that leaves a slot
   open is held to N, so a gate guest of any size (Pulp 4, forge 6 on m5) finds
   what the static model guarantees; agent builds stay within N; T binds every
-  lease. Only `tart-macos-vm` leases hold slots (Linux and Windows VMs do not),
-  and any live gate-priority lease (a gate guest, or a gate build that holds S
-  without a slot) turns lending off. A lent lease carries
+  lease. Only `tart-macos-vm` leases hold slots (Linux and Windows VMs do not;
+  parked warm VMs do), and any live gate-priority lease (a gate guest, or a gate
+  build that holds S without a slot) turns lending off. The one cost: a
+  gate-priority lease that holds no slot and ARRIVES while lending is open
+  finds only T minus the lent guests, so enable it only on a host that runs no
+  gate-priority builds or Linux VMs (m5). A lent lease carries
   `vm_slot_lending: true`, and its cores are not counted as preemptible `lent`
   cores. `--vm-slot-lending on|off` and `TARTCI_VM_SLOT_LENDING=0|1` override
   the profile; `lease_fit.py` answers with the same rule and reports
@@ -3225,10 +3228,15 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   Vellum supervisor whose VM fills N, so a host with a free slot and an idle
   Pulp queue could not start a second Vellum job (10.9 slot-hours/day idle
   while queued, fleet-wide). The canary profile pairs the key with
-  `supervisors = 2` on the vellum-gate lane. Watch: `vm_slot_lending` leases per
-  day, Vellum queue wait p50, and Pulp `macos` queue wait on the canary host
-  (a Pulp job that arrives while both slots hold Vellum waits for one to end;
-  `rank_vm_waiters` defers the second Vellum lease while a Pulp waiter is live).
+  `supervisors = 2` on the vellum-gate lane and `second_slot_yield` on it:
+  supervisor 2 runs the priority probe (`priority_demand`, fail-closed) against
+  Pulp's `Build and Test` queue and does not boot while any Pulp gate job is
+  queued unassigned anywhere in the fleet, so the lent guest never takes the
+  last slot from a waiting required gate. (`rank_vm_waiters` cannot do this: a
+  lane registers its lease waiter only after it holds a slot reservation.) A
+  Pulp job that arrives after both slots hold Vellum still waits for one of
+  them to end. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
+  and Pulp `macos` queue wait on the canary host.
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with

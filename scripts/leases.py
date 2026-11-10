@@ -764,7 +764,12 @@ def lending_active(records: list[dict[str, Any]], cfg: dict[str, int]) -> bool:
 #     guarantees it (sizes differ per lane: forge-gate leases 6 on m5, Pulp 4);
 #   * any live gate-priority lease turns lending off: one that holds no macOS
 #     slot (a build, a Linux VM) owns part of S, and a gate guest means the
-#     slots are not all non-gate;
+#     slots are not all non-gate. One that ARRIVES while lending is open finds
+#     only T minus the lent guests: that is the one case lending admits a gate
+#     lease less often than the static model, and it is why lending is opt-in
+#     per host (m5 runs no gate-priority builds or Linux VMs). The lane-side
+#     guard (second_slot_yield) keeps the lending guest off the last slot while
+#     a gate guest's job is queued;
 #   * only `tart-macos-vm` leases count as slot holders, and only a new one
 #     can be lent to: Linux and Windows VMs do not take Apple's guest slots.
 # Cores used inside the lent allowance are not "lent" in the dynamic-lending
@@ -1844,7 +1849,9 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         if memory_only:
             record["memory_only"] = True
-        if vm_slot_open and verdict.get("core_limit_class") == "vm_slot_lending":
+        if vm_slot_open and (
+                current_usage["non_gate_used_cores"] + lease_size
+                > max(1, cfg["total"] - cfg["reserved_gate_cores"])):
             # Took the last guest slot under VM slot lending: status and the
             # doctor can tell this lease from one inside the non-gate budget.
             record["vm_slot_lending"] = True
@@ -2206,7 +2213,13 @@ def resize(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         )
         others = [row for row in active if row.get("id") != args.id]
         current_usage = usage(others, cfg)
-        verdict = core_and_memory_verdict(cfg, current_usage, priority, lease_size, req_mem)
+        vm_slot_open = (
+            holds_macos_slot(record.get("command_kind"))
+            and priority < cfg["gate_priority"]
+            and vm_slot_lending_open(others, cfg, adding=1)
+        )
+        verdict = core_and_memory_verdict(cfg, current_usage, priority, lease_size, req_mem,
+                                          vm_slot_open=vm_slot_open)
         core_axis = verdict["total_exceeded"] or verdict["class_exceeded"]
         if core_axis or verdict["mem_exceeded"]:
             write_records(store_dir, active)

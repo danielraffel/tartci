@@ -68,7 +68,12 @@ def evaluate(
     cores: int,
     mem_mb: int | None,
     priority: int,
+    kind: str = leases.MACOS_GUEST_KIND,
+    slot_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """`slot_records` are the records that hold guest slots for VM slot lending
+    (default `active`): acquisition counts parked warm VMs there, so the caller
+    passes them even when it leaves them out of `active`."""
     if cores <= 0:
         raise ValueError("lease cores must be positive")
     req_mem = mem_mb if mem_mb is not None else cores * cfg["per_job_mem_mb"]
@@ -79,7 +84,8 @@ def evaluate(
     by_cores = core_budget // cores
     by_mem = (mem_budget // req_mem) if mem_axis and req_mem > 0 else by_cores
     gate = priority >= cfg["gate_priority"]
-    if not gate and cfg.get("vm_slot_lending"):
+    macos_guest = leases.holds_macos_slot(kind)
+    if not gate and macos_guest and cfg.get("vm_slot_lending"):
         # VM slot lending (leases.py): the lease that takes the last guest slot
         # is held to the host totals. Every guest before it stays in N, so the
         # most that run at once is the slot cap, if the cap's worth fits T.
@@ -88,7 +94,8 @@ def evaluate(
             not mem_axis or cap * req_mem <= cfg["total_mem_mb"])
         if fits_cap and not (never_cores or never_mem):
             by_cores = by_mem = max(min(by_cores, by_mem), cap)
-    slot_open = not gate and leases.vm_slot_lending_open(active, cfg, adding=1)
+    slot_open = not gate and macos_guest and leases.vm_slot_lending_open(
+        active if slot_records is None else slot_records, cfg, adding=1)
     if slot_open:
         core_budget, mem_budget = cfg["total"], cfg["total_mem_mb"]
     current = leases.usage(active, cfg)
@@ -155,6 +162,8 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         help="clamp a non-gate lease to this many cores, as acquisition does")
     parser.add_argument("--no-live", action="store_true",
                         help="ignore live leases (answers only the never/max_concurrent question)")
+    parser.add_argument("--kind", default=leases.MACOS_GUEST_KIND,
+                        help="the VM lease kind asked about (only tart-macos-vm holds a guest slot)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--record", help="also write the verdict here for doctor/status")
     parser.add_argument("--lane", default="", help="lane name stored in the record")
@@ -164,10 +173,12 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
     lease_args = leases.parse_args(["status", *rest])
     cfg = leases.capacity_config(lease_args)
     active: list[dict[str, Any]] = []
+    slot_records: list[dict[str, Any]] = []
     if not ours.no_live:
         store_dir = pathlib.Path(lease_args.store_dir).expanduser()
         records = leases.load_records(store_dir)
         active, _, _ = leases.reclaim(records, int(lease_args.stale_secs))
+        slot_records = list(active)
         # A parked warm VM's memory-only lease yields to real demand (the lane
         # that cannot get memory asks it to; providers/tart-macos/warm-vm.lib.sh),
         # so it must not make a lane skip the very poll that would ask. Its own
@@ -184,7 +195,8 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
             and cores > ours.non_gate_cap
         ):
             cores = ours.non_gate_cap
-        result = evaluate(cfg, active, cores=cores, mem_mb=ours.mem_mb, priority=priority)
+        result = evaluate(cfg, active, cores=cores, mem_mb=ours.mem_mb, priority=priority,
+                          kind=ours.kind, slot_records=slot_records)
         if best is None or RANK[result["verdict"]] < RANK[best["verdict"]] or (
             RANK[result["verdict"]] == RANK[best["verdict"]]
             and result["max_concurrent"] > best["max_concurrent"]

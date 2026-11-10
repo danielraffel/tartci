@@ -402,6 +402,35 @@ class VmSlotLendingTests(LeaseCliTestCase):
         self.assertTrue(body["lease"]["vm_slot_lending"])
         self.assertEqual(body["capacity"]["used_cores"], 12)
 
+    def test_a_parked_guest_upgraded_into_the_last_slot_is_lent_like_an_acquire(self) -> None:
+        self.guest("vellum-1", 6, check=True)
+        parked = self.acquire("warm", 0, priority="vm", capacity=self.T, reserved=self.S,
+                              kind="tart-macos-vm", disk_path=Path(self.tmp.name), mem_mb=4096,
+                              extra_args=("--memory-only", *self.LEND), check=False)
+        self.assertEqual(parked.returncode, 0, parked.stdout)
+        for lend, expected in ((("--vm-slot-lending", "off"), 75), (self.LEND, 0)):
+            proc = self.run_cli("resize", "--id", "warm", "--cores", "6", "--mem-mb", "4096",
+                                "--capacity", str(self.T), "--reserved-gate-cores", str(self.S),
+                                "--capacity-mem-mb", "0", *lend, check=False)
+            self.assertEqual(proc.returncode, expected, proc.stdout)
+
+    def test_a_lease_inside_n_is_not_tagged_as_lent(self) -> None:
+        self.guest("vellum-1", 3, check=True)
+        _, body = self.guest("vellum-2", 3, check=True)
+        self.assertNotIn("vm_slot_lending", body["lease"])
+
+    def test_a_gate_build_arriving_while_lending_is_open_finds_t_minus_the_guests(self) -> None:
+        # Documented cost of lending (leases.py, "VM slot lending"): pinned so a
+        # change to it is a decision, not an accident.
+        self.guest("vellum-1", 6, check=True)
+        self.guest("vellum-2", 6, check=True)
+        denied = self.acquire("gate-build", 4, priority="gate", capacity=self.T,
+                              reserved=self.S, extra_args=self.LEND, check=False)
+        self.assertEqual(denied.returncode, 75)
+        fits = self.acquire("gate-build-2", 2, priority="gate", capacity=self.T,
+                            reserved=self.S, extra_args=self.LEND, check=False)
+        self.assertEqual(fits.returncode, 0)
+
     def test_first_guest_stays_in_the_non_gate_budget(self) -> None:
         # One slot is still open for a gate guest of any size, so nothing of S
         # is lent: a 7-core non-gate guest is over N=6 and is refused.

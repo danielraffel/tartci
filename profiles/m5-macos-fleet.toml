@@ -104,7 +104,7 @@ rank_vm_waiters = true
 # VM slot lending (scripts/leases.py, "VM slot lending"): the Vellum guest that
 # takes this host's LAST guest slot may use the gate reserve, because no gate
 # guest can start while both slots hold Vellum. Paired with a second Vellum
-# supervisor below. Measured 2026-11-09T00:55Z..11-10T00:55Z: Vellum jobs
+# supervisor below, which yields to queued Pulp gate work (second_slot_yield). Measured 2026-11-09T00:55Z..11-10T00:55Z: Vellum jobs
 # queued 96 job-hours while this host had a free slot and its one Vellum lane
 # was busy for 1.8 slot-hours (m5studio 2.8, m1 5.0, m3 1.2: canary here
 # first, as rank_vm_waiters was). Every other lease keeps the static budgets,
@@ -290,6 +290,19 @@ priority = "vm"
 # second takes the last free guest slot (VM slot lending above); with a Pulp
 # guest in the other slot there is no slot for it. docs/runbook.md, "VM slot lending".
 supervisors = 2
+# Supervisor 2 yields while any Pulp gate job is queued unassigned anywhere in
+# the fleet (fails closed), so it never takes the last slot from the required
+# gate; supervisor 1 is unchanged.
+second_slot_yield = { repo = "Generous-Corp/pulp", workflow = "Build and Test", labels = [
+  "self-hosted",
+  "macOS",
+  "ARM64",
+  "pulp-build",
+  "pulp-build-vm",
+  "pulp-gate-fast",
+  "pulp-build-pr-head",
+  "pulp-build-merge-group",
+] }
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
 workflows = ["Locked macOS GPU proof"]
