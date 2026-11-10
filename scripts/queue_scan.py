@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
+from slot_demand import DemandDetail
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     NO_VALID_CREDENTIALS,
@@ -615,6 +616,7 @@ class QueueScanner:
 
         last_backlog_id: int | None = None
         matches = 0
+        detail = DemandDetail()
         matched_job_ids: set[int] = set()
         backlog_id_set = set(backlog_ids)
         for run in candidates:
@@ -673,6 +675,7 @@ class QueueScanner:
                             continue
                         matched_job_ids.add(job_id)
                     run_matches += 1
+                    detail.add(run, job)
             if run_matches:
                 matches += run_matches
                 negative.pop(str(run_id), None)
@@ -686,6 +689,10 @@ class QueueScanner:
         if cursor is None and isinstance(self.state.get("cursor_run_id"), int):
             cursor = self.state["cursor_run_id"]
         self._save_state(cursor, negative)
+        # Slot priority's input: the event class and age of what was counted,
+        # from the runs and jobs read above (no further call).
+        if getattr(self.args, "detail_file", None):
+            detail.write(self.args.detail_file)
         return matches
 
     def scan(self) -> int:
@@ -760,6 +767,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagger-max-seconds", type=int, default=int(os.environ.get("TARTCI_QUEUE_STAGGER_MAX_SECS", "4")))
     parser.add_argument("--negative-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEGATIVE_TTL_SECS", "30")))
     parser.add_argument("--max-age-seconds", type=int, default=0)
+    parser.add_argument(
+        "--detail-file",
+        help="also write the matched jobs' event classes and oldest created_at here "
+        "(scripts/slot_demand.py); makes no extra API call",
+    )
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
     # Off by default: changing what counts as demand is a scheduling decision,

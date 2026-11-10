@@ -598,6 +598,103 @@ inversion count to fall to zero on m5 while the control stays comparable, and
 re-render, restart the supervisors at an idle boundary; stale waiters expire on
 their own within `waiter_fresh_secs`.
 
+## Slot priority (opt-in, off on every host)
+
+Every lane on a host claims a free macOS VM slot first-come (the two-guest cap,
+`macos-vm-cap.lib.sh`). A lane that has just torn its VM down loops straight
+back to a claim, so whichever lanes are already running keep winning. Ranked VM
+lease waiters (above) cannot help: they rank lanes that already hold a slot
+reservation, and the slot itself is taken before any lease is asked for. On
+2026-11-09 the Pulp gate lanes held most slots fleet-wide while Vellum's
+merge-group jobs waited: GitHub's own record for the day puts Vellum
+merge-group job queue wait at p50 634 s and p90 2896 s, against Pulp's p90
+823 s (pulp-planning ledger, "merge-group job queue wait").
+
+`[leases] slot_priority` (`off` | `shadow` | `on`, env `TARTCI_SLOT_PRIORITY`;
+default `off`) ranks the lanes on one host that want the next free slot
+(`scripts/slot_priority.py`, `providers/tart-macos/slot-priority.lib.sh`):
+
+- **Order**: a `merge_group` job of any repository, then other events (push,
+  release, schedule, dispatch), then `pull_request`. A merge-group job can land
+  up to five PRs; a PR-head job only reports on one.
+- **Across repositories, oldest first**: within a class the longest wait ranks
+  first, whatever its repository and whichever lane asked first, so one
+  repository cannot starve another. The wait is the older of the job's GitHub
+  `created_at` and the lane's `waiting_since` (when it began wanting a slot
+  without a break), so a lane refused for a long time keeps ageing even when
+  its scan only sees a newer job.
+- **A lane is ranked by the job it will likely get**: GitHub, not tartci,
+  picks which matching job a new runner takes, likeliest the oldest. A lane
+  whose labels match several classes (vellum-gate) ranks as the class of its
+  OLDEST counted job, so a fresh merge-group job cannot win the slot for an
+  old PR job.
+- **No class starves either**: a lower-class job queued
+  `slot_priority_promote_after_secs` (default 2700, 300-14400) ranks as
+  merge-group.
+- **Ties**: when the lane began waiting, then the lane id (a strict order).
+- **Only lanes that can boot now count**: an intent ahead of this lane holds a
+  slot back only if its VM lease would be admitted on the store's current core
+  and memory budget, counting the intents ahead of it as granted, and (with
+  ranked VM lease waiters on) only if that acquire would not be deferred to a
+  higher-priority live waiter. A lane that defers withdraws its own lease
+  waiter, so it never blocks the lane it yielded to.
+- **Intent lifecycle**: refreshed at the claim point, and while the lane waits
+  for lease capacity (lease-fit `not_now`), because that is exactly when the
+  next freed slot must find it ranked; withdrawn when it claims, when its lease
+  can never fit, and on every path that stops wanting a slot (yields, storage,
+  pool drain, JIT denial, claim-delay backoff, blind scan, unknown inventory).
+  Dead owners and intents not refreshed within 240 s count for nothing. The
+  store lock is taken with a 10 s bound; a timeout claims first-come. A lease
+  wait only keeps an intent the lane already has; it never creates one, and it
+  does not rescan, so after 300 s its class reads `unknown` and it ranks only
+  through its `waiting_since`. Withdrawing the lease waiter on a deferral also
+  gives up the lane's place in the lease-waiter order.
+- **Non-preemptive and within the budgets**: it decides only who takes a FREE
+  slot. It never reads or writes a lease, a reservation or a VM, never stops
+  running work, and changes neither the cap nor any core or memory budget.
+- **Bounded**: in mode `on` an outranked lane does not claim this poll
+  (`slot_priority_deferred`, and a `demand_waiting` sample with
+  `reason=slot_priority`). After `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (default
+  300) of consecutive deferrals it claims anyway (`slot_priority_defer_expired`):
+  the lane it waits for is not taking the slot, and a free slot must not idle.
+- **No extra GitHub call**: the event class and age come from the scan the lane
+  already made. With the knob on, `queue_scan.py` and `assignment_scan.py` get
+  `--detail-file` and write the matched jobs' run `event` and oldest
+  `created_at` beside their count (`<state>/<runner>.slot-demand.<class>.json`).
+  The cross-lane meeting point is the existing lease store
+  (`slot-intents.json` under its lock).
+- **Shadow** records intents and, whenever ranking would have given the slot
+  to another lane, logs `slot_priority_shadow` "would have given slot to
+  `<lane>` (`<repo>` `<class>`)" and claims first-come exactly as with the knob
+  off.
+
+Known limits, so a reading is not over-interpreted:
+
+- A single-label lane (vellum-gate) ranks by the best job it counted, but
+  GitHub, not tartci, picks which matching job its runner gets. A Vellum lane
+  that won the slot for its merge-group job may be handed its PR job instead.
+- An event-class-v2 scan stops at its first witness, so its age is a lower
+  bound on the class's oldest job (`witness_only` in the detail file; the
+  intent records `queued_at_lower_bound`). A single-label scan counts every
+  match, so its age is exact. The `waiting_since` floor bounds the difference.
+- Unknown or stale detail (older than 300 s) ranks with `pull_request`: a lane
+  moves ahead only on evidence.
+- It does not lift Vellum's lease-fit denials. On m5, Vellum leases at `vm` and
+  is held to the non-gate budget ("cores=6 budget=6 used=10"); that is the
+  budget, which this does not change.
+
+### Measuring it
+
+Turn it on in `shadow` on one host first. Count per hour, from the merged lane
+event logs, `slot_priority_shadow` events by `winner_class`/`winner_repo`
+against the control `job_claim` count over the same window (a zero control
+means the logs were not read). Before `on`, compare the metric in the ledger,
+merge-group job queue wait p50/p90 per repository from GitHub's
+`started_at - created_at` for self-hosted macOS jobs of `merge_group` runs, and
+the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
+Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
+the supervisors at an idle boundary; stale intents expire on their own.
+
 ## Fallback lanes without a timer (opt-in, not enabled)
 
 m1's `pulp-gate` lane is the fleet's fallback: `min_queued_age_seconds = 600`
