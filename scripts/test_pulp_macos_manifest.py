@@ -45,6 +45,21 @@ class PulpMacosManifest(unittest.TestCase):
         for key in ("cmake", "ninja", "python", "node", "tart", "clang_format"):
             self.assertRegex(toolchain[key], r"^[0-9]+\.[0-9]+\.[0-9]+$", key)
 
+    def test_generated_toolchain_pins_the_source_revision(self) -> None:
+        # The generated block is copied from the companion Pulp change. Keep
+        # its immutable source revision alongside the digest so a manifest
+        # cannot claim new pins while still resolving the old source commit.
+        self.assertEqual(
+            self.manifest["source"]["commit"],
+            "c368b19e47e334be8a29c59e7108794a5570e3f2",
+        )
+        text = (ROOT / "manifests/pulp.macos.toml").read_text()
+        self.assertIn(
+            "source_sha256 = "
+            "7b695d2cbaf8c4a0eb572c673416b76cd728c23ef50c4126ffb0f621d7926959",
+            text,
+        )
+
     def test_ccache_capacity_preserves_cross_head_warmth(self) -> None:
         self.assertEqual(self.manifest["caches"]["ccache_max"], "40G")
 

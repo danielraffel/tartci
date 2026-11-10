@@ -38,7 +38,7 @@ class PulpMacosReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             changed = Path(temp) / "pulp.macos.toml"
             source = MANIFEST.read_text().replace(
-                'commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"',
+                'commit     = "c368b19e47e334be8a29c59e7108794a5570e3f2"',
                 'commit     = "2222222222222222222222222222222222222222"',
             )
             changed.write_text(source)

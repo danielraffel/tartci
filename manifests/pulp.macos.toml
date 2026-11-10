@@ -16,7 +16,7 @@ disk_gb = 150
 
 [source]
 repository = "https://github.com/Generous-Corp/pulp"
-commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
+commit     = "c368b19e47e334be8a29c59e7108794a5570e3f2"
 manifest   = "tools/deps/manifest.json"
 
 [toolchain]
