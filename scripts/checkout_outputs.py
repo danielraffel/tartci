@@ -105,10 +105,17 @@ def kind_of(name: str) -> str | None:
     return name if name in OUTPUT_KINDS else None
 
 
-def enclosing_checkout(path: pathlib.Path) -> pathlib.Path | None:
-    """The nearest ancestor of `path` that holds a `.git`, within the bound."""
+def enclosing_checkout(path: pathlib.Path,
+                       root: pathlib.Path | None = None) -> pathlib.Path | None:
+    """The nearest ancestor of `path` that holds a `.git`, within the bound.
+
+    Never above `root` (the scan root it was found under): a dotfiles `.git`
+    in the home directory must not vouch for a project that is not in git.
+    """
     current = path.parent
     for _ in range(CHECKOUT_SEARCH_DEPTH):
+        if root is not None and current != root and root not in current.parents:
+            return None
         if os.path.lexists(current / ".git"):
             return current
         if current.parent == current:
@@ -117,26 +124,57 @@ def enclosing_checkout(path: pathlib.Path) -> pathlib.Path | None:
     return None
 
 
+def _inside(path: str, checkout: pathlib.Path) -> bool:
+    spelled = {str(checkout)}
+    try:
+        spelled.add(str(checkout.resolve()))
+    except OSError:
+        pass
+    return any(path == s or path.startswith(s + os.sep) for s in spelled)
+
+
 def checkout_gate(path: pathlib.Path, *, now: float | None = None,
-                  runner: Runner = subprocess.run) -> str | None:
-    """None when `path` may be taken by the short tier, else the reason to keep it."""
+                  runner: Runner = subprocess.run, root: pathlib.Path | None = None,
+                  cwds: list[str] | None | bool = True,
+                  status_cache: dict | None = None) -> str | None:
+    """None when `path` may be taken by the short tier, else the reason to keep it.
+
+    `cwds` is every process cwd on the host (default: ask lsof; None = the
+    table could not be read, which keeps everything). A process whose cwd is
+    inside the checkout is using it, whatever its command line says: a
+    `node dist/index.js` started there reads node_modules without writing it,
+    so neither the build-process scan nor the mtime gate can see it.
+    `status_cache` shares one `git status` per checkout across a pass.
+    """
     now = time.time() if now is None else now
-    checkout = enclosing_checkout(path)
+    checkout = enclosing_checkout(path, root)
     if checkout is None:
         return "not_in_checkout"
     kind, gitdir = tmp_checkouts.gitdir_of(checkout)
     if gitdir is None:
         return f"checkout_{kind}"
+    if cwds is True:
+        cwds = tmp_checkouts.process_cwds(runner)
+    if cwds is None:
+        return "process_scan_unavailable"
+    assert isinstance(cwds, list)
+    if any(_inside(cwd, checkout) for cwd in cwds):
+        return "checkout_in_use"
     relative = os.path.relpath(path, checkout)
     try:
-        tracked = tmp_checkouts._git(checkout, "ls-files", "-z", "--", relative,
-                                     runner=runner)
+        tracked = tmp_checkouts._git(checkout, "--literal-pathspecs", "ls-files", "-z",
+                                     "--", relative, runner=runner)
         if tracked.returncode != 0:
             return "git_unanswered"
         if tracked.stdout.strip("\0"):
             return "tracked_files"
-        status = tmp_checkouts._git(checkout, "status", "--porcelain",
-                                    "--untracked-files=no", runner=runner)
+        key = str(checkout)
+        status = (status_cache or {}).get(key)
+        if status is None:
+            status = tmp_checkouts._git(checkout, "status", "--porcelain",
+                                        "--untracked-files=no", runner=runner)
+            if status_cache is not None:
+                status_cache[key] = status
     except (OSError, subprocess.SubprocessError):
         return "git_unanswered"
     if status.returncode != 0:

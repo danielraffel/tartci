@@ -86,6 +86,32 @@ class CheckoutGateTests(unittest.TestCase):
         backdate(checkout, co.STALE_CHECKOUT_HOURS + 1)
         self.assertIsNone(co.checkout_gate(target))
 
+    def test_a_process_working_in_the_checkout_keeps_it(self) -> None:
+        checkout = make_checkout(self.root)
+        target = make_target(checkout)
+        self.assertEqual(co.checkout_gate(target, cwds=[str(checkout / "src")]),
+                         "checkout_in_use")
+        self.assertEqual(co.checkout_gate(target, cwds=None), "process_scan_unavailable")
+        self.assertIsNone(co.checkout_gate(target, cwds=[str(self.root / "elsewhere")]))
+
+    def test_the_search_stops_at_the_scan_root(self) -> None:
+        make_checkout(self.root, "home")
+        loose = self.root / "home" / "Code" / "project" / "target"
+        loose.mkdir(parents=True)
+        self.assertEqual(co.checkout_gate(loose, root=self.root / "home" / "Code", cwds=[]),
+                         "not_in_checkout")
+        self.assertNotEqual(co.checkout_gate(loose, cwds=[]), "not_in_checkout",
+                            "control: without the bound the home repository vouches for it")
+
+    def test_tracked_files_under_a_bracketed_name_are_found(self) -> None:
+        checkout = make_checkout(self.root)
+        weird = checkout / "build-[x]"
+        weird.mkdir()
+        (weird / "keep.txt").write_text("tracked")
+        git(checkout, "add", "-f", "build-[x]/keep.txt")
+        git(checkout, "commit", "-q", "-m", "track")
+        self.assertEqual(co.checkout_gate(weird, cwds=[]), "tracked_files")
+
     def test_outside_any_checkout_is_kept(self) -> None:
         loose = self.root / "loose" / "target"
         loose.mkdir(parents=True)
@@ -97,7 +123,7 @@ class CheckoutGateTests(unittest.TestCase):
         def broken(argv, **_kwargs):
             return subprocess.CompletedProcess(argv, 128, "", "fatal")
 
-        self.assertEqual(co.checkout_gate(target, runner=broken), "git_unanswered")
+        self.assertEqual(co.checkout_gate(target, runner=broken, cwds=[]), "git_unanswered")
 
     def test_without_tomllib_the_tier_is_off(self) -> None:
         from unittest import mock

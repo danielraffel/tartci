@@ -99,7 +99,10 @@ GENERATED_MARKERS = ("CMakeCache.txt", "build.ninja", "CMakeFiles")
 SOURCE_MARKERS = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
 
 # Command names whose live command lines are scanned for candidate paths.
-BUILD_PROCESS_PATTERN = r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
+BUILD_PROCESS_PATTERN = (r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
+                         # writers and readers of target/ and node_modules/
+                         # (checkout_outputs.py); matching only ever keeps a tree
+                         r"|cargo|rustc|node|npm|pnpm|yarn|bun|deno")
 
 GIB = 1024**3
 
@@ -644,7 +647,6 @@ def classify(
     min_age_days: float,
     active: str | None,
 ) -> tuple[bool, str, float]:
-    kind = checkout_outputs.kind_of(path.name)
     """Decide one candidate. Returns (delete, reason, age_days).
 
     `active` is the live build command lines, or None when that scan failed.
@@ -652,6 +654,7 @@ def classify(
     build is not running, and the whole contract is that deletion requires
     positive proof rather than absence of evidence.
     """
+    kind = checkout_outputs.kind_of(path.name)
     measured = newest_mtime(path)
     if measured is None:
         return False, "unmeasured", 0.0
@@ -1398,8 +1401,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         f"{'fix' if args.fix else 'dry-run'}, min age {min_age}d", force=True)
 
     active = active_command_lines()
-    candidates = (find_candidates(roots, args.maxdepth, output_kinds=True) if outputs
-                  else find_candidates(roots, args.maxdepth))
+    # Only a pressured pass looks for the output kinds, so with no pressure the
+    # walk (and which CMake trees it reaches) is exactly the tier-off walk.
+    candidates = (find_candidates(roots, args.maxdepth, output_kinds=True)
+                  if outputs and pressure else find_candidates(roots, args.maxdepth))
+    tier_cwds: list[str] | None | bool = True
+    tier_status: dict = {}
     progress.emit(f"scanned {len(candidates)} candidate(s)", force=True)
 
     deleted: list[dict[str, Any]] = []
@@ -1419,7 +1426,12 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
         delete, reason, age_days = classify(
             path, now=now, min_age_days=candidate_min_age, active=active)
         if delete and checkout_tier(path, candidate_min_age):
-            refusal = checkout_outputs.checkout_gate(path, now=now)
+            if tier_cwds is True:
+                tier_cwds = tmp_checkouts.process_cwds()
+            scan_root = next((root for root in roots
+                              if root == path or root in path.parents), None)
+            refusal = checkout_outputs.checkout_gate(
+                path, now=now, root=scan_root, cwds=tier_cwds, status_cache=tier_status)
             if refusal is not None and age_days >= short_gate \
                     and checkout_outputs.kind_of(path.name) is None:
                 refusal = None  # old enough for the day tier, which has no checkout gates
