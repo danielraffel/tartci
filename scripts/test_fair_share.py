@@ -18,6 +18,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import fair_share
 
@@ -345,6 +346,81 @@ class ShellClockTests(unittest.TestCase):
         self.assertIn("EVENT fair_share_yield", proc.stdout)
         self.assertIn("yield_to=m5-vellum-gate repo=Generous-Corp/vellum", proc.stdout)
         self.assertIn("HEARTBEAT lease-wait", proc.stdout)
+
+
+class ShippedProfileTests(unittest.TestCase):
+    """m5 is the canary: only its profile turns fair share on."""
+
+    KEY = "fair_share_after_secs = 1800"
+
+    def test_only_m5_turns_it_on_and_the_readers_see_it(self) -> None:
+        import host_profile
+        seen = set()
+        for path in sorted((ROOT / "profiles").glob("*.toml")):
+            text = path.read_text()
+            host = path.name.replace("-macos-fleet.toml", "")
+            self.assertEqual("fair_share_after_secs" in text, host == "m5", path.name)
+            if host != "m5":
+                continue
+            seen.add(host)
+            self.assertIn(self.KEY, text)
+            with tempfile.TemporaryDirectory() as td:
+                installed = Path(td) / "macos-fleet-profile.toml"
+                installed.write_text(text)
+                env = {k: v for k, v in os.environ.items()
+                       if k != "TARTCI_FAIR_SHARE_AFTER_SECS"}
+                env["TARTCI_FLEET_PROFILE"] = str(installed)
+                with mock.patch.dict(os.environ, env, clear=True):
+                    settings = host_profile.lease_policy_settings(str(installed))
+                self.assertEqual(settings["fair_share_after_secs"], AFTER)
+                self.assertTrue(fair_share.enabled(settings))
+                # The shell lanes read the same key through tartci_profile_value.
+                proc = subprocess.run(
+                    ["bash", "-c",
+                     f'TARTCI_ROOT="{ROOT}"; source "{VM_LEASE_LIB}"; '
+                     'tartci_profile_value fair_share_after_secs'],
+                    capture_output=True, text=True, env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(proc.stdout.strip().splitlines()[-1], str(AFTER))
+                # The hosts' stock /usr/bin/python3 (3.9) has no tomllib and
+                # takes the line parser.
+                if Path("/usr/bin/python3").exists():
+                    proc = subprocess.run(
+                        ["/usr/bin/python3", "-c",
+                         "import json,sys; sys.path.insert(0, sys.argv[1]); "
+                         "import host_profile; "
+                         "print(host_profile.lease_policy_settings(sys.argv[2])"
+                         "['fair_share_after_secs'])",
+                         str(ROOT / "scripts"), str(installed)],
+                        capture_output=True, text=True, env=env)
+                    self.assertEqual(proc.returncode, 0, proc.stderr)
+                    self.assertEqual(proc.stdout.strip(), str(AFTER))
+        self.assertEqual(seen, {"m5"}, "control: the m5 profile was read")
+        # Control: a profile without the key reads off.
+        with tempfile.TemporaryDirectory() as td:
+            bare = Path(td) / "p.toml"
+            bare.write_text("[host]\n")
+            off = host_profile.lease_policy_settings(str(bare))
+            self.assertEqual(off["fair_share_after_secs"], 0)
+            self.assertFalse(fair_share.enabled(off))
+
+    def test_the_fleet_validator_accepts_the_shipped_value_and_refuses_out_of_range(self) -> None:
+        if not testing_support.HAVE_TOMLLIB:
+            self.skipTest(testing_support.REASON)
+        import macos_fleet_lanes as fleet
+        path = ROOT / "profiles/m5-macos-fleet.toml"
+        self.assertEqual(fleet.load(path)["leases"]["fair_share_after_secs"], AFTER)
+        body = path.read_text()
+        with tempfile.TemporaryDirectory() as td:
+            bad_path = Path(td) / "m5.toml"
+            for value in ("120", "20000", '"1800"'):
+                bad = body.replace(self.KEY, f"fair_share_after_secs = {value}", 1)
+                self.assertNotEqual(bad, body)
+                bad_path.write_text(bad)
+                with self.assertRaisesRegex(ValueError, "fair_share_after_secs"):
+                    fleet.load(bad_path)
+            bad_path.write_text(body.replace(self.KEY, "fair_share_after_secs = 0", 1))
+            self.assertEqual(fleet.load(bad_path)["leases"]["fair_share_after_secs"], 0)
 
 
 if __name__ == "__main__":
