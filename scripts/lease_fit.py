@@ -20,8 +20,14 @@ at once. A host whose lanes outnumber it has lanes that can only boot while a
 sibling is idle (m5: two gate lanes at 12 cores in a 14-core universe). That is
 also a configuration finding, surfaced by tartci doctor fleet.
 
-Exit codes: 0 fits now, 3 not now, 4 never, 1 could not tell. Callers must treat
-1 as "unknown" and fall back to acquiring as before.
+With fair share on (scripts/fair_share.py) and --repo given, two more answers
+follow the acquire rules: a starved lane is asked about at gate priority, and a
+lane whose lease fits but would displace a starved lane of another repository
+answers `yield`, so it neither scans nor asks Shipyard for a VM it would be
+refused at acquire.
+
+Exit codes: 0 fits now, 3 not now, 4 never, 5 yield (fair share), 1 could not
+tell. Callers must treat 1 as "unknown" and fall back to acquiring as before.
 """
 
 from __future__ import annotations
@@ -37,12 +43,14 @@ import sys
 from typing import Any
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import fair_share  # noqa: E402
 import leases  # noqa: E402
 import macos_runner_identity  # noqa: E402
 
 FITS_NOW = 0
 NOT_NOW = 3
 NEVER = 4
+YIELD = 5
 UNKNOWN = 1
 
 
@@ -167,6 +175,12 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--record", help="also write the verdict here for doctor/status")
     parser.add_argument("--lane", default="", help="lane name stored in the record")
+    parser.add_argument("--repo", default="", help="repository this lane serves (fair share)")
+    parser.add_argument("--demand-since", type=int, default=0,
+                        help="epoch seconds since this lane has had work it could not place")
+    parser.add_argument("--vm-slot-cap", type=int, default=0,
+                        help="VM slots on this host (fair share keeps the last for a starved lane)")
+    parser.add_argument("--waiter-id", default="", help="this lane's own waiter, never ranked against it")
     ours, rest = parser.parse_known_args(argv)
     # Everything else (store dir, role, capacity overrides) is leases.py's own
     # grammar, so the capacity model is the one acquire would use.
@@ -184,9 +198,19 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         # so it must not make a lane skip the very poll that would ask. Its own
         # lane is served by upgrading that lease in place, not by a second one.
         active = [record for record in active if not record.get("memory_only")]
+    live_waiters: list[dict[str, Any]] = []
+    fair = fair_share.enabled(cfg) and bool(ours.repo) and not ours.no_live
+    if fair:
+        waiters, _ = leases.load_waiters(pathlib.Path(lease_args.store_dir).expanduser())
+        live_waiters, _ = leases.live_waiters(waiters, int(cfg["waiter_fresh_secs"]))
     best: dict[str, Any] | None = None
     for raw in ours.priority or ["vm"]:
         priority, _ = leases.parse_priority(raw)
+        if fair:
+            priority = fair_share.promoted_priority(
+                cfg, priority, repo=ours.repo, since=ours.demand_since,
+                active=active, waiters=live_waiters,
+            )
         cores = ours.cores
         if (
             ours.non_gate_cap
@@ -203,7 +227,23 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         ):
             best = result
     assert best is not None
-    rc = {"fits_now": FITS_NOW, "not_now": NOT_NOW, "never": NEVER}[best["verdict"]]
+    if fair and best["verdict"] == "fits_now":
+        mine = {
+            "id": "lease-fit",
+            "lease_size_cores": best["requested_cores"],
+            "lease_size_mem_mb": best["requested_mem_mb"],
+            "priority": best["priority"],
+            "command_kind": "lease-fit-vm",
+        }
+        blocker = leases.fair_share_blocker(
+            cfg, live_waiters, active, [*active, mine], repo=ours.repo,
+            since=ours.demand_since, self_waiter_id=ours.waiter_id,
+            vm_slot_cap=ours.vm_slot_cap,
+        )
+        if blocker is not None:
+            best = dict(best, verdict="yield", yield_to=leases.waiter_summary(blocker))
+    rc = {"fits_now": FITS_NOW, "not_now": NOT_NOW, "never": NEVER,
+          "yield": YIELD}[best["verdict"]]
     if ours.record:
         write_record(pathlib.Path(ours.record), best, ours.lane)
     return best, rc

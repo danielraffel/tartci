@@ -601,6 +601,9 @@ LEASE_POLICY_DEFAULT_FRESH_SECS = 90
 # TARTCI_SLOT_PRIORITY overrides the file for one shell.
 SLOT_PRIORITY_MODES = ("off", "shadow", "on")
 SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS = 2700
+# `fair_share_after_secs` (scripts/fair_share.py): a VM lane that has had work
+# it could not place for this long is ranked ahead of other repositories on the
+# host. 0 (the default) is off. TARTCI_FAIR_SHARE_AFTER_SECS overrides the file.
 
 
 def _parse_leases_table(text: str) -> dict[str, Any]:
@@ -669,6 +672,12 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     promote = table.get("slot_priority_promote_after_secs")
     if type(promote) is not int or promote < 0:
         promote = SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS
+    fair = table.get("fair_share_after_secs")
+    if type(fair) is not int or fair < 0:
+        fair = 0
+    raw = os.environ.get("TARTCI_FAIR_SHARE_AFTER_SECS")
+    if raw is not None and raw.strip().isdigit():
+        fair = int(raw.strip())
     return {
         "rank_vm_waiters": enabled,
         "vm_waiter_fresh_secs": fresh,
@@ -676,6 +685,7 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
         "lease_policy_source": source,
         "slot_priority": slot_priority,
         "slot_priority_promote_after_secs": promote,
+        "fair_share_after_secs": fair,
     }
 
 

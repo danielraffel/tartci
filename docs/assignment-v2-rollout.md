@@ -681,7 +681,7 @@ Known limits, so a reading is not over-interpreted:
   moves ahead only on evidence.
 - It does not lift Vellum's lease-fit denials. On m5, Vellum leases at `vm` and
   is held to the non-gate budget ("cores=6 budget=6 used=10"); that is the
-  budget, which this does not change.
+  budget, which this does not change. Fair share (below) does.
 
 ### Measuring it
 
@@ -694,6 +694,69 @@ merge-group job queue wait p50/p90 per repository from GitHub's
 the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
 Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
 the supervisors at an idle boundary; stale intents expire on their own.
+
+## Fair share between repositories (opt-in, m5 canary)
+
+Every VM lane leases at its repository's priority: Pulp's gate derives 100 (PR
+head) or 110 (merge group), Vellum leases at `vm` (60). Admission and ranked
+waiters both follow that priority, so while Pulp has a steady queue every VM a
+host frees goes back to a Pulp lane. A Vellum lane is held to the non-gate
+budget, so lease_fit answers `not_now` and it never reaches an acquire, never
+registers a waiter, and slot priority (above) cannot rank it. On 2026-11-10 13
+Vellum "Locked macOS GPU proof" runs waited up to four hours this way: m1 and
+m5 refused the lease ("cores=3 budget=3 used=6", "cores=6 budget=6 used=14")
+and m5s had both VM slots held by Pulp.
+
+`[leases] fair_share_after_secs` (0 = off, the default; else 300-14400; env
+`TARTCI_FAIR_SHARE_AFTER_SECS`) makes a lane *starved* once it has had work it
+could not place for that long (`scripts/fair_share.py`):
+
+- **Promotion**: a starved VM lease is admitted at gate priority, against the
+  host budget instead of the non-gate share, but only while another
+  repository holds or waits for a VM on the host. A lane alone on a host is
+  admitted exactly as before.
+- **Yield**: a lane of another repository whose lease would take the cores or
+  memory a starved lane needs, or the last free VM slot it needs
+  (`--vm-slot-cap`), yields. lease_fit answers `yield` (exit 5, event
+  `fair_share_yield`, heartbeat `lease-wait`) so the yielding lane neither scans
+  nor asks Shipyard; acquire defers it (`deferred_to_waiter`) as a backstop.
+- **Order**: among starved lanes of different repositories, the one starved
+  longest goes first. A starved lane is not ranked below another repository's
+  waiter on priority alone.
+- **Within one repository nothing changes**: merge-group above PR-head, the
+  priorities lanes lease at and ranked waiters all stay as they are.
+- **The clock**: per lane, in the supervisor. It starts at the first scan that
+  counts queued work, survives polls that cannot scan (lease_fit `not_now`,
+  blind scans), and resets when the lane is granted a VM
+  (`fair_share_granted`) or a scan finds its queue empty. A starved lane
+  registers or refreshes its lease waiter (with `repo` and `demand_since`)
+  on every poll it cannot place work, which is how other lanes see it. A lane
+  that lease_fit holds at `not_now` from its first poll never scans, so with
+  its clock unstarted it scans once per `TARTCI_FAIR_SHARE_PROBE_SECS`
+  (default 300) to start it (`fair_share_demand_probe`).
+- **Work-conserving**: a starved lane that would not fit even at gate priority
+  blocks nobody. A stale claim corrects itself: whenever a starved waiter holds
+  another lane back, the capacity it needs is free, so its own lease_fit passes
+  and its next scan either places the job or finds the queue empty and drops
+  the waiter.
+
+Known limits: the cost of fairness is paid by the gate. A Pulp job may wait one
+Vellum job's length for a VM after Vellum has waited `fair_share_after_secs`,
+and while a promoted Vellum VM runs it counts as gate use. The clock counts a
+lane's unplaced demand, not each job's age: a lane granted a VM starts again at
+its next unplaced job. A parked warm VM upgraded in place (`leases resize`)
+is not ranked by fair share; it already holds its slot.
+
+### Measuring it
+
+Per host and per repository, from the lane event logs: `fair_share_granted`
+(and its `waited=`), `fair_share_yield`, and the slot wait from the first
+`demand_waiting` or `lease_unfit_now` to the next `job_claim`, against the
+`job_claim` count as the control. From GitHub: Vellum "Locked macOS GPU proof"
+queue wait p50/p90 (`started_at - created_at`) before and after, and the same
+for Pulp's `macos` merge-group jobs, which must not regress beyond one Vellum
+job length. Rollback: delete the key, re-render, restart the lanes at an idle
+boundary; waiters expire on their own.
 
 ## Fallback lanes without a timer (opt-in, not enabled)
 
