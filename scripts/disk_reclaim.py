@@ -187,6 +187,28 @@ def foreground_while(receipt: dict[str, Any]) -> Iterator[None]:
             enter_background()
 
 
+@contextlib.contextmanager
+def background_while(receipt: dict[str, Any]) -> Iterator[None]:
+    """Run one step at background priority even when the pass went foreground.
+
+    A pressured pass leaves background to free space sooner, but the checkout
+    sweep (tmp_checkouts.py with its merged rule) is thousands of `git status`
+    calls and `git worktree remove`s on the volume agents are building on; it
+    stays throttled so their builds keep the disk. Its timeouts then keep a
+    checkout, which is the safe direction.
+    """
+    promoted = (receipt.get("mode") == "fix"
+                and str(receipt.get("priority", "")).startswith("foreground"))
+    demoted = promoted and enter_background() == "darwin_background"
+    if demoted:
+        receipt["checkout_sweep_priority"] = "darwin_background"
+    try:
+        yield
+    finally:
+        if demoted:
+            leave_background()
+
+
 def bounded_fs_call(operation: Any, *, description: str,
                     timeout: float = ROOT_PROBE_TIMEOUT_S,
                     pass_deadline: bool = True) -> Any:
@@ -1059,7 +1081,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
     summary["tmp_checkouts"] = ({key: tmp.get(key) for key in (
         "enabled", "reason", "error", "mode", "idle_hours", "checkouts", "removed",
         "removed_bytes", "kept", "deferred", "orphaned_worktrees", "orphaned_paths",
-        "broken_checkouts", "broken_paths", "root", "by_root")}
+        "broken_checkouts", "broken_paths", "root", "by_root", "merged_worktrees")}
         if tmp else None)
     tmp_freed = int(tmp.get("removed_bytes") or 0) if receipt.get("mode") == "fix" else 0
     scratch = receipt.get("scratch_dirs") or report.get("scratch_dirs") or {}
@@ -1101,6 +1123,19 @@ def tmp_checkout_detail(tmp: dict[str, Any] | None) -> str:
         text += f", {tmp['orphaned_worktrees']} orphaned worktrees (not removed)"
     if tmp.get("broken_checkouts"):
         text += f", {tmp['broken_checkouts']} broken .git dirs (not removed)"
+    return text + merged_worktree_detail(tmp.get("merged_worktrees"))
+
+
+def merged_worktree_detail(merged: dict[str, Any] | None) -> str:
+    """"; merged worktrees removed 12 (40.1 GiB), 3 holding work, PR read ok: o/r, 4 branch(es)"."""
+    if not merged or not merged.get("enabled"):
+        return ""
+    text = (f"; merged worktrees removed {merged.get('removed', 0)} "
+            f"({int(merged.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if merged.get("holding_work"):
+        text += f", {merged['holding_work']} holding unpushed work (kept, listed)"
+    if merged.get("pr_lookup") not in (None, "not needed"):
+        text += f", PR read {merged['pr_lookup']}"
     return text
 
 
@@ -1179,6 +1214,20 @@ def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
                     "ts": event["ts"], "event": "pulp_reaper",
                     "detail": f"{run['reaper']} exit {run['exit_code']}",
                     "fields": run}, sort_keys=True) + "\n")
+            merged = (summary.get("tmp_checkouts") or {}).get("merged_worktrees") or {}
+            if merged.get("enabled"):
+                # One metrics line per pass for the merged-worktree rule, so
+                # removals, holds and the PR read can be charted without
+                # unpacking the reclaim_pass event.
+                handle.write(json.dumps({
+                    "ts": event["ts"], "event": "merged_worktrees",
+                    "detail": merged_worktree_detail(merged).lstrip("; "),
+                    "fields": {key: merged.get(key) for key in (
+                        "mode", "roots", "idle_hours", "removed", "removed_bytes",
+                        "holding_work", "pr_lookup", "pr_lookups", "pr_deferred",
+                        "lineage_recorded", "lineage_failed",
+                        "forced_submodule_removals", "pruned", "report_path")}},
+                    sort_keys=True) + "\n")
     except OSError as exc:
         print(f"disk_reclaim: could not write the reclaim receipt under {directory}: {exc}",
               file=stream)
@@ -1515,10 +1564,21 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # gates). A live build naming one protects it, exactly as for build dirs;
     # an unreadable process table protects all of them.
     progress.emit("stale checkouts: checking the fleet profile", force=True)
-    tmp = tmp_checkouts.run(
-        fix=args.fix, profile=pulp_reapers.default_profile_path(),
-        in_use=None if active is None
-        else (lambda path: names_candidate(active, path_spellings(path))))
+
+    def root_pressured(path: pathlib.Path) -> bool:
+        """The merged-worktree rule's default trigger, judged on the root's own volume."""
+        if pressured(path):
+            return True
+        return pulp_reapers.under_pressure(
+            free_bytes(path), used_percent(path), pressure_free_gb=args.pressure_free_gb,
+            pressure_used_percent=args.pressure_used_percent)
+
+    with background_while(receipt):
+        tmp = tmp_checkouts.run(
+            fix=args.fix, profile=pulp_reapers.default_profile_path(),
+            in_use=None if active is None
+            else (lambda path: names_candidate(active, path_spellings(path))),
+            pressured=root_pressured)
     receipt["tmp_checkouts"] = tmp
     # Test and validation scratch in /private/tmp and the per-user temp dir
     # (scratch_dirs.py): on the boot volume, outside every root above.

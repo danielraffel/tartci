@@ -1856,6 +1856,42 @@ class BackgroundPriorityTests(unittest.TestCase):
                 calls.append("trim")
         self.assertEqual(calls, ["fg", "trim", "bg", "trim"])
 
+    def test_the_checkout_sweep_stays_in_the_background_under_pressure(self) -> None:
+        calls = []
+        with unittest.mock.patch.object(dr, "leave_background",
+                                        side_effect=lambda: calls.append("fg") or True), \
+                unittest.mock.patch.object(dr, "enter_background",
+                                           side_effect=lambda: calls.append("bg")
+                                           or "darwin_background"):
+            pressured = {"mode": "fix", "priority": "foreground: a volume is under pressure"}
+            with dr.background_while(pressured):
+                calls.append("sweep")
+            # Already background, or a dry run: nothing to change.
+            for receipt in ({"mode": "fix", "priority": "darwin_background"},
+                            {"mode": "dry-run", "priority": "unchanged: dry-run"}):
+                with dr.background_while(receipt):
+                    calls.append("sweep")
+        self.assertEqual(calls, ["bg", "sweep", "fg", "sweep", "sweep"])
+        self.assertEqual(pressured["checkout_sweep_priority"], "darwin_background")
+
+    def test_the_merged_worktree_rule_writes_a_metrics_line(self) -> None:
+        merged = {"enabled": True, "mode": "pressure", "removed": 2,
+                  "removed_bytes": 3 * dr.GIB, "holding_work": 1,
+                  "pr_lookup": "ok: acme/widget, 1 branch(es)"}
+        receipt = {"started_ts": 1.0, "mode": "fix", "priority": "darwin_background",
+                   "tmp_checkouts": {"enabled": True, "mode": "fix", "removed": 2,
+                                     "merged_worktrees": merged}}
+        with tempfile.TemporaryDirectory() as tmp:
+            args = dr.build_parser().parse_args(["--state-dir", tmp])
+            dr.record_pass(args, receipt, 0, stream=io.StringIO())
+            lines = [json.loads(line) for line in
+                     (pathlib.Path(tmp) / dr.EVENTS_NAME).read_text().splitlines()]
+        events = {line["event"]: line for line in lines}
+        self.assertIn("merged worktrees removed 2 (3.0 GiB)",
+                      events["reclaim_pass"]["detail"])
+        self.assertEqual(events["merged_worktrees"]["fields"]["removed"], 2)
+        self.assertIn("1 holding unpushed work", events["merged_worktrees"]["detail"])
+
     def test_leave_background_restores_normal_priority(self) -> None:
         calls = []
         self.assertTrue(dr.leave_background(lambda *a: calls.append(a)))
