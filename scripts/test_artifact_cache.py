@@ -6,6 +6,8 @@ from __future__ import annotations
 import hashlib
 import os
 import plistlib
+import re
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -324,7 +326,8 @@ class RefreshTests(unittest.TestCase):
         return subprocess.run(
             ["bash", str(SYNC), *args, "--dir", str(self.cache)],
             capture_output=True, text=True, check=False,
-            env={**os.environ, "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base), **(env or {})},
+            env={**os.environ, "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base),
+                 "TARTCI_ARTIFACT_CACHE_RUNNER_SH": "", **(env or {})},
         )
 
     def _tart(self, running: int | None) -> dict:
@@ -595,7 +598,8 @@ class PinnedRefreshTests(unittest.TestCase):
             ["bash", str(SYNC), *args, "--dir", str(self.cache)],
             capture_output=True, text=True, check=False,
             env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
-                 "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base), **(env or {})},
+                 "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.base),
+                 "TARTCI_ARTIFACT_CACHE_RUNNER_SH": "", **(env or {})},
         )
 
     def _refresh(self, **env: str) -> subprocess.CompletedProcess:
@@ -695,6 +699,278 @@ class PinnedRefreshTests(unittest.TestCase):
                 if line and not line.startswith("#")]
         self.assertIn(["Generous-Corp/pulp", "main", "tools/deps/manifest.json", "Skia", "mac-arm64"], rows)
         self.assertTrue(all(len(row) == 5 for row in rows), rows)
+
+
+class RunnerArchiveRefreshTests(unittest.TestCase):
+    """`refresh` keeps the pinned Actions Runner archive in the cache.
+
+    Every gate VM downloaded the runner from GitHub (9 to 14 s) and about 38 a
+    day were thrown away on a GitHub 504 (2026-11-07..09). The pinned url and
+    digest come from runner.sh, the file whose guest code verifies them.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.cache = self.tmp / "cache"
+        origin = self.tmp / "remote/owner/repo.git"
+        origin.mkdir(parents=True)
+        _git("init", "--quiet", "--bare", "-b", "main", str(origin))
+        work = self.tmp / "work"
+        _git("clone", "--quiet", str(origin), str(work))
+        (work / "f").write_text("f")
+        _git("add", "f", cwd=work)
+        _git("commit", "--quiet", "-m", "f", cwd=work)
+        _git("push", "--quiet", "origin", "HEAD:main", cwd=work)
+        subprocess.run(["bash", str(SYNC), "git-sync", "--repo", "owner/repo", "--dir", str(self.cache)],
+                       check=True, capture_output=True,
+                       env={**os.environ, "TARTCI_ARTIFACT_CACHE_GIT_BASE": str(self.tmp / "remote")})
+        self.payload = b"runner-archive-bytes"
+        self.sha = hashlib.sha256(self.payload).hexdigest()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.calls = self.tmp / "curl.calls"
+        curl = self.bin / "curl"
+        curl.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            echo "$*" >> {self.calls}
+            out=""
+            while [ "$#" -gt 0 ]; do [ "$1" = "--output" ] && out="$2"; shift; done
+            [ -n "${{STUB_FAIL:-}}" ] && exit 22
+            printf '%s' "${{STUB_BYTES:-runner-archive-bytes}}" > "$out"
+            """))
+        curl.chmod(0o755)
+        self.runner = self.tmp / "runner.sh"
+        self._runner(f"https://example.invalid/runner.tar.gz {self.sha}")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _runner(self, line: str, code: int = 0) -> None:
+        self.runner.write_text(f"#!/bin/bash\n[ \"$1\" = --print-runner-archive ] || exit 9\n"
+                               f"printf '%s\\n' '{line}'\nexit {code}\n")
+
+    def _refresh(self, **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["bash", str(SYNC), "refresh", "--pins", str(self.tmp / "none.tsv"),
+             "--dir", str(self.cache)],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "PATH": f"{self.bin}:{os.environ['PATH']}",
+                 "TARTCI_ARTIFACT_CACHE_RUNNER_SH": str(self.runner), **env},
+        )
+
+    def _blobs(self) -> list[str]:
+        root = self.cache / "sha256"
+        return sorted(p.name for p in root.iterdir() if not p.name.startswith(".")) if root.exists() else []
+
+    def test_the_pinned_runner_archive_is_added_then_only_reverified(self) -> None:
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(self._blobs(), [self.sha])
+        self.assertEqual((self.cache / "sha256" / self.sha).read_bytes(), self.payload)
+        self.assertIn("https://example.invalid/runner.tar.gz", self.calls.read_text())
+        self.calls.unlink()
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("already present", proc.stdout)
+        self.assertFalse(self.calls.exists(), "an existing blob was downloaded again")
+
+    def test_runner_bytes_that_miss_the_pin_never_land(self) -> None:
+        proc = self._refresh(STUB_BYTES="a 504 error page")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("SHA-256 mismatch", proc.stderr)
+        self.assertEqual(self._blobs(), [])
+
+    def test_a_failed_runner_download_leaves_nothing(self) -> None:
+        proc = self._refresh(STUB_FAIL="1")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("download failed", proc.stderr)
+        self.assertEqual(self._blobs(), [])
+
+    def test_an_unreadable_runner_pin_fails_the_pass_without_downloading(self) -> None:
+        for line, code in (("not an archive line", 0), ("https://x.invalid/a " + "G" * 64, 0),
+                           ("http://x.invalid/a " + self.sha, 0), ("", 1)):
+            with self.subTest(line=line, code=code):
+                self._runner(line, code)
+                proc = self._refresh()
+                self.assertEqual(proc.returncode, 1)
+                self.assertIn("could not read the pinned runner archive", proc.stderr)
+                self.assertEqual(self._blobs(), [])
+                self.assertFalse(self.calls.exists())
+
+    def test_a_host_that_mirrors_nothing_is_untouched(self) -> None:
+        shutil.rmtree(self.cache / "git/owner/repo.git")
+        proc = self._refresh()
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(self._blobs(), [])
+        self.assertFalse(self.calls.exists())
+
+    def test_the_real_pin_is_the_default_archive_the_guest_verifies(self) -> None:
+        source = MAC_JIT.read_text()
+        version = re.search(r"^DEFAULT_RUNNER_VERSION=(\S+)$", source, re.M).group(1)
+        digest = re.search(r"^DEFAULT_RUNNER_SHA256=([0-9a-f]{64})$", source, re.M).group(1)
+        out = subprocess.run(["bash", str(MAC_JIT), "--print-runner-archive"], check=True,
+                             capture_output=True, text=True, cwd=ROOT).stdout.strip()
+        self.assertEqual(out, "https://github.com/actions/runner/releases/download/"
+                              f"v{version}/actions-runner-osx-arm64-{version}.tar.gz {digest}")
+
+    def test_an_override_digest_is_published_lowercase(self) -> None:
+        out = subprocess.run(
+            ["bash", str(MAC_JIT), "--print-runner-archive"], check=True, capture_output=True,
+            text=True, cwd=ROOT,
+            env={**os.environ, "TARTCI_RUNNER_VERSION": "9.8.7", "TARTCI_RUNNER_SHA256": "AB" * 32},
+        ).stdout.strip()
+        self.assertTrue(out.endswith("actions-runner-osx-arm64-9.8.7.tar.gz " + "ab" * 32), out)
+
+
+class GuestRunnerInstallTests(unittest.TestCase):
+    """The in-VM runner install takes the cached archive only when it verifies.
+
+    Runs the real guest script out of runner.sh with a stub curl and a fake
+    Runner.Listener, so the cache path and the download fallback are both
+    exercised end to end.
+    """
+
+    VERSION = "9.9.9"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.home = self.tmp / "home"
+        self.home.mkdir()
+        self.cache = self.tmp / "cache"
+        (self.cache / "sha256").mkdir(parents=True)
+        self.archive = self._tarball(self.VERSION)
+        self.sha = hashlib.sha256(self.archive).hexdigest()
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        self.calls = self.tmp / "curl.calls"
+        self.download = self.tmp / "download.tar.gz"
+        self.download.write_bytes(self.archive)
+        curl = self.bin / "curl"
+        curl.write_text(textwrap.dedent(f"""\
+            #!/bin/bash
+            echo "$*" >> {self.calls}
+            out=""
+            while [ "$#" -gt 0 ]; do [ "$1" = "-o" ] && out="$2"; shift; done
+            [ -z "${{STUB_FAIL:-}}" ] || exit 22
+            cp {self.download} "$out"
+            """))
+        curl.chmod(0o755)
+        source = MAC_JIT.read_text()
+        start = source.index("ensure_runner_version(){")
+        body = source[source.index("<<'GUEST'\n", start) + len("<<'GUEST'\n"):]
+        self.guest = body[:body.index("\nGUEST\n")]
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _tarball(version: str) -> bytes:
+        import io
+        import tarfile
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+            script = f"#!/bin/sh\necho {version}\n".encode()
+            info = tarfile.TarInfo("bin/Runner.Listener")
+            info.size, info.mode = len(script), 0o755
+            tar.addfile(info, io.BytesIO(script))
+        return buf.getvalue()
+
+    def _install(self, cache_dir: str | None = None, sha: str | None = None,
+                 **env: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["/bin/bash", "-s", "--", self.VERSION, (sha or self.sha).upper(), "",
+             "https://example.invalid/runner.tar.gz",
+             str(self.cache) if cache_dir is None else cache_dir],
+            input=self.guest, capture_output=True, text=True, check=False,
+            env={**os.environ, "HOME": str(self.home), "PATH": f"{self.bin}:{os.environ['PATH']}", **env},
+        )
+
+    def _cache(self, data: bytes, name: str | None = None) -> None:
+        (self.cache / "sha256" / (name or self.sha)).write_bytes(data)
+
+    def _installed(self) -> bool:
+        return (self.home / "actions-runner/bin/Runner.Listener").exists()
+
+    def test_a_verified_cached_archive_is_used_without_downloading(self) -> None:
+        self._cache(self.archive)
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=cache", proc.stdout)
+        self.assertIn(f"actions-runner-version={self.VERSION}", proc.stdout)
+        self.assertTrue(self._installed())
+        self.assertFalse(self.calls.exists(), "the guest downloaded despite a cached archive")
+
+    def test_an_absent_cache_entry_falls_back_to_the_download(self) -> None:
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+        self.assertTrue(self.calls.exists())
+        self.assertTrue(self._installed())
+
+    def test_no_mounted_cache_falls_back_to_the_download(self) -> None:
+        self._cache(self.archive)
+        proc = self._install(cache_dir="")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+        self.assertTrue(self.calls.exists())
+
+    def test_a_cached_blob_that_does_not_hash_to_its_name_is_never_installed(self) -> None:
+        self._cache(self._tarball("1.1.1"))
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+        self.assertNotIn("archive=cache", proc.stdout)
+        self.assertTrue(self.calls.exists())
+        self.assertIn(f"actions-runner-version={self.VERSION}", proc.stdout)
+
+    def test_a_bad_cache_and_a_bad_download_still_fail_closed(self) -> None:
+        self._cache(b"rot")
+        self.download.write_bytes(b"a 504 error page")
+        proc = self._install()
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("does not match expected", proc.stderr)
+        self.assertFalse(self._installed())
+
+    def test_an_unreadable_cache_entry_falls_back_to_the_download(self) -> None:
+        # A directory under the digest name: present, but not a readable file.
+        (self.cache / "sha256" / self.sha).mkdir()
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+
+    def test_a_cached_file_the_guest_cannot_read_falls_back_to_the_download(self) -> None:
+        self._cache(self.archive)
+        blob = self.cache / "sha256" / self.sha
+        blob.chmod(0)
+        try:
+            proc = self._install()
+        finally:
+            blob.chmod(0o644)
+        if os.access(blob, os.R_OK) and blob.stat().st_mode & 0o777 == 0 and os.geteuid() == 0:
+            self.skipTest("root reads mode 0 files")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("actions-runner-archive=download", proc.stdout)
+
+    def test_a_current_runner_needs_neither_cache_nor_download(self) -> None:
+        self.assertEqual(self._install().returncode, 0)
+        self.calls.unlink()
+        self._cache(self.archive)
+        proc = self._install()
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("actions-runner-archive", proc.stdout)
+        self.assertFalse(self.calls.exists())
+
+    def test_the_host_hands_the_guest_the_cache_only_when_the_vm_mounted_it(self) -> None:
+        source = MAC_JIT.read_text()
+        start = source.index("ensure_runner_version(){")
+        host = source[start:source.index("<<'GUEST'", start)]
+        self.assertIn('[ "$CURRENT_ARTIFACT_CACHE" != 1 ] || runner_cache_dir="$GUEST_ARTIFACT_CACHE"', host)
+        self.assertIn("'$RUNNER_ARCHIVE_URL' '$runner_cache_dir'", host)
+        # The mount is declared before the runner is checked, so the flag is current.
+        self.assertLess(source.index("CURRENT_ARTIFACT_CACHE=1\n  fi\n  tartci_vm_lease_guard_exec"),
+                        source.index("if ! ensure_runner_version"))
 
 
 if __name__ == "__main__":

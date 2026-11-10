@@ -326,6 +326,128 @@ class WorktreeRootGateTests(Fixture):
         self.assertEqual(self.scan(cache=cache)["removed"], 1)
 
 
+class ResumeCursorTests(Fixture):
+    """A pass that runs out of budget resumes after the last checkout it examined."""
+
+    def dirty_clones(self, *names: str) -> None:
+        for name in names:
+            path = self.clone(name)
+            (path / "new.txt").write_text("x")     # kept as dirty, so it stays put
+            age(path, 3)
+
+    def examined_by(self, resume_after, budget_calls: int = 2) -> tuple[list[str], dict]:
+        """Scan with a clock that advances one second per budget check."""
+        examined: list[str] = []
+
+        def runner(argv, **kw):
+            if "status" in argv:
+                examined.append(pathlib.Path(argv[argv.index("-C") + 1]).name)
+            return subprocess.run(argv, **kw)
+        ticks = iter(range(10_000))
+        with mock.patch.object(tc.time, "monotonic", lambda: float(next(ticks))):
+            report = self.scan(runner=runner, budget_s=budget_calls + 0.5,
+                               resume_after=resume_after)
+        return examined, report
+
+    def test_deferred_checkouts_are_reached_first_by_the_next_pass(self) -> None:
+        self.dirty_clones("a", "b", "c", "d")
+        first, report = self.examined_by(None)
+        self.assertEqual(first, ["a", "b"])
+        self.assertEqual((report["deferred"], report["next_cursor"]), (2, "b"))
+        second, report = self.examined_by(report["next_cursor"])
+        self.assertEqual(second, ["c", "d"])          # not a and b again
+        self.assertEqual((report["deferred"], report["next_cursor"]), (2, "d"))
+        third, report = self.examined_by(report["next_cursor"])
+        self.assertEqual(third, ["a", "b"])           # wrapped around
+
+    def test_a_pass_that_reaches_everything_clears_the_cursor(self) -> None:
+        self.dirty_clones("a", "b", "c")
+        examined, report = self.examined_by("a", budget_calls=100)
+        self.assertEqual(examined, ["b", "c", "a"])
+        self.assertEqual((report["deferred"], report["next_cursor"]), (0, None))
+        self.assertEqual(report["resumed_after"], "a")
+
+    def test_a_vanished_cursor_resumes_at_the_next_name(self) -> None:
+        self.dirty_clones("a", "c", "e")
+        examined, report = self.examined_by("b")      # "b" was removed since
+        self.assertEqual(examined, ["c", "e"])
+        self.assertEqual(report["next_cursor"], "e")
+
+    def test_a_pass_that_examines_nothing_keeps_the_previous_cursor(self) -> None:
+        self.dirty_clones("a", "b")
+        examined, report = self.examined_by("a", budget_calls=0)
+        self.assertEqual(examined, [])
+        self.assertEqual(report["next_cursor"], "a")
+
+    @testing_support.requires_tomllib
+    def test_run_persists_the_cursor_between_passes(self) -> None:
+        self.dirty_clones("a", "b", "c", "d")
+        profile = self.base / "profile.toml"
+        profile.write_text("[reclaim]\ntmp_checkouts = true\n")
+        verdicts = self.base / "state" / "verdicts.json"
+        seen: list[list[str]] = []
+        real_scan = tc.scan
+
+        def two_per_pass(root, **kw):
+            examined: list[str] = []
+
+            def runner(argv, **rkw):
+                if "status" in argv:
+                    examined.append(pathlib.Path(argv[argv.index("-C") + 1]).name)
+                return subprocess.run(argv, **rkw)
+            ticks = iter(range(10_000))
+            kw.update(runner=runner, budget_s=2.5)
+            with mock.patch.object(tc.time, "monotonic", lambda: float(next(ticks))):
+                report = real_scan(root, **kw)
+            seen.append(examined)
+            return report
+        with mock.patch.dict(os.environ, {"TARTCI_TMP_CHECKOUT_ROOT": str(self.tmp)}), \
+                mock.patch.object(tc, "process_cwds", return_value=["/"]), \
+                mock.patch.object(tc, "scan", two_per_pass):
+            first = tc.run(fix=True, profile=profile, in_use=lambda p: False,
+                           verdicts=verdicts)
+            tc.run(fix=True, profile=profile, in_use=lambda p: False, verdicts=verdicts)
+        self.assertEqual(seen, [["a", "b"], ["c", "d"]])
+        self.assertEqual(first["by_root"][str(self.tmp)]["next_cursor"], "b")
+        cursors = json.loads((verdicts.parent / tc.CURSORS_FILE).read_text())
+        self.assertEqual(cursors, {str(self.tmp): "d"})
+
+
+class CursorPersistenceTests(Fixture):
+    """When run() keeps, moves or leaves the saved cursor."""
+
+    def run_pass(self, fix: bool, cursors: dict, cwds=("/",)) -> dict:
+        profile = self.base / "profile.toml"
+        profile.write_text("[reclaim]\ntmp_checkouts = true\n")
+        verdicts = self.base / "state" / "verdicts.json"
+        verdicts.parent.mkdir(exist_ok=True)
+        path = verdicts.parent / tc.CURSORS_FILE
+        path.write_text(json.dumps(cursors))
+        with mock.patch.dict(os.environ, {"TARTCI_TMP_CHECKOUT_ROOT": str(self.tmp)}), \
+                mock.patch.object(tc, "process_cwds",
+                                  return_value=list(cwds) if cwds else None):
+            tc.run(fix=fix, profile=profile, in_use=lambda p: False, verdicts=verdicts)
+        return json.loads(path.read_text())
+
+    @testing_support.requires_tomllib
+    def test_a_dry_run_leaves_the_cursor_alone(self) -> None:
+        self.clone("a")
+        self.assertEqual(self.run_pass(False, {str(self.tmp): "zzz"}), {str(self.tmp): "zzz"})
+        self.assertEqual(self.run_pass(True, {str(self.tmp): "zzz"}), {})   # control
+
+    @testing_support.requires_tomllib
+    def test_a_root_this_pass_did_not_scan_keeps_its_cursor(self) -> None:
+        self.clone("a")
+        other = str(self.base / "elsewhere")
+        self.assertEqual(self.run_pass(True, {other: "m"}), {other: "m"})
+
+    @testing_support.requires_tomllib
+    def test_a_blind_pass_keeps_the_cursor(self) -> None:
+        self.clone("a")
+        self.assertEqual(self.run_pass(True, {str(self.tmp): "zzz"}, cwds=None),
+                         {str(self.tmp): "zzz"})
+
+
 class MultiRootTests(Fixture):
     def profile(self, body: str) -> pathlib.Path:
         path = self.base / "profile.toml"

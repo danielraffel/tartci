@@ -117,7 +117,8 @@ class HttpConnectSshRelayTests(unittest.TestCase):
         self.assertIn("HTTP_PROXY=$GUEST_HTTP_PROXY", runner)
         self.assertIn("NO_PROXY=127.0.0.1,localhost,::1", runner)
         self.assertIn(
-            '"bash -s -- \'$RUNNER_VERSION\' \'$RUNNER_SHA256\' \'$GUEST_HTTP_PROXY\'"',
+            "\"bash -s -- '$RUNNER_VERSION' '$RUNNER_SHA256' '$GUEST_HTTP_PROXY' "
+            "'$RUNNER_ARCHIVE_URL' '$runner_cache_dir'\"",
             runner,
         )
         self.assertLess(

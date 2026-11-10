@@ -62,6 +62,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import functools
 import json
@@ -73,7 +74,7 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 import boot_usage
 import pulp_reapers
@@ -117,6 +118,69 @@ PROGRESS_INTERVAL_S = 300.0
 ROOT_PROBE_TIMEOUT_S = 15.0
 PASS_TIMEOUT_S = 900.0
 PASS_DEADLINE: float | None = None
+
+# The hourly pass runs as a macOS background process: low CPU priority on the
+# efficiency cores, throttled disk I/O and network, inherited by every git,
+# du, lsof and ccache child it starts. Its `git status`, `git fetch` and
+# ccache eviction walks share the Workshop volume with the gate VMs, and on m3
+# a pass ran 36 min to 1 h 45 min of every 96: GitHub reads by the steward on
+# that host timed out in 13% of passes while it ran against 5% otherwise, and
+# the VM store read unhealthy twice as often. launchd's LowPriorityIO throttles
+# disk I/O only; this also yields the CPU. A background pass runs longer, and
+# its per-command timeouts then keep a checkout rather than remove it, which
+# is the safe direction. The lease-denial reclaim is not demoted: a VM waits.
+PRIO_DARWIN_PROCESS = 4
+PRIO_DARWIN_BG = 0x1000
+FOREGROUND_ENV = "TARTCI_RECLAIM_FOREGROUND"
+
+
+def enter_background(platform: str | None = None,
+                     environ: Any = None,
+                     setpriority: Any = None) -> str:
+    """Demote this process (and its future children) to macOS background.
+
+    Returns what happened, for the receipt. Never raises: a pass that cannot
+    lower its priority still runs, at the priority launchd gave it.
+    """
+    platform = sys.platform if platform is None else platform
+    environ = os.environ if environ is None else environ
+    setpriority = os.setpriority if setpriority is None else setpriority
+    if platform != "darwin":
+        return "unchanged: not macOS"
+    if environ.get(FOREGROUND_ENV) == "1":
+        return f"unchanged: {FOREGROUND_ENV}=1"
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)
+    except OSError as exc:
+        return f"unchanged: setpriority failed: {exc}"
+    return "darwin_background"
+
+
+def leave_background(setpriority: Any = None) -> bool:
+    """Undo `enter_background` for a step that must not be throttled."""
+    setpriority = os.setpriority if setpriority is None else setpriority
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def foreground_while(receipt: dict[str, Any]) -> Iterator[None]:
+    """Run one step at normal priority, then return to background.
+
+    The gate ccache eviction holds the guard lock that VM boots wait on, and it
+    only runs with no VM up, so throttling it only widens that window.
+    """
+    demoted = receipt.get("priority") == "darwin_background"
+    if demoted:
+        leave_background()
+    try:
+        yield
+    finally:
+        if demoted:
+            enter_background()
 
 
 def bounded_fs_call(operation: Any, *, description: str,
@@ -924,6 +988,7 @@ def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
         # None is "the pass raised"; a receipt must still say it ran and failed.
         "result": "ok" if code == 0 else "failed",
         "mode": receipt.get("mode"),
+        "priority": receipt.get("priority"),
         "pressure": report.get("pressure"),
         "free_bytes_before": report.get("free_bytes_before"),
         "free_bytes_after": report.get("free_bytes_after"),
@@ -1159,7 +1224,9 @@ def main(argv: list[str] | None = None) -> int:
         import denial_reclaim  # noqa: PLC0415 - only this mode needs it
         return denial_reclaim.main([item for item in raw if item != "--on-lease-denial"])
     args = build_parser().parse_args(raw)
-    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run"}
+    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run",
+                               "priority": (enter_background() if args.fix
+                                            else "unchanged: dry-run")}
     code: int | None = None
     try:
         code = _run(args, receipt)
@@ -1261,6 +1328,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
             pressure_used_percent=args.pressure_used_percent)
     }
     pressure = bool(pressured_devices)
+    # A volume below its floor needs space now: reclaim at normal priority.
+    if (pressure or boot_pressure) and receipt.get("priority") == "darwin_background" \
+            and leave_background():
+        receipt["priority"] = "foreground: a volume is under pressure"
 
     def min_age_for(path: pathlib.Path) -> float:
         device = device_id(path)
@@ -1370,8 +1441,10 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
     # Gate ccache entries unused for N days (gate_ccache_trim.py for the
     # gates): only with no VM running or leased, under the guard's lock.
     progress.emit("gate ccache: checking the fleet profile", force=True)
-    gate_ccache = gate_ccache_trim.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
-                                       state_dir=state_dir(args))
+    with foreground_while(receipt):
+        gate_ccache = gate_ccache_trim.run(fix=args.fix,
+                                           profile=pulp_reapers.default_profile_path(),
+                                           state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
     # Which CI and agent paths hold the boot volume, sampled once a day after
     # the reapers above (boot_usage.py). Read-only.
