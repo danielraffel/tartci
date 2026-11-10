@@ -16,8 +16,17 @@ disk_gb = 150
 
 [source]
 repository = "https://github.com/Generous-Corp/pulp"
-commit     = "c368b19e47e334be8a29c59e7108794a5570e3f2"
+commit     = "21fbc9da9214d4e6279fa2e8b4e70df9bed8662a"
 manifest   = "tools/deps/manifest.json"
+
+# The revision of Pulp's tools/toolchain/manifest.toml that the generated
+# toolchain block below was copied from. It is separate from [source]: that
+# pin selects the render dependencies (tools/deps/manifest.json), which must
+# stay the chrome/m153 source shared with pulp.linux.toml.
+[toolchain_source]
+repository = "https://github.com/Generous-Corp/pulp"
+commit     = "c368b19e47e334be8a29c59e7108794a5570e3f2"
+manifest   = "tools/toolchain/manifest.toml"
 
 [toolchain]
 macos_build = "26B123"

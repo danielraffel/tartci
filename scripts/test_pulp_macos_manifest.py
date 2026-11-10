@@ -48,11 +48,20 @@ class PulpMacosManifest(unittest.TestCase):
     def test_generated_toolchain_pins_the_source_revision(self) -> None:
         # The generated block is copied from the companion Pulp change. Keep
         # its immutable source revision alongside the digest so a manifest
-        # cannot claim new pins while still resolving the old source commit.
+        # cannot claim new pins without naming the revision they came from.
+        # That revision lives in [toolchain_source], never in [source]: [source]
+        # selects the render dependencies, and moving it to the toolchain
+        # revision silently changes the baked Skia (c368b19e pins chrome/m158).
+        toolchain_source = self.manifest["toolchain_source"]
         self.assertEqual(
-            self.manifest["source"]["commit"],
+            toolchain_source["commit"],
             "c368b19e47e334be8a29c59e7108794a5570e3f2",
         )
+        self.assertEqual(toolchain_source["manifest"], "tools/toolchain/manifest.toml")
+        self.assertEqual(
+            toolchain_source["repository"], self.manifest["source"]["repository"]
+        )
+        self.assertEqual(self.manifest["source"]["manifest"], "tools/deps/manifest.json")
         text = (ROOT / "manifests/pulp.macos.toml").read_text()
         self.assertIn(
             "source_sha256 = "
