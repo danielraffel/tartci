@@ -90,6 +90,7 @@ HOST_KEYS = {
     "home_volume_floor_mode",
     "vm_dhcp_breaker",
 }
+SCAN_APP_REPO_PREFIX = "Generous-Corp/"
 GITHUB_APP_KEYS = {"id", "private_key_path", "cache_dir"}
 STACKED_IMAGE_KEYS = {
     "enabled", "minimum_macos_major", "minimum_tart_version",
@@ -3069,7 +3070,9 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
         })
     scan_app = data.get("github_scan_app")
-    if scan_app is not None:
+    # The reader App is installed on Generous-Corp repositories only; a lane on
+    # any other owner keeps scanning on GH_CLI instead of failing closed.
+    if scan_app is not None and str(lane.get("repo", "")).startswith(SCAN_APP_REPO_PREFIX):
         # Read-only App for queue scans; the lane resolves the wrapper itself
         # (providers/tart-macos/runner.sh). References only, never key bytes.
         env.update({

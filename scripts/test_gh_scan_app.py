@@ -209,9 +209,21 @@ class ProfileAndCallSiteTests(unittest.TestCase):
                 self.assertEqual(self.validate_path(path).returncode, 0)
                 for lane in data["lane"]:
                     env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+                    if not lane["repo"].startswith("Generous-Corp/"):
+                        self.assertFalse([k for k in env if k.startswith("TARTCI_SCAN_")], lane["repo"])
+                        continue
                     self.assertEqual(env["TARTCI_SCAN_APP_ID"], "5665767")
                     self.assertTrue(env["TARTCI_SCAN_APP_CACHE_DIR"].endswith("ghapp-cache-reader"))
                     self.assertNotEqual(env.get("SHIPYARD_GITHUB_APP_ID"), "5665767")
+
+    def test_lane_outside_reader_app_installation_keeps_gh_cli(self) -> None:
+        data = tomllib.loads(self.profile())
+        lane = dict(data["lane"][0], repo="danielraffel/spectr")
+        env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+        self.assertFalse([k for k in env if k.startswith("TARTCI_SCAN_")])
+        lane = dict(data["lane"][0], repo="Generous-Corp/pulp")
+        env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+        self.assertEqual(env["TARTCI_SCAN_APP_ID"], "5665767")
 
     def validate_path(self, path: Path):
         return subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
