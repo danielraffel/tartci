@@ -27,6 +27,7 @@ import fleet_self_update as su  # noqa: E402
 import keychain_unlock  # noqa: E402
 import signing_prompt_guard as guard  # noqa: E402
 import tartci_support_manifest as support_manifest  # noqa: E402
+import testing_support  # noqa: E402
 
 
 class Host(unittest.TestCase):
@@ -81,12 +82,16 @@ class Host(unittest.TestCase):
 
 
 @unittest.skipUnless(sys.platform == "darwin", "macOS launcher builder")
+@testing_support.requires_tomllib  # the builder refuses an interpreter without tomllib
 class LauncherBuildTests(unittest.TestCase):
     """Exercise the builder's actual render and lane pin validation."""
 
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # The built app bundle and staged generation are read-only; make them
+        # removable first (cleanups run last-in, first-out).
+        self.addCleanup(subprocess.run, ["chmod", "-R", "u+w", self.temp.name], check=False)
         root = Path(self.temp.name)
         source = root / "source"
         source.mkdir()
@@ -121,11 +126,20 @@ class LauncherBuildTests(unittest.TestCase):
                 "--profile", str(self.profile), *extra]
         if python is not None:
             args += ["--python", str(python)]
-        return subprocess.run(
+        result = subprocess.run(
             args,
             env={**os.environ, "TARTCI_PYTHON": "", "TARTCI_RENDER_PYTHON": ""},
             capture_output=True, text=True, check=False,
         )
+        if "ambiguous (matches" in result.stderr:
+            # The builder resolves the identity against the host's real
+            # keychains. A host holding the same Developer ID certificate in
+            # two keychains (login plus the unattended one) makes the lookup
+            # ambiguous before any render logic runs. CI runners and fresh
+            # hosts do not have the certificate, so this is host state, not a
+            # behaviour under test.
+            self.skipTest("signing identity is in more than one keychain on this host")
+        return result
 
     def test_real_render_without_pin_pins_every_lane(self) -> None:
         root = Path(self.temp.name)
