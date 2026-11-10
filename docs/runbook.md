@@ -3205,6 +3205,47 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `leases.json` and expire after `waiter_fresh_secs` (default 90) without a
   refresh or when their owner process exits. Full rules and the canary proxy:
   `docs/assignment-v2-rollout.md`, "Ranked VM lease waiters".
+- **VM slot lending (opt-in, default off; m5 canary)** — `[leases]
+  vm_slot_lending = true` lets the non-gate macOS VM lease that takes the
+  host's LAST guest slot (a second Vellum VM beside the first) be admitted
+  against the host totals T instead of the non-gate budgets N = T - S, on the
+  core and memory axes. While non-gate guests hold every one of the
+  `macos_vm_cap` slots no gate guest can start, so no gate VM can use the gate
+  reserve S. Everything else is unchanged: a non-gate guest that leaves a slot
+  open is held to N, so a gate guest of any size (Pulp 4, forge 6 on m5) finds
+  what the static model guarantees; agent builds stay within N; T binds every
+  lease. Only `tart-macos-vm` leases hold slots (Linux and Windows VMs do not;
+  parked warm VMs do), and any live gate-priority lease (a gate guest, or a gate
+  build that holds S without a slot) turns lending off. The one cost: a
+  gate-priority lease that holds no slot and ARRIVES while lending is open
+  finds only T minus the lent guests, so enable it only on a host that runs no
+  gate-priority builds or Linux VMs (m5). A lent lease carries
+  `vm_slot_lending: true`, and its cores are not counted as preemptible `lent`
+  cores. `--vm-slot-lending on|off` and `TARTCI_VM_SLOT_LENDING=0|1` override
+  the profile; `lease_fit.py` answers with the same rule and reports
+  `max_concurrent` = the slot cap when cap x VM fits T. Why: Vellum's queue is
+  the fleet's longest (96 job-hours queued on 2026-11-09) and each host runs one
+  Vellum supervisor whose VM fills N, so a host with a free slot and an idle
+  Pulp queue could not start a second Vellum job (10.9 slot-hours/day idle
+  while queued, fleet-wide). The canary profile pairs the key with
+  `supervisors = 2` on the vellum-gate lane and `last_slot_yield` on it: when
+  a supervisor's boot would take the host's LAST guest slot (running guests or
+  live slot reservations already hold cap - 1, whoever owns them), it runs the
+  fail-closed priority probe against Pulp's `Build and Test` queue and does not
+  boot while any Pulp gate job is queued unassigned anywhere in the fleet; a
+  claim that filled the last slot without that probe (two supervisors counting
+  at once) probes after the claim and releases the slot on demand
+  (`last_slot_yield_after_claim`). With two slots free it boots as before.
+  (`rank_vm_waiters` cannot do this: a lane registers its lease waiter only
+  after it holds a slot reservation.) Limits, by design: a Pulp job queued in
+  the minute between the probe and the lease, or after both slots hold Vellum,
+  waits for a Vellum job to end; forge-gate and spectr-gate demand is not
+  probed (almost none on m5). The yield also applies beside a Pulp guest, so
+  the last slot goes to Pulp first whenever Pulp work is queued; under a
+  steady Pulp backlog m5's Vellum throughput can fall below the
+  one-supervisor baseline, so the Vellum queue wait on m5 is a canary
+  guardrail. The key cannot be combined with `warm_vm`. Watch: `vm_slot_lending` leases per day, Vellum queue wait p50,
+  and Pulp `macos` queue wait on the canary host.
 - **Slot priority (opt-in, default off)** — `[leases] slot_priority =
   "shadow"` or `"on"` ranks the lanes on a host that want the next FREE macOS
   VM slot: merge_group jobs of any repo, then other events, then pull_request;

@@ -52,6 +52,17 @@ class IdleGateWiringTests(unittest.TestCase):
         self.assertIn('p="$(priority_demand)"', self.body)
         self.assertIn('[ "${p:-0}" -eq 0 ]', self.body)
 
+    def test_a_claim_that_filled_the_last_slot_rechecks_before_booting(self) -> None:
+        # Two supervisors can both count a spare slot and claim; the one whose
+        # claim filled the last slot must probe and release before run_one.
+        boot = self.body.index('CURRENT_RESV="$resv"\n')
+        run = self.body.index('run_one "$i" "$selected_labels" "$selected_tier"', boot)
+        block = self.body[boot:run]
+        self.assertIn('[ "$(last_slot_occupancy)" -ge "$cap" ]', block)
+        self.assertIn("YIELD_LAST_SLOT_ONLY=0 priority_demand", block)
+        self.assertIn('rm -f "$resv"', block)
+        self.assertIn("continue", block)
+
     def test_priority_demand_uses_shared_bounded_scanner(self) -> None:
         self.assertIn('scripts/queue_scan.py"', self.body)
         self.assertIn("--job-statuses queued,in_progress", self.body)
@@ -73,16 +84,19 @@ class IdleGateFailClosed(unittest.TestCase):
         gh_stub_body: str,
         *,
         yield_labels: str = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
+        extra_env: dict | None = None,
+        tart_body: str = "#!/usr/bin/env bash\nexit 0\n",
+        home: Path | None = None,
     ) -> subprocess.CompletedProcess:
         import stat
         import tempfile
         d = tempfile.mkdtemp()
-        tmp = Path(d)
+        tmp = home or Path(d)
         def _exe(name: str, body: str) -> None:
             p = tmp / name
             p.write_text(body, encoding="utf-8")
             p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        _exe("tart", "#!/usr/bin/env bash\nexit 0\n")
+        _exe("tart", tart_body)
         _exe("stubgh", gh_stub_body)
         base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
                 if Path(b).exists()]
@@ -95,12 +109,70 @@ class IdleGateFailClosed(unittest.TestCase):
             # Idle gate ON so priority_demand actually probes.
             "TARTCI_YIELD_TO_WORKFLOW_NAME": "Build and Test",
             "TARTCI_YIELD_TO_LABELS": yield_labels,
+            **(extra_env or {}),
         }
         return subprocess.run(
             ["bash", str(SCRIPT), "--print-priority-demand",
              "--labels", "self-hosted,macOS,ARM64,pulp-coverage-vm-macos"],
             capture_output=True, text=True, check=False, env=env,
         )
+
+    STUB_PULP_DEMAND = """#!/usr/bin/env bash
+case "$*" in
+  *rate_limit*) printf '%s\n' '{"resources":{"core":{"limit":15000,"remaining":14999}}}' ;;
+  *repos/Generous-Corp/vellum/*workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":7,"name":"Build and Test"}]}' ;;
+  *repos/Generous-Corp/vellum/*) printf '%s\n' '{"workflow_runs":[]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows?per_page=100*) printf '%s\n' '{"workflows":[{"id":99,"name":"Build and Test"}]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows/99/runs*status=queued*) printf '%s\n' '{"workflow_runs":[{"id":101,"name":"Build and Test","created_at":"2099-01-01T00:00:00Z","updated_at":"2099-01-01T00:00:00Z"}]}' ;;
+  *repos/Generous-Corp/pulp/actions/workflows/99/runs*) printf '%s\n' '{"workflow_runs":[]}' ;;
+  *repos/Generous-Corp/pulp/actions/runs/101/jobs*) printf '%s\n' '{"jobs":[{"id":201,"status":"queued","created_at":"2099-01-01T00:00:00Z","labels":["self-hosted","macOS","ARM64","pulp-build","pulp-build-vm","pulp-build-pr-head"]}]}' ;;
+  *) exit 1 ;;
+esac
+"""
+    PULP_LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+
+    def test_last_slot_yield_scans_the_other_repository(self) -> None:
+        # A Vellum lane yields to Pulp's queue: the probe asks Pulp, not Vellum.
+        lane = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum"}
+        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=lane)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "0", "control: the lane's own repository is quiet")
+        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS,
+                      extra_env={**lane, "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp"})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "1")
+
+    def test_last_slot_yield_applies_only_when_this_boot_takes_the_last_slot(self) -> None:
+        # Decided from slot occupancy, not from which supervisor is which: a
+        # sibling between its slot claim and its VM holds only a reservation.
+        import json
+        import tempfile
+        import time
+        home = Path(tempfile.mkdtemp())
+        resv = home / ".config" / "tartci" / "macos-vm-reservations"
+        resv.mkdir(parents=True)
+        env = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum",
+               "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp",
+               "TARTCI_YIELD_LAST_SLOT_ONLY": "1"}
+        no_guests = "#!/usr/bin/env bash\n[ \"$1\" = list ] && echo '[]'\nexit 0\n"
+        one_guest = ("#!/usr/bin/env bash\n[ \"$1\" = list ] && echo "
+                     "'[{\"Name\":\"m5-vellum-gate-01-1-1\",\"State\":\"running\",\"Source\":\"local\"}]'\nexit 0\n")
+
+        def demand(tart: str) -> str:
+            r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS,
+                          extra_env=env, tart_body=tart, home=home)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.strip()
+
+        self.assertEqual(demand(no_guests), "0", "both slots free: boot as before")
+        # A sibling that has claimed its slot but has no VM yet.
+        (resv / "resv.sibling").write_text(f"{os.getpid()} {int(time.time())}\n")
+        self.assertEqual(demand(no_guests), "1", "a reservation holds a slot: this boot is the last")
+        (resv / "resv.sibling").unlink()
+        self.assertEqual(demand(one_guest), "1", "a running guest holds a slot")
+        self.assertEqual(demand("#!/usr/bin/env bash\nexit 3\n"), "1",
+                         "an unreadable inventory counts as full")
+        del json
 
     def test_gh_error_reports_demand_not_zero(self) -> None:
         # Stub gh exits non-zero (simulates rate-limit / 5xx).
