@@ -434,6 +434,10 @@ class ProfileValidatorTests(unittest.TestCase):
             self.skipTest(testing_support.REASON)
         import macos_fleet_lanes as fleet
         body = (ROOT / "profiles/m5-macos-fleet.toml").read_text()
+        # The shipped profile carries slot_priority; drop it so each case sets its own.
+        stripped = re.sub(r'(?m)^slot_priority = "on"\n', "", body, count=1)
+        self.assertNotEqual(stripped, body, "control: the shipped key was found")
+        body = stripped
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m5.toml"
             for extra, pattern in (('slot_priority = "shadow"', None),
@@ -453,9 +457,16 @@ class ProfileValidatorTests(unittest.TestCase):
                     with self.assertRaisesRegex(ValueError, pattern):
                         fleet.load(path)
 
-    def test_no_shipped_profile_turns_it_on(self) -> None:
+    def test_the_four_host_profiles_turn_it_on_and_no_other_does(self) -> None:
+        hosts = {"m1", "m3", "m5", "m5studio"}
+        seen = set()
         for path in (ROOT / "profiles").glob("*.toml"):
-            self.assertNotIn("slot_priority", path.read_text(), path.name)
+            has = 'slot_priority = "on"' in path.read_text()
+            host = path.name.replace("-macos-fleet.toml", "")
+            self.assertEqual(has, host in hosts, path.name)
+            if has:
+                seen.add(host)
+        self.assertEqual(seen, hosts, "control: all four host profiles were read")
 
 
 class DemandDetailTests(unittest.TestCase):

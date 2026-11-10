@@ -226,7 +226,8 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertIn(fleet.load(HOST_CONFIGS["m5"])["leases"]["rank_vm_waiters"], (True, False))
         for host, path in HOST_CONFIGS.items():
             if host != "m5":
-                self.assertNotIn("leases", fleet.load(path), host)
+                # Only slot_priority is shipped elsewhere; ranked waiters stay m5-only.
+                self.assertNotIn("rank_vm_waiters", fleet.load(path).get("leases", {}), host)
         body = HOST_CONFIGS["m5"].read_text()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m5.toml"
@@ -239,6 +240,72 @@ class MacosFleetLaneTests(unittest.TestCase):
                 path.write_text(mutated)
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
+
+    def test_last_slot_yield_renders_on_both_supervisors(self) -> None:
+        import plistlib
+        rendered = fleet.rendered_plists(fleet.load(HOST_CONFIGS["m5"]))
+        envs = {name: plistlib.loads(body)["EnvironmentVariables"]
+                for name, body in rendered.items() if ".m5.vellum-gate" in name}
+        slot2 = next(env for name, env in envs.items() if name.endswith(".slot2.plist"))
+        slot1 = next(env for name, env in envs.items() if not name.endswith(".slot2.plist"))
+        for env in (slot1, slot2):
+            self.assertEqual(env["TARTCI_YIELD_TO_REPO"], "Generous-Corp/pulp")
+            self.assertEqual(env["TARTCI_YIELD_TO_WORKFLOW_NAME"], "Build and Test")
+            self.assertIn("pulp-build-merge-group", env["TARTCI_YIELD_TO_LABELS"].split(","))
+            self.assertEqual(env["TARTCI_YIELD_LAST_SLOT_ONLY"], "1")
+        body = HOST_CONFIGS["m5"].read_text()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            for old, new, pattern in (
+                    ('repo = "Generous-Corp/pulp", workflow = "Build and Test", labels',
+                     'repo = "pulp", workflow = "Build and Test", labels', "last_slot_yield must"),
+                    ("supervisors = 2\n# A supervisor whose boot", "supervisors = 1\n# A supervisor whose boot",
+                     "needs supervisors = 2"),
+                    ("supervisors = 2\n# A supervisor whose boot", "supervisors = 2\nwarm_vm = true\n# A supervisor whose boot",
+                     "cannot be combined with warm_vm")):
+                mutated = body.replace(old, new, 1)
+                self.assertNotEqual(mutated, body, f"control: {old!r} was rewritten")
+                path.write_text(mutated)
+                with self.assertRaisesRegex(ValueError, pattern):
+                    fleet.load(path)
+
+    def test_vm_slot_lending_is_a_policed_boolean_on_the_m5_canary(self) -> None:
+        self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["vm_slot_lending"], True)
+        vellum = next(lane for lane in fleet.load(HOST_CONFIGS["m5"])["lane"]
+                      if lane["id"] == "vellum-gate")
+        self.assertEqual(vellum["supervisors"], 2)
+        body = HOST_CONFIGS["m5"].read_text()
+        mutated = re.sub(r"(?m)^vm_slot_lending = \w+$", "vm_slot_lending = 1", body, count=1)
+        self.assertNotEqual(mutated, body, "control: the vm_slot_lending value was rewritten")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(mutated)
+            with self.assertRaisesRegex(ValueError, "vm_slot_lending must be a boolean"):
+                fleet.load(path)
+
+    def test_every_host_profile_turns_slot_priority_on_and_the_reader_sees_it(self) -> None:
+        import host_profile
+        for host, path in HOST_CONFIGS.items():
+            self.assertEqual(fleet.load(path)["leases"]["slot_priority"], "on", host)
+            with tempfile.TemporaryDirectory() as td:
+                installed = Path(td) / "macos-fleet-profile.toml"
+                installed.write_text(path.read_text())
+                settings = host_profile.lease_policy_settings(str(installed))
+            self.assertEqual(settings["slot_priority"], "on", host)
+            self.assertEqual(settings["slot_priority_promote_after_secs"], 2700, host)
+        # Control: a profile without the key reads off.
+        with tempfile.TemporaryDirectory() as td:
+            bare = Path(td) / "p.toml"
+            bare.write_text("[host]\n")
+            self.assertEqual(host_profile.lease_policy_settings(str(bare))["slot_priority"], "off")
+        body = HOST_CONFIGS["m1"].read_text()
+        bad = body.replace('slot_priority = "on"', 'slot_priority = "maybe"', 1)
+        self.assertNotEqual(bad, body)
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m1.toml"
+            path.write_text(bad)
+            with self.assertRaisesRegex(ValueError, "slot_priority"):
+                fleet.load(path)
 
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])

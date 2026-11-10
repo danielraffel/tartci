@@ -63,6 +63,10 @@ def reads_profile(call: str) -> str:
 # "<module>" for a module-level skip or a module-level `if` on tomllib, else
 # "Class.method", "Class" or "function".
 ALLOWED = {
+    ("test_checkout_outputs.py", "ReclaimPassTests.opt_in"):
+        ("3.11-only: [reclaim] checkout_build_outputs is read from the fleet profile with "
+         "tomllib; without it the tier is off "
+         "(CheckoutGateTests.test_without_tomllib_the_tier_is_off)"),
     ("test_denial_reclaim.py",
      "Run.test_a_run_deletes_unreferenced_images_and_evicts_old_ccache"):
         ("3.11-only: reads [host].cache_root from the fleet profile with tomllib; on 3.9 the "
