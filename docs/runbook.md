@@ -3251,7 +3251,9 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   VM slot: merge_group jobs of any repo, then other events, then pull_request;
   longest wait first within a class (the older of the job's `created_at` and
   the lane's continuous `waiting_since`); a lower-class job queued
-  `slot_priority_promote_after_secs` (default 2700) ranks as merge-group. Only
+  `slot_priority_promote_after_secs` (default 2700) ranks as merge-group. With
+  `slot_priority_release_first = true` (on all four hosts) a lane about to
+  serve a queued `pulp-release-tagged` job ranks ahead of all of them. Only
   intents whose VM lease would be admitted now count, and nothing running is
   touched. Shadow logs `slot_priority_shadow` ("would have given slot to ...")
   and still claims first-come; on logs `slot_priority_deferred` and skips the

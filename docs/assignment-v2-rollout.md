@@ -419,7 +419,7 @@ The m1 profile is an explicit exception: it declares only
 merge-group. This keeps the slower 3-core m1 guest out of merge batches while
 the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
-## Release event classes (declared per lane, m5 only)
+## Release event classes (declared on every host's pulp-gate lane)
 
 An event-class-v2 lane may declare the Pulp release classes after its two gate
 tiers. The validator accepts exactly these extras, each with exactly its
@@ -447,7 +447,9 @@ values apply only to registrations carrying the gate base label
 `pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
 `gate`/`vm`.
 
-Only m5's `pulp-gate` lane declares the classes, and one slot is release-first:
+Every host's `pulp-gate` lane declares the classes. Every slot consults
+`pulp-release-tagged` first ("Slot priority", "Release first"), and one slot per
+host puts both release classes first, as m5's slot 2:
 
 ```toml
 assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
@@ -614,7 +616,8 @@ merge-group job queue wait at p50 634 s and p90 2896 s, against Pulp's p90
 default `off`) ranks the lanes on one host that want the next free slot
 (`scripts/slot_priority.py`, `providers/tart-macos/slot-priority.lib.sh`):
 
-- **Order**: a `merge_group` job of any repository, then other events (push,
+- **Order**: a tagged release (with `slot_priority_release_first`, below),
+  then a `merge_group` job of any repository, then other events (push,
   release, schedule, dispatch), then `pull_request`. A merge-group job can land
   up to five PRs; a PR-head job only reports on one.
 - **Across repositories, oldest first**: within a class the longest wait ranks
@@ -682,6 +685,46 @@ Known limits, so a reading is not over-interpreted:
 - It does not lift Vellum's lease-fit denials. On m5, Vellum leases at `vm` and
   is held to the non-gate budget ("cores=6 budget=6 used=10"); that is the
   budget, which this does not change. Fair share (below) does.
+
+### Release first
+
+`[leases] slot_priority_release_first` (boolean, default `false`; env
+`TARTCI_SLOT_PRIORITY_RELEASE_FIRST=0|1`; on in all four host profiles) ranks a
+lane about to serve a tagged release ahead of every other class, including a
+promoted lower class, for the next free slot on its host.
+
+On 2026-11-10 Pulp's release run for v1.99.1 (the first since v1.80.0 able to
+publish) had every build job green and then queued "Smoke darwin-x64", a 40 s
+job, from 11:34Z with no runner. Every host was at its two-VM cap with ~40 min
+PR and merge-group gates. Two things kept it waiting: only one slot per host
+preferred the release class, so when the other slot freed first it took gate
+work; and a release-tier lane ranked as `other` (its run's event is a tag
+`push`), below any merge-group intent on the host.
+
+- **Evidence is the class label**: a release run's event is `push`, so the
+  scan cannot tell it from any other push. The lane's selected registration
+  can: a registration carrying `pulp-release-tagged` (the event-class-v2
+  release class, `scripts/macos_fleet_lanes.py` `V2_EXTRA_CLASS_WORKFLOWS`)
+  can only be handed a tagged-release job. Such a lane ranks as `release`
+  (rank -1, below merge-group's 0, so the starvation promotion never lifts
+  anything past it).
+- **Only on evidence**: a release lane with no fresh scan detail stays
+  `unknown`, as before. The release PR gate (`pulp-release-pr-gate`) is a PR
+  check and keeps its ordinary class.
+- **Unchanged without a release**: no lane carries the label unless a tagged
+  release is what it selected, so with none queued the order is exactly the
+  one above.
+- **Every slot asks for releases first**: each `pulp-gate` slot's
+  `assignment_slot_tier_order` now starts with `pulp-release-tagged` and then
+  keeps its previous order. A slot whose first class has no queued job selects
+  what it did before, so this costs nothing without a release.
+- **Bounded, non-preemptive**: nothing running is stopped; the gate a release
+  displaces waits for the next free slot. A lane deferring to a release still
+  claims after `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (default 300) if the
+  release lane does not take the slot. No slot is reserved for releases.
+
+Rollback: delete the key (and restore the previous slot orders), re-render,
+restart the lanes at an idle boundary.
 
 ### Measuring it
 

@@ -2560,17 +2560,19 @@ class MacosFleetLaneTests(unittest.TestCase):
     # ahead of PR-head to protect merge order.
     RELEASE_FIRST_ORDER = ("pulp-release-tagged,pulp-release-pr-gate,"
                            "pulp-build-merge-group,pulp-build-pr-head")
+    # Every slot consults tagged releases first; the gate-first slot then
+    # keeps merge-group ahead of PR-head and the release PR gate last.
+    TAGGED_THEN_GATES_ORDER = ("pulp-release-tagged,pulp-build-merge-group,"
+                               "pulp-build-pr-head,pulp-release-pr-gate")
     SHIPPED_SLOT_ORDERS = {
-        ".m1.pulp-gate.plist": "pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+        ".m1.pulp-gate.plist": "pulp-release-tagged,pulp-build-pr-head,pulp-release-pr-gate",
         ".m1.pulp-gate.slot2.plist": "pulp-release-tagged,pulp-release-pr-gate,pulp-build-pr-head",
         ".studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
-        ".studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
-                                          "pulp-release-tagged,pulp-release-pr-gate"),
-        ".m5.pulp-gate.plist": None,
+        ".studio.pulp-gate.slot2.plist": TAGGED_THEN_GATES_ORDER,
+        ".m5.pulp-gate.plist": TAGGED_THEN_GATES_ORDER,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
         ".m5studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
-        ".m5studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
-                                             "pulp-release-tagged,pulp-release-pr-gate"),
+        ".m5studio.pulp-gate.slot2.plist": TAGGED_THEN_GATES_ORDER,
     }
 
     def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:
@@ -2583,7 +2585,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertEqual(len(slot2), 1)
         self.assertEqual(
             slot2[0]["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
-            "pulp-build-merge-group,pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+            "pulp-release-tagged,pulp-build-merge-group,pulp-build-pr-head,pulp-release-pr-gate",
         )
 
     def test_slot_tier_orders_are_pinned_exactly_on_every_pulp_gate_slot(self) -> None:
@@ -3485,6 +3487,12 @@ replaces_launchd_labels=REPLACEMENT
         'assignment_slot_tier_order = { 2 = ["pulp-release-tagged", '
         '"pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }'
     )
+    M5_SHIPPED_ORDER = (
+        'assignment_slot_tier_order = { 1 = ["pulp-release-tagged", '
+        '"pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"], '
+        '2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", '
+        '"pulp-build-pr-head"] }'
+    )
     M5_PR_HEAD_TIER = (
         '\n[[lane.tier]]\nlabel = "pulp-build-pr-head"\nworkflow = "Build and Test"\nrunner_group_id = 1\n'
     )
@@ -3499,7 +3507,8 @@ replaces_launchd_labels=REPLACEMENT
         self.assertLess(base.index(self.RELEASE_TIERS), base.index('id = "pulp-release"'))
         # Drop the slot order with its comment block, which ends on that line.
         order_block = re.compile(
-            r"(?m)^# Release-first slot.*\n(?:#.*\n)*" + re.escape(self.RELEASE_FIRST) + r"\n")
+            r"(?m)^# Per-slot class order.*\n(?:#.*\n)*" + re.escape(self.M5_SHIPPED_ORDER)
+            + r"\n")
         self.assertEqual(len(order_block.findall(base)), 1)
         base = order_block.sub("", base.replace(self.RELEASE_TIERS, "", 1), count=1)
         # The first pr-head tier in m5 is the pulp-gate lane's; the release
@@ -3533,10 +3542,11 @@ replaces_launchd_labels=REPLACEMENT
         )
 
     def test_release_classes_are_declared_on_every_host_pulp_gate(self) -> None:
-        """Every host's pulp-gate slots render the four classes, each host has
-        exactly one release-first slot, and its other slot orders both gate
-        classes ahead of both release classes. No other lane but m5's legacy
-        pulp-release controller scans for or registers a release class."""
+        """Every host's pulp-gate slots render the four classes, every slot
+        consults pulp-release-tagged first, each host has exactly one slot
+        that puts both release classes first, and its other slot orders both
+        gate classes ahead of the release PR gate. No other lane but m5's
+        legacy pulp-release controller scans for or registers a release class."""
         release = {"pulp-release-tagged", "pulp-release-pr-gate"}
         seen = 0
         for host_id, config in HOST_CONFIGS.items():
@@ -3566,9 +3576,10 @@ replaces_launchd_labels=REPLACEMENT
                                  if set(order[:2]) == release]
                 self.assertEqual(len(release_first), 1)
                 for slot, order in orders.items():
+                    self.assertEqual(order[0], "pulp-release-tagged", slot)
                     if slot not in release_first:
-                        self.assertEqual(set(order[:len(gate)]), gate)
-                        self.assertEqual(set(order[len(gate):]), release)
+                        self.assertEqual(set(order[1:1 + len(gate)]), gate)
+                        self.assertEqual(order[1 + len(gate):], ["pulp-release-pr-gate"])
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))
         # Publication is an operational flag.  Use published copies of the
         # profile fixtures so this declaration test always covers every host,
