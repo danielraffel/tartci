@@ -13,7 +13,7 @@ the oldest one's `created_at`. A scan that stops at its first witness
 witness, so its age is a lower bound on the class's oldest queued job; it says
 so with `witness_only`.
 
-Python 3.9-safe.
+Compatible with the hosts' Python 3.9.
 """
 from __future__ import annotations
 

@@ -101,12 +101,17 @@ tartci_slot_priority_token(){
 }
 
 tartci_slot_priority_withdraw(){
+  local out=""
   SLOT_PRIORITY_DEFER_SINCE=0
+  # A lane that stopped wanting a slot keeps no class to refresh later.
+  SLOT_PRIORITY_LAST_LABELS=""
   [ "$SLOT_PRIORITY_HAS_INTENT" = 1 ] || return 0
-  SLOT_PRIORITY_HAS_INTENT=0
-  tartci_slot_priority_enabled || return 0
-  python3 "$TARTCI_ROOT/scripts/slot_priority.py" withdraw \
-    --lane "$(tartci_slot_priority_lane_id)" </dev/null >/dev/null 2>&1 || true
+  tartci_slot_priority_enabled || { SLOT_PRIORITY_HAS_INTENT=0; return 0; }
+  out="$(python3 "$TARTCI_ROOT/scripts/slot_priority.py" withdraw --json \
+    --lane "$(tartci_slot_priority_lane_id)" </dev/null 2>/dev/null)" || out=""
+  # Only a confirmed withdraw clears the flag; otherwise the next path that
+  # stops wanting a slot tries again.
+  case "$out" in *'"ok": true'*) SLOT_PRIORITY_HAS_INTENT=0 ;; esac
 }
 
 # Remember that this lane is about to hold an intent. Must run in the
@@ -142,7 +147,10 @@ _tartci_slot_priority_decide(){
 # decide on. Anything else the lease-fit gate says withdraws it.
 tartci_slot_priority_lease_wait(){
   tartci_slot_priority_enabled || return 0
-  if [ "${LEASE_FIT_LAST_VERDICT:-}" = not_now ] && [ -n "$SLOT_PRIORITY_LAST_LABELS" ]; then
+  # Only an intent that already exists is kept; a lease wait proves no demand,
+  # so it never creates one.
+  if [ "${LEASE_FIT_LAST_VERDICT:-}" = not_now ] && [ "$SLOT_PRIORITY_HAS_INTENT" = 1 ] \
+     && [ -n "$SLOT_PRIORITY_LAST_LABELS" ]; then
     _tartci_slot_priority_mark "$SLOT_PRIORITY_LAST_LABELS" "$SLOT_PRIORITY_LAST_TIER"
     _tartci_slot_priority_decide 0 "$SLOT_PRIORITY_LAST_LABELS" "$SLOT_PRIORITY_LAST_TIER" \
       >/dev/null || tartci_slot_priority_withdraw

@@ -19,7 +19,7 @@ Properties covered, each from the side that could break:
   call;
 * the bash glue runs under macOS /bin/bash 3.2 with `set -euo pipefail`.
 
-Python 3.9-safe.
+Compatible with the hosts' Python 3.9.
 """
 from __future__ import annotations
 
@@ -709,6 +709,16 @@ echo "rc=$rc"
         self.assertIn("me-lane", lanes)
         rc, _ = self.gate("on", running=2, preset="", tail=(
             "LEASE_FIT_LAST_VERDICT=never; tartci_slot_priority_lease_wait"))
+        lanes = {row["lane"] for row in json.loads(intents.read_text())}
+        self.assertNotIn("me-lane", lanes)
+
+    def test_a_lease_wait_never_creates_an_intent_after_a_withdraw(self) -> None:
+        self.outrank()
+        intents = self.store / "slot-intents.json"
+        # Registered, then withdrawn (no demand), then a lease wait.
+        self.gate("on", running=2, tail=(
+            "tartci_slot_priority_withdraw; "
+            "LEASE_FIT_LAST_VERDICT=not_now; tartci_slot_priority_lease_wait"))
         lanes = {row["lane"] for row in json.loads(intents.read_text())}
         self.assertNotIn("me-lane", lanes)
 

@@ -644,7 +644,11 @@ default `off`) ranks the lanes on one host that want the next free slot
   can never fit, and on every path that stops wanting a slot (yields, storage,
   pool drain, JIT denial, claim-delay backoff, blind scan, unknown inventory).
   Dead owners and intents not refreshed within 240 s count for nothing. The
-  store lock is taken with a 10 s bound; a timeout claims first-come.
+  store lock is taken with a 10 s bound; a timeout claims first-come. A lease
+  wait only keeps an intent the lane already has; it never creates one, and it
+  does not rescan, so after 300 s its class reads `unknown` and it ranks only
+  through its `waiting_since`. Withdrawing the lease waiter on a deferral also
+  gives up the lane's place in the lease-waiter order.
 - **Non-preemptive and within the budgets**: it decides only who takes a FREE
   slot. It never reads or writes a lease, a reservation or a VM, never stops
   running work, and changes neither the cap nor any core or memory budget.

@@ -37,7 +37,7 @@ The facts an intent carries (event class, oldest queued `created_at`) come
 from the scan the lane already made (scripts/slot_demand.py); this module
 makes no GitHub call.
 
-Python 3.9-safe.
+Compatible with the hosts' Python 3.9.
 """
 from __future__ import annotations
 
