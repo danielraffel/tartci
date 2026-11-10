@@ -366,7 +366,7 @@ silently fall back from `ghapp` to ambient `gh`.
 scans (`assignment_scan.py`) and current-job reads (`current_job_scan.py`) only
 read, so a lane can run them as a separate read-only GitHub App and draw on its
 own rate-limit bucket instead of the Shipyard App's. A host profile declares
-`[github_scan_app]` with `id`, `private_key_path` and `cache_dir` (same
+`[github_scan_app]` (applied only to lanes whose repository is under `Generous-Corp/`, the only owner the reader App is installed on; other lanes keep scanning on `TARTCI_GH_CLI`) with `id`, `private_key_path` and `cache_dir` (same
 host-local path rules as `[github_app]`); the renderer exports
 `TARTCI_SCAN_APP_ID`, `TARTCI_SCAN_APP_PRIVATE_KEY_PATH` and
 `TARTCI_SCAN_APP_CACHE_DIR` (references only), and the provider then runs scans
