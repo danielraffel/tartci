@@ -754,7 +754,10 @@ Vellum job's length for a VM after Vellum has waited `fair_share_after_secs`,
 and while a promoted Vellum VM runs it counts as gate use. The clock counts a
 lane's unplaced demand, not each job's age: a lane granted a VM starts again at
 its next unplaced job. A parked warm VM upgraded in place (`leases resize`)
-is not ranked by fair share; it already holds its slot.
+is not ranked by fair share; it already holds its slot. While a starved lane's
+last-slot yield is lifted, that lane's fail-closed last-slot guard is off for
+its boot by design, so a Pulp gate job may wait one Vellum job length for m5's
+last slot.
 
 ### Measuring it
 
