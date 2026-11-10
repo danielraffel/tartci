@@ -70,7 +70,8 @@ export SCAN_LEDGER="$TMP/scan-calls"
 export TARTCI_ROOT="$ROOT" REPO="Generous-Corp/pulp" GH_CLI="$TMP/write-cli"
 selection="$(sed -n '/^# scan-cli-selection: begin$/,/^# scan-cli-selection: end$/p' \
   "$ROOT/providers/tart-macos/runner.sh")"
-# Control: the markers still bracket the real selection.
+# Control: the markers still bracket the real selection (a literal match).
+# shellcheck disable=SC2016
 case "$selection" in
   *'SCAN_GH_CLI="$TARTCI_ROOT/scripts/gh-scan-app"'*) ;;
   *) fail "scan-cli-selection block not found in runner.sh" ;;
@@ -92,15 +93,14 @@ heartbeat(){ :; }
 run_discover(){
   # Consumed by production functions loaded through eval above.
   # shellcheck disable=SC2034
-  CURRENT_RUN_ID="" CURRENT_JOB_ID="" CURRENT_WORKFLOW_NAME=""
-  CURRENT_JOB_CAPTURE_STATUS="" CURRENT_JOB_RECEIPT=""
-  # shellcheck disable=SC2034
-  CURRENT_JOB_SCAN_SPENT=0 CURRENT_JOB_SCAN_FAILURES=0 CURRENT_JOB_SCAN_NEXT_AT=0
-  # shellcheck disable=SC2034
-  CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0 CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
-  # shellcheck disable=SC2034
-  CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0 CURRENT_ASSIGNMENT_QUARANTINE=none
-  CURRENT_SCAN_PID="" CURRENT_SCAN_TMP=""
+  {
+    CURRENT_RUN_ID="" CURRENT_JOB_ID="" CURRENT_WORKFLOW_NAME=""
+    CURRENT_JOB_CAPTURE_STATUS="" CURRENT_JOB_RECEIPT=""
+    CURRENT_JOB_SCAN_SPENT=0 CURRENT_JOB_SCAN_FAILURES=0 CURRENT_JOB_SCAN_NEXT_AT=0
+    CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0 CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
+    CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0 CURRENT_ASSIGNMENT_QUARANTINE=none
+    CURRENT_SCAN_PID="" CURRENT_SCAN_TMP=""
+  }
   : >"$TMP/scan-calls"; : >"$TMP/mints"; rm -rf "$TMP/cache"
   capture_current_job discover \
     || { sed 's/^/  /' "$EVENTS" >&2; fail "discover scan failed through gh-scan-app"; }
