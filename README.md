@@ -148,7 +148,8 @@ explains how the pieces fit, including GitHub-hosted runners as overflow.
 Run the same checks CI runs before you push:
 
 ```bash
-./scripts/prepush.sh   # lint.sh + unit tests under /usr/bin/python3 (3.9) and python3 + shell tests
+./scripts/prepush.sh          # fast: lint.sh, 3.9 checks, changed modules' tests
+./scripts/prepush.sh --full   # what CI runs: whole suite under 3.9 and python3, shell tests
 ./scripts/lint.sh      # just shellcheck, bash -n, py_compile and TOML parsing
 ```
 

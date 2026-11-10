@@ -1,26 +1,43 @@
 #!/usr/bin/env bash
-# Run what CI runs, before you push. Fails fast and names the CI job that the
-# failing stage maps to, so a red here is the same red the PR would show.
+# Catch what broke agent PRs before CI does. CI is the full run; this is the
+# quick local check.
 #
-# Gates (each mirrors a step of .github/workflows/ci.yml):
-#   lint            ./scripts/lint.sh
-#   python-39-tests the unit tests under /usr/bin/python3 (3.9, no tomllib), the
-#                   fleet hosts' system interpreter, with that 3.9 first on PATH
-#                   so tests that spawn a bare `python3` get it too
-#   lint            the unit tests under the default python3, and tests/test_*.sh
-#                   (the three test gates run concurrently)
+#   scripts/prepush.sh          fast (target: under 3 minutes on an idle host)
+#   scripts/prepush.sh --full   everything the lint and python-39-tests jobs run
+#
+# Fast mode:
+#   lint            ./scripts/lint.sh (shellcheck, bash -n, py_compile, TOML,
+#                   public-path lint)
+#   python-39-tests the interpreter is a tomllib-less 3.9
+#   python-39-tests py_compile of every tracked .py under 3.9
 #   python-floor    py_compile under python3.11 (skipped with a note if absent)
+#   python-39-tests under that 3.9, with it first on PATH as CI does: the 3.9
+#                   skip-allowlist test (test_system_python_tests_run, which
+#                   also flags an unguarded tomllib import), the leak-needles
+#                   test, the public-path lint test, and only the unit-test
+#                   modules that changed against origin/main plus those that
+#                   import a changed module (scripts/prepush_select.py)
 #
-# If the default python3 IS the 3.9, the "lint" unit-test gate repeats the 3.9
-# run and does not exercise CI's newer interpreter; a warning says so.
+# --full adds what the fast mode skips: the whole unit-test suite under 3.9, the
+# whole suite and tests/test_*.sh under the default python3 (concurrently).
+# If the default python3 IS the 3.9, that "lint" run repeats the 3.9 run and a
+# warning says so.
 #
 # scripts/test_prepush_matches_ci.py fails when a command in the lint or
-# python-39-tests job is missing from this script. Bash 3.2 safe.
+# python-39-tests job is missing from the full run, or when the fast mode stops
+# covering a class of failure it exists to catch. Bash 3.2 safe.
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
 PY39="${TARTCI_PREPUSH_PY39:-/usr/bin/python3}"
+BASE="${TARTCI_PREPUSH_BASE:-origin/main}"
 total_start=$SECONDS
+FULL=0
+case "${1:-}" in
+  "") ;;
+  --full) FULL=1 ;;
+  *) echo "usage: scripts/prepush.sh [--full]" >&2; exit 2 ;;
+esac
 
 stage() { # stage <ci-job> <description> <command...>
   local job="$1" desc="$2"; shift 2
@@ -62,10 +79,41 @@ py_floor() {
   git ls-files -z '*.py' | xargs -0 "$py311" -m py_compile
 }
 
+py_compile_39() {
+  git ls-files -z '*.py' | xargs -0 "$PY39" -m py_compile
+}
+
+# Run the fast unit-test selection under the CI-like 3.9 (3.9 first on PATH).
+fast_unit_tests() {
+  local mods=() m
+  mods+=(test_system_python_tests_run test_leak_needles test_public_path_lint)
+  while IFS= read -r m; do
+    [ -n "$m" ] && mods+=("$m")
+  done < <(python3 scripts/prepush_select.py "$BASE")
+  # De-duplicate, keeping order (bash 3.2: no associative arrays).
+  local uniq=() seen=" "
+  for m in "${mods[@]}"; do  # bash32-lint: nonempty seeded with three fixed modules
+    case "$seen" in *" $m "*) continue ;; esac
+    seen="$seen$m "; uniq+=("$m")
+  done
+  echo "unit-test modules: ${uniq[*]}"  # bash32-lint: nonempty one per fixed module
+  mkdir -p "$logdir/bin39" && ln -sf "$PY39" "$logdir/bin39/python3"
+  PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" -m unittest "${uniq[@]}"  # bash32-lint: nonempty one per fixed module
+}
+
 # Cheap, serial gates first: lint, then the interpreter check.
 stage lint "repo lint" ./scripts/lint.sh
 stage python-39-tests "interpreter is a tomllib-less 3.9" require_py39
+stage python-39-tests "py_compile of every tracked .py under $PY39" py_compile_39
 stage python-floor "py_compile under 3.11" py_floor
+
+if [ "$FULL" != 1 ]; then
+  logdir="$(mktemp -d "${TMPDIR:-/tmp}/tartci-prepush.XXXXXX")"
+  trap 'rm -rf "$logdir"' EXIT
+  stage python-39-tests "fast unit tests (allowlist, leak needles, public paths, changed modules)" fast_unit_tests
+  printf '\033[32m✓ prepush (fast) passed in %ss. CI runs the full suite; use --full to match it.\033[0m\n' $((SECONDS - total_start))
+  exit 0
+fi
 
 # The slow gates are independent, so run them concurrently with output held per
 # job; the first failure kills the rest (whole process groups) and prints that

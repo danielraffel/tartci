@@ -5,10 +5,11 @@ Every `run:` step of those jobs is either a command prepush.sh must contain,
 or listed in SETUP_STEPS as CI-runner setup with no local equivalent. A new CI
 step that is in neither fails here, so the two cannot drift silently.
 
-Python 3.9-safe.
+Runs under Python 3.9.
 """
 import os
 import re
+import sys
 import unittest
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
@@ -162,6 +163,58 @@ class PrepushMatchesCiTest(unittest.TestCase):
         self.assertTrue(os.access(PREPUSH, os.X_OK))
         self.assertIn("set -euo pipefail", self.prepush)
         self.assertIn("exit 1", self.prepush)
+
+# The failure classes that put agent PRs red in CI, and what in fast mode
+# catches each. Each gate named here must be wired into the default run, and
+# the module that implements it must exist.
+FAST_CLASSES = {
+    "a negative-test needle shorter than 4 characters": "test_leak_needles",
+    "a tomllib-guarded test missing from the 3.9 skip allowlist": "test_system_python_tests_run",
+    "a hardcoded /Users path failing the public-path lint": "test_public_path_lint",
+}
+
+
+class FastModeCoversTodaysFailureClassesTest(unittest.TestCase):
+    def setUp(self):
+        raw = _read(PREPUSH)
+        self.text = "\n".join(l for l in raw.splitlines() if not l.lstrip().startswith("#"))
+        self.fast = self.text.split('if [ "$FULL" != 1 ]; then', 1)[1].split("\nfi\n", 1)[0]
+        self.serial = self.text.split('if [ "$FULL" != 1 ]; then', 1)[0]
+
+    def test_default_run_is_fast_and_full_is_opt_in(self):
+        self.assertIn('--full) FULL=1', self.text)
+        self.assertIn("exit 0", self.fast)
+        self.assertNotIn("launch ", self.fast)
+
+    def test_fixed_modules_are_in_the_fast_unit_run(self):
+        m = re.search(r"mods\+=\(([^)]*)\)", self.text)
+        self.assertTrue(m, "no fixed module list in fast_unit_tests")
+        fixed = m.group(1).split()
+        for cls, module in FAST_CLASSES.items():
+            self.assertIn(module, fixed, cls)
+            self.assertTrue(os.path.exists(os.path.join(ROOT, "scripts", module + ".py")), module)
+
+    def test_fast_unit_tests_run_under_the_39_interpreter(self):
+        self.assertIn('"$PY39" -m unittest "${uniq[@]}"', self.text)
+        self.assertIn("fast_unit_tests", self.fast)
+
+    def test_serial_gates_cover_lint_interpreter_and_compile(self):
+        self.assertIn('stage lint "repo lint" ./scripts/lint.sh', self.serial)
+        self.assertIn('stage python-39-tests "interpreter is a tomllib-less 3.9" require_py39', self.serial)
+        self.assertIn("py_compile_39", self.serial)
+        self.assertIn('"$PY39" -m py_compile', self.text)
+        self.assertIn('"$py311" -m py_compile', self.text)
+
+    def test_changed_modules_and_their_tests_are_selected(self):
+        # Unguarded tomllib import and a stale assertion in a changed module's
+        # own tests are caught by running that module's tests under 3.9: the
+        # selector must be consulted, against the base ref, in fast mode.
+        self.assertIn('python3 scripts/prepush_select.py "$BASE"', self.text)
+        self.assertIn('BASE="${TARTCI_PREPUSH_BASE:-origin/main}"', self.text)
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import prepush_select
+        self.assertIn("test_prepush_select", prepush_select.select(["scripts/test_prepush_select.py"]))
+        self.assertIn("test_prepush_select", prepush_select.select(["scripts/prepush_select.py"]))
 
 
 if __name__ == "__main__":
