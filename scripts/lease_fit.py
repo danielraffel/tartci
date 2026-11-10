@@ -71,9 +71,9 @@ def evaluate(
     kind: str = leases.MACOS_GUEST_KIND,
     slot_records: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """`slot_records` are the records that hold guest slots for VM slot lending
-    (default `active`): acquisition counts parked warm VMs there, so the caller
-    passes them even when it leaves them out of `active`."""
+    """slot_records are the records that hold guest slots for VM slot lending
+    (default: active). Acquisition counts parked warm VMs there, so the caller
+    passes them even when it leaves them out of active."""
     if cores <= 0:
         raise ValueError("lease cores must be positive")
     req_mem = mem_mb if mem_mb is not None else cores * cfg["per_job_mem_mb"]
