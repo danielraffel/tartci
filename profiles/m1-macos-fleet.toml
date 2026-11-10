@@ -96,6 +96,12 @@ extra_worktree_roots = ["/Users/danielraffel/Code", "/Users/danielraffel/Code/ag
 # and Chrome's code-sign clones (12 h idle, nothing open, no live process
 # naming it; 4 h while the boot volume is below its floor). scripts/scratch_dirs.py
 scratch_dirs = true
+# Build output in agent checkouts (scripts/checkout_outputs.py): under disk
+# pressure only, target/, node_modules/, DerivedData/ and CMake build trees in a
+# clean (or 48 h untouched) checkout, holding no tracked file, idle 4 h. m1's
+# volume fell to 41 GiB free on 2026-11-08 from ~277 GB of such output and
+# refused most VM leases for three days. Rollback: delete this key.
+checkout_build_outputs = true
 # Evict gate ccache entries unused for 14 days, once a day, only while no VM
 # is running or leased (scripts/gate_ccache_trim.py). m1's gate cache held 398k entries and the guard ran out of budget on
 # 8-13% of boots. The m5 canary

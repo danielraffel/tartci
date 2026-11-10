@@ -3343,6 +3343,26 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   starts just after it (wrapping around), so deferred checkouts are reached
   first instead of the same alphabetical head being re-examined every hour.
 
+  Build output in agent checkouts has a short tier of its own
+  (`scripts/checkout_outputs.py`), opt-in with `checkout_build_outputs = true`
+  (and `checkout_build_output_idle_hours`, 1..168, default 4) in `[reclaim]`.
+  On a volume under pressure only, the pass also considers Rust `target/`
+  (`CACHEDIR.TAG`), `node_modules/` (a package-manager lockfile marker) and
+  `DerivedData/` (`info.plist`) and judges them, and the CMake build trees it
+  already knew, idle for hours instead of the pressure tier's days. Everything
+  this tier takes must also lie inside a git checkout, hold no file git
+  tracks, and belong to a checkout that is clean (`git status --porcelain
+  --untracked-files=no`) or untouched for 48 h; git that cannot answer keeps
+  it. Every disk_reclaim gate still applies (no checkout below it, except
+  SwiftPM's clones under `DerivedData/SourcePackages`; no live build naming
+  it; the age re-read just before the delete). The JSON report's
+  `checkout_build_outputs` gives `selected` and `kept` by checkout-gate reason.
+  Why: on m1, 2026-11-06..08, about 277 GB of agent build output under
+  `~/Code` left 41 GiB free and 703 of the pulp-gate lane's 1,215 lease
+  attempts (slot 2: 653 of 1,085) were refused `disk_capacity_exceeded`; the
+  7-day pressure gate could not touch output that was hours or days old.
+  Enabled on m1 and m5, whose code and Tart store share the internal disk.
+
   A `--fix` pass runs as a macOS background process (efficiency cores,
   throttled disk I/O and network, inherited by its git, du, lsof and ccache
   children); the receipt's `priority` says `darwin_background`. It takes
