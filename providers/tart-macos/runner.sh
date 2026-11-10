@@ -654,6 +654,9 @@ configure_workflow_tier_groups
 tartci_assignment_v2_configure
 # Resolve slot priority's mode once, in this shell (slot-priority.lib.sh).
 tartci_slot_priority_load
+# Read the fair-share knob into this shell once (vm-lease.lib.sh); a lookup
+# made only inside $(...) would be repeated on every call.
+tartci_fair_share_enabled || true
 # The retarget is a V2 decision: a legacy or observe lane registers with the
 # tier labels but never consults it, so those lanes stay byte-for-byte unchanged.
 [ "$ASSIGNMENT_MODE" = event-class-v2 ] || ASSIGNMENT_V2_IDLE_RETARGET_SECS=0
@@ -1307,6 +1310,27 @@ tier_queued_work(){
 # Print `count|registration labels|zero-based tier`. A scan error at any tier is
 # fail-closed: never skip a blind higher class and hand its capacity to a lower
 # one. With no tier config this is the legacy single-label queue scan.
+# Fair share (vm-lease.lib.sh): while lease_fit holds this lane at not_now
+# and its demand clock has not started, scan at most once per
+# TARTCI_FAIR_SHARE_PROBE_SECS (default 300) to learn whether it has queued
+# work. Off, or with the clock running, this costs nothing.
+FAIR_SHARE_PROBE_AT=0
+fair_share_demand_probe(){
+  local now selection fq flabels ftier
+  tartci_fair_share_enabled || return 0
+  [ "${LEASE_FIT_LAST_VERDICT:-}" = not_now ] || return 0
+  [ "$TARTCI_FAIR_DEMAND_SINCE" -eq 0 ] || return 0
+  now="$(date +%s)"
+  [ $((now - FAIR_SHARE_PROBE_AT)) -ge "${TARTCI_FAIR_SHARE_PROBE_SECS:-300}" ] || return 0
+  FAIR_SHARE_PROBE_AT="$now"
+  tartci_heartbeat_keepalive_start
+  selection="$(select_work)"
+  tartci_heartbeat_keepalive_stop
+  IFS='|' read -r fq flabels ftier <<< "$selection"
+  tartci_fair_share_demand_seen "$fq" "$flabels"
+  case "$fq" in ''|*[!0-9]*) ;; *) event fair_share_demand_probe "queued=$fq labels=$flabels tier=$ftier" ;; esac
+}
+
 select_work(){
   local tier_labels q tier=0 legacy_selection v2_selection
   if [ "$ASSIGNMENT_MODE" = observe ]; then
@@ -3259,6 +3283,11 @@ if [ "$LOOP" = 1 ]; then
       # A lane whose acquire was denied is still waiting for exactly this
       # capacity: keep its ranked waiter alive (bounded; no-op when off).
       tartci_vm_lease_waiter_hold
+      # Fair share: a lane held off by the lease budget never scans, so its
+      # clock could never start; one throttled scan starts it. A starved lane
+      # then stays visible to other repositories.
+      fair_share_demand_probe
+      tartci_fair_share_wait "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" tart-macos-vm tart-macos
       # Waiting for lease capacity it still wants the next slot, so its slot
       # priority intent stays fresh; a lease that never fits withdraws it.
       tartci_slot_priority_lease_wait
@@ -3333,6 +3362,7 @@ if [ "$LOOP" = 1 ]; then
     blind=0
     reset_blind_restarts
     clear_scan_error
+    tartci_fair_share_demand_seen "$q" "$selected_labels"
     if [ "$r" = unknown ]; then
       tartci_vm_lease_waiter_withdraw
       tartci_slot_priority_withdraw
@@ -3534,7 +3564,8 @@ if [ "$LOOP" = 1 ]; then
       # no demand at all is not.
       case "${q:-0}" in
         0) tartci_vm_lease_waiter_withdraw; tartci_slot_priority_withdraw ;;
-        *) tartci_vm_lease_waiter_hold ;;
+        *) tartci_vm_lease_waiter_hold
+           tartci_fair_share_wait "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" tart-macos-vm tart-macos ;;
       esac
       # The claim counts reservations as well as guests: a sibling lane between
       # its job claim and its VM appearing in `tart list` (admission precheck,

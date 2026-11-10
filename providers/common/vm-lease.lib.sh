@@ -489,6 +489,7 @@ _tartci_vm_lease_acquire_call(){
     --job-id "${GITHUB_RUN_ID:-}" \
     --vm-name "$vm_name" \
     ${waiter_args[@]+"${waiter_args[@]}"} \
+    ${fair_args[@]+"${fair_args[@]}"} \
     --json 2>&1
 }
 
@@ -692,14 +693,82 @@ _tartci_vm_waiters_knob=""
 
 # The knob is read once per supervisor process (a profile change reaches the
 # supervisor with its next restart; the lease store itself reads it per call,
-# and either side alone being on changes nothing).
+# and either side alone being on changes nothing). Fair share keeps waiters
+# too, so either knob turns them on.
 tartci_vm_lease_waiters_enabled(){
   tartci_vm_leases_enabled || return 1
   if [ -z "$_tartci_vm_waiters_knob" ]; then
     _tartci_vm_waiters_knob="$(tartci_profile_value rank_vm_waiters 2>/dev/null)" \
       || _tartci_vm_waiters_knob=False
   fi
-  [ "$_tartci_vm_waiters_knob" = True ]
+  [ "$_tartci_vm_waiters_knob" = True ] || tartci_fair_share_enabled
+}
+
+# -- Fair share between repositories (scripts/fair_share.py) -------------------
+# With `[leases] fair_share_after_secs = N` a lane that has had queued work it
+# could not place for N seconds is starved: the lease store admits it at gate
+# priority and makes other repositories' lanes yield the capacity it needs.
+# The clock is this lane's own. It starts at the first scan that finds queued
+# work, survives polls that cannot scan (lease_fit not_now), and resets when
+# the lane is granted a VM or a scan finds its queue empty. A starved lane keeps
+# a waiter registered every poll it cannot place work, so other repositories
+# see it. Off (the default) none of this runs.
+TARTCI_FAIR_DEMAND_SINCE=0
+TARTCI_FAIR_LAST_LABELS=""
+_tartci_fair_share_knob=""
+
+tartci_fair_share_after_secs(){
+  if [ -z "$_tartci_fair_share_knob" ]; then
+    _tartci_fair_share_knob="$(tartci_profile_value fair_share_after_secs 2>/dev/null)" \
+      || _tartci_fair_share_knob=0
+    case "$_tartci_fair_share_knob" in ''|*[!0-9]*) _tartci_fair_share_knob=0 ;; esac
+  fi
+  printf '%s\n' "$_tartci_fair_share_knob"
+}
+
+tartci_fair_share_enabled(){
+  [ -n "$_tartci_fair_share_knob" ] || _tartci_fair_share_knob="$(tartci_fair_share_after_secs)"
+  [ "$_tartci_fair_share_knob" -gt 0 ] 2>/dev/null
+}
+
+# A scan's queued count for this lane: start the clock on demand, reset it on
+# an empty queue. Anything that is not a count (a blind scan) leaves it as is.
+# Must run in the supervisor's own shell.
+tartci_fair_share_demand_seen(){
+  local queued="$1" labels="${2:-}"
+  tartci_fair_share_enabled || return 0
+  case "$queued" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$queued" -eq 0 ]; then
+    TARTCI_FAIR_DEMAND_SINCE=0
+    return 0
+  fi
+  [ -z "$labels" ] || TARTCI_FAIR_LAST_LABELS="$labels"
+  [ "$TARTCI_FAIR_DEMAND_SINCE" -gt 0 ] || TARTCI_FAIR_DEMAND_SINCE="$(date +%s)"
+}
+
+tartci_fair_share_starved(){
+  tartci_fair_share_enabled || return 1
+  [ "$TARTCI_FAIR_DEMAND_SINCE" -gt 0 ] || return 1
+  [ $(( $(date +%s) - TARTCI_FAIR_DEMAND_SINCE )) -ge "$_tartci_fair_share_knob" ]
+}
+
+# The --repo/--demand-since pair the lease store and lease_fit rank by, one
+# word per line. Nothing without a repository: an unknown repo is never ranked.
+tartci_fair_share_args(){
+  tartci_fair_share_enabled || return 0
+  [ -n "${REPO:-}" ] || return 0
+  printf '%s\n' --repo "$REPO" --demand-since "$TARTCI_FAIR_DEMAND_SINCE"
+}
+
+# A starved lane that could not place its work this poll keeps its waiter
+# registered (and refreshed), whatever stopped it: the slot cap, the lease
+# budget or a deferral. $1 lane id, $2 kind, $3 provider for the VM size.
+tartci_fair_share_wait(){
+  local lane="$1" kind="$2" provider="$3" labels
+  tartci_fair_share_starved || return 0
+  labels="${TARTCI_FAIR_LAST_LABELS:-${LABELS:-}}"
+  tartci_vm_lease_waiter_register "$lane" "$(tartci_vm_lease_cores "$provider")" "$kind" \
+    "$(tartci_vm_lease_priority "$labels")" "$labels" "$(tartci_vm_lease_mem_mb "$provider")"
 }
 
 # $1 lane id, $2 requested cores, $3 kind, $4 lease priority, $5 labels, $6 mem MB.
@@ -712,6 +781,10 @@ tartci_vm_lease_waiter_register(){
     --id "waiter-$lane" --cores "$cores" --mem-mb "$mem_mb" --priority "$priority"
     --kind "$kind" --pid "$$" --lane "$lane" --label "$labels"
   )
+  local fair_arg
+  while IFS= read -r fair_arg; do
+    [ -z "$fair_arg" ] || _tartci_vm_waiter_args+=("$fair_arg")
+  done < <(tartci_fair_share_args)
   if python3 "$TARTCI_ROOT/scripts/leases.py" wait ${_tartci_vm_waiter_args[@]+"${_tartci_vm_waiter_args[@]}"} \
        --json >/dev/null 2>&1; then
     [ "$TARTCI_VM_WAITER_ID" = "waiter-$lane" ] || TARTCI_VM_WAITER_SINCE="$(date +%s)"
@@ -870,8 +943,14 @@ tartci_acquire_vm_lease(){
   local core_args=(--cores "$cores")
   [ "${TARTCI_VM_LEASE_MEMORY_ONLY:-0}" != 1 ] || core_args=(--cores 0 --memory-only)
   TARTCI_LAST_VM_LEASE_DENIAL=""
-  local waiter_args=()
+  local waiter_args=() fair_args=() fair_arg
   [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
+  while IFS= read -r fair_arg; do
+    [ -z "$fair_arg" ] || fair_args+=("$fair_arg")
+  done < <(tartci_fair_share_args)
+  if [ "${#fair_args[@]}" -gt 0 ] && declare -F tartci_effective_cap >/dev/null; then
+    fair_args+=(--vm-slot-cap "$(tartci_effective_cap)")
+  fi
   out="$(_tartci_vm_lease_acquire_call)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
@@ -908,6 +987,16 @@ tartci_acquire_vm_lease(){
   # The store withdrew this lane's waiter with the grant.
   TARTCI_VM_WAITER_ID=""
   TARTCI_VM_WAITER_SINCE=0
+  case "$out" in
+    *'"fair_share_promoted_from"'*)
+      if declare -F event >/dev/null 2>&1; then
+        event fair_share_granted \
+          "demand_since=$TARTCI_FAIR_DEMAND_SINCE waited=$(( $(date +%s) - TARTCI_FAIR_DEMAND_SINCE ))s priority=$priority" \
+          "kind=$kind" "priority=$priority" "lease_cores=$cores"
+      fi ;;
+  esac
+  # A granted VM is a placed job: this lane's fair-share clock starts again.
+  TARTCI_FAIR_DEMAND_SINCE=0
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing

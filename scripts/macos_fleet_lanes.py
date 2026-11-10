@@ -67,6 +67,8 @@ LEASES_KEYS = {
     "rank_vm_waiters", "waiter_fresh_secs",
     # Rank lanes wanting the next free macOS VM slot (scripts/slot_priority.py).
     "slot_priority", "slot_priority_promote_after_secs",
+    # Rank a starved VM lane ahead of other repositories (scripts/fair_share.py).
+    "fair_share_after_secs",
 }
 # Opt-in guest resolvers the runner configures inside each VM before it
 # registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
@@ -692,6 +694,9 @@ def load(path: Path) -> dict:
         promote = lease_policy.get("slot_priority_promote_after_secs", 2700)
         if type(promote) is not int or not 300 <= promote <= 14400:
             fail("leases.slot_priority_promote_after_secs must be an integer from 300 to 14400")
+        fair = lease_policy.get("fair_share_after_secs", 0)
+        if type(fair) is not int or not (fair == 0 or 300 <= fair <= 14400):
+            fail("leases.fair_share_after_secs must be 0 or an integer from 300 to 14400")
     guest_network = data.get("guest_network")
     if guest_network is not None:
         if not isinstance(guest_network, dict):

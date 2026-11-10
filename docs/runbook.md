@@ -3218,6 +3218,15 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
+- **Fair share between repositories (opt-in, default off)**: `[leases]
+  fair_share_after_secs = N` (300-14400). A VM lane with work it could not
+  place for N seconds is admitted at gate priority while another repository
+  uses or waits for a VM on the host, and other repositories' lanes yield it
+  the next VM: lease_fit answers `yield` (exit 5, `fair_share_yield`) and
+  acquire defers (`deferred_to_waiter`). Order within one repository is
+  unchanged. A promoted lease carries `fair_share_promoted_from`; the lane logs
+  `fair_share_granted`. Full rules and limits: `docs/assignment-v2-rollout.md`,
+  "Fair share between repositories".
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with

@@ -55,7 +55,7 @@ tartci_lease_fit_candidate_labels(){
 # Prints the verdict JSON; returns lease_fit.py's code (0 now, 3 not now,
 # 4 never, 1 unknown).
 tartci_lease_fit_probe(){
-  local cores mem ngc labels priority_args=() cap_args=() rc=0
+  local cores mem ngc labels priority_args=() cap_args=() fair_args=() fair_arg rc=0
   cores="$(tartci_vm_lease_cores tart-macos)" || return 1
   mem="$(tartci_vm_lease_mem_mb tart-macos)"
   while IFS= read -r labels; do
@@ -67,8 +67,18 @@ tartci_lease_fit_probe(){
   ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
   ! tartci_positive_int_or_empty "$ngc" || cap_args=(--non-gate-cap "$ngc")
   tartci_positive_int_or_empty "$mem" || mem="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  # Fair share: a starved lane is asked about at gate priority, and a lane that
+  # would displace another repository's starved lane answers `yield` (5).
+  while IFS= read -r fair_arg; do
+    [ -z "$fair_arg" ] || fair_args+=("$fair_arg")
+  done < <(tartci_fair_share_args)
+  if [ "${#fair_args[@]}" -gt 0 ]; then
+    fair_args+=(--vm-slot-cap "$(tartci_effective_cap)")
+    [ -z "${TARTCI_VM_WAITER_ID:-}" ] || fair_args+=(--waiter-id "$TARTCI_VM_WAITER_ID")
+  fi
   python3 "$TARTCI_ROOT/scripts/lease_fit.py" --cores "$cores" --mem-mb "$mem" \
     ${priority_args[@]+"${priority_args[@]}"} ${cap_args[@]+"${cap_args[@]}"} \
+    ${fair_args[@]+"${fair_args[@]}"} \
     --record "$STATE_DIR/$RUNNER_NAME.lease-fit.json" --lane "$RUNNER_NAME" || rc=$?
   return "$rc"
 }
@@ -83,6 +93,7 @@ tartci_lease_fit_gate(){
     0) verdict=fits_now ;;
     3) verdict=not_now ;;
     4) verdict=never ;;
+    5) verdict=yield ;;
     *) verdict=unknown ;;
   esac
   detail="$(printf '%s' "$out" | python3 -c '
@@ -91,9 +102,14 @@ try:
     d = json.load(sys.stdin)
 except ValueError:
     print("detail=unreadable"); raise SystemExit
-print("cores=%s budget=%s used=%s max_concurrent=%s" % (
+line = "cores=%s budget=%s used=%s max_concurrent=%s" % (
     d.get("requested_cores"), d.get("core_budget"), d.get("used_cores"),
-    d.get("max_concurrent")))
+    d.get("max_concurrent"))
+w = d.get("yield_to") or {}
+if w:
+    line += " yield_to=%s repo=%s demand_since=%s" % (
+        w.get("lane"), w.get("repo"), w.get("demand_since"))
+print(line)
 ' 2>/dev/null)" || detail="detail=unreadable"
   if [ "$verdict" != "$LEASE_FIT_LAST_VERDICT" ]; then
     case "$verdict" in
@@ -105,6 +121,10 @@ print("cores=%s budget=%s used=%s max_concurrent=%s" % (
         note "VM lease does not fit right now ($detail) — waiting without scanning or asking Shipyard"
         event lease_unfit_now "$detail"
         ;;
+      yield)
+        note "fair share: another repository's lane has waited longest for this host's next VM ($detail) — yielding without scanning or asking Shipyard"
+        event fair_share_yield "$detail"
+        ;;
       *)
         [ -z "$LEASE_FIT_LAST_VERDICT" ] || event lease_fit_restored "verdict=$verdict $detail"
         ;;
@@ -113,7 +133,7 @@ print("cores=%s budget=%s used=%s max_concurrent=%s" % (
   fi
   case "$verdict" in
     never) heartbeat lease-never-fits; return 1 ;;
-    not_now) heartbeat lease-wait; return 1 ;;
+    not_now|yield) heartbeat lease-wait; return 1 ;;
   esac
   return 0
 }

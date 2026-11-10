@@ -65,6 +65,11 @@ def parse_args(
             help="override the fleet profile's [leases] rank_vm_waiters knob",
         )
         command_parser.add_argument(
+            "--fair-share-after-secs",
+            type=int,
+            help="override the fleet profile's [leases] fair_share_after_secs (0 disables)",
+        )
+        command_parser.add_argument(
             "--waiter-fresh-secs",
             type=int,
             help="override how long an unrefreshed VM lease waiter still counts",
@@ -157,6 +162,18 @@ def parse_args(
     acquire_parser.add_argument("--job-id", default="")
     acquire_parser.add_argument("--vm-name", default="")
     acquire_parser.add_argument(
+        "--repo", default="",
+        help="repository this VM lease serves (fair share between repositories)",
+    )
+    acquire_parser.add_argument(
+        "--demand-since", type=int, default=0,
+        help="epoch seconds since this lane has had work it could not place",
+    )
+    acquire_parser.add_argument(
+        "--vm-slot-cap", type=int, default=0,
+        help="VM slots on this host, so fair share can keep the last one for a starved lane",
+    )
+    acquire_parser.add_argument(
         "--waiter-id",
         default="",
         help="this lane's VM lease waiter: never ranked against itself, refreshed "
@@ -237,6 +254,8 @@ def parse_args(
     wait_parser.add_argument("--pid", type=int)
     wait_parser.add_argument("--lane", default="")
     wait_parser.add_argument("--label", default="")
+    wait_parser.add_argument("--repo", default="")
+    wait_parser.add_argument("--demand-since", type=int, default=0)
 
     withdraw_parser = sub.add_parser("withdraw", help="remove a VM lease waiter by id")
     add_common(withdraw_parser)

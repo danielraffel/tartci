@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Any, Iterator
 
+import fair_share
 import host_profile
 import lease_cli
 from lease_disk import (
@@ -643,6 +644,12 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         if fresh_override is not None and int(fresh_override) > 0
         else int(profile.get("vm_waiter_fresh_secs", host_profile.LEASE_POLICY_DEFAULT_FRESH_SECS))
     )
+    fair_override = getattr(args, "fair_share_after_secs", None)
+    fair_share_after = (
+        max(0, int(fair_override))
+        if fair_override is not None
+        else int(profile.get("fair_share_after_secs", 0) or 0)
+    )
     lending_override = getattr(args, "dynamic_lending", None)
     dynamic_lending = (
         lending_override == "on"
@@ -678,6 +685,7 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         ),
         "rank_vm_waiters": int(rank_vm_waiters),
         "waiter_fresh_secs": max(1, waiter_fresh),
+        "fair_share_after_secs": fair_share_after,
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
         "agent_floor_qos": floor_qos,
@@ -1191,6 +1199,45 @@ def admits(
     )
 
 
+def waiters_enabled(cfg: dict[str, Any]) -> bool:
+    """Waiters are kept when either ranked waiters or fair share is on."""
+    return bool(cfg.get("rank_vm_waiters")) or fair_share.enabled(cfg)
+
+
+def fair_share_blocker(
+    cfg: dict[str, Any],
+    waiters: list[dict[str, Any]],
+    before: list[dict[str, Any]],
+    after: list[dict[str, Any]],
+    *,
+    repo: str,
+    since: Any,
+    self_waiter_id: str,
+    vm_slot_cap: int = 0,
+) -> dict[str, Any] | None:
+    """The starved waiter of another repository this grant would displace.
+
+    It displaces the grant when, admitted at gate priority, it fits in `before`
+    and not in `after`, or when the grant would take the last free VM slot (of
+    `vm_slot_cap`) that the starved waiters which fit now need.
+    """
+    rivals = fair_share.starved_rivals(
+        cfg, waiters, repo=repo, since=since, self_waiter_id=self_waiter_id
+    )
+    fitting = []
+    for waiter in rivals:
+        lease = fair_share.as_waiter_lease(cfg, waiter)
+        cores, mem = lease["lease_size_cores"], lease["lease_size_mem_mb"]
+        if not admits(cfg, before, lease["priority"], cores, mem):
+            continue
+        if not admits(cfg, after, lease["priority"], cores, mem):
+            return waiter
+        fitting.append(waiter)
+    if fitting and fair_share.vm_slot_taken(before, len(fitting), vm_slot_cap):
+        return fitting[0]
+    return None
+
+
 def blocking_waiter(
     cfg: dict[str, int],
     waiters: list[dict[str, Any]],
@@ -1198,13 +1245,30 @@ def blocking_waiter(
     after: list[dict[str, Any]],
     priority: int,
     self_waiter_id: str,
+    *,
+    repo: str = "",
+    since: Any = 0,
+    vm_slot_cap: int = 0,
 ) -> dict[str, Any] | None:
     """The highest-ranked waiter this grant would displace, or None.
 
     A waiter displaces the grant only if it outranks it, fits in `before` (the
     host without this grant) and does not fit in `after` (with it). Disk is not
     ranked: it is one volume-wide axis both leases are admitted against anyway.
+    With fair share on, a starved waiter of another repository is checked
+    first (fair_share_blocker), and a starved grant is not ranked below
+    another repository's waiter by priority alone.
     """
+    if fair_share.enabled(cfg):
+        blocker = fair_share_blocker(
+            cfg, waiters, before, after, repo=repo, since=since,
+            self_waiter_id=self_waiter_id, vm_slot_cap=vm_slot_cap,
+        )
+        if blocker is not None:
+            return blocker
+    if not cfg.get("rank_vm_waiters"):
+        return None
+    starved_self = fair_share.enabled(cfg) and fair_share.starved(cfg, since)
     ranked = sorted(
         waiters,
         key=lambda row: (
@@ -1217,6 +1281,8 @@ def blocking_waiter(
         if self_waiter_id and str(waiter.get("id")) == self_waiter_id:
             continue
         if not is_vm_kind(waiter.get("command_kind")):
+            continue
+        if starved_self and fair_share.other_repo(waiter.get("repo"), repo):
             continue
         waiter_priority = record_int(waiter, "priority")
         if waiter_priority <= priority:
@@ -1241,6 +1307,8 @@ def waiter_summary(waiter: dict[str, Any]) -> dict[str, Any]:
         "mem_mb": record_int(waiter, "lease_size_mem_mb"),
         "waiting_since": waiter.get("waiting_since"),
         "seen_at": waiter.get("seen_at"),
+        "repo": waiter.get("repo"),
+        "demand_since": waiter.get("demand_since"),
     }
 
 
@@ -1253,22 +1321,28 @@ def rank_check(
     before: list[dict[str, Any]],
     after: list[dict[str, Any]],
     waiter_id: str,
+    repo: str = "",
+    since: Any = 0,
+    vm_slot_cap: int = 0,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     """Called under the store lock. Prunes expired waiters; returns the blocker."""
-    if not cfg.get("rank_vm_waiters") or not is_vm_kind(kind):
+    if not waiters_enabled(cfg) or not is_vm_kind(kind):
         return None, []
     waiters, problems = load_waiters(store_dir)
     live, expired = live_waiters(waiters, int(cfg["waiter_fresh_secs"]))
     if expired:
         write_waiters(store_dir, live)
-    return blocking_waiter(cfg, live, before, after, priority, waiter_id), problems
+    return blocking_waiter(
+        cfg, live, before, after, priority, waiter_id,
+        repo=repo, since=since, vm_slot_cap=vm_slot_cap,
+    ), problems
 
 
 def settle_waiter(
     store_dir: pathlib.Path, cfg: dict[str, int], waiter_id: str, *, granted: bool
 ) -> None:
     """Under the store lock: a grant withdraws the lane's waiter, a denial refreshes it."""
-    if not waiter_id or not cfg.get("rank_vm_waiters"):
+    if not waiter_id or not waiters_enabled(cfg):
         return
     waiters, problems = load_waiters(store_dir)
     if problems:
@@ -1316,7 +1390,7 @@ def deferral_result(
 def register_waiter(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     store_dir = pathlib.Path(args.store_dir).expanduser()
     cfg = capacity_config(args)
-    if not cfg["rank_vm_waiters"]:
+    if not waiters_enabled(cfg):
         return {"ok": True, "registered": False, "reason": "rank_vm_waiters_off"}, 0
     if not is_vm_kind(args.kind):
         return {"ok": False, "reason": "waiter_requires_vm_kind", "kind": args.kind}, 64
@@ -1353,6 +1427,10 @@ def register_waiter(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             # refresh keeps the original timestamp.
             "waiting_since": previous.get("waiting_since") if same_owner else now,
             "seen_at": now,
+            # Fair share (scripts/fair_share.py): which repository waits, and
+            # since when its lane has had work it could not place.
+            "repo": str(getattr(args, "repo", "") or ""),
+            "demand_since": fair_share.demand_since(getattr(args, "demand_since", 0)),
         }
         kept = [row for row in live if str(row.get("id")) != args.id]
         kept.append(record)
@@ -1602,6 +1680,18 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                     "reaped": reaped_summary(reaped),
                     "problems": problem_summary(problems),
                 }, 75
+        # Fair share: a VM lane starved behind another repository is admitted
+        # at gate priority (scripts/fair_share.py). Off, or alone, unchanged.
+        fair_repo = str(getattr(args, "repo", "") or "")
+        fair_since = fair_share.demand_since(getattr(args, "demand_since", 0))
+        requested_priority = priority
+        if fair_share.enabled(cfg) and is_vm_kind(args.kind) and not memory_only:
+            fair_waiters, _ = load_waiters(store_dir)
+            fair_live, _ = live_waiters(fair_waiters, int(cfg["waiter_fresh_secs"]))
+            priority = fair_share.promoted_priority(
+                cfg, priority, repo=fair_repo, since=fair_since,
+                active=active, waiters=fair_live,
+            )
         current_usage = usage(active, cfg)
         build_class = getattr(args, "build_class", None)
         if build_class is not None and priority >= cfg["gate_priority"]:
@@ -1713,10 +1803,13 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 store_dir,
                 cfg,
                 kind=args.kind,
-                priority=priority,
+                priority=requested_priority,
                 before=active,
                 after=[*active, hypothetical],
                 waiter_id=waiter_id,
+                repo=fair_repo,
+                since=fair_since,
+                vm_slot_cap=int(getattr(args, "vm_slot_cap", 0) or 0),
             )
             problems.extend(waiter_problems)
             if blocker is not None:
@@ -1754,6 +1847,10 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "created_at": now,
             "heartbeat_at": now,
         }
+        if fair_repo:
+            record["repo"] = fair_repo
+        if priority != requested_priority:
+            record["fair_share_promoted_from"] = requested_priority
         if floor is not None:
             record.update(
                 {"floor": True, "qos": cfg["agent_floor_qos"], "requested_cores": requested_cores}
@@ -1790,7 +1887,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 }
             )
         active.append(record)
-        if priority >= cfg["gate_priority"] and lease_size > 0:
+        if requested_priority >= cfg["gate_priority"] and lease_size > 0:
             write_gate_hint(store_dir, lease_size)
         qos_actions = reconcile_borrowers(active, cfg)
         write_records(store_dir, active)
