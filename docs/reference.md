@@ -1004,8 +1004,12 @@ docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent o
 ```
 
 ## Contributing checks
-Run the same gate CI runs before you push: it's one script, portable to macOS's
-stock bash 3.2:
+Run `./scripts/prepush.sh` before you push: it runs the `lint` and
+`python-39-tests` CI jobs' commands (including the unit tests under the hosts'
+`/usr/bin/python3` 3.9), fails fast and names the CI job a failure maps to.
+It also compiles under `python3.11` when installed (the `python-floor` job).
+`scripts/test_prepush_matches_ci.py` fails if the two drift. The lint gate
+alone is one script, portable to macOS's stock bash 3.2:
 ```bash
 ./scripts/lint.sh    # shellcheck -S warning + bash -n on every shell script
                      # (incl. the extensionless `tartci` dispatcher), py_compile
