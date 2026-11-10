@@ -3252,7 +3252,7 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   longest wait first within a class (the older of the job's `created_at` and
   the lane's continuous `waiting_since`); a lower-class job queued
   `slot_priority_promote_after_secs` (default 2700) ranks as merge-group. With
-  `slot_priority_release_first = true` (on all four hosts) a lane about to
+  `slot_priority_release_first = true` (m5studio canary only) a lane about to
   serve a queued `pulp-release-tagged` job ranks ahead of all of them. Only
   intents whose VM lease would be admitted now count, and nothing running is
   touched. Shadow logs `slot_priority_shadow` ("would have given slot to ...")

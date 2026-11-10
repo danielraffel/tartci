@@ -265,6 +265,8 @@ class ReleaseFirstTests(Base):
         self.assertEqual(slot_priority.ranked_class("release", RELEASE_LABELS, False), "other")
         self.assertEqual(slot_priority.ranked_class("merge_group", GATE_MG_LABELS, True),
                          "merge_group")
+        # An explicit `release` without the class label is not believed.
+        self.assertEqual(slot_priority.ranked_class("release", GATE_MG_LABELS, True), "other")
 
     def test_profile_knob_default_off_env_override_and_validator(self) -> None:
         import host_profile
@@ -614,8 +616,8 @@ class ProfileValidatorTests(unittest.TestCase):
         self.assertEqual(seen, hosts, "control: all four host profiles were read")
 
 
-    def test_the_four_host_profiles_turn_release_first_on(self) -> None:
-        hosts = {"m1", "m3", "m5", "m5studio"}
+    def test_only_the_m5studio_canary_turns_release_first_on(self) -> None:
+        hosts = {"m5studio"}
         seen = set()
         for path in (ROOT / "profiles").glob("*.toml"):
             has = "slot_priority_release_first = true" in path.read_text()
@@ -623,15 +625,17 @@ class ProfileValidatorTests(unittest.TestCase):
             self.assertEqual(has, host in hosts, path.name)
             if has:
                 seen.add(host)
-        self.assertEqual(seen, hosts, "control: all four host profiles were read")
+        self.assertEqual(seen, hosts, "control: the canary profile was read")
+        self.assertEqual(len(list((ROOT / "profiles").glob("*-macos-fleet.toml"))), 4,
+                         "control: all four host profiles were read")
 
-    def test_every_pulp_gate_slot_consults_tagged_releases_first(self) -> None:
+    def test_every_canary_pulp_gate_slot_consults_tagged_releases_first(self) -> None:
         import testing_support
         if not testing_support.HAVE_TOMLLIB:
             self.skipTest(testing_support.REASON)
         import macos_fleet_lanes as fleet
         slots = 0
-        for host in ("m1", "m3", "m5", "m5studio"):
+        for host in ("m5studio",):
             data = fleet.load(ROOT / "profiles" / f"{host}-macos-fleet.toml")
             lane = next(l for l in data["lane"] if l["id"] == "pulp-gate")
             self.assertTrue(data["leases"]["slot_priority_release_first"], host)
@@ -641,7 +645,7 @@ class ProfileValidatorTests(unittest.TestCase):
             for slot, order in orders.items():
                 self.assertEqual(order[0], "pulp-release-tagged", f"{host} slot {slot}")
                 slots += 1
-        self.assertEqual(slots, 8, "control: two slots on each of four hosts")
+        self.assertEqual(slots, 2, "control: both canary slots were read")
 
     def test_validator_refuses_a_non_boolean_release_first(self) -> None:
         import re
@@ -649,12 +653,12 @@ class ProfileValidatorTests(unittest.TestCase):
         if not testing_support.HAVE_TOMLLIB:
             self.skipTest(testing_support.REASON)
         import macos_fleet_lanes as fleet
-        body = (ROOT / "profiles/m5-macos-fleet.toml").read_text()
+        body = (ROOT / "profiles/m5studio-macos-fleet.toml").read_text()
         mutated, n = re.subn(r"(?m)^slot_priority_release_first = true$",
                              'slot_priority_release_first = "yes"', body)
         self.assertEqual(n, 1, "control: the shipped key was found")
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "m5.toml"
+            path = Path(td) / "m5studio.toml"
             path.write_text(mutated)
             with self.assertRaisesRegex(ValueError, "slot_priority_release_first must be"):
                 fleet.load(path)
@@ -817,13 +821,14 @@ class Bash32GateTests(Base):
 
     def gate(self, mode: str, *, cap: int = 2, running: int = 1, preset: str = "",
              max_defer: str = "300", rounds: int = 1, detail: dict | None = None,
-             tail: str = "", labels: str = "self-hosted,x") -> tuple:
+             tail: str = "", labels: str = "self-hosted,x", tier: int = 0,
+             detail_key: str = "lane") -> tuple:
         if not Path(BASH32).exists():
             self.skipTest("no /bin/bash")
         state = self.root / "state"
         state.mkdir(exist_ok=True)
         if detail is not None:
-            (state / "lane-r.slot-demand.lane.json").write_text(json.dumps(detail))
+            (state / f"lane-r.slot-demand.{detail_key}.json").write_text(json.dumps(detail))
         events = self.root / "events.log"
         script = f"""
 set -euo pipefail
@@ -848,7 +853,7 @@ source {str(LIB)!r}
 rc=0
 for _ in $(seq 1 {rounds}); do
   rc=0
-  tartci_slot_priority_gate {cap} {running} {labels!r} 0 || rc=$?
+  tartci_slot_priority_gate {cap} {running} {labels!r} {tier} || rc=$?
 done
 {tail}
 echo "rc=$rc"
@@ -965,6 +970,36 @@ echo "rc=$rc"
                                     labels=RELEASE_LABELS)
                 self.assertEqual(rc, expected, log)
         self.env.pop(env_rf, None)
+
+    def test_a_v2_release_tier_reads_its_class_keyed_detail_in_bash(self) -> None:
+        # Production event-class-v2 path: the lane has tiers, the gate is
+        # given the CONFIGURED index of pulp-release-tagged (2 in the
+        # deduplicated class config), and the real claim-delay lib maps it to
+        # the class label that names the detail file the scan wrote.
+        self.outrank()
+        detail = slot_demand.DemandDetail(witness_only=True)
+        detail.add({"event": "push"}, {"created_at": ago(30)})
+        tiers = ("source " + repr(str(ROOT / "providers/tart-macos/claim-delay.lib.sh")) + "\n"
+                 "WORKFLOW_TIERS=configured\n"
+                 "TIER_LABELS_CONFIG=$'pulp-build-merge-group\\npulp-build-pr-head\\n"
+                 "pulp-release-tagged\\npulp-release-pr-gate'")
+        self.env["TARTCI_SLOT_PRIORITY_RELEASE_FIRST"] = "1"
+        try:
+            rc, log = self.gate("on", detail=detail.as_dict(), labels=RELEASE_LABELS,
+                                tier=2, detail_key="pulp-release-tagged", preset=tiers)
+            self.assertEqual(rc, "rc=0", log)
+            self.assertNotIn("slot_priority_deferred", log)
+            # Control, same instrument: the detail under the wrong key (the
+            # single-label `lane` file) is not read, so the lane is `unknown`
+            # and defers to the merge-group intent.
+            for path in (self.root / "state").glob("*.slot-demand.*.json"):
+                path.unlink()
+            rc, log = self.gate("on", detail=detail.as_dict(), labels=RELEASE_LABELS,
+                                tier=2, detail_key="lane", preset=tiers)
+            self.assertEqual(rc, "rc=75", log)
+            self.assertIn("class=unknown", log)
+        finally:
+            self.env.pop("TARTCI_SLOT_PRIORITY_RELEASE_FIRST", None)
 
     def test_full_host_only_refreshes_the_intent(self) -> None:
         self.outrank()

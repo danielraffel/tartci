@@ -185,13 +185,13 @@ def ranked_class(event_class: str, labels: Any, release_first: bool) -> str:
     With release-first on, a lane whose registration can only take a tagged
     release job ranks as `release`, but only on positive evidence that such a
     job is queued (a known class from its scan): `unknown` stays `unknown`.
-    With it off, an explicit `release` is ranked as `other`, as before.
+    An explicit `release` without the label (or with the rule off) ranks as
+    `other`.
     """
-    if not release_first:
-        return slot_demand.OTHER if event_class == RELEASE_CLASS else event_class
-    if event_class != UNKNOWN_CLASS and carries_release_label(labels):
+    if release_first and event_class != UNKNOWN_CLASS and carries_release_label(labels):
         return RELEASE_CLASS
-    return event_class
+    # `release` is only ever earned through the label, never asserted.
+    return slot_demand.OTHER if event_class == RELEASE_CLASS else event_class
 
 
 def _epoch(value: Any) -> Optional[float]:

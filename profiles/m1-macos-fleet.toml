@@ -128,9 +128,6 @@ gate_ccache_trim = true
 # See docs/assignment-v2-rollout.md, "Slot priority".
 [leases]
 slot_priority = "on"
-# A lane about to serve a tagged release (pulp-release-tagged) ranks ahead of
-# merge-group for the next free slot. Rollback: delete this key.
-slot_priority_release_first = true
 
 [[lane]]
 id = "pulp-gate"
@@ -189,17 +186,14 @@ guest_heartbeat_stale_seconds = 600
 # each GitHub call several times slower while it holds the lock, starving
 # every other lane on the host. The validator refuses both values.
 process_type = "Standard"
-# Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
-# preference" and "Release event classes"). Every slot consults
-# pulp-release-tagged first and falls back to its previous order whenever no
-# tagged release waits, so with none queued each slot selects exactly what it
-# did before. A Release CLI smoke is a ~40 s job, but on 2026-11-10 v1.99.1's
-# "Smoke darwin-x64" queued behind ~40 min gates on every host because only one
-# slot per host preferred it, and the other slot freed first. The release tiers
-# below serve only jobs carrying a release class label, which Pulp appends when
-# PULP_RELEASE_CLASS_TOKENS opts in. Rollback: restore the previous order (git
-# history), re-render, reload the slots at an idle boundary.
-assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-build-pr-head", "pulp-release-pr-gate"], 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-pr-head"] }
+# Release-first slot (docs/assignment-v2-rollout.md, "Release event classes").
+# Slot 2 consults both release classes before the gate classes and falls back
+# to gate work whenever no release waits; slot 1 keeps gate-first order with
+# the release classes after, so idle slot-1 capacity still serves releases.
+# The release tiers below serve only jobs carrying a release class label, which
+# Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in. Rollback: delete this key
+# and the release tiers, re-render, reload slot 2 at an idle boundary.
+assignment_slot_tier_order = { 1 = ["pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"], 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-pr-head"] }
 v2_gate_classes = ["pulp-build-pr-head"]
 # No pulp-build-merge-group tier (2026-10-16). Over 546 native macOS gate jobs
 # (2026-10-12..16) m1's success median was 32.7 min, about 1.7x the other hosts,
