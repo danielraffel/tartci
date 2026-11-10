@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import re
 import stat
 import subprocess
 import tempfile
@@ -38,6 +39,12 @@ SCAN_TABLE = (
     f'private_key_path = "{HOME}/github-apps/generous-admission-reader.private-key.pem"\n'
     f'cache_dir = "{HOME}/ghapp-cache-reader"\n'
 )
+
+
+def without_scan_table(body: str) -> str:
+    stripped = re.sub(r"(?ms)^\[github_scan_app\]\n.*?(?=^\[)", "", body, count=1)
+    assert stripped != body, "control: the checked-in profile declares the table"
+    return stripped
 
 
 def _stub(path: Path, body: str) -> None:
@@ -159,7 +166,7 @@ class WrapperTests(unittest.TestCase):
 
 class ProfileAndCallSiteTests(unittest.TestCase):
     def profile(self, extra: str = SCAN_TABLE) -> str:
-        base = CONFIG.read_text()
+        base = without_scan_table(CONFIG.read_text())
         marker = "[guest_network]"
         self.assertIn(marker, base)
         return base.replace(marker, extra + "\n" + marker, 1)
@@ -183,9 +190,32 @@ class ProfileAndCallSiteTests(unittest.TestCase):
         self.assertNotIn("BEGIN", json.dumps(env))
 
     def test_absent_scan_app_table_renders_nothing(self) -> None:
-        data = tomllib.loads(CONFIG.read_text())
+        data = tomllib.loads(without_scan_table(CONFIG.read_text()))
         env = fleet.lane_plist(data, data["lane"][0])["EnvironmentVariables"]
         self.assertFalse([k for k in env if k.startswith("TARTCI_SCAN_")])
+
+    def test_every_fleet_profile_loads_and_renders_the_scan_app(self) -> None:
+        for name in ("m1", "m3", "m5", "m5studio"):
+            with self.subTest(host=name):
+                path = ROOT / "profiles" / f"{name}-macos-fleet.toml"
+                data = fleet.load(path)
+                home = data["host"]["home"]
+                self.assertEqual(data["github_scan_app"], {
+                    "id": "5665767",
+                    "private_key_path": f"{home}/.config/shipyard/github-apps/"
+                                        "generous-admission-reader.private-key.pem",
+                    "cache_dir": f"{home}/.config/shipyard/ghapp-cache-reader",
+                })
+                self.assertEqual(self.validate_path(path).returncode, 0)
+                for lane in data["lane"]:
+                    env = fleet.lane_plist(data, lane)["EnvironmentVariables"]
+                    self.assertEqual(env["TARTCI_SCAN_APP_ID"], "5665767")
+                    self.assertTrue(env["TARTCI_SCAN_APP_CACHE_DIR"].endswith("ghapp-cache-reader"))
+                    self.assertNotEqual(env.get("SHIPYARD_GITHUB_APP_ID"), "5665767")
+
+    def validate_path(self, path: Path):
+        return subprocess.run([str(ROOT / "tartci"), "fleet-macos", "validate", str(path)],
+                              text=True, capture_output=True, check=False)
 
     def test_scan_app_table_is_validated_like_github_app(self) -> None:
         cases = {
