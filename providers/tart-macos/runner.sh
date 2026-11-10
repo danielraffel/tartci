@@ -154,6 +154,23 @@ ARTIFACT_CACHE_ROOT="${TARTCI_ARTIFACT_CACHE_DIR:-$CACHE_ROOT/artifact-cache}"
 GUEST_ARTIFACT_CACHE="/Volumes/My Shared Files/artifact-cache"
 GOLDEN="${TARTCI_MACOS_GOLDEN:-${PULP_RUNNER_GOLDEN:-pulp-build-runner:latest}}"
 REPO="${TARTCI_RUNNER_REPO:-${PULP_RUNNER_REPO:-Generous-Corp/pulp}}"
+# Read-only queue scans may run as their own read-only App so their polling
+# draws on a separate rate-limit bucket. TARTCI_SCAN_GH_CLI names a CLI
+# explicitly; otherwise a host profile's github_scan_app (TARTCI_SCAN_APP_ID)
+# selects scripts/gh-scan-app. Writes (JIT, reclaim, cancel) stay on GH_CLI.
+# The wrapper mints its token for exactly one repository and refuses to guess
+# it, so bind it to this lane's repository: the same one every scan passes as
+# --repo. A dedicated variable keeps GH_CLI's own repository binding untouched.
+# scan-cli-selection: begin
+if [ -n "${TARTCI_SCAN_GH_CLI:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_SCAN_GH_CLI"
+elif [ -n "${TARTCI_SCAN_APP_ID:-}" ]; then
+  SCAN_GH_CLI="$TARTCI_ROOT/scripts/gh-scan-app"
+  export TARTCI_SCAN_APP_REPO="$REPO"
+else
+  SCAN_GH_CLI="$GH_CLI"
+fi
+# scan-cli-selection: end
 LABELS="${TARTCI_RUNNER_LABELS:-${PULP_RUNNER_LABELS:-self-hosted,macOS,ARM64,pulp-build-vm}}"
 RUNNER_GROUP_ID="${TARTCI_RUNNER_GROUP_ID:-${PULP_RUNNER_GROUP_ID:-1}}"
 # GitHub retires old Actions Runner releases; a retired listener exits with
@@ -1822,7 +1839,7 @@ capture_current_job(){
     "$TARTCI_ROOT/scripts/current_job_scan.py"
     --repo "$REPO"
     --runner "$runner_registration"
-    --gh-cli "$GH_CLI"
+    --gh-cli "$SCAN_GH_CLI"
     --max-pages "${TARTCI_CAPTURE_CURRENT_JOB_MAX_PAGES:-3}"
     --mode "$scan_mode"
     --gh-timeout "${TARTCI_CAPTURE_CURRENT_JOB_GH_TIMEOUT_SECS:-4}"
