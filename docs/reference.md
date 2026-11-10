@@ -1004,8 +1004,18 @@ docs/        runbook.md (human from-scratch) · new-repo-agent-guide.md (agent o
 ```
 
 ## Contributing checks
-Run the same gate CI runs before you push: it's one script, portable to macOS's
-stock bash 3.2:
+Run `./scripts/prepush.sh` before you push. The default is fast: lint.sh,
+the tomllib-less 3.9 interpreter check, py_compile under 3.9 and 3.11, the
+skip-allowlist, leak-needle and public-path tests under the hosts'
+`/usr/bin/python3` 3.9, and only the unit-test modules that changed against
+`origin/main` plus those that import a changed module
+(`scripts/prepush_select.py`). **CI is the full run**: `--full` runs the same
+commands as the `lint` and `python-39-tests` jobs, including the whole suite
+under 3.9. Fast mode is not a substitute for CI; it exists to catch the
+failures that most often reach a PR. Both modes fail fast and name the CI job a
+failure maps to. `scripts/test_prepush_matches_ci.py` fails if the full run
+drifts from `ci.yml` or the fast mode stops covering those classes. The lint gate
+alone is one script, portable to macOS's stock bash 3.2:
 ```bash
 ./scripts/lint.sh    # shellcheck -S warning + bash -n on every shell script
                      # (incl. the extensionless `tartci` dispatcher), py_compile
