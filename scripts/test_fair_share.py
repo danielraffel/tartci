@@ -406,18 +406,19 @@ class LastSlotYieldTests(unittest.TestCase):
 
 
 class ShippedProfileTests(unittest.TestCase):
-    """m5 is the canary: only its profile turns fair share on."""
+    """Only the hosts already rolled out (m5, then m5studio) turn fair share on."""
 
     KEY = "fair_share_after_secs = 1800"
 
-    def test_only_m5_turns_it_on_and_the_readers_see_it(self) -> None:
+    def test_only_rolled_out_hosts_turn_it_on_and_the_readers_see_it(self) -> None:
         import host_profile
         seen = set()
+        on = {"m5", "m5studio"}
         for path in sorted((ROOT / "profiles").glob("*.toml")):
             text = path.read_text()
             host = path.name.replace("-macos-fleet.toml", "")
-            self.assertEqual("fair_share_after_secs" in text, host == "m5", path.name)
-            if host != "m5":
+            self.assertEqual("fair_share_after_secs" in text, host in on, path.name)
+            if host not in on:
                 continue
             seen.add(host)
             self.assertIn(self.KEY, text)
@@ -452,7 +453,7 @@ class ShippedProfileTests(unittest.TestCase):
                         capture_output=True, text=True, env=env)
                     self.assertEqual(proc.returncode, 0, proc.stderr)
                     self.assertEqual(proc.stdout.strip(), str(AFTER))
-        self.assertEqual(seen, {"m5"}, "control: the m5 profile was read")
+        self.assertEqual(seen, on, "control: the rolled-out profiles were read")
         # Control: a profile without the key reads off.
         with tempfile.TemporaryDirectory() as td:
             bare = Path(td) / "p.toml"
