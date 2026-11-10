@@ -49,7 +49,10 @@ class IdleGateWiringTests(unittest.TestCase):
 
     def test_loop_gate_consults_priority_demand(self) -> None:
         # The boot decision must include the priority-demand==0 clause.
-        self.assertIn('p="$(priority_demand)"', self.body)
+        # yield_demand is priority_demand unless fair share lifts a
+        # cross-repository yield (scripts/test_fair_share.py).
+        self.assertIn('p="$(yield_demand)"', self.body)
+        self.assertIn('  priority_demand\n}', self.body)
         self.assertIn('[ "${p:-0}" -eq 0 ]', self.body)
 
     def test_a_claim_that_filled_the_last_slot_rechecks_before_booting(self) -> None:
@@ -59,7 +62,7 @@ class IdleGateWiringTests(unittest.TestCase):
         run = self.body.index('run_one "$i" "$selected_labels" "$selected_tier"', boot)
         block = self.body[boot:run]
         self.assertIn('[ "$(last_slot_occupancy)" -ge "$cap" ]', block)
-        self.assertIn("YIELD_LAST_SLOT_ONLY=0 priority_demand", block)
+        self.assertIn("YIELD_LAST_SLOT_ONLY=0 yield_demand", block)
         self.assertIn('rm -f "$resv"', block)
         self.assertIn("continue", block)
 
