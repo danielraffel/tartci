@@ -3334,6 +3334,33 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   starts just after it (wrapping around), so deferred checkouts are reached
   first instead of the same alphabetical head being re-examined every hour.
 
+  Merged worktrees are cleared after their PR lands (`scripts/merged_checkouts.py`,
+  the "merged" rule of the same sweep). It covers `worktrees_root` and
+  `extra_worktree_roots`, ON by default only while the root's volume is under
+  pressure (the same GiB-or-percent test); `merged_worktrees = true` in
+  `[reclaim]` runs it every pass, `false` never. A checkout is removed only when
+  HEAD is an ancestor of the GitHub remote's `main` (fetched once per repository
+  per pass) or a PR for its branch is MERGED or CLOSED with `headRefOid` equal
+  to HEAD (one batched GraphQL read per pass, through the read-only scan App,
+  `[github_scan_app]`; without it squash-landed checkouts stay); `git status
+  --porcelain --untracked-files=normal --ignore-submodules=none` is empty; no
+  stash entry names its branch or sits on its HEAD; no process cwd is inside it
+  and no running command line (`ps`, every command) names it; its lineage is not
+  `active`; and it has been idle `merged_worktree_idle_hours` (24..720, default
+  24). Removal is `git worktree remove`; a worktree git refuses only for
+  populated submodules (Pulp's `planning`) gets one `--force` after each
+  submodule proves clean, stash-free and fully pushed. The local branch is kept
+  and its lineage recorded `merged` (with the PR URL when known);
+  `git worktree prune` runs only when every stale entry lies under a scanned
+  root. Plain clones are eligible only where `worktree_root_checkouts` already
+  allows them, under the every-branch-pushed check plus a merged HEAD. A
+  checkout holding work no remote has (dirty, a stash, or commits on no remote)
+  is never removed and is listed in `~/.tartci/state/reclaim/merged-worktrees-report.json`.
+  The sweep runs at macOS background priority even when a pressured pass went
+  foreground. Each pass writes a `merged_worktrees` event (removed, bytes,
+  holding, PR read) to `events.jsonl`; the `reclaim_pass` detail repeats it.
+  Rollback: `merged_worktrees = false`.
+
   Build output in agent checkouts has a short tier of its own
   (`scripts/checkout_outputs.py`), opt-in with `checkout_build_outputs = true`
   (and `checkout_build_output_idle_hours`, 1..168, default 4) in `[reclaim]`.
