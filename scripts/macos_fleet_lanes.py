@@ -1017,11 +1017,12 @@ def load(path: Path) -> dict:
                 f"lane {lane_id}: yield_to_labels must be unique and include "
                 f"{sorted(REQUIRED_BASE_LABELS)}"
             )
-        # Last-slot yield: on a two-supervisor lane, a supervisor whose sibling
-        # already holds a guest (so this boot would take the host's last slot,
-        # which VM slot lending lends the gate reserve to) yields while another
-        # repository's priority work is queued. Fails closed: an unreadable
-        # queue yields. With no sibling guest the supervisor boots as before.
+        # Last-slot yield: on a two-supervisor lane, a supervisor whose boot
+        # would take the host's last guest slot (running guests or live
+        # reservations hold cap - 1; the slot VM slot lending lends the gate
+        # reserve to) yields while another repository's priority work is
+        # queued. Fails closed: an unreadable queue or count yields. With two
+        # slots free the supervisor boots as before.
         second_yield = lane.get("last_slot_yield")
         if second_yield is not None:
             if (not isinstance(second_yield, dict)
@@ -3210,9 +3211,7 @@ def lane_plist(
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(lane["yield_to_labels"])
     second_yield = lane.get("last_slot_yield")
     if second_yield:
-        sibling = lane_id if slot == 2 else f"{lane_id}-slot2"
-        env["TARTCI_YIELD_SIBLING_STATE_DIR"] = (
-            f"{host['home']}/.tartci/state/macos-fleet/{sibling}")
+        env["TARTCI_YIELD_LAST_SLOT_ONLY"] = "1"
         env["TARTCI_YIELD_TO_REPO"] = second_yield["repo"]
         env["TARTCI_YIELD_TO_WORKFLOW_NAME"] = second_yield["workflow"]
         env["TARTCI_YIELD_TO_LABELS"] = ",".join(second_yield["labels"])

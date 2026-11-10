@@ -290,9 +290,9 @@ priority = "vm"
 # second takes the last free guest slot (VM slot lending above); with a Pulp
 # guest in the other slot there is no slot for it. docs/runbook.md, "VM slot lending".
 supervisors = 2
-# A supervisor whose sibling already holds a Vellum guest yields while any Pulp
-# gate job is queued unassigned anywhere in the fleet (fails closed), so neither
-# takes the last slot from the required gate. Not covered: forge-gate and
+# A supervisor whose boot would take the host's last guest slot yields while any
+# Pulp gate job is queued unassigned anywhere in the fleet (fails closed), so
+# neither takes the last slot from the required gate. Not covered: forge-gate and
 # spectr-gate demand (almost none on m5; see docs/runbook.md "VM slot lending").
 last_slot_yield = { repo = "Generous-Corp/pulp", workflow = "Build and Test", labels = [
   "self-hosted",

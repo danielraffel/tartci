@@ -52,6 +52,17 @@ class IdleGateWiringTests(unittest.TestCase):
         self.assertIn('p="$(priority_demand)"', self.body)
         self.assertIn('[ "${p:-0}" -eq 0 ]', self.body)
 
+    def test_a_claim_that_filled_the_last_slot_rechecks_before_booting(self) -> None:
+        # Two supervisors can both count a spare slot and claim; the one whose
+        # claim filled the last slot must probe and release before run_one.
+        boot = self.body.index('CURRENT_RESV="$resv"\n')
+        run = self.body.index('run_one "$i" "$selected_labels" "$selected_tier"', boot)
+        block = self.body[boot:run]
+        self.assertIn('[ "$(last_slot_occupancy)" -ge "$cap" ]', block)
+        self.assertIn("YIELD_LAST_SLOT_ONLY=0 priority_demand", block)
+        self.assertIn('rm -f "$resv"', block)
+        self.assertIn("continue", block)
+
     def test_priority_demand_uses_shared_bounded_scanner(self) -> None:
         self.assertIn('scripts/queue_scan.py"', self.body)
         self.assertIn("--job-statuses queued,in_progress", self.body)
@@ -74,16 +85,18 @@ class IdleGateFailClosed(unittest.TestCase):
         *,
         yield_labels: str = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm",
         extra_env: dict | None = None,
+        tart_body: str = "#!/usr/bin/env bash\nexit 0\n",
+        home: Path | None = None,
     ) -> subprocess.CompletedProcess:
         import stat
         import tempfile
         d = tempfile.mkdtemp()
-        tmp = Path(d)
+        tmp = home or Path(d)
         def _exe(name: str, body: str) -> None:
             p = tmp / name
             p.write_text(body, encoding="utf-8")
             p.chmod(p.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        _exe("tart", "#!/usr/bin/env bash\nexit 0\n")
+        _exe("tart", tart_body)
         _exe("stubgh", gh_stub_body)
         base = [b for b in ("/bin", "/usr/bin", "/opt/homebrew/bin", "/usr/local/bin")
                 if Path(b).exists()]
@@ -129,31 +142,37 @@ esac
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.strip(), "1")
 
-    def test_last_slot_yield_applies_only_beside_a_sibling_guest(self) -> None:
-        # Whichever supervisor boots second takes the last slot, so the yield
-        # follows the sibling's heartbeat, not a fixed slot number.
+    def test_last_slot_yield_applies_only_when_this_boot_takes_the_last_slot(self) -> None:
+        # Decided from slot occupancy, not from which supervisor is which: a
+        # sibling between its slot claim and its VM holds only a reservation.
         import json
         import tempfile
-        sibling = Path(tempfile.mkdtemp())
-        beat = sibling / "m5-vellum-gate-slot2-02.state.json"
+        import time
+        home = Path(tempfile.mkdtemp())
+        resv = home / ".config" / "tartci" / "macos-vm-reservations"
+        resv.mkdir(parents=True)
         env = {"TARTCI_RUNNER_REPO": "Generous-Corp/vellum",
                "TARTCI_YIELD_TO_REPO": "Generous-Corp/pulp",
-               "TARTCI_YIELD_SIBLING_STATE_DIR": str(sibling)}
-        for doc, expected, why in (
-                (None, "0", "no sibling heartbeat: the first slot, boot as before"),
-                ({"vm": ""}, "0", "sibling idle: this boot leaves a slot free"),
-                ({"vm": "m5-vellum-gate-slot2-02-1-3"}, "1",
-                 "sibling holds a guest: this boot takes the last slot, so yield")):
-            if doc is None:
-                beat.unlink(missing_ok=True)
-            else:
-                beat.write_text(json.dumps(doc))
-            r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=env)
+               "TARTCI_YIELD_LAST_SLOT_ONLY": "1"}
+        no_guests = "#!/usr/bin/env bash\n[ \"$1\" = list ] && echo '[]'\nexit 0\n"
+        one_guest = ("#!/usr/bin/env bash\n[ \"$1\" = list ] && echo "
+                     "'[{\"Name\":\"m5-vellum-gate-01-1-1\",\"State\":\"running\",\"Source\":\"local\"}]'\nexit 0\n")
+
+        def demand(tart: str) -> str:
+            r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS,
+                          extra_env=env, tart_body=tart, home=home)
             self.assertEqual(r.returncode, 0, r.stderr)
-            self.assertEqual(r.stdout.strip(), expected, why)
-        beat.write_text("{not json")
-        r = self._run(self.STUB_PULP_DEMAND, yield_labels=self.PULP_LABELS, extra_env=env)
-        self.assertEqual(r.stdout.strip(), "1", "an unreadable heartbeat yields")
+            return r.stdout.strip()
+
+        self.assertEqual(demand(no_guests), "0", "both slots free: boot as before")
+        # A sibling that has claimed its slot but has no VM yet.
+        (resv / "resv.sibling").write_text(f"{os.getpid()} {int(time.time())}\n")
+        self.assertEqual(demand(no_guests), "1", "a reservation holds a slot: this boot is the last")
+        (resv / "resv.sibling").unlink()
+        self.assertEqual(demand(one_guest), "1", "a running guest holds a slot")
+        self.assertEqual(demand("#!/usr/bin/env bash\nexit 3\n"), "1",
+                         "an unreadable inventory counts as full")
+        del json
 
     def test_gh_error_reports_demand_not_zero(self) -> None:
         # Stub gh exits non-zero (simulates rate-limit / 5xx).
