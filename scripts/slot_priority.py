@@ -11,6 +11,9 @@ land up to five pull requests; a PR-head job only reports on one.
 With `[leases] slot_priority` on, a lane that would claim a free slot first
 records an intent in the host's lease store and asks who should have it:
 
+  * with `slot_priority_release_first`, a lane about to serve a tagged
+    release class (`pulp-release-tagged`) ranks above everything else: a
+    release smoke is short and the release cannot publish until it runs;
   * merge_group jobs of any repository rank above other events (push,
     release, schedule, ...), which rank above pull_request jobs;
   * within a class the job that has waited longest ranks first, across
@@ -60,8 +63,18 @@ import leases
 import slot_demand
 
 MODES = ("off", "shadow", "on")
-CLASS_RANK = {slot_demand.MERGE_GROUP: 0, slot_demand.OTHER: 1, slot_demand.PULL_REQUEST: 2}
+# A lane serving a tagged release ranks ahead of merge-group. Its rank is below
+# zero so the starvation promotion (a lower class that has waited long enough
+# ranks as merge-group, 0) never lifts anything past a release.
+RELEASE_CLASS = "release"
+CLASS_RANK = {RELEASE_CLASS: -1, slot_demand.MERGE_GROUP: 0, slot_demand.OTHER: 1,
+              slot_demand.PULL_REQUEST: 2}
 UNKNOWN_CLASS = "unknown"
+# Runner labels that only a tagged-release job carries (the event-class-v2
+# release class, scripts/macos_fleet_lanes.py V2_EXTRA_CLASS_WORKFLOWS). A lane
+# whose selected registration carries one can only be handed a release job, so
+# the label is the evidence; the run's own event is `push` of a tag.
+RELEASE_CLASS_LABELS = ("pulp-release-tagged",)
 DEFAULT_PROMOTE_AFTER_SECS = 2700
 DEFAULT_DETAIL_MAX_AGE_SECS = 300
 # An intent outlives one loop pass: POLL plus a scan that may wait up to 120 s
@@ -151,6 +164,36 @@ def promote_after_setting(override: Optional[int] = None) -> int:
     return int(value) if isinstance(value, int) and value >= 0 else DEFAULT_PROMOTE_AFTER_SECS
 
 
+def release_first_setting(override: Optional[bool] = None) -> bool:
+    if override is not None:
+        return bool(override)
+    raw = os.environ.get("TARTCI_SLOT_PRIORITY_RELEASE_FIRST")
+    if raw is not None and raw.strip() in ("0", "1"):
+        return raw.strip() == "1"
+    return host_profile.lease_policy_settings().get("slot_priority_release_first") is True
+
+
+def carries_release_label(labels: Any) -> bool:
+    """True when a registration's labels name a tagged-release class."""
+    names = {part.strip() for part in str(labels or "").split(",")}
+    return any(label in names for label in RELEASE_CLASS_LABELS)
+
+
+def ranked_class(event_class: str, labels: Any, release_first: bool) -> str:
+    """The class a lane is ranked as.
+
+    With release-first on, a lane whose registration can only take a tagged
+    release job ranks as `release`, but only on positive evidence that such a
+    job is queued (a known class from its scan): `unknown` stays `unknown`.
+    An explicit `release` without the label (or with the rule off) ranks as
+    `other`.
+    """
+    if release_first and event_class != UNKNOWN_CLASS and carries_release_label(labels):
+        return RELEASE_CLASS
+    # `release` is only ever earned through the label, never asserted.
+    return slot_demand.OTHER if event_class == RELEASE_CLASS else event_class
+
+
 def _epoch(value: Any) -> Optional[float]:
     parsed = slot_demand.parse_ts(value)
     return parsed.timestamp() if parsed is not None else None
@@ -173,7 +216,9 @@ def demand_from_detail(detail: Optional[Dict[str, Any]], promote_after: int, now
     for cls, row in (detail.get("classes") or {}).items():
         if not isinstance(row, dict) or int(row.get("count") or 0) <= 0:
             continue
-        cls = cls if cls in CLASS_RANK else slot_demand.OTHER
+        # A scan's detail never names `release` (that comes from the lane's
+        # labels, ranked_class), so any other spelling is `other`.
+        cls = cls if cls in CLASS_RANK and cls != RELEASE_CLASS else slot_demand.OTHER
         stamp = _epoch(row.get("oldest_created_at"))
         if stamp is None:
             continue
@@ -298,6 +343,9 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         detail = slot_demand.read_detail(args.demand_file or "", args.detail_max_age_secs)
         event_class, queued_at = demand_from_detail(detail, promote_after, now)
         witness_only = bool(detail and detail.get("witness_only"))
+    release_first = release_first_setting(
+        None if args.release_first is None else args.release_first == "1")
+    event_class = ranked_class(event_class, args.labels, release_first)
     priority, priority_class = leases.parse_priority(args.priority)
     cores = max(0, int(args.cores))
     mem = int(args.mem_mb) if args.mem_mb is not None else cores * cfg["per_job_mem_mb"]
@@ -448,6 +496,8 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     d.add_argument("--detail-max-age-secs", type=int, default=DEFAULT_DETAIL_MAX_AGE_SECS)
     d.add_argument("--event-class", choices=sorted(CLASS_RANK) + [UNKNOWN_CLASS])
     d.add_argument("--queued-at", default="")
+    # Overrides [leases] slot_priority_release_first (tests and dry runs).
+    d.add_argument("--release-first", choices=("0", "1"))
 
     w = sub.add_parser("withdraw", help="remove this lane's intent")
     common(w)

@@ -419,7 +419,7 @@ The m1 profile is an explicit exception: it declares only
 merge-group. This keeps the slower 3-core m1 guest out of merge batches while
 the merge-capable m3, m5 and m5studio slots protect merge-group demand.
 
-## Release event classes (declared per lane, m5 only)
+## Release event classes (declared on every host's pulp-gate lane)
 
 An event-class-v2 lane may declare the Pulp release classes after its two gate
 tiers. The validator accepts exactly these extras, each with exactly its
@@ -430,8 +430,9 @@ workflows, listed contiguously and at most once:
 | `pulp-release-tagged` | `Release CLI`, `Sign and Release` | `120` (gate) |
 | `pulp-release-pr-gate` | `Release-path PR gate` | `115` (gate) |
 
-Gate tiers stay first, so a default slot keeps gate-first order and only takes
-release work when no gate work waits. Each class is its own JIT registration
+The release tiers are declared after the gate tiers, so a slot with no
+`assignment_slot_tier_order` keeps gate-first order and takes release work only
+when no gate work waits; a slot's order can put them first (below). Each class is its own JIT registration
 (base labels plus that one class label), so a release runner cannot take a gate
 job and a gate runner cannot take a release job. A lane that does not declare a
 class never scans for it, so hosts without the declaration never pick a release
@@ -447,48 +448,34 @@ values apply only to registrations carrying the gate base label
 `pulp-build-vm`; the legacy `pulp-release` lane (`pulp-build-vm-release`) keeps
 `gate`/`vm`.
 
-Only m5's `pulp-gate` lane declares the classes, and one slot is release-first:
+Every host's `pulp-gate` lane declares the classes, and each host has one
+release-first slot that puts both release classes before the gate classes:
 
 ```toml
 assignment_slot_tier_order = { 2 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"] }
 ```
 
-Both release classes precede the gate classes on slot 2. m5's `pulp-gate` lane
-is the only registration that serves either class, and the pre-mint check
-admits a class only while every class the slot prefers over it is empty. On
-2026-09-26 the release PR gate was ordered last on both slots; with gate work
-queued continuously from 18Z it was selected once in six hours, that boot was
-denied at pre-mint when merge-group work reappeared, and three `Release-path
-PR gate` jobs waited over three hours while tagged releases (first on slot 2)
-were served. A class that no slot prefers ahead of steady gate demand is a
-class that host never serves.
+That is m5's slot 2 and m1's slot 2; on m3 and m5studio it is slot 1. On m1,
+m3 and m5 the other slot orders both gate classes ahead of both release
+classes. On m5studio, the release-first canary ("Slot priority", "Release
+first"), the other slot also consults `pulp-release-tagged` first and then
+keeps merge-group ahead of PR-head and the release PR gate last.
+
+The pre-mint check admits a class only while every class the slot prefers
+over it is empty. On 2026-09-26 the release PR gate was ordered last on both
+of m5's slots; with gate work queued continuously from 18Z it was selected
+once in six hours, that boot was denied at pre-mint when merge-group work
+reappeared, and three `Release-path PR gate` jobs waited over three hours
+while tagged releases (first on slot 2) were served. A class that no slot
+prefers ahead of steady gate demand is a class that host never serves.
 
 Because the order names every class, it is a preference: with no release
 queued the slot selects exactly what a default slot selects. Pulp opts in
 separately (`PULP_RELEASE_CLASS_TOKENS=1` appends the class label to the
 release selectors); until both sides are live, release jobs keep riding idle
 gate runners. Rollback is unsetting the Pulp variable; host-side, delete the
-extra tiers and slot order, re-render, and reload slot 2 at an idle boundary.
-
-Canary, per decisions contract row 1: only m3 (`profiles/m3-macos-fleet.toml`,
-`pulp-gate` slot 2) carries the key. m3 slot 1, m1 and m5 are unaffected by
-deploying these bytes. Enable through the ordinary path: validate and render
-with `tartci fleet-macos`, then reload the slot-2 supervisor at an idle boundary
-(a host self-update does this). Watch for at least a week:
-
-- PR-head queue age should fall; `mint_jit tier=1` on the m3 slot-2 log should
-  follow PR-head demand even while merge-group work waits.
-- `assignment_v2_pre_mint_denied selected_tier=1` should disappear from m3 slot
-  2 whenever PR-head work is still queued; any that remain should be genuine
-  cancellations or another host's claim.
-- Merge-group latency should not regress beyond the one slot now preferring
-  PR-head: the fleet still has five merge-group-first slots.
-- `assignment_v2_pre_mint_denied selected_tier=0` on m3 slot 2 counts the
-  merge-group boots it yielded to PR-head; a high rate says the fallback boots
-  are being wasted and the order should be revisited.
-
-Rollback is deleting the key, re-rendering, and reloading slot 2; nothing on disk
-outlives it.
+extra tiers and slot order, re-render, and reload the slots at an idle
+boundary.
 
 ## Ranked VM lease waiters (opt-in, m5 canary)
 
@@ -614,7 +601,8 @@ merge-group job queue wait at p50 634 s and p90 2896 s, against Pulp's p90
 default `off`) ranks the lanes on one host that want the next free slot
 (`scripts/slot_priority.py`, `providers/tart-macos/slot-priority.lib.sh`):
 
-- **Order**: a `merge_group` job of any repository, then other events (push,
+- **Order**: a tagged release (with `slot_priority_release_first`, below),
+  then a `merge_group` job of any repository, then other events (push,
   release, schedule, dispatch), then `pull_request`. A merge-group job can land
   up to five PRs; a PR-head job only reports on one.
 - **Across repositories, oldest first**: within a class the longest wait ranks
@@ -682,6 +670,77 @@ Known limits, so a reading is not over-interpreted:
 - It does not lift Vellum's lease-fit denials. On m5, Vellum leases at `vm` and
   is held to the non-gate budget ("cores=6 budget=6 used=10"); that is the
   budget, which this does not change. Fair share (below) does.
+
+### Release first
+
+`[leases] slot_priority_release_first` (boolean, default `false`; env
+`TARTCI_SLOT_PRIORITY_RELEASE_FIRST=0|1`; on only in the m5studio canary) ranks a
+lane about to serve a tagged release ahead of every other class, including a
+promoted lower class, for the next free slot on its host.
+
+On 2026-11-10 Pulp's release run for v1.99.1 (the first since v1.80.0 able to
+publish) had every build job green and then queued "Smoke darwin-x64", a 40 s
+job, from 11:34Z with no runner. Every host was at its two-VM cap with ~40 min
+PR and merge-group gates. Two things kept it waiting: only one slot per host
+preferred the release class, so when the other slot freed first it took gate
+work; and a release-tier lane ranked as `other` (its run's event is a tag
+`push`), below any merge-group intent on the host.
+
+- **Evidence is the class label**: a release run's event is `push`, so the
+  scan cannot tell it from any other push. The lane's selected registration
+  can: a registration carrying `pulp-release-tagged` (the event-class-v2
+  release class, `scripts/macos_fleet_lanes.py` `V2_EXTRA_CLASS_WORKFLOWS`)
+  can only be handed a tagged-release job. Such a lane ranks as `release`
+  (rank -1, below merge-group's 0, so the starvation promotion never lifts
+  anything past it).
+- **Only on evidence**: a release lane with no fresh scan detail stays
+  `unknown`, as before. The release PR gate (`pulp-release-pr-gate`) is a PR
+  check and keeps its ordinary class.
+- **Unchanged without a release**: no lane carries the label unless a tagged
+  release is what it selected, so with none queued the order is exactly the
+  one above.
+- **Every canary slot asks for releases first**: on m5studio each `pulp-gate`
+  slot's `assignment_slot_tier_order` starts with `pulp-release-tagged` and
+  then keeps its previous order. A slot whose first class has no queued job
+  selects what it did before.
+- **It covers the whole release run**: `pulp-release-tagged` carries the
+  Release CLI build legs and Sign and Release as well as the smokes, so a
+  release run takes each newly freed canary slot until its matrix drains.
+  Gate work waits at most that long plus `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS`.
+- **Bounded, non-preemptive**: nothing running is stopped; the gate a release
+  displaces waits for the next free slot. A lane deferring to a release still
+  claims after `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (default 300) if the
+  release lane does not take the slot. No slot is reserved for releases.
+
+**Why a canary, and what it costs.** Selection scans classes in slot order
+and stops at the first with demand, and the pre-mint check rescans the
+classes preferred over the selected one. A slot that consults the release
+class first therefore adds one two-workflow scan (`Release CLI`,
+`Sign and Release`) to every live selection (cache 120 s) and every pre-mint
+whenever no release waits, all on the shared GitHub App REST budget. That
+budget is the fleet's single point of failure (a 15k/h drain stalled every
+lane on 2026-11-09), and a scan error in the first class blinds the slot
+(fail-closed) where before it blinded only the host's release-first slot. Hence
+one host first: m5studio adds the scan to one slot (its slot 2).
+
+**When to widen** to m3, m5 and m1 (key plus the slot order), compare at least
+a week of canary against the week before, all of:
+
+- Tagged-release job wait from GitHub (`started_at - created_at` of
+  `pulp-release-tagged` jobs, p50 and max), and the share of them that started
+  on m5studio. A falling wait with m5studio taking release jobs is the benefit.
+- App REST rate per hour on the scan App (`X-RateLimit-Used` deltas, or the
+  per-host scan call ledger), m5studio against the hour before. Widening to
+  three more hosts adds about three more slots' worth of that delta; it must
+  leave the fleet well under the 15k/h budget at peak.
+- `scan_blind` / `assignment_v2_*` ERR events on m5studio that name the
+  release tier: any rise is the fail-closed cost above.
+- Merge-group and PR-head job wait on m5studio: they must not regress beyond
+  the release runs' own length.
+
+Rollback: delete the key and restore m5studio slot 2's previous order
+(merge-group, PR-head, then the release classes), re-render, restart the lanes
+at an idle boundary.
 
 ### Measuring it
 

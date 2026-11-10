@@ -67,6 +67,8 @@ LEASES_KEYS = {
     "rank_vm_waiters", "waiter_fresh_secs",
     # Rank lanes wanting the next free macOS VM slot (scripts/slot_priority.py).
     "slot_priority", "slot_priority_promote_after_secs",
+    # A lane about to serve a tagged-release class ranks ahead of merge-group.
+    "slot_priority_release_first",
     # Rank a starved VM lane ahead of other repositories (scripts/fair_share.py).
     "fair_share_after_secs",
     # A non-gate guest taking the last slot may use the gate reserve (leases.py).
@@ -700,6 +702,8 @@ def load(path: Path) -> dict:
         promote = lease_policy.get("slot_priority_promote_after_secs", 2700)
         if type(promote) is not int or not 300 <= promote <= 14400:
             fail("leases.slot_priority_promote_after_secs must be an integer from 300 to 14400")
+        if type(lease_policy.get("slot_priority_release_first", False)) is not bool:
+            fail("leases.slot_priority_release_first must be a boolean")
         fair = lease_policy.get("fair_share_after_secs", 0)
         if type(fair) is not int or not (fair == 0 or 300 <= fair <= 14400):
             fail("leases.fair_share_after_secs must be 0 or an integer from 300 to 14400")
