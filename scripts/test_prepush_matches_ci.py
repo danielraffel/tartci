@@ -174,6 +174,7 @@ FAST_CLASSES = {
 }
 
 
+
 class FastModeCoversTodaysFailureClassesTest(unittest.TestCase):
     def setUp(self):
         raw = _read(PREPUSH)
@@ -205,11 +206,23 @@ class FastModeCoversTodaysFailureClassesTest(unittest.TestCase):
         self.assertIn('"$PY39" -m py_compile', self.text)
         self.assertIn('"$py311" -m py_compile', self.text)
 
+    def test_every_test_module_is_import_checked_under_39(self):
+        # An unguarded `import tomllib` in a test module fails CI's whole
+        # discover run; fast mode loads (not runs) every test module under 3.9.
+        self.assertIn('stage python-39-tests "every test module imports under $PY39" '
+                      "test_modules_import_under_39", self.fast)
+        self.assertIn("unittest.defaultTestLoader.discover", self.text)
+        self.assertIn("_FailedTest", self.text)
+        self.assertIn('PYTHONPATH=scripts "$PY39" -c', self.text)
+
+    def test_a_selector_failure_fails_the_run(self):
+        self.assertIn('selected="$(python3 scripts/prepush_select.py "$BASE")" || {', self.text)
+
     def test_changed_modules_and_their_tests_are_selected(self):
         # Unguarded tomllib import and a stale assertion in a changed module's
         # own tests are caught by running that module's tests under 3.9: the
         # selector must be consulted, against the base ref, in fast mode.
-        self.assertIn('python3 scripts/prepush_select.py "$BASE"', self.text)
+        self.assertIn('prepush_select.py "$BASE"', self.text)
         self.assertIn('BASE="${TARTCI_PREPUSH_BASE:-origin/main}"', self.text)
         sys.path.insert(0, os.path.join(ROOT, "scripts"))
         import prepush_select

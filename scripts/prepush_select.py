@@ -10,8 +10,9 @@ Prints one module name per line (scripts/test_*.py, without the extension):
 * any other changed file with a path (not a bare name such as `tartci`) selects
   the test modules that mention its repo-relative path.
 
-Changed means: committed since the merge base with the base ref, plus staged,
-unstaged and untracked files. Runs under Python 3.9; no third-party imports.
+Changed means: committed since the merge base with the base ref (a deleted file or
+the old name of a rename counts), plus staged, unstaged and untracked files. Exits 2
+when there is no merge base, rather than silently selecting only local edits. Runs under Python 3.9; no third-party imports.
 """
 from __future__ import annotations
 
@@ -29,14 +30,21 @@ def _git(*args):
     return proc.stdout if proc.returncode == 0 else ""
 
 
+class NoBase(Exception):
+    """The base ref has no merge base with HEAD (not fetched?)."""
+
+
 def changed_files(base):
-    names = set()
+    """Changed paths, including deleted ones and the old name of a rename."""
     merge_base = _git("merge-base", base, "HEAD").strip()
-    if merge_base:
-        names.update(_git("diff", "--name-only", merge_base, "HEAD").splitlines())
-    names.update(_git("diff", "--name-only", "HEAD").splitlines())
+    if not merge_base:
+        raise NoBase("no merge base with %s; run `git fetch origin` or set "
+                     "TARTCI_PREPUSH_BASE" % base)
+    names = set()
+    names.update(_git("diff", "--name-only", "--no-renames", merge_base, "HEAD").splitlines())
+    names.update(_git("diff", "--name-only", "--no-renames", "HEAD").splitlines())
     names.update(_git("ls-files", "--others", "--exclude-standard").splitlines())
-    return sorted(n for n in names if n and os.path.exists(os.path.join(ROOT, n)))
+    return sorted(n for n in names if n)
 
 
 def test_modules(root=ROOT):
@@ -81,7 +89,12 @@ def select(changed, root=ROOT):
 
 def main(argv):
     base = argv[1] if len(argv) > 1 else "origin/main"
-    for m in select(changed_files(base)):
+    try:
+        changed = changed_files(base)
+    except NoBase as exc:
+        print("prepush_select: %s" % exc, file=sys.stderr)
+        return 2
+    for m in select(changed):
         print(m)
     return 0
 

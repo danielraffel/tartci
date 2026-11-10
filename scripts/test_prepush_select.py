@@ -42,6 +42,14 @@ class SelectTest(unittest.TestCase):
     def test_unrelated_change_selects_nothing(self):
         self.assertEqual(self.pick("docs/readme.md"), [])
 
+    def test_a_deleted_module_still_selects_the_tests_that_import_it(self):
+        os.remove(os.path.join(self.root, "scripts", "widget.py"))
+        self.assertEqual(self.pick("scripts/widget.py"), ["test_other", "test_widget"])
+
+    def test_no_merge_base_is_an_error_not_an_empty_selection(self):
+        with self.assertRaises(sel.NoBase):
+            sel.changed_files("refs/does-not-exist")
+
 
 if __name__ == "__main__":
     unittest.main()

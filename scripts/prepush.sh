@@ -11,9 +11,11 @@
 #   python-39-tests the interpreter is a tomllib-less 3.9
 #   python-39-tests py_compile of every tracked .py under 3.9
 #   python-floor    py_compile under python3.11 (skipped with a note if absent)
+#   python-39-tests every test module imports under 3.9 (catches an unguarded
+#                   tomllib import in a test module)
 #   python-39-tests under that 3.9, with it first on PATH as CI does: the 3.9
 #                   skip-allowlist test (test_system_python_tests_run, which
-#                   also flags an unguarded tomllib import), the leak-needles
+#                   which pins which tests may skip without tomllib), the leak-needles
 #                   test, the public-path lint test, and only the unit-test
 #                   modules that changed against origin/main plus those that
 #                   import a changed module (scripts/prepush_select.py)
@@ -83,22 +85,60 @@ py_compile_39() {
   git ls-files -z '*.py' | xargs -0 "$PY39" -m py_compile
 }
 
-# Run the fast unit-test selection under the CI-like 3.9 (3.9 first on PATH).
+# Every test module must import under the 3.9: an unguarded `import tomllib`
+# (or other 3.11-only name) in one fails the whole CI discover run. Loading, not
+# running, the tests is enough to surface it; a failed import loads as a
+# _FailedTest whose id names the module.
+test_modules_import_under_39() {
+  PYTHONPATH=scripts "$PY39" -c '
+import sys, unittest
+suite = unittest.defaultTestLoader.discover("scripts", pattern="test_*.py")
+bad = []
+def walk(s):
+    for t in s:
+        if isinstance(t, unittest.TestSuite):
+            walk(t)
+        elif type(t).__name__ == "_FailedTest":
+            bad.append(t.id())
+walk(suite)
+if bad:
+    print("test modules that fail to import under Python %d.%d:" % sys.version_info[:2], file=sys.stderr)
+    for b in bad:
+        print("  " + b, file=sys.stderr)
+    raise SystemExit(1)
+print("all test modules import under Python %d.%d" % sys.version_info[:2])
+'
+}
+
+# Run the fast unit-test selection under the CI-like 3.9 (3.9 first on PATH),
+# then the changed modules once more under the default python3 when that is a
+# different interpreter, so tests that need tomllib are not skipped everywhere.
 fast_unit_tests() {
-  local mods=() m
+  local selected m
+  selected="$(python3 scripts/prepush_select.py "$BASE")" || {
+    echo "test selection failed (see above); refusing to pass on the fixed modules alone" >&2
+    return 1
+  }
+  local mods=() chosen=()
   mods+=(test_system_python_tests_run test_leak_needles test_public_path_lint)
   while IFS= read -r m; do
-    [ -n "$m" ] && mods+=("$m")
-  done < <(python3 scripts/prepush_select.py "$BASE")
+    [ -n "$m" ] && chosen+=("$m")
+  done <<SELECTED_END
+$selected
+SELECTED_END
   # De-duplicate, keeping order (bash 3.2: no associative arrays).
   local uniq=() seen=" "
-  for m in "${mods[@]}"; do  # bash32-lint: nonempty seeded with three fixed modules
+  for m in "${mods[@]}" ${chosen[@]+"${chosen[@]}"}; do  # bash32-lint: nonempty seeded with three fixed modules
     case "$seen" in *" $m "*) continue ;; esac
     seen="$seen$m "; uniq+=("$m")
   done
   echo "unit-test modules: ${uniq[*]}"  # bash32-lint: nonempty one per fixed module
   mkdir -p "$logdir/bin39" && ln -sf "$PY39" "$logdir/bin39/python3"
   PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" -m unittest "${uniq[@]}"  # bash32-lint: nonempty one per fixed module
+  if [ "${#chosen[@]}" -gt 0 ] && [ "$(python3 -c 'import sys; print(sys.version_info[:2])')" != "(3, 9)" ]; then
+    echo "changed modules again under the default python3 (tomllib-gated tests run here)"
+    PYTHONPATH=scripts python3 -m unittest "${chosen[@]}"  # bash32-lint: nonempty guarded by the -gt 0 test
+  fi
 }
 
 # Cheap, serial gates first: lint, then the interpreter check.
@@ -110,6 +150,7 @@ stage python-floor "py_compile under 3.11" py_floor
 if [ "$FULL" != 1 ]; then
   logdir="$(mktemp -d "${TMPDIR:-/tmp}/tartci-prepush.XXXXXX")"
   trap 'rm -rf "$logdir"' EXIT
+  stage python-39-tests "every test module imports under $PY39" test_modules_import_under_39
   stage python-39-tests "fast unit tests (allowlist, leak needles, public paths, changed modules)" fast_unit_tests
   printf '\033[32m✓ prepush (fast) passed in %ss. CI runs the full suite; use --full to match it.\033[0m\n' $((SECONDS - total_start))
   exit 0
