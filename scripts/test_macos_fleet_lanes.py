@@ -2569,8 +2569,9 @@ class MacosFleetLaneTests(unittest.TestCase):
         ".m5.pulp-gate.plist": None,
         ".m5.pulp-gate.slot2.plist": RELEASE_FIRST_ORDER,
         ".m5studio.pulp-gate.plist": RELEASE_FIRST_ORDER,
-        ".m5studio.pulp-gate.slot2.plist": ("pulp-build-merge-group,pulp-build-pr-head,"
-                                             "pulp-release-tagged,pulp-release-pr-gate"),
+        # Release-first canary: tagged releases first, then this slot's gate order.
+        ".m5studio.pulp-gate.slot2.plist": ("pulp-release-tagged,pulp-build-merge-group,"
+                                             "pulp-build-pr-head,pulp-release-pr-gate"),
     }
 
     def test_m5studio_slot2_prefers_merge_group_before_pr_head(self) -> None:
@@ -2583,7 +2584,7 @@ class MacosFleetLaneTests(unittest.TestCase):
         self.assertEqual(len(slot2), 1)
         self.assertEqual(
             slot2[0]["TARTCI_ASSIGNMENT_V2_TIER_ORDER"],
-            "pulp-build-merge-group,pulp-build-pr-head,pulp-release-tagged,pulp-release-pr-gate",
+            "pulp-release-tagged,pulp-build-merge-group,pulp-build-pr-head,pulp-release-pr-gate",
         )
 
     def test_slot_tier_orders_are_pinned_exactly_on_every_pulp_gate_slot(self) -> None:
@@ -3566,7 +3567,15 @@ replaces_launchd_labels=REPLACEMENT
                                  if set(order[:2]) == release]
                 self.assertEqual(len(release_first), 1)
                 for slot, order in orders.items():
-                    if slot not in release_first:
+                    if slot in release_first:
+                        continue
+                    if host_id == "m5studio":
+                        # Release-first canary: every slot consults
+                        # pulp-release-tagged first, then the gate classes.
+                        self.assertEqual(order[0], "pulp-release-tagged")
+                        self.assertEqual(set(order[1:1 + len(gate)]), gate)
+                        self.assertEqual(order[1 + len(gate):], ["pulp-release-pr-gate"])
+                    else:
                         self.assertEqual(set(order[:len(gate)]), gate)
                         self.assertEqual(set(order[len(gate):]), release)
         self.assertEqual(seen, 2 * len(HOST_CONFIGS))

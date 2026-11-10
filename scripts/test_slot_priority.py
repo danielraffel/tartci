@@ -15,6 +15,9 @@ Properties covered, each from the side that could break:
   only records the intent;
 * modes: off writes nothing, shadow always claims and names the lane that
   would have won, on defers;
+* release first: with `slot_priority_release_first`, a lane about to serve a
+  queued tagged release outranks merge-group and pull_request, only on
+  evidence, and with no release queued the order is unchanged;
 * the scanners' detail files carry the event class and age with no extra API
   call;
 * the bash glue runs under macOS /bin/bash 3.2 with `set -euo pipefail`.
@@ -156,6 +159,150 @@ class PriorityOrderTests(Base):
         self.decide("known-pr", event_class="pull_request", queued_ago=30, free=0)
         unknown = self.decide("unknown", event_class="unknown", free=1)
         self.assertEqual(unknown["decision"], "defer")
+
+
+RELEASE_LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-tagged"
+GATE_MG_LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+GATE_PR_LABELS = "self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+
+
+class ReleaseFirstTests(Base):
+    """A queued tagged release takes the next free slot ahead of gate work.
+
+    A release run's jobs come from a tag `push`, so their scan class is
+    `other`; the release lane is recognised by the class label its
+    registration carries, which only a release job can match.
+    """
+
+    def queue_gates(self, release_first: str) -> None:
+        # Older gate work, so age alone would put both ahead of the release.
+        flag = ("--release-first", release_first)
+        self.decide("pulp-gate-mg", event_class="merge_group", queued_ago=1800, free=0,
+                    priority="110", extra=("--labels", GATE_MG_LABELS, *flag))
+        self.decide("pulp-gate-pr", event_class="pull_request", queued_ago=2400, free=0,
+                    priority="100", extra=("--labels", GATE_PR_LABELS, *flag))
+
+    def release(self, release_first: str, *, free: int = 1,
+                event_class: str = "other") -> dict:
+        return self.decide("pulp-release-slot", event_class=event_class, queued_ago=30,
+                           free=free, priority="120",
+                           extra=("--labels", RELEASE_LABELS,
+                                  "--release-first", release_first))
+
+    def test_a_queued_release_outranks_merge_group_and_pull_request(self) -> None:
+        self.queue_gates("1")
+        rel = self.release("1")
+        self.assertEqual(rel["decision"], "claim", rel)
+        self.assertEqual(rel["reason"], "ranked_first")
+        self.assertEqual(rel["self"]["event_class"], "release")
+        self.assertEqual(rel["self"]["effective_rank"], -1)
+        self.assertEqual(rel["ahead"], [])
+        # The gate lanes, asking for the same free slot, yield to it.
+        for lane, cls, labels in (("pulp-gate-mg", "merge_group", GATE_MG_LABELS),
+                                  ("pulp-gate-pr", "pull_request", GATE_PR_LABELS)):
+            with self.subTest(lane=lane):
+                gate = self.decide(lane, event_class=cls, queued_ago=1800, priority="110",
+                                   extra=("--labels", labels, "--release-first", "1"))
+                self.assertEqual(gate["decision"], "defer", gate)
+                self.assertEqual(gate["winner"]["lane"], "pulp-release-slot")
+                self.assertEqual(gate["winner"]["event_class"], "release")
+
+    def test_negative_control_without_the_rule_the_release_waits(self) -> None:
+        # Same instrument, same lanes, rule off: the release ranks as `other`
+        # and loses the slot to merge-group, which is the 2026-11-10 incident.
+        self.queue_gates("0")
+        rel = self.release("0")
+        self.assertEqual(rel["self"]["event_class"], "other")
+        self.assertEqual(rel["decision"], "defer", rel)
+        self.assertEqual(rel["winner"]["lane"], "pulp-gate-mg")
+
+    def test_a_promoted_old_pull_request_still_ranks_behind_a_release(self) -> None:
+        self.decide("old-pr", event_class="pull_request", queued_ago=9000, free=0,
+                    extra=("--labels", GATE_PR_LABELS, "--release-first", "1",
+                           "--promote-after-secs", "2700"))
+        rel = self.decide("pulp-release-slot", event_class="other", queued_ago=10,
+                          priority="120",
+                          extra=("--labels", RELEASE_LABELS, "--release-first", "1",
+                                 "--promote-after-secs", "2700"))
+        self.assertEqual(rel["decision"], "claim", rel)
+        self.assertLess(slot_priority.CLASS_RANK["release"], 0)
+
+    def test_with_no_release_queued_ordering_is_unchanged(self) -> None:
+        # Release-first on, no release lane: merge-group > other > pull_request,
+        # exactly the order the rule-off path gives, round for round.
+        def order(release_first: str) -> list:
+            self.store_reset()
+            flag = ("--release-first", release_first)
+            self.decide("pr", event_class="pull_request", queued_ago=900, free=0,
+                        extra=("--labels", GATE_PR_LABELS, *flag))
+            self.decide("push", event_class="other", queued_ago=600, free=0,
+                        extra=("--labels", "self-hosted,x", *flag))
+            self.decide("mg", event_class="merge_group", queued_ago=60, free=0,
+                        extra=("--labels", GATE_MG_LABELS, *flag))
+            out = self.decide("probe", event_class="pull_request", queued_ago=1, free=3,
+                              extra=("--labels", GATE_PR_LABELS, *flag))
+            return [(row["lane"], row["event_class"], row["effective_rank"])
+                    for row in out["ahead"]]
+
+        on, off = order("1"), order("0")
+        self.assertEqual([lane for lane, _, _ in on], ["mg", "push", "pr"])
+        self.assertEqual(on, off)
+
+    def test_a_release_lane_moves_ahead_only_on_evidence(self) -> None:
+        # Unknown or stale detail on the release tier stays `unknown`.
+        self.decide("pulp-gate-pr", event_class="pull_request", queued_ago=60, free=0,
+                    extra=("--labels", GATE_PR_LABELS, "--release-first", "1"))
+        rel = self.release("1", event_class="unknown")
+        self.assertEqual(rel["self"]["event_class"], "unknown")
+        self.assertEqual(rel["decision"], "defer")
+
+    def test_release_class_needs_the_class_label_not_a_substring(self) -> None:
+        self.assertTrue(slot_priority.carries_release_label(RELEASE_LABELS))
+        self.assertFalse(slot_priority.carries_release_label(GATE_MG_LABELS))
+        self.assertFalse(slot_priority.carries_release_label("self-hosted,pulp-release-tagged-x"))
+        self.assertFalse(slot_priority.carries_release_label("self-hosted,pulp-build-vm-release"))
+        # Release-first off maps an explicit `release` back to `other`.
+        self.assertEqual(slot_priority.ranked_class("release", RELEASE_LABELS, False), "other")
+        self.assertEqual(slot_priority.ranked_class("merge_group", GATE_MG_LABELS, True),
+                         "merge_group")
+        # An explicit `release` without the class label is not believed.
+        self.assertEqual(slot_priority.ranked_class("release", GATE_MG_LABELS, True), "other")
+
+    def test_profile_knob_default_off_env_override_and_validator(self) -> None:
+        import host_profile
+        self.assertFalse(host_profile.lease_policy_settings(str(self.profile))
+                         ["slot_priority_release_first"])
+        self.profile.write_text('schema = 1\n[host]\nid = "test"\n[leases]\n'
+                                'slot_priority = "on"\nslot_priority_release_first = true\n',
+                                encoding="utf-8")
+        self.assertTrue(host_profile.lease_policy_settings(str(self.profile))
+                        ["slot_priority_release_first"])
+        # The 3.9 fallback parser reads the boolean too.
+        table = host_profile._parse_leases_table(self.profile.read_text())
+        self.assertIs(table.get("slot_priority_release_first"), True)
+        # With the profile on, a release lane ranks first through the profile.
+        self.queue_gates_from_profile()
+        rel = self.decide("pulp-release-slot", event_class="other", queued_ago=30,
+                          priority="120", extra=("--labels", RELEASE_LABELS))
+        self.assertEqual(rel["self"]["event_class"], "release")
+        old = os.environ.get("TARTCI_SLOT_PRIORITY_RELEASE_FIRST")
+        os.environ["TARTCI_SLOT_PRIORITY_RELEASE_FIRST"] = "0"
+        try:
+            self.assertFalse(slot_priority.release_first_setting())
+        finally:
+            if old is None:
+                os.environ.pop("TARTCI_SLOT_PRIORITY_RELEASE_FIRST", None)
+            else:
+                os.environ["TARTCI_SLOT_PRIORITY_RELEASE_FIRST"] = old
+
+    def queue_gates_from_profile(self) -> None:
+        self.decide("pulp-gate-mg", event_class="merge_group", queued_ago=1800, free=0,
+                    priority="110", extra=("--labels", GATE_MG_LABELS))
+
+    def store_reset(self) -> None:
+        path = slot_priority.intents_file(self.store)
+        if path.exists():
+            path.unlink()
 
 
 class StarvationTests(Base):
@@ -469,6 +616,53 @@ class ProfileValidatorTests(unittest.TestCase):
         self.assertEqual(seen, hosts, "control: all four host profiles were read")
 
 
+    def test_only_the_m5studio_canary_turns_release_first_on(self) -> None:
+        hosts = {"m5studio"}
+        seen = set()
+        for path in (ROOT / "profiles").glob("*.toml"):
+            has = "slot_priority_release_first = true" in path.read_text()
+            host = path.name.replace("-macos-fleet.toml", "")
+            self.assertEqual(has, host in hosts, path.name)
+            if has:
+                seen.add(host)
+        self.assertEqual(seen, hosts, "control: the canary profile was read")
+        self.assertEqual(len(list((ROOT / "profiles").glob("*-macos-fleet.toml"))), 4,
+                         "control: all four host profiles were read")
+
+    def test_every_canary_pulp_gate_slot_consults_tagged_releases_first(self) -> None:
+        import testing_support
+        if not testing_support.HAVE_TOMLLIB:
+            self.skipTest(testing_support.REASON)
+        import macos_fleet_lanes as fleet
+        slots = 0
+        for host in ("m5studio",):
+            data = fleet.load(ROOT / "profiles" / f"{host}-macos-fleet.toml")
+            lane = next(l for l in data["lane"] if l["id"] == "pulp-gate")
+            self.assertTrue(data["leases"]["slot_priority_release_first"], host)
+            orders = lane["assignment_slot_tier_order"]
+            self.assertEqual(sorted(orders), [str(n) for n in range(1, lane["supervisors"] + 1)],
+                             host)
+            for slot, order in orders.items():
+                self.assertEqual(order[0], "pulp-release-tagged", f"{host} slot {slot}")
+                slots += 1
+        self.assertEqual(slots, 2, "control: both canary slots were read")
+
+    def test_validator_refuses_a_non_boolean_release_first(self) -> None:
+        import re
+        import testing_support
+        if not testing_support.HAVE_TOMLLIB:
+            self.skipTest(testing_support.REASON)
+        import macos_fleet_lanes as fleet
+        body = (ROOT / "profiles/m5studio-macos-fleet.toml").read_text()
+        mutated, n = re.subn(r"(?m)^slot_priority_release_first = true$",
+                             'slot_priority_release_first = "yes"', body)
+        self.assertEqual(n, 1, "control: the shipped key was found")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5studio.toml"
+            path.write_text(mutated)
+            with self.assertRaisesRegex(ValueError, "slot_priority_release_first must be"):
+                fleet.load(path)
+
 class DemandDetailTests(unittest.TestCase):
     def test_a_lane_ranks_by_the_job_it_will_likely_get_the_oldest(self) -> None:
         # GitHub hands a new runner whichever matching job it picks, likeliest
@@ -627,13 +821,14 @@ class Bash32GateTests(Base):
 
     def gate(self, mode: str, *, cap: int = 2, running: int = 1, preset: str = "",
              max_defer: str = "300", rounds: int = 1, detail: dict | None = None,
-             tail: str = "") -> tuple:
+             tail: str = "", labels: str = "self-hosted,x", tier: int = 0,
+             detail_key: str = "lane") -> tuple:
         if not Path(BASH32).exists():
             self.skipTest("no /bin/bash")
         state = self.root / "state"
         state.mkdir(exist_ok=True)
         if detail is not None:
-            (state / "lane-r.slot-demand.lane.json").write_text(json.dumps(detail))
+            (state / f"lane-r.slot-demand.{detail_key}.json").write_text(json.dumps(detail))
         events = self.root / "events.log"
         script = f"""
 set -euo pipefail
@@ -658,7 +853,7 @@ source {str(LIB)!r}
 rc=0
 for _ in $(seq 1 {rounds}); do
   rc=0
-  tartci_slot_priority_gate {cap} {running} "self-hosted,x" 0 || rc=$?
+  tartci_slot_priority_gate {cap} {running} {labels!r} {tier} || rc=$?
 done
 {tail}
 echo "rc=$rc"
@@ -760,6 +955,51 @@ echo "rc=$rc"
         rc, log = self.gate("on", detail=detail.as_dict())
         self.assertEqual(rc, "rc=0")
         self.assertNotIn("slot_priority_deferred", log)
+
+    def test_a_release_tier_lane_wins_the_slot_from_merge_group_in_bash(self) -> None:
+        # The lane's scan saw a tag-push job (class `other`) on its release
+        # registration; a merge-group intent that fits is already waiting.
+        self.outrank()
+        detail = slot_demand.DemandDetail()
+        detail.add({"event": "push"}, {"created_at": ago(30)})
+        env_rf = "TARTCI_SLOT_PRIORITY_RELEASE_FIRST"
+        for flag, expected in (("1", "rc=0"), ("0", "rc=75")):
+            with self.subTest(release_first=flag):
+                self.env[env_rf] = flag
+                rc, log = self.gate("on", detail=detail.as_dict(),
+                                    labels=RELEASE_LABELS)
+                self.assertEqual(rc, expected, log)
+        self.env.pop(env_rf, None)
+
+    def test_a_v2_release_tier_reads_its_class_keyed_detail_in_bash(self) -> None:
+        # Production event-class-v2 path: the lane has tiers, the gate is
+        # given the CONFIGURED index of pulp-release-tagged (2 in the
+        # deduplicated class config), and the real claim-delay lib maps it to
+        # the class label that names the detail file the scan wrote.
+        self.outrank()
+        detail = slot_demand.DemandDetail(witness_only=True)
+        detail.add({"event": "push"}, {"created_at": ago(30)})
+        tiers = ("source " + repr(str(ROOT / "providers/tart-macos/claim-delay.lib.sh")) + "\n"
+                 "WORKFLOW_TIERS=configured\n"
+                 "TIER_LABELS_CONFIG=$'pulp-build-merge-group\\npulp-build-pr-head\\n"
+                 "pulp-release-tagged\\npulp-release-pr-gate'")
+        self.env["TARTCI_SLOT_PRIORITY_RELEASE_FIRST"] = "1"
+        try:
+            rc, log = self.gate("on", detail=detail.as_dict(), labels=RELEASE_LABELS,
+                                tier=2, detail_key="pulp-release-tagged", preset=tiers)
+            self.assertEqual(rc, "rc=0", log)
+            self.assertNotIn("slot_priority_deferred", log)
+            # Control, same instrument: the detail under the wrong key (the
+            # single-label `lane` file) is not read, so the lane is `unknown`
+            # and defers to the merge-group intent.
+            for path in (self.root / "state").glob("*.slot-demand.*.json"):
+                path.unlink()
+            rc, log = self.gate("on", detail=detail.as_dict(), labels=RELEASE_LABELS,
+                                tier=2, detail_key="lane", preset=tiers)
+            self.assertEqual(rc, "rc=75", log)
+            self.assertIn("class=unknown", log)
+        finally:
+            self.env.pop("TARTCI_SLOT_PRIORITY_RELEASE_FIRST", None)
 
     def test_full_host_only_refreshes_the_intent(self) -> None:
         self.outrank()

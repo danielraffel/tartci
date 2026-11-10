@@ -601,6 +601,9 @@ LEASE_POLICY_DEFAULT_FRESH_SECS = 90
 # TARTCI_SLOT_PRIORITY overrides the file for one shell.
 SLOT_PRIORITY_MODES = ("off", "shadow", "on")
 SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS = 2700
+# `slot_priority_release_first` (default false): with slot priority on, a lane
+# about to serve a tagged-release class ranks ahead of merge-group.
+# TARTCI_SLOT_PRIORITY_RELEASE_FIRST (0/1) overrides the file for one shell.
 # `fair_share_after_secs` (scripts/fair_share.py): a VM lane that has had work
 # it could not place for this long is ranked ahead of other repositories on the
 # host. 0 (the default) is off. TARTCI_FAIR_SHARE_AFTER_SECS overrides the file.
@@ -672,6 +675,11 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     promote = table.get("slot_priority_promote_after_secs")
     if type(promote) is not int or promote < 0:
         promote = SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS
+    release_first = type(table.get("slot_priority_release_first")) is bool \
+        and table["slot_priority_release_first"]
+    raw = os.environ.get("TARTCI_SLOT_PRIORITY_RELEASE_FIRST")
+    if raw is not None and raw.strip() in ("0", "1"):
+        release_first = raw.strip() == "1"
     fair = table.get("fair_share_after_secs")
     if type(fair) is not int or fair < 0:
         fair = 0
@@ -685,6 +693,7 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
         "lease_policy_source": source,
         "slot_priority": slot_priority,
         "slot_priority_promote_after_secs": promote,
+        "slot_priority_release_first": release_first,
         "fair_share_after_secs": fair,
     }
 

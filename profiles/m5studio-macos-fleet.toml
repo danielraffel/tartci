@@ -126,6 +126,10 @@ gate_ccache_trim = true
 # See docs/assignment-v2-rollout.md, "Slot priority".
 [leases]
 slot_priority = "on"
+# Release-first canary (this host only): a lane about to serve a tagged
+# release (pulp-release-tagged) ranks ahead of merge-group for the next free
+# slot. Rollback: delete this key.
+slot_priority_release_first = true
 
 [[lane]]
 id = "pulp-gate"
@@ -170,15 +174,17 @@ process_type = "Standard"
 # Rollback is removing this key. See docs/assignment-v2-rollout.md.
 assignment_idle_retarget_seconds = 120
 # Per-slot class order (docs/assignment-v2-rollout.md, "Per-slot class
-# preference" and "Release event classes"). Slot 2 keeps merge-group ahead of
-# PR-head so a queued merge group is selected before ordinary PR checks; releases follow
-# the gate classes there. Slot 1 is this host's release-first slot: both
-# release classes before the gate classes, falling back to gate work whenever
-# no release waits. The release tiers below serve only jobs carrying a release
-# class label, which Pulp appends when PULP_RELEASE_CLASS_TOKENS opts in.
-# Rollback: delete the slot-1 entry and the release tiers (restore slot 2 to
-# the two gate classes), re-render, reload both slots at an idle boundary.
-assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-tagged", "pulp-release-pr-gate"] }
+# preference", "Release event classes" and "Release first"). Release-first
+# canary: every slot here consults pulp-release-tagged first and falls back to
+# its previous order whenever no tagged release waits (slot 2 keeps merge-group
+# ahead of PR-head). On 2026-11-10 v1.99.1's 40 s "Smoke darwin-x64" queued
+# behind ~40 min gates because only one slot per host preferred releases. The
+# other hosts keep one release-first slot until the canary is widened (see the
+# doc for the measurements). The release tiers below serve only jobs carrying a
+# release class label, which Pulp appends when PULP_RELEASE_CLASS_TOKENS opts
+# in. Rollback: restore slot 2 to the gate classes first, re-render, reload the
+# slots at an idle boundary.
+assignment_slot_tier_order = { 1 = ["pulp-release-tagged", "pulp-release-pr-gate", "pulp-build-merge-group", "pulp-build-pr-head"], 2 = ["pulp-release-tagged", "pulp-build-merge-group", "pulp-build-pr-head", "pulp-release-pr-gate"] }
 
 [[lane.tier]]
 label = "pulp-build-merge-group"
