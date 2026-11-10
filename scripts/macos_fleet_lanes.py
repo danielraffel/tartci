@@ -57,13 +57,17 @@ PROCESS_TYPES = ("Background", "Standard", "Adaptive", "Interactive")
 SUPERVISOR_PROCESS_TYPES = ("Standard", "Interactive")
 DEFAULT_PROCESS_TYPE = "Standard"
 TOP_KEYS = {
-    "schema", "name", "host", "github_app", "stacked_images",
+    "schema", "name", "host", "github_app", "github_scan_app", "stacked_images",
     "launch_helper", "worktree_cleanup", "lane", "build_disagreement",
     "reclaim", "leases", "guest_network", "schedule_backstop", "support_agents",
     "reuse_canary", "debug_hold", "launchd_watchdog", "mise", "rustup",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
-LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
+LEASES_KEYS = {
+    "rank_vm_waiters", "waiter_fresh_secs",
+    # Rank lanes wanting the next free macOS VM slot (scripts/slot_priority.py).
+    "slot_priority", "slot_priority_promote_after_secs",
+}
 # Opt-in guest resolvers the runner configures inside each VM before it
 # registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
 GUEST_NETWORK_KEYS = {"dns_servers"}
@@ -683,6 +687,11 @@ def load(path: Path) -> dict:
         fresh = lease_policy.get("waiter_fresh_secs", 90)
         if type(fresh) is not int or not 30 <= fresh <= 600:
             fail("leases.waiter_fresh_secs must be an integer from 30 to 600")
+        if lease_policy.get("slot_priority", "off") not in ("off", "shadow", "on"):
+            fail('leases.slot_priority must be "off", "shadow" or "on"')
+        promote = lease_policy.get("slot_priority_promote_after_secs", 2700)
+        if type(promote) is not int or not 300 <= promote <= 14400:
+            fail("leases.slot_priority_promote_after_secs must be an integer from 300 to 14400")
     guest_network = data.get("guest_network")
     if guest_network is not None:
         if not isinstance(guest_network, dict):
@@ -693,33 +702,34 @@ def load(path: Path) -> dict:
         if host_profile.normalize_guest_dns_servers(guest_network.get("dns_servers")) is None:
             fail("guest_network.dns_servers must list 1 to "
                  f"{host_profile.GUEST_DNS_MAX_SERVERS} distinct routable IP addresses")
-    github_app = data.get("github_app")
-    if github_app is not None:
-        if not isinstance(github_app, dict):
-            fail("github_app must be a table")
-        unknown = set(github_app) - GITHUB_APP_KEYS
-        if unknown:
-            fail(f"unknown github_app keys: {sorted(unknown)}")
-        if set(github_app) != GITHUB_APP_KEYS:
-            fail("github_app must declare id, private_key_path, and cache_dir together")
-        if (not isinstance(github_app["id"], str)
-                or not re.fullmatch(r"[1-9][0-9]*", github_app["id"])):
-            fail("github_app.id must be a positive decimal string")
-        home = PurePosixPath(host["home"])
-        for key, required_root in (
-                ("private_key_path", home / ".config/shipyard/github-apps"),
-                ("cache_dir", home / ".config/shipyard")):
-            value = github_app[key]
-            if not isinstance(value, str):
-                fail(f"github_app.{key} must be an absolute host-local Shipyard path")
-            normalized = PurePosixPath(posixpath.normpath(value))
-            try:
-                relative = normalized.relative_to(required_root)
-            except ValueError:
-                relative = None
-            if (not normalized.is_absolute() or normalized.as_posix() != value
-                    or relative is None or not relative.parts):
-                fail(f"github_app.{key} must be an absolute host-local Shipyard path")
+    for app_table in ("github_app", "github_scan_app"):
+        github_app = data.get(app_table)
+        if github_app is not None:
+            if not isinstance(github_app, dict):
+                fail(f"{app_table} must be a table")
+            unknown = set(github_app) - GITHUB_APP_KEYS
+            if unknown:
+                fail(f"unknown {app_table} keys: {sorted(unknown)}")
+            if set(github_app) != GITHUB_APP_KEYS:
+                fail(f"{app_table} must declare id, private_key_path, and cache_dir together")
+            if (not isinstance(github_app["id"], str)
+                    or not re.fullmatch(r"[1-9][0-9]*", github_app["id"])):
+                fail(f"{app_table}.id must be a positive decimal string")
+            home = PurePosixPath(host["home"])
+            for key, required_root in (
+                    ("private_key_path", home / ".config/shipyard/github-apps"),
+                    ("cache_dir", home / ".config/shipyard")):
+                value = github_app[key]
+                if not isinstance(value, str):
+                    fail(f"{app_table}.{key} must be an absolute host-local Shipyard path")
+                normalized = PurePosixPath(posixpath.normpath(value))
+                try:
+                    relative = normalized.relative_to(required_root)
+                except ValueError:
+                    relative = None
+                if (not normalized.is_absolute() or normalized.as_posix() != value
+                        or relative is None or not relative.parts):
+                    fail(f"{app_table}.{key} must be an absolute host-local Shipyard path")
     stacked = data.get("stacked_images")
     if stacked is not None and not isinstance(stacked, dict):
         fail("stacked_images must be a table")
@@ -3057,6 +3067,15 @@ def lane_plist(
             "SHIPYARD_GITHUB_APP_ID": github_app["id"],
             "SHIPYARD_GITHUB_APP_PRIVATE_KEY_PATH": github_app["private_key_path"],
             "SHIPYARD_GITHUB_APP_CACHE_DIR": github_app["cache_dir"],
+        })
+    scan_app = data.get("github_scan_app")
+    if scan_app is not None:
+        # Read-only App for queue scans; the lane resolves the wrapper itself
+        # (providers/tart-macos/runner.sh). References only, never key bytes.
+        env.update({
+            "TARTCI_SCAN_APP_ID": scan_app["id"],
+            "TARTCI_SCAN_APP_PRIVATE_KEY_PATH": scan_app["private_key_path"],
+            "TARTCI_SCAN_APP_CACHE_DIR": scan_app["cache_dir"],
         })
     if host.get("vm_dhcp_breaker") is False:
         env["TARTCI_VM_DHCP_BREAKER"] = "0"

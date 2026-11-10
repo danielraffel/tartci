@@ -86,6 +86,10 @@ class AgentHygieneTests(unittest.TestCase):
         old = time.time() - 3 * 86400
         os.utime(transcript, (old, old))
         env = os.environ.copy()
+        # Run from an agent session (CLAUDECODE, CODEX_*) the script refuses a
+        # reap by design; these tests assert the human path, so start clean.
+        for agent_marker in ("CLAUDECODE", "CODEX_SANDBOX", "CODEX_HOME_SESSION"):
+            env.pop(agent_marker, None)
         env.update(AH_PS_SNAPSHOT_FILE=str(snapshot), AH_TRANSCRIPT_DIRS=str(transcripts),
                    AH_STALE_DAYS="2", AH_PROC_PCT="1000", AH_SWAP_PCT="1000")
         return env

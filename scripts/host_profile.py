@@ -589,6 +589,11 @@ def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
 # counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
 # TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
 LEASE_POLICY_DEFAULT_FRESH_SECS = 90
+# `slot_priority` ranks the lanes that want the next free macOS VM slot
+# (scripts/slot_priority.py): "off" (default), "shadow" (log only) or "on".
+# TARTCI_SLOT_PRIORITY overrides the file for one shell.
+SLOT_PRIORITY_MODES = ("off", "shadow", "on")
+SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS = 2700
 
 
 def _parse_leases_table(text: str) -> dict[str, Any]:
@@ -617,6 +622,8 @@ def _parse_leases_table(text: str) -> dict[str, Any]:
                 values[key.strip()] = value == "true"
             elif value.isdigit():
                 values[key.strip()] = int(value)
+            elif len(value) >= 2 and value[0] == value[-1] == '"' and '"' not in value[1:-1]:
+                values[key.strip()] = value[1:-1]
     return values
 
 
@@ -642,10 +649,21 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     raw = os.environ.get("TARTCI_VM_WAITER_FRESH_SECS")
     if raw is not None and raw.strip().isdigit() and int(raw.strip()) > 0:
         fresh = int(raw.strip())
+    slot_priority = table.get("slot_priority")
+    if slot_priority not in SLOT_PRIORITY_MODES:
+        slot_priority = "off"
+    raw = os.environ.get("TARTCI_SLOT_PRIORITY")
+    if raw is not None and raw.strip() in SLOT_PRIORITY_MODES:
+        slot_priority = raw.strip()
+    promote = table.get("slot_priority_promote_after_secs")
+    if type(promote) is not int or promote < 0:
+        promote = SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS
     return {
         "rank_vm_waiters": enabled,
         "vm_waiter_fresh_secs": fresh,
         "lease_policy_source": source,
+        "slot_priority": slot_priority,
+        "slot_priority_promote_after_secs": promote,
     }
 
 
