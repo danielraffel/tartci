@@ -18,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import leases
@@ -389,6 +390,35 @@ class ProfileKnobTests(unittest.TestCase):
                 self.assertEqual(got["vm_waiter_fresh_secs"], 120)
                 os.environ["TARTCI_RANK_VM_WAITERS"] = "0"
                 self.assertFalse(host_profile.lease_policy_settings(str(path))["rank_vm_waiters"])
+            finally:
+                os.environ.clear()
+                os.environ.update(saved)
+
+    def test_vm_slot_lending_table_and_environment(self) -> None:
+        import host_profile
+        import leases
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "p.toml"
+            saved = dict(os.environ)
+            try:
+                os.environ.pop("TARTCI_VM_SLOT_LENDING", None)
+                path.write_text("schema = 1\n[leases]\nrank_vm_waiters = true\n")
+                self.assertFalse(host_profile.lease_policy_settings(str(path))["vm_slot_lending"])
+                path.write_text("schema = 1\n[leases]\nvm_slot_lending = true\n")
+                self.assertTrue(host_profile.lease_policy_settings(str(path))["vm_slot_lending"])
+                os.environ["TARTCI_VM_SLOT_LENDING"] = "0"
+                self.assertFalse(host_profile.lease_policy_settings(str(path))["vm_slot_lending"])
+                # The lease store takes the knob from the profile it builds.
+                os.environ["TARTCI_VM_SLOT_LENDING"] = "1"
+                args = leases.parse_args(["status", "--capacity", "14",
+                                          "--reserved-gate-cores", "8"])
+                with mock.patch.object(host_profile, "fleet_profile_path", return_value=path):
+                    cfg = leases.capacity_config(args)
+                self.assertEqual(cfg["vm_slot_lending"], 1)
+                self.assertEqual(cfg["macos_vm_cap"], 2)
+                args = leases.parse_args(["status", "--vm-slot-lending", "off"])
+                with mock.patch.object(host_profile, "fleet_profile_path", return_value=path):
+                    self.assertEqual(leases.capacity_config(args)["vm_slot_lending"], 0)
             finally:
                 os.environ.clear()
                 os.environ.update(saved)

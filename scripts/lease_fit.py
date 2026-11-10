@@ -78,10 +78,23 @@ def evaluate(
     never_mem = mem_axis and (req_mem > mem_budget or req_mem > cfg["total_mem_mb"])
     by_cores = core_budget // cores
     by_mem = (mem_budget // req_mem) if mem_axis and req_mem > 0 else by_cores
+    gate = priority >= cfg["gate_priority"]
+    if not gate and cfg.get("vm_slot_lending"):
+        # VM slot lending (leases.py): the lease that takes the last guest slot
+        # is held to the host totals. Every guest before it stays in N, so the
+        # most that run at once is the slot cap, if the cap's worth fits T.
+        cap = int(cfg.get("macos_vm_cap", 2))
+        fits_cap = cap * cores <= cfg["total"] and (
+            not mem_axis or cap * req_mem <= cfg["total_mem_mb"])
+        if fits_cap and not (never_cores or never_mem):
+            by_cores = by_mem = max(min(by_cores, by_mem), cap)
+    slot_open = not gate and leases.vm_slot_lending_open(active, cfg, adding=1)
+    if slot_open:
+        core_budget, mem_budget = cfg["total"], cfg["total_mem_mb"]
     current = leases.usage(active, cfg)
     used_class = (
         current["used_cores"]
-        if priority >= cfg["gate_priority"]
+        if gate or slot_open
         else current["non_gate_used_cores"]
     )
     now_cores = (
@@ -92,7 +105,7 @@ def evaluate(
     if mem_axis:
         used_mem_class = (
             current.get("used_mem_mb", 0)
-            if priority >= cfg["gate_priority"]
+            if gate or slot_open
             else current.get("non_gate_used_mem_mb", 0)
         )
         now_mem = (

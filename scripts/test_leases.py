@@ -63,12 +63,13 @@ class LeaseCliTestCase(unittest.TestCase):
         kind: str = "test",
         pid: int | None = None,
         check: bool = True,
+        extra_args: tuple[str, ...] = (),
     ) -> subprocess.CompletedProcess[str]:
         # Core-axis tests keep the memory axis OFF (capacity_mem_mb=0) so they
         # are deterministic regardless of the CI host's RAM; memory-axis tests
         # pass an explicit budget. Without this, a core capacity like `10` on a
         # small-RAM runner would be denied by the derived memory budget.
-        extra: list[str] = ["--capacity-mem-mb", str(capacity_mem_mb)]
+        extra: list[str] = ["--capacity-mem-mb", str(capacity_mem_mb), *extra_args]
         if mem_mb is not None:
             extra += ["--mem-mb", str(mem_mb)]
         if disk_path is not None:
@@ -363,6 +364,106 @@ class LeasePriorityTests(LeaseCliTestCase):
         self.assertEqual(denied.returncode, 75)
         self.assertEqual(json.loads(denied.stdout)["reason"], "capacity_exceeded")
 
+
+
+class VmSlotLendingTests(LeaseCliTestCase):
+    """A non-gate macOS guest that takes the host's LAST guest slot may use the
+    gate reserve, because no gate guest can start while every slot is held.
+
+    Sized like m5 (T=14, S=8, N=6) and m5studio's Vellum lane (6-core guests).
+    """
+
+    T, S = 14, 8
+    LEND = ("--vm-slot-lending", "on", "--macos-vm-cap", "2")
+
+    def guest(self, lease_id: str, cores: int, *, priority: str = "vm",
+              kind: str = "tart-macos-vm", lend: bool = True, mem_mb: int | None = None,
+              capacity_mem_mb: int = 0, reserved_mem_mb: int = 0, check: bool = False):
+        proc = self.acquire(
+            lease_id, cores, priority=priority, capacity=self.T, reserved=self.S,
+            kind=kind, disk_path=Path(self.tmp.name), mem_mb=mem_mb,
+            capacity_mem_mb=capacity_mem_mb, reserved_mem_mb=reserved_mem_mb,
+            extra_args=self.LEND if lend else ("--vm-slot-lending", "off"), check=False)
+        if check and proc.returncode != 0:
+            self.fail(f"{lease_id} denied: {proc.stdout}")
+        return proc, json.loads(proc.stdout)
+
+    def test_second_non_gate_guest_is_denied_without_lending(self) -> None:
+        self.guest("vellum-1", 6, lend=False, check=True)
+        proc, body = self.guest("vellum-2", 6, lend=False)
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["reason"], "capacity_exceeded")
+        self.assertEqual(body["core_limit_class"], "non_gate")
+
+    def test_second_non_gate_guest_takes_the_last_slot_with_lending(self) -> None:
+        self.guest("vellum-1", 6, check=True)
+        proc, body = self.guest("vellum-2", 6)
+        self.assertEqual(proc.returncode, 0, body)
+        self.assertTrue(body["lease"]["vm_slot_lending"])
+        self.assertEqual(body["capacity"]["used_cores"], 12)
+
+    def test_first_guest_stays_in_the_non_gate_budget(self) -> None:
+        # One slot is still open for a gate guest of any size, so nothing of S
+        # is lent: a 7-core non-gate guest is over N=6 and is refused.
+        proc, body = self.guest("vellum-1", 7)
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["core_limit_class"], "non_gate")
+
+    def test_lending_never_exceeds_the_host_total(self) -> None:
+        self.guest("vellum-1", 6, check=True)
+        proc, body = self.guest("vellum-2", 9)
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["reason"], "capacity_exceeded")
+
+    def test_a_gate_guest_in_a_slot_keeps_lending_off(self) -> None:
+        self.guest("pulp", 4, priority="gate", check=True)
+        self.guest("vellum-1", 6, check=True)
+        # A stale third record must not let a non-gate guest into S.
+        proc, body = self.guest("vellum-2", 4)
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["core_limit_class"], "non_gate")
+
+    def test_a_gate_build_holding_cores_keeps_lending_off(self) -> None:
+        self.acquire("gate-build", 2, priority="gate", capacity=self.T, reserved=self.S)
+        self.guest("vellum-1", 6, check=True)
+        proc, body = self.guest("vellum-2", 6)
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["core_limit_class"], "non_gate")
+
+    def test_linux_guests_do_not_count_as_macos_slots(self) -> None:
+        self.guest("linux", 3, kind="tart-linux-vm", check=True)
+        proc, body = self.guest("vellum-1", 6)
+        # 3 + 6 = 9 > N: a Linux VM holds no macOS slot, so a gate guest can
+        # still start and the vellum guest gets only N.
+        self.assertEqual(proc.returncode, 75)
+        self.assertEqual(body["core_limit_class"], "non_gate")
+
+    def test_lent_guest_cores_are_not_preemptible_borrowing(self) -> None:
+        self.guest("vellum-1", 6, check=True)
+        self.guest("vellum-2", 6, check=True)
+        status = json.loads(self.run_cli(
+            "status", "--capacity", str(self.T), "--reserved-gate-cores", str(self.S),
+            "--capacity-mem-mb", "0", "--dynamic-lending", "on", *self.LEND).stdout)
+        self.assertEqual(status["capacity"]["lent_cores"], 0)
+
+    def test_agent_builds_stay_in_the_non_gate_budget(self) -> None:
+        self.guest("vellum-1", 6, check=True)
+        self.guest("vellum-2", 6, check=True)
+        denied = self.acquire("agent", 1, priority="build", capacity=self.T,
+                              reserved=self.S, extra_args=self.LEND, check=False)
+        self.assertEqual(denied.returncode, 75)
+
+    def test_memory_axis_uses_the_host_total_for_the_last_slot(self) -> None:
+        # N memory = 20000 - 12000 = 8000: one 6000 MB guest fits, a second
+        # only under lending, and never past the host's 20000.
+        args = dict(capacity_mem_mb=20000, reserved_mem_mb=12000)
+        self.guest("vellum-1", 6, mem_mb=6000, check=True, **args)
+        proc, _ = self.guest("vellum-2", 6, mem_mb=6000, lend=False, **args)
+        self.assertEqual(proc.returncode, 75)
+        proc, body = self.guest("vellum-2", 6, mem_mb=6000, **args)
+        self.assertEqual(proc.returncode, 0, body)
+        proc, _ = self.guest("vellum-3", 1, mem_mb=9000, **args)
+        self.assertEqual(proc.returncode, 75)
 
 
 class ReleaseClassLeaseAdmissionTests(LeaseCliTestCase):

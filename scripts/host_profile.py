@@ -588,6 +588,14 @@ def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
 # neither reads nor writes waiters. waiter_fresh_secs bounds how long a waiter
 # counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
 # TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
+#
+# vm_slot_lending (default off): a non-gate VM lease may use the part of the
+# gate reserve that belongs to the macOS guest slot it occupies. The reserve S
+# is sized for `macos_vm_cap` gate guests; while k non-gate guests hold slots,
+# at most cap - k gate guests can run, so only (cap - k) x S / cap of the
+# reserve is reachable by the gate. The rest is lent to the guests holding the
+# slots, and only to VM leases: agent builds stay within the static budget.
+# TARTCI_VM_SLOT_LENDING (0/1) overrides the file for one shell.
 LEASE_POLICY_DEFAULT_FRESH_SECS = 90
 
 
@@ -621,7 +629,7 @@ def _parse_leases_table(text: str) -> dict[str, Any]:
 
 
 def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
-    """Return {rank_vm_waiters, vm_waiter_fresh_secs, lease_policy_source}."""
+    """Return {rank_vm_waiters, vm_waiter_fresh_secs, vm_slot_lending, lease_policy_source}."""
     enabled = False
     fresh = LEASE_POLICY_DEFAULT_FRESH_SECS
     source = "default"
@@ -642,9 +650,14 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     raw = os.environ.get("TARTCI_VM_WAITER_FRESH_SECS")
     if raw is not None and raw.strip().isdigit() and int(raw.strip()) > 0:
         fresh = int(raw.strip())
+    slot_lending = type(table.get("vm_slot_lending")) is bool and table["vm_slot_lending"]
+    raw = os.environ.get("TARTCI_VM_SLOT_LENDING")
+    if raw is not None and raw.strip() in ("0", "1"):
+        slot_lending = raw.strip() == "1"
     return {
         "rank_vm_waiters": enabled,
         "vm_waiter_fresh_secs": fresh,
+        "vm_slot_lending": slot_lending,
         "lease_policy_source": source,
     }
 

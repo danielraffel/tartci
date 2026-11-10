@@ -3205,6 +3205,30 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `leases.json` and expire after `waiter_fresh_secs` (default 90) without a
   refresh or when their owner process exits. Full rules and the canary proxy:
   `docs/assignment-v2-rollout.md`, "Ranked VM lease waiters".
+- **VM slot lending (opt-in, default off; m5 canary)** — `[leases]
+  vm_slot_lending = true` lets the non-gate macOS VM lease that takes the
+  host's LAST guest slot (a second Vellum VM beside the first) be admitted
+  against the host totals T instead of the non-gate budgets N = T - S, on the
+  core and memory axes. While non-gate guests hold every one of the
+  `macos_vm_cap` slots no gate guest can start, so no gate VM can use the gate
+  reserve S. Everything else is unchanged: a non-gate guest that leaves a slot
+  open is held to N, so a gate guest of any size (Pulp 4, forge 6 on m5) finds
+  what the static model guarantees; agent builds stay within N; T binds every
+  lease. Only `tart-macos-vm` leases hold slots (Linux and Windows VMs do not),
+  and any live gate-priority lease (a gate guest, or a gate build that holds S
+  without a slot) turns lending off. A lent lease carries
+  `vm_slot_lending: true`, and its cores are not counted as preemptible `lent`
+  cores. `--vm-slot-lending on|off` and `TARTCI_VM_SLOT_LENDING=0|1` override
+  the profile; `lease_fit.py` answers with the same rule and reports
+  `max_concurrent` = the slot cap when cap x VM fits T. Why: Vellum's queue is
+  the fleet's longest (96 job-hours queued on 2026-11-09) and each host runs one
+  Vellum supervisor whose VM fills N, so a host with a free slot and an idle
+  Pulp queue could not start a second Vellum job (10.9 slot-hours/day idle
+  while queued, fleet-wide). The canary profile pairs the key with
+  `supervisors = 2` on the vellum-gate lane. Watch: `vm_slot_lending` leases per
+  day, Vellum queue wait p50, and Pulp `macos` queue wait on the canary host
+  (a Pulp job that arrives while both slots hold Vellum waits for one to end;
+  `rank_vm_waiters` defers the second Vellum lease while a Pulp waiter is live).
 
 - **A VM lease's memory is the guest's memory** — for a Tart lane, the figure
   charged on the memory axis is the figure the clone is booted with

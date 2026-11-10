@@ -643,6 +643,18 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         if fresh_override is not None and int(fresh_override) > 0
         else int(profile.get("vm_waiter_fresh_secs", host_profile.LEASE_POLICY_DEFAULT_FRESH_SECS))
     )
+    slot_override = getattr(args, "vm_slot_lending", None)
+    vm_slot_lending = (
+        slot_override == "on"
+        if slot_override in ("on", "off")
+        else bool(profile.get("vm_slot_lending", False))
+    )
+    cap_override = getattr(args, "macos_vm_cap", None)
+    macos_vm_cap = (
+        int(cap_override)
+        if cap_override is not None and int(cap_override) > 0
+        else int(profile.get("macos_vm_cap", 2))
+    )
     lending_override = getattr(args, "dynamic_lending", None)
     dynamic_lending = (
         lending_override == "on"
@@ -677,6 +689,8 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
             ),
         ),
         "rank_vm_waiters": int(rank_vm_waiters),
+        "vm_slot_lending": int(vm_slot_lending),
+        "macos_vm_cap": max(1, macos_vm_cap),
         "waiter_fresh_secs": max(1, waiter_fresh),
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
@@ -733,6 +747,67 @@ def lending_active(records: list[dict[str, Any]], cfg: dict[str, int]) -> bool:
     )
 
 
+# --- VM slot lending -----------------------------------------------------------
+#
+# The gate reserve S exists so that gate guests find their cores. A gate guest
+# also needs one of the host's `macos_vm_cap` guest slots, and a non-gate guest
+# (a Vellum VM) holds one for as long as it runs. When non-gate guests hold
+# EVERY slot, no gate guest can start until one of them ends, so no gate VM
+# can use any part of S in that state. vm_slot_lending (opt-in, [leases] in the
+# fleet profile) lets the non-gate VM lease that takes the last slot use S.
+#
+# What it never changes:
+#   * the host total T binds every lease, as before (no oversubscription);
+#   * agent builds and other non-VM non-gate leases stay within N = T - S;
+#   * with any slot left for a gate guest, every non-gate lease is held to N,
+#     so a gate guest of any size finds exactly the cores the static model
+#     guarantees it (sizes differ per lane: forge-gate leases 6 on m5, Pulp 4);
+#   * any live gate-priority lease turns lending off: one that holds no macOS
+#     slot (a build, a Linux VM) owns part of S, and a gate guest means the
+#     slots are not all non-gate;
+#   * only `tart-macos-vm` leases count as slot holders, and only a new one
+#     can be lent to: Linux and Windows VMs do not take Apple's guest slots.
+# Cores used inside the lent allowance are not "lent" in the dynamic-lending
+# sense: no gate grant can need them back, so nothing is preempted for them.
+
+
+#: The only lease kind that occupies one of Apple's macOS guest slots. Linux
+#: and Windows VMs (`tart-linux-vm`, `qemu-windows-vm`) are VMs but hold none.
+MACOS_GUEST_KIND = "tart-macos-vm"
+
+
+def holds_macos_slot(kind: Any) -> bool:
+    return str(kind or "") == MACOS_GUEST_KIND
+
+
+def is_non_gate_vm(record: dict[str, Any], cfg: dict[str, int]) -> bool:
+    """A non-gate lease that holds a macOS guest slot."""
+    return (
+        not is_floor(record)
+        and holds_macos_slot(record.get("command_kind"))
+        and not is_gate_record(record, cfg)
+    )
+
+
+def vm_slot_lending_open(records: list[dict[str, Any]], cfg: dict[str, int], *, adding: int = 0) -> bool:
+    """True when non-gate guests hold every slot (counting `adding` new ones)."""
+    if not cfg.get("vm_slot_lending"):
+        return False
+    live = [record for record in records if not is_floor(record)]
+    # Any live gate lease turns it off: one without a slot holds part of S, and
+    # one with a slot means the slots are not all non-gate (a record that has
+    # not been released yet is treated as the guest it was).
+    if any(is_gate_record(record, cfg) for record in live):
+        return False
+    held = sum(1 for record in live if is_non_gate_vm(record, cfg)) + adding
+    return held >= int(cfg.get("macos_vm_cap", 2))
+
+
+def vm_slot_allowance(records: list[dict[str, Any]], cfg: dict[str, int]) -> int:
+    """Cores of S that the live non-gate guests may use beyond N right now."""
+    return int(cfg["reserved_gate_cores"]) if vm_slot_lending_open(records, cfg) else 0
+
+
 def class_usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, Any]:
     """Class and lending figures over non-floor records."""
     guaranteed_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
@@ -749,7 +824,8 @@ def class_usage(records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str,
         if build_class in by_class:
             by_class[build_class] += cores
     lent = (
-        max(0, non_gate_used - guaranteed_limit) if lending_active(records, cfg) else 0
+        max(0, non_gate_used - guaranteed_limit - vm_slot_allowance(records, cfg))
+        if lending_active(records, cfg) else 0
     )
     return {
         "dynamic_lending": bool(cfg.get("dynamic_lending")),
@@ -857,7 +933,10 @@ def reconcile_borrowers(
     used = sum(record_int(record, "lease_size_cores") for record in live)
     non_gate = [record for record in live if not is_gate_record(record, cfg)]
     non_gate_used = sum(record_int(record, "lease_size_cores") for record in non_gate)
-    lent = max(0, non_gate_used - guaranteed_limit) if lending_active(live, cfg) else 0
+    lent = (
+        max(0, non_gate_used - guaranteed_limit - vm_slot_allowance(live, cfg))
+        if lending_active(live, cfg) else 0
+    )
     overlap = used - total
     # Store order is admission order (records are appended), which breaks
     # created_at ties inside one second.
@@ -1607,6 +1686,11 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         if build_class is not None and priority >= cfg["gate_priority"]:
             raise ValueError("--class applies to non-gate build leases only")
         reserve, reserve_source = prompt_reserve(store_dir, cfg)
+        vm_slot_open = (
+            holds_macos_slot(args.kind)
+            and priority < cfg["gate_priority"]
+            and vm_slot_lending_open(active, cfg, adding=1)
+        )
         # Memory is the second admission axis. A build lease that omits --mem-mb
         # is charged its cores * per-job estimate so the axis engages even before
         # every caller passes memory explicitly. The axis is skipped entirely when
@@ -1615,7 +1699,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
         req_mem = int(args.mem_mb) if explicit_mem else lease_size * cfg["per_job_mem_mb"]
         verdict = core_and_memory_verdict(
             cfg, current_usage, priority, lease_size, req_mem,
-            build_class=build_class, reserve=reserve,
+            build_class=build_class, reserve=reserve, vm_slot_open=vm_slot_open,
         )
         min_cores = int(getattr(args, "min_cores", 0) or 0)
         requested_full = lease_size
@@ -1634,7 +1718,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
                 )
                 trial = core_and_memory_verdict(
                     cfg, current_usage, priority, size, size_mem,
-                    build_class=build_class, reserve=reserve,
+                    build_class=build_class, reserve=reserve, vm_slot_open=vm_slot_open,
                 )
                 if not (trial["total_exceeded"] or trial["class_exceeded"] or trial["mem_exceeded"]):
                     lease_size, req_mem, verdict = size, size_mem, trial
@@ -1760,6 +1844,10 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             )
         if memory_only:
             record["memory_only"] = True
+        if vm_slot_open and verdict.get("core_limit_class") == "vm_slot_lending":
+            # Took the last guest slot under VM slot lending: status and the
+            # doctor can tell this lease from one inside the non-gate budget.
+            record["vm_slot_lending"] = True
         if build_class is not None and floor is None:
             record["build_class"] = build_class
             if lease_size < requested_full:
@@ -2009,8 +2097,13 @@ def core_and_memory_verdict(
     *,
     build_class: str | None = None,
     reserve: int = 0,
+    vm_slot_open: bool = False,
 ) -> dict[str, Any]:
     """Whether a lease of this size, priority and class exceeds an axis.
+
+    `vm_slot_open` (see "VM slot lending") holds a non-gate VM lease that takes
+    the host's last guest slot to the host totals instead of the non-gate
+    budgets; the caller decides it from the live records.
 
     Cores: the host-wide total binds every lease. A gate lease does not count
     lent cores (see "build classes and dynamic gate lending"), so its check is
@@ -2036,7 +2129,10 @@ def core_and_memory_verdict(
     else:
         core_limit = guaranteed_limit
         core_limit_class = "non_gate"
-        if build_class == "interactive" and cfg.get("dynamic_lending"):
+        if vm_slot_open:
+            core_limit = total
+            core_limit_class = "vm_slot_lending"
+        elif build_class == "interactive" and cfg.get("dynamic_lending"):
             gate_used = int(current_usage.get("gate_used_cores", 0))
             core_limit = max(guaranteed_limit, total - gate_used - reserve)
             core_limit_class = "interactive_lending"
@@ -2051,7 +2147,7 @@ def core_and_memory_verdict(
     mem_axis_on = cfg["total_mem_mb"] > 0
     mem_limit = cfg["total_mem_mb"]
     used_mem_for_limit = current_usage.get("used_mem_mb", 0)
-    if not gate:
+    if not gate and not vm_slot_open:
         mem_limit = max(
             cfg["per_job_mem_mb"],
             cfg["total_mem_mb"] - cfg["reserved_gate_mem_mb"],

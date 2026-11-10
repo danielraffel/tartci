@@ -101,6 +101,16 @@ gate_ccache_trim = true
 # Canary: ranked VM lease waiters on for m5 (baseline window 2026-09-27T09:03Z
 # to 2026-09-28T08:07Z: 1 inversion in 12 contended hours, 78 acquires).
 rank_vm_waiters = true
+# VM slot lending (scripts/leases.py, "VM slot lending"): the Vellum guest that
+# takes this host's LAST guest slot may use the gate reserve, because no gate
+# guest can start while both slots hold Vellum. Paired with a second Vellum
+# supervisor below. Measured 2026-11-09T00:55Z..11-10T00:55Z: Vellum jobs
+# queued 96 job-hours while this host had a free slot and its one Vellum lane
+# was busy for 1.8 slot-hours (m5studio 2.8, m1 5.0, m3 1.2: canary here
+# first, as rank_vm_waiters was). Every other lease keeps the static budgets,
+# and the host total still binds. Rollback: delete this key
+# and set the vellum-gate lane back to supervisors = 1.
+vm_slot_lending = true
 
 [[lane]]
 id = "pulp-gate"
@@ -276,7 +286,10 @@ golden = "pulp-build-runner:latest"
 # Vellum is advisory to Pulp's required gate: vm=60, while Pulp
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"
-supervisors = 1
+# Two supervisors. Both Vellum guests fit the lease budget only when the
+# second takes the last free guest slot (VM slot lending above); with a Pulp
+# guest in the other slot there is no slot for it. docs/runbook.md, "VM slot lending".
+supervisors = 2
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m5"]
 workflows = ["Locked macOS GPU proof"]

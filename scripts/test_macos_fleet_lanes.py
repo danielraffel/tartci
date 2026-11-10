@@ -240,6 +240,20 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
 
+    def test_vm_slot_lending_is_a_policed_boolean_on_the_m5_canary(self) -> None:
+        self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["vm_slot_lending"], True)
+        vellum = next(lane for lane in fleet.load(HOST_CONFIGS["m5"])["lane"]
+                      if lane["id"] == "vellum-gate")
+        self.assertEqual(vellum["supervisors"], 2)
+        body = HOST_CONFIGS["m5"].read_text()
+        mutated = re.sub(r"(?m)^vm_slot_lending = \w+$", "vm_slot_lending = 1", body, count=1)
+        self.assertNotEqual(mutated, body, "control: the vm_slot_lending value was rewritten")
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "m5.toml"
+            path.write_text(mutated)
+            with self.assertRaisesRegex(ValueError, "vm_slot_lending must be a boolean"):
+                fleet.load(path)
+
     def test_external_volume_profile_uses_stable_signed_resident_launcher(self) -> None:
         data = fleet.load(HOST_CONFIGS["studio"])
         rendered = fleet.rendered_plists(data)

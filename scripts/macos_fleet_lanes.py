@@ -63,7 +63,7 @@ TOP_KEYS = {
     "reuse_canary", "debug_hold", "launchd_watchdog", "mise", "rustup",
 }
 # Opt-in lease-store policy read by scripts/leases.py through host_profile.py.
-LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs"}
+LEASES_KEYS = {"rank_vm_waiters", "waiter_fresh_secs", "vm_slot_lending"}
 # Opt-in guest resolvers the runner configures inside each VM before it
 # registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
 GUEST_NETWORK_KEYS = {"dns_servers"}
@@ -680,6 +680,8 @@ def load(path: Path) -> dict:
             fail(f"unknown leases keys: {sorted(unknown)}")
         if type(lease_policy.get("rank_vm_waiters", False)) is not bool:
             fail("leases.rank_vm_waiters must be a boolean")
+        if type(lease_policy.get("vm_slot_lending", False)) is not bool:
+            fail("leases.vm_slot_lending must be a boolean")
         fresh = lease_policy.get("waiter_fresh_secs", 90)
         if type(fresh) is not int or not 30 <= fresh <= 600:
             fail("leases.waiter_fresh_secs must be an integer from 30 to 600")
