@@ -791,6 +791,11 @@ could not place for that long (`scripts/fair_share.py`):
   the starved lane would still yield every time Pulp had queued work, which is
   the steady-queue case fair share exists for. A `yield_to_workflow` lane
   yields to its own repository and is unaffected.
+- **At most half the slots**: while another repository has demand, a lane
+  admitted through fair share holds at most half the host's VM slots (rounded
+  down, at least 1; 1 of 2 on every current host). A repository already at its
+  share is neither promoted nor yielded to; it waits like any other lane, so
+  starvation does not move onto Pulp's required gate.
 - **Within one repository nothing changes**: merge-group above PR-head, the
   priorities lanes lease at and ranked waiters all stay as they are.
 - **The clock**: per lane, in the supervisor. It starts at the older of the

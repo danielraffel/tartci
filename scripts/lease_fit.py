@@ -209,7 +209,7 @@ def run(argv: list[str] | None = None) -> tuple[dict[str, Any], int]:
         if fair:
             priority = fair_share.promoted_priority(
                 cfg, priority, repo=ours.repo, since=ours.demand_since,
-                active=active, waiters=live_waiters,
+                active=active, waiters=live_waiters, vm_slot_cap=ours.vm_slot_cap,
             )
         cores = ours.cores
         if (

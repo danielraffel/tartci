@@ -201,6 +201,56 @@ class TwoReposContendTests(FairShareCase):
         self.assertEqual([w["id"] for w in rivals], ["w-vellum"])
 
 
+class ShareGuardTests(FairShareCase):
+    """A lane admitted through fair share holds at most half the host's VM
+    slots (at least 1) while another repository has demand, so starvation is
+    not moved onto Pulp's required gate."""
+
+    def test_an_old_backlog_gets_the_next_vm_after_a_grant(self) -> None:
+        self.knobs(fair=AFTER)
+        self.contended_host()
+        old_job = self.now - 2 * 3600  # the clock counts the oldest queued job
+        self.wait("waiter-vellum", "vm", VELLUM, old_job)
+        rc, body = self.vm("vm-vellum-1", "vm", VELLUM, since=old_job,
+                           waiter="waiter-vellum", slot_cap=2)
+        self.assertEqual(rc, 0, body)
+        self.release("vm-vellum-1")  # its job finished; the backlog is still old
+        self.assertEqual(self.wait("waiter-vellum", "vm", VELLUM, old_job)[0], 0)
+        rc, body = self.vm("vm-pulp-c", "110", PULP, slot_cap=2)
+        self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"), body)
+        rc, body = self.vm("vm-vellum-2", "vm", VELLUM, since=old_job,
+                           waiter="waiter-vellum", slot_cap=2)
+        self.assertEqual(rc, 0, body)
+        self.assertEqual(body["lease"]["fair_share_promoted_from"], 60)
+
+    def test_both_repos_backlogged_on_a_two_slot_host_each_hold_one(self) -> None:
+        self.knobs(fair=AFTER)
+        self.contended_host()
+        starved = self.now - 4 * 3600
+        self.wait("waiter-vellum", "vm", VELLUM, starved)
+        rc, body = self.vm("vm-vellum-1", "vm", VELLUM, since=starved,
+                           waiter="waiter-vellum", slot_cap=2)
+        self.assertEqual(rc, 0, body)  # Vellum 1, Pulp 1
+        # Vellum still has a starved backlog, but holds its share: Pulp's next
+        # VM is not held back, and Vellum's next lease is not promoted.
+        self.wait("waiter-vellum", "vm", VELLUM, starved)
+        self.release("vm-pulp-b")
+        rc, body = self.fit("110", PULP, slot_cap=2)
+        self.assertEqual((rc, body["verdict"]), (0, "fits_now"), body)
+        rc, body = self.vm("vm-pulp-c", "110", PULP, slot_cap=2)
+        self.assertEqual(rc, 0, body)
+        rc, body = self.vm("vm-vellum-2", "vm", VELLUM, since=starved,
+                           waiter="waiter-vellum", slot_cap=2)
+        self.assertEqual((rc, body["reason"], body["priority"]), (75, "capacity_exceeded", 60))
+        # Control: without the slot cap (no share known) Pulp would be deferred.
+        self.release("vm-pulp-c")
+        rc, body = self.vm("vm-pulp-d", "110", PULP)
+        self.assertEqual((rc, body["reason"]), (75, "deferred_to_waiter"), body)
+
+    def test_share_limit_is_half_the_slots_at_least_one(self) -> None:
+        self.assertEqual([fair_share.share_limit(c) for c in (0, 1, 2, 3, 4)], [0, 1, 1, 1, 2])
+
+
 class OneRepoOrSameRepoTests(FairShareCase):
     def test_a_lane_alone_on_the_host_is_admitted_exactly_as_before(self) -> None:
         """Only Vellum has demand: no promotion, the same answer as with it off."""
@@ -343,7 +393,8 @@ class ShellClockTests(unittest.TestCase):
         stale = self.detail((now - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
                             written=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
         young = self.detail((now - dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
-        for path in (stale, young):
+        missing = Path(tempfile.mkdtemp()) / "absent.slot-demand.lane.json"
+        for path in (stale, young, missing):
             proc = self.bash(
                 f"TARTCI_FAIR_DEMAND_SINCE=0; tartci_fair_share_demand_seen 1 L {path}\n"
                 "tartci_fair_share_starved && echo STARVED || echo FRESH\n")

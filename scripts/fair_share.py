@@ -90,6 +90,29 @@ def contended(
     return any(other_repo(row.get("repo"), repo) for row in rows)
 
 
+def share_limit(vm_slot_cap: int) -> int:
+    """VM slots a lane may hold through fair share: half the host's, at least 1.
+
+    0 when the cap is unknown (the caller passed none): no limit is applied.
+    """
+    return max(1, vm_slot_cap // 2) if vm_slot_cap > 0 else 0
+
+
+def within_share(repo: str, active: List[Dict[str, Any]], vm_slot_cap: int) -> bool:
+    """`repo` holds fewer VMs on this host than its fair share.
+
+    Fair share must not move starvation onto the other repository (Pulp's
+    required gate): a repository that already holds half the host's VM slots
+    waits like any other lane, however old its backlog.
+    """
+    limit = share_limit(vm_slot_cap)
+    if limit == 0:
+        return True
+    held = sum(1 for row in active
+               if is_vm_kind(row.get("command_kind")) and str(row.get("repo") or "") == repo)
+    return held < limit
+
+
 def promoted_priority(
     cfg: Dict[str, Any],
     priority: int,
@@ -99,12 +122,15 @@ def promoted_priority(
     active: List[Dict[str, Any]],
     waiters: List[Dict[str, Any]],
     now: Optional[float] = None,
+    vm_slot_cap: int = 0,
 ) -> int:
-    """The priority a VM lease is admitted at: gate priority when starved and
-    contended, else unchanged."""
+    """The priority a VM lease is admitted at: gate priority when starved,
+    contended and within its share of the host's VM slots, else unchanged."""
     if not enabled(cfg) or not starved(cfg, since, now):
         return priority
     if not contended(repo, active, waiters):
+        return priority
+    if not within_share(repo, active, vm_slot_cap):
         return priority
     return max(priority, int(cfg["gate_priority"]))
 

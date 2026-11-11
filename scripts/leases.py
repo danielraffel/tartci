@@ -1310,6 +1310,8 @@ def fair_share_blocker(
     )
     fitting = []
     for waiter in rivals:
+        if not fair_share.within_share(str(waiter.get("repo") or ""), before, vm_slot_cap):
+            continue
         lease = fair_share.as_waiter_lease(cfg, waiter)
         cores, mem = lease["lease_size_cores"], lease["lease_size_mem_mb"]
         if not admits(cfg, before, lease["priority"], cores, mem):
@@ -1352,7 +1354,11 @@ def blocking_waiter(
             return blocker
     if not cfg.get("rank_vm_waiters"):
         return None
-    starved_self = fair_share.enabled(cfg) and fair_share.starved(cfg, since)
+    starved_self = (
+        fair_share.enabled(cfg)
+        and fair_share.starved(cfg, since)
+        and fair_share.within_share(repo, before, vm_slot_cap)
+    )
     ranked = sorted(
         waiters,
         key=lambda row: (
@@ -1775,6 +1781,7 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             priority = fair_share.promoted_priority(
                 cfg, priority, repo=fair_repo, since=fair_since,
                 active=active, waiters=fair_live,
+                vm_slot_cap=int(getattr(args, "vm_slot_cap", 0) or 0),
             )
         current_usage = usage(active, cfg)
         build_class = getattr(args, "build_class", None)
