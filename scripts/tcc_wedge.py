@@ -325,7 +325,7 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
     unsafe = insecurity(wrapper)
     if unsafe:
         record.update(outcome="wrapper_insecure",
-                      detail=f"refusing NOPASSWD root through a path not owned by root alone: "
+                      detail=f"refusing NOPASSWD root through a path that is not root-owned alone: "
                              f"{unsafe}")
         return record
     try:
