@@ -141,6 +141,13 @@ gate_ccache_trim = true
 # See docs/assignment-v2-rollout.md, "Slot priority".
 [leases]
 slot_priority = "on"
+# Fair share between repositories (scripts/fair_share.py): a VM lane with work
+# it could not place for this long is admitted at gate priority and other
+# repositories' lanes yield it the next VM; order within one repository is
+# unchanged. Follows the m5 and m5studio rollout (2026-11-11). Rollback: delete
+# this key and restart the lanes at an idle boundary.
+# See docs/assignment-v2-rollout.md, "Fair share between repositories".
+fair_share_after_secs = 1800
 
 [[lane]]
 id = "pulp-gate"
