@@ -98,6 +98,9 @@ BLOCKED_PHASES = frozenset({
     # heartbeat with this phase proves the supervisor is alive while it is
     # deliberately refusing new VM work; it never counts as free capacity.
     "yielded-storage-health", "yielded_storage_health",
+    # runner.sh: the same deferral, with the cause named by the watchdog: the
+    # store's opens hang on a wedged tccd (tcc_wedge.py), not on the volume.
+    "tcc-attribution-wedge",
     # lease-fit.lib.sh: this lane's VM lease cannot be granted now, or ever.
     "lease-wait", "lease-never-fits",
     # vm-dhcp.lib.sh: the host's VM DHCP is not answering; no boot can succeed.

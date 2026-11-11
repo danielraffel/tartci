@@ -1188,10 +1188,27 @@ tartci_storage_health_check(){
   fi
   reason="$(printf '%s\n' "$result" | tail -1)"
   STORAGE_HEALTH_STATE=unknown
-  event yielded_storage_health "Tart store probe failed" \
-    "state=unknown" "path=$path" "reason=$reason"
-  heartbeat yielded-storage-health
-  note "Tart store health is unknown — deferring new VM admission"
+  # The watchdog classifies a hang host-wide (tcc_wedge.py) and records its
+  # verdict on the internal volume. When it is a wedged tccd, say so and name
+  # the heal outcome, so the lane log, the heartbeat and the fleet check carry
+  # the cause instead of "health unknown". The read never touches the store.
+  local cause="" heal_outcome=""
+  cause="$(python3 "$TARTCI_ROOT/scripts/tcc_wedge.py" --lane-cause 2>/dev/null || true)"
+  case "$cause" in
+    "tcc_attribution_wedge "*)
+      heal_outcome="${cause#tcc_attribution_wedge }"
+      event tcc_attribution_wedge "Tart store opens hang on a wedged TCC daemon" \
+        "state=unknown" "path=$path" "reason=$reason" "heal=$heal_outcome"
+      heartbeat tcc-attribution-wedge
+      note "Tart store health is unknown — TCC attribution wedge (sandboxd/tccd not answering Removable Volumes checks; heal: $heal_outcome) — deferring new VM admission"
+      ;;
+    *)
+      event yielded_storage_health "Tart store probe failed" \
+        "state=unknown" "path=$path" "reason=$reason"
+      heartbeat yielded-storage-health
+      note "Tart store health is unknown — deferring new VM admission"
+      ;;
+  esac
   return 75
 }
 

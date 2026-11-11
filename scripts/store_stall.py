@@ -60,8 +60,12 @@ PROBE_TIMEOUT_S = 15
 PROBE_INTERVAL_S = 15 * 60     # the watchdog's probe cadence
 CAUSE = ("likely a system-wide sandbox or TCC stall (a wedged sandboxd or tccd): the volume "
          "itself answers nothing, and it does not clear on its own")
-STEP = ("drain this host (`tartci pool drain`), let running jobs finish, then reboot it; a "
-        "reboot clears it. Verify: `tartci doctor fleet` reports store_ok")
+STEP = ("read the tcc_wedge finding: when the watchdog classified a wedged tccd it ran "
+        "`sudo -n /usr/local/sbin/tartci-heal-tcc` (restarts tccd and sandboxd, once per 30 "
+        "min) and recorded the outcome; a missing wrapper means install "
+        "fleet/ops/tartci-heal-tcc. Otherwise drain this host (`tartci pool drain`), let "
+        "running jobs finish, then reboot it; a reboot clears it. Verify: `tartci doctor "
+        "fleet` reports store_ok")
 
 # runner(argv, timeout, env, started) -> seconds, or None when it did not
 # finish; it calls started(pid) as soon as the child exists.
