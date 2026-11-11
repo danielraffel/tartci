@@ -1,0 +1,87 @@
+#!/bin/bash
+# tartci-heal-tcc: root-owned, argument-less, rate-limited restart of macOS's
+# privacy daemons (tccd, sandboxd) on a TartCI host whose external Tart store
+# stopped answering launchd-context opens.
+#
+# Installed to /usr/local/sbin/tartci-heal-tcc (root:wheel 0755) by
+# fleet/ops/install-tartci-heal-tcc.sh, with /etc/sudoers.d/tartci-heal-tcc
+# granting NOPASSWD for this path with an EMPTY argument spec, so sudo itself
+# refuses any argument.
+#
+# WHAT IT DOES, EXACTLY: /usr/bin/killall tccd sandboxd. launchd relaunches both
+# on demand. No path, label, signal or argument is accepted; nothing else runs.
+#
+# WHY A ROOT ACTION AT ALL: every open() of an external volume from a launchd
+# job needs a Removable Volumes authorization from sandboxd, which asks the
+# system tccd. When tccd stops answering, those opens block in the kernel, the
+# store probes time out, and the lanes admit no VM (m3, 2026-10-25 and
+# 2026-11-11). Restarting the two daemons clears it without a reboot.
+#
+# THREAT MODEL, STATED PLAINLY: restarting tccd drops in-flight privacy prompts
+# and makes apps re-ask; it changes no grant and reads no database. A principal
+# able to run this can do so at most once per 30 minutes (a stamp in a
+# root-only directory under /var/db). The command vector is fixed, so
+# it cannot be bent into any other root action. tartci invokes it only when
+# its three readings agree the hang is tccd (scripts/tcc_wedge.py); the wrapper
+# itself does not know or care who asked.
+set -euo pipefail
+export PATH=/usr/bin:/bin:/usr/sbin:/sbin
+
+MIN_INTERVAL=1800
+STAMP_DIR=/var/db/tartci-heal-tcc
+STAMP=$STAMP_DIR/last-heal
+LOG=/var/log/tartci-heal-tcc.log
+KILLALL=/usr/bin/killall
+
+die() { printf 'tartci-heal-tcc: %s\n' "$1" >&2; exit "${2:-64}"; }
+
+[[ $# -eq 0 ]] || die "takes no arguments"
+[[ "$(uname -s)" == Darwin ]] || die "macOS only" 78
+
+if [[ $EUID -ne 0 ]]; then
+  # The dry-run test (tests/test_fleet_ops_scripts.sh) runs unprivileged with
+  # stub binaries. The root path above never reads these variables.
+  [[ "${TARTCI_HEAL_TCC_TEST:-}" == 1 ]] \
+    || die "must run as root: sudo -n /usr/local/sbin/tartci-heal-tcc" 77
+  STAMP="${TARTCI_HEAL_TCC_STAMP:?TARTCI_HEAL_TCC_STAMP is required under test}"
+  STAMP_DIR=$(dirname "$STAMP")
+  LOG="${TARTCI_HEAL_TCC_LOG:?TARTCI_HEAL_TCC_LOG is required under test}"
+  KILLALL=killall
+  export PATH="${TARTCI_HEAL_TCC_PATH:-$PATH}"
+fi
+
+umask 077
+[[ -d "$STAMP_DIR" ]] || mkdir -m 0700 "$STAMP_DIR"
+[[ ! -L "$STAMP_DIR" && ! -L "$STAMP" ]] || die "refusing a symlinked stamp path: $STAMP" 70
+
+now=$(date +%s)
+stamp_age=""
+if [[ -e "$STAMP" ]]; then
+  last=$(stat -f %m "$STAMP" 2>/dev/null || echo 0)
+  stamp_age=$(( now - last ))
+  if (( stamp_age >= 0 && stamp_age < MIN_INTERVAL )); then
+    printf '%s rate-limited uid=%s sudo_user=%s last_heal=%ss_ago\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$stamp_age" >>"$LOG" 2>/dev/null || true
+    die "rate limited: last heal ${stamp_age}s ago (< ${MIN_INTERVAL}s)" 75
+  fi
+fi
+
+# Stamp BEFORE acting, so a failed attempt still spends the budget.
+: >"$STAMP"
+
+before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
+before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
+rc=0
+output=$("$KILLALL" tccd sandboxd 2>&1) || rc=$?
+{
+  printf '%s heal uid=%s sudo_user=%s rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" \
+    "${before_tccd% }" "${before_sandboxd% }"
+  [[ -z "$output" ]] || printf '  killall: %s\n' "$(tr '\n' '|' <<<"$output")"
+} >>"$LOG" 2>/dev/null || true
+
+if (( rc != 0 )); then
+  die "killall tccd sandboxd exited $rc: $output" "$rc"
+fi
+printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
+  "${before_tccd% }" "${before_sandboxd% }"

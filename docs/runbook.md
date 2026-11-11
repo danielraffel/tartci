@@ -439,6 +439,70 @@ the event's `fields.reason` (`probe_timeout`, `health_supervisor_timeout`,
 timed-out probe is killed together with any child it started in its own
 session, so a probe stuck in `open()` is not left behind as an orphan.
 
+**A store that times out from launchd but answers an interactive shell is a
+wedged tccd, not a slow disk (m3, 2026-10-25 and 2026-11-11).** Every `open()`
+of an external volume from a launchd job needs a Removable Volumes
+authorization from sandboxd, which asks the system tccd; when tccd stops
+answering, those opens block in the kernel. The watchdog's probe and every
+lane's probe then time out for hours, the lanes log "store health is unknown",
+and an interactive shell (whose decision is cached) opens the same directory in
+microseconds. sandboxd logs the refusal only at the onset and at release
+(`tcc_server_message_request_authorization(kTCCServiceSystemPolicyRemovableVolumes)
+failed: ... "Failed to create Attribution Chain from message."` or `"missing
+'auth_value' in reply message"`); while requests merely hang nothing is logged.
+
+Once the watchdog's store probe has failed `--store-health-failure-threshold`
+times in a row (default 2), `scripts/tcc_wedge.py` classifies the hang from
+independent readings: the same bounded probe on an internal control path (the
+state directory) must answer; a bounded `log show` over the whole failing
+streak (10 min to 3 h) must contain a sandboxd/tccd Removable Volumes
+authorization failure (lines written after the last heal are ignored, so the
+burst a release writes cannot justify the next heal); and, when
+`TARTCI_TCC_CONTEXT_PROBE` names a command that probes the store from a context
+with TCC access (for example over `ssh localhost`, whose sshd holds Full Disk
+Access), that command must exit 0. Only every configured reading agreeing
+yields `tcc_attribution_wedge`; otherwise the
+verdict is `stalled_unclassified` (volume stalled, cause unproven) or
+`host_unresponsive`, and nothing privileged runs. The verdict and its evidence
+are written to `~/.tartci/state/store-health.json` (`classification`), and:
+
+- the watchdog line reads `store-health: healthy: ... [tcc-healed]
+  [tcc_attribution_wedge: heal ran, store answered in 8.1 ms]` after a
+  successful heal, or `store-health: draining: timeout after 10s [report-only]
+  [tcc_attribution_wedge: heal wrapper_missing]` when it could not run;
+- each lane's deferral names the cause: event `tcc_attribution_wedge`
+  (fields `reason`, `heal`), heartbeat phase `tcc-attribution-wedge` (blocked
+  for `gate_supply`, idle for `lane_busy`), and the note `Tart store health is
+  unknown — TCC attribution wedge (...; heal: <outcome>)`;
+- `tartci doctor fleet` carries a `tcc_wedge` finding: `tcc_wedge_healed`,
+  `tcc_wedge_unhealed` (the detail names `wrapper_missing`, `not_permitted`,
+  `rate_limited`, `wrapper_rate_limited`, `timeout`, `failed`, or a restart
+  after which the store still hangs), or `tcc_wedge_none`.
+
+The heal is one scoped root action and nothing broader:
+`sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs
+exactly `/usr/bin/killall tccd sandboxd` (launchd relaunches both on demand),
+takes no arguments (its sudoers grant has an empty argument spec, so sudo
+refuses any), runs at most once per 30 minutes (stamp in the root-only
+`/var/db/tartci-heal-tcc`, plus tartci's own `last_heal` record) and at most
+once per failing streak (a restart after which the store still hangs is
+`heal escalated`: drain and reboot), refuses to run through a path not owned
+by root alone (`wrapper_insecure`), and logs to
+`/var/log/tartci-heal-tcc.log`. After a run the watchdog reprobes the store
+and records the result; a store that answers again is `action: tcc-healed`.
+It is installed by hand, once per host:
+
+```sh
+fleet/ops/install-tartci-heal-tcc.sh             # plan
+sudo fleet/ops/install-tartci-heal-tcc.sh --apply
+```
+
+With the wrapper absent the watchdog still classifies, records
+`heal: wrapper_missing`, and the doctor reports `tcc_wedge_unhealed` naming
+the install step; `TARTCI_TCC_HEAL=0` in the watchdog's environment keeps it
+classify-only. Operator reads: `python3 scripts/tcc_wedge.py --state`,
+`python3 scripts/tcc_wedge.py --scan-log --last-minutes 60`.
+
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
 token — the `[github.auth]` `source = "command"` block (the

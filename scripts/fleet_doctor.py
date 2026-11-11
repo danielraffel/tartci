@@ -22,6 +22,7 @@ the fault present and the fault absent -- can be exercised without a fleet host.
 from __future__ import annotations
 
 import json
+import calendar
 import os
 import plistlib
 import subprocess
@@ -167,6 +168,9 @@ CODES: tuple[str, ...] = (
     "support_agents_ok",
     "support_agents_pending",
     "support_agents_unreadable",
+    "tcc_wedge_healed",
+    "tcc_wedge_none",
+    "tcc_wedge_unhealed",
     "tool_freshness_current",
     "tool_freshness_stale",
     "tool_freshness_unmeasured",
@@ -1192,6 +1196,45 @@ def check_store_stall(value: dict | None) -> Finding:
     return Finding("store_stall", UNKNOWN, "store_unprobed", detail, facts)
 
 
+def check_tcc_wedge(value: dict | None, now: float | None = None) -> Finding:
+    """Did the watchdog attribute a store hang to a wedged tccd, and did its heal work?
+
+    `value` is the watchdog's store-health state (tcc_wedge.read_state). Only a
+    classification fresher than tcc_wedge.FRESH_S counts; an old one says
+    nothing about now.
+    """
+    import tcc_wedge
+
+    value = value or {}
+    classification = value.get("classification") or {}
+    facts = {"classification": classification, "heal": value.get("heal"),
+             "last_heal": value.get("last_heal"), "store_state": value.get("state")}
+    fresh = False
+    try:
+        stamp = time.strptime(str(classification.get("classified_at")), "%Y-%m-%dT%H:%M:%SZ")
+        fresh = (time.time() if now is None else now) - calendar.timegm(stamp) <= tcc_wedge.FRESH_S
+    except (ValueError, TypeError):
+        fresh = False
+    if classification.get("kind") != tcc_wedge.KIND or not fresh:
+        return Finding("tcc_wedge", OK, "tcc_wedge_none",
+                       "tcc wedge: no fresh wedged-tccd verdict for the Tart store", facts)
+    heal = value.get("heal") or {}
+    outcome = str(heal.get("outcome") or "not_attempted")
+    reprobe = heal.get("reprobe") if isinstance(heal.get("reprobe"), dict) else None
+    at = classification.get("classified_at")
+    if outcome == "ran" and reprobe and reprobe.get("ok"):
+        return Finding("tcc_wedge", OK, "tcc_wedge_healed",
+                       f"tcc wedge: classified at {at}; tartci-heal-tcc ran and the store "
+                       f"answered in {reprobe.get('latency_ms')} ms", facts)
+    detail = (f"tcc wedge: classified at {at} ({classification.get('reason')}); "
+              f"heal {outcome}")
+    if heal.get("detail"):
+        detail += f": {str(heal['detail'])[:200]}"
+    if outcome == "ran" and reprobe:
+        detail += f"; after the restart the store still {reprobe.get('reason')}"
+    return Finding("tcc_wedge", PROBLEM, "tcc_wedge_unhealed", detail, facts)
+
+
 def check_reclaim(value: dict | None) -> Finding:
     """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
     import reclaim_status
@@ -1688,6 +1731,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             launchd_run: Callable[[list[str]], tuple[int, str, str]] | None = None,
             reclaim_value: dict | None = None,
             store_value: dict | None = None,
+            tcc_value: dict | None = None,
             launchd_timers_value: dict | None = None,
             vm_dhcp_value: dict | None = None,
             lane_python_value: dict | None = None,
@@ -1847,6 +1891,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
         except Exception as exc:  # noqa: BLE001 - reported as not probed
             store_value = {"state": "unprobed", "detail": f"probe failed: {exc}", "stalled": []}
     findings.append(check_store_stall(store_value))
+    if tcc_value is None:
+        try:
+            import tcc_wedge
+            tcc_value = tcc_wedge.read_state(str(home))
+        except Exception as exc:  # noqa: BLE001 - reported as no verdict
+            tcc_value = {"classification": {}, "read_error": str(exc)}
+    findings.append(check_tcc_wedge(tcc_value))
     if launchd_timers_value is None:
         try:
             import launchd_interval_guard

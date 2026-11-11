@@ -236,6 +236,29 @@ first; list it only when what it asserts really needs tomllib.
   diagnosis and pre-admission detector (live attribution plus focused tests),
   MEDIUM for final TCC durability until that replacement-build canary runs.
 
+## A Tart store that hangs from launchd but answers a shell is tccd (2026-11-11)
+
+- **Every lane on M3 logged "Tart store health is unknown — deferring new VM
+  admission" for four hours; the watchdog's `store-health.json` showed 38
+  consecutive `timeout after 10s`; yet `open()`+`fstat` of `/Volumes/<data-volume>/VMs`
+  from an interactive shell took 0.05 ms.** → *Cause:* a launchd job's open of
+  an external volume waits for a Removable Volumes authorization from sandboxd,
+  which asks the system tccd; tccd had stopped answering, so the opens blocked
+  in the kernel. sandboxd logged `tcc_server_message_request_authorization(kTCCServiceSystemPolicyRemovableVolumes)
+  failed: ... "Failed to create Attribution Chain from message."` (626 lines) at
+  the onset and 47,852 lines in the two minutes of release, and nothing in the
+  3.5 h between: a hanging request logs nothing. The same hang quarantined the
+  lanes on 2026-10-25, where it was misread as Spotlight or Time Machine holding
+  the directory. → *Fix:* `scripts/tcc_wedge.py` names the cause past the
+  failure threshold (internal control path answers + signature in the bounded
+  log window + optional TCC-context probe) and the watchdog runs the one scoped
+  root action, `sudo -n /usr/local/sbin/tartci-heal-tcc` (`killall tccd
+  sandboxd`, once per 30 min), then reprobes. The lanes, the doctor
+  (`tcc_wedge_*`) and the fleet check name the cause and the heal outcome.
+  → *Read:* `tartci doctor fleet`, `python3 scripts/tcc_wedge.py --state`.
+  → *Do not:* widen the grant, kill tccd in a loop, or reboot before reading
+  the heal outcome; a healed store is not a fixed trigger.
+
 ## A webhook 403 has three causes and only one is a credential (2026-09-21)
 
 - **`shipyard-daemon-health` clears the token cache and refreshes every five

@@ -110,6 +110,8 @@ IDLE_PHASES = frozenset({
     # No VM exists while the pinned Actions Runner retirement backoff runs.
     "runner-version-deprecated",
     "yielded-storage-health",
+    # The same deferral with its cause named: a wedged tccd (tcc_wedge.py).
+    "tcc-attribution-wedge",
     # Before the lease: no VM exists yet. The clone that follows is covered
     # by the VM lease and the `tart clone` descendant.
     "admission-precheck",

@@ -272,4 +272,56 @@ touch "$STUB_STATE/ci-in-staff"
 expect_rc 4 "ci: apply where ci lands in staff" -- env FLEET_OPS_TEST_EUID=0 bash "$CI_OPS" --apply
 has err "came out in staff"
 
+# ── tartci-heal-tcc: argument-less, rate-limited, one fixed command ──────────
+# Unprivileged dry run: TARTCI_HEAL_TCC_TEST=1 points the stamp and the log at
+# $tmp and takes killall from PATH (a stub that records its arguments). The
+# installer is exercised in plan mode only (its apply needs root).
+HEAL="$ROOT/fleet/ops/tartci-heal-tcc"
+HEAL_INSTALL="$ROOT/fleet/ops/install-tartci-heal-tcc.sh"
+heal_bin="$tmp/heal-bin"; mkdir -p "$heal_bin"
+cat >"$heal_bin/killall" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
+exit "${STUB_KILLALL_RC:-0}"
+EOF
+chmod +x "$heal_bin/killall"
+heal_env=(env TARTCI_HEAL_TCC_TEST=1 TARTCI_HEAL_TCC_STAMP="$tmp/heal.stamp"
+          TARTCI_HEAL_TCC_LOG="$tmp/heal.log" TARTCI_HEAL_TCC_PATH="$heal_bin:$PATH"
+          STUB_STATE="$STUB_STATE")
+: >"$STUB_STATE/killall.log"
+if [ "$(uname -s)" = Darwin ]; then
+  expect_rc 64 "heal: refuses an argument" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL" --help
+  has err "takes no arguments"
+  lacks err "rate limited"
+  [ ! -s "$STUB_STATE/killall.log" ] || fail "heal: an argument must run nothing"
+  expect_rc 77 "heal: refuses to run unprivileged outside the test knob" -- env -u TARTCI_HEAL_TCC_TEST bash "$HEAL"
+  has err "must run as root"
+  expect_rc 0 "heal: first run" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has out "restarted tccd and sandboxd"
+  [ "$(cat "$STUB_STATE/killall.log")" = "tccd sandboxd" ] || fail "heal: killall must receive exactly 'tccd sandboxd', got: $(cat "$STUB_STATE/killall.log")"
+  [ -e "$tmp/heal.stamp" ] || fail "heal: no stamp written"
+  grep -q "heal uid=" "$tmp/heal.log" || fail "heal: no audit line"
+  expect_rc 75 "heal: second run within the interval is rate limited" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "rate limited"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 1 ] || fail "heal: rate limit must run nothing"
+  grep -q "rate-limited" "$tmp/heal.log" || fail "heal: rate limit not logged"
+  # An old stamp (older than 30 min) allows a run again; a failing killall is reported and still stamps.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  expect_rc 3 "heal: killall failure is passed through" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_RC=3 bash "$HEAL"
+  has err "killall tccd sandboxd exited 3"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: an old stamp must allow one run"
+  expect_rc 75 "heal: a failed attempt still spends the budget" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+else
+  expect_rc 78 "heal: refuses off macOS" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "macOS only"
+  [ ! -s "$STUB_STATE/killall.log" ] || fail "heal: off macOS nothing may run"
+fi
+# The installer plans without root and names the single no-argument grant.
+expect_rc 0 "heal installer: plan" -- env -u SUDO_USER bash "$HEAL_INSTALL"
+has out "NOPASSWD: /usr/local/sbin/tartci-heal-tcc \"\""
+has out "nothing changed"
+expect_rc 77 "heal installer: apply refuses without root" -- env -u SUDO_USER bash "$HEAL_INSTALL" --apply
+has err "run with sudo"
+expect_rc 64 "heal installer: unknown flag" -- bash "$HEAL_INSTALL" --bogus
+
 echo 'fleet ops scripts: ok'
