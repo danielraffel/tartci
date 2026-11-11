@@ -44,10 +44,15 @@ def hung_control(path, timeout_s):
     return {"ok": False, "path": path, "reason": "timeout after 10s", "latency_ms": None}
 
 
-def scan_with(total: int, ok: bool = True):
-    def scan(window_s):
+def scan_with(total: int, ok: bool = True, removable: int | None = None, seen: list | None = None):
+    removable = total if removable is None else removable
+
+    def scan(window_s, before=None):
+        if seen is not None:
+            seen.append({"window_s": window_s, "before": before})
         return {"ok": ok, "window_s": window_s, "total": total, "first": "x", "last": "y",
-                "by_signature": {"attribution_chain": total, "removable_volumes_auth_failed": 0},
+                "by_signature": {"attribution_chain": total - removable,
+                                 "removable_volumes_auth_failed": removable},
                 "error": None if ok else "timeout: log show did not finish"}
     return scan
 
@@ -71,6 +76,15 @@ class SignatureTests(unittest.TestCase):
         self.assertEqual(hits["first"], "2026-11-10 22:58:43")
         self.assertEqual(hits["last"], "2026-11-11 00:15:23")
 
+    def test_lines_after_the_last_heal_are_ignored(self) -> None:
+        # The release burst a heal triggers must not be the next heal's evidence.
+        text = "\n".join([ATTRIBUTION_LINE, ONSET_LINE])
+        hits = tw.signature_hits(text, before="2026-11-11 00:00:00")
+        self.assertEqual(hits["total"], 1)
+        self.assertEqual(hits["ignored_after_heal"], 1)
+        self.assertEqual(hits["last"], "2026-11-10 22:58:43")
+        self.assertEqual(tw.signature_hits(text, before="2026-11-10 00:00:00")["total"], 0)
+
     def test_unrelated_tcc_noise_is_not_a_signature(self) -> None:
         # Negative control: the Code=9 AppDataDetailed chatter runs at ~700
         # lines per hour on a healthy host and must never count.
@@ -90,7 +104,7 @@ class SignatureTests(unittest.TestCase):
         def runner(argv, *, timeout, operation):
             seen.update(argv=argv, timeout=timeout)
             return subprocess.CompletedProcess(argv, 0, stdout=ONSET_LINE + "\n", stderr="")
-        value = tw.scan_log(1500, runner=runner)
+        value = tw.scan_log(1500, before="2026-11-12 00:00:00", runner=runner)
         self.assertTrue(value["ok"])
         self.assertEqual(value["total"], 1)
         self.assertEqual(seen["argv"][:4], [tw.LOG_SHOW, "show", "--last", "25m"])
@@ -114,6 +128,21 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(verdict["evidence"]["log_scan"]["window_s"], 1800 + tw.MIN_WINDOW_S)
         self.assertTrue(verdict["evidence"]["control_probe"]["ok"])
         self.assertEqual(verdict["classified_at"], tw._iso(NOW))
+
+    def test_attribution_chain_alone_is_not_the_store(self) -> None:
+        # Negative control: that error is logged for any TCC service; only the
+        # Removable Volumes request line ties it to the external store.
+        verdict = classify(scan=scan_with(40, removable=0))
+        self.assertEqual(verdict["kind"], "stalled_unclassified")
+        self.assertIn("40 other TCC failure", verdict["reason"])
+
+    def test_log_lines_after_the_last_heal_are_cut_off(self) -> None:
+        seen: list = []
+        classify(scan=scan_with(5, seen=seen), healed_at=NOW - 300)
+        self.assertEqual(seen[0]["before"], tw.local_stamp(NOW - 300))
+        seen.clear()
+        classify(scan=scan_with(5, seen=seen))
+        self.assertIsNone(seen[0]["before"])
 
     def test_below_threshold_is_not_classified(self) -> None:
         verdict = classify(consecutive_failures=1)
@@ -162,51 +191,78 @@ class HealTests(unittest.TestCase):
         self.wrapper.chmod(0o755)
         self.calls: list = []
 
-    def runner_rc(self, rc: int, stderr: str = "", stdout: str = ""):
-        def runner(argv, **kwargs):
-            self.calls.append((argv, kwargs))
-            return subprocess.CompletedProcess(argv, rc, stdout=stdout, stderr=stderr)
+    def runner_rc(self, rc, output: str = ""):
+        def runner(argv, timeout):
+            self.calls.append((argv, timeout))
+            return rc, output
         return runner
 
+    def heal(self, **kwargs):
+        kwargs.setdefault("wrapper", str(self.wrapper))
+        kwargs.setdefault("insecurity", lambda path: "")
+        return tw.heal(now=NOW, **kwargs)
+
     def test_runs_exactly_sudo_n_wrapper_with_no_arguments(self) -> None:
-        record = tw.heal(now=NOW, runner=self.runner_rc(0, stdout="restarted"),
-                         wrapper=str(self.wrapper), sudo="/usr/bin/sudo")
+        record = self.heal(runner=self.runner_rc(0, "restarted"), sudo="/usr/bin/sudo")
         self.assertEqual(record["outcome"], "ran")
-        self.assertEqual(self.calls[0][0], ["/usr/bin/sudo", "-n", str(self.wrapper)])
-        self.assertEqual(self.calls[0][1]["timeout"], tw.HEAL_TIMEOUT_S)
-        self.assertIs(self.calls[0][1]["stdin"], subprocess.DEVNULL)
+        self.assertEqual(self.calls, [(["/usr/bin/sudo", "-n", str(self.wrapper)],
+                                       tw.HEAL_TIMEOUT_S)])
 
     def test_missing_wrapper_runs_nothing_and_names_the_install_step(self) -> None:
-        record = tw.heal(now=NOW, runner=self.runner_rc(0), wrapper=str(self.wrapper) + ".absent")
+        record = self.heal(runner=self.runner_rc(0), wrapper=str(self.wrapper) + ".absent")
         self.assertEqual(record["outcome"], "wrapper_missing")
         self.assertIn("install-tartci-heal-tcc", record["detail"])
         self.assertEqual(self.calls, [])
 
+    def test_a_wrapper_not_owned_by_root_alone_is_never_run(self) -> None:
+        # The default check, against a temp dir the login user owns.
+        record = tw.heal(now=NOW, runner=self.runner_rc(0), wrapper=str(self.wrapper))
+        self.assertEqual(record["outcome"], "wrapper_insecure")
+        self.assertIn("not root", record["detail"])
+        self.assertEqual(self.calls, [])
+
+    def test_wrapper_insecurity_walks_the_whole_chain(self) -> None:
+        import stat as st
+
+        def info(mode, uid=0):
+            return type("I", (), {"st_mode": mode, "st_uid": uid})()
+        good = {"/": info(st.S_IFDIR | 0o755), "/usr": info(st.S_IFDIR | 0o755),
+                "/usr/local": info(st.S_IFDIR | 0o755), "/usr/local/sbin": info(st.S_IFDIR | 0o755),
+                "/usr/local/sbin/tartci-heal-tcc": info(st.S_IFREG | 0o755)}
+        self.assertEqual(tw.wrapper_insecurity(tw.WRAPPER, lstat=lambda p: good[p]), "")
+        brew = dict(good, **{"/usr/local": info(st.S_IFDIR | 0o755, uid=501)})
+        self.assertIn("/usr/local is owned by uid 501", tw.wrapper_insecurity(tw.WRAPPER, lstat=lambda p: brew[p]))
+        loose = dict(good, **{"/usr/local/sbin": info(st.S_IFDIR | 0o775)})
+        self.assertIn("writable by group", tw.wrapper_insecurity(tw.WRAPPER, lstat=lambda p: loose[p]))
+        link = dict(good, **{"/usr/local/sbin/tartci-heal-tcc": info(st.S_IFLNK | 0o755)})
+        self.assertIn("symlink", tw.wrapper_insecurity(tw.WRAPPER, lstat=lambda p: link[p]))
+        self.assertIn("not an absolute", tw.wrapper_insecurity("relative/x"))
+
     def test_refused_sudo_is_not_permitted(self) -> None:
-        record = tw.heal(now=NOW, runner=self.runner_rc(1, stderr="sudo: a password is required"),
-                         wrapper=str(self.wrapper))
+        record = self.heal(runner=self.runner_rc(1, "sudo: a password is required"))
         self.assertEqual(record["outcome"], "not_permitted")
 
     def test_wrapper_rate_limit_and_other_failures_are_distinct(self) -> None:
-        self.assertEqual(tw.heal(now=NOW, runner=self.runner_rc(75, stderr="rate limited"),
-                                 wrapper=str(self.wrapper))["outcome"], "wrapper_rate_limited")
-        self.assertEqual(tw.heal(now=NOW, runner=self.runner_rc(1, stderr="killall: boom"),
-                                 wrapper=str(self.wrapper))["outcome"], "failed")
+        self.assertEqual(self.heal(runner=self.runner_rc(75, "rate limited"))["outcome"],
+                         "wrapper_rate_limited")
+        self.assertEqual(self.heal(runner=self.runner_rc(1, "killall: boom"))["outcome"],
+                         "failed")
+        self.assertEqual(self.heal(runner=self.runner_rc(None, ""))["outcome"], "timeout")
 
-        def hangs(argv, **kwargs):
-            raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
-        self.assertEqual(tw.heal(now=NOW, runner=hangs, wrapper=str(self.wrapper))["outcome"],
-                         "timeout")
+    def test_privileged_runner_gives_up_on_a_child_it_cannot_kill(self) -> None:
+        rc, output = tw.run_privileged_bounded(["/bin/sh", "-c", "echo hi; exit 3"], 5)
+        self.assertEqual((rc, output.strip()), (3, "hi"))
+        with mock.patch.object(tw.subprocess.Popen, "kill", side_effect=PermissionError):
+            rc, output = tw.run_privileged_bounded(["/bin/sh", "-c", "sleep 5"], 0.2)
+        self.assertIsNone(rc)
 
     def test_tartci_side_rate_limit_runs_nothing(self) -> None:
         recent = {"at_epoch": NOW - 600, "outcome": "ran"}
-        record = tw.heal(now=NOW, last_heal=recent, runner=self.runner_rc(0),
-                         wrapper=str(self.wrapper))
+        record = self.heal(last_heal=recent, runner=self.runner_rc(0))
         self.assertEqual(record["outcome"], "rate_limited")
         self.assertEqual(self.calls, [])
         old = {"at_epoch": NOW - tw.HEAL_INTERVAL_S - 1, "outcome": "ran"}
-        self.assertEqual(tw.heal(now=NOW, last_heal=old, runner=self.runner_rc(0),
-                                 wrapper=str(self.wrapper))["outcome"], "ran")
+        self.assertEqual(self.heal(last_heal=old, runner=self.runner_rc(0))["outcome"], "ran")
 
 
 class WatchdogStepTests(unittest.TestCase):
@@ -237,6 +293,61 @@ class WatchdogStepTests(unittest.TestCase):
         self.assertTrue(state["heal"]["reprobe"]["ok"])
         self.assertEqual(state["failing_since"], NOW - 900)
         self.assertEqual(state["last_heal"]["outcome"], "ran")
+
+    def test_one_heal_per_streak_then_escalate(self) -> None:
+        # A restart that did not bring the store back must not be repeated
+        # every 30 min while the real cause (a failing disk) goes unread.
+        state = self.draining()
+        previous = {"failing_since": NOW - 7200,
+                    "last_heal": {"outcome": "ran", "at": tw._iso(NOW - 3600),
+                                  "at_epoch": NOW - 3600, "failing_since": NOW - 7200}}
+        healed = []
+        self.assertIsNone(self.step(state, previous=previous,
+                                    heal_fn=lambda **kw: healed.append(kw)))
+        self.assertEqual(healed, [])
+        self.assertEqual(state["heal"]["outcome"], "escalated")
+        self.assertIn("reboot", state["heal"]["detail"])
+        # A NEW streak after a healthy gap may heal again.
+        fresh = self.draining()
+        self.assertIsNotNone(self.step(fresh, previous={
+            "last_heal": {"outcome": "ran", "at_epoch": NOW - 3600, "failing_since": NOW - 9000}}))
+        self.assertEqual(fresh["heal"]["outcome"], "ran")
+
+    def test_log_cutoff_is_the_last_heal(self) -> None:
+        seen = []
+        state = self.draining()
+        self.step(state, previous={"last_heal": {"outcome": "ran", "at_epoch": NOW - 3600,
+                                                  "failing_since": NOW - 9000}},
+                  classify_fn=lambda **kw: seen.append(kw) or {"kind": "x", "reason": "",
+                                                               "evidence": {}})
+        self.assertEqual(seen[0]["healed_at"], NOW - 3600)
+
+    def test_rollout_mid_wedge_seeds_the_streak_from_the_failure_count(self) -> None:
+        seen = []
+        state = self.draining(failures=5)
+        self.step(state, previous={"consecutive_failures": 4},
+                  classify_fn=lambda **kw: seen.append(kw) or {"kind": "x", "reason": "",
+                                                               "evidence": {}})
+        self.assertEqual(state["failing_since"], NOW - 4 * tw.WATCHDOG_INTERVAL_S)
+        self.assertEqual(seen[0]["failing_since"], NOW - 4 * tw.WATCHDOG_INTERVAL_S)
+
+    def test_a_refused_sudo_spends_the_budget(self) -> None:
+        state = self.draining()
+        self.step(state, heal_fn=lambda **kw: {"outcome": "not_permitted", "at": tw._iso(NOW),
+                                               "detail": "a password is required"})
+        self.assertEqual(state["last_heal"]["outcome"], "not_permitted")
+        again = self.draining()
+        self.assertIsNone(self.step(again, previous={"failing_since": NOW - 300,
+                                                     "last_heal": state["last_heal"]},
+                                    heal_fn=tw.heal, now=NOW + 300))
+        self.assertEqual(again["heal"]["outcome"], "rate_limited")
+
+    def test_a_wrapper_rate_limit_keeps_the_earlier_budget_record(self) -> None:
+        state = self.draining()
+        earlier = {"outcome": "ran", "at_epoch": NOW - 1500, "failing_since": NOW - 99}
+        self.step(state, previous={"failing_since": NOW - 60, "last_heal": earlier},
+                  heal_fn=lambda **kw: {"outcome": "wrapper_rate_limited", "at": tw._iso(NOW)})
+        self.assertEqual(state["last_heal"], earlier)
 
     def test_first_failure_starts_the_streak_and_recovery_clears_it(self) -> None:
         state = {"state": "suspect", "consecutive_failures": 1, "drain_required": False,
@@ -385,11 +496,16 @@ class WrapperSourceTests(unittest.TestCase):
         self.assertIn('"$KILLALL" tccd sandboxd', text)
         self.assertEqual(text.count('"$KILLALL"'), 1, "one fixed command vector")
         self.assertIn("MIN_INTERVAL=1800", text)
-        self.assertIn("STAMP=/var/run/tartci-heal-tcc.stamp", text)
+        self.assertIn("STAMP=$STAMP_DIR/last-heal", text)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin", text)
-        # The root path never reads the test knobs.
-        root_path = text[:text.index("if [[ $EUID -ne 0 ]]")]
+        # The root path never reads the test knobs: strip the unprivileged
+        # branch and nothing else may mention them.
+        start = text.index("if [[ $EUID -ne 0 ]]")
+        end = text.index("\nfi\n", start) + len("\nfi\n")
+        root_path = text[:start] + text[end:]
         self.assertNotIn("TARTCI_HEAL_TCC_", root_path)
+        self.assertIn("STAMP_DIR=/var/db/tartci-heal-tcc", text)
+        self.assertNotIn("/var/run", text)
         code = "\n".join(line.split("#", 1)[0] for line in text.splitlines())
         for forbidden in ("launchctl", "reboot", "shutdown", "kill -9", "pkill", "rm -rf"):
             self.assertNotIn(forbidden, code)

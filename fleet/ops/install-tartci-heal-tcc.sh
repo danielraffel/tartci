@@ -38,6 +38,8 @@ plan (nothing changed):
   $SUDOERS_DST (root:wheel 0440):
     $user ALL=(root) NOPASSWD: $WRAPPER_DST ""
   $LOG (root:wheel 0640), rotated by $NEWSYSLOG_DST
+  /var/db/tartci-heal-tcc (root 0700): the 30-minute stamp
+  refuses unless /, /usr, /usr/local and /usr/local/sbin are root-owned and not group/other writable
 apply:    sudo $0 --apply
 rollback: sudo $0 --rollback
 EOF
@@ -47,7 +49,8 @@ fi
 [[ $EUID -eq 0 ]] || { echo "run with sudo: sudo $0 $1" >&2; exit 77; }
 
 if [[ $mode == rollback ]]; then
-  rm -f "$SUDOERS_DST" "$WRAPPER_DST" "$NEWSYSLOG_DST"
+  rm -f "$SUDOERS_DST" "$WRAPPER_DST" "$NEWSYSLOG_DST" /var/db/tartci-heal-tcc/last-heal
+  rmdir /var/db/tartci-heal-tcc 2>/dev/null || true
   visudo -c >/dev/null || { echo "WARNING: sudoers failed validation after rollback; inspect /etc/sudoers.d" >&2; exit 1; }
   echo "removed $WRAPPER_DST, $SUDOERS_DST and $NEWSYSLOG_DST (the log $LOG is kept)"
   exit 0
@@ -57,8 +60,18 @@ bash -n "$src/tartci-heal-tcc"
 # /usr/local/sbin does not exist on a stock macOS install; `install` writes its
 # temp file INTO the target directory, so create it first.
 install -d -o root -g wheel -m 0755 /usr/local/sbin
+# A NOPASSWD root command is only as safe as every directory above it: on a
+# host where Homebrew owns /usr/local, the login user could replace the
+# wrapper. Refuse unless the whole chain is root-owned and writable by root only.
+for node in / /usr /usr/local /usr/local/sbin; do
+  owner=$(stat -f %u "$node"); mode=$(stat -f %Lp "$node")
+  [[ -L "$node" ]] && { echo "refusing: $node is a symlink" >&2; exit 1; }
+  [[ "$owner" == 0 ]] || { echo "refusing: $node is owned by uid $owner, not root; a NOPASSWD wrapper under it could be replaced" >&2; exit 1; }
+  (( (mode & 022) == 0 )) || { echo "refusing: $node is writable by group or other (mode $mode)" >&2; exit 1; }
+done
 install -o root -g wheel -m 0755 "$src/tartci-heal-tcc" "$WRAPPER_DST"
-echo "installed $WRAPPER_DST (root:wheel 0755)"
+echo "installed $WRAPPER_DST (root:wheel 0755; chain / -> /usr/local/sbin is root-owned)"
+install -d -o root -g wheel -m 0700 /var/db/tartci-heal-tcc
 
 tmp=$(mktemp); trap 'rm -f "$tmp"' EXIT
 sed "s/^TARTCI_USER /$user /" "$src/tartci-heal-tcc.sudoers" >"$tmp"

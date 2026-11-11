@@ -19,8 +19,8 @@
 #
 # THREAT MODEL, STATED PLAINLY: restarting tccd drops in-flight privacy prompts
 # and makes apps re-ask; it changes no grant and reads no database. A principal
-# able to run this can do so at most once per 30 minutes (a root-owned stamp
-# under /var/run that only root can create). The command vector is fixed, so
+# able to run this can do so at most once per 30 minutes (a stamp in a
+# root-only directory under /var/db). The command vector is fixed, so
 # it cannot be bent into any other root action. tartci invokes it only when
 # its three readings agree the hang is tccd (scripts/tcc_wedge.py); the wrapper
 # itself does not know or care who asked.
@@ -28,7 +28,8 @@ set -euo pipefail
 export PATH=/usr/bin:/bin:/usr/sbin:/sbin
 
 MIN_INTERVAL=1800
-STAMP=/var/run/tartci-heal-tcc.stamp
+STAMP_DIR=/var/db/tartci-heal-tcc
+STAMP=$STAMP_DIR/last-heal
 LOG=/var/log/tartci-heal-tcc.log
 KILLALL=/usr/bin/killall
 
@@ -43,10 +44,15 @@ if [[ $EUID -ne 0 ]]; then
   [[ "${TARTCI_HEAL_TCC_TEST:-}" == 1 ]] \
     || die "must run as root: sudo -n /usr/local/sbin/tartci-heal-tcc" 77
   STAMP="${TARTCI_HEAL_TCC_STAMP:?TARTCI_HEAL_TCC_STAMP is required under test}"
+  STAMP_DIR=$(dirname "$STAMP")
   LOG="${TARTCI_HEAL_TCC_LOG:?TARTCI_HEAL_TCC_LOG is required under test}"
   KILLALL=killall
   export PATH="${TARTCI_HEAL_TCC_PATH:-$PATH}"
 fi
+
+umask 077
+[[ -d "$STAMP_DIR" ]] || mkdir -m 0700 "$STAMP_DIR"
+[[ ! -L "$STAMP_DIR" && ! -L "$STAMP" ]] || die "refusing a symlinked stamp path: $STAMP" 70
 
 now=$(date +%s)
 stamp_age=""

@@ -61,11 +61,15 @@ SUDO = "/usr/bin/sudo"
 LOG_SHOW = "/usr/bin/log"
 HEAL_INTERVAL_S = 30 * 60
 HEAL_TIMEOUT_S = 20.0
-LOG_SCAN_TIMEOUT_S = 25.0
+LOG_SCAN_TIMEOUT_S = 40.0   # a 180 min window takes ~3 s on m3
 MIN_WINDOW_S = 10 * 60
 MAX_WINDOW_S = 3 * 3600
 # A classification older than this says nothing about now.
 FRESH_S = 30 * 60
+# The watchdog's cadence; seeds the streak start on a first pass that finds
+# an older failure count but no recorded start (rollout mid-wedge).
+WATCHDOG_INTERVAL_S = 300
+STAMP_DIR = "/var/db/tartci-heal-tcc"
 LOG_PREDICATE = (
     '(process == "sandboxd" OR process == "tccd") AND '
     '(eventMessage CONTAINS "Failed to create Attribution Chain" OR '
@@ -78,19 +82,38 @@ SIGNATURES = (
 )
 _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 OUTCOMES = ("ran", "rate_limited", "wrapper_rate_limited", "wrapper_missing",
-            "not_permitted", "timeout", "failed", "disabled")
+            "wrapper_insecure", "not_permitted", "timeout", "failed", "disabled",
+            "escalated")
+# Outcomes that reached sudo and so spend the 30-minute budget. A refused
+# sudo spends it too: retrying it every pass would be a 300 s loop of nothing.
+BUDGET_OUTCOMES = frozenset({"ran", "not_permitted", "timeout", "failed"})
 
 
 def _iso(epoch: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
 
 
-def signature_hits(text: str) -> dict[str, Any]:
-    """Count the wedge signatures in `log show --style compact` output."""
+def local_stamp(epoch: float) -> str:
+    """An epoch as `log show --style compact` prints its timestamps (local time)."""
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(epoch))
+
+
+def signature_hits(text: str, *, before: Optional[str] = None) -> dict[str, Any]:
+    """Count the wedge signatures in `log show --style compact` output.
+
+    Lines stamped at or after `before` (a local_stamp) are ignored: the burst
+    sandboxd writes as a wedge RELEASES after a heal must not be the evidence
+    for the next heal.
+    """
     counts = {name: 0 for name, _ in SIGNATURES}
+    ignored = 0
     first: Optional[str] = None
     last: Optional[str] = None
     for line in text.splitlines():
+        stamp = _TIMESTAMP.match(line)
+        if before and stamp and stamp.group(1) >= before:
+            ignored += 1
+            continue
         matched = False
         for name, pattern in SIGNATURES:
             if pattern.search(line):
@@ -98,12 +121,11 @@ def signature_hits(text: str) -> dict[str, Any]:
                 matched = True
         if not matched:
             continue
-        stamp = _TIMESTAMP.match(line)
         if stamp:
             first = first or stamp.group(1)
             last = stamp.group(1)
     return {"total": sum(counts.values()), "by_signature": counts,
-            "first": first, "last": last}
+            "first": first, "last": last, "ignored_after_heal": ignored}
 
 
 def window_seconds(failing_since: Optional[float], now: float) -> int:
@@ -113,7 +135,8 @@ def window_seconds(failing_since: Optional[float], now: float) -> int:
     return int(min(MAX_WINDOW_S, max(MIN_WINDOW_S, now - failing_since + MIN_WINDOW_S)))
 
 
-def scan_log(window_s: int, *, runner: Callable[..., Any] = run_bounded) -> dict[str, Any]:
+def scan_log(window_s: int, *, before: Optional[str] = None,
+             runner: Callable[..., Any] = run_bounded) -> dict[str, Any]:
     """Bounded `log show` for the signatures over the last `window_s` seconds."""
     minutes = max(1, int(math.ceil(window_s / 60.0)))
     argv = [LOG_SHOW, "show", "--last", f"{minutes}m", "--predicate", LOG_PREDICATE,
@@ -126,8 +149,8 @@ def scan_log(window_s: int, *, runner: Callable[..., Any] = run_bounded) -> dict
                 "error": f"{exc.kind}: {exc.detail}"[:300]}
     except (OSError, ValueError) as exc:
         return {"ok": False, "window_s": window_s, "total": 0, "error": str(exc)[:300]}
-    hits = signature_hits(completed.stdout or "")
-    hits.update(ok=True, window_s=window_s)
+    hits = signature_hits(completed.stdout or "", before=before)
+    hits.update(ok=True, window_s=window_s, before=before)
     return hits
 
 
@@ -145,8 +168,8 @@ def is_timeout(reason: Any) -> bool:
 
 def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: Any,
              failing_since: Optional[float], control_path: str, now: Optional[float] = None,
-             store_timeout_s: float = 10.0,
-             scan: Optional[Callable[[int], dict]] = None,
+             store_timeout_s: float = 10.0, healed_at: Optional[float] = None,
+             scan: Optional[Callable[..., dict]] = None,
              control: Optional[Callable[[str, float], dict]] = None,
              context_probe: Optional[Callable[[], dict]] = None) -> dict[str, Any]:
     """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}."""
@@ -174,17 +197,22 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                        f"the internal control path {control_path} also fails "
                        f"({ctl.get('reason')}); not a TCC verdict")
     window = window_seconds(failing_since, now)
-    log = scan(window)
+    before = local_stamp(healed_at) if isinstance(healed_at, (int, float)) else None
+    log = scan(window, before=before)
     evidence["log_scan"] = log
     minutes = max(1, int(math.ceil(window / 60.0)))
     if not log.get("ok"):
         return verdict("stalled_unclassified",
                        f"log show unavailable ({log.get('error')}); the store is stalled "
                        "but the cause is unproven")
-    if int(log.get("total") or 0) == 0:
+    removable = int((log.get("by_signature") or {}).get("removable_volumes_auth_failed") or 0)
+    if removable == 0:
+        # "Failed to create Attribution Chain" is logged for any TCC service;
+        # only the Removable Volumes request line ties the failure to the store.
         return verdict("stalled_unclassified",
-                       f"no sandboxd/tccd Removable Volumes failure in the last {minutes} min; "
-                       "the store is stalled but the cause is unproven")
+                       f"no sandboxd/tccd Removable Volumes failure in the last {minutes} min "
+                       f"({log.get('total')} other TCC failure line(s)); the store is stalled "
+                       "but the cause is unproven")
     if context_probe is not None:
         ctx = context_probe()
         evidence["tcc_context_probe"] = ctx
@@ -193,7 +221,7 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                            "the store did not answer from a context with TCC access either "
                            f"({ctx.get('reason')}); the volume, not tccd, is stalled")
     return verdict(KIND,
-                   f"{log.get('total')} sandboxd/tccd Removable Volumes authorization "
+                   f"{removable} sandboxd/tccd Removable Volumes authorization "
                    f"failure(s) in the last {minutes} min while the internal control path "
                    "answers: launchd-context opens of the store hang on tccd")
 
@@ -211,14 +239,79 @@ def heal_allowed(last_heal: Optional[dict], now: float) -> tuple[bool, str]:
     return True, ""
 
 
+def wrapper_insecurity(wrapper: str, *, lstat: Callable[[str], Any] = os.lstat) -> str:
+    """Why the wrapper must not be run with NOPASSWD root, or "" when it may.
+
+    Every directory above it and the file itself must be owned by root and
+    writable by nobody else; on a host where Homebrew owns /usr/local the login
+    user could otherwise replace the wrapper and own root.
+    """
+    import stat as stat_module
+    if not os.path.isabs(wrapper):
+        return f"{wrapper} is not an absolute path"
+    # Walk the REAL chain: on macOS /var and /tmp are symlinks into /private,
+    # and a symlink above the wrapper is only acceptable when the resolved
+    # chain is itself root-owned.
+    path = os.path.realpath(wrapper)
+    parts = path.split(os.sep)
+    chain = [os.sep] + [os.sep.join(parts[:index + 1]) for index in range(1, len(parts))]
+    for node in chain:
+        try:
+            info = lstat(node)
+        except FileNotFoundError:
+            return f"{node} does not exist"
+        except OSError as exc:
+            return f"{node}: {exc}"
+        if stat_module.S_ISLNK(info.st_mode):
+            return f"{node} is a symlink"
+        if info.st_uid != 0:
+            return f"{node} is owned by uid {info.st_uid}, not root"
+        if info.st_mode & (stat_module.S_IWGRP | stat_module.S_IWOTH):
+            return f"{node} is writable by group or other (mode {oct(info.st_mode & 0o777)})"
+    if not stat_module.S_ISREG(info.st_mode):
+        return f"{path} is not a regular file"
+    if not info.st_mode & stat_module.S_IXUSR:
+        return f"{path} is not executable"
+    return ""
+
+
+def run_privileged_bounded(argv: list, timeout: float) -> tuple[Optional[int], str]:
+    """Run sudo with a deadline the caller survives.
+
+    The login user cannot signal a root process, so a plain subprocess.run
+    timeout would raise on kill() and then wait forever. Here a timeout gives
+    up on the child without waiting for it; the wrapper's own stamp still
+    bounds what it can do.
+    """
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    try:
+        output, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except (PermissionError, ProcessLookupError, OSError):
+            pass
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
+        return None, ""
+    return proc.returncode, output or ""
+
+
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
-         runner: Optional[Callable[..., Any]] = None, wrapper: Optional[str] = None,
-         sudo: Optional[str] = None) -> dict[str, Any]:
+         runner: Optional[Callable[[list, float], tuple]] = None,
+         wrapper: Optional[str] = None, sudo: Optional[str] = None,
+         insecurity: Optional[Callable[[str], str]] = None) -> dict[str, Any]:
     """Run the scoped root wrapper once. Never anything broader."""
     now = time.time() if now is None else now
-    runner = subprocess.run if runner is None else runner
+    runner = run_privileged_bounded if runner is None else runner
     wrapper = WRAPPER if wrapper is None else wrapper
     sudo = SUDO if sudo is None else sudo
+    insecurity = wrapper_insecurity if insecurity is None else insecurity
     record: dict[str, Any] = {"at": _iso(now), "at_epoch": now, "command": [sudo, "-n", wrapper]}
     allowed, why = heal_allowed(last_heal, now)
     if not allowed:
@@ -229,25 +322,29 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
                       detail=f"{wrapper} is not installed; install fleet/ops/tartci-heal-tcc "
                              "(sudo fleet/ops/install-tartci-heal-tcc.sh)")
         return record
-    try:
-        completed = runner([sudo, "-n", wrapper], stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True, timeout=HEAL_TIMEOUT_S,
-                           check=False)
-    except subprocess.TimeoutExpired:
-        record.update(outcome="timeout", rc=None,
-                      detail=f"{wrapper} did not return within {HEAL_TIMEOUT_S:g}s")
+    unsafe = insecurity(wrapper)
+    if unsafe:
+        record.update(outcome="wrapper_insecure",
+                      detail=f"refusing NOPASSWD root through a path not owned by root alone: "
+                             f"{unsafe}")
         return record
+    try:
+        rc, output = runner([sudo, "-n", wrapper], HEAL_TIMEOUT_S)
     except OSError as exc:
         record.update(outcome="failed", rc=None, detail=str(exc)[:300])
         return record
-    output = ((completed.stderr or "") + (completed.stdout or "")).strip()[-300:]
-    record["rc"] = completed.returncode
+    if rc is None:
+        record.update(outcome="timeout", rc=None,
+                      detail=f"{wrapper} did not return within {HEAL_TIMEOUT_S:g}s")
+        return record
+    output = output.strip()[-300:]
+    record["rc"] = rc
     record["detail"] = output
-    if completed.returncode == 0:
+    if rc == 0:
         record["outcome"] = "ran"
-    elif completed.returncode == 75:
+    elif rc == 75:
         record["outcome"] = "wrapper_rate_limited"
-    elif completed.returncode == 1 and "password" in output.lower():
+    elif rc == 1 and "password" in output.lower():
         record["outcome"] = "not_permitted"
     else:
         record["outcome"] = "failed"
@@ -259,7 +356,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
                   heal_enabled: bool = True,
                   classify_fn: Callable[..., dict] = classify,
                   heal_fn: Callable[..., dict] = heal,
-                  reprobe: Optional[Callable[..., dict]] = None) -> Optional[dict]:
+                  reprobe: Optional[Callable[..., dict]] = None,
+                  context_probe: Optional[Callable[[], dict]] = None) -> Optional[dict]:
     """Classify, heal once, and reprobe. Mutates `state`; returns a recovered
     probe result when the heal brought the store back, else None.
 
@@ -276,18 +374,37 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
             state["last_heal"] = previous["last_heal"]
         return None
     since = previous.get("failing_since")
-    state["failing_since"] = since if isinstance(since, (int, float)) and since <= now else now
-    if isinstance(previous.get("last_heal"), dict):
-        state["last_heal"] = previous["last_heal"]
+    if isinstance(since, (int, float)) and since <= now:
+        state["failing_since"] = since
+    else:
+        # No recorded start (first pass after a rollout mid-wedge): the earlier
+        # failures this pass inherited happened one watchdog interval apart.
+        earlier = max(0, int(state.get("consecutive_failures") or 1) - 1)
+        state["failing_since"] = now - earlier * WATCHDOG_INTERVAL_S
+    last_heal = previous.get("last_heal") if isinstance(previous.get("last_heal"), dict) else None
+    if last_heal:
+        state["last_heal"] = last_heal
     if not state.get("drain_required"):
         return None
+    healed_at = last_heal.get("at_epoch") if last_heal else None
     classification = classify_fn(
         consecutive_failures=int(state.get("consecutive_failures") or 0),
         failure_threshold=int(state.get("failure_threshold") or 2),
         last_reason=last_result.get("reason"), failing_since=state["failing_since"],
-        control_path=control_path, now=now, store_timeout_s=store_timeout_s)
+        control_path=control_path, now=now, store_timeout_s=store_timeout_s,
+        healed_at=healed_at if isinstance(healed_at, (int, float)) else None,
+        context_probe=context_probe)
     state["classification"] = classification
     if classification.get("kind") != KIND:
+        return None
+    if (last_heal and last_heal.get("outcome") == "ran"
+            and last_heal.get("failing_since") == state["failing_since"]):
+        # One heal per streak. The restart did not bring the store back, so a
+        # second one would only spend the budget on a cause this is not.
+        state["heal"] = {"outcome": "escalated", "at": _iso(now),
+                         "detail": "tccd and sandboxd were already restarted in this streak "
+                                   f"(at {last_heal.get('at')}) and the store still hangs: "
+                                   "drain the host, let jobs finish, and reboot"}
         return None
     if dry_run:
         state["heal"] = {"outcome": "disabled", "at": _iso(now),
@@ -299,16 +416,44 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         return None
     record = heal_fn(now=now, last_heal=state.get("last_heal"))
     state["heal"] = record
-    if record.get("outcome") in ("ran", "wrapper_rate_limited", "timeout", "failed"):
-        # These all reached the wrapper: they spend the heal budget.
+    if record.get("outcome") in BUDGET_OUTCOMES:
         state["last_heal"] = {"at": record["at"], "at_epoch": now,
-                              "outcome": record["outcome"]}
+                              "outcome": record["outcome"],
+                              "failing_since": state["failing_since"]}
     if record.get("outcome") != "ran":
         return None
     result = reprobe(str(state.get("path") or ""), timeout_s=store_timeout_s)
     record["reprobe"] = {"ok": result.get("ok") is True, "reason": result.get("reason"),
                          "latency_ms": result.get("latency_ms")}
     return result if result.get("ok") is True else None
+
+
+def context_probe_from_env(env: Optional[dict] = None,
+                           runner: Callable[..., Any] = run_bounded) -> Optional[Callable[[], dict]]:
+    """A probe from a context with TCC access, when the host configures one.
+
+    TARTCI_TCC_CONTEXT_PROBE is an argv (shell-split) that exits 0 when the
+    store answers from that context, for example an `ssh localhost ...` whose
+    sshd holds Full Disk Access. Unset, the reading is skipped and recorded
+    as not configured.
+    """
+    import shlex
+    env = os.environ if env is None else env
+    text = str(env.get("TARTCI_TCC_CONTEXT_PROBE") or "").strip()
+    if not text:
+        return None
+    argv = shlex.split(text)
+
+    def probe() -> dict:
+        try:
+            completed = runner(argv, timeout=LOG_SCAN_TIMEOUT_S, operation="tcc_context_probe")
+            require_success(completed, operation="tcc_context_probe")
+        except ObservationError as exc:
+            return {"ok": False, "reason": f"{exc.kind}: {exc.detail}"[:200], "argv": argv}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "reason": str(exc)[:200], "argv": argv}
+        return {"ok": True, "argv": argv}
+    return probe
 
 
 def describe(state: dict) -> str:

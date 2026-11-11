@@ -25,7 +25,8 @@ class TccWedgeWatchdogTests(unittest.TestCase):
     """store_health_pass past the threshold: classify, heal once, reprobe."""
 
     def run_passes(self, td: str, *, scan_total: int, heal_rc: int = 0,
-                   wrapper_present: bool = True, reprobe_ok: bool = True) -> tuple:
+                   wrapper_present: bool = True, reprobe_ok: bool = True,
+                   status_only: bool = False) -> tuple:
         import tcc_wedge
         state_home = Path(td) / "state-home"
         wrapper = Path(td) / "tartci-heal-tcc"
@@ -34,14 +35,14 @@ class TccWedgeWatchdogTests(unittest.TestCase):
             wrapper.chmod(0o755)
         heal_calls: list = []
 
-        def heal_runner(argv, **kwargs):
+        def heal_runner(argv, timeout):
             heal_calls.append(argv)
-            return subprocess.CompletedProcess(argv, heal_rc, stdout="", stderr="")
+            return heal_rc, ""
         probes = [
             {"ok": False, "reason": "timeout after 10s"},
             {"ok": False, "reason": "timeout after 10s"},
         ]
-        if scan_total and wrapper_present and heal_rc == 0:
+        if scan_total and wrapper_present and heal_rc == 0 and not status_only:
             probes.append({"ok": reprobe_ok, "reason": None if reprobe_ok else "timeout after 10s",
                            "device_id": "7", "latency_ms": 8.1, "path": td})
         with mock.patch.dict(os.environ, {"TARTCI_HOME": str(state_home)}), \
@@ -49,18 +50,20 @@ class TccWedgeWatchdogTests(unittest.TestCase):
                 mock.patch.object(watchdog.store_health, "probe", side_effect=probes), \
                 mock.patch.object(tcc_wedge, "WRAPPER", str(wrapper)), \
                 mock.patch.object(tcc_wedge, "scan_log",
-                                  lambda window_s: {"ok": True, "window_s": window_s,
-                                                    "total": scan_total, "first": "f", "last": "l",
-                                                    "by_signature": {}}), \
+                                  lambda window_s, before=None: {
+                                      "ok": True, "window_s": window_s, "total": scan_total,
+                                      "first": "f", "last": "l",
+                                      "by_signature": {"removable_volumes_auth_failed": scan_total}}), \
                 mock.patch.object(tcc_wedge, "control_probe",
                                   lambda path, timeout_s: {"ok": True, "path": path,
                                                            "latency_ms": 0.05}), \
-                mock.patch.object(tcc_wedge.subprocess, "run", heal_runner):
+                mock.patch.object(tcc_wedge, "wrapper_insecurity", lambda path: ""), \
+                mock.patch.object(tcc_wedge, "run_privileged_bounded", heal_runner):
             first = watchdog.store_health_pass(
                 participation_file=str(Path(td) / "participation"), status_only=False,
                 dry_run=False, failure_threshold=2)
             second = watchdog.store_health_pass(
-                participation_file=str(Path(td) / "participation"), status_only=False,
+                participation_file=str(Path(td) / "participation"), status_only=status_only,
                 dry_run=False, failure_threshold=2)
         saved = store_health.load(str(state_home / "state" / "store-health.json"))
         return first, second, saved, heal_calls, wrapper
@@ -80,6 +83,34 @@ class TccWedgeWatchdogTests(unittest.TestCase):
         self.assertEqual(saved["state"], "healthy")
         self.assertEqual(saved["last_heal"]["outcome"], "ran")
         self.assertNotIn("failing_since", saved)
+
+    def test_a_status_pass_classifies_but_never_heals(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            _, second, saved, heal_calls, _ = self.run_passes(td, scan_total=3, status_only=True)
+        self.assertEqual(second["classification"]["kind"], "tcc_attribution_wedge")
+        self.assertEqual(second["heal"]["outcome"], "disabled")
+        self.assertEqual(heal_calls, [], "a status pass must not run the root action")
+        self.assertEqual(second["state"], "draining")
+        self.assertNotIn("heal", saved, "a status pass writes no state")
+
+    def test_a_classifier_crash_still_saves_state_and_reports(self) -> None:
+        import tcc_wedge
+        with tempfile.TemporaryDirectory() as td:
+            state_home = Path(td) / "state-home"
+            probes = [{"ok": False, "reason": "timeout after 10s"}] * 2
+            with mock.patch.dict(os.environ, {"TARTCI_HOME": str(state_home)}), \
+                    mock.patch.object(watchdog, "resolve_tart_home", return_value=(td, "test")), \
+                    mock.patch.object(watchdog.store_health, "probe", side_effect=probes), \
+                    mock.patch.object(tcc_wedge, "watchdog_step", side_effect=RuntimeError("boom")):
+                for _ in range(2):
+                    result = watchdog.store_health_pass(
+                        participation_file=str(Path(td) / "participation"), status_only=False,
+                        dry_run=False, failure_threshold=2)
+            saved = store_health.load(str(state_home / "state" / "store-health.json"))
+        self.assertEqual(result["state"], "draining")
+        self.assertEqual(result["classification"]["kind"], "classifier_error")
+        self.assertEqual(result["action"], "report-only")
+        self.assertEqual(saved["state"], "draining")
 
     def test_no_signature_is_the_negative_control(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -122,12 +153,14 @@ class TccWedgeWatchdogTests(unittest.TestCase):
                     mock.patch.object(watchdog.store_health, "probe", side_effect=probes), \
                     mock.patch.object(tcc_wedge, "WRAPPER", str(wrapper)), \
                     mock.patch.object(tcc_wedge, "scan_log",
-                                      lambda window_s: {"ok": True, "window_s": window_s,
-                                                        "total": 9, "by_signature": {}}), \
+                                      lambda window_s, before=None: {
+                                          "ok": True, "window_s": window_s, "total": 9,
+                                          "by_signature": {"removable_volumes_auth_failed": 9}}), \
                     mock.patch.object(tcc_wedge, "control_probe",
                                       lambda path, timeout_s: {"ok": True, "path": path}), \
-                    mock.patch.object(tcc_wedge.subprocess, "run",
-                                      lambda argv, **kw: heal_calls.append(argv)):
+                    mock.patch.object(tcc_wedge, "wrapper_insecurity", lambda path: ""), \
+                    mock.patch.object(tcc_wedge, "run_privileged_bounded",
+                                      lambda argv, timeout: (heal_calls.append(argv), 0, "")[1:]):
                 for _ in range(2):
                     again = watchdog.store_health_pass(
                         participation_file=str(Path(td) / "participation"), status_only=False,

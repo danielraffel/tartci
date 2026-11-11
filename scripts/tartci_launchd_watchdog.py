@@ -1886,10 +1886,16 @@ def store_health_pass(
         # agree it is a wedged tccd, run the one scoped root heal. The control
         # path is the state directory: internal volume, never the store. A
         # status pass classifies and records, but never heals.
-        recovered = tcc_wedge.watchdog_step(
-            state, previous, control_path=os.path.dirname(state_path),
-            store_timeout_s=timeout_s, dry_run=dry_run or status_only,
-            heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0")
+        recovered = None
+        try:
+            recovered = tcc_wedge.watchdog_step(
+                state, previous, control_path=os.path.dirname(state_path),
+                store_timeout_s=timeout_s, dry_run=dry_run or status_only,
+                heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0",
+                context_probe=tcc_wedge.context_probe_from_env())
+        except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive
+            state["classification"] = {"kind": "classifier_error", "reason": str(exc)[:300],
+                                       "evidence": {}, "classified_at": _iso(time.time())}
         if recovered is not None:
             healed = store_health.next_state(state, recovered, failure_threshold)
             for key in ("state", "consecutive_failures", "last_result", "drain_required"):
