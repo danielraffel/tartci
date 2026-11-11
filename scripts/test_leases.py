@@ -29,6 +29,14 @@ class LeaseCliTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = Path(self.tmp.name) / "leases"
         self.pid = os.getpid()
+        # Isolate the CLI from the host's installed fleet profile: a fleet host
+        # sets [host] agent_floor_qos and floor knobs that change the answers.
+        profile = Path(self.tmp.name) / "fleet.toml"
+        profile.write_text('schema = 1\n[host]\nid = "test"\n', encoding="utf-8")
+        self.cli_env = {k: v for k, v in os.environ.items()
+                        if not k.startswith(("TARTCI_AGENT_FLOOR", "TARTCI_RANK_VM_WAITERS",
+                                             "TARTCI_FAIR_SHARE"))}
+        self.cli_env["TARTCI_FLEET_PROFILE"] = str(profile)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -39,6 +47,7 @@ class LeaseCliTestCase(unittest.TestCase):
             text=True,
             capture_output=True,
             check=False,
+            env=self.cli_env,
         )
         if check and proc.returncode != 0:
             self.fail(f"{args} failed rc={proc.returncode}\nstdout={proc.stdout}\nstderr={proc.stderr}")
