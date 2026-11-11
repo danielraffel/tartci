@@ -406,14 +406,14 @@ class LastSlotYieldTests(unittest.TestCase):
 
 
 class ShippedProfileTests(unittest.TestCase):
-    """Only the hosts already rolled out (m5, then m5studio) turn fair share on."""
+    """Every macOS fleet host has fair share enabled after rollout."""
 
     KEY = "fair_share_after_secs = 1800"
 
-    def test_only_rolled_out_hosts_turn_it_on_and_the_readers_see_it(self) -> None:
+    def test_all_fleet_hosts_turn_it_on_and_the_readers_see_it(self) -> None:
         import host_profile
         seen = set()
-        on = {"m5", "m5studio"}
+        on = {"m1", "m3", "m5", "m5studio"}
         for path in sorted((ROOT / "profiles").glob("*.toml")):
             text = path.read_text()
             host = path.name.replace("-macos-fleet.toml", "")

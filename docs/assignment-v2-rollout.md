@@ -754,7 +754,7 @@ the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
 Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
 the supervisors at an idle boundary; stale intents expire on their own.
 
-## Fair share between repositories (opt-in, m5 canary, m5studio)
+## Fair share between repositories (on every macOS fleet host)
 
 Every VM lane leases at its repository's priority: Pulp's gate derives 100 (PR
 head) or 110 (merge group), Vellum leases at `vm` (60). Admission and ranked
