@@ -676,6 +676,23 @@
       "why": "An unreadable receipt or profile is not evidence the agents are right.",
       "remedy": "Inspect ~/.tartci/state/support-agents/last.json and the [support_agents] table of ~/.config/tartci/macos-fleet-profile.toml."
     },
+    "tcc_wedge_healed": {
+      "summary": "The watchdog classified the store hang as a wedged tccd, restarted tccd and sandboxd through the scoped root wrapper, and the store answered again.",
+      "why": "Opens of an external Tart store from a launchd job each need a Removable Volumes authorization from sandboxd, which asks the system tccd; when tccd stops answering, every such open blocks while an interactive shell still answers in microseconds. Restarting the two daemons clears it without a reboot. On 2026-11-11 m3 admitted no VM for four hours this way.",
+      "remedy": "Nothing now. If it recurs every few hours, read the heal history in ~/.tartci/state/store-health.json and the launchd watchdog log, and look at what loads tccd on this host.",
+      "do_not": "Do not take a healed verdict as proof the volume is fast or that the cause is fixed: the wrapper restarts daemons; it changes no grant and removes no trigger."
+    },
+    "tcc_wedge_none": {
+      "summary": "The watchdog has no fresh wedged-tccd verdict for the Tart store.",
+      "why": "Either the store answers, or it is failing for a reason the three readings (internal control path, sandboxd/tccd log signature, optional probe from a TCC-granted context) do not attribute to tccd.",
+      "remedy": "Nothing for this check; a stalled store is reported by store_stall."
+    },
+    "tcc_wedge_unhealed": {
+      "summary": "The watchdog classified the store hang as a wedged tccd, but the heal did not run or did not bring the store back.",
+      "why": "The scoped wrapper (/usr/local/sbin/tartci-heal-tcc) is missing, sudo refused it, it was rate-limited (once per 30 min), it timed out, or tccd and sandboxd restarted and the store still did not answer. The detail names which.",
+      "remedy": "wrapper_missing or not_permitted: install it (sudo fleet/ops/install-tartci-heal-tcc.sh) on this host. rate_limited: wait for the interval. A ran-but-still-hanging store: drain the host (`tartci pool drain`), let jobs finish, and reboot.",
+      "do_not": "Do not kill tccd by hand repeatedly or widen the sudo grant: the wrapper's one fixed command and its 30-minute stamp are the whole safety case."
+    },
     "undeclared_fleet_agent": {
       "summary": "A LaunchAgent under the tartci or tmp. prefix is installed but declared nowhere.",
       "why": "Hand-installed agents drift: on 2026-10-04 a stopgap kicker installed outside any installer ran beside the interval guard on every host. The scan accounts for lanes, declared agents, and agents another codified installer owns; anything else is listed here.",

@@ -76,6 +76,7 @@ from typing import Any, NamedTuple
 
 import macos_runner_identity
 import store_health
+import tcc_wedge
 
 try:
     import tomllib
@@ -1879,7 +1880,22 @@ def store_health_pass(
         state = store_health.next_state(previous, result, failure_threshold)
         state["path"] = tart_home
         state["resolution"] = resolution
+        state["failure_threshold"] = failure_threshold
         state["updated_at"] = int(time.time())
+        # Past the threshold, name the cause of a hang and, when the readings
+        # agree it is a wedged tccd, run the one scoped root heal. The control
+        # path is the state directory: internal volume, never the store. A
+        # status pass classifies and records, but never heals.
+        recovered = tcc_wedge.watchdog_step(
+            state, previous, control_path=os.path.dirname(state_path),
+            store_timeout_s=timeout_s, dry_run=dry_run or status_only,
+            heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0")
+        if recovered is not None:
+            healed = store_health.next_state(state, recovered, failure_threshold)
+            for key in ("state", "consecutive_failures", "last_result", "drain_required"):
+                state[key] = healed[key]
+            state["action"] = "tcc-healed"
+            state.pop("failing_since", None)
         if not status_only and not dry_run:
             store_health.save(state_path, state)
         # Production pool mutation is an explicit rollout decision.  Keep the
@@ -2153,12 +2169,15 @@ def main(argv: list[str] | None = None) -> int:
         if not results:
             print(f"{_iso(now)} launchd-watchdog: no managed runner "
                   f"LaunchAgents found")
-        if store_health_result.get("state") != "healthy":
+        if store_health_result.get("state") != "healthy" \
+                or store_health_result.get("action") == "tcc-healed":
             last_result = store_health_result.get("last_result", {})
+            cause = tcc_wedge.describe(store_health_result)
             print(f"{_iso(now)} launchd-watchdog: store-health: "
                   f"{store_health_result.get('state')}: "
                   f"{last_result.get('reason', store_health_result.get('reason', ''))} "
-                  f"[{store_health_result.get('action', 'report-only')}]")
+                  f"[{store_health_result.get('action', 'report-only')}]"
+                  + (f" [{cause}]" if cause else ""))
         for r in results:
             mark = {"healthy": "✓", "attention": "!", "wedged": "✗",
                     "broken": "✗", "unknown": "?"}.get(
