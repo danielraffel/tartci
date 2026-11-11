@@ -363,6 +363,13 @@ class QueueScanner:
         if not backlog:
             return latency, []
 
+        # Reserve one slot for the globally oldest queued run on every
+        # bounded sweep. The rotating page/group cursor still provides
+        # breadth, while this reservation prevents an old run from remaining
+        # invisible when the backlog grows faster than the cursor reaches it.
+        oldest = min(backlog, key=_created_key)
+        oldest_id = int(oldest["id"])
+
         groups: dict[str, list[dict[str, Any]]] = {}
         for run in backlog:
             key = str(run.get("_page_key") or "legacy")
@@ -386,6 +393,8 @@ class QueueScanner:
         group = groups[key]
         capacity = self.args.max_job_fetches - len(latency)
         selected: list[dict[str, Any]] = []
+        if capacity > 0:
+            selected.append(oldest)
         entry = offsets.get(key)
         if isinstance(entry, dict):
             offset = int(entry.get("offset", 0)) % len(group)
@@ -397,8 +406,10 @@ class QueueScanner:
             # by the backlog capacity, which is coprime to the 100-run page.
             sweep = int(group[0].get("_page_sweep", 0))
             offset = (sweep * capacity) % len(group)
-        for step in range(min(capacity, len(group))):
-            selected.append(group[(offset + step) % len(group)])
+        for step in range(min(capacity - len(selected), len(group))):
+            candidate = group[(offset + step) % len(group)]
+            if int(candidate["id"]) != oldest_id:
+                selected.append(candidate)
         offsets[key] = {
             "offset": (offset + len(selected)) % len(group),
             "last_seen": offset_tick,
