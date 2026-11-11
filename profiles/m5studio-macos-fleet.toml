@@ -126,6 +126,19 @@ gate_ccache_trim = true
 # See docs/assignment-v2-rollout.md, "Slot priority".
 [leases]
 slot_priority = "on"
+# Fair share between repositories (scripts/fair_share.py), extended from the m5
+# canary (#815). A VM lane with work it could not place for 30 min is admitted
+# at gate priority while another repository uses or waits for a VM here, and
+# other repositories' lanes yield it the next VM. Order within one repository is
+# unchanged. This host's two VM slots were both busy with work queued in 63% of
+# samples on 2026-11-10, and Vellum "Locked macOS GPU proof" runs took about
+# 30% of VM-minutes across 16 merges with a merge-queue-stage p90 of 14.9 h.
+# Measure fair_share_granted / fair_share_yield and Vellum and Pulp merge-group
+# queue waits before m3, then m1.
+# Rollback: set 0 (or delete the key), re-render, restart the lanes at an idle
+# boundary. See docs/assignment-v2-rollout.md, "Fair share between
+# repositories".
+fair_share_after_secs = 1800
 # Release-first canary (this host only): a lane about to serve a tagged
 # release (pulp-release-tagged) ranks ahead of merge-group for the next free
 # slot. Rollback: delete this key.

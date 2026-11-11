@@ -754,7 +754,7 @@ the lane-event slot wait (first `demand_waiting` to the next `job_claim`).
 Rollback: set `slot_priority = "off"` (or delete the key), re-render, restart
 the supervisors at an idle boundary; stale intents expire on their own.
 
-## Fair share between repositories (opt-in, m5 canary)
+## Fair share between repositories (opt-in, m5 canary, m5studio)
 
 Every VM lane leases at its repository's priority: Pulp's gate derives 100 (PR
 head) or 110 (merge group), Vellum leases at `vm` (60). Admission and ranked
@@ -828,6 +828,18 @@ queue wait p50/p90 (`started_at - created_at`) before and after, and the same
 for Pulp's `macos` merge-group jobs, which must not regress beyond one Vellum
 job length. Rollback: delete the key, re-render, restart the lanes at an idle
 boundary; waiters expire on their own.
+
+### Rollout
+
+| host | `fair_share_after_secs` | status |
+|---|---|---|
+| m5 | 1800 | canary, on |
+| m5studio | 1800 | on (this step) |
+| m3 | off | next, gated on measured Vellum wait |
+| m1 | off | after m3, same gate |
+
+m5studio's own Vellum lane carries no `last_slot_yield`, so only promotion and
+yield apply there.
 
 ## Fallback lanes without a timer (opt-in, not enabled)
 
