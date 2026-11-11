@@ -734,8 +734,11 @@ tartci_fair_share_enabled(){
 # A scan's queued count for this lane: start the clock on demand, reset it on
 # an empty queue. Anything that is not a count (a blind scan) leaves it as is.
 # Must run in the supervisor's own shell.
+# $3, when given, is the scan's slot-demand detail file: the clock then also
+# counts back to the oldest matching queued job, so the job's wait carries over
+# a grant (scripts/fair_share.py).
 tartci_fair_share_demand_seen(){
-  local queued="$1" labels="${2:-}"
+  local queued="$1" labels="${2:-}" detail="${3:-}" oldest
   tartci_fair_share_enabled || return 0
   case "$queued" in ''|*[!0-9]*) return 0 ;; esac
   if [ "$queued" -eq 0 ]; then
@@ -744,6 +747,10 @@ tartci_fair_share_demand_seen(){
   fi
   [ -z "$labels" ] || TARTCI_FAIR_LAST_LABELS="$labels"
   [ "$TARTCI_FAIR_DEMAND_SINCE" -gt 0 ] || TARTCI_FAIR_DEMAND_SINCE="$(date +%s)"
+  [ -n "$detail" ] && [ -r "$detail" ] || return 0
+  oldest="$(python3 "$TARTCI_ROOT/scripts/fair_share.py" oldest-queued "$detail" 2>/dev/null)" || oldest=""
+  case "$oldest" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$oldest" -ge "$TARTCI_FAIR_DEMAND_SINCE" ] || TARTCI_FAIR_DEMAND_SINCE="$oldest"
 }
 
 tartci_fair_share_starved(){
