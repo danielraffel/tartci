@@ -24,13 +24,24 @@ and a starved lane is ranked ahead of the other repositories on its host:
 Nothing changes within a repository: Pulp's merge-group-above-PR order, the
 priorities lanes lease at and rank_vm_waiters all stay as they are. A lane is
 promoted only while another repository holds or waits for a VM on the host,
-so a lane alone on a host is admitted exactly as before. The clock is the
-lane's own: it starts when the lane first sees queued work it cannot place and
-resets when the lane is granted a VM or sees its queue empty. Every rule here
-is work-conserving: a starved lane that could not fit anyway blocks nobody.
+so a lane alone on a host is admitted exactly as before. The clock starts at
+the older of two moments: when the lane first saw queued work it could not
+place, and when its oldest matching queued job was created (read from the
+slot-demand detail file its scan already writes; no GitHub call). The lane's
+own part resets when it is granted a VM or sees its queue empty, but the job
+age carries across a grant: a lane granted one VM while its backlog is still
+older than N stays starved for the next one, instead of waiting N again
+(m5studio, 2026-11-11: one Vellum VM per 30 minutes while a merge-group job
+waited over an hour). Every rule here is work-conserving: a starved lane that
+could not fit anyway blocks nobody.
+
+CLI: `fair_share.py oldest-queued <detail-file>` prints the oldest queued
+job's created_at as epoch seconds, or nothing when the file is missing,
+stale or names no job.
 """
 from __future__ import annotations
 
+import sys
 import time
 from typing import Any, Dict, List, Optional
 
@@ -154,3 +165,42 @@ def as_waiter_lease(cfg: Dict[str, Any], waiter: Dict[str, Any]) -> Dict[str, An
         "command_kind": waiter.get("command_kind"),
         "repo": waiter.get("repo"),
     }
+
+
+DETAIL_MAX_AGE_SECS = 300
+
+
+def oldest_queued_epoch(detail: Optional[Dict[str, Any]]) -> int:
+    """Epoch seconds of the oldest job across a detail file's classes; 0 if none."""
+    import slot_demand
+
+    if not isinstance(detail, dict):
+        return 0
+    oldest = 0
+    for row in (detail.get("classes") or {}).values():
+        if not isinstance(row, dict) or not int(row.get("count") or 0):
+            continue
+        stamp = slot_demand.parse_ts(row.get("oldest_created_at"))
+        if stamp is None:
+            continue
+        epoch = int(stamp.timestamp())
+        if epoch > 0 and (oldest == 0 or epoch < oldest):
+            oldest = epoch
+    return oldest
+
+
+def main(argv: List[str]) -> int:
+    if len(argv) == 2 and argv[0] == "oldest-queued":
+        import slot_demand
+
+        epoch = oldest_queued_epoch(slot_demand.read_detail(argv[1], DETAIL_MAX_AGE_SECS))
+        if epoch:
+            print(epoch)
+        return 0
+    print("usage: fair_share.py oldest-queued <detail-file>", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.path.insert(0, __import__("os").path.dirname(__import__("os").path.abspath(__file__)))
+    raise SystemExit(main(sys.argv[1:]))

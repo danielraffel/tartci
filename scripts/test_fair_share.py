@@ -307,6 +307,56 @@ class ShellClockTests(unittest.TestCase):
         self.assertIn(f"--repo {VELLUM} --demand-since ", out)
         self.assertIn("reset=0", out)
 
+    def detail(self, oldest: str, *, written: str = "") -> Path:
+        import datetime as dt
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(tmp, ignore_errors=True))
+        now = written or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        path = tmp / "lane.slot-demand.lane.json"
+        path.write_text(json.dumps({
+            "schema": 1, "written_at": now, "witness_only": False,
+            "classes": {"merge_group": {"count": 1, "oldest_created_at": oldest},
+                        "pull_request": {"count": 0, "oldest_created_at": None}}}))
+        return path
+
+    def test_an_old_queued_job_keeps_the_lane_starved_across_a_grant(self) -> None:
+        """m5studio, 2026-11-11: the clock reset on every grant, so a lane
+        whose merge-group job had waited an hour waited another 30 minutes."""
+        import datetime as dt
+        old = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=1)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        path = self.detail(old)
+        proc = self.bash(
+            "TARTCI_FAIR_DEMAND_SINCE=0  # just granted a VM\n"
+            f"tartci_fair_share_demand_seen 1 L {path}\n"
+            "tartci_fair_share_starved && echo STARVED || echo FRESH\n"
+            "TARTCI_FAIR_DEMAND_SINCE=0\n"
+            "tartci_fair_share_demand_seen 1 L\n"
+            "tartci_fair_share_starved && echo CONTROL_STARVED || echo CONTROL_FRESH\n")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("STARVED", proc.stdout.split()[0])
+        self.assertIn("CONTROL_FRESH", proc.stdout)
+
+    def test_a_stale_or_young_detail_file_does_not_starve_a_lane(self) -> None:
+        import datetime as dt
+        now = dt.datetime.now(dt.timezone.utc)
+        stale = self.detail((now - dt.timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                            written=(now - dt.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        young = self.detail((now - dt.timedelta(minutes=2)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        for path in (stale, young):
+            proc = self.bash(
+                f"TARTCI_FAIR_DEMAND_SINCE=0; tartci_fair_share_demand_seen 1 L {path}\n"
+                "tartci_fair_share_starved && echo STARVED || echo FRESH\n")
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("FRESH", proc.stdout, path)
+
+    def test_oldest_queued_epoch_ignores_empty_classes(self) -> None:
+        self.assertEqual(fair_share.oldest_queued_epoch(None), 0)
+        detail = {"classes": {
+            "merge_group": {"count": 0, "oldest_created_at": "2026-11-11T10:00:00Z"},
+            "pull_request": {"count": 2, "oldest_created_at": "2026-11-11T11:00:00Z"}}}
+        self.assertEqual(fair_share.oldest_queued_epoch(detail), 1794394800)
+
     def test_knob_off_passes_nothing_and_never_starves(self) -> None:
         proc = self.bash(
             'tartci_fair_share_demand_seen 3 L; echo "since=$TARTCI_FAIR_DEMAND_SINCE"\n'

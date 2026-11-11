@@ -1338,6 +1338,12 @@ tier_queued_work(){
 # TARTCI_FAIR_SHARE_PROBE_SECS (default 300) to learn whether it has queued
 # work. Off, or with the clock running, this costs nothing.
 FAIR_SHARE_PROBE_AT=0
+# The scan's slot-demand detail file for a tier (written only while slot
+# priority is on), or nothing.
+fair_share_detail_file(){
+  declare -F tartci_slot_priority_detail_file >/dev/null || return 0
+  tartci_slot_priority_detail_file "$(tartci_slot_priority_key "${1:-0}")"
+}
 fair_share_demand_probe(){
   local now selection fq flabels ftier
   tartci_fair_share_enabled || return 0
@@ -1350,7 +1356,7 @@ fair_share_demand_probe(){
   selection="$(select_work)"
   tartci_heartbeat_keepalive_stop
   IFS='|' read -r fq flabels ftier <<< "$selection"
-  tartci_fair_share_demand_seen "$fq" "$flabels"
+  tartci_fair_share_demand_seen "$fq" "$flabels" "$(fair_share_detail_file "$ftier")"
   case "$fq" in ''|*[!0-9]*) ;; *) event fair_share_demand_probe "queued=$fq labels=$flabels tier=$ftier" ;; esac
 }
 
@@ -3438,7 +3444,7 @@ if [ "$LOOP" = 1 ]; then
     blind=0
     reset_blind_restarts
     clear_scan_error
-    tartci_fair_share_demand_seen "$q" "$selected_labels"
+    tartci_fair_share_demand_seen "$q" "$selected_labels" "$(fair_share_detail_file "$selected_tier")"
     if [ "$r" = unknown ]; then
       tartci_vm_lease_waiter_withdraw
       tartci_slot_priority_withdraw

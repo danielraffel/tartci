@@ -793,12 +793,16 @@ could not place for that long (`scripts/fair_share.py`):
   yields to its own repository and is unaffected.
 - **Within one repository nothing changes**: merge-group above PR-head, the
   priorities lanes lease at and ranked waiters all stay as they are.
-- **The clock**: per lane, in the supervisor. It starts at the first scan that
-  counts queued work, survives polls that cannot scan (lease_fit `not_now`,
-  blind scans), and resets when the lane is granted a VM
-  (`fair_share_granted`) or a scan finds its queue empty. A starved lane
-  registers or refreshes its lease waiter (with `repo` and `demand_since`)
-  on every poll it cannot place work, which is how other lanes see it. A lane
+- **The clock**: per lane, in the supervisor. It starts at the older of the
+  first scan that counts queued work and the oldest matching queued job's
+  `created_at` (from the scan's slot-demand detail file, written while slot
+  priority is on; no extra GitHub call). It survives polls that cannot scan
+  (lease_fit `not_now`, blind scans). The lane's own part resets when it is
+  granted a VM (`fair_share_granted`) or a scan finds its queue empty, but the
+  job age carries across a grant, so a lane whose backlog is still older than
+  `fair_share_after_secs` is starved again at its next poll. A starved lane
+  registers or refreshes its lease waiter (with `repo` and `demand_since`) on
+  every poll it cannot place work, which is how other lanes see it. A lane
   that lease_fit holds at `not_now` from its first poll never scans, so with
   its clock unstarted it scans once per `TARTCI_FAIR_SHARE_PROBE_SECS`
   (default 300) to start it (`fair_share_demand_probe`).
@@ -810,9 +814,8 @@ could not place for that long (`scripts/fair_share.py`):
 
 Known limits: the cost of fairness is paid by the gate. A Pulp job may wait one
 Vellum job's length for a VM after Vellum has waited `fair_share_after_secs`,
-and while a promoted Vellum VM runs it counts as gate use. The clock counts a
-lane's unplaced demand, not each job's age: a lane granted a VM starts again at
-its next unplaced job. A parked warm VM upgraded in place (`leases resize`)
+and while a promoted Vellum VM runs it counts as gate use. Without slot priority's detail file the clock counts only the lane's
+unplaced demand, so a lane granted a VM starts again at its next unplaced job. A parked warm VM upgraded in place (`leases resize`)
 is not ranked by fair share; it already holds its slot. While a starved lane's
 last-slot yield is lifted, that lane's fail-closed last-slot guard is off for
 its boot by design, so a Pulp gate job may wait one Vellum job length for m5's
