@@ -477,10 +477,32 @@ class QueueScanner:
         selected: list[dict[str, Any]] = []
         # Always reserve one slot for the globally oldest backlog run, even on
         # a full page, so it cannot sit outside the rotating offset forever.
-        # The remaining slots keep rotating.
-        reserved_oldest = capacity > 0
+        # The remaining slots keep rotating. Re-fetching the same oldest run
+        # on every sweep would only repeat an answer the negative cache already
+        # holds and would cut rotation throughput by one slot per sweep, so the
+        # reservation is spent on a run at most once per negative-cache TTL.
+        # The record is keyed by run ID because each sweep sees a different
+        # older page, so the oldest visible run alternates between pages.
+        now = int(getattr(self, "now", 0) or 0)
+        interval = int(getattr(self.args, "negative_ttl", 0) or 0)
+        reserved_raw = state.get("oldest_reserved_at")
+        reserved_at = {
+            str(run_id): int(at)
+            for run_id, at in (
+                reserved_raw.items() if isinstance(reserved_raw, dict) else ()
+            )
+            if isinstance(at, int) and now - at < interval
+        }
+        reserved_oldest = capacity > 0 and str(oldest_id) not in reserved_at
         if reserved_oldest:
             selected.append(oldest)
+            reserved_at[str(oldest_id)] = now
+        cap = int(getattr(self.args, "page_offset_cap", 64) or 64)
+        if len(reserved_at) > cap:
+            reserved_at = dict(
+                sorted(reserved_at.items(), key=lambda item: item[1])[-cap:]
+            )
+        state["oldest_reserved_at"] = reserved_at
         entry = offsets.get(key)
         if isinstance(entry, dict):
             offset = int(entry.get("offset", 0)) % len(group)

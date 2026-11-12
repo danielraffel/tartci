@@ -68,6 +68,44 @@ class QueueScanFairnessTests(unittest.TestCase):
         self.assertEqual(len(ids), 5)
         self.assertEqual(len(set(ids)), 5)
 
+    def test_reserved_oldest_rechecks_only_after_negative_ttl(self) -> None:
+        value = scanner()
+        value.args.negative_ttl = 300
+        runs = [run(1, "2026-11-11T21:00:00Z", "queued:1"),
+                run(2, "2026-11-11T20:59:00Z", "queued:1")]
+        runs += [run(100 + i, f"2026-11-10T00:{i % 60:02d}:00Z", "queued:2") for i in range(99)]
+        runs.append(run(1000, "2026-11-01T00:00:00Z", "queued:2"))
+        state = {"run_item_offsets": {"queued:2": {"offset": 50, "last_seen": 1}}}
+        value.now = 10_000
+        first, _ = value._candidate_runs(runs, state)
+        self.assertIn(1000, [int(item["id"]) for item in first])
+        # Within the TTL the slot goes back to rotation: the full capacity of
+        # three backlog fetches advances the page cursor.
+        value.now += 121
+        before = state["run_item_offsets"]["queued:2"]["offset"]
+        second, rotated = value._candidate_runs(runs, state)
+        self.assertNotIn(1000, [int(item["id"]) for item in second])
+        self.assertEqual(len(rotated), 3)
+        self.assertEqual(
+            (state["run_item_offsets"]["queued:2"]["offset"] - before) % 100, 3
+        )
+        # Once the TTL has passed the oldest run is reserved again.
+        value.now += 300
+        third, _ = value._candidate_runs(runs, state)
+        self.assertIn(1000, [int(item["id"]) for item in third])
+        # A different oldest run is reserved immediately.
+        value.now += 1
+        runs.append(run(2000, "2026-10-01T00:00:00Z", "queued:2"))
+        fourth, _ = value._candidate_runs(runs, state)
+        self.assertIn(2000, [int(item["id"]) for item in fourth])
+        # Alternating back to a page whose oldest run was reserved within the
+        # TTL does not spend the slot again.
+        value.now += 1
+        runs.pop()
+        fifth, rotated = value._candidate_runs(runs, state)
+        self.assertNotIn(1000, [int(item["id"]) for item in fifth])
+        self.assertEqual(len(rotated), 3)
+
 
 if __name__ == "__main__":
     unittest.main()
