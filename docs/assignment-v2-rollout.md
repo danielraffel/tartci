@@ -358,7 +358,11 @@ whose labels pin it to one host (`vellum-host-<id>`) shares no key with its
 peers, and their claims never count. Such a lane names the labels its jobs
 request in `job_claim_labels` (env `TARTCI_JOB_CLAIM_LABELS`); the validator
 requires them to be labels the lane advertises, and refuses the key on an
-event-class-v2 lane, whose class labels already match across hosts.
+event-class-v2 lane, whose class labels already match across hosts. On a lane
+with workflow tiers, `job_claim_labels` names only the labels every class
+shares, and the selected tier's class label is appended to the key, so a
+merge-group claim and a PR-head claim never cover each other. The labels the
+runner registers with, host pin included, are unchanged.
 
 The `vellum-gate` lane runs with both keys on every host: in the ~67 h before
 the change, 31 of its 65 boots got no job, because each free host booted for

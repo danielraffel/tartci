@@ -18,7 +18,9 @@
 # TARTCI_JOB_CLAIM=0 disables claims; TARTCI_JOB_CLAIM_FLEET=0 keeps them
 # host-local (no runner listing); TARTCI_JOB_CLAIM_TTL_SECS bounds a claim.
 # TARTCI_JOB_CLAIM_LABELS (profile `job_claim_labels`) replaces the selected
-# labels as the claim key on a lane whose labels pin it to one host.
+# labels as the claim key on a lane whose labels pin it to one host. On a lane
+# with workflow tiers it is the shared base, and the selected tier's class
+# label is appended, so each class keeps its own claim key.
 # TARTCI_JOB_CLAIM_FLEET_PEERS=1 (profile `assignment_fleet_claim_peers`) also
 # reads every other published host's live claims over SSH before acquiring,
 # within TARTCI_JOB_CLAIM_FLEET_READ_SECS (default 5); an unread peer counts
@@ -131,6 +133,29 @@ _tartci_job_claim_call(){
   return "$_jc_rc"
 }
 
+# The labels a claim for <selected_labels> at <selected_tier> is keyed by.
+# Without job_claim_labels: the selected labels themselves. With it: those
+# shared labels, plus the selected tier's class label on a tiered lane. The
+# labels the runner registers with (and its host pin) are not changed here.
+tartci_job_claim_key_labels(){
+  local selected_labels="$1" selected_tier="${2:-0}" tier_label tier=0
+  if [ -z "${TARTCI_JOB_CLAIM_LABELS:-}" ]; then
+    printf '%s\n' "$selected_labels"
+    return 0
+  fi
+  if [ -n "${TIER_LABELS_CONFIG:-}" ] && [ "${ASSIGNMENT_MODE:-legacy}" != event-class-v2 ]; then
+    while IFS= read -r tier_label; do
+      [ -n "$tier_label" ] || continue
+      if [ "$tier" -eq "$selected_tier" ]; then
+        printf '%s,%s\n' "$TARTCI_JOB_CLAIM_LABELS" "$tier_label"
+        return 0
+      fi
+      tier=$((tier + 1))
+    done <<< "$TIER_LABELS_CONFIG"
+  fi
+  printf '%s\n' "$TARTCI_JOB_CLAIM_LABELS"
+}
+
 # Decide whether this lane may boot for its selected class.
 # Returns 0 to boot (claimed, or fail-open) and 75 when every queued job of
 # the class is already covered by another lane.
@@ -139,7 +164,7 @@ tartci_job_claim_acquire(){
   local runners peers out="" rc=0 lower=() exact detail
   # A lane whose labels carry a per-host pin keys its claims by the labels
   # every host shares (profile `job_claim_labels`), so peers' claims match.
-  [ -z "${TARTCI_JOB_CLAIM_LABELS:-}" ] || selected_labels="$TARTCI_JOB_CLAIM_LABELS"
+  selected_labels="$(tartci_job_claim_key_labels "$selected_labels" "$selected_tier")"
   JOB_CLAIM_CONTENDED=0
   JOB_CLAIM_ID=""
   tartci_job_claim_enabled || return 0

@@ -460,6 +460,54 @@ class LibraryTests(unittest.TestCase):
         return (f"rc=0; tartci_job_claim_acquire vm-me {LABELS!r} 1 {queued} repos/x/actions/runners || rc=$?\n"
                 "echo \"rc=$rc contended=$JOB_CLAIM_CONTENDED id=$JOB_CLAIM_ID\"\n")
 
+    VELLUM_TIERS = "TIER_LABELS_CONFIG=$'vellum-build-macos-merge-group\\nvellum-build-macos'\n"
+    VELLUM_SELECTED = "self-hosted,macOS,ARM64,vellum-host-m5"
+
+    def test_each_class_of_a_tiered_lane_has_its_own_claim_key(self) -> None:
+        """A host-pinned tiered lane keys claims by the shared labels plus the
+        selected class, so merge-group and PR-head claims never cover each
+        other, and the registration labels keep their host pin."""
+        body = (
+            self.VELLUM_TIERS +
+            "export TARTCI_JOB_CLAIM_LABELS=self-hosted,macOS,ARM64\n"
+            f"sel0={self.VELLUM_SELECTED},vellum-build-macos-merge-group\n"
+            f"sel1={self.VELLUM_SELECTED},vellum-build-macos\n"
+            'echo "k0=$(tartci_job_claim_key_labels "$sel0" 0)"\n'
+            'echo "k1=$(tartci_job_claim_key_labels "$sel1" 1)"\n'
+            'echo "sel0=$sel0"\n'
+            "unset TARTCI_JOB_CLAIM_LABELS\n"
+            'echo "plain=$(tartci_job_claim_key_labels "$sel1" 1)"\n'
+        )
+        proc = self.run_bash(self.script(body, mode="legacy"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        out = proc.stdout
+        self.assertIn("k0=self-hosted,macOS,ARM64,vellum-build-macos-merge-group\n", out)
+        self.assertIn("k1=self-hosted,macOS,ARM64,vellum-build-macos\n", out)
+        self.assertIn(f"sel0={self.VELLUM_SELECTED},vellum-build-macos-merge-group\n", out)
+        self.assertIn(f"plain={self.VELLUM_SELECTED},vellum-build-macos\n", out)
+
+    def test_one_job_per_class_boots_one_vm_per_class(self) -> None:
+        """Control for the key: one queued job in each class is two boots, not
+        one boot covering both."""
+        self.gh("exit 0\n")
+        body = (
+            self.VELLUM_TIERS +
+            "export TARTCI_JOB_CLAIM_LABELS=self-hosted,macOS,ARM64\n"
+            f"rc=0; tartci_job_claim_acquire vm-mg {self.VELLUM_SELECTED},vellum-build-macos-merge-group 0 1 repos/x/actions/runners || rc=$?\n"
+            'echo "mg rc=$rc key=$JOB_CLAIM_LABELS"\n'
+            "SLOT=2; RUNNER_NAME=lane2\n"
+            f"rc=0; tartci_job_claim_acquire vm-pr {self.VELLUM_SELECTED},vellum-build-macos 1 1 repos/x/actions/runners || rc=$?\n"
+            'echo "pr rc=$rc key=$JOB_CLAIM_LABELS"\n'
+            f"rc=0; tartci_job_claim_acquire vm-pr2 {self.VELLUM_SELECTED},vellum-build-macos 1 1 repos/x/actions/runners || rc=$?\n"
+            'echo "pr2 rc=$rc"\n'
+        )
+        proc = self.run_bash(self.script(body, mode="legacy"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("mg rc=0 key=self-hosted,macOS,ARM64,vellum-build-macos-merge-group", proc.stdout)
+        self.assertIn("pr rc=0 key=self-hosted,macOS,ARM64,vellum-build-macos", proc.stdout)
+        # A second PR-head boot for the same single job is covered.
+        self.assertIn("pr2 rc=75", proc.stdout)
+
     def test_covered_demand_does_not_boot(self) -> None:
         self.gh("exit 0\n")
         self.hold("vm-a")
