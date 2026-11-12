@@ -39,7 +39,7 @@ Proof status, 2026-06-13:
 - The fresh runtime export imported into Shipyard with
   `shipyard metrics import tartci --file ... --json` (`imported: 1`).
   `shipyard metrics summary --project pulp --json` then reported one
-  `tart-macos` VM row for `Daniels-Mac-Studio.local`; `shipyard metrics watch
+  `tart-macos` VM row for `studio-host.local`; `shipyard metrics watch
   --project pulp --since 1d --json` reported the expected
   `insufficient_samples` finding.
 - The proof workflow's macOS operator job and required `macos` wrapper job both
@@ -58,7 +58,7 @@ Proof status, 2026-06-13:
   `TARTCI_RUNTIME_MEASURE=1`, the cacheopt golden, and labels
   `["self-hosted","Windows","ARM64","tartci-runtime-proof-windows"]` emitted a
   runner-sourced `qemu-windows` record for
-  `win-ephr-daniels-mac-studio-79179-1`. The record has `status=pass`,
+  `win-ephr-studio-host-79179-1`. The record has `status=pass`,
   `source=runner`, `boot_ms=23000`, `setup_ms=11000`, `run_ms=50000`,
   `total_ms=86000`, `tags=["runtime-proof","macstudio","windows","linked"]`,
   and `external_id=github:27459521777/81170449321/`.
@@ -66,7 +66,7 @@ Proof status, 2026-06-13:
   job: a one-shot QEMU Windows runner using labels
   `["self-hosted","Windows","ARM64","tartci-runtime-idle-timeout-proof"]` and
   `TARTCI_RUNNER_IDLE_TIMEOUT_SECS=60` emitted a runner-sourced
-  `qemu-windows` record for `win-ephr-daniels-mac-studio-82716-1` with
+  `qemu-windows` record for `win-ephr-studio-host-82716-1` with
   `status=fail`, `exit_code=124`, `failure_class=idle_timeout`,
   `boot_ms=24000`, `setup_ms=12000`, `run_ms=60000`, and `total_ms=99000`.
   The stale GitHub runner registration was deleted and no proof runner
@@ -79,7 +79,7 @@ Proof status, 2026-06-13:
   `tart-linux`, `tart-macos`, and `qemu-windows` rows plus a failed
   idle-timeout row.
 **Parent plan:** `Shipyard/planning/2026-06-12-ci-runtime-measurement-plan.md`
-(canonical at `/Volumes/Workshop/Code/Shipyard`). That plan owns the normalized
+(canonical at `/Volumes/<data-volume>/Code/Shipyard`). That plan owns the normalized
 store (`metrics.db`), GitHub import, summaries, drift detection, and the
 agent-facing `shipyard metrics watch/advise/compare` contract. **This plan is the
 tartci side of that boundary:** the optional VM-lane emitter of host-local

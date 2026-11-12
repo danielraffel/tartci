@@ -42,7 +42,7 @@ tartci owns host-local provider truth:
 
 Shipyard owns fleet and repo routing:
 
-- host ordering across Mac Studio, M5/blackbook, and GitHub fallback;
+- host ordering across Mac Studio, M5/laptop, and GitHub fallback;
 - reading `tartci status --json` from reachable hosts;
 - planning and applying repo-level GitHub variables;
 - issue filing/updating for scheduled main/nightly failures;
