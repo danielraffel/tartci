@@ -475,10 +475,10 @@ class QueueScanner:
         group = groups[key]
         capacity = self.args.max_job_fetches - len(latency)
         selected: list[dict[str, Any]] = []
-        # Keep full-page rotation at its existing throughput.  When the
-        # selected page has spare entries, use that spare capacity to reserve
-        # the globally oldest backlog run so a small page cannot starve it.
-        reserved_oldest = capacity > 0 and len(group) < capacity
+        # Always reserve one slot for the globally oldest backlog run, even on
+        # a full page, so it cannot sit outside the rotating offset forever.
+        # The remaining slots keep rotating.
+        reserved_oldest = capacity > 0
         if reserved_oldest:
             selected.append(oldest)
         entry = offsets.get(key)
@@ -493,7 +493,9 @@ class QueueScanner:
             sweep = int(group[0].get("_page_sweep", 0))
             offset = (sweep * capacity) % len(group)
         consumed = 0
-        for step in range(min(capacity - len(selected), len(group))):
+        for step in range(len(group)):
+            if len(selected) >= capacity:
+                break
             consumed += 1
             candidate = group[(offset + step) % len(group)]
             if not reserved_oldest or int(candidate["id"]) != oldest_id:
