@@ -8,8 +8,12 @@ It is written down here because a reader of this repo would otherwise conclude t
 fleet is Macs-only and reach for a Tart provider for x86_64 work — which is the
 specific mistake this host exists to prevent.
 
-**Status:** operational, serving Pulp's protected disposable Linux x64 build
-lane through the `pulp-trusted-build` runner group. The
+**Status:** operational as a dispatch-only lane. One repository-scoped
+disposable Linux x64 slot serves operator-dispatched Pulp runs (the five-label
+`PULP_LOCAL_LINUX_RUNS_ON_JSON` selector); automatic PR and merge-group Linux
+stays GitHub-hosted. The protected `pulp-trusted-build` role is off because its
+group verifier fails closed against the live group (see "Provisioning and drift"
+below). The
 profile is coordinated by Shipyard, but the Linux host is **not managed by
 TartCI**. It uses Proxmox and systemd pool supervisors rather than Tart and the
 macOS launchd provider.
@@ -20,13 +24,13 @@ macOS launchd provider.
 
 | | |
 |---|---|
-| **Host** | `macpro` 192.168.86.43 — Proxmox VE 8.4, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
-| **Serves** | Pulp protected `Linux (x64)` merge-group/main builds · Windows x64 later |
+| **Host** | `macpro` (LAN address: see the private fleet table) — Proxmox VE 9.2, Xeon E5-1650 v2 6c/12t, 31 GB, 338 GB thin pool |
+| **Serves** | operator-dispatched Pulp `Linux (x64)` · an opportunistic Windows x64 build VM |
 | **Model** | golden template → linked clone → one job → destroy |
 | **Templates** | `9005` `pulp-linux-golden-warm4` (current and retained parent) · `9004`, `9003`, `9002`, `9001` (rollback/superseded) |
-| **Pool** | Trusted `pulp-ephemeral-pool@{1,2}.service`; PR-safe services must use a separate unit namespace and capability label |
-| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64 — **stopped**; do not treat its free memory as approval to enable slot 3 |
-| **Governor** | `/usr/local/sbin/macpro-governor.sh` — mem hard, CPU 1.5x overcommit, 2c/4G host reserve |
+| **Pool** | One generic slot, `pulp-ephemeral-pool@1.service`; trusted and PR-safe roles use separate unit namespaces and are disabled |
+| **Windows VM** | `300` `pulp-win-ci`, Server 2022 Eval x64, VS 2022 Build Tools; runs beside the one Linux slot. Snapshot `toolchain-vs2022` |
+| **Governor** | `/usr/local/sbin/macpro-governor.sh` (Pulp `tools/ci/macpro-governor.sh`) — mem hard, CPU 1.5x, thin-pool disk axis; reserve derived from the host |
 | **Credentials** | Registration PAT for the ephemeral runner service; separate Shipyard GitHub App key/token for policy verification. All root-only and file-backed. |
 | **Rollback** | expire/unset the local Linux lease/selector; subsequent jobs return to GitHub-hosted Linux |
 
@@ -52,8 +56,8 @@ That is the whole point: it is the only x86_64 host in a fleet of Apple Silicon.
 ## The machine
 
 ```
-host      macpro   192.168.86.43   `ssh macpro`   (reachable from m1, m3, m5)
-          Proxmox VE 8.4, kernel 6.8.12-39-pve
+host      macpro   <lan-address>   `ssh macpro`   (reachable from m1, m3, m5)
+          Proxmox VE 9.2, kernel 7.0.14-16-pve
 cpu       Xeon E5-1650 v2 — 6 cores / 12 threads @ 3.5 GHz (Ivy Bridge-EP)
 memory    31 GB DDR3
 disk      466 GB Apple PCIe SSD → local-lvm thin pool, 338 GB usable
@@ -103,23 +107,59 @@ Why this rather than a persistent runner with a cleanup hook:
   incident on the macOS runners. Pulp's `build.yml` sets `clean: false` on
   self-hosted, so persistent build dirs across branches are a live hazard.
 
-Two trusted slots run as `pulp-ephemeral-pool@{1,2}.service`; **systemd restarting
-a slot is what provisions the next clone** — that loop *is* the pool. The
+One generic slot runs as `pulp-ephemeral-pool@1.service`; **systemd restarting
+a slot is what provisions the next clone** — that loop *is* the pool. One idle
+slot holds 8 GB, which leaves room for the 10 GB Windows VM; a second slot only
+fits while Windows is stopped. The
 PR-safe lane must use separate services, runner group, registration-name prefix,
 and label. Sharing a service between `pulp-auto-linux-x64` and
 `pulp-pr-safe-linux-x64` destroys the isolation boundary even if the VM itself
 is disposable.
 
-VMIDs `200..202` have stable network identities: `192.168.86.251..253` and
+VMIDs `200..202` have stable network identities: three reserved LAN addresses (listed in the private fleet table) and
 deterministic locally administered MAC addresses. The Actions registration name
 is deliberately different: `pulp-ci-ephemeral-<vmid>-<uuid>` is unique for every
 invocation so an interrupted runner cannot collide with its replacement.
+
+### Provisioning and drift
+
+Nothing on this host is provisioned by TartCI. Its files come from Pulp's
+`tools/ci/`, and Pulp's `tools/ci/proxmox-host-health.sh` owns the one table of
+repository file to host path. Install the whole matched set from a checkout of
+Pulp `main` on the host, never one file:
+
+```sh
+tools/ci/proxmox-host-health.sh --install "$PWD"   # backs up, renames into place
+/usr/local/sbin/pulp-proxmox-host-health.sh        # HEALTHY, or DRIFT/FAILED/DISK lines
+```
+
+The reaper unit runs the check after every 15-minute pass, so a host copy that
+differs from `main` (an in-place edit, or a merge nobody deployed) leaves
+`pulp-ephemeral-reap.service` failed. That is the guard for the failure this
+host had from 2026-09-10 to 2026-10-05:
+
+- A hand-forked supervisor never stamped `pulp-runner-generation` on its clones.
+- The reaper, which needs that stamp, kept three finished clones for three weeks.
+- Those clones held 24 GB, so the governor refused every new clone, and the pool
+  restarted about 45,000 times.
+
+Each refusal now names its axis (`because cpu|memory|disk: ...`), a refused
+supervisor waits about five minutes before retrying, and each pool unit stops
+after 40 restarts in an hour.
+
+The trusted role stays off until runner group `pulp-trusted-build` and Pulp's
+verifier policy agree on the workflow list. The verifier also expects
+`pr-safe-linux.yml`, which the live group does not select. The Pulp `local-ci`
+guide carries the check command and one known reaper limit: an idle JIT orphan
+cannot be fenced, because JIT labels are read-only.
 
 ### Scripts on the host
 
 ```
 /usr/local/sbin/pulp-ephemeral-runner.sh   one clone → one job → teardown
 /usr/local/sbin/macpro-governor.sh         capacity admission (Tier 1)
+/usr/local/sbin/pulp-ephemeral-reap.sh     orphan recovery (timer, every 15 min)
+/usr/local/sbin/pulp-proxmox-host-health.sh  drift + failed-slot + disk check
 /etc/systemd/system/pulp-ephemeral-pool@.service
 /root/.config/pulp/secrets/gh-runner-pat   fine-grained PAT, mode 600, root
 /root/.config/pulp/secrets/shipyard-local.private-key.pem  App key, mode 600
@@ -334,6 +374,34 @@ public key written to `administrators_authorized_keys`.
 
 Unlicensed by design — Server 2022 Eval is 180 days and needs no key. A CI builder
 does not need activation.
+
+It was first installed on 2026-10-05; until then the disk was empty. Three
+things about that install are worth knowing before you redo it:
+
+- **Boot order put the installer first** (`ide0;scsi0`), so a fresh start waited
+  at "Press any key to boot from CD" and then failed to "No bootable option".
+  Install by `qm reset 300` plus a few `qm sendkey 300 ret`, then set
+  `qm set 300 --boot order=scsi0` once Windows is on disk.
+- **The unattend file installs no virtio-serial driver**, so the QEMU guest agent
+  runs but cannot talk to the host. Install `vioserial\2k22\amd64\vioser.inf`
+  from the attached `virtio-win.iso` with `pnputil /add-driver ... /install`;
+  `qm guest cmd 300 ping` then works.
+- **It takes a DHCP lease on the LAN** (its address is not fixed). SSH as
+  `ci` with the operator key named in the unattend file; read the current address
+  with `qm guest cmd 300 network-get-interfaces`.
+
+Toolchain, installed by a SYSTEM scheduled task and captured as snapshot
+`toolchain-vs2022`:
+
+- VS 2022 Build Tools 17.14 (VCTools workload, Windows 11 SDK 10.0.22621)
+- Git 2.56, Python 3.12, CMake 3.31.8, Ninja 1.13
+
+CMake is pinned below 4.x on purpose: CMake 4 drops compatibility with
+`cmake_minimum_required` below 3.5, which some fetched dependencies still
+declare.
+
+Builds take a share of the VM: `cmake --build build --config Release --parallel 3`
+on its 4 vCPU. The VM and one Linux slot fit the governor together.
 
 Its intended job is the **nightly** Windows run, moving that off 2x-billed hosted
 minutes. Nightly is the right latency class for self-hosted: if the host is down,

@@ -1,0 +1,102 @@
+# Captured with ps -axo pid=,ppid=,command= on m3 after the 2026-10-12 reboot.
+     1      0 /sbin/launchd
+  1313      1 /Applications/cmux.app/Contents/MacOS/cmux
+  6052      1 /Users/ci/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate-slot2
+  6069      1 /Users/ci/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-vellum-gate
+  6081      1 /Users/ci/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-spectr-gate
+  6082      1 /Users/ci/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-forge-gate
+  6092      1 /Users/ci/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher --lane studio-pulp-gate
+  6258   6052 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+  6260   6092 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 10296   6069 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 10454   6081 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 10997   6082 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 12948   6258 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/launchd_interval_guard.py loop --owner-pid 6258 --cadence 60 --event-log /Users/ci/.tartci/state/macos-fleet/pulp-gate-slot2/events.jsonl --runner studio-pulp-gate-slot2-02
+ 12982   6260 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/launchd_interval_guard.py loop --owner-pid 6260 --cadence 60 --event-log /Users/ci/.tartci/state/macos-fleet/pulp-gate/events.jsonl --runner studio-pulp-gate-01
+ 14178  10296 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/launchd_interval_guard.py loop --owner-pid 10296 --cadence 60 --event-log /Users/ci/.tartci/state/macos-fleet/vellum-gate/events.jsonl --runner studio-vellum-gate-01
+ 14195  10454 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/launchd_interval_guard.py loop --owner-pid 10454 --cadence 60 --event-log /Users/ci/.tartci/state/macos-fleet/spectr-gate/events.jsonl --runner studio-spectr-gate-01
+ 14197  10997 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/launchd_interval_guard.py loop --owner-pid 10997 --cadence 60 --event-log /Users/ci/.tartci/state/macos-fleet/forge-gate/events.jsonl --runner studio-forge-gate-01
+ 83002   6260 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 83004   6260 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 83022  83004 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 97908  83022 bash /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/providers/tart-macos/runner.sh --loop
+ 97951  97908 /opt/homebrew/Cellar/python@3.14/3.14.6/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python /Users/ci/.local/libexec/TartCILauncher.app/Contents/Resources/support/scripts/assignment_scan.py --repo Generous-Corp/pulp --workflow Release-path PR gate --labels self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-pr-gate --require-label pulp-release-pr-gate --min-age-seconds 0 --gh-cli ghapp
+  1500   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1502   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1513   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1520   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1524   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1526   1524 -/bin/zsh
+ 32188   1526 sr codex resume 01a126fe-4702-7b62-9852-63e986e1379c
+  1528   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1540   1528 -/bin/zsh
+ 32113   1540 sr codex resume 01a1269c-72a7-7880-bbfc-b2b536606dbc
+  1598   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1736   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1818   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1880   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  1935   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  2092   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  2382   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  2700   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  2792   2700 -/bin/zsh
+ 32042   2792 sr codex resume 01a12445-5aea-7511-bcf6-1220275176b1
+  2893   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  2990   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3097   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3133   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3134   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3143   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3144   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3153   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3213   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  3276   3213 -/bin/zsh
+ 32003   3276 sr codex resume 01a12441-ce03-78e0-8718-f2259fe26f0b
+  6354   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6360   6354 -/bin/zsh
+ 20408   6360 sr codex resume 01a10852-5eed-7993-bee8-c40693a36dc3
+  6385   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6426   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6509   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6588   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6777   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  6964   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7173   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7358   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7498   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7673   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7803   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  7900   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8037   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8154   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8254   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8422   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8547   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8650   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8807   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8896   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  8995   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9022   8995 -/bin/zsh
+ 23320   9022 sr claude proxy --resume 08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb
+ 23486  23320 /Users/ci/.local/bin/claude --settings /var/folders/13/h9mz2d49113d43hqz2cff2z00000gn/T/cmux-claude-settings.oWulwD --mcp-config={"mcpServers":{"cmux-cua":{"command":"/Applications/cmux.app/Contents/Resources/bin/cmux-cua","args":["mcp","--socket","/var/folders/13/h9mz2d49113d43hqz2cff2z00000gn/T/cmux-cua-501/com.cmuxterm.app/cmux-cua.sock"],"env":{"CMUX_CUA_MCP_FORCE_PROXY":"1","CMUX_CUA_EXTERNAL_PERMISSION_FLOW":"1","CMUX_CUA_DEFAULT_SESSION":"cmux-00FD407D-DAED-4046-992F-8E0EF9BA146C","CMUX_CUA_STATE_OWNER_PID":"23486","CMUX_CUA_TELEMETRY_ENABLED":"false","CMUX_CUA_UPDATE_CHECK":"false","CMUX_CUA_CURSOR_GRADIENT":"#12c7f5,#2d8cff,#6c5cff","CMUX_CUA_CURSOR_BLOOM":"#2d8cff","CMUX_CUA_CURSOR_LABEL":"cmux","CMUX_CUA_STATE_DIR":"/Users/ci/Library/Application Support/cmux/cmux-cua/runtime/com.cmuxterm.app/state","NODE_OPTIONS":"","BUN_OPTIONS":""}}}} --resume 08fb81d8-38a3-4b20-8bcc-c34ba2a66ffb
+  9083   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9193   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9360   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9486   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9594   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9746   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+  9905   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10030   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10149   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10252   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10359   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10459   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10565   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10682   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10791   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 10897   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 11612   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 11690   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+ 11745   1313 /usr/bin/login -flp danielraffel /bin/bash --noprofile --norc -c exec -l /bin/zsh
+27857 27849 /Users/ci/.subrouter/codex/claude-proxy/25bf8e1a2393f1108d37029b/shell-snapshots/snapshot-zsh-real.sh 6
+34994 34989 /bin/sh -c trap : TERM; sleep 6

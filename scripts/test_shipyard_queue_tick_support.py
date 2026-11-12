@@ -26,7 +26,7 @@ class QueueTickSupportTests(unittest.TestCase):
             result = function(type("Args", (), namespace)())
         return result, output.getvalue().strip()
 
-    def test_versioned_decoders_allow_additive_fields(self) -> None:
+    def test_control_decoder_allows_additive_fields(self) -> None:
         _, control = self.invoke_json(
             support.command_control_flags,
             {
@@ -35,94 +35,27 @@ class QueueTickSupportTests(unittest.TestCase):
                 "future": {"value": 1},
             },
         )
-        self.assertEqual(control, "0|1")
+        self.assertEqual(control, "0")
 
-        _, mergeability = self.invoke_json(
-            support.command_mergeability,
-            {
-                "mergeable": "MERGEABLE",
-                "mergeStateStatus": "CLEAN",
-                "isDraft": False,
-                "future": "field",
-            },
-        )
-        self.assertEqual(mergeability, "MERGEABLE|CLEAN|false")
-
-        _, reconcile = self.invoke_json(
-            support.command_reconcile_ok,
-            {
-                "schema_version": 1,
-                "command": "ship-state:reconcile",
-                "results": [
-                    {
-                        "pr": 42,
-                        "ok": True,
-                        "changes": [],
-                        "future_result": 1,
-                    }
-                ],
-                "future_envelope": True,
-            },
-            pr=42,
-        )
-        self.assertEqual(reconcile, "1")
-
-        _, event = self.invoke_json(
-            support.command_auto_merge_event,
-            {
-                "schema_version": 1,
-                "command": "auto-merge",
-                "event": "merged",
-                "pr": 42,
-                "future": {"field": True},
-            },
-            pr=42,
-        )
-        self.assertEqual(event, "merged")
-
-    def test_decoders_still_require_version_and_core_typed_fields(self) -> None:
-        malformed = (
-            (
-                support.command_control_flags,
-                {"held": "false", "authority_matches": True},
-                {},
-            ),
-            (
-                support.command_mergeability,
-                {
-                    "mergeable": "MERGEABLE",
-                    "mergeStateStatus": "CLEAN",
-                    "isDraft": "false",
-                },
-                {},
-            ),
-            (
-                support.command_auto_merge_event,
-                {
-                    "schema_version": 2,
-                    "command": "auto-merge",
-                    "event": "merged",
-                    "pr": 42,
-                },
-                {"pr": 42},
-            ),
-        )
-        for function, payload, namespace in malformed:
-            with self.subTest(function=function.__name__):
-                with self.assertRaises(ValueError):
-                    self.invoke_json(function, payload, **namespace)
-
-    def test_origin_parser_is_shared_and_exact(self) -> None:
-        self.assertEqual(
-            support.parse_github_origin(
-                "git@github.com:Generous-Corp/pulp.git"
-            ),
-            "Generous-Corp/pulp",
-        )
+    def test_control_decoder_requires_an_exact_boolean(self) -> None:
         with self.assertRaises(ValueError):
-            support.parse_github_origin(
-                "https://evilgithub.com/Generous-Corp/pulp.git"
-            )
+            self.invoke_json(support.command_control_flags, {"held": "false"})
+
+    def test_merge_path_subcommands_are_gone(self) -> None:
+        parser = support.build_parser()
+        for retired in (
+            "auth-mode",
+            "app-token",
+            "authority-read",
+            "run-bounded",
+            "mergeability",
+            "reconcile-ok",
+            "auto-merge-event",
+            "github-origin",
+        ):
+            with self.subTest(retired=retired):
+                with self.assertRaises(SystemExit), mock.patch("sys.stderr", io.StringIO()):
+                    parser.parse_args([retired])
 
     def test_ledger_update_is_atomic_and_typed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

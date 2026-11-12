@@ -108,12 +108,23 @@ PY
 }
 
 tartci_check_macos_disk_floor_with_cleanup_once(){
-  local path="$1" lane="$2" runner="$3" rc=0
+  local path="$1" lane="$2" runner="$3" rc=0 attempt=""
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner" || rc=$?
   [ "$rc" -ne 0 ] || return 0
-  [ "$path" = /Volumes/Workshop/VMs ] || return "$rc"
-  [ -n "${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}" ] || return "$rc"
-  tartci_try_worktree_cleanup "$TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON" || return "$rc"
+  attempt="${TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON:-}"
+  [ -n "$attempt" ] || return "$rc"
+  # Worktree cleanup: only the Tart store the cleanup authority was rendered
+  # for (host.tart_home). The lease-denial reclaim: only the lane's own store.
+  if [ -n "${TARTCI_WORKTREE_CLEANUP_TART_HOME:-}" ] \
+     && [ "$path" = "$TARTCI_WORKTREE_CLEANUP_TART_HOME" ] \
+     && tartci_try_worktree_cleanup "$attempt"; then
+    :
+  elif [ -n "${TART_HOME:-}" ] && [ "$path" = "$TART_HOME" ] \
+       && tartci_try_disk_denial_reclaim "$attempt" "$lane" "$path"; then
+    :
+  else
+    return "$rc"
+  fi
   # One exact remeasurement only. A second denial remains authoritative.
   tartci_check_disk_floor_observed "$path" tart-macos "$lane" "$runner"
 }
@@ -138,7 +149,9 @@ import subprocess
 import sys
 
 root, key = sys.argv[1], sys.argv[2]
-profile = json.loads(subprocess.check_output([sys.executable, f"{root}/scripts/host_profile.py", "--json"], text=True))
+sys.path.insert(0, f"{root}/scripts")
+from python_child import child_python
+profile = json.loads(subprocess.check_output([child_python(), f"{root}/scripts/host_profile.py", "--json"], text=True))
 print(profile[key])
 PY
 }
@@ -150,11 +163,27 @@ tartci_positive_int_or_empty(){
   esac
 }
 
+# Per-slot VM cores for a lane sized from this host's gate reserve
+# (vm_cores_from = "gate-reserve"): gate_reserve_fit.share_cores is the one
+# derivation, shared with the gate-supply and gate-reserve checks. When it
+# cannot be computed tartci_vm_lease_cores fails rather than fall back to
+# vm_pool_cores, which is the overcommitted size the rule exists to avoid.
+tartci_gate_reserve_share_cores(){
+  python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots "${1:-1}"
+}
+
 tartci_vm_lease_cores(){
   local provider="$1" fallback="${2:-}" value="" key="vm_pool_cores"
   case "$provider" in
     tart-macos)
       value="${TARTCI_MACOS_VM_CORES:-${PULP_MACOS_VM_CORES:-}}"
+      if [ -z "$value" ] && [ "${TARTCI_MACOS_VM_CORES_FROM:-}" = "gate-reserve" ]; then
+        value="$(tartci_gate_reserve_share_cores "${TARTCI_MACOS_VM_CORES_SLOTS:-1}" 2>/dev/null || true)"
+        if ! tartci_positive_int_or_empty "$value"; then
+          echo "tartci: gate-reserve VM size unavailable; refusing to size the VM" >&2
+          return 1
+        fi
+      fi
       ;;
     tart-linux)
       value="${TARTCI_LINUX_VM_CORES:-${PULP_LINUX_VM_CORES:-}}"
@@ -174,11 +203,16 @@ tartci_vm_lease_cores(){
   printf '%s' "$value"
 }
 
-# Memory (MB) a VM lease should reserve on the host memory axis. Explicit
-# per-provider override wins; else a conservative per-guest default — a macOS or
-# Linux CI guest wants ~8 GiB, and Windows already carries WIN_MEMORY_MB. Passing
-# this (rather than letting leases.py derive cores*per-job) keeps VM accounting
-# honest: a VM's real RAM footprint is its guest memory, not its vCPU count.
+# Memory (MB) a VM lease should reserve on the host memory axis. An explicit
+# per-provider override wins and is used verbatim; otherwise this returns EMPTY
+# and tartci_acquire_vm_lease derives the size from the lease's finally-granted
+# core count (see tartci_vm_lease_derived_mem_mb). The derivation cannot happen
+# here because the core count is not final until after the non-gate clamp inside
+# acquisition. qemu-windows keeps its caller-supplied WIN_MEMORY_MB fallback:
+# that lane sizes its own guest and is not vCPU-derived.
+# Passing a real number (rather than letting leases.py derive cores*per-job)
+# keeps VM accounting honest: a VM's real RAM footprint is its guest memory,
+# not its vCPU count.
 tartci_vm_lease_mem_mb(){
   local provider="$1" fallback="${2:-}" value=""
   case "$provider" in
@@ -193,9 +227,55 @@ tartci_vm_lease_mem_mb(){
       ;;
   esac
   if ! tartci_positive_int_or_empty "$value"; then
-    value="${fallback:-8192}"
+    value="${fallback:-}"
   fi
-  tartci_positive_int_or_empty "$value" || value=8192
+  tartci_positive_int_or_empty "$value" || value=""
+  printf '%s' "$value"
+}
+
+# Guest memory (MB) for a VM lease of $1 granted cores — the amount charged on
+# the host memory axis AND applied to the guest, which must be the same number.
+#
+# C vCPUs are worth (4/3 * C * per_compile_job_mem_mb): the exact inverse of the
+# guest-side governor's own bound in Pulp's tools/ci/governed-build.sh, which
+# computes jobs = mem_mb * 3 / 4 / 1536 and takes min(cores, that). The 3/4 and
+# the 1536 are a CROSS-REPO CONTRACT with that script — change one, change both.
+# per_compile_job_mem_mb is read from the host profile rather than hardcoded so
+# the two stay tied to a single definition of "one compile job".
+#
+# Sized for C-1 jobs, not C. The exact inverse leaves the guest zero slack: it
+# would spend its whole compile budget on compile jobs while the guest's own
+# link/LTO peak, its runner agent and its OS are unaccounted for. The host
+# profile subtracts a flat link_lto_reserve_mem_mb for exactly this reason and
+# the guest formula has no equivalent, so the slack has to come from here.
+# Guest-internal swap is invisible to every host-side signal, so this errs small.
+#
+# Floor and ceiling are deliberate. The floor keeps small lanes (a 3-core m1
+# guest) from shrinking below the size they boot at today. The ceiling is a
+# staged-rollout limit, not a derived quantity: measured per-Virtualization
+# process RSS runs well above configured guest memory, so two concurrent guests
+# at a higher size can approach host RAM. Raise it only against a fresh
+# RSS-to-configured measurement at the current size.
+tartci_vm_lease_derived_mem_mb(){
+  local cores="$1" per_job="" floor ceiling value
+  tartci_positive_int_or_empty "$cores" || cores=1
+  floor="${TARTCI_VM_LEASE_MIN_MEM_MB:-8192}"
+  ceiling="${TARTCI_VM_LEASE_MAX_MEM_MB:-16384}"
+  tartci_positive_int_or_empty "$floor" || floor=8192
+  tartci_positive_int_or_empty "$ceiling" || ceiling=16384
+  # Tolerate a profile hiccup rather than aborting a VM boot over it: the
+  # caller runs under `set -e`, where a bare command substitution that exits
+  # non-zero would end the acquisition before the fallback below could apply.
+  # per_compile_job_mem_mb is a fixed constant in host_profile.py, so the
+  # fallback is that same value and not a guess.
+  per_job="$(tartci_profile_value per_compile_job_mem_mb 2>/dev/null)" || per_job=""
+  tartci_positive_int_or_empty "$per_job" || per_job=1536
+  local jobs=$(( cores - 1 ))
+  [ "$jobs" -ge 1 ] || jobs=1
+  value=$(( jobs * per_job * 4 / 3 ))
+  [ "$value" -ge "$floor" ] || value="$floor"
+  [ "$ceiling" -ge "$floor" ] || ceiling="$floor"
+  [ "$value" -le "$ceiling" ] || value="$ceiling"
   printf '%s' "$value"
 }
 
@@ -267,6 +347,33 @@ tartci_vm_lease_priority(){
     *,pulp-build-pr-head,*)
       printf '%s' 100
       return 0
+      ;;
+  esac
+  # Release classes minted by an event-class-v2 gate lane, whose registrations
+  # carry the gate base label pulp-build-vm (the legacy pulp-release lane carries
+  # pulp-build-vm-release instead and keeps its gate/vm classes below). Tagged
+  # releases sort above merge-group (120 > 110) so a release boot is admitted
+  # from gate-reserved capacity ahead of queued gate work. The release-path PR
+  # gate sits between them (115): it is gate class, so it admits exactly like
+  # PR-head (a slot that boots it holds what a gate guest on that slot would,
+  # and an ordinary build holding the non-gate budget cannot lock it out), and
+  # where ranked VM lease waiters are on it outranks merge-group, PR-head and
+  # the other lanes' `gate` class (100) instead of tying with them. Each
+  # supervisor slot holds at most one lease, so this cannot take a second
+  # slot's reserve.
+  case ",$labels," in
+    *,pulp-release-tagged,*pulp-release-pr-gate,*|*,pulp-release-pr-gate,*pulp-release-tagged,*) ;;
+    *,pulp-build-vm,*)
+      case ",$labels," in
+        *,pulp-release-tagged,*)
+          printf '%s' 120
+          return 0
+          ;;
+        *,pulp-release-pr-gate,*)
+          printf '%s' 115
+          return 0
+          ;;
+      esac
       ;;
   esac
   case ",$labels," in
@@ -365,6 +472,114 @@ finally:
 PY
 }
 
+# One `leases.py acquire` with the caller's arguments. Reads the locals of
+# tartci_acquire_vm_lease (bash dynamic scope), so a retry asks for exactly
+# what the first attempt asked for, including a memory-only warm lease.
+_tartci_vm_lease_acquire_call(){
+  python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
+    --id "$lease_id" \
+    ${core_args[@]+"${core_args[@]}"} \
+    ${mem_args[@]+"${mem_args[@]}"} \
+    ${disk_args[@]+"${disk_args[@]}"} \
+    --priority "$priority" \
+    --pid "$$" \
+    --kind "$kind" \
+    --owner "$(tartci_vm_lease_owner)" \
+    --label "$labels" \
+    --job-id "${GITHUB_RUN_ID:-}" \
+    --vm-name "$vm_name" \
+    ${waiter_args[@]+"${waiter_args[@]}"} \
+    ${fair_args[@]+"${fair_args[@]}"} \
+    --json 2>&1
+}
+
+# A refusal for disk alone (`disk_capacity_exceeded` with only the disk axis
+# exceeded) runs the lease-denial reclaim once: old gate ccache entries and
+# OCI cache images nothing references (scripts/denial_reclaim.py, at most once
+# per denial_reclaim_interval_minutes per host). 0 only when it RAN, so the
+# caller retries admission exactly once; a cooldown, a busy lock, a disabled
+# knob, a non-disk refusal or any error returns 1 and the denial stands as
+# it would have without this.
+tartci_try_disk_denial_reclaim(){
+  local attempt_json="$1" lane="${2:-}" measure="${3:-}" required="" out="" summary=""
+  local status="" detail=""
+  [ "${TARTCI_DISK_DENIAL_RECLAIM:-1}" = 1 ] || return 1
+  [ -n "${TARTCI_ROOT:-}" ] || return 1
+  required="$(printf '%s' "$attempt_json" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+disk=d.get("disk"); axis=d.get("exceeded_axis")
+if d.get("ok") is not False or d.get("reason")!="disk_capacity_exceeded": raise SystemExit(1)
+if not isinstance(axis,dict) or axis.get("disk") is not True or axis.get("cores") or axis.get("memory"): raise SystemExit(1)
+if not isinstance(disk,dict): raise SystemExit(1)
+r=disk.get("required_bytes")
+print(r if type(r) is int else "")
+' 2>/dev/null)" || return 1
+  local reclaim_args=(--fix --json --lane "$lane")
+  [ -z "$required" ] || reclaim_args+=(--required-bytes "$required")
+  [ -z "$measure" ] || reclaim_args+=(--measure-path "$measure")
+  tartci_vm_lease_note "disk admission refused for $lane; running the lease-denial reclaim (regenerable caches only)"
+  # A fresh phase before up to 300 s of reclaim: the launchd watchdog treats
+  # it as a boot phase that must finish inside its stale-boot bound, and
+  # gate_supply / lane_busy read it as a lane at work, not idle or unknown.
+  if declare -F heartbeat >/dev/null 2>&1; then
+    heartbeat disk-denial-reclaim
+  fi
+  if ! out="$(python3 "$TARTCI_ROOT/scripts/denial_reclaim.py" ${reclaim_args[@]+"${reclaim_args[@]}"} 2>/dev/null)"; then
+    tartci_vm_lease_note "lease-denial reclaim failed (ignored; the disk denial stands)"
+    return 1
+  fi
+  summary="$(printf '%s' "$out" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: raise SystemExit(1)
+gib=1024**3
+freed=d.get("freed_bytes")
+fields=["status=%s" % d.get("status")]
+if d.get("reason"): fields.append("reason=%s" % str(d["reason"]).replace(" ","_")[:120])
+if isinstance(freed,int): fields.append("freed_gib=%.1f" % (freed/gib))
+for key,label in (("free_before","free_before_gib"),("free_after","free_after_gib")):
+    if isinstance(d.get(key),int): fields.append("%s=%.1f" % (label,d[key]/gib))
+cc=d.get("ccache") or {}
+if cc: fields.append("ccache=%s" % cc.get("status"))
+oci=d.get("oci") or {}
+if oci: fields.append("oci=%s oci_deleted=%s" % (oci.get("status"), oci.get("deleted",0)))
+if d.get("elapsed_s") is not None: fields.append("elapsed_s=%s" % d["elapsed_s"])
+print("%s\t%s" % (d.get("status"), " ".join(fields)))
+' 2>/dev/null)" || summary=""
+  IFS=$'\t' read -r status detail <<<"$summary"
+  [ -n "$status" ] || { tartci_vm_lease_note "lease-denial reclaim output unreadable (ignored)"; return 1; }
+  tartci_vm_lease_note "lease-denial reclaim: $detail"
+  if declare -F event >/dev/null 2>&1; then
+    event disk_denial_reclaim "lane=$lane $detail"
+  fi
+  [ "$status" = ran ]
+}
+
+# After a granted disk-axis lease: when what is left would refuse the NEXT
+# VM (free space minus this grant's requirement is under one VM's growth),
+# say so now, while the host still serves, instead of at the first refusal.
+tartci_vm_lease_disk_headroom_event(){
+  local headroom
+  headroom="$(printf '%s' "$1" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)["disk"]
+except Exception: raise SystemExit(0)
+free,req,growth=d.get("free_bytes"),d.get("required_bytes"),d.get("requested_bytes")
+if not all(type(v) is int for v in (free,req,growth)) or growth<=0: raise SystemExit(0)
+if free-req<growth:
+    g=1024**3
+    print("free_gib=%.1f required_gib=%.1f growth_gib=%.1f next_vm=refused" % (free/g,req/g,growth/g))
+' 2>/dev/null)" || headroom=""
+  [ -n "$headroom" ] || return 0
+  tartci_vm_lease_note "disk headroom low: the next VM lease on this store would be refused for disk ($headroom)"
+  if declare -F event >/dev/null 2>&1; then
+    event disk_headroom_low "$headroom"
+  fi
+  return 0
+}
+
 tartci_start_vm_lease_heartbeat(){
   local lease_id="$1"
   (
@@ -384,6 +599,251 @@ tartci_stop_vm_lease_heartbeat(){
   fi
 }
 
+# A structured `lease_denied` event for the supervisor's events.jsonl, when the
+# sourcing provider defines `event` (the macOS runner does). A denial used to
+# reach only the note stream, so a host that refused every lease for an hour
+# left no event behind. axis is the exceeded capacity axes joined with "+"
+# (cores, memory, disk), or "none" for a denial that is not a capacity
+# verdict (legacy accounting, disk root unavailable, ...).
+tartci_vm_lease_denied_event(){
+  local out="$1" rc="$2" kind="$3" cores="$4" mem_mb="$5" priority="$6" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except ValueError:
+    d = {}
+if not isinstance(d, dict):
+    d = {}
+axis = d.get("exceeded_axis") if isinstance(d.get("exceeded_axis"), dict) else {}
+axes = "+".join(k for k in ("cores", "memory", "disk") if axis.get(k) is True) or "none"
+disk = d.get("disk") if isinstance(d.get("disk"), dict) else {}
+home = d.get("home_volume") if isinstance(d.get("home_volume"), dict) else {}
+def num(v):
+    return v if type(v) is int else ""
+extra = ""
+if home.get("state") == "below":
+    extra = " volume=home free=%s floor=%s" % (num(home.get("free_bytes")), num(home.get("floor_bytes")))
+print("axis=%s reason=%s requested_cores=%s requested_mem_mb=%s requested_disk_bytes=%s disk_free_bytes=%s disk_required_bytes=%s%s" % (
+    axes, str(d.get("reason") or "unreadable").replace(" ", "_"),
+    num(d.get("requested_cores")), num(d.get("requested_mem_mb")),
+    num(disk.get("requested_bytes")), num(disk.get("free_bytes")),
+    num(disk.get("required_bytes")), extra))
+' 2>/dev/null)" || parsed="axis=none reason=unreadable"
+  local fields=()
+  read -r -a fields <<< "$parsed rc=$rc kind=$kind lease_cores=$cores lease_mem_mb=${mem_mb:-auto} priority=$priority"
+  event lease_denied "$parsed rc=$rc kind=$kind" ${fields[@]+"${fields[@]}"}
+}
+
+# Events for a grant the home-volume floor did not refuse: `disk_axis_unread`
+# when the volume could not be read (the axis fails open, so the event keeps it
+# from failing silent), and `home_volume_would_refuse` when report mode admitted
+# a lease that refuse mode would have denied (the data that decides the flip).
+tartci_vm_lease_home_unread_event(){
+  local out="$1" line name fields
+  declare -F event >/dev/null 2>&1 || return 0
+  line="$(printf '%s' "$out" | python3 -c 'import json,sys
+try:
+    h = json.load(sys.stdin).get("home_volume") or {}
+except ValueError:
+    h = {}
+if not isinstance(h, dict):
+    h = {}
+if h.get("state") == "unread":
+    print("disk_axis_unread volume=home reason=" + str(h.get("reason") or "unknown").replace(" ", "_"))
+elif h.get("would_refuse"):
+    print("home_volume_would_refuse volume=home free=%s floor=%s" % (h.get("free_bytes"), h.get("floor_bytes")))' 2>/dev/null || true)"
+  [ -n "$line" ] || return 0
+  name="${line%% *}"
+  fields=()
+  read -r -a fields <<< "${line#* }"
+  event "$name" "${line#* }" ${fields[@]+"${fields[@]}"}
+}
+
+# The cores a VM lease of $1 at priority $2 is granted: a non-gate lane is
+# clamped to the host's non-gate budget (see tartci_acquire_vm_lease).
+tartci_vm_lease_granted_cores(){
+  local cores="$1" priority="$2" ngc
+  tartci_positive_int_or_empty "$cores" || cores=1
+  ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)" || ngc=""
+  if tartci_vm_lease_is_non_gate_priority "$priority" \
+     && tartci_positive_int_or_empty "$ngc" && [ "$cores" -gt "$ngc" ]; then
+    cores="$ngc"
+  fi
+  printf '%s' "$cores"
+}
+
+# --- ranked VM lease waiters (opt-in: [leases] rank_vm_waiters) ---------------
+#
+# A lane registers as a waiter once it has taken a job and wants a VM, BEFORE
+# its admission precheck, so a lower-priority lane whose acquire lands first is
+# deferred rather than handed the cores (scripts/leases.py). The store refreshes
+# the waiter on every denied acquire and withdraws it on a grant; the lane
+# withdraws it when it stops wanting a VM. A lane whose acquire was denied keeps
+# its waiter while it waits for capacity (tartci_vm_lease_waiter_hold), bounded
+# by TARTCI_VM_WAITER_HOLD_SECS so a lane that never gets to re-check demand
+# cannot hold it forever. Every call fails open: a waiter that cannot be
+# written only means this lane is ranked first-come, exactly as without it.
+: "${TARTCI_VM_WAITER_HOLD_SECS:=900}"
+TARTCI_VM_WAITER_ID=""
+TARTCI_VM_WAITER_SINCE=0
+declare -a _tartci_vm_waiter_args=()
+_tartci_vm_waiters_knob=""
+
+# The knob is read once per supervisor process (a profile change reaches the
+# supervisor with its next restart; the lease store itself reads it per call,
+# and either side alone being on changes nothing). Fair share keeps waiters
+# too, so either knob turns them on.
+tartci_vm_lease_waiters_enabled(){
+  tartci_vm_leases_enabled || return 1
+  if [ -z "$_tartci_vm_waiters_knob" ]; then
+    _tartci_vm_waiters_knob="$(tartci_profile_value rank_vm_waiters 2>/dev/null)" \
+      || _tartci_vm_waiters_knob=False
+  fi
+  [ "$_tartci_vm_waiters_knob" = True ] || tartci_fair_share_enabled
+}
+
+# -- Fair share between repositories (scripts/fair_share.py) -------------------
+# With `[leases] fair_share_after_secs = N` a lane that has had queued work it
+# could not place for N seconds is starved: the lease store admits it at gate
+# priority and makes other repositories' lanes yield the capacity it needs.
+# The clock is this lane's own. It starts at the first scan that finds queued
+# work, survives polls that cannot scan (lease_fit not_now), and resets when
+# the lane is granted a VM or a scan finds its queue empty. A starved lane keeps
+# a waiter registered every poll it cannot place work, so other repositories
+# see it. Off (the default) none of this runs.
+TARTCI_FAIR_DEMAND_SINCE=0
+TARTCI_FAIR_LAST_LABELS=""
+_tartci_fair_share_knob=""
+
+tartci_fair_share_after_secs(){
+  if [ -z "$_tartci_fair_share_knob" ]; then
+    _tartci_fair_share_knob="$(tartci_profile_value fair_share_after_secs 2>/dev/null)" \
+      || _tartci_fair_share_knob=0
+    case "$_tartci_fair_share_knob" in ''|*[!0-9]*) _tartci_fair_share_knob=0 ;; esac
+  fi
+  printf '%s\n' "$_tartci_fair_share_knob"
+}
+
+tartci_fair_share_enabled(){
+  [ -n "$_tartci_fair_share_knob" ] || _tartci_fair_share_knob="$(tartci_fair_share_after_secs)"
+  [ "$_tartci_fair_share_knob" -gt 0 ] 2>/dev/null
+}
+
+# A scan's queued count for this lane: start the clock on demand, reset it on
+# an empty queue. Anything that is not a count (a blind scan) leaves it as is.
+# Must run in the supervisor's own shell.
+# $3, when given, is the scan's slot-demand detail file: the clock then also
+# counts back to the oldest matching queued job, so the job's wait carries over
+# a grant (scripts/fair_share.py).
+tartci_fair_share_demand_seen(){
+  local queued="$1" labels="${2:-}" detail="${3:-}" oldest
+  tartci_fair_share_enabled || return 0
+  case "$queued" in ''|*[!0-9]*) return 0 ;; esac
+  if [ "$queued" -eq 0 ]; then
+    TARTCI_FAIR_DEMAND_SINCE=0
+    return 0
+  fi
+  [ -z "$labels" ] || TARTCI_FAIR_LAST_LABELS="$labels"
+  [ "$TARTCI_FAIR_DEMAND_SINCE" -gt 0 ] || TARTCI_FAIR_DEMAND_SINCE="$(date +%s)"
+  [ -n "$detail" ] && [ -r "$detail" ] || return 0
+  oldest="$(python3 "$TARTCI_ROOT/scripts/fair_share.py" oldest-queued "$detail" 2>/dev/null)" || oldest=""
+  case "$oldest" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$oldest" -ge "$TARTCI_FAIR_DEMAND_SINCE" ] || TARTCI_FAIR_DEMAND_SINCE="$oldest"
+}
+
+tartci_fair_share_starved(){
+  tartci_fair_share_enabled || return 1
+  [ "$TARTCI_FAIR_DEMAND_SINCE" -gt 0 ] || return 1
+  [ $(( $(date +%s) - TARTCI_FAIR_DEMAND_SINCE )) -ge "$_tartci_fair_share_knob" ]
+}
+
+# The --repo/--demand-since pair the lease store and lease_fit rank by, one
+# word per line. Nothing without a repository: an unknown repo is never ranked.
+tartci_fair_share_args(){
+  tartci_fair_share_enabled || return 0
+  [ -n "${REPO:-}" ] || return 0
+  printf '%s\n' --repo "$REPO" --demand-since "$TARTCI_FAIR_DEMAND_SINCE"
+}
+
+# A starved lane that could not place its work this poll keeps its waiter
+# registered (and refreshed), whatever stopped it: the slot cap, the lease
+# budget or a deferral. $1 lane id, $2 kind, $3 provider for the VM size.
+tartci_fair_share_wait(){
+  local lane="$1" kind="$2" provider="$3" labels
+  tartci_fair_share_starved || return 0
+  labels="${TARTCI_FAIR_LAST_LABELS:-${LABELS:-}}"
+  tartci_vm_lease_waiter_register "$lane" "$(tartci_vm_lease_cores "$provider")" "$kind" \
+    "$(tartci_vm_lease_priority "$labels")" "$labels" "$(tartci_vm_lease_mem_mb "$provider")"
+}
+
+# $1 lane id, $2 requested cores, $3 kind, $4 lease priority, $5 labels, $6 mem MB.
+tartci_vm_lease_waiter_register(){
+  local lane="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}"
+  tartci_vm_lease_waiters_enabled || return 0
+  cores="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  tartci_positive_int_or_empty "$mem_mb" || mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  _tartci_vm_waiter_args=(
+    --id "waiter-$lane" --cores "$cores" --mem-mb "$mem_mb" --priority "$priority"
+    --kind "$kind" --pid "$$" --lane "$lane" --label "$labels"
+  )
+  local fair_arg
+  while IFS= read -r fair_arg; do
+    [ -z "$fair_arg" ] || _tartci_vm_waiter_args+=("$fair_arg")
+  done < <(tartci_fair_share_args)
+  if python3 "$TARTCI_ROOT/scripts/leases.py" wait ${_tartci_vm_waiter_args[@]+"${_tartci_vm_waiter_args[@]}"} \
+       --json >/dev/null 2>&1; then
+    [ "$TARTCI_VM_WAITER_ID" = "waiter-$lane" ] || TARTCI_VM_WAITER_SINCE="$(date +%s)"
+    TARTCI_VM_WAITER_ID="waiter-$lane"
+  else
+    tartci_vm_lease_note "VM lease waiter registration failed for $lane (ignored: first-come)"
+    TARTCI_VM_WAITER_ID=""
+  fi
+  return 0
+}
+
+# Keep a denied lane's waiter alive while it waits for capacity.
+tartci_vm_lease_waiter_hold(){
+  [ -n "$TARTCI_VM_WAITER_ID" ] || return 0
+  if [ $(( $(date +%s) - TARTCI_VM_WAITER_SINCE )) -ge "$TARTCI_VM_WAITER_HOLD_SECS" ]; then
+    tartci_vm_lease_waiter_withdraw
+    return 0
+  fi
+  python3 "$TARTCI_ROOT/scripts/leases.py" wait ${_tartci_vm_waiter_args[@]+"${_tartci_vm_waiter_args[@]}"} \
+    --json >/dev/null 2>&1 || true
+}
+
+tartci_vm_lease_waiter_withdraw(){
+  [ -n "$TARTCI_VM_WAITER_ID" ] || return 0
+  python3 "$TARTCI_ROOT/scripts/leases.py" withdraw --id "$TARTCI_VM_WAITER_ID" \
+    --json >/dev/null 2>&1 || true
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
+}
+
+# A deferral is not a capacity denial: it gets its own event naming the waiter
+# it yielded to, and no lease_denied (whose axis=cores count is the canary's
+# proxy for the race this prevents).
+tartci_vm_lease_deferred_event(){
+  local out="$1" kind="$2" cores="$3" priority="$4" parsed
+  declare -F event >/dev/null 2>&1 || return 0
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    w = json.loads(sys.stdin.read()).get("waiter") or {}
+except (ValueError, AttributeError):
+    w = {}
+def v(x):
+    return str(x if x not in (None, "") else "unknown").replace(" ", "_")
+print("waiter_lane=%s waiter_priority=%s waiter_cores=%s waiter_since=%s" % (
+    v(w.get("lane")), v(w.get("priority")), v(w.get("cores")), v(w.get("waiting_since"))))
+' 2>/dev/null)" || parsed="waiter_lane=unknown"
+  local fields=()
+  read -r -a fields <<< "$parsed kind=$kind lease_cores=$cores priority=$priority"
+  event lease_deferred_to_waiter "$parsed priority=$priority" ${fields[@]+"${fields[@]}"}
+}
+
 tartci_acquire_vm_lease(){
   local vm_name="$1" cores="$2" kind="$3" priority="$4" labels="${5:-}" mem_mb="${6:-}" disk_path="${7:-}"
   local receipt_provider="${8:-unknown}" receipt_lane="${9:-unknown}" receipt_runner="${10:-unknown}" lease_id rc=0 out
@@ -401,6 +861,15 @@ tartci_acquire_vm_lease(){
     TARTCI_ACTIVE_VM_LEASE_ID=""
     # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
     TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+    # Break-glass still sizes the guest: the invariant is "the guest boots at
+    # what was charged", and a disabled lease store charges nothing but still
+    # has to hand the provider a size. Derived from the unclamped request,
+    # because with leases off there is no clamp.
+    if ! tartci_positive_int_or_empty "$mem_mb"; then
+      mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+    fi
+    # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+    TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
     _tartci_vm_lease_bypass_state=(authorized)
     tartci_observe_disk_admission '{"ok":true,"reason":"leases_disabled"}' "$receipt_provider" "$receipt_lane" "$receipt_runner"
     return 0
@@ -413,15 +882,22 @@ tartci_acquire_vm_lease(){
   # Clamping here makes any over-sized request safe by construction, so no
   # override is load-bearing and no VM lane can encroach on the gate reserve.
   # The gate lane runs at gate priority and is intentionally NOT clamped.
-  local _ngc
-  _ngc="$(tartci_profile_value non_gate_capacity_cores 2>/dev/null)"
-  if tartci_vm_lease_is_non_gate_priority "$priority" \
-     && tartci_positive_int_or_empty "$_ngc" && [ "$cores" -gt "$_ngc" ]; then
-    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_ngc (non-gate budget)"
-    cores="$_ngc"
+  local _granted
+  _granted="$(tartci_vm_lease_granted_cores "$cores" "$priority")"
+  if [ "$_granted" != "$cores" ]; then
+    tartci_vm_lease_note "clamping $kind lease cores $cores -> $_granted (non-gate budget)"
+    cores="$_granted"
   fi
-  # An explicit VM memory size charges the memory axis its real footprint;
-  # omitted (empty) lets leases.py fall back to the cores*per-job estimate.
+  # Size the guest from the cores this lease will actually be granted — i.e.
+  # AFTER the clamp above. Deriving from the requested count would charge a
+  # clamped non-gate lane for cores it never gets (a 14-core request clamped to
+  # 12 would still be billed for 14).
+  if ! tartci_positive_int_or_empty "$mem_mb"; then
+    mem_mb="$(tartci_vm_lease_derived_mem_mb "$cores")"
+  fi
+  # The VM memory size charges the memory axis its real footprint. It is also
+  # the size the guest is booted at (tartci_set_tart_vm_size): what admission
+  # charges and what the guest boots with must be the same number.
   local mem_args=()
   if tartci_positive_int_or_empty "$mem_mb" && [ -n "$mem_mb" ]; then
     mem_args=(--mem-mb "$mem_mb")
@@ -457,48 +933,136 @@ tartci_acquire_vm_lease(){
       --disk-floor-mb "$((disk_floor_gb * 1024))"
     )
     [ -z "$disk_expected_device_id" ] || disk_args+=(--disk-expected-device-id "$disk_expected_device_id")
+    # The home volume holds the supervisors' temp files and the build trees; a
+    # VM lease also refuses a new clone while it is below its per-host floor
+    # (scripts/home_volume_floor.py). The host profile's home_volume_floor_mode
+    # (TARTCI_HOME_VOLUME_FLOOR_MODE) is `report` until a day of would-refuse
+    # data shows no false refusals; TARTCI_HOME_VOLUME_FLOOR=0 turns it off.
+    if [ "${TARTCI_HOME_VOLUME_FLOOR:-1}" = 1 ] && [ -n "${HOME:-}" ]; then
+      disk_args+=(--home-floor-path "$HOME" --home-floor-hours "${TARTCI_HOME_VOLUME_FLOOR_HOURS:-1}"
+                  --home-floor-mode "${TARTCI_HOME_VOLUME_FLOOR_MODE:-report}")
+    fi
     [ -z "$disk_expected_mount_path" ] || disk_args+=(--disk-expected-mount-path "$disk_expected_mount_path")
   fi
   lease_id="vm-$kind-$vm_name"
-  out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
-    --id "$lease_id" \
-    --cores "$cores" \
-    ${mem_args[@]+"${mem_args[@]}"} \
-    ${disk_args[@]+"${disk_args[@]}"} \
-    --priority "$priority" \
-    --pid "$$" \
-    --kind "$kind" \
-    --owner "$(tartci_vm_lease_owner)" \
-    --label "$labels" \
-    --job-id "${GITHUB_RUN_ID:-}" \
-    --vm-name "$vm_name" \
-    --json 2>&1)" || rc=$?
+  # A parked warm VM (TARTCI_VM_LEASE_MEMORY_ONLY=1) holds its memory and disk
+  # but no cores until tartci_resize_vm_lease upgrades it at hand-off.
+  local core_args=(--cores "$cores")
+  [ "${TARTCI_VM_LEASE_MEMORY_ONLY:-0}" != 1 ] || core_args=(--cores 0 --memory-only)
+  TARTCI_LAST_VM_LEASE_DENIAL=""
+  local waiter_args=() fair_args=() fair_arg
+  [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
+  while IFS= read -r fair_arg; do
+    [ -z "$fair_arg" ] || fair_args+=("$fair_arg")
+  done < <(tartci_fair_share_args)
+  if [ "${#fair_args[@]}" -gt 0 ] && declare -F tartci_effective_cap >/dev/null; then
+    fair_args+=(--vm-slot-cap "$(tartci_effective_cap)")
+  fi
+  out="$(_tartci_vm_lease_acquire_call)" || rc=$?
   if [ "$rc" -ne 0 ]; then
     tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
     if tartci_try_worktree_cleanup "$out"; then
       rc=0
-      out="$(python3 "$TARTCI_ROOT/scripts/leases.py" acquire \
-        --id "$lease_id" --cores "$cores" ${mem_args[@]+"${mem_args[@]}"} \
-        ${disk_args[@]+"${disk_args[@]}"} --priority "$priority" --pid "$$" \
-        --kind "$kind" --owner "$(tartci_vm_lease_owner)" --label "$labels" \
-        --job-id "${GITHUB_RUN_ID:-}" --vm-name "$vm_name" --json 2>&1)" || rc=$?
+      out="$(_tartci_vm_lease_acquire_call)" || rc=$?
       tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
       tartci_record_worktree_cleanup_retry "$out" "$rc"
     fi
   fi
+  # Still refused for disk alone: free regenerable caches once (rate limited
+  # per host) and retry exactly once. Any reclaim failure leaves the denial.
+  if [ "$rc" -ne 0 ] && [ -n "$disk_path" ] \
+     && tartci_try_disk_denial_reclaim "$out" "$receipt_lane" "$disk_path"; then
+    rc=0
+    out="$(_tartci_vm_lease_acquire_call)" || rc=$?
+    tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
+    if declare -F event >/dev/null 2>&1; then
+      event disk_denial_reclaim_retry "rc=$rc lane=$receipt_lane"
+    fi
+  fi
   if [ "$rc" -ne 0 ]; then
+    # shellcheck disable=SC2034 # read by the provider (warm-VM yield signal)
+    TARTCI_LAST_VM_LEASE_DENIAL="$out"
     tartci_vm_lease_note "lease denied for $vm_name kind=$kind cores=$cores mem_mb=${mem_mb:-auto} priority=$priority rc=$rc: $out"
+    case "$out" in
+      *'"reason": "deferred_to_waiter"'*)
+        tartci_vm_lease_deferred_event "$out" "$kind" "$cores" "$priority" ;;
+      *)
+        tartci_vm_lease_denied_event "$out" "$rc" "$kind" "$cores" "${mem_mb:-}" "$priority" ;;
+    esac
     return "$rc"
   fi
+  # The store withdrew this lane's waiter with the grant.
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
+  case "$out" in
+    *'"fair_share_promoted_from"'*)
+      if declare -F event >/dev/null 2>&1; then
+        event fair_share_granted \
+          "demand_since=$TARTCI_FAIR_DEMAND_SINCE waited=$(( $(date +%s) - TARTCI_FAIR_DEMAND_SINCE ))s priority=$priority" \
+          "kind=$kind" "priority=$priority" "lease_cores=$cores"
+      fi ;;
+  esac
+  # A granted VM is a placed job: this lane's fair-share clock starts again.
+  TARTCI_FAIR_DEMAND_SINCE=0
   tartci_observe_disk_admission "$out" "$receipt_provider" "$receipt_lane" "$receipt_runner"
   TARTCI_ACTIVE_VM_LEASE_ID="$lease_id"
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
   tartci_start_vm_lease_heartbeat "$lease_id"
   if [ -n "$disk_path" ]; then
     disk_summary="$(printf '%s' "$out" | python3 -c 'import json,sys; d=json.load(sys.stdin)["disk"]; gib=1024**3; print("disk_free_gib=%.1f disk_reserved_gib=%.1f disk_requested_gib=%.1f disk_required_gib=%.1f disk_device=%s" % (d["free_bytes"]/gib,d["reserved_bytes"]/gib,d["requested_bytes"]/gib,d["required_bytes"]/gib,d["device_id"]))')"
   fi
   tartci_vm_lease_note "lease acquired id=$lease_id cores=$cores mem_mb=${mem_mb:-auto} priority=$priority ${disk_summary}"
+  [ -z "$disk_path" ] || tartci_vm_lease_disk_headroom_event "$out"
+  tartci_vm_lease_home_unread_event "$out"
+  if declare -F event >/dev/null 2>&1; then
+    event lease_acquired "kind=$kind priority=$priority lease_cores=$cores" \
+      "kind=$kind" "priority=$priority" "lease_cores=$cores" "lease_mem_mb=${mem_mb:-auto}"
+  fi
+  return 0
+}
+
+# Upgrade the active lease in place (leases.py resize): a parked warm VM's
+# memory-only lease becomes a full core lease at hand-off. Atomic under the
+# lease-store lock, so there is no released window another lease can take, and
+# the guardian and disk reservation are unchanged. Returns 75 on a capacity
+# denial with the lease left exactly as it was.
+tartci_resize_vm_lease(){
+  local cores="$1" mem_mb="$2" priority="$3" labels="${4:-}" lease_id="${TARTCI_ACTIVE_VM_LEASE_ID:-}" out rc=0
+  TARTCI_LAST_VM_LEASE_DENIAL=""
+  tartci_positive_int_or_empty "$cores" || return 1
+  if [ -z "$lease_id" ]; then
+    # Break-glass (leases disabled) has no record to resize; the size is
+    # simply what the provider applies. Anything else without a lease is wrong.
+    [ "${_tartci_vm_lease_bypass_state[0]:-}" = authorized ] || return 1
+    TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+    TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
+    return 0
+  fi
+  local waiter_args=()
+  [ -z "$TARTCI_VM_WAITER_ID" ] || waiter_args=(--waiter-id "$TARTCI_VM_WAITER_ID")
+  out="$(python3 "$TARTCI_ROOT/scripts/leases.py" resize --id "$lease_id" \
+    --cores "$cores" --mem-mb "$mem_mb" --priority "$priority" --label "$labels" \
+    ${waiter_args[@]+"${waiter_args[@]}"} --json 2>&1)" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    # shellcheck disable=SC2034 # read by the provider
+    TARTCI_LAST_VM_LEASE_DENIAL="$out"
+    tartci_vm_lease_note "lease resize denied for $lease_id cores=$cores mem_mb=$mem_mb priority=$priority rc=$rc: $out"
+    case "$out" in
+      *'"reason": "deferred_to_waiter"'*)
+        tartci_vm_lease_deferred_event "$out" resize "$cores" "$priority" ;;
+    esac
+    return "$rc"
+  fi
+  TARTCI_VM_WAITER_ID=""
+  TARTCI_VM_WAITER_SINCE=0
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_CORES="$cores"
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB="$mem_mb"
+  tartci_vm_lease_note "lease resized id=$lease_id cores=$cores mem_mb=$mem_mb priority=$priority"
   return 0
 }
 
@@ -555,11 +1119,28 @@ tartci_release_vm_lease(){
   _tartci_vm_lease_bypass_state=()
   # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
   TARTCI_ACTIVE_VM_LEASE_CORES=""
+  # shellcheck disable=SC2034 # consumed by provider scripts after sourcing
+  TARTCI_ACTIVE_VM_LEASE_MEM_MB=""
   return 0
 }
 
-tartci_set_tart_vm_cpu(){
-  local vm_name="$1" cores="$2"
+# Apply the lease's granted size to the clone. Both axes, in one call: a clone
+# inherits its golden's CPU *and* memory, so setting only --cpu leaves the guest
+# booting at the golden's baked memory however much the lease charged for. That
+# silently breaks the plumbing invariant — the guest's own build governor sizes
+# itself from the memory it can see, so it would derive its job count from the
+# golden's number while the host reserved a different one.
+tartci_set_tart_vm_size(){
+  local vm_name="$1" cores="$2" mem_mb="${3:-}"
   tartci_positive_int_or_empty "$cores" || cores=1
-  tart set "$vm_name" --cpu "$cores"
+  if tartci_positive_int_or_empty "$mem_mb"; then
+    tart set "$vm_name" --cpu "$cores" --memory "$mem_mb"
+  else
+    tart set "$vm_name" --cpu "$cores"
+  fi
+}
+
+# Retained name for callers that only size the CPU axis.
+tartci_set_tart_vm_cpu(){
+  tartci_set_tart_vm_size "$1" "$2" ""
 }

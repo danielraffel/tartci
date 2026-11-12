@@ -28,7 +28,7 @@ LABELS=(
 )
 
 echo "no-Orchard cleanup plan:"
-for label in "${LABELS[@]}"; do
+for label in ${LABELS[@]+"${LABELS[@]}"}; do
   echo "  label=$DOMAIN/$label"
   echo "  plist=$HOME/Library/LaunchAgents/$label.plist"
 done
@@ -37,13 +37,13 @@ if [ "$APPLY" != "1" ]; then
   exit 0
 fi
 
-for label in "${LABELS[@]}"; do
+for label in ${LABELS[@]+"${LABELS[@]}"}; do
   launchctl bootout "$DOMAIN/$label" >/dev/null 2>&1 || true
   rm -f "$HOME/Library/LaunchAgents/$label.plist"
 done
 
 failed=0
-for label in "${LABELS[@]}"; do
+for label in ${LABELS[@]+"${LABELS[@]}"}; do
   if launchctl print "$DOMAIN/$label" >/dev/null 2>&1; then
     echo "retired Orchard LaunchAgent is still loaded: $DOMAIN/$label" >&2
     failed=1

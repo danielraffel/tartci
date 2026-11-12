@@ -1,0 +1,9 @@
+# /etc/sudoers.d/tartci-heal-tcc  -  owner root:wheel, mode 0440
+# Installed by fleet/ops/install-tartci-heal-tcc.sh, which validates it with
+# `visudo -cf` before and after placing it.
+#
+# One fixed command, no arguments: the trailing "" is sudoers' empty argument
+# spec, so `sudo -n /usr/local/sbin/tartci-heal-tcc anything` is refused by sudo
+# before the wrapper runs. No wildcards (in sudoers `*` matches `/` and spaces).
+# The user is the account whose LaunchAgents run the tartci watchdog.
+TARTCI_USER ALL=(root) NOPASSWD: /usr/local/sbin/tartci-heal-tcc ""

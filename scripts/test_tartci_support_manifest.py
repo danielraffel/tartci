@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tartci_support_manifest as support_manifest
 
@@ -183,6 +185,84 @@ class TartciSupportManifestTests(unittest.TestCase):
                     installed / support_manifest.MANIFEST_NAME,
                     immutable=True,
                 )
+            thaw_directories(generations)
+
+    def staged_source(self, root: Path) -> tuple[Path, Path]:
+        source = root / "source"
+        source.mkdir()
+        self.fixture(source)
+        self.git_commit(source)
+        manifest = source / support_manifest.MANIFEST_NAME
+        support_manifest.write(source, manifest)
+        return source, manifest
+
+    def test_the_generation_is_renamed_while_writable_then_sealed(self) -> None:
+        # macOS 15 refuses to rename a directory whose own mode is 0555
+        # (EACCES); macOS 27 allows it. Recording the mode at the rename makes
+        # the order checkable on any host.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, manifest = self.staged_source(root)
+            generations = root / "generations"
+            modes = []
+            real_rename = os.rename
+
+            def rename(src, dst):
+                modes.append(stat.S_IMODE(os.lstat(src).st_mode))
+                return real_rename(src, dst)
+
+            with mock.patch.object(support_manifest.os, "rename", side_effect=rename):
+                result = support_manifest.stage_install(source, manifest, generations)
+            self.assertEqual(len(modes), 1)
+            self.assertTrue(modes[0] & stat.S_IWUSR, oct(modes[0]))
+            installed = Path(str(result["root"]))
+            self.assertEqual(stat.S_IMODE(installed.stat().st_mode), 0o555)
+            if os.geteuid() != 0:
+                with self.assertRaises(PermissionError):
+                    (installed / "added-after-seal").write_text("x")
+            thaw_directories(generations)
+
+    def test_install_succeeds_where_a_sealed_directory_cannot_be_renamed(self) -> None:
+        # macOS 15's rule, on any host: renaming a directory without its own
+        # write bit fails with EACCES.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, manifest = self.staged_source(root)
+            generations = root / "generations"
+            real_rename = os.rename
+
+            def rename(src, dst):
+                if os.path.isdir(src) and not os.lstat(src).st_mode & stat.S_IWUSR:
+                    raise PermissionError(13, "Permission denied", str(src))
+                return real_rename(src, dst)
+
+            with mock.patch.object(support_manifest.os, "rename", side_effect=rename):
+                result = support_manifest.stage_install(source, manifest, generations)
+            self.assertTrue(result["created"])
+            installed = Path(str(result["root"]))
+            support_manifest.verify(installed, installed / support_manifest.MANIFEST_NAME,
+                                    immutable=True)
+            thaw_directories(generations)
+
+    def test_a_generation_that_fails_its_seal_is_not_left_under_its_name(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            source, manifest = self.staged_source(root)
+            generations = root / "generations"
+            real_verify = support_manifest.verify
+
+            def verify(path, manifest_path, *, immutable=False):
+                if immutable:
+                    raise ValueError("seal check failed")
+                return real_verify(path, manifest_path, immutable=immutable)
+
+            with mock.patch.object(support_manifest, "verify", side_effect=verify), \
+                    self.assertRaisesRegex(ValueError, "seal check failed"):
+                support_manifest.stage_install(source, manifest, generations)
+            self.assertEqual(sorted(p.name for p in generations.iterdir()), [])
+            # Control: without the failure the same call installs one generation.
+            support_manifest.stage_install(source, manifest, generations)
+            self.assertEqual(len(list(generations.iterdir())), 1)
             thaw_directories(generations)
 
     def test_stage_install_rejects_source_without_repository_identity(self) -> None:

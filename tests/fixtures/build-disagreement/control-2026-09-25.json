@@ -1,0 +1,2268 @@
+[
+ {
+  "completed_at": "2026-09-25T01:05:10Z",
+  "event": "pull_request",
+  "head_branch": "fix/sdf-chart-contract-backend-independent",
+  "head_sha": "7278e7d8b4cb5b62bd57af7a8d52aebb0610ee4c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36078647056/job/107895582988",
+  "identities": [
+   "run:36078647056"
+  ],
+  "job_id": 107895582988,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36078647056,
+  "runner_name": "studio-pulp-gate-01-15154-1",
+  "started_at": "2026-09-25T00:53:09Z"
+ },
+ {
+  "completed_at": "2026-09-25T02:28:56Z",
+  "event": "pull_request",
+  "head_branch": "feature/p8-gpu-convolver-provider-policy-20260923",
+  "head_sha": "adc12c496b4854b8c5599fd73eb05e6ea7f86462",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36085150200/job/107915368839",
+  "identities": [
+   "run:36085150200"
+  ],
+  "job_id": 107915368839,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36085150200,
+  "runner_name": "studio-pulp-gate-slot2-02-33017-1",
+  "started_at": "2026-09-25T02:14:57Z"
+ },
+ {
+  "completed_at": "2026-09-25T02:39:58Z",
+  "event": "pull_request",
+  "head_branch": "p4-raw-honest-20260924",
+  "head_sha": "9f67d4dece45161f162289e167e5ac02e703bd91",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36085298807/job/107915840129",
+  "identities": [
+   "run:36085298807"
+  ],
+  "job_id": 107915840129,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36085298807,
+  "runner_name": "m5-pulp-gate-01-78663-12",
+  "started_at": "2026-09-25T02:14:45Z"
+ },
+ {
+  "completed_at": "2026-09-25T02:57:04Z",
+  "event": "pull_request",
+  "head_branch": "p4-raw-honest-20260924",
+  "head_sha": "b96d1b791d27c0207b0b4d8e8d51c908b1edafe8",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36087164932/job/107921705560",
+  "identities": [
+   "run:36087164932"
+  ],
+  "job_id": 107921705560,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36087164932,
+  "runner_name": "studio-pulp-gate-01-98009-1",
+  "started_at": "2026-09-25T02:43:43Z"
+ },
+ {
+  "completed_at": "2026-09-25T03:27:29Z",
+  "event": "pull_request",
+  "head_branch": "fix/sdf-chart-contract-backend-independent",
+  "head_sha": "6d6afa2fea9a2b9fb1013b6ab54862628b12650c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36089417012/job/107928464979",
+  "identities": [
+   "run:36089417012"
+  ],
+  "job_id": 107928464979,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36089417012,
+  "runner_name": "studio-pulp-gate-slot2-02-14797-1",
+  "started_at": "2026-09-25T03:16:06Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:00:59Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8807-bb7e5335281771bf7122f2e385e13835770be93d",
+  "head_sha": "2c2e767d89ca6d1cddfb7509f2c6eb17ace9e5d2",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36090859921/job/107932883910",
+  "identities": [
+   "run:36090859921",
+   "sha:2c2e767d89ca6d1cddfb7509f2c6eb17ace9e5d2",
+   "tree:ffb6c63afbf7fb0bc310e586e82ae9cda04bd027"
+  ],
+  "job_id": 107932883910,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36090859921,
+  "runner_name": "studio-pulp-gate-01-22515-1",
+  "started_at": "2026-09-25T03:37:43Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:05:42Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-view-host",
+  "head_sha": "e147f2d09972babcc9977e82a46470e17f9de538",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36091683913/job/107935360624",
+  "identities": [
+   "run:36091683913"
+  ],
+  "job_id": 107935360624,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36091683913,
+  "runner_name": "m5-pulp-gate-01-56440-8",
+  "started_at": "2026-09-25T03:52:39Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:10:11Z",
+  "event": "pull_request",
+  "head_branch": "fix/canvas-cg-suites-apple-only",
+  "head_sha": "d8f3491540ddbb05e3e663065495b2a347a1b896",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36092668988/job/107938284515",
+  "identities": [
+   "run:36092668988"
+  ],
+  "job_id": 107938284515,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36092668988,
+  "runner_name": "m1-pulp-gate-slot2-02-26273-16",
+  "started_at": "2026-09-25T04:07:14Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:12:19Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8811-2c2e767d89ca6d1cddfb7509f2c6eb17ace9e5d2",
+  "head_sha": "9b4c3892f326382317340e020e7947c0890d5539",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36093055057/job/107939447281",
+  "identities": [
+   "run:36093055057",
+   "sha:9b4c3892f326382317340e020e7947c0890d5539",
+   "tree:9707de98b7b27c90d44eb6c0b33cd871a3746f9e"
+  ],
+  "job_id": 107939447281,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36093055057,
+  "runner_name": "studio-pulp-gate-01-26351-3",
+  "started_at": "2026-09-25T04:09:25Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:33:21Z",
+  "event": "pull_request",
+  "head_branch": "fix/trace-category-counts",
+  "head_sha": "989d45d1ffc8495130092cffcac111ab718a16ea",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36091868422/job/107935899102",
+  "identities": [
+   "run:36091868422"
+  ],
+  "job_id": 107935899102,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36091868422,
+  "runner_name": "m1-pulp-gate-01-26254-14",
+  "started_at": "2026-09-25T04:12:23Z"
+ },
+ {
+  "completed_at": "2026-09-25T04:43:42Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "3278feead86bc19a668d261dd4e9b5ad56e504fb",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36092791212/job/107938635028",
+  "identities": [
+   "run:36092791212"
+  ],
+  "job_id": 107938635028,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36092791212,
+  "runner_name": "m5-pulp-gate-slot2-02-68359-29",
+  "started_at": "2026-09-25T04:14:23Z"
+ },
+ {
+  "completed_at": "2026-09-25T05:06:02Z",
+  "event": "pull_request",
+  "head_branch": "fix/canvas-cg-suites-apple-only",
+  "head_sha": "d8f3491540ddbb05e3e663065495b2a347a1b896",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36092668988/job/107949186078",
+  "identities": [
+   "run:36092668988"
+  ],
+  "job_id": 107949186078,
+  "outcome": "green",
+  "run_attempt": 2,
+  "run_id": 36092668988,
+  "runner_name": "m5-pulp-gate-slot2-02-46279-1",
+  "started_at": "2026-09-25T04:56:17Z"
+ },
+ {
+  "completed_at": "2026-09-25T05:54:24Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8812-0c434b4315f52db11d19f1f33c1c2e37d5bc063d",
+  "head_sha": "c664feeec806b5991dd59a753146030ae18e1945",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36097172636/job/107951864411",
+  "identities": [
+   "run:36097172636",
+   "sha:c664feeec806b5991dd59a753146030ae18e1945",
+   "tree:3bff2e40e52b8085557a48483948ad1eafb15bb8"
+  ],
+  "job_id": 107951864411,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36097172636,
+  "runner_name": "m1-pulp-gate-01-26254-17",
+  "started_at": "2026-09-25T05:20:05Z"
+ },
+ {
+  "completed_at": "2026-09-25T06:05:56Z",
+  "event": "pull_request",
+  "head_branch": "feature/build-metrics-awareness",
+  "head_sha": "9e148b05c33892c3b0e76cabcb1db3b9d9e61f32",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36098682978/job/107956417183",
+  "identities": [
+   "run:36098682978"
+  ],
+  "job_id": 107956417183,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36098682978,
+  "runner_name": "m1-pulp-gate-slot2-02-26273-18",
+  "started_at": "2026-09-25T05:41:53Z"
+ },
+ {
+  "completed_at": "2026-09-25T06:59:44Z",
+  "event": "pull_request",
+  "head_branch": "fix/release-runner-rollback-truth-20260924",
+  "head_sha": "ce6e9a98211af39c36f0567f439083eb6a21e292",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36096775672/job/107950670123",
+  "identities": [
+   "run:36096775672"
+  ],
+  "job_id": 107950670123,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36096775672,
+  "runner_name": "studio-pulp-gate-slot2-02-3280-1",
+  "started_at": "2026-09-25T06:37:13Z"
+ },
+ {
+  "completed_at": "2026-09-25T07:09:01Z",
+  "event": "pull_request",
+  "head_branch": "feature/b6-cargo-off-all",
+  "head_sha": "ba4b9215350cb74f312f38c85392e7c18db3da24",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36097045648/job/107951487763",
+  "identities": [
+   "run:36097045648"
+  ],
+  "job_id": 107951487763,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36097045648,
+  "runner_name": "studio-pulp-gate-01-3281-2",
+  "started_at": "2026-09-25T06:37:42Z"
+ },
+ {
+  "completed_at": "2026-09-25T07:34:14Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8810-c664feeec806b5991dd59a753146030ae18e1945",
+  "head_sha": "48736734396752d028fb27770dc751b8def7cfd4",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36103971191/job/107972431371",
+  "identities": [
+   "run:36103971191",
+   "sha:48736734396752d028fb27770dc751b8def7cfd4",
+   "tree:23000ecc4de976edcc9412d5913746d6ee3eccae"
+  ],
+  "job_id": 107972431371,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36103971191,
+  "runner_name": "m5-pulp-gate-slot2-02-80216-6",
+  "started_at": "2026-09-25T06:54:50Z"
+ },
+ {
+  "completed_at": "2026-09-25T07:48:31Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8800-626681729a31f89dc6bfbd87b71f603858bbb5d0",
+  "head_sha": "2de71059ea8d90f4c1dd98045aa3104a625d5d15",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36103973610/job/107972439849",
+  "identities": [
+   "run:36103973610",
+   "sha:2de71059ea8d90f4c1dd98045aa3104a625d5d15",
+   "tree:f92765878449129c1154cdeced964d994389dd92"
+  ],
+  "job_id": 107972439849,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36103973610,
+  "runner_name": "m1-pulp-gate-01-2117-6",
+  "started_at": "2026-09-25T07:03:50Z"
+ },
+ {
+  "completed_at": "2026-09-25T07:51:53Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8802-48736734396752d028fb27770dc751b8def7cfd4",
+  "head_sha": "626681729a31f89dc6bfbd87b71f603858bbb5d0",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36103973754/job/107972434009",
+  "identities": [
+   "run:36103973754",
+   "sha:626681729a31f89dc6bfbd87b71f603858bbb5d0",
+   "tree:99f5b772312d09345b4da3d4bb1094bd45b90062"
+  ],
+  "job_id": 107972434009,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36103973754,
+  "runner_name": "studio-pulp-gate-slot2-02-3978-6",
+  "started_at": "2026-09-25T07:29:05Z"
+ },
+ {
+  "completed_at": "2026-09-25T07:59:04Z",
+  "event": "pull_request",
+  "head_branch": "feature/b5-sdl3-configure-speed",
+  "head_sha": "550ec07af187370c8a11d9f42474f68d9eaf2f4c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36106955477/job/107981696674",
+  "identities": [
+   "run:36106955477"
+  ],
+  "job_id": 107981696674,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36106955477,
+  "runner_name": "studio-pulp-gate-01-37192-22",
+  "started_at": "2026-09-25T07:45:10Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:14:49Z",
+  "event": "pull_request",
+  "head_branch": "fix/status-tone-noncolour-signal",
+  "head_sha": "f00425f0ec87562b7f1338b6df714568386eea70",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36100194125/job/107960948103",
+  "identities": [
+   "run:36100194125"
+  ],
+  "job_id": 107960948103,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36100194125,
+  "runner_name": "m1-pulp-gate-slot2-02-2136-7",
+  "started_at": "2026-09-25T07:53:01Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:15:10Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8815-2de71059ea8d90f4c1dd98045aa3104a625d5d15",
+  "head_sha": "f02046705470e1a1da8021f34e95454384d671ab",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36108358337/job/107986085407",
+  "identities": [
+   "run:36108358337",
+   "sha:f02046705470e1a1da8021f34e95454384d671ab",
+   "tree:b0304ccfff2c32d873907bfa2e4026c35adc555e"
+  ],
+  "job_id": 107986085407,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36108358337,
+  "runner_name": "m5-pulp-gate-01-80159-27",
+  "started_at": "2026-09-25T07:38:17Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:41:29Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-sampler-runtime",
+  "head_sha": "fb2b204136ea7a76970ef7a69a6cbaaeb1ee02cc",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36105212761/job/107976238136",
+  "identities": [
+   "run:36105212761"
+  ],
+  "job_id": 107976238136,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36105212761,
+  "runner_name": "studio-pulp-gate-slot2-02-48349-9",
+  "started_at": "2026-09-25T08:33:04Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:44:35Z",
+  "event": "pull_request",
+  "head_branch": "feature/build-speed-b8-backend-tus",
+  "head_sha": "f44ab0f0f3e9ce98f5fcae733b8594b6f8fda5f1",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36105229623/job/107976283215",
+  "identities": [
+   "run:36105229623"
+  ],
+  "job_id": 107976283215,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36105229623,
+  "runner_name": "studio-pulp-gate-01-18182-10",
+  "started_at": "2026-09-25T08:30:45Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:50:18Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8816-f02046705470e1a1da8021f34e95454384d671ab",
+  "head_sha": "d9b1779bf8c9e8c223b95b239bcc5835d360a424",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36109596966/job/107989915999",
+  "identities": [
+   "run:36109596966",
+   "sha:d9b1779bf8c9e8c223b95b239bcc5835d360a424",
+   "tree:1408dec479d50517c7db4cc3aadba58d35b49e97"
+  ],
+  "job_id": 107989915999,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36109596966,
+  "runner_name": "m1-pulp-gate-01-2117-15",
+  "started_at": "2026-09-25T08:04:19Z"
+ },
+ {
+  "completed_at": "2026-09-25T08:58:15Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-timeline",
+  "head_sha": "0e7cd798a0e4d7a9ff76cb3a3ba1ed4200207fb4",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36106033947/job/107978779187",
+  "identities": [
+   "run:36106033947"
+  ],
+  "job_id": 107978779187,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36106033947,
+  "runner_name": "studio-pulp-gate-01-57543-1",
+  "started_at": "2026-09-25T08:49:46Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:00:03Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-dsp-rt-contract",
+  "head_sha": "986797d5664e10cad299d5a7b7a9ac749767dcd0",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36107420628/job/107983216182",
+  "identities": [
+   "run:36107420628"
+  ],
+  "job_id": 107983216182,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36107420628,
+  "runner_name": "studio-pulp-gate-slot2-02-93032-1",
+  "started_at": "2026-09-25T08:45:24Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:00:53Z",
+  "event": "pull_request",
+  "head_branch": "feat/grid-placement-policy",
+  "head_sha": "f82506945519141488fb8b084555a35e7a84ab55",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36111474854/job/107995808793",
+  "identities": [
+   "run:36111474854"
+  ],
+  "job_id": 107995808793,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36111474854,
+  "runner_name": "m5-pulp-gate-01-61888-8",
+  "started_at": "2026-09-25T08:35:24Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:01:29Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8822-79d2e10c3dbced9d58d3381f5843b38709c3d66c",
+  "head_sha": "c4d133049ba09e915bf2c16dc71a17d556051eb2",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36111932796/job/107997276806",
+  "identities": [
+   "run:36111932796",
+   "sha:c4d133049ba09e915bf2c16dc71a17d556051eb2",
+   "tree:983abfb8ec93d7d21419e61b3ffe1a0ab47381dd"
+  ],
+  "job_id": 107997276806,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36111932796,
+  "runner_name": "m5-pulp-gate-slot2-02-61907-2",
+  "started_at": "2026-09-25T08:23:36Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:03:01Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8826-d9b1779bf8c9e8c223b95b239bcc5835d360a424",
+  "head_sha": "79d2e10c3dbced9d58d3381f5843b38709c3d66c",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36110500352/job/107992968448",
+  "identities": [
+   "run:36110500352",
+   "sha:79d2e10c3dbced9d58d3381f5843b38709c3d66c",
+   "tree:00e48d6fa1473950c35e8c8c278d7bf53b202b49"
+  ],
+  "job_id": 107992968448,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36110500352,
+  "runner_name": "m1-pulp-gate-slot2-02-2136-8",
+  "started_at": "2026-09-25T08:17:58Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:20:43Z",
+  "event": "pull_request",
+  "head_branch": "feature/b4-fold-duplicate-sources",
+  "head_sha": "df9707750837900d76c311319e64c31db69c9a0e",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36107410721/job/107983137649",
+  "identities": [
+   "run:36107410721"
+  ],
+  "job_id": 107983137649,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36107410721,
+  "runner_name": "m1-pulp-gate-01-63801-1",
+  "started_at": "2026-09-25T08:55:57Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:30:23Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-view-host",
+  "head_sha": "5a1cf5627c2d2d4c72a2de4f98cffb9bdbcb7a2b",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36107089928/job/107982132829",
+  "identities": [
+   "run:36107089928"
+  ],
+  "job_id": 107982132829,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36107089928,
+  "runner_name": "studio-pulp-gate-slot2-02-64254-2",
+  "started_at": "2026-09-25T09:21:59Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:36:39Z",
+  "event": "pull_request",
+  "head_branch": "fix-box-shadow-group-tag",
+  "head_sha": "e8dcf90bc90dd9dedf6b3cd8fe66628bded60c3d",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36113591865/job/108002490931",
+  "identities": [
+   "run:36113591865"
+  ],
+  "job_id": 108002490931,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36113591865,
+  "runner_name": "m1-pulp-gate-01-63801-2",
+  "started_at": "2026-09-25T09:25:15Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:37:36Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8820-8250c8b02d6a5630b275aad51d570e31a51f676d",
+  "head_sha": "99ddba8a88ee77d8ca0a2d9d193b9af767b16a8c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36116170534/job/108010822299",
+  "identities": [
+   "run:36116170534",
+   "sha:99ddba8a88ee77d8ca0a2d9d193b9af767b16a8c",
+   "tree:c58f32f28076a02c9d47cfb2dd4341418bc68cc3"
+  ],
+  "job_id": 108010822299,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36116170534,
+  "runner_name": "studio-pulp-gate-01-67436-3",
+  "started_at": "2026-09-25T09:10:28Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:39:10Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8823-c4d133049ba09e915bf2c16dc71a17d556051eb2",
+  "head_sha": "8250c8b02d6a5630b275aad51d570e31a51f676d",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36115151279/job/108007519669",
+  "identities": [
+   "run:36115151279",
+   "sha:8250c8b02d6a5630b275aad51d570e31a51f676d",
+   "tree:168414378bcd21bf2f6fa6c9dd7f5bc951486c2f"
+  ],
+  "job_id": 108007519669,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36115151279,
+  "runner_name": "m1-pulp-gate-slot2-02-2136-9",
+  "started_at": "2026-09-25T09:06:12Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:39:33Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8829-99ddba8a88ee77d8ca0a2d9d193b9af767b16a8c",
+  "head_sha": "3cea0ea3ab659a63b24eb44e39681aecaed47c47",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36116277386/job/108011168806",
+  "identities": [
+   "run:36116277386",
+   "sha:3cea0ea3ab659a63b24eb44e39681aecaed47c47",
+   "tree:f1575122f544e3e1a9b4045e3e9d61f4f369a66c"
+  ],
+  "job_id": 108011168806,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36116277386,
+  "runner_name": "m5-pulp-gate-slot2-02-88894-1",
+  "started_at": "2026-09-25T09:06:12Z"
+ },
+ {
+  "completed_at": "2026-09-25T09:55:02Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-core-runtime",
+  "head_sha": "0419f2d236c41590e429f00fc637620b0bf7a37a",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36106364129/job/107979812462",
+  "identities": [
+   "run:36106364129"
+  ],
+  "job_id": 107979812462,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36106364129,
+  "runner_name": "m1-pulp-gate-01-63801-3",
+  "started_at": "2026-09-25T09:42:20Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:09:56Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8832-1d1e705edc4b7d3131eb1b82f92a5a01b27bb976",
+  "head_sha": "7b82bb3c79fba5cde7b188dc5e32f20b37a099cd",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36120436260/job/108024525285",
+  "identities": [
+   "run:36120436260",
+   "sha:7b82bb3c79fba5cde7b188dc5e32f20b37a099cd",
+   "tree:3890e48420c8cdac572236269f315769bbc085c4"
+  ],
+  "job_id": 108024525285,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36120436260,
+  "runner_name": "studio-pulp-gate-slot2-02-52640-6",
+  "started_at": "2026-09-25T09:52:43Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:10:27Z",
+  "event": "pull_request",
+  "head_branch": "feature/build-metrics-awareness",
+  "head_sha": "1f63467154d7bb565c1425ce5f48b83d80ef89c8",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36106647677/job/107980732462",
+  "identities": [
+   "run:36106647677"
+  ],
+  "job_id": 107980732462,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36106647677,
+  "runner_name": "m1-pulp-gate-slot2-02-2136-11",
+  "started_at": "2026-09-25T09:48:21Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:16:04Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-app-audio-host",
+  "head_sha": "cb07f59cbd83af2b51ea4040b46e282f8bdb23b6",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36108307108/job/107985926173",
+  "identities": [
+   "run:36108307108"
+  ],
+  "job_id": 107985926173,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36108307108,
+  "runner_name": "m1-pulp-gate-01-63801-4",
+  "started_at": "2026-09-25T10:01:43Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:16:43Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-timeline",
+  "head_sha": "c97369d420c2c8206f4140d3281e9beb48273121",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36120306585/job/108024114691",
+  "identities": [
+   "run:36120306585"
+  ],
+  "job_id": 108024114691,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36120306585,
+  "runner_name": "studio-pulp-gate-01-64318-8",
+  "started_at": "2026-09-25T10:08:31Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:22:08Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8835-3cea0ea3ab659a63b24eb44e39681aecaed47c47",
+  "head_sha": "5662b6e6038461ab0998b3de1db226f210546562",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36119541628/job/108021648857",
+  "identities": [
+   "run:36119541628",
+   "sha:5662b6e6038461ab0998b3de1db226f210546562",
+   "tree:ec9114e1a33a3f67a7ece33518a0be8f04ab0003"
+  ],
+  "job_id": 108021648857,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36119541628,
+  "runner_name": "m5-pulp-gate-01-88876-30",
+  "started_at": "2026-09-25T09:52:44Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:35:04Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-core-runtime",
+  "head_sha": "64417ed644ee976623f199d33e993219df49a6b3",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36121064270/job/108026662656",
+  "identities": [
+   "run:36121064270"
+  ],
+  "job_id": 108026662656,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36121064270,
+  "runner_name": "m5-pulp-gate-slot2-02-91280-30",
+  "started_at": "2026-09-25T10:24:17Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:38:00Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8819-7b82bb3c79fba5cde7b188dc5e32f20b37a099cd",
+  "head_sha": "6684ea2def310cf5d28facc9b9ad854aac2002e6",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36122582671/job/108031431970",
+  "identities": [
+   "run:36122582671",
+   "sha:6684ea2def310cf5d28facc9b9ad854aac2002e6",
+   "tree:879af982e853f3fe08fc48d871e2c245bd480c08"
+  ],
+  "job_id": 108031431970,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36122582671,
+  "runner_name": "studio-pulp-gate-slot2-02-61408-1",
+  "started_at": "2026-09-25T10:14:54Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:39:38Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8824-6684ea2def310cf5d28facc9b9ad854aac2002e6",
+  "head_sha": "07aa3bc01dd6dccfa5df524bf220bc94000de725",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36123143559/job/108033238407",
+  "identities": [
+   "run:36123143559",
+   "sha:07aa3bc01dd6dccfa5df524bf220bc94000de725",
+   "tree:71a5c7712a179140e5840f004182ea1cb5fe3042"
+  ],
+  "job_id": 108033238407,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36123143559,
+  "runner_name": "studio-pulp-gate-01-72255-1",
+  "started_at": "2026-09-25T10:21:05Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:49:50Z",
+  "event": "pull_request",
+  "head_branch": "fix/8836-scoped-empty-suite",
+  "head_sha": "ea4e98daea30d13c8deac5b636b35fea04b84d40",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36121407757/job/108027654547",
+  "identities": [
+   "run:36121407757"
+  ],
+  "job_id": 108027654547,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36121407757,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-1",
+  "started_at": "2026-09-25T10:22:02Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:51:55Z",
+  "event": "pull_request",
+  "head_branch": "feature/relay-contract-guard-20260924",
+  "head_sha": "fe4ac42584c307be151aa0f337979d0cd9e273a5",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36097560927/job/107953019545",
+  "identities": [
+   "run:36097560927"
+  ],
+  "job_id": 107953019545,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36097560927,
+  "runner_name": "m1-pulp-gate-01-86161-2",
+  "started_at": "2026-09-25T10:23:51Z"
+ },
+ {
+  "completed_at": "2026-09-25T10:58:04Z",
+  "event": "pull_request",
+  "head_branch": "gpu-8808-test-contract",
+  "head_sha": "9f7e4abfb5f5bf1c6e4ef21850c93be4b6eec4e0",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36106740469/job/107980996007",
+  "identities": [
+   "run:36106740469"
+  ],
+  "job_id": 107980996007,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36106740469,
+  "runner_name": "studio-pulp-gate-01-9047-5",
+  "started_at": "2026-09-25T10:52:40Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:05:37Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8818-07aa3bc01dd6dccfa5df524bf220bc94000de725",
+  "head_sha": "dd9d704671e237f6e8a816dcb982058784949248",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36124840046/job/108038586722",
+  "identities": [
+   "run:36124840046",
+   "sha:dd9d704671e237f6e8a816dcb982058784949248",
+   "tree:7b1bec3b4922a7e22dca8668aae4f142255a3983"
+  ],
+  "job_id": 108038586722,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36124840046,
+  "runner_name": "m5-pulp-gate-01-80847-18",
+  "started_at": "2026-09-25T10:42:26Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:10:25Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-format-reload",
+  "head_sha": "72fb341c27fe56d3ff2a4e1c1317d020b55d415a",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36120133897/job/108023570885",
+  "identities": [
+   "run:36120133897"
+  ],
+  "job_id": 108023570885,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36120133897,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-2",
+  "started_at": "2026-09-25T10:55:25Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:25:06Z",
+  "event": "pull_request",
+  "head_branch": "feature/b4-fold-duplicate-sources",
+  "head_sha": "3d2f1047b285b435aaae744f6a51792186bf7f90",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36118624092/job/108018694035",
+  "identities": [
+   "run:36118624092"
+  ],
+  "job_id": 108018694035,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36118624092,
+  "runner_name": "m1-pulp-gate-01-86161-8",
+  "started_at": "2026-09-25T10:58:27Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:31:08Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8817-dd9d704671e237f6e8a816dcb982058784949248",
+  "head_sha": "f980be6849874169a5ee052a83933f62faf24ba1",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36126317795/job/108043309149",
+  "identities": [
+   "run:36126317795",
+   "sha:f980be6849874169a5ee052a83933f62faf24ba1",
+   "tree:dbfc11fbfd24272b4276f44b7806b98762a204d7"
+  ],
+  "job_id": 108043309149,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36126317795,
+  "runner_name": "studio-pulp-gate-01-83673-3",
+  "started_at": "2026-09-25T11:06:10Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:32:08Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8841-f980be6849874169a5ee052a83933f62faf24ba1",
+  "head_sha": "9cf3e924ddc3ca9dd5c566bb733b80e52270407b",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36126510666/job/108043898298",
+  "identities": [
+   "run:36126510666",
+   "sha:9cf3e924ddc3ca9dd5c566bb733b80e52270407b",
+   "tree:770359a2100a91972e6dbe5ea0ddbb08d690c514"
+  ],
+  "job_id": 108043898298,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36126510666,
+  "runner_name": "studio-pulp-gate-slot2-02-74101-4",
+  "started_at": "2026-09-25T11:06:32Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:35:13Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8825-9cf3e924ddc3ca9dd5c566bb733b80e52270407b",
+  "head_sha": "a7795d7e90924002e902ef70ac6fa81ebfc37720",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36127567481/job/108047232120",
+  "identities": [
+   "run:36127567481",
+   "sha:a7795d7e90924002e902ef70ac6fa81ebfc37720",
+   "tree:4bb15865191e5fc6fec8c2c5905d05632852e77d"
+  ],
+  "job_id": 108047232120,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36127567481,
+  "runner_name": "m5-pulp-gate-slot2-02-72066-29",
+  "started_at": "2026-09-25T11:09:35Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:41:31Z",
+  "event": "pull_request",
+  "head_branch": "feature/build-speed-b3-objc-unity",
+  "head_sha": "f6418762f66072d3005dbcdceeb12a16a61b22e2",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36107537845/job/107983541381",
+  "identities": [
+   "run:36107537845"
+  ],
+  "job_id": 107983541381,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36107537845,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-3",
+  "started_at": "2026-09-25T11:14:26Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:56:54Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-design-import",
+  "head_sha": "b18f6c92a0a7c072f6f4bb00e0c88e43e72eb0be",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36127834594/job/108048091136",
+  "identities": [
+   "run:36127834594"
+  ],
+  "job_id": 108048091136,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36127834594,
+  "runner_name": "m5-pulp-gate-01-28553-19",
+  "started_at": "2026-09-25T11:33:07Z"
+ },
+ {
+  "completed_at": "2026-09-25T11:57:15Z",
+  "event": "pull_request",
+  "head_branch": "feature/warm-seed-build-dir",
+  "head_sha": "85dc3ece1ff3642f75d800a4ef0be01da409e79f",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36109323113/job/107989060368",
+  "identities": [
+   "run:36109323113"
+  ],
+  "job_id": 107989060368,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36109323113,
+  "runner_name": "m1-pulp-gate-01-86161-9",
+  "started_at": "2026-09-25T11:29:50Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:01:22Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8828-4e60f4a92c424db5dd8da26918a059e3e6ade151",
+  "head_sha": "4f7ff0d3c25fa3f577a26a66b51fa11a03422fc4",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36129927183/job/108054736830",
+  "identities": [
+   "run:36129927183",
+   "sha:4f7ff0d3c25fa3f577a26a66b51fa11a03422fc4",
+   "tree:6992f7a13e0b999536a94b15a13357c7aa7f9b4e"
+  ],
+  "job_id": 108054736830,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36129927183,
+  "runner_name": "studio-pulp-gate-slot2-02-12601-1",
+  "started_at": "2026-09-25T11:35:55Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:08:05Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8834-a7795d7e90924002e902ef70ac6fa81ebfc37720",
+  "head_sha": "4e60f4a92c424db5dd8da26918a059e3e6ade151",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36129874544/job/108054567185",
+  "identities": [
+   "run:36129874544",
+   "sha:4e60f4a92c424db5dd8da26918a059e3e6ade151",
+   "tree:4dec014ba1e992fd442711d356e928b2cdea4294"
+  ],
+  "job_id": 108054567185,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36129874544,
+  "runner_name": "m5-pulp-gate-slot2-02-26011-1",
+  "started_at": "2026-09-25T11:38:57Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:12:09Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "77a5cbf25142db8e916ce446d3352ea66c926fcc",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36108437278/job/107986324535",
+  "identities": [
+   "run:36108437278"
+  ],
+  "job_id": 107986324535,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36108437278,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-4",
+  "started_at": "2026-09-25T11:45:38Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:13:10Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-app-audio-host",
+  "head_sha": "ef74272ea30c5e3c30efc12cc9b6e212120ff05b",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36124408190/job/108037235516",
+  "identities": [
+   "run:36124408190"
+  ],
+  "job_id": 108037235516,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36124408190,
+  "runner_name": "m5-pulp-gate-01-63056-1",
+  "started_at": "2026-09-25T12:00:21Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:19:18Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8821-4f7ff0d3c25fa3f577a26a66b51fa11a03422fc4",
+  "head_sha": "b4fe7c4006e74a9e78d285ececdd9635f1b9b98d",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36130819090/job/108057563343",
+  "identities": [
+   "run:36130819090",
+   "sha:b4fe7c4006e74a9e78d285ececdd9635f1b9b98d",
+   "tree:375319768a883f662cce381053101ec1ca0d8f00"
+  ],
+  "job_id": 108057563343,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36130819090,
+  "runner_name": "studio-pulp-gate-01-59680-3",
+  "started_at": "2026-09-25T11:47:45Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:24:25Z",
+  "event": "pull_request",
+  "head_branch": "fix/host-vitals-carry-build",
+  "head_sha": "24699d7252e1304d23a1244a78641390d1bbfeed",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36125744682/job/108041460670",
+  "identities": [
+   "run:36125744682"
+  ],
+  "job_id": 108041460670,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36125744682,
+  "runner_name": "m1-pulp-gate-01-86161-10",
+  "started_at": "2026-09-25T12:00:58Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:31:29Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8830-b4fe7c4006e74a9e78d285ececdd9635f1b9b98d",
+  "head_sha": "d65322e3f6b2db0b562ae41b965ce90e84e69510",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36132627934/job/108063348974",
+  "identities": [
+   "run:36132627934",
+   "sha:d65322e3f6b2db0b562ae41b965ce90e84e69510",
+   "tree:f4666d96c1b2f2b1a0ea87fea9845477acf6a585"
+  ],
+  "job_id": 108063348974,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36132627934,
+  "runner_name": "studio-pulp-gate-slot2-02-92618-2",
+  "started_at": "2026-09-25T12:06:17Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:35:38Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-view-host",
+  "head_sha": "2a0df4b7d38f6e351dac1e4c392dd4dd9026d70c",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36127948409/job/108048612757",
+  "identities": [
+   "run:36127948409"
+  ],
+  "job_id": 108048612757,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36127948409,
+  "runner_name": "m5-pulp-gate-01-17270-1",
+  "started_at": "2026-09-25T12:18:56Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:41:34Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-audio-prepared-program-current-20260925",
+  "head_sha": "fceedb0f5a6dee949ca5eec23d67d66288cf8ca8",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36128658766/job/108050780644",
+  "identities": [
+   "run:36128658766"
+  ],
+  "job_id": 108050780644,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36128658766,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-6",
+  "started_at": "2026-09-25T12:17:58Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:49:08Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8831-57df00bf1aaf9edd05f5acda10451a508c709643",
+  "head_sha": "49477e9546309d388d23428b5f660eed3a6d1be8",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36134305401/job/108068762080",
+  "identities": [
+   "run:36134305401",
+   "sha:49477e9546309d388d23428b5f660eed3a6d1be8",
+   "tree:6bdbf1f2d3a99eef87617faa3a6ada7edf24c1cc"
+  ],
+  "job_id": 108068762080,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36134305401,
+  "runner_name": "studio-pulp-gate-01-49869-2",
+  "started_at": "2026-09-25T12:24:42Z"
+ },
+ {
+  "completed_at": "2026-09-25T12:53:12Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8833-d65322e3f6b2db0b562ae41b965ce90e84e69510",
+  "head_sha": "57df00bf1aaf9edd05f5acda10451a508c709643",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36133231348/job/108065273301",
+  "identities": [
+   "run:36133231348",
+   "sha:57df00bf1aaf9edd05f5acda10451a508c709643",
+   "tree:6aec56405f0334fb4a4895285a8a888d08a3020b"
+  ],
+  "job_id": 108065273301,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36133231348,
+  "runner_name": "m5-pulp-gate-slot2-02-30032-2",
+  "started_at": "2026-09-25T12:13:21Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:01:17Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "993038b74b2807ce74d849b9741ce8ca0e9becf8",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36134752979/job/108070190923",
+  "identities": [
+   "run:36134752979"
+  ],
+  "job_id": 108070190923,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36134752979,
+  "runner_name": "studio-pulp-gate-slot2-02-83305-1",
+  "started_at": "2026-09-25T12:50:26Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:12:46Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8845-49477e9546309d388d23428b5f660eed3a6d1be8",
+  "head_sha": "321f1e38d922b6fe43a13d753e143bd8500639d1",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36135472574/job/108072540440",
+  "identities": [
+   "run:36135472574",
+   "sha:321f1e38d922b6fe43a13d753e143bd8500639d1",
+   "tree:d8bae9b6a03f526d6db4187cab89dda6fa361369"
+  ],
+  "job_id": 108072540440,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36135472574,
+  "runner_name": "m5-pulp-gate-01-10534-1",
+  "started_at": "2026-09-25T12:39:38Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:15:47Z",
+  "event": "pull_request",
+  "head_branch": "fix/gpu-missing-categories-20260925",
+  "head_sha": "f88c905ec19ba1715c72d00a90b8205bf57fd69c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36134794223/job/108070692425",
+  "identities": [
+   "run:36134794223"
+  ],
+  "job_id": 108070692425,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36134794223,
+  "runner_name": "studio-pulp-gate-01-89789-3",
+  "started_at": "2026-09-25T13:03:34Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:17:22Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-app-audio-host",
+  "head_sha": "546754b948919207ae363ef836c250efd89fe96c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36135056501/job/108071184093",
+  "identities": [
+   "run:36135056501"
+  ],
+  "job_id": 108071184093,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36135056501,
+  "runner_name": "studio-pulp-gate-slot2-02-95859-1",
+  "started_at": "2026-09-25T13:09:12Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:19:47Z",
+  "event": "pull_request",
+  "head_branch": "audit/gpu-wavenet-shared-provider-boundary-20260925",
+  "head_sha": "84faa3c9fd86b3c7a67440d754d3a83451812d57",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36133818683/job/108067166506",
+  "identities": [
+   "run:36133818683"
+  ],
+  "job_id": 108067166506,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36133818683,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-7",
+  "started_at": "2026-09-25T12:52:37Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:23:26Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8811-321f1e38d922b6fe43a13d753e143bd8500639d1",
+  "head_sha": "78e52792a3500bd628070e201026bc4f069f8bdb",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36137196482/job/108078179723",
+  "identities": [
+   "run:36137196482",
+   "sha:78e52792a3500bd628070e201026bc4f069f8bdb",
+   "tree:276ceeab8ef7e78e7216d1e57c78b40ef882faa8"
+  ],
+  "job_id": 108078179723,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36137196482,
+  "runner_name": "m5-pulp-gate-slot2-02-31773-1",
+  "started_at": "2026-09-25T12:56:49Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:34:59Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "a29961a987e59dff1441726c80d35f652f571f5c",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36138854950/job/108083623307",
+  "identities": [
+   "run:36138854950"
+  ],
+  "job_id": 108083623307,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36138854950,
+  "runner_name": "m5-pulp-gate-01-46329-1",
+  "started_at": "2026-09-25T13:16:25Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:51:32Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8847-78e52792a3500bd628070e201026bc4f069f8bdb",
+  "head_sha": "06834b87c565469ecaf2966572ba09ab13fc154d",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36139909168/job/108087087678",
+  "identities": [
+   "run:36139909168",
+   "sha:06834b87c565469ecaf2966572ba09ab13fc154d",
+   "tree:bc548f2ec02a80e926257bc355a43295a9af2953"
+  ],
+  "job_id": 108087087678,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36139909168,
+  "runner_name": "studio-pulp-gate-01-22975-5",
+  "started_at": "2026-09-25T13:28:24Z"
+ },
+ {
+  "completed_at": "2026-09-25T13:57:55Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "6097fa04d326d03df54717013d603b6f69e93a00",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36142196119/job/108095131203",
+  "identities": [
+   "run:36142196119"
+  ],
+  "job_id": 108095131203,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36142196119,
+  "runner_name": "m5-pulp-gate-01-41967-1",
+  "started_at": "2026-09-25T13:41:11Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:08:22Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-audio-prepared-program-current-20260925",
+  "head_sha": "26efc16acc7ab74cd665cabf7f0abdf9843fa96a",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36142066212/job/108094274203",
+  "identities": [
+   "run:36142066212"
+  ],
+  "job_id": 108094274203,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36142066212,
+  "runner_name": "studio-pulp-gate-01-34577-2",
+  "started_at": "2026-09-25T13:56:36Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:11:02Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "041027ddcbb9678cc0bd458692944845dae41400",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36139692197/job/108086352523",
+  "identities": [
+   "run:36139692197"
+  ],
+  "job_id": 108086352523,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36139692197,
+  "runner_name": "m1-pulp-gate-01-86161-16",
+  "started_at": "2026-09-25T13:59:35Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:14:36Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "81badd3f96a211b9292c99849db3b3e3e3902828",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36142176513/job/108094592189",
+  "identities": [
+   "run:36142176513"
+  ],
+  "job_id": 108094592189,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36142176513,
+  "runner_name": "studio-pulp-gate-slot2-02-95859-8",
+  "started_at": "2026-09-25T14:02:12Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:17:12Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-app-audio-host",
+  "head_sha": "d2a5606fd33bc1603174892956ad2472c9bf1287",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36143846065/job/108100128016",
+  "identities": [
+   "run:36143846065"
+  ],
+  "job_id": 108100128016,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36143846065,
+  "runner_name": "m5-pulp-gate-slot2-02-4144-2",
+  "started_at": "2026-09-25T13:57:33Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:33:42Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "cd9a12ad820fc525edc02a919e187fc798d2d0d2",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36146521910/job/108109150598",
+  "identities": [
+   "run:36146521910"
+  ],
+  "job_id": 108109150598,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36146521910,
+  "runner_name": "m1-pulp-gate-01-86161-17",
+  "started_at": "2026-09-25T14:30:22Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:38:29Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8850-0a657d565c6f15057d65234bd4e8d6f2a399c9e3",
+  "head_sha": "45ced298535ac01a0f0f1c844845140c1d1d01e1",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36145942426/job/108107214776",
+  "identities": [
+   "run:36145942426",
+   "sha:45ced298535ac01a0f0f1c844845140c1d1d01e1",
+   "tree:91d9449b6c587bb22a3dbee516208e3c8e9673a8"
+  ],
+  "job_id": 108107214776,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36145942426,
+  "runner_name": "studio-pulp-gate-01-6475-9",
+  "started_at": "2026-09-25T14:22:56Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:40:45Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-audio-sdk-artifact-20260925",
+  "head_sha": "e5d0819b69beea4f8f93c7d2462c78bbfdb2893f",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36145600920/job/108107163420",
+  "identities": [
+   "run:36145600920"
+  ],
+  "job_id": 108107163420,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36145600920,
+  "runner_name": "studio-pulp-gate-slot2-02-47240-3",
+  "started_at": "2026-09-25T14:29:22Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:49:00Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-audio-prepared-program-current-20260925",
+  "head_sha": "535c78dbf408cbc0129eb1ba217ecb3c931b8a5d",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36146336213/job/108108720477",
+  "identities": [
+   "run:36146336213"
+  ],
+  "job_id": 108108720477,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36146336213,
+  "runner_name": "m5-pulp-gate-01-36850-1",
+  "started_at": "2026-09-25T14:30:22Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:52:27Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-grouping-app-audio-host",
+  "head_sha": "a75556818df1ce3648b68e5c5061ea4fc2cd6fdb",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36146877592/job/108110344703",
+  "identities": [
+   "run:36146877592"
+  ],
+  "job_id": 108110344703,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36146877592,
+  "runner_name": "m1-pulp-gate-01-86161-18",
+  "started_at": "2026-09-25T14:37:49Z"
+ },
+ {
+  "completed_at": "2026-09-25T14:54:41Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "78335eef840b4a663e353e4285ec96f6d5859ecb",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36146514348/job/108109286263",
+  "identities": [
+   "run:36146514348"
+  ],
+  "job_id": 108109286263,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36146514348,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-19",
+  "started_at": "2026-09-25T14:30:57Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:00:02Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "d158ce271b5f0742b5d29533eb34bdcdc7178d26",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36148835025/job/108117081680",
+  "identities": [
+   "run:36148835025"
+  ],
+  "job_id": 108117081680,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36148835025,
+  "runner_name": "studio-pulp-gate-slot2-02-55399-1",
+  "started_at": "2026-09-25T14:48:12Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:06:44Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8854-45ced298535ac01a0f0f1c844845140c1d1d01e1",
+  "head_sha": "00abeb0bb62e2a0d978d87a541709f33445e7983",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36149190671/job/108118055444",
+  "identities": [
+   "run:36149190671",
+   "sha:00abeb0bb62e2a0d978d87a541709f33445e7983",
+   "tree:9f07f850d2ad54f1c07855ae336375e853babfb0"
+  ],
+  "job_id": 108118055444,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36149190671,
+  "runner_name": "studio-pulp-gate-01-6475-10",
+  "started_at": "2026-09-25T14:44:35Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:13:08Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "fe0e4e6ff024fdebee24b654a76fdac7c72a9148",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36151848933/job/108126989920",
+  "identities": [
+   "run:36151848933"
+  ],
+  "job_id": 108126989920,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36151848933,
+  "runner_name": "studio-pulp-gate-01-6475-11",
+  "started_at": "2026-09-25T15:10:49Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:23:24Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8827-00abeb0bb62e2a0d978d87a541709f33445e7983",
+  "head_sha": "5b0f24585729be9bc3462fee0c1e2a70564286ab",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36150465598/job/108122342657",
+  "identities": [
+   "run:36150465598",
+   "sha:5b0f24585729be9bc3462fee0c1e2a70564286ab",
+   "tree:52ec17393be8c683156498f3867b3b9210be70db"
+  ],
+  "job_id": 108122342657,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36150465598,
+  "runner_name": "studio-pulp-gate-slot2-02-97596-1",
+  "started_at": "2026-09-25T15:03:57Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:25:29Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "b10e6a66023a232c7b6acceeff35775e27f5b5f7",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36152139811/job/108127932079",
+  "identities": [
+   "run:36152139811"
+  ],
+  "job_id": 108127932079,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36152139811,
+  "runner_name": "m5-pulp-gate-slot2-02-61468-32",
+  "started_at": "2026-09-25T15:17:14Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:33:01Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "c0bb40f8f27642f8766f9014adfc1dec52bb4980",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36152789649/job/108130137626",
+  "identities": [
+   "run:36152789649"
+  ],
+  "job_id": 108130137626,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36152789649,
+  "runner_name": "studio-pulp-gate-01-6475-13",
+  "started_at": "2026-09-25T15:18:03Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:49:56Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-audio-prepared-program-current-20260925",
+  "head_sha": "28dd514d42718e6a6016c20fe4aba1ae3cfe7ab3",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36152765968/job/108130167795",
+  "identities": [
+   "run:36152765968"
+  ],
+  "job_id": 108130167795,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36152765968,
+  "runner_name": "m5-pulp-gate-01-92803-10",
+  "started_at": "2026-09-25T15:24:31Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:50:09Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "5500ce831d12a323f9eb365b1417cf9077063e60",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36152801808/job/108130630944",
+  "identities": [
+   "run:36152801808"
+  ],
+  "job_id": 108130630944,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36152801808,
+  "runner_name": "studio-pulp-gate-slot2-02-33827-1",
+  "started_at": "2026-09-25T15:27:11Z"
+ },
+ {
+  "completed_at": "2026-09-25T15:56:43Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8855-5b0f24585729be9bc3462fee0c1e2a70564286ab",
+  "head_sha": "c9cc91190e512973a17656214ab6f46dc09a4de1",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36154130382/job/108134603509",
+  "identities": [
+   "run:36154130382",
+   "sha:c9cc91190e512973a17656214ab6f46dc09a4de1",
+   "tree:c6ba16e3ceddf994da3cf961f6f4dd1684280a1f"
+  ],
+  "job_id": 108134603509,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36154130382,
+  "runner_name": "m5-pulp-gate-slot2-02-76465-1",
+  "started_at": "2026-09-25T15:29:31Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:17:09Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8848-c9cc91190e512973a17656214ab6f46dc09a4de1",
+  "head_sha": "b4d7b48b4e1f41e6635385420df96b2369a053cf",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36156885640/job/108143681305",
+  "identities": [
+   "run:36156885640",
+   "sha:b4d7b48b4e1f41e6635385420df96b2369a053cf",
+   "tree:d5bdc35767ae79dc22c6a149afbaa5db296911a2"
+  ],
+  "job_id": 108143681305,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36156885640,
+  "runner_name": "m5-pulp-gate-01-4733-4",
+  "started_at": "2026-09-25T15:58:18Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:18:42Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "6a1829a7c9d93894268c65105b6113b19ffb4b1c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36157581806/job/108145974956",
+  "identities": [
+   "run:36157581806"
+  ],
+  "job_id": 108145974956,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36157581806,
+  "runner_name": "studio-pulp-gate-01-17173-1",
+  "started_at": "2026-09-25T16:03:51Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:34:05Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "81cd516ae5b859888ccc5f70f42f20afa549c9e1",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36160922921/job/108157195095",
+  "identities": [
+   "run:36160922921"
+  ],
+  "job_id": 108157195095,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36160922921,
+  "runner_name": "studio-pulp-gate-slot2-02-66698-11",
+  "started_at": "2026-09-25T16:32:55Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:38:04Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8851-c9cc91190e512973a17656214ab6f46dc09a4de1",
+  "head_sha": "3dcd51374debb783f1bf49568e272f3f600338c9",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36160016033/job/108154159958",
+  "identities": [
+   "run:36160016033",
+   "sha:3dcd51374debb783f1bf49568e272f3f600338c9",
+   "tree:31fab7497f9300beaa4980fdb7cbe26a6d3a4cb7"
+  ],
+  "job_id": 108154159958,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36160016033,
+  "runner_name": "studio-pulp-gate-01-96310-1",
+  "started_at": "2026-09-25T16:27:04Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:46:04Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "96ef3396a07a938de15c1adf151e38047315b267",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36161554210/job/108159471202",
+  "identities": [
+   "run:36161554210"
+  ],
+  "job_id": 108159471202,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36161554210,
+  "runner_name": "m5-pulp-gate-01-10590-8",
+  "started_at": "2026-09-25T16:37:26Z"
+ },
+ {
+  "completed_at": "2026-09-25T16:59:43Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "95d98fe595bd957b3e80a3cbc2d6ed9aa3525632",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36162765704/job/108163570969",
+  "identities": [
+   "run:36162765704"
+  ],
+  "job_id": 108163570969,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36162765704,
+  "runner_name": "studio-pulp-gate-slot2-02-66698-12",
+  "started_at": "2026-09-25T16:48:45Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:16:11Z",
+  "event": "pull_request",
+  "head_branch": "feature/test-audit-skill",
+  "head_sha": "ca574e13e765a7a2ac7a4e4166cb0ac7fee0e4c9",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36163934262/job/108167130919",
+  "identities": [
+   "run:36163934262"
+  ],
+  "job_id": 108167130919,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36163934262,
+  "runner_name": "studio-pulp-gate-01-57679-1",
+  "started_at": "2026-09-25T17:02:32Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:29:02Z",
+  "event": "pull_request",
+  "head_branch": "fix/f4-exact-identity-c9a4-20260925",
+  "head_sha": "594202ea94e465178a15e6fadfcddeecd871eeb9",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36163631935/job/108166121442",
+  "identities": [
+   "run:36163631935"
+  ],
+  "job_id": 108166121442,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36163631935,
+  "runner_name": "m5-pulp-gate-01-62988-3",
+  "started_at": "2026-09-25T16:59:59Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:34:21Z",
+  "event": "pull_request",
+  "head_branch": "fix/ccache-pch-cross-worktree",
+  "head_sha": "b8ceef0e59a9a9731aa79182ac8d3c6545ef326e",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36165356997/job/108171827588",
+  "identities": [
+   "run:36165356997"
+  ],
+  "job_id": 108171827588,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36165356997,
+  "runner_name": "studio-pulp-gate-01-61338-1",
+  "started_at": "2026-09-25T17:19:16Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:35:03Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8843-c9a4d2dd2af48d58774c0538057be462e367efbd",
+  "head_sha": "ac6dea0418423af93df097851f29fbfc9e5c4cf6",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36164761192/job/108169862150",
+  "identities": [
+   "run:36164761192",
+   "sha:ac6dea0418423af93df097851f29fbfc9e5c4cf6",
+   "tree:c5c9a4a1bd63f585898e6cd8df304fcd8d50c6b0"
+  ],
+  "job_id": 108169862150,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36164761192,
+  "runner_name": "studio-pulp-gate-slot2-02-83812-1",
+  "started_at": "2026-09-25T17:07:25Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:43:43Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "be20486573f39f89036e1a3701ce2723ae1568fb",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36166093749/job/108174644614",
+  "identities": [
+   "run:36166093749"
+  ],
+  "job_id": 108174644614,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36166093749,
+  "runner_name": "m1-pulp-gate-01-86161-29",
+  "started_at": "2026-09-25T17:32:20Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:49:10Z",
+  "event": "pull_request",
+  "head_branch": "fix/sanitizer-lanes-skip-timing-labels",
+  "head_sha": "4651b65c2e0ee58e2399996d3803053f116b69c0",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36163638218/job/108166159290",
+  "identities": [
+   "run:36163638218"
+  ],
+  "job_id": 108166159290,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36163638218,
+  "runner_name": "m5-pulp-gate-slot2-02-79310-2",
+  "started_at": "2026-09-25T17:16:06Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:50:02Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "b8793e26c0229bc927c362c17b558e26b285573b",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36168877140/job/108183773567",
+  "identities": [
+   "run:36168877140"
+  ],
+  "job_id": 108183773567,
+  "outcome": "other",
+  "run_attempt": 1,
+  "run_id": 36168877140,
+  "runner_name": "m1-pulp-gate-01-86161-30",
+  "started_at": "2026-09-25T17:47:47Z"
+ },
+ {
+  "completed_at": "2026-09-25T17:54:53Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8862-f1704ba9f55ef5e176a2301d5be313cb1ce070f2",
+  "head_sha": "05e9dbcb37283433b854c9cbb7059a006d3c6931",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36168025513/job/108180616287",
+  "identities": [
+   "run:36168025513",
+   "sha:05e9dbcb37283433b854c9cbb7059a006d3c6931",
+   "tree:f7d3e2eb2155503fa8358ac6ac627fc4eb46326f"
+  ],
+  "job_id": 108180616287,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36168025513,
+  "runner_name": "studio-pulp-gate-01-19405-1",
+  "started_at": "2026-09-25T17:41:21Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:01:45Z",
+  "event": "pull_request",
+  "head_branch": "audit/gpu-wavenet-shared-provider-boundary-20260925",
+  "head_sha": "407430e38363374d1dbeff51645eb851beddf4aa",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36167112372/job/108177610378",
+  "identities": [
+   "run:36167112372"
+  ],
+  "job_id": 108177610378,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36167112372,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-29",
+  "started_at": "2026-09-25T17:35:05Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:14:04Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8860-05e9dbcb37283433b854c9cbb7059a006d3c6931",
+  "head_sha": "9fca0c3dc9d756f242f8e9a2f75cb0911173783f",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36169566202/job/108185683230",
+  "identities": [
+   "run:36169566202",
+   "sha:9fca0c3dc9d756f242f8e9a2f75cb0911173783f",
+   "tree:d1b7a9778065f44dd7e217032f8af8aac3ccfcd0"
+  ],
+  "job_id": 108185683230,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36169566202,
+  "runner_name": "studio-pulp-gate-slot2-02-19452-1",
+  "started_at": "2026-09-25T17:50:21Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:17:59Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8859-ac6dea0418423af93df097851f29fbfc9e5c4cf6",
+  "head_sha": "f1704ba9f55ef5e176a2301d5be313cb1ce070f2",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36167462302/job/108178780695",
+  "identities": [
+   "run:36167462302",
+   "sha:f1704ba9f55ef5e176a2301d5be313cb1ce070f2",
+   "tree:389a8224af3e6725dcff907b3035f4d095f8e078"
+  ],
+  "job_id": 108178780695,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36167462302,
+  "runner_name": "m5-pulp-gate-01-43837-1",
+  "started_at": "2026-09-25T17:34:54Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:20:59Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-provider-plan-20260925",
+  "head_sha": "bf539cb967e4836e87403c6477bb4dc0b1d08672",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36167294998/job/108178366297",
+  "identities": [
+   "run:36167294998"
+  ],
+  "job_id": 108178366297,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36167294998,
+  "runner_name": "m1-pulp-gate-01-86161-31",
+  "started_at": "2026-09-25T17:54:56Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:23:31Z",
+  "event": "pull_request",
+  "head_branch": "feature/browser-capture-parallel-shards",
+  "head_sha": "0358b8b6db3c74fd2190cd29f89f437de0ae3aa1",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36169623953/job/108185858263",
+  "identities": [
+   "run:36169623953"
+  ],
+  "job_id": 108185858263,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36169623953,
+  "runner_name": "m5-pulp-gate-slot2-02-66759-1",
+  "started_at": "2026-09-25T17:54:14Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:30:18Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-dawn-program-20260925",
+  "head_sha": "f1a8759b2e53b505be6dceb8cf38a91a61d7eac9",
+  "host": "m1",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36166525652/job/108175689460",
+  "identities": [
+   "run:36166525652"
+  ],
+  "job_id": 108175689460,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36166525652,
+  "runner_name": "m1-pulp-gate-slot2-02-86180-30",
+  "started_at": "2026-09-25T18:05:41Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:38:08Z",
+  "event": "pull_request",
+  "head_branch": "feat/gpu-wavenet-authenticated-one-layer-20260925",
+  "head_sha": "505d3d72c287a24a29959a87a8703e5dc857ef8e",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36169598158/job/108185829365",
+  "identities": [
+   "run:36169598158"
+  ],
+  "job_id": 108185829365,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36169598158,
+  "runner_name": "studio-pulp-gate-slot2-02-52489-1",
+  "started_at": "2026-09-25T18:22:27Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:45:29Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8860-f1704ba9f55ef5e176a2301d5be313cb1ce070f2",
+  "head_sha": "a3e2fbc36f9fe85f5445c4ae6fcd26f1b8fc1f58",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36172590362/job/108195642666",
+  "identities": [
+   "run:36172590362",
+   "sha:a3e2fbc36f9fe85f5445c4ae6fcd26f1b8fc1f58",
+   "tree:b5b1025b378a9f8c58a41ad0447f110fe5250311"
+  ],
+  "job_id": 108195642666,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36172590362,
+  "runner_name": "studio-pulp-gate-01-65513-1",
+  "started_at": "2026-09-25T18:23:03Z"
+ },
+ {
+  "completed_at": "2026-09-25T18:54:57Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "b44ed2bfb2c957ee1d8f1a000a3827d2e4e413cb",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36175588045/job/108205452931",
+  "identities": [
+   "run:36175588045"
+  ],
+  "job_id": 108205452931,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36175588045,
+  "runner_name": "studio-pulp-gate-slot2-02-55841-1",
+  "started_at": "2026-09-25T18:49:37Z"
+ },
+ {
+  "completed_at": "2026-09-25T19:33:14Z",
+  "event": "pull_request",
+  "head_branch": "chore/format-changed-gotcha-and-path-map",
+  "head_sha": "c6412064dfc76bea7c9d9091d0caeafe64b12d01",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36177451483/job/108211754944",
+  "identities": [
+   "run:36177451483"
+  ],
+  "job_id": 108211754944,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36177451483,
+  "runner_name": "m5-pulp-gate-slot2-02-15611-3",
+  "started_at": "2026-09-25T19:09:09Z"
+ },
+ {
+  "completed_at": "2026-09-25T20:26:41Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8865-5b5c16b9ed4c2124daee336b09ff6a4281eaf398",
+  "head_sha": "64a18a46e9923e607630072ea50329f13b6ef804",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36180458329/job/108221422154",
+  "identities": [
+   "run:36180458329",
+   "sha:64a18a46e9923e607630072ea50329f13b6ef804",
+   "tree:7d3053f270be1771c6ab9b70040039139ad0e768"
+  ],
+  "job_id": 108221422154,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36180458329,
+  "runner_name": "m5-pulp-gate-01-21794-7",
+  "started_at": "2026-09-25T19:38:08Z"
+ },
+ {
+  "completed_at": "2026-09-25T20:37:54Z",
+  "event": "pull_request",
+  "head_branch": "release/version-bump",
+  "head_sha": "7e550f7525ef8e0682d4c4c21588b971a165b29c",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36185934751/job/108239309816",
+  "identities": [
+   "run:36185934751"
+  ],
+  "job_id": 108239309816,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36185934751,
+  "runner_name": "studio-pulp-gate-slot2-02-26542-4",
+  "started_at": "2026-09-25T20:32:42Z"
+ },
+ {
+  "completed_at": "2026-09-25T21:26:44Z",
+  "event": "pull_request",
+  "head_branch": "fix/ccache-pch-cross-worktree",
+  "head_sha": "ecaf78e550acabd989f607e6de5ed9e18c8d817e",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36187883243/job/108245797038",
+  "identities": [
+   "run:36187883243"
+  ],
+  "job_id": 108245797038,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36187883243,
+  "runner_name": "m5-pulp-gate-01-19156-4",
+  "started_at": "2026-09-25T20:51:51Z"
+ },
+ {
+  "completed_at": "2026-09-25T22:08:06Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8862-d870274af0a1d5e0a7035bdba030d75ed1752cb0",
+  "head_sha": "d98399c2aa0e15823fbf68f29e88bc1ddadad78c",
+  "host": "m5",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36191630583/job/108258016648",
+  "identities": [
+   "run:36191630583",
+   "sha:d98399c2aa0e15823fbf68f29e88bc1ddadad78c",
+   "tree:e3f6b2cc6b45a2548162b3869dd5250e107eb633"
+  ],
+  "job_id": 108258016648,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36191630583,
+  "runner_name": "m5-pulp-gate-slot2-02-18777-7",
+  "started_at": "2026-09-25T21:30:15Z"
+ },
+ {
+  "completed_at": "2026-09-25T23:17:56Z",
+  "event": "pull_request",
+  "head_branch": "fix/release-signing-honest",
+  "head_sha": "0a58932edb9027b0af70e0798bcadb77f5c8cfe7",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36199339844/job/108282418036",
+  "identities": [
+   "run:36199339844"
+  ],
+  "job_id": 108282418036,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36199339844,
+  "runner_name": "studio-pulp-gate-slot2-02-4545-2",
+  "started_at": "2026-09-25T23:05:53Z"
+ },
+ {
+  "completed_at": "2026-09-25T23:21:21Z",
+  "event": "pull_request",
+  "head_branch": "fix/receipt-reuse-decision-notes",
+  "head_sha": "3379d73039e83f62a8eb8b0da5cbeb31a421c53e",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36199655970/job/108283405229",
+  "identities": [
+   "run:36199655970"
+  ],
+  "job_id": 108283405229,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36199655970,
+  "runner_name": "studio-pulp-gate-01-69634-16",
+  "started_at": "2026-09-25T23:07:50Z"
+ },
+ {
+  "completed_at": "2026-09-25T23:52:23Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8867-d98399c2aa0e15823fbf68f29e88bc1ddadad78c",
+  "head_sha": "f5837f361d8fd85adbd2831c566540976d0269e2",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36200538162/job/108286108321",
+  "identities": [
+   "run:36200538162",
+   "sha:f5837f361d8fd85adbd2831c566540976d0269e2",
+   "tree:3e0c2271edc7180a6939e3dd1cb6c00c07d765f7"
+  ],
+  "job_id": 108286108321,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36200538162,
+  "runner_name": "studio-pulp-gate-01-80134-2",
+  "started_at": "2026-09-25T23:25:16Z"
+ },
+ {
+  "completed_at": "2026-09-25T23:54:53Z",
+  "event": "merge_group",
+  "head_branch": "gh-readonly-queue/main/pr-8868-f5837f361d8fd85adbd2831c566540976d0269e2",
+  "head_sha": "a7043b08164b48ab798ee7f23856bb6e0fdc34c7",
+  "host": "m3",
+  "html_url": "https://github.com/Generous-Corp/pulp/actions/runs/36200939885/job/108287319565",
+  "identities": [
+   "run:36200939885",
+   "sha:a7043b08164b48ab798ee7f23856bb6e0fdc34c7",
+   "tree:6bfd24daccf7c2341fef5756286339d076c9829d"
+  ],
+  "job_id": 108287319565,
+  "outcome": "green",
+  "run_attempt": 1,
+  "run_id": 36200939885,
+  "runner_name": "studio-pulp-gate-slot2-02-12391-5",
+  "started_at": "2026-09-25T23:27:39Z"
+ }
+]

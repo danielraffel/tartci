@@ -49,6 +49,9 @@ import os
 import sys
 
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 eligible_id = os.environ["ELIGIBLE_ID"]
 if path.endswith("/actions/workflows?per_page=100"):
     print(json.dumps({"workflows": [{"id": 99, "name": "Build and Test"}]}))

@@ -24,7 +24,7 @@ class TartImageSyncTests(unittest.TestCase):
             result = subprocess.run(
                 [str(ROOT / "tartci"), "tart-image-sync", "--name", "golden:latest",
                  "--destination", "m1-lan", "--fallback", "m1",
-                 "--source-tart-home", "/Volumes/Workshop/VMs",
+                 "--source-tart-home", "/Volumes/Example/VMs",
                  "--destination-tart-home", "/Users/test/VMs",
                  "--staging", "/tmp/tartci-test-stage"],
                 text=True, capture_output=True, env=env, check=False,

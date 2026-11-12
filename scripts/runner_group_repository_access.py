@@ -63,15 +63,26 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
     owner = repo.split("/", 1)[0]
     group_path = f"orgs/{owner}/actions/runner-groups/{runner_group_id}"
     group = api(gh_cli, group_path, repo, timeout)
-    visibility = group.get("visibility")
-    if visibility == "all":
+    allows_public = group.get("allows_public_repositories")
+    if not isinstance(allows_public, bool):
+        raise AccessError("runner group response has invalid allows_public_repositories")
+    repository = api(gh_cli, f"repos/{repo}", repo, timeout)
+    visibility = repository.get("visibility")
+    if visibility not in {"public", "private", "internal"}:
+        raise AccessError(f"repository response has unsupported visibility {visibility!r}")
+    if visibility == "public" and not allows_public:
+        raise RepositoryInaccessible(
+            f"runner group {runner_group_id} disallows public repositories; {repo} is public"
+        )
+    group_visibility = group.get("visibility")
+    if group_visibility == "all":
         raise RepositoryInaccessible(
             f"runner group {runner_group_id} is visible to multiple repositories; "
             "tartci assignment observation is repository-scoped"
         )
-    if visibility != "selected":
+    if group_visibility != "selected":
         raise AccessError(
-            f"runner group {runner_group_id} has unsupported visibility {visibility!r}"
+            f"runner group {runner_group_id} has unsupported visibility {group_visibility!r}"
         )
 
     seen = 0
@@ -112,7 +123,8 @@ def verify(repo: str, runner_group_id: int, gh_cli: str, timeout: int) -> dict[s
         "repo": repo,
         "runner_group_id": runner_group_id,
         "registration_scope": "organization-single-repository",
-        "visibility": visibility,
+        "visibility": group_visibility,
+        "allows_public_repositories": allows_public,
         "reason": "runner group is exclusively visible to this repository",
     }
 

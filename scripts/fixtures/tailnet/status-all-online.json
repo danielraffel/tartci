@@ -1,0 +1,90 @@
+{
+ "AuthURL": "",
+ "BackendState": "Running",
+ "HaveNodeKey": true,
+ "MagicDNSSuffix": "example-tailnet.ts.net",
+ "Peer": {
+  "nodekey:fixture-iphone": {
+   "Active": false,
+   "DNSName": "iphone-15-pro-1.example-tailnet.ts.net.",
+   "HostName": "localhost",
+   "LastSeen": "2026-10-10T15:20:30.1Z",
+   "OS": "iOS",
+   "Online": false,
+   "TailscaleIPs": [
+    "203.0.113.15",
+    "2001:db8::1"
+   ]
+  },
+  "nodekey:fixture-m1": {
+   "Active": true,
+   "DNSName": "laptop-host-1.example-tailnet.ts.net.",
+   "HostName": "Daniel\u2019s MacBook Pro",
+   "KeyExpiry": "2026-12-14T02:52:02Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "OS": "macOS",
+   "Online": true,
+   "TailscaleIPs": [
+    "203.0.113.10",
+    "2001:db8::2"
+   ]
+  },
+  "nodekey:fixture-m5": {
+   "Active": true,
+   "DNSName": "laptop-pro.example-tailnet.ts.net.",
+   "HostName": "Laptop Pro",
+   "KeyExpiry": "2026-11-28T21:50:46Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "OS": "macOS",
+   "Online": true,
+   "TailscaleIPs": [
+    "203.0.113.12",
+    "2001:db8::3"
+   ]
+  },
+  "nodekey:fixture-m5studio": {
+   "Active": true,
+   "DNSName": "m5studio.example-tailnet.ts.net.",
+   "HostName": "Daniel\u2019s Mac Studio (m5) (4770)",
+   "KeyExpiry": "2027-03-27T22:47:36Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "OS": "macOS",
+   "Online": true,
+   "TailscaleIPs": [
+    "203.0.113.13",
+    "2001:db8::4"
+   ]
+  },
+  "nodekey:fixture-macmini": {
+   "Active": true,
+   "DNSName": "mini-host-4.example-tailnet.ts.net.",
+   "HostName": "Daniel\u2019s Mac mini (4)",
+   "KeyExpiry": "2027-01-26T23:15:40Z",
+   "LastSeen": "0001-01-01T00:00:00Z",
+   "OS": "macOS",
+   "Online": true,
+   "TailscaleIPs": [
+    "203.0.113.14",
+    "2001:db8::5"
+   ]
+  }
+ },
+ "Self": {
+  "Active": false,
+  "DNSName": "m3studio.example-tailnet.ts.net.",
+  "HostName": "Daniel\u2019s Mac Studio (m3)",
+  "KeyExpiry": "2026-11-24T21:57:58Z",
+  "LastSeen": "0001-01-01T00:00:00Z",
+  "OS": "macOS",
+  "Online": true,
+  "TailscaleIPs": [
+   "203.0.113.11",
+   "2001:db8::6"
+  ]
+ },
+ "TailscaleIPs": [
+  "203.0.113.11",
+  "2001:db8::6"
+ ],
+ "Version": "1.102.4-t3caf7d9e7-g084ee3b64"
+}

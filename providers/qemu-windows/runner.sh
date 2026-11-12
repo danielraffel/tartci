@@ -31,6 +31,8 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
+# shellcheck source=providers/common/toml-python.lib.sh
+source "$TARTCI_ROOT/providers/common/toml-python.lib.sh"
 GOLDEN="${TARTCI_WIN_GOLDEN:-${TARTCI_GOLDENS:-$HOME/.tartci/goldens}/pulp-windows-build-24h2-arm64-2026-06-12-cacheopt.qcow2}"
 KEY="${TARTCI_WIN_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 WUSER="${TARTCI_WIN_SSH_USER:-admin}"
@@ -72,6 +74,7 @@ CURRENT_WIN_PORT_LOCK=""
 CURRENT_WIN_PORT_LOCK_DEVICE=""
 CURRENT_WIN_PORT_LOCK_INODE=""
 CURRENT_WIN_QPID=""
+CURRENT_WIN_QPID_STARTED_AT=""
 CURRENT_WIN_STATE_DIR=""
 CURRENT_WIN_LEASE_ID_EXPECTED=""
 CURRENT_WIN_CPUS=""
@@ -82,6 +85,56 @@ die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
 now_epoch(){ date +%s; }
 elapsed(){ awk -v start="$1" -v end="$2" 'BEGIN { printf "%.1f", end - start }'; }
 prefix_guest_log(){ [ -f "$1" ] && LC_ALL=C sed 's/^/[guest] /' "$1" >&2 || true; }
+
+windows_build_parallel_fragment(){
+  # This is an environment default only. A workflow's explicit --parallel/-j
+  # remains authoritative (the active Pulp Windows workflow uses 4/8).
+  local cpus="$1"
+  case "$cpus" in ''|*[!0-9]*|0) return 2;; esac
+  printf '%s\n' \
+    '$env:CMAKE_BUILD_PARALLEL_LEVEL="'"$cpus"'"' \
+    'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f $env:CMAKE_BUILD_PARALLEL_LEVEL)'
+}
+
+# The PowerShell the guest runs for one job: PATH, the lease's build
+# parallelism, the MSVC environment, then Runner.Listener with the JIT file.
+# CPUS is the lease's CPU grant; an invalid grant leaves the default unset.
+windows_listener_script(){
+  local ps
+  ps='$runnerPathAdd = @(
+  "C:\Program Files\Git\cmd",
+  "C:\Program Files\Git\bin",
+  "C:\Program Files\Git\usr\bin",
+  "C:\ProgramData\chocolatey\bin"
+)
+$env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
+__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__
+$vcvarsArch="'"$VCVARS_ARCH"'"
+$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
+if ($vcvars) {
+  Write-Output ("TARTCI_DIAG runner_vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
+  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
+  try {
+    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
+    $lines = & cmd.exe /d /c $tmp
+    foreach ($line in $lines) {
+      if ($line -match "^(.*?)=(.*)$") {
+        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+      }
+    }
+  } finally {
+    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
+  }
+  $cl = Get-Command cl -ErrorAction SilentlyContinue
+  if ($cl) { Write-Output ("TARTCI_DIAG runner_command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG runner_command cl=missing-after-vcvars" }
+} else {
+  Write-Output "TARTCI_DIAG runner_vcvars=missing"
+}
+Set-Location C:\actions-runner
+& "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
+exit $LASTEXITCODE'
+  printf '%s\n' "${ps/__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__/$(windows_build_parallel_fragment "$1") }"
+}
 
 # shellcheck source=providers/common/vm-lease.lib.sh
 source "$TARTCI_ROOT/providers/common/vm-lease.lib.sh"
@@ -117,6 +170,36 @@ runtime_emit_complete(){
     --gh-enrich \
     --json >/dev/null 2>&1 || note "runtime measurement emit failed (ignored)"
 }
+
+# Parse pure-output options before host prerequisites.  These modes are used by
+# fixture tests and diagnostics and must remain runnable on hosts without QEMU
+# or GitHub credentials.
+: "${PRINT_HOST_HEALTH:=0}"
+PRINT_BUILD_ENV_SCRIPT=""
+PRINT_LISTENER_SCRIPT=""
+while [ $# -gt 0 ]; do case "$1" in
+  --loop) LOOP=1; shift;;
+  --once) LOOP=0; shift;;
+  --golden) GOLDEN="$2"; shift 2;;
+  --labels) LABELS="$2"; shift 2;;
+  --repo) REPO="$2"; shift 2;;
+  --print-host-health) PRINT_HOST_HEALTH=1; shift;;
+  --print-build-env-script) PRINT_BUILD_ENV_SCRIPT="$2"; shift 2;;
+  --print-listener-script) PRINT_LISTENER_SCRIPT="$2"; shift 2;;
+  -h|--help) sed -n '2,30p' "$0"; exit 0;;
+  *) die "unknown arg: $1";;
+esac; done
+
+# Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
+# print-exits precede any golden/VM requirement).
+[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+[ -n "$PRINT_BUILD_ENV_SCRIPT" ] && {
+  windows_build_parallel_fragment "$PRINT_BUILD_ENV_SCRIPT" \
+    || die "invalid build parallelism '$PRINT_BUILD_ENV_SCRIPT'"
+  exit 0
+}
+[ -n "$PRINT_LISTENER_SCRIPT" ] && { windows_listener_script "$PRINT_LISTENER_SCRIPT"; exit 0; }
+
 command -v qemu-system-aarch64 >/dev/null 2>&1 || die "qemu not installed"
 # GitHub CLI for all API calls. Default `gh`; hosts authenticating as a GitHub
 # App set TARTCI_GH_CLI=ghapp to move provider API traffic off the personal PAT
@@ -203,29 +286,48 @@ finally:
 PY
 }
 
-PRINT_HOST_HEALTH=0
-while [ $# -gt 0 ]; do case "$1" in
-  --loop) LOOP=1; shift;;
-  --once) LOOP=0; shift;;
-  --golden) GOLDEN="$2"; shift 2;;
-  --labels) LABELS="$2"; shift 2;;
-  --repo) REPO="$2"; shift 2;;
-  --print-host-health) PRINT_HOST_HEALTH=1; shift;;
-  -h|--help) sed -n '2,30p' "$0"; exit 0;;
-  *) die "unknown arg: $1";;
-esac; done
+# PRINT_HOST_HEALTH=0 (kept as a structural marker for the port-lock fixture)
 
-# Preflight probe — safe to run without a golden (mirrors tart-macos ordering:
-# print-exits precede any golden/VM requirement).
-[ "$PRINT_HOST_HEALTH" = 1 ] && { tartci_host_health_yield; exit 0; }
+# Golden admission streams a potentially large qcow2. Resolve the interpreter
+# once through the host pin so a launchd PATH change cannot silently select a
+# different Python (or one without the required tomllib support). This comes
+# after the print-exits (above the qemu check), which need no interpreter and
+# must answer on a host whose pin is broken.
+TARTCI_PYTHON="$(tartci_toml_python_path)" || die "no pinned Python 3.11+ interpreter for Windows golden admission"
+export TARTCI_PYTHON
+[[ "$RUNNER_NAME_PREFIX" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ ]] \
+  || die "unsafe Windows runner name prefix"
 tartci_validate_admission_clean_config "$REPO" "$LABELS" \
   || die "invalid required Shipyard admission-clean configuration"
 
 [ -f "$GOLDEN" ] || die "golden not found: $GOLDEN (set TARTCI_WIN_GOLDEN)"
 FW=""; for c in /opt/homebrew/share/qemu/edk2-aarch64-code.fd /Applications/UTM.app/Contents/Resources/qemu/edk2-aarch64-code.fd; do [ -f "$c" ] && FW="$c" && break; done
 [ -n "$FW" ] || die "no edk2-aarch64-code.fd"
-VARS_TPL=""; for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
-[ -n "$VARS_TPL" ] || die "no edk2 vars template"
+# A golden whose boot entry lives in its own UEFI variable store ships that
+# store beside it; TARTCI_WIN_VARS_TEMPLATE names it and TARTCI_WIN_VARS_SHA256
+# pins it. Every job copies it and verifies the copy before QEMU writes to it.
+# Without it, the stock edk2 template serves a golden that auto-boots
+# \EFI\BOOT\BOOTAA64.EFI.
+VARS_TPL="${TARTCI_WIN_VARS_TEMPLATE:-}"
+VARS_SHA256="${TARTCI_WIN_VARS_SHA256:-}"
+if [ -n "$VARS_TPL" ]; then
+  [ -n "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_TEMPLATE requires TARTCI_WIN_VARS_SHA256"
+  "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+    --template "$VARS_TPL" --sha256 "$VARS_SHA256" --check >/dev/null \
+    || die "EFI vars template failed its pinned SHA-256: $VARS_TPL"
+else
+  [ -z "$VARS_SHA256" ] || die "TARTCI_WIN_VARS_SHA256 is set without TARTCI_WIN_VARS_TEMPLATE"
+  for v in /opt/homebrew/share/qemu/edk2-aarch64-vars.fd /opt/homebrew/share/qemu/edk2-arm-vars.fd; do [ -f "$v" ] && VARS_TPL="$v" && break; done
+  [ -n "$VARS_TPL" ] || die "no edk2 vars template"
+fi
+copy_efi_vars(){ # $1=destination
+  if [ -n "$VARS_SHA256" ]; then
+    "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/windows_efi_vars.py" \
+      --template "$VARS_TPL" --sha256 "$VARS_SHA256" --dest "$1" >/dev/null
+  else
+    cp "$VARS_TPL" "$1"
+  fi
+}
 case "$MAX_QUEUED_AGE_SECONDS" in ''|*[!0-9]*) MAX_QUEUED_AGE_SECONDS=0;; esac
 case "$PREFLIGHT_MODE" in fast|full) ;; *) die "invalid TARTCI_WIN_PREFLIGHT_MODE='$PREFLIGHT_MODE' (fast|full)";; esac
 case "$WIN_CPUS" in ''|*[!0-9]*) die "invalid TARTCI_WIN_CPUS='$WIN_CPUS'";; esac
@@ -252,12 +354,56 @@ delete_runner_registration(){
 
 cleanup_active_windows_job(){
   [ "$CURRENT_WIN_CLEANED_UP" = 0 ] || return 0
-  CURRENT_WIN_CLEANED_UP=1
+  local state
   if [ -n "$CURRENT_WIN_QPID" ]; then
-    kill -9 "$CURRENT_WIN_QPID" 2>/dev/null || true
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]] \
+      && { [ -z "$CURRENT_WIN_QPID_STARTED_AT" ] \
+           || [ "$(tartci_pid_started_at "$CURRENT_WIN_QPID")" != "$CURRENT_WIN_QPID_STARTED_AT" ]; }; then
+      note "QEMU PID identity is unknown or changed; preserving job and lease for recovery"
+      return 1
+    fi
+  fi
+  if [ -n "$CURRENT_WIN_QPID" ] && [ -n "$state" ] && [[ "$state" != Z* ]]; then
+    kill "$CURRENT_WIN_QPID" 2>/dev/null || true
+    for _ in 1 2 3 4 5; do
+      state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+      [[ -z "$state" || "$state" == Z* ]] && break
+      sleep 1
+    done
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]] \
+      && [ "$(tartci_pid_started_at "$CURRENT_WIN_QPID")" = "$CURRENT_WIN_QPID_STARTED_AT" ]; then
+      kill -KILL "$CURRENT_WIN_QPID" 2>/dev/null || true
+      for _ in 1 2 3 4 5; do
+        state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+        [[ -z "$state" || "$state" == Z* ]] && break
+        sleep 1
+      done
+    fi
+    state="$(ps -p "$CURRENT_WIN_QPID" -o stat= 2>/dev/null | tr -d '[:space:]')"
+    if [[ -n "$state" && "$state" != Z* ]]; then
+      note "QEMU still alive; preserving job and lease for recovery"
+      return 1
+    fi
     wait "$CURRENT_WIN_QPID" 2>/dev/null || true
   fi
-  [ -z "$CURRENT_WIN_JOBDIR" ] || rm -rf "$CURRENT_WIN_JOBDIR"
+  if [ -n "$CURRENT_WIN_JOBDIR" ]; then
+    [[ "$CURRENT_WIN_JOBDIR" == "$WORKROOT/$CURRENT_WIN_JOB" \
+       && "$CURRENT_WIN_JOB" =~ ^[a-zA-Z0-9][a-zA-Z0-9_-]*$ \
+       && ! -L "$CURRENT_WIN_JOBDIR" ]] || {
+      note "unsafe Windows job path; preserving lease for recovery"
+      return 1
+    }
+    chflags nouchg "$CURRENT_WIN_JOBDIR/golden.qcow2" \
+      "$CURRENT_WIN_JOBDIR/golden.qcow2.sha256" 2>/dev/null || true
+    if [ -e "$CURRENT_WIN_JOBDIR" ]; then
+      if ! rm -r "$CURRENT_WIN_JOBDIR" || [ -e "$CURRENT_WIN_JOBDIR" ]; then
+        note "Windows job directory could not be deleted; preserving lease for recovery"
+        return 1
+      fi
+    fi
+  fi
   if [ -n "$CURRENT_WIN_PORT_LOCK" ]; then
     release_ssh_port_lock "$CURRENT_WIN_PORT_LOCK" \
       "$CURRENT_WIN_PORT_LOCK_DEVICE" "$CURRENT_WIN_PORT_LOCK_INODE" \
@@ -278,9 +424,11 @@ cleanup_active_windows_job(){
   CURRENT_WIN_PORT_LOCK_DEVICE=""
   CURRENT_WIN_PORT_LOCK_INODE=""
   CURRENT_WIN_QPID=""
+  CURRENT_WIN_QPID_STARTED_AT=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
   CURRENT_WIN_CPUS=""
+  CURRENT_WIN_CLEANED_UP=1
   return 0
 }
 
@@ -324,18 +472,24 @@ run_one(){ # $1=iteration index
   tartci_prepare_and_check_disk_root_observed "$WORKROOT/port-locks" "" "" qemu-windows \
     "${TARTCI_QUEUE_LANE_ID:-qemu-windows}" "${TARTCI_RUNNER_NAME:-$job}" || return $?
 
-  local port port_lock port_lock_device port_lock_inode jobdir logdir overlay efivars qpid
+  local port port_lock port_lock_device port_lock_inode jobdir logdir overlay jobbase efivars qpid
   read -r port port_lock port_lock_device port_lock_inode < <(allocate_ssh_port)
   [ -n "$port" ] && [ -n "$port_lock" ] \
     && [ -n "$port_lock_device" ] && [ -n "$port_lock_inode" ] \
     || die "failed to allocate SSH port"
   jobdir="$WORKROOT/$job"
+  if [ -e "$jobdir" ] || [ -L "$jobdir" ]; then
+    release_ssh_port_lock "$port_lock" "$port_lock_device" "$port_lock_inode" || true
+    note "[$i] Windows job directory already exists; refusing collision: $jobdir"
+    return 1
+  fi
   CURRENT_WIN_JOB="$job"
   CURRENT_WIN_JOBDIR="$jobdir"
   CURRENT_WIN_PORT_LOCK="$port_lock"
   CURRENT_WIN_PORT_LOCK_DEVICE="$port_lock_device"
   CURRENT_WIN_PORT_LOCK_INODE="$port_lock_inode"
   CURRENT_WIN_QPID=""
+  CURRENT_WIN_QPID_STARTED_AT=""
   CURRENT_WIN_STATE_DIR=""
   CURRENT_WIN_LEASE_ID_EXPECTED=""
   CURRENT_WIN_CPUS=""
@@ -355,7 +509,7 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
     return "$prepare_rc"
   fi
-  overlay="$jobdir/overlay.qcow2"; efivars="$jobdir/efivars.fd"
+  overlay="$jobdir/overlay.qcow2"; jobbase="$jobdir/golden.qcow2"; efivars="$jobdir/efivars.fd"
   state_dir="$(tartci_provider_state_dir qemu-windows)"
   CURRENT_WIN_STATE_DIR="$state_dir"
   write_state(){
@@ -366,6 +520,7 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_WORK_DIR="$jobdir" \
     TARTCI_STATE_LOG_DIR="$logdir" \
     TARTCI_STATE_OVERLAY="$overlay" \
+    TARTCI_STATE_GOLDEN_SNAPSHOT="$jobbase" \
     TARTCI_STATE_PORT_LOCK="$WORKROOT/port-locks/$port_lock" \
     TARTCI_STATE_SSH_PORT="$port" \
     TARTCI_STATE_QEMU_PID="${qpid:-}" \
@@ -373,6 +528,11 @@ run_one(){ # $1=iteration index
     TARTCI_STATE_KEEP_FAILED="${2:-}" \
     tartci_write_vm_state qemu-windows "$job" "$job" "$1" ephemeral "$state_dir"
   }
+  if ! nice -n 20 "$TARTCI_PYTHON" "$TARTCI_ROOT/scripts/verify_windows_golden.py" "$GOLDEN"; then
+    note "[$i] Windows golden failed SHA-256 admission; refusing clone before lease/JIT"
+    cleanup_active_windows_job
+    return 1
+  fi
   lease_cores="$(tartci_vm_lease_cores qemu-windows "$WIN_CPUS")"
   lease_mem="$(tartci_vm_lease_mem_mb qemu-windows "$WIN_MEMORY_MB")"
   lease_priority="$(tartci_vm_lease_priority "$LABELS")"
@@ -389,13 +549,18 @@ run_one(){ # $1=iteration index
   CURRENT_WIN_CPUS="$effective_win_cpus"
   write_state preparing
 
-  note "[$i] CoW overlay off $(basename "$GOLDEN") + boot (ssh 127.0.0.1:$port)"
-  if ! tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$GOLDEN" -F qcow2 "$overlay" >/dev/null; then
+  if ! "$TARTCI_ROOT/providers/qemu-windows/prepare-golden-snapshot.sh" "$GOLDEN" "$jobbase"; then
+    note "[$i] Windows golden failed private snapshot admission"
+    cleanup_active_windows_job
+    return 1
+  fi
+  note "[$i] CoW overlay off verified private snapshot + boot (ssh 127.0.0.1:$port)"
+  if ! tartci_vm_lease_guard_run qemu-img create -f qcow2 -b "$jobbase" -F qcow2 "$overlay" >/dev/null; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     cleanup_active_windows_job
     return 1
   fi
-  if ! cp "$VARS_TPL" "$efivars"; then
+  if ! copy_efi_vars "$efivars"; then
     runtime_emit_complete fail boot_failed 1 "$job" "" "$logdir"
     cleanup_active_windows_job
     return 1
@@ -408,6 +573,7 @@ run_one(){ # $1=iteration index
     -display none >"$logdir/qemu.log" 2>&1 & CURRENT_WIN_QPID=$!
   qpid="$CURRENT_WIN_QPID"
   qemu_started="$(tartci_pid_started_at "$qpid")"
+  CURRENT_WIN_QPID_STARTED_AT="$qemu_started"
   write_state booting
 
   cleanup_job(){
@@ -423,6 +589,7 @@ run_one(){ # $1=iteration index
       CURRENT_WIN_PORT_LOCK_DEVICE=""
       CURRENT_WIN_PORT_LOCK_INODE=""
       CURRENT_WIN_QPID=""
+      CURRENT_WIN_QPID_STARTED_AT=""
       CURRENT_WIN_STATE_DIR=""
       CURRENT_WIN_LEASE_ID_EXPECTED=""
       CURRENT_WIN_CPUS=""
@@ -433,7 +600,8 @@ run_one(){ # $1=iteration index
     cleanup_active_windows_job
   }
 
-  wsh(){ ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
+  # ssh-stdin: callers pipe scripts and the JIT config into wsh
+  wsh(){ ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$KEY" -p "$port" "$WUSER@127.0.0.1" "$@"; }
   # Wait for SSH, but bail the moment QEMU dies — that's how a free-port TOCTOU
   # (another process grabbed $port between the probe close and QEMU's bind)
   # surfaces: qemu exits instantly. Without this check the wait would burn the
@@ -463,7 +631,10 @@ run_one(){ # $1=iteration index
       || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
       write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off ($admission_detail)"
       cleanup_job success
       return "$admission_rc"
     fi
@@ -471,7 +642,7 @@ run_one(){ # $1=iteration index
 
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${_ls[@]+"${_ls[@]}"}; do label_args+=(-f "labels[]=$l"); done
   if ! tartci_pool_lock_acquire; then
     note "[$i] pool transition busy before JIT mint — discarding unassigned VM"
     cleanup_job success
@@ -484,7 +655,7 @@ run_one(){ # $1=iteration index
     return 75
   fi
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        -f "name=$job" -F "runner_group_id=$RUNNER_GROUP_ID" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
     note "[$i] JIT mint failed — discarding VM"
@@ -661,37 +832,7 @@ $jitPath="C:\actions-runner\jit.cfg"
   # (3) run the agent reading the jit FILE — small PS, no blob on the wire.
   # Use Runner.Listener.exe directly (not run.cmd) so the huge JIT config is not
   # expanded through cmd.exe's 8191-character command-line limit.
-  ps_run='$runnerPathAdd = @(
-  "C:\Program Files\Git\cmd",
-  "C:\Program Files\Git\bin",
-  "C:\Program Files\Git\usr\bin",
-  "C:\ProgramData\chocolatey\bin"
-)
-$env:Path = (($runnerPathAdd + @($env:Path -split ";")) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique) -join ";"
-$vcvarsArch="'"$VCVARS_ARCH"'"
-$vcvars = Get-ChildItem "C:\Program Files\Microsoft Visual Studio" -Recurse -Filter vcvarsall.bat -ErrorAction SilentlyContinue | Where-Object { $_.FullName -match "BuildTools" } | Select-Object -First 1 -ExpandProperty FullName
-if ($vcvars) {
-  Write-Output ("TARTCI_DIAG runner_vcvars={0} arch={1}" -f $vcvars, $vcvarsArch)
-  $tmp = Join-Path $env:TEMP ("tartci-vcvars-" + [guid]::NewGuid().ToString("N") + ".cmd")
-  try {
-    "@echo off",("call ""{0}"" {1} >nul" -f $vcvars, $vcvarsArch),"set" | Set-Content -Path $tmp -Encoding ASCII
-    $lines = & cmd.exe /d /c $tmp
-    foreach ($line in $lines) {
-      if ($line -match "^(.*?)=(.*)$") {
-        [Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
-      }
-    }
-  } finally {
-    Remove-Item -Force -ErrorAction SilentlyContinue $tmp
-  }
-  $cl = Get-Command cl -ErrorAction SilentlyContinue
-  if ($cl) { Write-Output ("TARTCI_DIAG runner_command cl={0}" -f $cl.Source) } else { Write-Output "TARTCI_DIAG runner_command cl=missing-after-vcvars" }
-} else {
-  Write-Output "TARTCI_DIAG runner_vcvars=missing"
-}
-Set-Location C:\actions-runner
-& "C:\actions-runner\bin\Runner.Listener.exe" run --jitconfig (Get-Content "C:\actions-runner\jit.cfg")
-exit $LASTEXITCODE'
+  ps_run="$(windows_listener_script "$effective_win_cpus")"
   local run_status=0
   local runner_output="$logdir/runner-output.log"
   local runner_pid runner_start runner_assigned=0 runner_timed_out=0 now idle_elapsed

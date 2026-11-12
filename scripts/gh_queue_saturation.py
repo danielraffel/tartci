@@ -23,6 +23,12 @@ The detection is a triad — all three must hold, or it's a false positive:
   3. stuck required check — an open PR's required check has been `pending`
      beyond a grace window.
 
+There is a second, earlier failure mode that the triad cannot see: the routing
+preamble itself can be queued on a hosted label while the macOS lane is healthy
+and idle.  `resolve-provider` and `classify` are sampled from queued Build and
+Test runs and reported as `preamble_starved`; this keeps `queued=0` in a Tart
+supervisor from being mistaken for a healthy end-to-end queue.
+
 The ONE structural constraint: this detector must NOT run on the GitHub-hosted
 pool it watches, or it queues behind the very saturation it reports (silent
 exactly when needed). Its home is a launchd timer on the always-on Macs (see
@@ -48,6 +54,7 @@ network, no `gh`, no clock (see scripts/test_gh_queue_saturation.py).
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
 import subprocess
@@ -71,6 +78,8 @@ class Verdict:
     idle_runners: list[str] = field(default_factory=list)
     reasons: list[str] = field(default_factory=list)
     capacity_unknown: bool = False
+    preamble_starved: bool = False
+    preamble_jobs: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {
@@ -82,6 +91,8 @@ class Verdict:
             "idle_runners": self.idle_runners,
             "reasons": self.reasons,
             "capacity_unknown": self.capacity_unknown,
+            "preamble_starved": self.preamble_starved,
+            "preamble_jobs": self.preamble_jobs,
         }
 
 
@@ -94,6 +105,7 @@ def classify_saturation(
     grace_secs: int,
     required_labels: set[str],
     census_complete: bool = True,
+    preamble_jobs: list[dict] | None = None,
 ) -> Verdict:
     """Decide whether the repo is in GitHub-hosted queue starvation.
 
@@ -129,6 +141,14 @@ def classify_saturation(
     stuck = any(age >= grace_secs for age in pending_check_ages)
 
     capacity_unknown = not idle_capacity and not census_complete
+    preamble_jobs = preamble_jobs or []
+    preamble_names = {"resolve-provider", "classify"}
+    blocked_preamble = [
+        str(job.get("name")) for job in preamble_jobs
+        if str(job.get("name")) in preamble_names
+        and int(job.get("age_secs") or 0) >= grace_secs
+    ]
+    preamble_starved = bool(blocked_preamble)
     saturated = queue_high and idle_capacity and stuck
 
     reasons: list[str] = []
@@ -139,7 +159,14 @@ def classify_saturation(
             f"({', '.join(idle)}), and a required check pending "
             f">= {grace_secs}s — GitHub-hosted starvation, not a wedged runner."
         )
-    else:
+    if preamble_starved:
+        reasons.append(
+            "routing preamble queued beyond grace ("
+            + ", ".join(sorted(set(blocked_preamble)))
+            + ") — downstream macOS jobs are not materialized; check the "
+            "preamble runner route and capacity"
+        )
+    if not saturated:
         if not queue_high:
             reasons.append(f"queue shallow ({queued_count} < {queue_trip})")
         if capacity_unknown:
@@ -162,6 +189,8 @@ def classify_saturation(
         idle_runners=idle,
         reasons=reasons,
         capacity_unknown=capacity_unknown,
+        preamble_starved=preamble_starved,
+        preamble_jobs=sorted(set(blocked_preamble)),
     )
 
 
@@ -205,10 +234,10 @@ def _iso_age_secs(iso: str, now_epoch: float) -> int:
 
 def gather(
     repo: str, *, now_epoch: float | None = None
-) -> tuple[int, list[dict], list[int], bool]:
+) -> tuple[int, list[dict], list[int], bool, list[dict]]:
     """Collect the inputs from the GitHub API via the configured App wrapper.
 
-    Returns (queued_count, runners, ages, census_complete). `ages` is the wait
+    Returns (queued_count, runners, ages, census_complete, preamble_jobs). `ages` is the wait
     time of the oldest still-`queued` workflow run — a robust proxy for "the
     required check is stuck pending" that needs no per-check bookkeeping. Empty
     when the queue is empty. `census_complete` is false when a runner
@@ -246,7 +275,34 @@ def gather(
         oldest = min((str(run.get("created_at") or "") for run in runs if run.get("created_at")), default="")
         if oldest:
             ages.append(_iso_age_secs(oldest, now))
-    return queued_count, runners, ages, census.complete
+    preamble_jobs: list[dict] = []
+    max_runs = max(1, int(os.environ.get("PULP_SAT_PREAMBLE_RUNS", "8")))
+    candidate_runs = [
+        run for run in runs if str(run.get("name") or "") == "Build and Test"
+    ][:max_runs]
+    def queued_preamble(run: dict) -> list[dict]:
+        run_id = run.get("id")
+        if not run_id:
+            return []
+        try:
+            jobs = _gh_json(["api", f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100"])
+        except Exception:
+            return []
+        run_age = _iso_age_secs(str(run.get("created_at") or ""), now)
+        return [
+            {"name": job.get("name"), "labels": [str(x) for x in (job.get("labels") or [])],
+             "age_secs": run_age, "run_id": run_id}
+            for job in (jobs.get("jobs", []) if isinstance(jobs, dict) else [])
+            if job.get("status") == "queued" and job.get("name") in {"resolve-provider", "classify"}
+        ]
+
+    # The detector itself must not become the next queue bottleneck. Job
+    # sampling is bounded and parallel, while the pure classifier remains
+    # deterministic and fully covered by hermetic tests.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(candidate_runs) or 1)) as pool:
+        for jobs in pool.map(queued_preamble, candidate_runs):
+            preamble_jobs.extend(jobs)
+    return queued_count, runners, ages, census.complete, preamble_jobs
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -265,17 +321,18 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     required = {s for s in (x.strip() for x in args.required_labels.split(",")) if s}
-    queued_count, runners, ages, census_complete = gather(args.repo)
+    queued_count, runners, ages, census_complete, preamble_jobs = gather(args.repo)
     v = classify_saturation(
         queued_count, runners, ages,
         queue_trip=args.queue_trip, grace_secs=args.grace_secs, required_labels=required,
         census_complete=census_complete,
+        preamble_jobs=preamble_jobs,
     )
 
     if args.json:
         print(json.dumps(v.as_dict(), indent=2))
     elif args.status:
-        state = "SATURATED" if v.saturated else "ok"
+        state = "BLOCKED" if v.preamble_starved else ("SATURATED" if v.saturated else "ok")
         print(f"[queue-saturation] {state}: {'; '.join(v.reasons)}")
     else:
         print(f"[queue-saturation] saturated={v.saturated} "
@@ -284,11 +341,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {r}")
 
     apply = args.apply or os.environ.get("PULP_SAT_APPLY") == "1"
-    if apply and v.saturated:
+    if apply and (v.saturated or v.preamble_starved):
         # Open or update a single tracking issue (deduped by title). Kept
         # deliberately simple; recovery auto-close is the natural follow-up.
+        title = ISSUE_TITLE if v.saturated else "CI: routing preamble starvation blocking native gates"
         print("[queue-saturation] --apply: would open/update the tracking issue "
-              f"'{ISSUE_TITLE}' (label {ISSUE_LABEL})")
+              f"'{title}' (label {ISSUE_LABEL})")
 
     return 0
 

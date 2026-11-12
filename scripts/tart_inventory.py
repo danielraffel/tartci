@@ -61,14 +61,47 @@ def count_running_macos(timeout_seconds: float, tart: str = "tart") -> int:
     return count
 
 
+def vm_is_present(name: str, timeout_seconds: float, tart: str = "tart") -> bool:
+    """Whether a local Tart VM with exactly this name still exists.
+
+    Only a successful, well-formed listing can say "absent". A timeout, a
+    failed command or malformed output raises, so a caller never mistakes an
+    inventory it could not read for proof that a VM is gone.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    payload: Any = json.loads(
+        run_bounded([tart, "list", "--format", "json", "--source", "local"], deadline)
+    )
+    if not isinstance(payload, list):
+        raise ValueError("tart list did not return an array")
+    for vm in payload:
+        if not isinstance(vm, dict):
+            raise ValueError("tart list contains a non-object entry")
+        if (vm.get("Name") or vm.get("name")) == name:
+            return True
+    return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--timeout-seconds", type=float, default=5.0)
     parser.add_argument("--tart", default="tart")
+    parser.add_argument(
+        "--vm-absent",
+        metavar="NAME",
+        help="exit 0 only when a readable local inventory proves NAME is gone; "
+        "exit 1 when it is still listed, 75 when the inventory cannot be read",
+    )
     args = parser.parse_args()
     if not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
     try:
+        if args.vm_absent is not None:
+            if not args.vm_absent:
+                parser.error("--vm-absent needs a VM name")
+            present = vm_is_present(args.vm_absent, args.timeout_seconds, args.tart)
+            print("present" if present else "absent")
+            return 1 if present else 0
         print(count_running_macos(args.timeout_seconds, args.tart))
     except (json.JSONDecodeError, ObservationError, OSError, subprocess.SubprocessError, ValueError) as exc:
         print(f"tart inventory failed: {exc}", file=sys.stderr)

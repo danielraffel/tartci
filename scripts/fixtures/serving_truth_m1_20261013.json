@@ -1,0 +1,2847 @@
+{
+ "jobs": [
+  {
+   "completed_at": "2026-10-13T02:02:33Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T02:02:34Z",
+   "id": 115092978763,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38335002568,
+   "runner_name": null,
+   "started_at": "2026-10-13T02:02:34Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:53:45Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:53:46Z",
+   "id": 115090820546,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38334242969,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:53:46Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T04:36:47Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:54:14Z",
+   "id": 115090933480,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38334242969,
+   "runner_name": "m5studio-pulp-gate-slot2-02-62351-2",
+   "started_at": "2026-10-13T04:14:00Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:50:51Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:50:51Z",
+   "id": 115090112401,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38334044141,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:50:51Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T03:03:54Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:51:17Z",
+   "id": 115090221409,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38334044141,
+   "runner_name": "studio-pulp-gate-slot2-02-60047-2",
+   "started_at": "2026-10-13T02:57:36Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:48:08Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:48:08Z",
+   "id": 115089437867,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333858208,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:48:08Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:19:06Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:48:39Z",
+   "id": 115089562658,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38333858208,
+   "runner_name": "m5studio-pulp-gate-01-54473-9",
+   "started_at": "2026-10-13T01:59:25Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:46:20Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:46:20Z",
+   "id": 115088982416,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333715657,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:46:20Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:50:29Z",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-13T01:46:46Z",
+   "id": 115089092313,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38333715657,
+   "runner_name": "",
+   "started_at": "2026-10-13T01:46:46Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:44:49Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:44:49Z",
+   "id": 115088600691,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333588883,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:44:49Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:09:19Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:45:18Z",
+   "id": 115088722572,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38333588883,
+   "runner_name": "studio-pulp-gate-slot2-02-15766-9",
+   "started_at": "2026-10-13T01:46:46Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:51:35Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:51:35Z",
+   "id": 115090293176,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333415263,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:51:35Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:38:57Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:38:57Z",
+   "id": 115087153404,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333128864,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:38:57Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:06:23Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:39:25Z",
+   "id": 115087265208,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38333128864,
+   "runner_name": "studio-pulp-gate-01-15730-6",
+   "started_at": "2026-10-13T01:43:48Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:38:55Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:38:55Z",
+   "id": 115087146954,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38333126777,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:38:55Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:26:06Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:26:06Z",
+   "id": 115083957804,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38332110487,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:26:06Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:00:53Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:26:34Z",
+   "id": 115084067918,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38332110487,
+   "runner_name": "m5studio-pulp-gate-slot2-02-54539-3",
+   "started_at": "2026-10-13T01:38:21Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:24:34Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:24:35Z",
+   "id": 115083580720,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331860507,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:24:35Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T03:59:57Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:25:02Z",
+   "id": 115083694482,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331860507,
+   "runner_name": "m5-pulp-gate-01-61125-3",
+   "started_at": "2026-10-13T03:47:26Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:22:42Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:22:43Z",
+   "id": 115083102028,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331840346,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:22:43Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:02:56Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:23:07Z",
+   "id": 115083208169,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331840346,
+   "runner_name": "m5-pulp-gate-slot2-02-97438-1",
+   "started_at": "2026-10-13T01:51:28Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:20:13Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:20:14Z",
+   "id": 115082454914,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331639241,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:20:14Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T03:22:04Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:20:39Z",
+   "id": 115082561826,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331639241,
+   "runner_name": "studio-pulp-gate-slot2-02-60047-3",
+   "started_at": "2026-10-13T03:10:55Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:18:54Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:18:55Z",
+   "id": 115082122297,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331531573,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:18:55Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:53:45Z",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-13T01:19:21Z",
+   "id": 115082232127,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331531573,
+   "runner_name": "m5studio-pulp-gate-01-54473-8",
+   "started_at": "2026-10-13T01:51:25Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:16:11Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:16:11Z",
+   "id": 115081444639,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331313667,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:16:11Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:22:57Z",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-13T01:16:39Z",
+   "id": 115081560103,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331313667,
+   "runner_name": "",
+   "started_at": "2026-10-13T01:16:39Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:13:19Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:13:19Z",
+   "id": 115080729552,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331083628,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:13:19Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T03:25:00Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:13:43Z",
+   "id": 115080829552,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331083628,
+   "runner_name": "studio-pulp-gate-01-59895-9",
+   "started_at": "2026-10-13T03:18:03Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:12:46Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:12:47Z",
+   "id": 115080592709,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38331000348,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:12:47Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:46:25Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:13:14Z",
+   "id": 115080709216,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38331000348,
+   "runner_name": "m5studio-pulp-gate-slot2-02-54539-5",
+   "started_at": "2026-10-13T02:28:56Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:10:48Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:10:48Z",
+   "id": 115080099480,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330884700,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:10:48Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:10:46Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:10:46Z",
+   "id": 115080091801,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330881932,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:10:46Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:09:44Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:09:45Z",
+   "id": 115079825697,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330795441,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:09:45Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:38:48Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:10:14Z",
+   "id": 115079950763,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38330795441,
+   "runner_name": "m5-pulp-gate-slot2-02-62044-7",
+   "started_at": "2026-10-13T01:11:21Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:09:45Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:09:45Z",
+   "id": 115079828549,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330796232,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:09:45Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:41:59Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:10:14Z",
+   "id": 115079953113,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38330796232,
+   "runner_name": "m5-pulp-gate-01-62025-12",
+   "started_at": "2026-10-13T01:16:41Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:08:01Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:08:02Z",
+   "id": 115079401035,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330657735,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:08:02Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:56:51Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:08:26Z",
+   "id": 115079500882,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38330657735,
+   "runner_name": "m5-pulp-gate-slot2-02-97438-4",
+   "started_at": "2026-10-13T02:28:17Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:07:05Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:07:06Z",
+   "id": 115079167946,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330582318,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:07:06Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:20:55Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:07:31Z",
+   "id": 115079270964,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38330582318,
+   "runner_name": "m5studio-pulp-gate-slot2-02-54539-4",
+   "started_at": "2026-10-13T02:06:26Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:05:48Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:05:48Z",
+   "id": 115078836565,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330476331,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:05:48Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:30:02Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:06:18Z",
+   "id": 115078965559,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38330476331,
+   "runner_name": "studio-pulp-gate-01-15730-4",
+   "started_at": "2026-10-13T01:11:57Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:01:45Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:01:45Z",
+   "id": 115077824156,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330147667,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:01:45Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:27:10Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T01:02:13Z",
+   "id": 115077941529,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38330147667,
+   "runner_name": "m5studio-pulp-gate-slot2-02-54539-1",
+   "started_at": "2026-10-13T01:05:13Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:00:37Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T01:00:38Z",
+   "id": 115077523544,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38330050412,
+   "runner_name": null,
+   "started_at": "2026-10-13T01:00:38Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:12:15Z",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-13T01:01:08Z",
+   "id": 115077664610,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38330050412,
+   "runner_name": "",
+   "started_at": "2026-10-13T01:01:08Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:52:27Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:52:28Z",
+   "id": 115075389814,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38329383340,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:52:28Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:37:14Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:52:56Z",
+   "id": 115075514505,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38329383340,
+   "runner_name": "m1-pulp-gate-01-9867-7",
+   "started_at": "2026-10-13T01:01:30Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:51:36Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:51:36Z",
+   "id": 115075172685,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38329311093,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:51:36Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:16:10Z",
+   "conclusion": "cancelled",
+   "created_at": "2026-10-13T00:52:02Z",
+   "id": 115075281357,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38329311093,
+   "runner_name": "",
+   "started_at": "2026-10-13T00:52:02Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:41:53Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:41:53Z",
+   "id": 115072702270,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38328520568,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:41:53Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:05:12Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:42:22Z",
+   "id": 115072826422,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38328520568,
+   "runner_name": "m5-pulp-gate-slot2-02-62044-5",
+   "started_at": "2026-10-13T00:52:14Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:41:33Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:41:33Z",
+   "id": 115072619422,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38328493394,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:41:33Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:57:22Z",
+   "conclusion": "failure",
+   "created_at": "2026-10-13T00:42:01Z",
+   "id": 115072735840,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38328493394,
+   "runner_name": "studio-pulp-gate-01-15730-2",
+   "started_at": "2026-10-13T00:46:35Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:39:58Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:39:59Z",
+   "id": 115072211516,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38328301628,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:39:59Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T02:20:31Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:40:26Z",
+   "id": 115072333828,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38328301628,
+   "runner_name": "m5-pulp-gate-01-97419-6",
+   "started_at": "2026-10-13T02:02:36Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:37:57Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:37:58Z",
+   "id": 115071688442,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38328199060,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:37:58Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:38:23Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:38:24Z",
+   "id": 115071801942,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38328199060,
+   "runner_name": "studio-pulp-gate-slot2-02-15766-3",
+   "started_at": "2026-10-13T01:22:18Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:35:44Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:35:44Z",
+   "id": 115071114789,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38328020645,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:35:44Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:09:22Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:36:49Z",
+   "id": 115071397302,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "macos",
+   "run_id": 38328020645,
+   "runner_name": "m5-pulp-gate-01-62025-9",
+   "started_at": "2026-10-13T00:41:07Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T00:32:58Z",
+   "conclusion": "skipped",
+   "created_at": "2026-10-13T00:32:58Z",
+   "id": 115070387083,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-merge-group"
+   ],
+   "name": "Pulp repository-isolation local proof",
+   "run_id": 38327791251,
+   "runner_name": null,
+   "started_at": "2026-10-13T00:32:58Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  },
+  {
+   "completed_at": "2026-10-13T01:01:03Z",
+   "conclusion": "success",
+   "created_at": "2026-10-13T00:33:28Z",
+   "id": 115070516197,
+   "labels": [
+    "self-hosted",
+    "macOS",
+    "ARM64",
+    "pulp-build",
+    "pulp-build-vm",
+    "pulp-build-pr-head"
+   ],
+   "name": "macos",
+   "run_id": 38327791251,
+   "runner_name": "m5studio-pulp-gate-slot2-02-7400-6",
+   "started_at": "2026-10-13T00:34:03Z",
+   "status": "completed",
+   "workflow_name": "Build and Test"
+  }
+ ],
+ "rows": [
+  {
+   "detail": "consecutive=1 running=2/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T20:03:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=32s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T20:03:07Z",
+   "vm": "m1-pulp-gate-01-15902-2"
+  },
+  {
+   "detail": "2026-10-12 20:04:19Z: Running job: macos",
+   "event": "job_assigned",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T20:05:29Z",
+   "vm": "m1-pulp-gate-slot2-02-93494-6"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T20:05:40Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=23s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T20:07:51Z",
+   "vm": "m1-pulp-gate-01-15902-3"
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T20:38:03Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=1/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T20:39:32Z",
+   "vm": ""
+  },
+  {
+   "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : api_timeout: scan exceeded its overall deadline , kind : observation_error }",
+   "event": "job_terminal_receipt",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T20:40:09Z",
+   "vm": "m1-pulp-gate-slot2-02-93494-6"
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 28.4s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T20:40:15Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 4.1s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T20:40:38Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=64348 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T20:42:44.588441+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T20:43:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T20:44:21Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T20:44:23Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=75362 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T20:45:41.978606+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T20:47:36Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=30463 lane=m1-spectr-gate generation=unknown started_at=2026-10-12T20:49:49.977418+00:00 age=20....",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T20:50:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=31171 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T20:50:13.405569+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T20:50:46Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T20:54:38Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=11019 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T20:54:36.363138+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T20:56:24Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=60265 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-12T20:56:28.407189+00:00 age=12...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T20:58:38Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=60265 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-12T20:56:28.407189+00:00 age=12...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T20:58:38Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T21:00:16Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=2 peer_cover=2 local_cover=1 excess=-1 studio-host-m3-4:free=1,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T21:08:56Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T21:11:36Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=98678 lane=unknown generation=unknown started_at=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T21:13:54Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T21:21:48Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T21:23:16Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=0",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T21:25:24Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T21:27:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T21:33:24Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T21:34:53Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=1006 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T21:35:47.095737+00:00 a...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T21:36:02Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=32s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T21:40:16Z",
+   "vm": "m1-pulp-gate-01-15902-5"
+  },
+  {
+   "detail": "2026-10-12 21:42:17Z: Running job: macos",
+   "event": "job_assigned",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T21:43:13Z",
+   "vm": "m1-pulp-gate-01-15902-5"
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T21:43:36Z",
+   "vm": ""
+  },
+  {
+   "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : success , job_id :115017776073, job_status : completed , kind : terminal , run_conclusion : success , run_id :38311364271, run_status : completed , runner_name : m1-pulp-gate-01-15902-5 , workflow_id :256999733, workflow_name : Build and Test }",
+   "event": "job_terminal_receipt",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:08:38Z",
+   "vm": "m1-pulp-gate-01-15902-5"
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:09:00Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:09:04Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:09:04Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:09:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:09:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:13:48Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:14:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=80527 lane=unknown generation=unknown started_at=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:14:09Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: rate_limited: an authenticated identity exhausted its allowance (identity=app-i...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:15:15Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:15:47Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:16:54Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=1 excess=-1 studio-host-m3-4:free=0,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:21:16Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=1 local_cover=0 excess=0 studio-host-m3-4:free=0,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:26:37Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:28:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=72736 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:28:55Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:28:55Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=79761 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:31:40Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:31:45Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:31:49Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:31:50Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:37:43Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=3146 lane=m1-forge-gate generation=unknown started_at=2026-10-12T22:38:26.763863+00:00 age=43.1s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T22:39:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=3146 lane=m1-forge-gate generation=unknown started_at=2026-10-12T22:38:26.763863+00:00 age=47.0s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:39:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:39:25Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=9416 lane=m1-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:40:34Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=13767 lane=m1-vellum-gate generation=unknown started_at=2026-10-12T22:41:59.204415+00:00 age=13....",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T22:42:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=39s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:45:30Z",
+   "vm": "m1-pulp-gate-01-56421-1"
+  },
+  {
+   "detail": "consecutive=1 running=1/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=30082 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-12T22:47:17.806480+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T22:47:44Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:49:09Z",
+   "vm": ""
+  },
+  {
+   "detail": "2026-10-12 22:49:04Z: Running job: macos",
+   "event": "job_assigned",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T22:49:41Z",
+   "vm": "m1-pulp-gate-01-56421-1"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group source=parallel age=53s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T22:54:37Z",
+   "vm": "m1-pulp-gate-slot2-02-56532-1"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:03:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=19s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:05:52Z",
+   "vm": "m1-pulp-gate-slot2-02-56532-2"
+  },
+  {
+   "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }",
+   "event": "job_terminal_receipt",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:10:15Z",
+   "vm": "m1-pulp-gate-01-56421-1"
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:11:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:11:07Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-12T23:11:07Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T23:11:11Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T23:11:11Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:16:01Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=0 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=0",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:24:29Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=70127 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:32:57Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=1 peer_cover=2 local_cover=0 excess=-1 studio-host-m3-4:free=1,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:33:32Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=1 label=pulp-build-pr-head demand=3 peer_cover=2 local_cover=1 excess=0 studio-host-m3-4:free=0,in_flight=2",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:39:50Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T23:44:34Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=1075 lane=m1-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:45:04Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T23:51:35Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-12T23:57:24Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=49174 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-12T23:57:29Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=49174 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-12T23:56:50.600682+00:00 age=41...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-12T23:57:37Z",
+   "vm": ""
+  },
+  {
+   "detail": "tier=0 label=pulp-build-merge-group demand=1 peer_cover=1 local_cover=0 excess=0 studio-host-m3-4:free=0,in_flight=1",
+   "event": "fallback_hold",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-12T23:58:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:01:11Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:02:21Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=57272 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:04:43Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 27.9s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:05:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=60475 lane=m1-spectr-gate generation=unknown started_at=2026-10-13T00:05:04.778957+00:00 age=13....",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:05:23Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=60475 lane=m1-spectr-gate generation=unknown started_at=2026-10-13T00:05:04.778957+00:00 age=29....",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:05:58Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:06:00Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=83s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:08:02Z",
+   "vm": "m1-pulp-gate-01-9867-6"
+  },
+  {
+   "detail": "consecutive=2 running=1/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:08:36Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=1/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=82142 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:11:01Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=1/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=82142 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:09:38.535830+00:00 age=97...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:11:25Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=1/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=82142 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:09:38.535830+00:00 age=11...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:11:56Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:13:44Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=15397 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:14:49Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=15397 lane=m1-vellum-gate generation=unknown started_at=2026-10-13T00:14:01.563219+00:00 age=52....",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:15:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:15:11Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:16:20Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=38270 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:16:05.882551+00:00 age=15...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:18:43Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=38270 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:16:05.882551+00:00 age=15...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:18:44Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:19:11Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=6 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=44379 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-13T00:19:06.367203+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:20:57Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:21:22Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=48166 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:21:45Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=6 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 0.3s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:21:53Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=6 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=48166 lane=m1-forge-gate generation=unknown started_at=2026-10-13T00:21:19.607295+00:00 age=36.3...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:21:57Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=7 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:23:19Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=7 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=56600 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:24:34Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=7 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=56600 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:23:11.438892+00:00 age=96...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:24:54Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=8 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=64613 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:27:15Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:29:39Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:30:59Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=81155 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:31:30.568273+00:00 age=82...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:32:57Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:33:33Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=9 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=84653 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:33:35Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:34:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:35:13Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=90526 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:36:04Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=90526 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:34:58.883539+00:00 age=76...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:36:19Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=6 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:38:32Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner=unknown age=unkno...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:38:35Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=90526 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:34:58.883539+00:00 age=20...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:38:45Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan identity unproven, reading the queue anyway: timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s|queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:39:47Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=97258 lane=unknown generation=unknown started_at=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:39:54Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=3366 lane=m1-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:41:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=7 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:42:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=5701 lane=m1-vellum-gate generation=unknown started_at=2026-10-13T00:42:07.085472+00:00 age=48.5...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:43:07Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:43:07Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:43:34Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=15882 lane=m1-spectr-gate generation=unknown started_at=2026-10-13T00:45:45.429609+00:00 age=25....",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:46:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=15882 lane=m1-spectr-gate generation=unknown started_at=2026-10-13T00:45:45.429609+00:00 age=43....",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:46:32Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=5 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:46:39Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=6 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=27487 lane=m1-forge-gate generation=unknown started_at=2026-10-13T00:48:47.707181+00:00 age=39.8...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T00:49:33Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:50:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=46s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T00:57:22Z",
+   "vm": "m1-pulp-gate-01-9867-7"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T00:58:44Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=1/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=59488 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T00:58:40.813195+00:00 age=57...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T00:59:41Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=1/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=66075 lane=unknown generation=unknown started_at=unknown age=unknown",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T00:59:49Z",
+   "vm": ""
+  },
+  {
+   "detail": "2026-10-13 01:01:30Z: Running job: macos",
+   "event": "job_assigned",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:02:55Z",
+   "vm": "m1-pulp-gate-01-9867-7"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head source=parallel age=26s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:04:40Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-1"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-tagged",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:12:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-tagged source=parallel age=17s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:14:26Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-2"
+  },
+  {
+   "detail": "rc=1 unregistered=true reason=revalidation_failed error=active workflow runs failed: gh api repos/Generous-Corp/pulp/actions/runs?status=in_progress&per_page=100&page=1 failed ...",
+   "event": "admission_error",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:14:27Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-2"
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-tagged",
+   "event": "admission_precheck",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:15:42Z",
+   "vm": ""
+  },
+  {
+   "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-release-tagged source=parallel age=36s",
+   "event": "admission_check",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:18:38Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-3"
+  },
+  {
+   "detail": "2026-10-13 01:19:57Z: Running job: CLI darwin-x64",
+   "event": "job_assigned",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:20:32Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-3"
+  },
+  {
+   "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }",
+   "event": "job_terminal_receipt",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:36:39Z",
+   "vm": "m1-pulp-gate-slot2-02-90094-3"
+  },
+  {
+   "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }",
+   "event": "job_terminal_receipt",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:37:19Z",
+   "vm": "m1-pulp-gate-01-9867-7"
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=8898 lane=m1-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:39:56Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:40:32Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=75526 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:43:50Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T01:44:01Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=75526 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T01:42:11.382807+00:00 age=11...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:44:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:45:16Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T01:46:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=99329 lane=m1-pulp-gate-slot2-02 generation=unknown started_at=2026-10-13T01:46:08.462093+00:00 ...",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T01:46:48Z",
+   "vm": ""
+  },
+  {
+   "detail": "",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:47:03Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:47:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:47:09Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:47:15Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T01:47:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "INT/TERM quarantine=none",
+   "event": "supervisor_signal",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T01:47:30Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:51:10Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=19352 lane=m1-forge-gate generation=unknown started_at=2026-10-13T01:51:24.737407+00:00 age=9.6s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T01:51:37Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner_pid=34808 lane=m1...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T01:56:18Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=34808 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T01:54:11.126104+00:00 age=18...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T01:57:17Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 29.5s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T01:57:19Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=assignment scan failed closed: timeout: the observation ran out of time: GitHub API failed for repos/Generous-...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-slot2-02",
+   "ts": "2026-10-13T02:00:03Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock timed out; owner=unknown age=unkno...",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T02:00:08Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T02:00:56Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=1 running=0/2 detail=queue scan identity unproven, reading the queue anyway: timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s|queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-spectr-gate-01",
+   "ts": "2026-10-13T02:01:34Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=85025 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T02:01:51.870045+00:00 age=83...",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T02:03:19Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=2 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=85025 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T02:01:51.870045+00:00 age=13...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T02:04:07Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T02:06:14Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=3 running=0/2 detail=queue scan failed (tart-macos): lock_contention: another observation held the host queue lock: host queue observation lock timed out; owner_pid=12514 lane=m1-pulp-gate-01 generation=unknown started_at=2026-10-13T02:06:03.851567+00:00 age=52...",
+   "event": "scan_blind",
+   "runner": "m1-vellum-gate-01",
+   "ts": "2026-10-13T02:07:05Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=assignment scan failed closed: lock_contention: host queue observation lock backoff active for 28.9s",
+   "event": "scan_blind",
+   "runner": "m1-pulp-gate-01",
+   "ts": "2026-10-13T02:08:06Z",
+   "vm": ""
+  },
+  {
+   "detail": "consecutive=4 running=0/2 detail=queue scan failed (tart-macos): timeout: the observation ran out of time: queue_scan_github_api:timeout:timed out after 30s",
+   "event": "scan_blind",
+   "runner": "m1-forge-gate-01",
+   "ts": "2026-10-13T02:08:42Z",
+   "vm": ""
+  }
+ ],
+ "runs": [
+  {
+   "created_at": "2026-10-13T02:02:33Z",
+   "event": "pull_request",
+   "id": 38335002568,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T02:02:33Z",
+   "updated_at": "2026-10-13T02:03:24Z"
+  },
+  {
+   "created_at": "2026-10-13T02:01:29Z",
+   "event": "push",
+   "id": 38334917302,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T02:01:29Z",
+   "updated_at": "2026-10-13T02:09:54Z"
+  },
+  {
+   "created_at": "2026-10-13T01:53:01Z",
+   "event": "pull_request",
+   "id": 38334242969,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:53:01Z",
+   "updated_at": "2026-10-13T04:36:53Z"
+  },
+  {
+   "created_at": "2026-10-13T01:50:28Z",
+   "event": "pull_request",
+   "id": 38334044141,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:50:28Z",
+   "updated_at": "2026-10-13T03:03:59Z"
+  },
+  {
+   "created_at": "2026-10-13T01:48:07Z",
+   "event": "pull_request",
+   "id": 38333858208,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:48:07Z",
+   "updated_at": "2026-10-13T02:19:12Z"
+  },
+  {
+   "created_at": "2026-10-13T01:46:19Z",
+   "event": "pull_request",
+   "id": 38333715657,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:46:19Z",
+   "updated_at": "2026-10-13T01:50:51Z"
+  },
+  {
+   "created_at": "2026-10-13T01:44:48Z",
+   "event": "merge_group",
+   "id": 38333588883,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:44:48Z",
+   "updated_at": "2026-10-13T02:09:19Z"
+  },
+  {
+   "created_at": "2026-10-13T01:42:33Z",
+   "event": "push",
+   "id": 38333415263,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:42:33Z",
+   "updated_at": "2026-10-13T04:13:30Z"
+  },
+  {
+   "created_at": "2026-10-13T01:38:56Z",
+   "event": "pull_request",
+   "id": 38333128864,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:38:56Z",
+   "updated_at": "2026-10-13T02:08:43Z"
+  },
+  {
+   "created_at": "2026-10-13T01:38:54Z",
+   "event": "merge_group",
+   "id": 38333126777,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:38:54Z",
+   "updated_at": "2026-10-13T01:39:40Z"
+  },
+  {
+   "created_at": "2026-10-13T01:38:54Z",
+   "event": "push",
+   "id": 38333126241,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:38:54Z",
+   "updated_at": "2026-10-13T01:42:34Z"
+  },
+  {
+   "created_at": "2026-10-13T01:26:05Z",
+   "event": "merge_group",
+   "id": 38332110487,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:26:05Z",
+   "updated_at": "2026-10-13T02:00:54Z"
+  },
+  {
+   "created_at": "2026-10-13T01:22:56Z",
+   "event": "pull_request",
+   "id": 38331860507,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:22:56Z",
+   "updated_at": "2026-10-13T04:00:02Z"
+  },
+  {
+   "created_at": "2026-10-13T01:22:42Z",
+   "event": "pull_request",
+   "id": 38331840346,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:22:42Z",
+   "updated_at": "2026-10-13T02:03:06Z"
+  },
+  {
+   "created_at": "2026-10-13T01:20:13Z",
+   "event": "pull_request",
+   "id": 38331639241,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:20:13Z",
+   "updated_at": "2026-10-13T03:22:11Z"
+  },
+  {
+   "created_at": "2026-10-13T01:18:53Z",
+   "event": "pull_request",
+   "id": 38331531573,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:18:53Z",
+   "updated_at": "2026-10-13T01:53:46Z"
+  },
+  {
+   "created_at": "2026-10-13T01:16:10Z",
+   "event": "pull_request",
+   "id": 38331313667,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:16:10Z",
+   "updated_at": "2026-10-13T01:24:35Z"
+  },
+  {
+   "created_at": "2026-10-13T01:13:18Z",
+   "event": "pull_request",
+   "id": 38331083628,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:13:18Z",
+   "updated_at": "2026-10-13T03:25:05Z"
+  },
+  {
+   "created_at": "2026-10-13T01:12:14Z",
+   "event": "pull_request",
+   "id": 38331000348,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:12:14Z",
+   "updated_at": "2026-10-13T02:46:32Z"
+  },
+  {
+   "created_at": "2026-10-13T01:10:47Z",
+   "event": "pull_request",
+   "id": 38330884700,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:10:47Z",
+   "updated_at": "2026-10-13T01:11:41Z"
+  },
+  {
+   "created_at": "2026-10-13T01:10:45Z",
+   "event": "pull_request",
+   "id": 38330881932,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:10:45Z",
+   "updated_at": "2026-10-13T01:11:20Z"
+  },
+  {
+   "created_at": "2026-10-13T01:09:44Z",
+   "event": "merge_group",
+   "id": 38330795441,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:09:44Z",
+   "updated_at": "2026-10-13T01:38:49Z"
+  },
+  {
+   "created_at": "2026-10-13T01:09:44Z",
+   "event": "merge_group",
+   "id": 38330796232,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:09:44Z",
+   "updated_at": "2026-10-13T01:42:00Z"
+  },
+  {
+   "created_at": "2026-10-13T01:09:43Z",
+   "event": "push",
+   "id": 38330794502,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:09:43Z",
+   "updated_at": "2026-10-13T01:38:55Z"
+  },
+  {
+   "created_at": "2026-10-13T01:08:01Z",
+   "event": "pull_request",
+   "id": 38330657735,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:08:01Z",
+   "updated_at": "2026-10-13T02:56:59Z"
+  },
+  {
+   "created_at": "2026-10-13T01:07:05Z",
+   "event": "pull_request",
+   "id": 38330582318,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:07:05Z",
+   "updated_at": "2026-10-13T02:21:02Z"
+  },
+  {
+   "created_at": "2026-10-13T01:05:47Z",
+   "event": "merge_group",
+   "id": 38330476331,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:05:47Z",
+   "updated_at": "2026-10-13T01:30:52Z"
+  },
+  {
+   "created_at": "2026-10-13T01:01:44Z",
+   "event": "merge_group",
+   "id": 38330147667,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:01:44Z",
+   "updated_at": "2026-10-13T01:27:10Z"
+  },
+  {
+   "created_at": "2026-10-13T01:00:37Z",
+   "event": "pull_request",
+   "id": 38330050412,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T01:00:37Z",
+   "updated_at": "2026-10-13T01:12:46Z"
+  },
+  {
+   "created_at": "2026-10-13T00:52:27Z",
+   "event": "pull_request",
+   "id": 38329383340,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:52:27Z",
+   "updated_at": "2026-10-13T01:37:20Z"
+  },
+  {
+   "created_at": "2026-10-13T00:51:35Z",
+   "event": "pull_request",
+   "id": 38329311093,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:51:35Z",
+   "updated_at": "2026-10-13T01:16:11Z"
+  },
+  {
+   "created_at": "2026-10-13T00:41:52Z",
+   "event": "pull_request",
+   "id": 38328520568,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:41:52Z",
+   "updated_at": "2026-10-13T01:05:17Z"
+  },
+  {
+   "created_at": "2026-10-13T00:41:32Z",
+   "event": "merge_group",
+   "id": 38328493394,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:41:32Z",
+   "updated_at": "2026-10-13T00:59:27Z"
+  },
+  {
+   "created_at": "2026-10-13T00:39:12Z",
+   "event": "pull_request",
+   "id": 38328301628,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:39:12Z",
+   "updated_at": "2026-10-13T02:20:39Z"
+  },
+  {
+   "created_at": "2026-10-13T00:37:56Z",
+   "event": "pull_request",
+   "id": 38328199060,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:37:56Z",
+   "updated_at": "2026-10-13T01:38:31Z"
+  },
+  {
+   "created_at": "2026-10-13T00:35:43Z",
+   "event": "merge_group",
+   "id": 38328020645,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:35:43Z",
+   "updated_at": "2026-10-13T01:09:23Z"
+  },
+  {
+   "created_at": "2026-10-13T00:32:57Z",
+   "event": "pull_request",
+   "id": 38327791251,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:32:57Z",
+   "updated_at": "2026-10-13T01:01:09Z"
+  },
+  {
+   "created_at": "2026-10-13T00:31:07Z",
+   "event": "push",
+   "id": 38327635635,
+   "name": "Build and Test",
+   "run_started_at": "2026-10-13T00:31:07Z",
+   "updated_at": "2026-10-13T01:09:45Z"
+  }
+ ],
+ "source": "m1 lane event logs (macos-fleet/{pulp-gate,pulp-gate-slot2,forge-gate,spectr-gate,vellum-gate}/events.jsonl), 2026-10-12T20:00Z-2026-10-13T02:10Z, serving-relevant events only; and every self-hosted job of the Generous-Corp/pulp Build and Test runs created 2026-10-13 00:30-02:06Z (filter=latest), read 2026-10-13 ~17:10Z, with those runs (id, name, event, created_at). A job was queued at time T when created_at <= T < started_at."
+}

@@ -1,0 +1,802 @@
+{
+  "schema": 1,
+  "purpose": "Why a fleet state exists, for the states where the honest answer is counterintuitive and the intuitive fix is destructive. Keyed by the reason codes fleet_doctor emits; every code carries a row and every row is cited by a code.",
+  "reasons": {
+    "agents_dir_unreadable": {
+      "summary": "The LaunchAgent directory could not be listed.",
+      "why": "Every generation, delivery and drain fact is read from installed LaunchAgents. With the directory unreadable there is no evidence at all, which is reported as unknown rather than as an empty host.",
+      "remedy": "Check the path and its permissions, then re-run. Treat every other finding in this run as unverified.",
+      "do_not": "Do not read an unreadable agents directory as a host with no agents."
+    },
+    "census_complete": {
+      "summary": "Both registration scopes were read.",
+      "why": "Runners register at repository scope or at organization scope, and the repository endpoint omits organization runners without saying so. Only a census that read both can be quoted as capacity."
+    },
+    "census_identity_authenticated": {
+      "summary": "The capacity census CLI reaches GitHub as an authenticated identity.",
+      "why": "Only an authenticated identity can read runner registrations reliably; the check reads the free rate_limit endpoint with the census's own repository binding."
+    },
+    "census_identity_unauthenticated": {
+      "summary": "The capacity census CLI reaches GitHub anonymously (60/hour ceiling).",
+      "why": "An anonymous census shares one 60/hour allowance with every host behind the same IP, runs it out within minutes of a --plan loop, and then reports every required label as capacity unknown, which refuses pool drain/off.",
+      "remedy": "Run with TARTCI_GH_CLI=ghapp (the default when ghapp is installed), or repair the CLI's GitHub login.",
+      "do_not": "Do not change GitHub App permissions or org settings for this; the identity, not the permission, is wrong."
+    },
+    "census_identity_unknown": {
+      "summary": "The census CLI did not report a core rate-limit ceiling, so its identity is unproven.",
+      "why": "A CLI that will not answer the free rate_limit probe leaves the identity unproven; that is neither authenticated nor anonymous.",
+      "remedy": "Run `<cli> api rate_limit` by hand with GH_REPO=<repo> to see what it returns."
+    },
+    "census_incomplete": {
+      "summary": "A registration scope could not be read.",
+      "why": "The scope that failed is exactly where a missing runner might live, so a label absent from an incomplete census is unknown, never unserved. A smaller number reads as a confident finding and is the more dangerous error.",
+      "remedy": "Restore access to the failed endpoint and re-run before making any capacity decision.",
+      "do_not": "Do not quote the partial count as the runner population."
+    },
+    "census_module_unavailable": {
+      "summary": "The dual-scope census module is absent from this support root.",
+      "why": "Reading only the repository endpoint would produce a confident undercount, so no census is reported rather than a single-scope one.",
+      "remedy": "Install a support generation that carries scripts/runner_census.py, or pass --no-census to state that capacity was deliberately not measured."
+    },
+    "census_repo_unknown": {
+      "summary": "No managed lane declares a runner repository.",
+      "why": "Census targets are derived from each installed lane's own TARTCI_RUNNER_REPO, because the plist is what launchd hands the supervisor. With none declared there is no target to measure.",
+      "remedy": "Pass --repo OWNER/REPO explicitly, or check that the installed lane plists still carry their runner environment."
+    },
+    "delivery_unknown": {
+      "summary": "Some agent declares no resolvable program.",
+      "why": "Whether a staged generation reaches this host depends entirely on what its agents exec. An agent whose program cannot be resolved makes the answer unknown for the whole host.",
+      "remedy": "Inspect the named LaunchAgent's ProgramArguments before planning a deploy.",
+      "do_not": "Do not start a deploy on the assumption that the unresolved agent behaves like its siblings."
+    },
+    "disk_axis_unread": {
+      "summary": "The home volume could not be read for at least a reclaim cadence, so VM admissions skipped it.",
+      "why": "The axis fails open so a probe failure never becomes an outage, and must therefore never fail silently.",
+      "remedy": "Check the path in unread_reason and the volume's mount; disk_axis_unread events in the supervisor log show each skipped admission.",
+      "do_not": "Do not read an unread axis as a healthy volume."
+    },
+    "disk_floor_refusing": {
+      "summary": "VM admissions have been refused below the home-volume floor as many times in a row as this host has lanes.",
+      "why": "A floor that denies everything looks exactly like a full disk from outside, so a streak needs a person: either the volume is full or the computed floor is wrong.",
+      "remedy": "Read ~/.tartci/state/leases/home-volume.json (free, floor, fill rate); reclaim the volume (tartci reclaim, clean_build_cov.sh) or set TARTCI_HOME_VOLUME_FLOOR=0 on the lane while investigating.",
+      "do_not": "Do not raise the floor's cap or delete running jobs' files to clear it."
+    },
+    "effective_generation_matches": {
+      "summary": "Every managed agent executes the cohort the receipt records as installed.",
+      "why": "Installed and effective are separate facts. They agree here, which is the only state in which a receipt can be read as a statement about what runs."
+    },
+    "effective_generation_mismatch": {
+      "summary": "The host executes a different cohort than the one it records as installed.",
+      "why": "Staging a generation writes a receipt whether or not anything execs it. A host in this state runs old code while every receipt, exit code and status line reports the new one, so the fix an operator believes they shipped was never delivered.",
+      "remedy": "Deliver the cohort by the route this host actually execs, then re-run and confirm effective matches installed. For a sealed launcher host see sealed_launcher_bundle.",
+      "do_not": "Do not treat the install receipt, or a zero exit from the installer, as evidence that the new code is running."
+    },
+    "fleet_not_ready": {
+      "summary": "The authoritative support root reports the fleet not ready.",
+      "why": "The named problem code is the machine-readable cause and is the thing to act on; the word NO by itself has sent operators to rebuild parts that were never broken.",
+      "remedy": "Act on the reported problem code, not on the readiness verdict."
+    },
+    "fleet_ready": {
+      "summary": "The installed generation reports the fleet ready.",
+      "why": "Readiness is reported from the installed generation because that is the tree the running supervisors execute."
+    },
+    "gate_reserve_fits": {
+      "summary": "Every gate lane's slots fit together inside this host's gate reserve.",
+      "why": "Agent builds may hold every core outside the reserve; slots that fit inside it can always run together.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not grow a gate lane without re-reading this line."
+    },
+    "gate_reserve_not_applicable": {
+      "summary": "No installed fleet profile on this host.",
+      "why": "Only a managed fleet host has gate lanes to fit.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not install a fleet profile only to clear this."
+    },
+    "gate_reserve_overcommitted": {
+      "summary": "A gate lane's slots together need more cores or memory than this host's gate reserve.",
+      "why": "With agent builds holding the rest of the host, the second slot is lease-denied while jobs queue (m3 2026-10-04, #373: 2 x 12 cores against 14).",
+      "remedy": "A profile decision with the host's owner: fewer gate slots, smaller VMs, or a larger reserve. Self-update refuses only a profile that makes it worse; it never resizes on its own.",
+      "do_not": "Do not take agent cores to fit gate VMs, and do not resize from this finding without the owner."
+    },
+    "gate_reserve_unknown": {
+      "summary": "The gate-reserve fit could not be computed (host profile or installed profile unreadable).",
+      "why": "An uncomputed fit is not a fitting one.",
+      "remedy": "Run `tartci host-profile --json` and `tartci fleet-macos validate <profile> --check-reserve` on the host.",
+      "do_not": "Do not read unknown as fits."
+    },
+    "generation_path_exec": {
+      "summary": "Agents exec a generation path directly, so a staged generation reaches them.",
+      "why": "This is the delivery shape in which install means what it appears to mean: the next generation replaces what execs."
+    },
+    "hold_receipt_malformed": {
+      "summary": "The held-idle receipt could not be read, or is not exactly held-idle.",
+      "why": "The receipt is compared exactly. A near-miss is not a weaker yes, it is a no, and drain will refuse on it.",
+      "remedy": "Resolve the file's state before attempting a drain.",
+      "do_not": "Do not write the receipt by hand to make this pass. See persistent_runners_without_hold_receipt."
+    },
+    "hold_receipt_present": {
+      "summary": "Persistent listeners are covered by an exact held-idle receipt.",
+      "why": "The receipt authorizes exactly one drain era and is invalidated when the pool reopens."
+    },
+    "home_volume_floor_not_judged": {
+      "summary": "No VM admission has judged the home volume.",
+      "why": "On a host whose Tart store is on the home volume, the store's own disk axis already judges it.",
+      "remedy": "Nothing to do unless the store is on another volume and leases have been taken.",
+      "do_not": "Do not read not-judged as ok on a host whose store is external."
+    },
+    "home_volume_floor_ok": {
+      "summary": "The home volume is judged at VM admission and is not refusing in a streak.",
+      "why": "The home volume holds supervisor temp files and build trees; a full one kills running supervisors (m5studio 2026-10-04).",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read one refusal as a problem; a refusal is the floor working."
+    },
+    "host_agents_failing": {
+      "summary": "A loaded watchdog or self-update agent last exited nonzero.",
+      "why": "Loaded is not running: an agent refused by the interpreter pin (exit 127) stays loaded and fails every start, so the host stops healing and updating while launchctl list still shows it.",
+      "remedy": "Read the agent's log under ~/Library/Logs/tartci; for exit 127 read ~/.tartci/state/interpreter-refused and ~/.config/tartci/python.pin, fix host.python and reinstall.",
+      "do_not": "Do not kickstart it in a loop; the next start fails the same way until the cause is fixed."
+    },
+    "host_agents_missing": {
+      "summary": "This managed fleet host is missing the launchd watchdog or the self-update agent.",
+      "why": "A host brought up without them serves jobs but never heals lanes, never refreshes skew or tool freshness, and never updates tartci, Shipyard or the pulp CLI, so it drifts unnoticed (m5studio ran with no watchdog).",
+      "remedy": "Install the watchdog from launchd/README.md (render com.danielraffel.tartci.launchd-watchdog.plist.template with TART_HOME and HOME, bootstrap, kickstart) and the self-update agent with scripts/install_self_update_agent.sh --install.",
+      "do_not": "Do not copy another host's plist; render the template with this host's TART_HOME."
+    },
+    "host_agents_not_applicable": {
+      "summary": "No installed fleet profile, so this is not a managed fleet host.",
+      "why": "Only managed fleet hosts are expected to carry the maintenance agents.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not install fleet agents on a host that is not in the fleet."
+    },
+    "host_agents_ok": {
+      "summary": "The launchd watchdog and self-update agents are loaded on this fleet host.",
+      "why": "They are what keeps a host healed, measured and current without anyone logging in.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read loaded as working; the watchdog's own log and last exit show whether its passes run."
+    },
+    "host_agents_unreadable": {
+      "summary": "launchd could not be asked which agents are loaded.",
+      "why": "Unknown is not the same as present.",
+      "remedy": "Run `launchctl list` as this user and re-run `tartci doctor fleet`.",
+      "do_not": "Do not read unreadable as ok."
+    },
+    "installed_generation_unknown": {
+      "summary": "Managed agents are installed but no readable receipt says which cohort they should execute.",
+      "why": "Without an installed identity there is nothing to compare the executed cohort against, so the comparison is unknown rather than passing by default.",
+      "remedy": "Restore or re-write the install receipt before judging what this host runs."
+    },
+    "lane_lease_never_fits": {
+      "summary": "A lane's VM is larger than the lease budget it is admitted against.",
+      "why": "The lease store would deny this VM even on an idle host, so the lane can never boot. It stops polling for work and says so instead of scanning the queue and asking Shipyard every minute for a VM it cannot start.",
+      "remedy": "Shrink the lane's VM (TARTCI_MACOS_VM_CORES / vm_pool_cores) to fit the budget, or give the host a larger lease universe. The finding names the requested cores and the budget.",
+      "do_not": "Do not disable the lease store or raise the gate reserve to make the lane boot; the budget exists to keep agent cores."
+    },
+    "lane_python_no_tomllib": {
+      "summary": "python3 on a lane's PATH cannot import tomllib.",
+      "why": "Lanes run gate_supply decide (gate placement), macos_fleet_lanes render and host_profile with a bare python3. That works only while the lane PATH resolves python3 to a 3.11+ interpreter, normally Homebrew's. Here it resolves to one without tomllib, usually macOS's /usr/bin/python3 3.9, so those helpers die on import tomllib inside the lane.",
+      "remedy": "Install or repair a Python 3.11+ at a PATH entry ahead of /usr/bin in the lane plist (Homebrew's /opt/homebrew/bin/python3), then re-run the doctor. The finding names the interpreter and version it found.",
+      "do_not": "Do not edit the helpers to tolerate a missing tomllib: they read the fleet profile, and a guess in its place is a mis-placed gate."
+    },
+    "lane_python_not_applicable": {
+      "summary": "No installed lane plist names a PATH.",
+      "why": "There are no fleet lanes on this host (or none sets PATH), so no lane runs a bare python3 to check.",
+      "remedy": "Nothing, unless this host should run lanes; then install the fleet profile.",
+      "do_not": "Do not read this as the lane python being fine: nothing was probed."
+    },
+    "lane_python_tomllib": {
+      "summary": "python3 on every lane PATH imports tomllib.",
+      "why": "Each distinct lane PATH was resolved the way a shell would and its python3 run once; each reported a tomllib-capable version.",
+      "remedy": "Nothing.",
+      "do_not": "Do not take this as covering an interactive ssh shell: its PATH differs from the lane plist's."
+    },
+    "lane_python_unknown": {
+      "summary": "The lane python3 could not be probed.",
+      "why": "The LaunchAgents directory was unreadable, or a lane's python3 was found but failed to run the probe, so whether it imports tomllib is not known.",
+      "remedy": "Run the named interpreter by hand with the lane PATH and fix whatever the error says, then re-run the doctor.",
+      "do_not": "Do not read an unprobed interpreter as a working one."
+    },
+    "lanes_exceed_lease_capacity": {
+      "summary": "More identical lanes are installed than the lease budget can run at once.",
+      "why": "A lane beyond the budget's capacity can only boot while a sibling is idle, and then the sibling would have served. It adds queue polling and admission calls but no concurrent capacity (m5: two 12-core gate lanes in a 14-core universe). While a sibling holds a VM the extra lane waits locally without scanning or asking Shipyard.",
+      "remedy": "Remove the extra lane from the host's fleet profile, or size the VMs so the budget holds every lane at once.",
+      "do_not": "Do not treat the extra lane as spare capacity when planning the fleet."
+    },
+    "launchd_registration_leaked": {
+      "summary": "A loaded tartci LaunchAgent was registered from a plist outside this account's ~/Library/LaunchAgents.",
+      "why": "launchd's gui/<uid> domain is keyed by uid, not HOME. An installer run with a temporary HOME (a test, a script) bootstraps its temp plist into the real domain, and that label then SHADOWS the real agent: on m3 the disk reclaimer ran a deleted temp copy and exited 127 hourly for a day while every 'is it loaded' view said yes and the volume filled.",
+      "remedy": "Boot out the leaked label (`tartci launchd reload <label>` or an operator bootout), then re-register the real plist from ~/Library/LaunchAgents (for the reclaimer: scripts/install_reclaim_agent.sh --install). Find what registered it; installers now refuse a non-account HOME.",
+      "do_not": "Do not read 'loaded' as 'the right job is loaded'. Do not delete the real plist in ~/Library/LaunchAgents."
+    },
+    "launchd_registrations_ok": {
+      "summary": "Every loaded tartci LaunchAgent came from this account's ~/Library/LaunchAgents.",
+      "why": "Only a job loaded from the account's own agents directory is the job its installer and every status view describe."
+    },
+    "launchd_registrations_unreadable": {
+      "summary": "launchd could not be asked which tartci jobs are loaded.",
+      "why": "Without launchctl there is no way to see a shadowing registration, so this is unknown rather than clean.",
+      "remedy": "Run `launchctl list` as the host's account; on a non-macOS host this is expected."
+    },
+    "launchd_timers_never": {
+      "summary": "No interval guard receipt on this host yet.",
+      "why": "A host whose supervisors predate the guard, or whose pool has been off since it shipped, has never run it.",
+      "remedy": "Self-update the host; the supervisors start the guard."
+    },
+    "launchd_timers_not_running": {
+      "summary": "The interval guard's receipt is older than ten minutes.",
+      "why": "The guard runs inside the lane supervisors, so no running supervisor means no guard. Reported as unknown rather than a problem: a host with its pool off has no supervisors by design.",
+      "remedy": "Check the lane supervisors (`tartci pool status`); when they run, the guard writes a receipt within a minute."
+    },
+    "launchd_timers_ok": {
+      "summary": "launchd is starting the fleet's timer jobs on its own.",
+      "why": "The interval guard compares each StartInterval agent's run counter with its interval every minute, and no two agents have gone twice their interval without launchd starting them."
+    },
+    "launchd_timers_stalled": {
+      "summary": "macOS launchd stopped starting timer jobs, likely a stalled automatic macOS install; the supervisor is starting them; a reboot clears it.",
+      "why": "On m3 (2026-10-04) a macOS automatic install that never finished left launchd refusing every non-demand spawn: StartInterval agents showed `pended nondemand spawn = interval` with frozen run counters for 16 h, and a lane that exited was not respawned for an hour. Lane supervisors started before the stall kept serving, so nothing else looked down. The interval guard inside the supervisors kicks each overdue agent with `launchctl kickstart`, which still works, and keeps this finding open while launchd itself starts nothing. Self-update is paused for the episode: an update stops every supervisor, so no guard would run and a lane restart left to launchd would pend unattended. A reboot resumes it.",
+      "remedy": "Reboot the host when its lanes are idle (or let the pending macOS install finish); the finding clears once launchd starts the timers on its own. Until then the guard keeps them running: see interval_agent_kicked events in ~/.tartci/state/launchd-interval-guard/events.jsonl.",
+      "do_not": "Do not read `serving: ok` or a loaded label as proof that launchd still runs the host's timers, and do not bootout/bootstrap lanes to fix it: a re-bootstrapped agent is a non-demand spawn and pends."
+    },
+    "launchd_timers_unreadable": {
+      "summary": "The interval guard's receipt could not be read.",
+      "why": "An unparseable receipt is not evidence that launchd is healthy.",
+      "remedy": "Inspect ~/.tartci/state/launchd-interval-guard/status.json; the next pass rewrites it atomically."
+    },
+    "launcher_layout_not_applicable": {
+      "summary": "No launch helper is installed on this host.",
+      "why": "Only a host whose Tart store is on an external volume runs a sealed launcher, v1 or v2.",
+      "remedy": "Nothing to do. A v2 opt-in file here has no effect.",
+      "do_not": "Do not create the v2 opt-in file to make a host sealed; the profile's launch_helper decides that."
+    },
+    "launcher_layout_unreadable": {
+      "summary": "The install receipt or the v2 opt-in file could not be read.",
+      "why": "The layout comes from the receipt and the opt-in file; without them the doctor cannot say which launcher runs.",
+      "remedy": "Run `tartci pool status` and read ~/.config/tartci/macos-fleet-install.json by hand.",
+      "do_not": "Do not read unreadable as v1."
+    },
+    "launcher_layout_v1": {
+      "summary": "The host runs launcher v1: the support tree and lanes are sealed in the app.",
+      "why": "v1 is the default; a host moves to v2 only through its opt-in file and a reinstall.",
+      "remedy": "Nothing to do. With the opt-in present, the next install moves the host to v2.",
+      "do_not": "Do not create the opt-in file before the install dry run for the move has been reviewed."
+    },
+    "launcher_layout_v2": {
+      "summary": "The host runs launcher v2: a stable app running the signed launch set the pointer names.",
+      "why": "v2 keeps the app's bytes, and so its Removable Volumes grant, across ordinary updates.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not edit the pointer or the launch set by hand; an install publishes both."
+    },
+    "launcher_opt_in_missing": {
+      "summary": "The host runs launcher v2 but its opt-in file is gone.",
+      "why": "A layout never flips back silently, so the next install refuses rather than reinstalling v1.",
+      "remedy": "Restore the file (touch it, mode 600) to keep v2, or install with --launcher-layout v1 to go back deliberately; that is a launcher change and needs its approval and the Removable Volumes grant.",
+      "do_not": "Do not reinstall without deciding which layout the host should run."
+    },
+    "launcher_opt_in_refused": {
+      "summary": "The v2 opt-in file is not a regular file owned by this user, or is group- or world-writable.",
+      "why": "Anything else could be planted by another account; it is refused rather than read as either answer.",
+      "remedy": "Remove it and create it again as this user with mode 600.",
+      "do_not": "Do not loosen the check; fix the file."
+    },
+    "lease_fit_ok": {
+      "summary": "Every measured lane can lease its VM, and identical lanes can run together.",
+      "why": "Each lane records its own lease-fit verdict against the lease store's capacity model."
+    },
+    "lease_fit_unmeasured": {
+      "summary": "No lane has recorded a lease-fit verdict yet.",
+      "why": "Lanes write the verdict each poll; a host whose supervisors predate lease-fit, or that has not polled since install, has none.",
+      "remedy": "Wait one poll after the lanes start, or update the host's tartci."
+    },
+    "no_installed_profile": {
+      "summary": "This host has no installed macOS fleet profile.",
+      "why": "Only a host that installed a fleet profile can drift from its checked-in source; the check has nothing to compare here."
+    },
+    "no_managed_launchagents": {
+      "summary": "No managed fleet LaunchAgent is installed.",
+      "why": "With no receipt either, this host is simply not a managed fleet host. With a receipt present it is a real fault: something records a cohort that nothing executes.",
+      "remedy": "If a receipt exists, install the fleet lanes or remove the stale receipt."
+    },
+    "no_persistent_runners": {
+      "summary": "No persistent Actions listener is installed, so drain terminalizes on provider agents alone.",
+      "why": "Ephemeral providers finish their current job and then wait at the admission gate, which is a safe local drain primitive. Only a stock persistent listener lacks one."
+    },
+    "peer_reachability_ok": {
+      "summary": "Every peer was readable at this host's last self-update survey."
+    },
+    "peer_reachability_unreadable": {
+      "summary": "This host's record of unreachable peers could not be read.",
+      "why": "Without it the doctor cannot say which peers are dark or whether one has stopped holding the update turn. The next self-update survey rewrites the record.",
+      "remedy": "Wait for the next self-update attempt (every 30 min), or run `tartci fleet-macos self-update --plan` to read every peer now."
+    },
+    "peer_unreachable": {
+      "summary": "A peer's pool status could not be read at this host's last self-update survey, so it still blocks this host's update turn.",
+      "why": "An unreadable peer may be mid-update, so it counts as busy and no host updates while it is dark. It stops holding the turn only after 4 consecutive unreadable reads over at least 3 h (the age at which a peer's update marker already counts as stale), with this host reading a majority of the fleet and every readable peer also unable to read it within the last hour. A peer that flaps between readable and unreadable never meets that and keeps blocking; self_update_starved reports it after 6 h.",
+      "remedy": "Reach the peer: ssh to it and run `tartci pool status --json`. If the machine is asleep, off, or off the network, it needs someone at it.",
+      "do_not": "Do not remove the peer from the published supply to unblock updates: that also drops its lanes from the capacity floor's view while they may still be running."
+    },
+    "peer_unreachable_excluded": {
+      "summary": "A peer has been unreachable long enough that it no longer holds the update turn: the other hosts update without it.",
+      "why": "It was unreadable for 4 consecutive reads over at least 3 h, this host read a majority of the fleet, and every readable peer also failed to read it within the last hour. A peer read holding an update marker that old already counts as not updating, so the dark peer is trusted no more than a stale one. It still serves nothing for the capacity floor, so a drain that would leave a required label unserved still refuses. It rejoins on its first readable read (peer_unreachable_rejoined).",
+      "remedy": "Bring the peer back: it needs someone at the machine if ssh times out. Nothing on this host needs to change; the exclusion ends by itself when the peer answers.",
+      "do_not": "Do not treat the excluded peer as serving: its lanes take no jobs while it is dark."
+    },
+    "pf_not_applicable": {
+      "summary": "This host has no VM lanes, so there is no VM network for pf to hold up."
+    },
+    "pf_boot_holder_missing": {
+      "summary": "pf holds a reference now, but this host has lost it before and nothing takes one at boot, so the next reboot loses the VM network again.",
+      "why": "A reboot drops every pf enable reference. Most hosts get one back from something else and never notice; a host whose breaker history records a pfd_crash_loop outage has proven it does not. m5 lost its VM network after reboots on 2026-10-07 and 2026-10-09 until a boot-time holder was installed.",
+      "remedy": "On the host, from the tartci checkout: `sudo scripts/install_pf_enable_ref.sh` (plan), then `sudo scripts/install_pf_enable_ref.sh --install`. It installs /Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist (root:wheel 0644), which runs `/sbin/pfctl -E` at each boot and keeps the token (the undo key, `sudo pfctl -X <token>`) in /var/run/pf-enable-ref.token; bootstrapping it takes a reference now too. It verifies launchd ran it with exit 0 and the token exists. Then `tartci vm-dhcp probe-now`, and `tartci doctor fleet` reads pf_reference_ok naming the holder.",
+      "do_not": "Do not settle for a hand-run `sudo pfctl -E`: it does not survive the next reboot. Never `pfctl -d`."
+    },
+    "pf_pfd_exiting": {
+      "summary": "pfd keeps exiting with a code other than 3 on a host that shares its network with VMs.",
+      "why": "InternetSharing waits on pfd before it creates the VM network. Exit 3 is the known no-reference fault; any other non-zero exit with pfd not running is a pfd failure this check has not seen before.",
+      "remedy": "Read `launchctl print system/com.apple.pfd` and `log show --last 10m --predicate 'process == \"pfd\"'` on the host, and compare with the VM DHCP breaker (`tartci doctor fleet`, vm_dhcp)."
+    },
+    "pf_reference_missing": {
+      "summary": "pf holds no enable reference on a host that shares its network with VMs, so pfd exits 3 and InternetSharing never creates the VM network.",
+      "why": "InternetSharing asks pfd for packet-filter state before it creates bridge100; with no pf enable reference pfd logs \"no pf starter references held\" and exits 3, so every VM boots without an address. pf's state needs root to read, but pfd's launchd record does not: healthy is running or an idle exit 0, this fault is exit 3 with a climbing run count. A reboot drops every reference, which is how m5 lost its VM network on 2026-10-07 and 2026-10-09.",
+      "remedy": "On the host, from the tartci checkout: `sudo scripts/install_pf_enable_ref.sh` (plan), then `sudo scripts/install_pf_enable_ref.sh --install`. It installs /Library/LaunchDaemons/com.danielraffel.pf-enable-ref.plist (root:wheel 0644), which runs `/sbin/pfctl -E` at each boot and keeps the token (the undo key, `sudo pfctl -X <token>`) in /var/run/pf-enable-ref.token; bootstrapping it takes a reference now too. It verifies launchd ran it with exit 0 and the token exists. Then `tartci vm-dhcp probe-now`, and `tartci doctor fleet` reads pf_reference_ok naming the holder.",
+      "do_not": "Never `pfctl -d`: it drops every holder's references. Never kickstart com.apple.NetworkSharing: System Integrity Protection refuses it (error 150)."
+    },
+    "pf_reference_ok": {
+      "summary": "pfd is healthy (running, or idle-exited 0), so pf holds an enable reference and InternetSharing can create the VM network."
+    },
+    "pf_reference_unknown": {
+      "summary": "pfd's launchd record could not be read.",
+      "why": "An unreadable pfd record is not evidence that pf holds a reference.",
+      "remedy": "Run `launchctl print system/com.apple.pfd` on the host."
+    },
+    "persistent_runners_without_hold_receipt": {
+      "summary": "Drain will refuse, and it refuses after the host is already opted out.",
+      "why": "A stock persistent Actions listener has no safe local drain primitive: worker absence misses the interval between a job being accepted and its worker spawning, so stopping on that evidence can kill a running job. Draining safely requires removing the host from routing and publishing a held-idle receipt only once the scheduler reports every persistent runner idle. No supported producer ships that receipt today. Drain writes participation=0 and pool-state=draining before it discovers this, so a refusal leaves the host opted out with its agents still loaded.",
+      "remedy": "Do not begin a drain on this host. If one has already refused, return the host to service with tartci pool on, which also invalidates any stale hold receipt.",
+      "do_not": "Do not create the held-idle receipt by hand. It asserts that a scheduler observed every persistent runner idle. Writing it locally asserts an observation nothing made, and authorizes stopping a listener that may be holding a live job."
+    },
+    "profile_drift": {
+      "summary": "The installed fleet profile differs from the checked-in profile with the same name.",
+      "why": "Every receipt check verifies the installed copy against itself, so a host edited in place, or installed before the checked-in profile moved on, passes all of them while running settings nobody reviewed (for example a missing github_api_timeout_seconds silently reverting to the 15-second default).",
+      "remedy": "Decide which side is right. Reinstall from the checked-in profile with `tartci fleet-macos install <profile> --apply` (drain first), or commit the host's edit to profiles/.",
+      "do_not": "Do not hand-edit the installed profile to match; the receipt and rendered plists would then disagree with it."
+    },
+    "profile_drift_unknown": {
+      "summary": "The installed profile could not be compared with a checked-in source.",
+      "why": "An unparsable profile, a missing `name`, zero or several checked-in profiles with that name, or no tomllib interpreter all leave the comparison unanswered, which is not the same as in sync.",
+      "remedy": "Run `tartci fleet-macos profile-drift` for the specific reason."
+    },
+    "profile_in_sync": {
+      "summary": "The installed fleet profile matches its checked-in source key for key.",
+      "why": "Receipts bind the installed copy to itself, so only a comparison against the checked-in profile carrying the same name can say the host runs what the repository describes."
+    },
+    "program_unresolvable": {
+      "summary": "The executed cohort could not be resolved for some agent.",
+      "why": "The executed cohort is read from ProgramArguments and, for a signed launcher, from the bundle's sealed metadata. When neither can be read the agent's identity is unknown, which must not be reported as agreement.",
+      "remedy": "Inspect the named LaunchAgent and its program before trusting any generation claim for this host."
+    },
+    "python_pin_missing": {
+      "summary": "This managed fleet host has no ~/.config/tartci/python.pin.",
+      "why": "Every tartci LaunchAgent then runs the interpreter the fleet lanes carry, by bootstrap. That is meant for one cycle, until an install writes the pin; a host that stays on it never completed an install with the pinned-interpreter generation.",
+      "remedy": "Set host.python in the fleet profile and reinstall (tartci fleet-macos install <profile> --apply), which writes the pin.",
+      "do_not": "Do not write the pin by hand to a path the lanes do not run; macOS grants follow the binary."
+    },
+    "python_pin_not_applicable": {
+      "summary": "No installed fleet profile, so no interpreter pin is expected.",
+      "why": "Only managed fleet hosts run tartci LaunchAgents that resolve through the pin.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not write a pin on a host that is not in the fleet."
+    },
+    "python_pin_ok": {
+      "summary": "The interpreter pin names an executable absolute path.",
+      "why": "LaunchAgents rendered without their own TARTCI_PYTHON run exactly that binary, never a PATH search.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read executable as granted; the lanes' privacy grants are proven by the install preflight, not here."
+    },
+    "python_pin_unusable": {
+      "summary": "The interpreter pin is unreadable or names something that is not an executable absolute path.",
+      "why": "Every tartci LaunchAgent that resolves through the pin refuses to run (exit 127), so the host stops healing and updating.",
+      "remedy": "Fix host.python in the fleet profile and reinstall; tartci launchd heal still runs the refusal alert.",
+      "do_not": "Do not delete the pin to make agents run; under launchd that falls back only to the lanes' interpreter or a refusal."
+    },
+    "readiness_not_managed": {
+      "summary": "This host carries no managed fleet profile.",
+      "why": "Legacy and provider-only hosts are legitimate. Readiness does not apply to them and is not reported as a failure."
+    },
+    "readiness_probe_failed": {
+      "summary": "Readiness could not be determined.",
+      "why": "The probe needs a Python 3.11 or newer interpreter with tomllib and a support root that carries the readiness script. macOS ships 3.9, so a stock interpreter fails the probe. Reporting that as not ready would invent a fleet fault out of a missing interpreter.",
+      "remedy": "Set TARTCI_PYTHON to a 3.11+ interpreter, or check that the support root named in the receipt still exists."
+    },
+    "readiness_verdict_depends_on_invocation": {
+      "summary": "Two support roots on this host return different readiness verdicts for the same fleet.",
+      "why": "Readiness is computed against a support root, and the support root comes from whichever copy of the CLI asked. A git checkout and the installed generation therefore disagree at the same instant, each correct about the tree it measured and each read as a statement about the fleet. A checkout reports receipt_mismatch because the receipt names the installed generation's root, not the checkout's.",
+      "remedy": "Read the installed generation's verdict as authoritative, since that is the tree the running supervisors execute. Run the installed CLI, not a checkout, when asking whether the fleet is up.",
+      "do_not": "Do not report a checkout's readiness verdict as the host's."
+    },
+    "power_ok": {
+      "summary": "The host never sleeps on AC power (pmset AC `sleep` is 0)."
+    },
+    "signing_prompts_not_applicable": {
+      "summary": "No dedicated signing keychain is configured on this host (no ~/.config/pulp/secrets/keychain.env).",
+      "why": "Nothing on this host signs unattended, so there is no keychain to keep from prompting."
+    },
+    "signing_prompts_ok": {
+      "summary": "Only the dedicated signing keychain and login are on the user search list, the dedicated keychain unlocks with keychain.env's password, and it does not re-lock on its own.",
+      "why": "Read without prompting: list-keychains, then unlock-keychain -p, and only then show-keychain-info."
+    },
+    "signing_prompts_risk": {
+      "summary": "This host's keychain setup can put a password dialog on screen.",
+      "why": "A process in the GUI session that touches a locked non-login keychain makes securityd start SecurityAgent and ask for that keychain's password, which only keychain.env holds. On 2026-10-02 a legacy pulp-signing keychain beside its -unattended replacement, walked by an unpinned codesign, put such dialogs on m5studio at each self-update attempt.",
+      "remedy": "Run `pulp ship doctor` on the host. Then keep only the dedicated keychain and login on the search list (`security list-keychains -d user -s <dedicated> ~/Library/Keychains/login.keychain-db`), leaving the legacy file on disk.",
+      "do_not": "Never answer the dialog, never type a password into it, and never put the login keychain to work for signing."
+    },
+    "signing_prompts_unknown": {
+      "summary": "The keychain setup could not be read.",
+      "why": "An unreadable search list cannot be told apart from a safe one.",
+      "remedy": "Run `python3 scripts/signing_prompt_guard.py --json` on the host and read the detail."
+    },
+    "power_sleeps": {
+      "summary": "The host is configured to sleep after N idle minutes on AC power.",
+      "why": "A sleeping Mac takes its runners, SSH, lease store and VMs with it while launchd still reports every lane loaded. m5studio ran for days with the setting off and spent 4-6 hours a day asleep. `pmset -g` can print `sleep N (sleep prevented by ...)` while an app holds an assertion, which hides it until that app lets go.",
+      "remedy": "System Settings > Energy > turn on 'Prevent automatic sleeping when the display is off' (or `sudo pmset -c sleep 0`), then confirm `pmset -g custom` shows `sleep 0` under AC Power.",
+      "do_not": "Do not read an awake host, or `sleep prevented by ...`, as the setting being on."
+    },
+    "power_unknown": {
+      "summary": "The AC Power profile could not be read from `pmset -g custom`.",
+      "why": "An unreadable power profile is not evidence that the host stays awake.",
+      "remedy": "Run `pmset -g custom` on the host and read the AC Power section."
+    },
+    "reclaim_boot_low": {
+      "summary": "The reclaimer's last pass ran; the Tart store's volume is fine, but the boot data volume, which no lease floor covers, is still below its own floor (exit 5).",
+      "why": "On a host whose Tart store is on another volume (m3: Workshop), the lease floor never looks at the boot disk, so it could fill to zero unseen; m3 went from 57 GiB to 2 GiB free on 2026-10-01. Leases keep working, but a full boot disk stops commands from starting.",
+      "remedy": "Read the reclaim_pass event's scratch_dirs (what the scratch reaper removed and kept, by pattern), then look in /private/tmp and the per-user temp dir for scratch it does not name; add a pattern to scripts/scratch_dirs.py rather than deleting by hand repeatedly.",
+      "do_not": "Do not move the lease floor back to the boot volume to make this visible, and do not delete user data (iCloud, Messages, Library/Developer) to clear it."
+    },
+    "reclaim_failed": {
+      "summary": "The disk reclaimer's last pass finished recently with a non-zero exit.",
+      "why": "Exit 3 means free space is still below the floor after reclaiming, 4 means the process table or free space could not be read (nothing deleted), 2 means an unusable scan root. A full data volume refuses every lease (disk_capacity_exceeded).",
+      "remedy": "Read the reclaim_pass event in ~/.tartci/state/reclaim/events.jsonl and the tail of ~/Library/Logs/tartci/tartci-reclaim.log."
+    },
+    "reclaim_low_space": {
+      "summary": "The reclaimer's last pass ran, and a scanned volume is still below the free-space floor (exit 3).",
+      "why": "The pass itself worked: it deleted everything its rules allow and the volume is still full. What remains is data it may not remove (active or dirty checkouts, caches outside its roots). A volume this full stalls I/O and refuses leases.",
+      "remedy": "`tartci pool status` names the volume. Read the reclaim_pass event's tmp_checkouts.kept for what stayed and why, then free space on that volume by hand.",
+      "do_not": "Do not read exit 3 as a broken reclaimer, and do not loosen its safety gates to make it pass."
+    },
+    "reclaim_never_recorded": {
+      "summary": "No reclaim pass has written a receipt on this host yet.",
+      "why": "Receipts ship with the Pulp-reaper reclaim change; a host that has not completed a pass on that generation has none, which proves nothing either way.",
+      "remedy": "Wait one hourly pass after the update, or run `tartci reclaim --json` (dry run) to write one."
+    },
+    "reclaim_ok": {
+      "summary": "The disk reclaimer finished a pass recently and exited 0.",
+      "why": "The receipt is written at the end of every pass, so its age is the reclaimer's real heartbeat regardless of what launchd reports."
+    },
+    "reclaim_pass_degraded": {
+      "summary": "The reclaim pass exited 0, but part of it did not run: the Pulp reapers (for example, the profile's worktrees_root does not exist) or the host-vitals sensor reinstall.",
+      "why": "An exit-0 pass printed `reclaim: ok` while the reapers that keep the worktree volume from filling had never run, with the reason only in a parenthesis. A part that silently does nothing is how a volume fills with every status green.",
+      "remedy": "`tartci pool status` names what did not run. For a missing worktrees_root, create the directory or correct [pulp_reapers].worktrees_root in the host profile; for a failed sensor reinstall, read the installer output in the reclaim_pass event.",
+      "do_not": "Do not read `exit 0` as every part of the pass having run."
+    },
+    "reclaim_stale": {
+      "summary": "No reclaim pass has finished for longer than two missed hourly passes.",
+      "why": "The reclaim agent is dead, wedged, unscheduled, or shadowed by a leaked registration. launchd may still report the label loaded. Left alone the data volume fills and every gate VM lease is refused.",
+      "remedy": "Check the launchd_registrations finding, then `launchctl print gui/$(id -u)/com.danielraffel.tartci.reclaim` (path, last exit code) and re-register with scripts/install_reclaim_agent.sh --install.",
+      "do_not": "Do not treat 'installed and loaded' as proof the reclaimer runs."
+    },
+    "reclaim_unreadable": {
+      "summary": "The reclaim receipt exists and could not be parsed.",
+      "why": "An unparseable receipt is not evidence of a healthy reclaimer.",
+      "remedy": "Inspect ~/.tartci/state/reclaim/last-run.json; the next pass rewrites it atomically."
+    },
+    "reuse_canary_never": {
+      "summary": "The reuse canary is installed but has recorded no pass yet.",
+      "why": "It runs every 6 h and RunAtLoad is off, so a freshly installed agent is quiet for up to 6 h. Unknown rather than a problem until the 13 h stale bound.",
+      "remedy": "Wait for the first pass, or check `launchctl print gui/$(id -u)/com.danielraffel.tartci.reuse-canary` and ~/Library/Logs/tartci/reuse-canary.log."
+    },
+    "reuse_canary_no_bindable": {
+      "summary": "The reuse canary ran, but no pass in 36 h produced a bindable reuse record.",
+      "why": "Pull requests only bind mac validation to an earlier run when a bindable record exists; the canary is what keeps one. Passes that refuse, fail, time out, or produce non-bindable records leave every PR running the full mac lane.",
+      "remedy": "Read the newest receipt under ~/.tartci/state/reuse-canary/attempts/: its outcome, shipyard_rc, and reuse_records[].reason say which. A refusal names its gate; a failed run has its log in ~/Library/Logs/tartci/reuse-canary.log."
+    },
+    "reuse_canary_not_installed": {
+      "summary": "The fleet profile enables the reuse canary, but its LaunchAgent is not installed.",
+      "why": "The canary is installed only through its [support_agents] declaration, which installs nothing while bootstrap = false.",
+      "remedy": "Check `tartci fleet-macos support-agents plan`: reuse-canary should read missing there. It is installed once the host's [support_agents] bootstrap is turned on."
+    },
+    "reuse_canary_off": {
+      "summary": "The reuse canary is not enabled on this host.",
+      "why": "Only hosts whose Shipyard runs in shadow_compare mode enable [reuse_canary] in their fleet profile."
+    },
+    "reuse_canary_ok": {
+      "summary": "The reuse canary produced a bindable reuse record within 36 h.",
+      "why": "Its newest bindable receipt is younger than the 36 h bound and a pass ran within 13 h."
+    },
+    "reuse_canary_stale": {
+      "summary": "The reuse canary has recorded no pass for over 13 h.",
+      "why": "It runs every 6 h and the interval guard kicks an overdue one at 12 h, so silence past 13 h means the agent is not running at all, not that it had nothing to do (a pass with nothing due still writes a receipt).",
+      "remedy": "Check `launchctl print gui/$(id -u)/com.danielraffel.tartci.reuse-canary` (loaded, last exit code) and the interval guard's receipt."
+    },
+    "reuse_canary_unreadable": {
+      "summary": "The reuse canary's state or the fleet profile could not be read.",
+      "why": "An unreadable receipt or profile is not evidence the canary is healthy.",
+      "remedy": "Inspect ~/.tartci/state/reuse-canary/ and the [reuse_canary] table of ~/.config/tartci/macos-fleet-profile.toml."
+    },
+    "sealed_launcher_bundle": {
+      "summary": "This host execs a sealed launcher bundle, so a generation stage alone cannot change what it runs.",
+      "why": "Agents exec a signed Developer ID app, and that app runs its own sealed copy of the support cohort from inside the bundle. Staging a newer generation beside it succeeds, writes a receipt and exits 0 while the bundle keeps executing the cohort it was sealed around. This is how a host silently misses every fix it appears to have received.",
+      "remedy": "Deliver a re-signed launcher bundle built around the new cohort and install with --launch-helper-source, refreshing the pinned approval digest, then confirm the executed cohort matches the installed one.",
+      "do_not": "Do not read a zero exit from fleet-macos install --apply on this host as evidence that the new generation is running."
+    },
+    "self_update_current": {
+      "summary": "This host runs main's tartci, or its undeployed commits are recent and the last self-update did not fail.",
+      "why": "Hosts fell weeks behind main unnoticed; tartci's skew is measured against first-parent main and shown here even when the self-update agent is off."
+    },
+    "self_update_paused": {
+      "summary": "tartci's self-update has not run since a launchd timer stall began: launchd starts no timer job on its own and the interval guard deliberately does not kick self-update, so the host stays behind main and self-update writes no attempt or log line of its own.",
+      "why": "During a stall (launchd_timers_stalled) an update would stop every supervisor, so no guard would run and any lane restart left to launchd would pend unattended; the guard therefore holds self-update for the episode. On m3 from 2026-10-05 that left self-update silent for days, 44 commits behind, while its finding read like a failed update: there was no receipt to read because it never ran.",
+      "remedy": "The operator reboots the host when its lanes are idle (or lets the pending macOS install finish); tartci never does. The stall clears, launchd starts self-update on its next interval, and it updates from its own clean checkout. Afterwards `launchctl print gui/$(id -u)/com.danielraffel.tartci.self-update` shows the run count moving and no `pended nondemand spawn` line.",
+      "do_not": "Do not kickstart self-update by hand during the stall: its pool off and on re-bootstrap every lane, and on a stalled launchd a re-bootstrapped agent pends with no guard alive to kick it."
+    },
+    "self_update_problem": {
+      "summary": "This host runs stale tartci code, its skew could not be measured, or the last self-update failed.",
+      "why": "A host behind main runs fixes the rest of the fleet has; a failed self-update leaves the host serving the previous generation, which is safe but must be seen.",
+      "remedy": "Read `tartci fleet-macos self-update --status` and the receipt under ~/.tartci/state/self-update/attempts, then run `tartci fleet-macos self-update --plan`.",
+      "do_not": "Do not hand-install from a shared working copy; the self-update path installs from its own clean checkout of main."
+    },
+    "self_update_unmeasured": {
+      "summary": "tartci's skew against main was never measured here.",
+      "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
+      "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
+    },
+    "store_ok": {
+      "summary": "Every store volume the profile names answered its probe in time.",
+      "why": "A directory listing, tart list and git rev-parse on the VM store and repository volumes each finished within the probe timeout.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read ok as fast: the probe proves the volume answers, not that it is quick."
+    },
+    "store_stalled": {
+      "summary": "A store volume did not answer: a listing, tart list or git on it hung past the probe timeout.",
+      "why": "Usually a system-wide sandbox or TCC stall (a wedged sandboxd or tccd): every process touching the volume hangs, lanes stay loaded, and the reclaim agent only reads STALE hours later. It does not clear on its own.",
+      "remedy": "Drain the host (`tartci pool drain`), let running jobs finish, then reboot it; a reboot clears it. Verify with `tartci doctor fleet` (store_ok).",
+      "do_not": "Do not kill the hung processes one by one and call it fixed: new ones hang the same way until the reboot."
+    },
+    "store_unprobed": {
+      "summary": "The store volumes were not probed.",
+      "why": "No installed fleet profile, no TOML parser in this interpreter, or the probe itself failed to start.",
+      "remedy": "Run `tartci doctor fleet` with the pinned interpreter on a managed host.",
+      "do_not": "Do not read unprobed as healthy."
+    },
+    "supply_match": {
+      "summary": "Every registration this host's installed profile mints matches the published declared supply.",
+      "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."
+    },
+    "supply_mismatch": {
+      "summary": "This host's installed registrations differ from the published declared supply.",
+      "why": "A lane the host registers that git does not publish is capacity no consumer can discover; a lane git publishes that the host does not register is capacity consumers will route to and wait on forever.",
+      "remedy": "Run `tartci fleet-macos verify-supply` for the per-lane verdicts. Reinstall from the checked-in profile (drain first), or commit the host's change and regenerate fleet/advertised-labels.json.",
+      "do_not": "Do not edit fleet/advertised-labels.json by hand; it is regenerated from profiles/ and CI rejects a hand edit."
+    },
+    "supply_unknown": {
+      "summary": "The installed registrations could not be compared with the published supply.",
+      "why": "An unreadable installed profile or published file, or a host_id the published file does not declare, leaves the comparison unanswered, which is not the same as a match.",
+      "remedy": "Run `tartci fleet-macos verify-supply` for the specific reason."
+    },
+    "tool_freshness_current": {
+      "summary": "Shipyard and the pulp CLI are at their latest releases, or behind for less than the stale window.",
+      "why": "A merged improvement only helps once the host runs it; this is the proof it arrived.",
+      "remedy": "Nothing to do.",
+      "do_not": "Do not read an old measurement as current; the line carries its measured time."
+    },
+    "tool_freshness_stale": {
+      "summary": "Shipyard or the pulp CLI has been behind its latest release for longer than the stale window, or its version or releases could not be read.",
+      "why": "An installed CLI can sit months behind its releases unnoticed, so every agent build and gate on the host runs without merged fixes.",
+      "remedy": "Read `tartci fleet-macos tool-freshness` and ~/.tartci/state/tool-freshness/events.jsonl; a line marked HELD is an `auto_apply = false` hold in ~/.config/tartci/tool-freshness.toml: remove it once its reason is gone (it also lifts by itself at `hold_until`, or `hold_max_hours` after `held_since`; an unreadable value keeps the hold and is reported until fixed). Otherwise update with `shipyard update --to <tag> --refresh-daemon` or the pulp release's install.sh, then `tartci fleet-macos tool-freshness --refresh`.",
+      "do_not": "Do not install from a working copy's build directory; install the published release so every host runs the same bytes."
+    },
+    "tool_freshness_unmeasured": {
+      "summary": "Tool freshness has never been measured on this host.",
+      "why": "The launchd watchdog measures it every 30 minutes, so an unmeasured host usually means the watchdog is not running its pass.",
+      "remedy": "Run `tartci fleet-macos tool-freshness --refresh`, then check the watchdog log for why it did not.",
+      "do_not": "Do not read unmeasured as current."
+    },
+    "vm_dhcp_verifying": {
+      "summary": "This host is proving its VM network with one probe VM before its lanes clone freely: after a reboot, after a self-update, or on the first run.",
+      "why": "A reboot used to close the breaker, and every lane cloned again into a VM network that was still broken: on m5 on 2026-10-07 that spent about 56 VMs after the reboot. Now one lane probes while the others idle; the probe's address closes the breaker (vm_dhcp_verified), its no_ip opens it at once with the failing layer, and a probe that never reports within 960 s opens it with cause probe_unreported so a crashed probe cannot hold every lane idle. Every host enters this once when the breaker first runs with no recorded boot time.",
+      "remedy": "Nothing, normally: it ends within one boot, about 3 min. If it lasts longer, read the probe lane's log for the VM; the breaker opens on its own if the probe never reports."
+    },
+    "vm_dhcp_vm_network_missing": {
+      "summary": "VMs on this host stopped getting an address because the VM network itself was never created: no bridge100 existed while a VM ran.",
+      "why": "Tart's NAT network is vmnet shared mode, which InternetSharing (com.apple.NetworkSharing) creates per VM as bridge100 and then configures bootpd for. On m5 on 2026-10-07 InternetSharing never answered a VM's request (each VM logged \"xpc send -> client create\" and got nothing back), so no bridge100 appeared and bootpd had nothing to serve; restarting the InternetSharing process did not bring it back. A healthy host answers each VM with \"netrbCreateInterface: VM interface create submitted\". This layer comes before bootpd: no bootpd step can help until it is fixed.",
+      "remedy": "On the host (tartci never runs it): No verified remedy yet; run `tartci vm-dhcp probe-now` after any change and capture `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the InternetSharing pid; the Internet Sharing toggle in System Settings and a reboot are the known resets. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
+      "do_not": "Do not move /etc/bootpd.plist or /Library/Preferences/SystemConfiguration/com.apple.vmnet.plist aside: dhcp_enabled=false there is the normal idle state, which InternetSharing rewrites when it creates bridge100."
+    },
+    "warm_vm_none": {
+      "summary": "No warm gate VM is parked on this host.",
+      "why": "A warm VM is opt-in (lane key warm_vm) and off by default; when on, none is parked while the lane is serving, cooling down, or yielding to other demand.",
+      "remedy": "Nothing to do."
+    },
+    "warm_vm_overdue": {
+      "summary": "The warm VM has been parked past its maximum park age.",
+      "why": "The supervisor tears a parked VM down at TARTCI_WARM_VM_MAX_PARK_SECS on its next loop pass. Overdue means the loop is not passing, usually because the supervisor is stuck.",
+      "remedy": "Inspect the lane log for the supervisor named in the record; reload the lane at an idle boundary if it is stuck."
+    },
+    "warm_vm_parked": {
+      "summary": "A warm gate VM is parked under a memory-only lease.",
+      "why": "The opted-in lane pre-booted one VM to VM-up so the next job skips lease, clone and boot. It reserves memory and one macOS VM slot, no cores, and yields to other demand.",
+      "remedy": "Nothing to do. To stop it, remove the lane's warm_vm key and reload, or drain the pool."
+    },
+    "warm_vm_stale": {
+      "summary": "The warm VM record is not being refreshed by a live supervisor.",
+      "why": "The supervisor that parked the VM exited or wedged without tearing it down. The VM and its lease may remain until the reaper or lease reclaim removes them.",
+      "remedy": "Run `tartci doctor --reap --json` under its ownership rules, confirm no parked VM remains in `tart list`, then delete ~/.tartci/state/warm-vm/parked.json.",
+      "do_not": "Do not delete a VM whose supervisor is still alive; check the pid first."
+    },
+    "warm_vm_unreadable": {
+      "summary": "The warm VM record could not be read.",
+      "why": "The record is malformed or unreadable, so whether a VM is parked is unknown.",
+      "remedy": "Inspect ~/.tartci/state/warm-vm/parked.json and `tart list`.",
+      "do_not": "Do not read an unreadable record as no warm VM."
+    },
+    "worktrees_in_tmp": {
+      "summary": "Git worktrees of the configured Pulp repo live under /tmp or /private/tmp.",
+      "why": "Pulp worktrees must live under PULP_WORKTREES_ROOT or a sibling of the primary checkout, never /tmp. /tmp worktrees are outside every reaper root, so their build dirs fill the volume unseen (m5 had 162 on 2026-09-27).",
+      "remedy": "Have the owning sessions land or abandon them and `git worktree remove` them; recreate live work under the host's worktree root.",
+      "do_not": "Do not delete or move them automatically: a worktree under /tmp may be live."
+    },
+    "worktrees_in_tmp_none": {
+      "summary": "No worktree of the configured Pulp repo lives under /tmp.",
+      "why": "Every Pulp worktree is where the reapers and host policy expect it."
+    },
+    "worktrees_in_tmp_not_checked": {
+      "summary": "Worktrees under /tmp were not checked.",
+      "why": "The check needs the [reclaim] table (for the Pulp repo path) and a readable repo; without one this host has no configured Pulp checkout to ask.",
+      "remedy": "Enable [reclaim] in the fleet profile, or run `git -C <pulp> worktree list` by hand."
+    },
+    "support_agents_drift": {
+      "summary": "bootstrap is on, but a declared support agent did not converge.",
+      "why": "The last self-update's support-agents step failed to install or reload an agent the profile declares; the receipt names which and why.",
+      "remedy": "Read ~/.tartci/state/support-agents/last.json (failures, per-agent action), then run `tartci fleet-macos support-agents apply` on the host."
+    },
+    "support_agents_never": {
+      "summary": "No support-agents receipt on this host yet.",
+      "why": "The receipt is written by self-update after it verifies the lanes; a host that has not updated since the step shipped has none.",
+      "remedy": "Run `tartci fleet-macos support-agents plan` (writes only its receipt), or wait for the next self-update."
+    },
+    "support_agents_ok": {
+      "summary": "Every declared support agent's installed plist matches its render and is loaded from it.",
+      "why": "The render uses the same render_launchd_template.py arguments as each agent's install script, so a match means the host carries exactly what the profile declares."
+    },
+    "support_agents_pending": {
+      "summary": "bootstrap is off; some declared support agent is missing or differs from its render.",
+      "why": "With `[support_agents] bootstrap = false` the step only reports. The finding names the agents it would install or change, and the receipt carries each differing key path.",
+      "remedy": "Read the per-agent diff in ~/.tartci/state/support-agents/last.json. Set bootstrap = true in the host's profile only after that diff is explained and approved."
+    },
+    "support_agents_unreadable": {
+      "summary": "The support-agents receipt or the fleet profile could not be read.",
+      "why": "An unreadable receipt or profile is not evidence the agents are right.",
+      "remedy": "Inspect ~/.tartci/state/support-agents/last.json and the [support_agents] table of ~/.config/tartci/macos-fleet-profile.toml."
+    },
+    "tcc_wedge_healed": {
+      "summary": "The watchdog classified the store hang as a wedged tccd, restarted tccd and sandboxd through the scoped root wrapper, and the store answered again.",
+      "why": "Opens of an external Tart store from a launchd job each need a Removable Volumes authorization from sandboxd, which asks the system tccd; when tccd stops answering, every such open blocks while an interactive shell still answers in microseconds. Restarting the two daemons clears it without a reboot. On 2026-11-11 m3 admitted no VM for four hours this way.",
+      "remedy": "Nothing now. If it recurs every few hours, read the heal history in ~/.tartci/state/store-health.json and the launchd watchdog log, and look at what loads tccd on this host.",
+      "do_not": "Do not take a healed verdict as proof the volume is fast or that the cause is fixed: the wrapper restarts daemons; it changes no grant and removes no trigger."
+    },
+    "tcc_wedge_none": {
+      "summary": "The watchdog has no fresh wedged-tccd verdict for the Tart store.",
+      "why": "Either the store answers, or it is failing for a reason the three readings (internal control path, sandboxd/tccd log signature, optional probe from a TCC-granted context) do not attribute to tccd.",
+      "remedy": "Nothing for this check; a stalled store is reported by store_stall."
+    },
+    "tcc_wedge_unhealed": {
+      "summary": "The watchdog classified the store hang as a wedged tccd, but the heal did not run or did not bring the store back.",
+      "why": "The scoped wrapper (/usr/local/sbin/tartci-heal-tcc) is missing, sudo refused it, it was rate-limited (once per 30 min), it timed out, or tccd and sandboxd restarted and the store still did not answer. The detail names which.",
+      "remedy": "wrapper_missing or not_permitted: install it (sudo fleet/ops/install-tartci-heal-tcc.sh) on this host. rate_limited: wait for the interval. A ran-but-still-hanging store: drain the host (`tartci pool drain`), let jobs finish, and reboot.",
+      "do_not": "Do not kill tccd by hand repeatedly or widen the sudo grant: the wrapper's one fixed command and its 30-minute stamp are the whole safety case."
+    },
+    "undeclared_fleet_agent": {
+      "summary": "A LaunchAgent under the tartci or tmp. prefix is installed but declared nowhere.",
+      "why": "Hand-installed agents drift: on 2026-10-04 a stopgap kicker installed outside any installer ran beside the interval guard on every host. The scan accounts for lanes, declared agents, and agents another codified installer owns; anything else is listed here.",
+      "remedy": "Declare it (add it to the registry and the profile), or retire it deliberately: boot it out and move its plist aside.",
+      "do_not": "Do not expect the support-agents step to remove it; it never removes an agent it does not manage."
+    },
+    "undeclared_fleet_agents_none": {
+      "summary": "Every LaunchAgent under the tartci and tmp. prefixes is declared or owned by a named installer."
+    },
+    "vm_janitor_loaded": {
+      "summary": "The VM janitor (com.danielraffel.tartci.reap) is installed from its render and loaded."
+    },
+    "vm_janitor_missing": {
+      "summary": "The VM janitor (com.danielraffel.tartci.reap) is not declared, not installed, or not loaded.",
+      "why": "Without it a stale VM or overlay stays in the Tart store until someone notices. On 2026-10-09 every profile declared it and only m3 had it, because `bootstrap = false` kept the support-agents step to a plan.",
+      "remedy": "Declare reap in [support_agents] declared and list it in bootstrap (bootstrap = [\"reap\"]); the next self-update installs it. To install by hand, run `tartci fleet-macos support-agents apply` with that profile."
+    },
+    "vm_janitor_unknown": {
+      "summary": "No readable support-agents receipt, so whether the VM janitor is installed is unknown.",
+      "remedy": "Run `tartci fleet-macos support-agents plan` and read ~/.tartci/state/support-agents/last.json."
+    },
+    "vm_boot_degraded": {
+      "summary": "At least max(2, lanes) VM boots on this host got no address in the last 24 h: one failed boot per lane in a day.",
+      "why": "On 30 days of the fleet's own lane logs (2026-10-07), m3, m1 and m5studio had no day with any boot that got no address, and m5's outage days had 13, 10, 172 and 122 while its one isolated day had 2 in 53 boots. A count rather than a rate: at these volumes one failure moves the rate, so the rate is reported and never judged. The VM-DHCP breaker stops most of the cloning during an outage; this finding is the record that it happened and how often.",
+      "remedy": "Read the vm_dhcp finding for the failing layer and its remedy, and the outage history in `tartci vm-dhcp status`. If the breaker is closed again the outage is over; the finding clears once the 24 h window passes."
+    },
+    "vm_boot_ok": {
+      "summary": "This host's VMs are getting addresses: the 24 h and 7 d boot counts and the outages of the last week are reported, and none crosses the threshold."
+    },
+    "vm_boot_unmeasured": {
+      "summary": "No VM boot has been counted on this host yet: there is no breaker record, or it holds no boots."
+    },
+    "vm_boot_unreadable": {
+      "summary": "The VM-DHCP breaker record could not be read, so the boot counts and outages are unknown.",
+      "remedy": "The vm_dhcp finding reports the same unreadable record; the next lane boot rewrites it."
+    },
+    "vm_dhcp_bootpd_not_loaded": {
+      "summary": "VMs on this host stopped getting an address, and launchd has no bootpd job loaded at all, so lanes have stopped cloning except one probe every 300 s.",
+      "why": "bootpd's plist (/System/Library/LaunchDaemons/bootps.plist) ships Disabled, and only Internet Sharing (com.apple.NetworkSharing) loads it. When it is not loaded, `launchctl print system/com.apple.bootpd` exits 113 (\"Could not find service\"), a kickstart of bootpd fails the same way, and disable/enable only changes the override without loading anything. On m5 on 2026-10-07 the job was absent after a reboot while NetworkSharing itself was running; bootstrapping bootps.plist loaded it under SIP.",
+      "remedy": "On the host, as root (tartci never runs it): 1) `sudo launchctl bootstrap system /System/Library/LaunchDaemons/bootps.plist` (proven on m5 on 2026-10-07 with SIP on); 2) confirm `launchctl print system/com.apple.bootpd` now exits 0 with a state; 3) `tartci vm-dhcp probe-now` so the next lane probes at once. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
+      "do_not": "Do not kickstart or disable/enable com.apple.bootpd to fix this: neither loads a job launchd does not have."
+    },
+    "vm_dhcp_config_disabled": {
+      "summary": "VMs on this host stopped getting an address because /etc/bootpd.plist did not enable DHCP on the VM network while a VM ran.",
+      "why": "InternetSharing writes /etc/bootpd.plist (dhcp_enabled=[bridge100] plus a Subnets entry created by com.apple.NetworkSharing) when it creates the VM network, and resets it when the last VM stops. dhcp_enabled=false is normal while no VM runs; only a running VM's bridge missing from dhcp_enabled is a fault, and it means InternetSharing did not finish configuring it.",
+      "remedy": "On the host (tartci never runs it): No verified remedy yet; run `tartci vm-dhcp probe-now` after any change and capture `ifconfig -l`, `launchctl print system/com.apple.NetworkSharing` and the InternetSharing pid; the Internet Sharing toggle in System Settings and a reboot are the known resets. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150).",
+      "do_not": "Do not hand-edit or move /etc/bootpd.plist: InternetSharing owns it and rewrites it per VM."
+    },
+    "vm_dhcp_ok": {
+      "summary": "The host's VM DHCP breaker is closed: booted VMs are getting addresses."
+    },
+    "vm_dhcp_pfd_crash_loop": {
+      "summary": "VMs on this host stopped getting an address because pfd, the packet-filter daemon InternetSharing waits on, keeps exiting, so the VM network is never created.",
+      "why": "InternetSharing asks pfd for packet-filter state before it creates bridge100, and pfd exits 3 when pf holds no enable reference: it logs \"no pf starter references held\" and exits, so InternetSharing's request is never served and no VM network appears. On m5 on 2026-10-07, after a reboot, `sudo pfctl -s info` read \"Status: Disabled\" and `sudo pfctl -s References` read \"No pf starter references held\"; pfd exited 3 every 10 s (state \"spawn scheduled\", runs climbing by thousands). A healthy pfd serves its requests and then idle-exits with last exit 0; exit 3 with a climbing run count is this fault. `launchctl print system/com.apple.pfd` (no root) shows the state, runs and last exit code.",
+      "remedy": "On the host (tartci never runs it): `sudo pfctl -E`. It takes one ref-counted pf enable reference and prints a token; keep the token, which is the undo key (`sudo pfctl -X <token>`). On m5 on 2026-10-07 this brought pfd to running and then an idle exit 0, bridge100 came up at 192.168.64.1 on the next VM, and the breaker closed on its probe's address. Then run `tartci vm-dhcp probe-now` so the next lane probes at once. The reference does not survive a reboot unless a LaunchDaemon takes it at boot: install the boot-time holder with `sudo scripts/install_pf_enable_ref.sh --install` (docs/runbook.md, 'pf enable reference'). Without it a recurrence after a reboot is caught by the post-boot verification and the alert, and `sudo pfctl -E` is run again. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150). Never `pfctl -d`: it drops every holder's pf references.",
+      "do_not": "Do not move /etc/bootpd.plist or /Library/Preferences/SystemConfiguration/com.apple.vmnet.plist aside, and do not restart bootpd for this: neither is the failing layer."
+    },
+    "vm_dhcp_unanswered": {
+      "summary": "VMs on this host stopped getting an address from the host's DHCP server; lanes have stopped cloning except one probe every 300 s.",
+      "why": "Two boots in a row within 15 min waited 120 s for an address and got none. On m5 (2026-09-23 and 2026-10-04) the host's bootpd, which macOS Internet Sharing manages, answered nothing for 47 and 40 minutes while every lane kept cloning and discarding. No boot can succeed until DHCP answers, so the breaker trades about one VM per 300 s for recovery noticed within 300 s plus a boot. The vm_dhcp_unanswered event carries bootpd's state, run count and last exit at the moment it opened, and the no_ip timestamps.",
+      "remedy": "On the host, all of it needs root, and tartci never runs it. This code means the VM network exists, bootpd is loaded and /etc/bootpd.plist enables DHCP on it, and still no address came back: 1) confirm with `sudo launchctl print system/com.apple.bootpd` (state, runs, last exit) and `/usr/bin/log show --last 30m --predicate 'process == \"bootpd\"'` (expect silence); 2) `sudo launchctl kickstart -k system/com.apple.bootpd`; 3) if no VM gets an address within 2 min, `sudo launchctl disable system/com.apple.bootpd && sudo launchctl enable system/com.apple.bootpd` (what macOS did itself on 2026-10-04); 4) a reboot also clears it. Never kickstart the com.apple.NetworkSharing job: System Integrity Protection refuses it (error 150). After a fix, `tartci vm-dhcp probe-now` makes the next lane probe at once; the breaker closes on the first address a VM gets.",
+      "do_not": "Do not delete the breaker file to force cloning: every clone fails the same way until DHCP answers."
+    },
+    "vm_dhcp_unreadable": {
+      "summary": "The host's VM DHCP breaker file could not be read.",
+      "why": "Lanes read an unreadable breaker as closed and clone as usual; the doctor reports it so the cause is fixed.",
+      "remedy": "Inspect ~/.tartci/state/vm-dhcp/breaker.json; the next breaker write replaces it atomically."
+    },
+    "lane_python_unavailable": {
+      "summary": "A lane pins an interpreter path that no longer exists.",
+      "why": "The sealed or managed lane cannot start its verified helper interpreter, so GitHub reads and fleet supervision are unavailable.",
+      "remedy": "Restore the pinned interpreter at the recorded path or reinstall the generation with a verified interpreter, then rerun fleet doctor."
+    },
+    "vm_dhcp_probe_blocked_by_admission": {
+      "summary": "This host's VM-network verification probe cannot clone because VM admission refuses it (disk, memory or cores). It is not a DHCP failure.",
+      "why": "After a reboot or self-update one lane probes the VM network before the others clone. On m1 on 2026-11-08 every lease was refused for disk, so the probe never cloned, the breaker stayed in verifying for hours, and the idle slot reported a DHCP outage that was a full disk. A probe refused before it clones is now recorded as admission_blocked with the real reason: it is not counted as DHCP evidence and opens nothing.",
+      "remedy": "Free what the reason names (disk: the lease-denial reclaim runs on its own; else `tartci reclaim --fix`, or remove what fills the Tart store's volume). The next probe that clones proves the network and closes the breaker.",
+      "do_not": "Do not treat this as a DHCP outage or kickstart bootpd for it."
+    },
+    "vm_disk_headroom_low": {
+      "summary": "The Tart store's volume admits one more VM but not two: it is within one VM's disk growth of refusing every VM lease for disk.",
+      "why": "A VM lease needs the free-space floor plus each live VM's reserved growth plus its own growth (25 + 24 GiB by default). m1 refused every lease for hours on 2026-11-08 at 27 GiB free, and after a manual reclaim sat at about 56 GiB, one VM from the same refusal, with nothing reporting it.",
+      "remedy": "Reclaim before it blocks: `tartci reclaim --fix`, `tartci reclaim --on-lease-denial --fix` (old gate ccache entries and unreferenced OCI images), `tartci image-prune`, or remove what fills the volume."
+    },
+    "vm_disk_headroom_not_applicable": {
+      "summary": "No Tart store is declared, or the lease disk axis is disabled, so there is no VM disk headroom to judge.",
+      "why": "The check reads TART_HOME from the installed lane plists or the fleet profile.",
+      "remedy": "Nothing, unless this host should run VMs."
+    },
+    "vm_disk_headroom_ok": {
+      "summary": "The Tart store has more than one VM's growth of headroom above what the next VM lease needs.",
+      "why": "Judged the way a VM lease is: floor plus live reservations plus one VM's growth.",
+      "remedy": "Nothing."
+    },
+    "vm_disk_headroom_refusing": {
+      "summary": "The Tart store's free space is below what the next VM lease needs: the host refuses new VMs for disk (disk_capacity_exceeded).",
+      "why": "A full store does not slow a host, it stops it: every lease is refused and the queue moves to whatever host is left.",
+      "remedy": "The lease-denial reclaim frees regenerable caches on the next refused lease (at most every 30 min). If that is not enough, run `tartci reclaim --fix` and `tartci image-prune`, or free the volume by hand."
+    },
+    "vm_disk_headroom_unmeasured": {
+      "summary": "The Tart store's free space could not be measured.",
+      "why": "The store path does not exist or statvfs failed, so the headroom is unknown rather than fine.",
+      "remedy": "Check that the Tart store exists and its volume is mounted, then re-run.",
+      "do_not": "Do not read an unmeasured store as one with headroom."
+    }
+  }
+}

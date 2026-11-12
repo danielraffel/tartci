@@ -6,7 +6,23 @@ import worktree_cleanup as cleanup
 
 class Tests(unittest.TestCase):
     def authority_argv(self, root):
-        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Workshop/Code/pulp","--prefix","/Volumes/Workshop/Code","--main-ref","origin/main","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
+        return ["--provider","merged-main-v1","--repo","Generous-Corp/pulp","--primary","/Volumes/Example/Code/pulp","--prefix","/Volumes/Example/Code","--main-ref","origin/main","--receipt",str(root/"receipt.json"),"--lock",str(root/"lock"),"--required-bytes","1","--before-free-bytes","0"]
+
+    def test_authority_paths_come_from_the_profile_within_limits(self):
+        ok=cleanup.authority_paths_ok
+        self.assertTrue(ok(Path("/Volumes/Example/Code/pulp"),Path("/Volumes/Example/Code")))
+        self.assertTrue(ok(Path("/Volumes/Store/Src/a/pulp"),Path("/Volumes/Store/Src")))
+        for primary,prefix in (("/Volumes/Example/pulp","/Volumes/Example"),          # prefix is a volume root
+                               ("/Volumes/Example/Other/pulp","/Volumes/Example/Code"),# primary outside prefix
+                               ("/Volumes/Example/Code","/Volumes/Example/Code"),      # primary is the prefix
+                               ("/Users/example/Code/pulp","/Users/example/Code"),     # not an external volume
+                               ("/Volumes/Example/Code/../pulp","/Volumes/Example/Code")):
+            with self.subTest(primary=primary,prefix=prefix):
+                self.assertFalse(ok(Path(primary),Path(prefix)))
+        with tempfile.TemporaryDirectory() as td:
+            argv=self.authority_argv(Path(td)); argv[argv.index("--prefix")+1]="/Volumes/Example"
+            with self.assertRaisesRegex(cleanup.Stop,"unsupported cleanup authority"):
+                cleanup.main(argv)
 
     def test_nonblocking_lock_and_cooldown_stop_before_inspection(self):
         with tempfile.TemporaryDirectory() as td:

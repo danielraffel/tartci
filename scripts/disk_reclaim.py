@@ -15,6 +15,9 @@ deleted only when EVERY positive check passes:
   * it carries a generated-tree marker (`CMakeCache.txt`, `build.ninja`, or
     `CMakeFiles/`), so a source directory that merely has the name is skipped,
   * it carries no source marker (`.git`, `CMakeLists.txt`) of its own,
+  * nor one anywhere in the few levels below it, because the tree is removed
+    whole and a fetched dependency at `_deps/<name>-src/.git` is a real
+    checkout,
   * no live build process references its path,
   * nothing inside it has been modified inside the age gate.
 
@@ -24,22 +27,42 @@ so an idle host keeps recent build dirs warm and a full host reclaims harder.
 
 `--fail-below-gb` closes the escalation half: a host still below the floor after
 a reclaim pass exits non-zero, so launchd records it and a supervisor can see a
-full disk instead of only seeing refused leases.
+full disk instead of only seeing refused leases. The floor is judged on the
+volume lease admission probes, which is the volume holding the Tart store
+(`--lease-path`, else `$TART_HOME`, else the fleet profile's
+`[host].tart_home`). A scan root on another volume is still measured and
+reported, and still selects its own pressure gate, but it cannot fail the
+pass: m3 keeps its VMs on Workshop while its boot disk is mostly personal data
+the janitor must never touch, so failing on the boot disk reported a host that
+leases fine as one that refuses every lease. Only when no Tart store is
+declared does the floor fall back to every scanned volume.
+
+The boot data volume is judged on its own floor, `--boot-floor-gb`, whenever
+the floor above does not already cover it. Moving the lease floor to the Tart
+store left m3's boot disk watched by nothing: it went from 57 GiB free to 2
+GiB in a day on 2026-10-01 and no pass said so. The boot volume does not
+refuse leases, so it has its own exit code (5) rather than sharing 3, and
+while it is below its floor the scratch reaper (scratch_dirs.py) uses its
+shorter idle gate.
 
 Exit codes:
 
   0  the pass ran and the host is above its floor,
   2  no scan roots resolved, so nothing was examined,
-  3  the pass ran and the host is STILL below `--fail-below-gb`; the reclaim
-     could not free enough and a human needs to look,
+  3  the pass ran and the lease volume is STILL below `--fail-below-gb`; the
+     reclaim could not free enough and a human needs to look,
   4  a measurement the decision depends on could not be taken (the process
      table or the free-space figure). Nothing was deleted. This is distinct
      from 3 on purpose: 3 means the host is full, 4 means we do not know.
+  5  the lease volume is fine, but the boot data volume (a different volume)
+     is STILL below `--boot-floor-gb` after the pass. Leases are unaffected;
+     the machine itself is running out of disk.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import functools
 import json
@@ -49,8 +72,21 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
+
+import boot_usage
+import checkout_outputs
+import pulp_reapers
+import gate_ccache_trim
+import scratch_dirs
+import tmp_checkouts
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
+    tomllib = None  # type: ignore[assignment]
 
 BUILD_DIR_PREFIXES = ("build-",)
 BUILD_DIR_EXACT = ("build",)
@@ -63,15 +99,148 @@ GENERATED_MARKERS = ("CMakeCache.txt", "build.ninja", "CMakeFiles")
 SOURCE_MARKERS = (".git", "CMakeLists.txt", "Cargo.toml", "package.json")
 
 # Command names whose live command lines are scanned for candidate paths.
-BUILD_PROCESS_PATTERN = r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
+BUILD_PROCESS_PATTERN = (r"cmake|ctest|ninja|make|clang|cc1|c\+\+|xcodebuild|swift"
+                         # writers and readers of target/ and node_modules/
+                         # (checkout_outputs.py); matching only ever keeps a tree
+                         r"|cargo|rustc|node|npm|pnpm|yarn|bun|deno")
 
 GIB = 1024**3
+
+# The volume macOS keeps user data, /private/tmp and /var/folders on. `/` is
+# the sealed system volume, whose free figure is the same container's but
+# whose device id is not the data volume's.
+DEFAULT_BOOT_VOLUME = "/System/Volumes/Data"
+DEFAULT_BOOT_FLOOR_GB = 30.0
 
 # A --fix pass can run for minutes with nothing to say, and the watchdog reads
 # this agent's liveness from the mtime of its log. A pass that is working but
 # silent is indistinguishable from one that is wedged, so emit a bounded
 # heartbeat instead of leaving the log frozen for the whole run.
 PROGRESS_INTERVAL_S = 300.0
+# Metadata and free-space calls can block in the kernel when an external APFS
+# volume is wedged. Keep root admission and the post-pass receipt bounded too.
+ROOT_PROBE_TIMEOUT_S = 15.0
+PASS_TIMEOUT_S = 900.0
+PASS_DEADLINE: float | None = None
+
+# The hourly pass runs as a macOS background process: low CPU priority on the
+# efficiency cores, throttled disk I/O and network, inherited by every git,
+# du, lsof and ccache child it starts. Its `git status`, `git fetch` and
+# ccache eviction walks share the Workshop volume with the gate VMs, and on m3
+# a pass ran 36 min to 1 h 45 min of every 96: GitHub reads by the steward on
+# that host timed out in 13% of passes while it ran against 5% otherwise, and
+# the VM store read unhealthy twice as often. launchd's LowPriorityIO throttles
+# disk I/O only; this also yields the CPU. A background pass runs longer, and
+# its per-command timeouts then keep a checkout rather than remove it, which
+# is the safe direction. The lease-denial reclaim is not demoted: a VM waits.
+PRIO_DARWIN_PROCESS = 4
+PRIO_DARWIN_BG = 0x1000
+FOREGROUND_ENV = "TARTCI_RECLAIM_FOREGROUND"
+
+
+def enter_background(platform: str | None = None,
+                     environ: Any = None,
+                     setpriority: Any = None) -> str:
+    """Demote this process (and its future children) to macOS background.
+
+    Returns what happened, for the receipt. Never raises: a pass that cannot
+    lower its priority still runs, at the priority launchd gave it.
+    """
+    platform = sys.platform if platform is None else platform
+    environ = os.environ if environ is None else environ
+    setpriority = os.setpriority if setpriority is None else setpriority
+    if platform != "darwin":
+        return "unchanged: not macOS"
+    if environ.get(FOREGROUND_ENV) == "1":
+        return f"unchanged: {FOREGROUND_ENV}=1"
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, PRIO_DARWIN_BG)
+    except OSError as exc:
+        return f"unchanged: setpriority failed: {exc}"
+    return "darwin_background"
+
+
+def leave_background(setpriority: Any = None) -> bool:
+    """Undo `enter_background` for a step that must not be throttled."""
+    setpriority = os.setpriority if setpriority is None else setpriority
+    try:
+        setpriority(PRIO_DARWIN_PROCESS, 0, 0)
+    except OSError:
+        return False
+    return True
+
+
+@contextlib.contextmanager
+def foreground_while(receipt: dict[str, Any]) -> Iterator[None]:
+    """Run one step at normal priority, then return to background.
+
+    The gate ccache eviction holds the guard lock that VM boots wait on, and it
+    only runs with no VM up, so throttling it only widens that window.
+    """
+    demoted = receipt.get("priority") == "darwin_background"
+    if demoted:
+        leave_background()
+    try:
+        yield
+    finally:
+        if demoted:
+            enter_background()
+
+
+@contextlib.contextmanager
+def background_while(receipt: dict[str, Any]) -> Iterator[None]:
+    """Run one step at background priority even when the pass went foreground.
+
+    A pressured pass leaves background to free space sooner, but the checkout
+    sweep (tmp_checkouts.py with its merged rule) is thousands of `git status`
+    calls and `git worktree remove`s on the volume agents are building on; it
+    stays throttled so their builds keep the disk. Its timeouts then keep a
+    checkout, which is the safe direction.
+    """
+    promoted = (receipt.get("mode") == "fix"
+                and str(receipt.get("priority", "")).startswith("foreground"))
+    demoted = promoted and enter_background() == "darwin_background"
+    if demoted:
+        receipt["checkout_sweep_priority"] = "darwin_background"
+    try:
+        yield
+    finally:
+        if demoted:
+            leave_background()
+
+
+def bounded_fs_call(operation: Any, *, description: str,
+                    timeout: float = ROOT_PROBE_TIMEOUT_S,
+                    pass_deadline: bool = True) -> Any:
+    """Run one filesystem metadata call with a fail-closed deadline.
+
+    `pass_deadline=False` gives the call its own `timeout` even once the pass
+    deadline is spent; it is for the single statfs that measures free space
+    after the pass, which must not inherit what the walk used up.
+    """
+    result: dict[str, Any] = {}
+    error: list[BaseException] = []
+
+    def invoke() -> None:
+        try:
+            result["value"] = operation()
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
+            error.append(exc)
+
+    remaining = (None if PASS_DEADLINE is None or not pass_deadline
+                 else PASS_DEADLINE - time.monotonic())
+    if remaining is not None and remaining <= 0:
+        raise OSError(errno.ETIMEDOUT, f"reclaim pass deadline reached before {description}")
+    effective_timeout = timeout if remaining is None else min(timeout, remaining)
+    worker = threading.Thread(target=invoke, name=f"fs probe {description}", daemon=True)
+    worker.start()
+    worker.join(effective_timeout)
+    if worker.is_alive():
+        raise OSError(errno.ETIMEDOUT,
+                      f"{description} timed out after {effective_timeout:.0f}s")
+    if error:
+        raise error[0]
+    return result.get("value")
 
 
 class Progress:
@@ -118,7 +287,78 @@ def has_marker(path: pathlib.Path, markers: Iterable[str]) -> str | None:
     return None
 
 
-def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Path]:
+#: How far below a candidate a source checkout is looked for. A build tree
+#: puts fetched dependencies two levels down (`_deps/<name>-src/.git`), and a
+#: developer parking a worktree inside one puts it at depth one, so a bound of
+#: four covers both with a sub-directory to spare.
+NESTED_SOURCE_MAXDEPTH = 4
+# Subdirectories of a build tree that a test suite writes its own projects
+# into. Pulp: ${CMAKE_BINARY_DIR}/test-tmp/<name>/ (tools/cli/CMakeLists.txt).
+# Below one, only a `.git` marks a checkout; a CMakeLists.txt there is the
+# test's output, and read as source it kept m3's 55 GiB
+# pulp-p0a-failure-proof/build from ever being reclaimed.
+GENERATED_SCRATCH_DIRS = ("test-tmp",)
+
+#: How far below a candidate the pre-delete age re-read looks. Deeper than the
+#: scan pass on purpose: the process guard only sees an ABSOLUTE path in a
+#: command line, so a build driven as `cd build && make` is invisible to it and
+#: this walk is the only thing left. The Makefiles generator writes objects at
+#: `CMakeFiles/<target>.dir/<nested/src>.o`, which a two-level walk never sees.
+RECHECK_MAXDEPTH = 4
+
+
+def nested_source_marker(
+    path: pathlib.Path, maxdepth: int = NESTED_SOURCE_MAXDEPTH,
+    markers: tuple[str, ...] = SOURCE_MARKERS,
+    generated_dirs: tuple[str, ...] = GENERATED_SCRATCH_DIRS,
+) -> tuple[str | None, bool]:
+    """Look for a source checkout BELOW `path`. Returns (marker path, readable).
+
+    The depth-0 marker check answers "is this directory itself a source tree".
+    It does not answer the question that actually loses work, because a build
+    tree is deleted whole: a fetched dependency at `_deps/<name>-src/.git`, or
+    a worktree someone parked inside a scratch build dir, is a real checkout
+    that no later pass can bring back. A pristine dependency is re-fetchable;
+    one carrying local edits, or one with no `.git` of its own, is not.
+
+    `readable` is the same refusal-versus-answer distinction the age scan and
+    the process scan make. A subtree we were refused could hold a checkout, so
+    "could not look" must never render as "nothing there".
+    """
+    stack: list[tuple[pathlib.Path, int, bool]] = [(path, 0, False)]
+    while stack:
+        current, depth, generated = stack.pop()
+        if depth >= maxdepth:
+            continue
+        try:
+            entries = bounded_scandir(current)
+        except OSError as error:
+            if error.errno in UNMEASURABLE_ERRNOS:
+                return None, False
+            continue
+        for entry in entries:
+            child = pathlib.Path(entry.path)
+            # Below a generated scratch directory a build tree's own rules
+            # count only a `.git`; an output kind's generated directories
+            # (SwiftPM's clones in DerivedData) hold no checkout of ours.
+            if depth > 0 and entry.name in markers and (
+                    not generated or (entry.name == ".git" and markers == SOURCE_MARKERS)):
+                # A linked worktree's `.git` is a regular file, and a
+                # `CMakeLists.txt` is never a directory, so this deliberately
+                # does not test the entry's type.
+                return str(child), True
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            stack.append((child, depth + 1,
+                          generated or (depth == 0 and entry.name in generated_dirs)))
+    return None, True
+
+
+def find_candidates(roots: list[pathlib.Path], maxdepth: int,
+                    output_kinds: bool = False) -> list[pathlib.Path]:
     """Directories under `roots` whose name looks like a build directory.
 
     Does not descend into a candidate (a nested `build/` inside a build tree is
@@ -135,14 +375,21 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
             if depth >= maxdepth:
                 continue
             try:
-                entries = list(os.scandir(current))
-            except OSError:
+                entries = bounded_scandir(current)
+            except OSError as error:
+                if error.errno in (errno.EPERM, errno.EACCES):
+                    # A refusal is "could not look", never "empty": name it, so
+                    # a directory that would prompt or is protected is visible.
+                    SCAN_REFUSED.append(str(current))
+                    print(f"disk_reclaim: skipped {current}: "
+                          f"{os.strerror(error.errno)}", file=sys.stderr)
                 continue
             for entry in entries:
                 if not entry.is_dir(follow_symlinks=False):
                     continue
                 child = pathlib.Path(entry.path)
-                if is_build_dir_name(entry.name):
+                if is_build_dir_name(entry.name) or (
+                        output_kinds and checkout_outputs.kind_of(entry.name)):
                     found.append(child)
                     continue
                 stack.append((child, depth + 1))
@@ -155,7 +402,78 @@ def find_candidates(roots: list[pathlib.Path], maxdepth: int) -> list[pathlib.Pa
 # files under the scan, so an entry vanishing mid-walk is routine AND is
 # positive evidence the tree is busy. Treating that as unmeasured would make
 # the hourly pass report unknown on every busy host.
-UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELOOP})
+UNMEASURABLE_ERRNOS = frozenset({errno.EACCES, errno.EPERM, errno.EIO, errno.ELOOP,
+                                 errno.ETIMEDOUT})
+
+# One directory listing that has not returned in this long is abandoned. On
+# 2026-10-02 m1's hourly pass sat in open() of one directory for 14 h, and
+# launchd never starts an interval job's next run while one is alive, so the
+# host went unreclaimed the whole time. A listing that cannot be read in time
+# is "could not look", never "empty", so nothing under it is deleted.
+SCANDIR_TIMEOUT_S = 120.0
+SCAN_TIMEOUTS: list[str] = []
+SCAN_REFUSED: list[str] = []
+
+
+# Other apps' data containers. Opening one from a process without Full Disk
+# Access asks the logged-in user ("would like to access data from other
+# apps") and the open() waits for the answer; under launchd nobody is there,
+# so it waits forever. On 2026-10-02 m1's hourly pass hung at its first
+# listing while sandboxd sent kTCCServiceSystemPolicyAppDataDetailed requests.
+# Never list them: a skipped container is "could not look", so nothing in it
+# is judged or removed.
+APP_CONTAINER_DIRS = ("Containers", "Group Containers", "Daemon Containers")
+APP_CONTAINERS_SKIPPED: list[str] = []
+
+
+def is_app_container(path: Any) -> bool:
+    """Whether `path` is, or lies inside, ~/Library or a Library/*Containers directory."""
+    parts = pathlib.PurePath(os.fspath(path)).parts
+    if any(parts[i] == "Library" and parts[i + 1] in APP_CONTAINER_DIRS
+           for i in range(len(parts) - 1)):
+        return True
+    library = pathlib.PurePath(os.path.expanduser("~")) / "Library"
+    candidate = pathlib.PurePath(os.fspath(path))
+    return candidate == library or library in candidate.parents
+
+
+def bounded_scandir(path: Any, timeout: float | None = None) -> list[os.DirEntry]:
+    """`list(os.scandir(path))`, or OSError(ETIMEDOUT) once `timeout` passes.
+
+    The listing runs on a daemon thread. A listing stuck in the kernel cannot
+    be cancelled, so its thread is abandoned; being a daemon thread, it does
+    not keep the pass from exiting. Every abandoned path is recorded in
+    SCAN_TIMEOUTS and printed, so the directory that blocks is named.
+    """
+    if is_app_container(path):
+        APP_CONTAINERS_SKIPPED.append(str(path))
+        raise OSError(errno.EPERM, "another app's data container is never listed", str(path))
+    limit = SCANDIR_TIMEOUT_S if timeout is None else timeout
+    if PASS_DEADLINE is not None:
+        remaining = PASS_DEADLINE - time.monotonic()
+        if remaining <= 0:
+            raise OSError(errno.ETIMEDOUT, "reclaim pass deadline reached")
+        limit = min(limit, remaining)
+    result: dict[str, Any] = {}
+
+    def listing() -> None:
+        try:
+            result["entries"] = list(os.scandir(path))
+        except BaseException as error:  # noqa: BLE001 - re-raised on the caller's thread
+            result["error"] = error
+
+    worker = threading.Thread(target=listing, name=f"scandir {path}", daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        SCAN_TIMEOUTS.append(str(path))
+        print(f"disk_reclaim: SCAN TIMEOUT: listing {path} did not return in "
+              f"{limit:.0f}s; skipped (nothing under it is deleted)", file=sys.stderr)
+        raise OSError(errno.ETIMEDOUT, f"directory listing timed out after {limit:.0f}s",
+                      str(path))
+    if "error" in result:
+        raise result["error"]
+    return result["entries"]
 
 
 def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float | None:
@@ -178,7 +496,7 @@ def newest_mtime(path: pathlib.Path, maxdepth: int = 2) -> float | None:
         try:
             newest = max(newest, current.stat().st_mtime)
             measured = True
-            entries = list(os.scandir(current))
+            entries = bounded_scandir(current)
         except OSError as exc:
             if exc.errno in UNMEASURABLE_ERRNOS:
                 return None
@@ -254,14 +572,30 @@ def free_bytes(path: pathlib.Path) -> int | None:
     root before any measurement is taken. It is not: the post-fix re-measure
     runs after a whole pass has walked and deleted, which on a loaded host is
     minutes after that check, and the volume it re-measures is a mount point
-    (m3 scans /Volumes/Workshop). An unmount inside that window, or an EIO off
+    (m3 scans /Volumes/<data-volume>). An unmount inside that window, or an EIO off
     a failing disk, reaches here. Deleting this branch would turn that into a
     traceback out of the janitor instead of an honest "unknown".
+
+    Bounded by its own timeout, never by the pass deadline: on m3
+    (2026-10-22) the walk spent the whole 900 s pass, the re-measure was
+    refused without a statfs, and every pass exited 4 while the volume sat
+    at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
-        return shutil.disk_usage(path).free
+        return bounded_fs_call(lambda: shutil.disk_usage(path).free,
+                               description=f"disk usage {path}", pass_deadline=False)
     except OSError:
         return None
+
+
+def used_percent(path: pathlib.Path) -> float | None:
+    """Percent of `path`'s volume in use, or None when it cannot be read."""
+    try:
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", pass_deadline=False)
+    except OSError:
+        return None
+    return 100.0 * usage.used / usage.total if usage.total else None
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:
@@ -318,6 +652,16 @@ def names_candidate(active: str, spellings: set[str]) -> bool:
     return False
 
 
+def nested_scan(path: pathlib.Path,
+                maxdepth: int = NESTED_SOURCE_MAXDEPTH) -> tuple[str | None, bool]:
+    """nested_source_marker with the rules of `path`'s kind (checkout_outputs)."""
+    rules = checkout_outputs.OUTPUT_KINDS.get(checkout_outputs.kind_of(path.name) or "")
+    if rules is None:
+        return nested_source_marker(path, maxdepth)
+    return nested_source_marker(path, maxdepth, markers=rules["nested"],
+                                generated_dirs=rules["generated"])
+
+
 def classify(
     path: pathlib.Path,
     *,
@@ -332,6 +676,7 @@ def classify(
     build is not running, and the whole contract is that deletion requires
     positive proof rather than absence of evidence.
     """
+    kind = checkout_outputs.kind_of(path.name)
     measured = newest_mtime(path)
     if measured is None:
         return False, "unmeasured", 0.0
@@ -339,9 +684,15 @@ def classify(
 
     if has_marker(path, SOURCE_MARKERS):
         return False, "source_tree", age_days
-    marker = has_marker(path, GENERATED_MARKERS)
+    rules = checkout_outputs.OUTPUT_KINDS.get(kind or "")
+    marker = has_marker(path, rules["markers"] if rules else GENERATED_MARKERS)
     if marker is None:
         return False, "not_a_build_tree", age_days
+    nested, readable = nested_scan(path)
+    if not readable:
+        return False, "nested_scan_unreadable", age_days
+    if nested is not None:
+        return False, f"nested_source_tree ({nested})", age_days
     if active is None:
         return False, "process_scan_unavailable", age_days
     if active and names_candidate(active, path_spellings(path)):
@@ -358,11 +709,76 @@ def classify(
 # code and worktrees on an external Workshop volume and still has a populated
 # `~/Code` on the boot disk, so `~/Code` alone is exactly that failure.
 # Discovery keeps whichever of these the host actually has, so a host is
-# covered without per-host tuning of the rendered plist.
+# covered without per-host tuning of the rendered plist. The external-volume
+# code root is not named here: it comes from the installed fleet profile's
+# `[reclaim]` repo and worktrees_root (profile_root_candidates), so a host whose
+# volume has a different name (m3: Workshop, m5studio: Atelier) is covered.
 DEFAULT_ROOT_CANDIDATES = (
     "~/Code",
-    "/Volumes/Workshop/Code",
 )
+
+
+def checkout_output_settings() -> dict[str, Any] | None:
+    """The installed profile's checkout_outputs tier, or None when it is off."""
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return None
+    try:
+        with profile.open("rb") as handle:
+            return checkout_outputs.settings(tomllib.load(handle).get("reclaim"))
+    except (OSError, ValueError):
+        return None
+
+
+def profile_root_candidates() -> list[str]:
+    """Code roots the installed fleet profile declares under `[reclaim]`.
+
+    The parent of `repo` (the code directory a checkout sits in) and
+    `worktrees_root` itself. Taking the parent of `worktrees_root` too assumed
+    it was always `<volume>/Code/agent-worktrees`; m1 and m5 set it to
+    `~/Code`, whose parent is the home directory, and every pass walked all of
+    $HOME, ~/Library included. Empty when there is no profile or no table.
+    """
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return []
+    try:
+        with profile.open("rb") as handle:
+            reclaim = tomllib.load(handle).get("reclaim")
+    except (OSError, ValueError):
+        return []
+    if not isinstance(reclaim, dict):
+        return []
+    out: list[str] = []
+    for key in ("repo", "worktrees_root"):
+        value = reclaim.get(key)
+        if isinstance(value, str) and value.strip().startswith("/"):
+            path = pathlib.PurePosixPath(value.strip())
+            out.append(str(path.parent if key == "repo" else path))
+    return out
+
+
+def refused_root(path: pathlib.Path) -> str | None:
+    """Why `path` may never be a scan root, or None.
+
+    A root at or above the home directory reaches ~/Library, where listing
+    another app's data asks the logged-in user and, under launchd, waits
+    forever. `/`, `/Users`, `/Volumes`, a whole volume (`/Volumes/<name>`) and
+    $HOME are refused outright, as is any root that contains or lies inside
+    ~/Library.
+    """
+    resolved = pathlib.Path(os.path.realpath(path))
+    home = pathlib.Path(os.path.realpath(os.path.expanduser("~")))
+    library = home / "Library"
+    if resolved in (pathlib.Path("/"), pathlib.Path("/Users"), pathlib.Path("/Volumes"), home):
+        return f"{resolved} is a whole-system or home directory"
+    if resolved.parent == pathlib.Path("/Volumes"):
+        return f"{resolved} is a whole volume"
+    if resolved == library or library in resolved.parents:
+        return f"{resolved} is inside {library}"
+    if resolved in library.parents:
+        return f"{resolved} contains {library}"
+    return None
 
 
 def discover_roots() -> list[pathlib.Path]:
@@ -375,7 +791,7 @@ def discover_roots() -> list[pathlib.Path]:
     """
     found: list[pathlib.Path] = []
     seen: set[str] = set()
-    for candidate in DEFAULT_ROOT_CANDIDATES:
+    for candidate in (*DEFAULT_ROOT_CANDIDATES, *profile_root_candidates()):
         path = pathlib.Path(os.path.expanduser(candidate))
         try:
             resolved = path.resolve()
@@ -383,9 +799,16 @@ def discover_roots() -> list[pathlib.Path]:
             continue
         if not resolved.is_dir() or str(resolved) in seen:
             continue
+        reason = refused_root(resolved)
+        if reason:
+            print(f"disk_reclaim: REFUSED scan root {candidate}: {reason}", file=sys.stderr)
+            continue
         seen.add(str(resolved))
         found.append(resolved)
-    return found
+    # A root inside another root (m3: Code and Code/agent-worktrees) would be
+    # walked twice and report its build trees twice; keep the outer one.
+    return [root for root in found
+            if not any(other != root and other in root.parents for other in found)]
 
 
 def parse_roots(raw: str | None) -> list[pathlib.Path]:
@@ -403,7 +826,8 @@ def device_id(path: pathlib.Path) -> int | None:
     measurement rather than take one.
     """
     try:
-        return os.stat(path).st_dev
+        return bounded_fs_call(lambda: os.stat(path).st_dev,
+                               description=f"stat {path}")
     except OSError:
         return None
 
@@ -423,8 +847,10 @@ def volumes_free_bytes(roots: list[pathlib.Path]) -> list[dict[str, Any]]:
             if device in seen:
                 continue
             seen.add(device)
-        out.append({"root": str(root), "device": device,
-                    "free_bytes": free_bytes(root)})
+        free = free_bytes(root)
+        out.append({"root": str(root), "device": device, "free_bytes": free,
+                    # Only alongside a known free figure: unknown stays unknown.
+                    "used_percent": None if free is None else used_percent(root)})
     return out
 
 
@@ -449,6 +875,81 @@ def tightest_volume_root(volumes: list[dict[str, Any]]) -> str | None:
     if not known or len(known) != len(volumes):
         return None
     return min(known, key=lambda v: v["free_bytes"])["root"]
+
+
+def resolve_boot_volume(explicit: str | None) -> pathlib.Path:
+    """The boot data volume: the explicit path, else macOS's data volume, else /."""
+    if explicit:
+        return pathlib.Path(os.path.expanduser(explicit))
+    data = pathlib.Path(DEFAULT_BOOT_VOLUME)
+    try:
+        return data if bounded_fs_call(data.is_dir, description=f"is_dir {data}") else pathlib.Path("/")
+    except OSError:
+        # Keep the authoritative path so its later free-space check remains
+        # unknown; never substitute another volume after a stall.
+        return data
+
+
+def boot_volume_report(path: pathlib.Path, before: dict[str, Any],
+                       after: dict[str, Any], floor_gb: float,
+                       floor_devices: set[Any], lease_floor_gb: float) -> dict[str, Any]:
+    """How the boot data volume was judged this pass.
+
+    `lease_floor` when the main floor already measured the same device (every
+    host whose Tart store is on the boot disk), `own_floor` when only this
+    check covers it (m3: Tart store on Workshop), `disabled` at floor 0.
+    """
+    device = after.get("device")
+    if lease_floor_gb > 0 and device is not None and device in floor_devices:
+        judged_by = "lease_floor"
+    elif floor_gb > 0:
+        judged_by = "own_floor"
+    else:
+        judged_by = "disabled"
+    free_after = after.get("free_bytes")
+    return {
+        "path": str(path),
+        "device": device,
+        "free_bytes_before": before.get("free_bytes"),
+        "free_bytes_after": free_after,
+        "floor_gb": floor_gb,
+        "judged_by": judged_by,
+        "below_floor": (judged_by == "own_floor" and free_after is not None
+                        and free_after < floor_gb * GIB),
+    }
+
+
+def resolve_lease_path(explicit: str | None) -> dict[str, Any] | None:
+    """The Tart store lease admission probes, and where that answer came from.
+
+    The runners hand `$TART_HOME` to the lease as its disk root, so the floor
+    that says "this host will refuse leases" has to be read off that volume
+    and no other. Precedence: an explicit `--lease-path`, then `$TART_HOME`,
+    then the installed fleet profile's `[host].tart_home`. None when nothing
+    declares one, which keeps the legacy every-scanned-volume floor.
+
+    A declared path that does not exist is still returned: an unmounted
+    Workshop volume is a lease root the runners cannot use, and the floor has
+    to say "unknown" (exit 4) rather than quietly judge some other disk.
+    """
+    if explicit:
+        return {"path": os.path.expanduser(explicit), "source": "--lease-path"}
+    tart_home = os.environ.get("TART_HOME", "").strip()
+    if tart_home:
+        return {"path": os.path.expanduser(tart_home), "source": "TART_HOME"}
+    profile = pulp_reapers.default_profile_path()
+    if tomllib is None or not profile.is_file():
+        return None
+    try:
+        with profile.open("rb") as handle:
+            host = tomllib.load(handle).get("host")
+    except (OSError, ValueError):
+        return None
+    value = host.get("tart_home") if isinstance(host, dict) else None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return {"path": os.path.expanduser(value.strip()),
+            "source": f"{profile} [host].tart_home"}
 
 
 def rotate_log(path: pathlib.Path, max_bytes: int, generations: int,
@@ -503,13 +1004,244 @@ def rotate_log(path: pathlib.Path, max_bytes: int, generations: int,
     return True
 
 
+RECEIPT_NAME = "last-run.json"
+EVENTS_NAME = "events.jsonl"
+EVENTS_MAX_BYTES = 1024 * 1024
+EVENTS_GENERATIONS = 3
+
+
+def state_dir(args: argparse.Namespace) -> pathlib.Path:
+    if getattr(args, "state_dir", None):
+        return pathlib.Path(args.state_dir).expanduser()
+    return pulp_reapers.default_state_dir()
+
+
+def _atomic_write(path: pathlib.Path, body: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(body)
+    os.replace(tmp, path)
+
+
+def _discovery_summary(value: Any) -> Any:
+    """The discovery block, with its unreadable list bounded for the receipt."""
+    if not isinstance(value, dict):
+        return value
+    unreadable = value.get("unreadable") or []
+    return dict(value, unreadable=unreadable[:10])
+
+
+def pass_summary(receipt: dict[str, Any], code: int | None) -> dict[str, Any]:
+    """The small, stable shape the receipt, the event and status all share."""
+    report = receipt.get("report") or {}
+    pulp = receipt.get("pulp_reapers") or report.get("pulp_reapers") or {}
+    finished = time.time()
+    summary: dict[str, Any] = {
+        "schema": 1,
+        "started_ts": round(receipt.get("started_ts", finished), 3),
+        "finished_ts": round(finished, 3),
+        "duration_s": round(finished - receipt.get("started_ts", finished), 1),
+        "exit_code": code,
+        # None is "the pass raised"; a receipt must still say it ran and failed.
+        "result": "ok" if code == 0 else "failed",
+        "mode": receipt.get("mode"),
+        "priority": receipt.get("priority"),
+        "pressure": report.get("pressure"),
+        "free_bytes_before": report.get("free_bytes_before"),
+        "free_bytes_after": report.get("free_bytes_after"),
+        "tartci_reclaimed_bytes": report.get("reclaimed_bytes", 0),
+        "fail_below_gb": report.get("fail_below_gb"),
+        "tightest_root": report.get("tightest_root"),
+        "pulp_reapers": {
+            "enabled": bool(pulp.get("enabled")),
+            "reason": pulp.get("reason"),
+            "error": pulp.get("error"),
+            "pressure": pulp.get("pressure"),
+            "scripts": pulp.get("scripts"),
+            "host_vitals_sensor": pulp.get("host_vitals_sensor"),
+            "reclaimed_bytes": pulp.get("reclaimed_bytes", 0),
+            "free_bytes_before": pulp.get("free_bytes_before"),
+            "free_bytes_after": pulp.get("free_bytes_after"),
+            # Report only; nothing deletes these (pulp_reapers.tmp_worktrees).
+            "worktrees_in_tmp": {key: (pulp.get("worktrees_in_tmp") or {}).get(key)
+                                 for key in ("count", "total_bytes", "size",
+                                             "oldest_mtime", "error")}
+            if pulp.get("worktrees_in_tmp") else None,
+            "runs": [{key: run.get(key) for key in (
+                "reaper", "mode", "exit_code", "reclaimed_bytes", "reported_gb",
+                "free_bytes_before", "free_bytes_after", "duration_s", "error",
+                "summary", "reason", "worktrees_root")} for run in pulp.get("runs") or []],
+            # Which roots outside the profile were reaped, and how discovery
+            # judged them, including a readable "scanned N, matched 0".
+            "outside_profile_roots": pulp.get("outside_profile_roots"),
+            "discovery": _discovery_summary(pulp.get("discovery")),
+        },
+    }
+    tmp = receipt.get("tmp_checkouts") or report.get("tmp_checkouts") or {}
+    summary["tmp_checkouts"] = ({key: tmp.get(key) for key in (
+        "enabled", "reason", "error", "mode", "idle_hours", "checkouts", "removed",
+        "removed_bytes", "kept", "deferred", "orphaned_worktrees", "orphaned_paths",
+        "broken_checkouts", "broken_paths", "root", "by_root", "merged_worktrees")}
+        if tmp else None)
+    tmp_freed = int(tmp.get("removed_bytes") or 0) if receipt.get("mode") == "fix" else 0
+    scratch = receipt.get("scratch_dirs") or report.get("scratch_dirs") or {}
+    summary["scratch_dirs"] = ({key: scratch.get(key) for key in (
+        "enabled", "reason", "error", "errors", "mode", "idle_hours", "pressure",
+        "candidates", "removed", "removed_bytes", "removed_paths", "kept",
+        "deferred", "by_pattern")} if scratch else None)
+    scratch_freed = (int(scratch.get("removed_bytes") or 0)
+                     if receipt.get("mode") == "fix" else 0)
+    gate_ccache = receipt.get("gate_ccache_trim") or report.get("gate_ccache_trim") or {}
+    summary["gate_ccache_trim"] = ({key: gate_ccache.get(key) for key in (
+        "enabled", "status", "reason", "cache", "max_age_days", "interval_hours", "elapsed_s",
+        "before", "after", "counters_after", "last_completed_at")} if gate_ccache else None)
+    summary["boot_volume"] = report.get("boot_volume")
+    summary["scan_timeouts"] = report.get("scan_timeouts") or []
+    summary["reclaimed_bytes"] = (int(summary["tartci_reclaimed_bytes"] or 0)
+                                  + int(summary["pulp_reapers"]["reclaimed_bytes"] or 0)
+                                  + tmp_freed + scratch_freed)
+    if "error" in receipt:
+        summary["error"] = receipt["error"]
+    return summary
+
+
+def tmp_checkout_detail(tmp: dict[str, Any] | None) -> str:
+    """"; stale checkouts removed 3 (1.2 GiB), kept dirty=2 recent=5, 72 orphaned"."""
+    if not tmp or not tmp.get("enabled"):
+        return ""
+    if tmp.get("error") and tmp.get("checkouts") is None:
+        return f"; stale checkouts: {tmp['error']}"
+    verb = "removed" if tmp.get("mode") == "fix" else "would remove"
+    kept = " ".join(f"{k}={v}" for k, v in sorted((tmp.get("kept") or {}).items()))
+    text = (f"; stale checkouts {verb} {tmp.get('removed', 0)} "
+            f"({int(tmp.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if kept:
+        text += f", kept {kept}"
+    if tmp.get("deferred"):
+        text += f", deferred {tmp['deferred']}"
+    if tmp.get("orphaned_worktrees"):
+        text += f", {tmp['orphaned_worktrees']} orphaned worktrees (not removed)"
+    if tmp.get("broken_checkouts"):
+        text += f", {tmp['broken_checkouts']} broken .git dirs (not removed)"
+    return text + merged_worktree_detail(tmp.get("merged_worktrees"))
+
+
+def merged_worktree_detail(merged: dict[str, Any] | None) -> str:
+    """"; merged worktrees removed 12 (40.1 GiB), 3 holding work, PR read ok: o/r, 4 branch(es)"."""
+    if not merged or not merged.get("enabled"):
+        return ""
+    text = (f"; merged worktrees removed {merged.get('removed', 0)} "
+            f"({int(merged.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if merged.get("holding_work"):
+        text += f", {merged['holding_work']} holding unpushed work (kept, listed)"
+    if merged.get("pr_lookup") not in (None, "not needed"):
+        text += f", PR read {merged['pr_lookup']}"
+    return text
+
+
+def scratch_detail(scratch: dict[str, Any] | None) -> str:
+    """"; scratch removed 12 (31.4 GiB), kept open_files=2 recent=5"."""
+    if not scratch or not scratch.get("enabled"):
+        return ""
+    if scratch.get("error") and scratch.get("candidates") is None:
+        return f"; scratch: {scratch['error']}"
+    verb = "removed" if scratch.get("mode") == "fix" else "would remove"
+    kept = " ".join(f"{k}={v}" for k, v in sorted((scratch.get("kept") or {}).items()))
+    text = (f"; scratch {verb} {scratch.get('removed', 0)} "
+            f"({int(scratch.get('removed_bytes') or 0) / GIB:.1f} GiB)")
+    if kept:
+        text += f", kept {kept}"
+    if scratch.get("error"):
+        text += f", {scratch['error']}"
+    return text
+
+
+def gate_ccache_detail(trim: dict[str, Any] | None) -> str:
+    """"; gate ccache evicted >14d: 506745 -> 149655 entries (14.3 -> 5.5 GB)"."""
+    if not trim or not trim.get("enabled") or trim.get("status") == "not_due":
+        return ""
+    if trim.get("status") != "evicted":
+        return f"; gate ccache {trim.get('status')}: {trim.get('reason') or '-'}"
+    before, after = trim.get("before") or {}, trim.get("after") or {}
+
+    def gb(side: dict[str, Any]) -> str:
+        return f"{side['bytes'] / 1e9:.1f}" if isinstance(side.get("bytes"), int) else "?"
+
+    return (f"; gate ccache evicted >{trim.get('max_age_days')}d: "
+            f"{before.get('entries', '?')} -> {after.get('entries', '?')} entries "
+            f"({gb(before)} -> {gb(after)} GB)")
+
+
+def boot_detail(boot: dict[str, Any] | None) -> str:
+    if not boot or not boot.get("below_floor"):
+        return ""
+    return (f"; BOOT VOLUME LOW {int(boot['free_bytes_after']) / GIB:.1f} GiB on "
+            f"{boot['path']} < {boot['floor_gb']:g} GiB")
+
+
+def record_pass(args: argparse.Namespace, receipt: dict[str, Any],
+                code: int | None, stream: Any = None) -> dict[str, Any] | None:
+    """Write the last-run receipt and append one reclaim_pass event.
+
+    Also printed to stderr as one JSON line, because stderr is the reclaim log
+    and a grep for `reclaim_pass` there should find every pass. Never raises:
+    a receipt that cannot be written must not turn a successful reclaim into
+    a failed one, and the missing receipt is itself what status reports.
+    """
+    stream = sys.stderr if stream is None else stream
+    summary = pass_summary(receipt, code)
+    event = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(summary["finished_ts"])),
+        "event": "reclaim_pass",
+        "detail": (f"exit {code}; reclaimed {summary['reclaimed_bytes'] / GIB:.1f} GiB "
+                   f"(pulp {summary['pulp_reapers']['reclaimed_bytes'] / GIB:.1f} GiB)"
+                   + tmp_checkout_detail(summary.get("tmp_checkouts"))
+                   + scratch_detail(summary.get("scratch_dirs"))
+                   + gate_ccache_detail(summary.get("gate_ccache_trim"))
+                   + boot_detail(summary.get("boot_volume"))),
+        "fields": summary,
+    }
+    print(f"disk_reclaim: {json.dumps(event, sort_keys=True)}", file=stream, flush=True)
+    directory = state_dir(args)
+    try:
+        _atomic_write(directory / RECEIPT_NAME, json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        events = directory / EVENTS_NAME
+        rotate_log(events, EVENTS_MAX_BYTES, EVENTS_GENERATIONS, stream=stream)
+        with events.open("a") as handle:
+            handle.write(json.dumps(event, sort_keys=True) + "\n")
+            for run in summary["pulp_reapers"]["runs"]:
+                handle.write(json.dumps({
+                    "ts": event["ts"], "event": "pulp_reaper",
+                    "detail": f"{run['reaper']} exit {run['exit_code']}",
+                    "fields": run}, sort_keys=True) + "\n")
+            merged = (summary.get("tmp_checkouts") or {}).get("merged_worktrees") or {}
+            if merged.get("enabled"):
+                # One metrics line per pass for the merged-worktree rule, so
+                # removals, holds and the PR read can be charted without
+                # unpacking the reclaim_pass event.
+                handle.write(json.dumps({
+                    "ts": event["ts"], "event": "merged_worktrees",
+                    "detail": merged_worktree_detail(merged).lstrip("; "),
+                    "fields": {key: merged.get(key) for key in (
+                        "mode", "roots", "idle_hours", "removed", "removed_bytes",
+                        "holding_work", "pr_lookup", "pr_lookups", "pr_deferred",
+                        "lineage_recorded", "lineage_failed",
+                        "forced_submodule_removals", "pruned", "report_path")}},
+                    sort_keys=True) + "\n")
+    except OSError as exc:
+        print(f"disk_reclaim: could not write the reclaim receipt under {directory}: {exc}",
+              file=stream)
+        return None
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Reclaim regenerable build directories on a CI host.")
     parser.add_argument(
         "--roots",
         default=os.environ.get("TARTCI_RECLAIM_ROOTS"),
-        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and /Volumes/Workshop/Code exist)")
+        help="colon-separated scan roots (default: $TARTCI_RECLAIM_ROOTS, else whichever of ~/Code and the fleet profile's [reclaim] repo/worktrees_root parents exist)")
     parser.add_argument("--maxdepth", type=int,
                         default=int(os.environ.get("TARTCI_RECLAIM_MAXDEPTH", "5")),
                         help="directory depth below each root to scan (default 5)")
@@ -519,12 +1251,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--pressure-free-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_FREE_GB", "200")),
                         help="free space below which the shorter age gate applies (default 200)")
+    parser.add_argument("--pressure-used-percent", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_USED_PERCENT", "0")),
+                        help="also apply the shorter age gate on a volume at least this "
+                             "percent used (default 0: off; the installed agent sets it "
+                             "below the readiness disk_pressure limit)")
     parser.add_argument("--pressure-min-age-days", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS", "7")),
                         help="age gate used under disk pressure (default 7)")
     parser.add_argument("--fail-below-gb", type=float,
                         default=float(os.environ.get("TARTCI_RECLAIM_FAIL_BELOW_GB", "0")),
-                        help="exit 3 when free space is still below this after the pass (0 disables)")
+                        help="exit 3 when the lease volume's free space is still below this after the pass (0 disables)")
+    parser.add_argument("--lease-path",
+                        default=os.environ.get("TARTCI_RECLAIM_LEASE_PATH"),
+                        help="the Tart store whose volume --fail-below-gb judges (default: $TARTCI_RECLAIM_LEASE_PATH, else $TART_HOME, else the fleet profile's [host].tart_home; with none, every scanned volume)")
+    parser.add_argument("--boot-volume",
+                        default=os.environ.get("TARTCI_RECLAIM_BOOT_VOLUME"),
+                        help=f"the boot data volume judged on its own floor (default: $TARTCI_RECLAIM_BOOT_VOLUME, else {DEFAULT_BOOT_VOLUME} when it exists, else /)")
+    parser.add_argument("--boot-floor-gb", type=float,
+                        default=float(os.environ.get("TARTCI_RECLAIM_BOOT_FLOOR_GB",
+                                                     str(DEFAULT_BOOT_FLOOR_GB))),
+                        help=f"exit 5 when the boot data volume is still below this after the pass and no other floor covers it (default {DEFAULT_BOOT_FLOOR_GB:g}; 0 disables)")
     parser.add_argument("--log-path",
                         default=os.environ.get("TARTCI_RECLAIM_LOG"),
                         help="log file to rotate aside at startup once it reaches --log-max-bytes (default: $TARTCI_RECLAIM_LOG; unset disables rotation)")
@@ -534,6 +1281,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-generations", type=int,
                         default=int(os.environ.get("TARTCI_RECLAIM_LOG_GENERATIONS", "5")),
                         help="how many rotated generations to keep (default 5)")
+    parser.add_argument("--state-dir",
+                        default=os.environ.get("TARTCI_RECLAIM_STATE_DIR"),
+                        help="where the last-run receipt and reclaim events are written (default: $TARTCI_RECLAIM_STATE_DIR, else $TARTCI_HOME/state/reclaim)")
     parser.add_argument("--fix", action="store_true",
                         help="actually delete; without it the pass is a dry run")
     parser.add_argument("--json", action="store_true", help="emit a JSON report")
@@ -541,7 +1291,51 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    """One pass, always followed by its receipt and event.
+
+    The receipt is what makes a dead janitor visible. m3's reclaim agent was
+    shadowed by a leaked registration for a day and exited 127 every hour
+    without writing a line anywhere tartci looks; tartci status kept printing
+    "installed and loaded" because a job with that label WAS loaded. A pass
+    that does not leave a fresh receipt is now the signal, whatever launchd
+    believes.
+    """
+    raw = list(sys.argv[1:] if argv is None else argv)
+    if "--on-lease-denial" in raw:
+        # The lease-denial reclaim (denial_reclaim.py): regenerable caches only,
+        # rate limited per host, with its own receipt so it never stands in for
+        # the hourly pass that reclaim_status judges.
+        import denial_reclaim  # noqa: PLC0415 - only this mode needs it
+        return denial_reclaim.main([item for item in raw if item != "--on-lease-denial"])
+    args = build_parser().parse_args(raw)
+    receipt: dict[str, Any] = {"started_ts": time.time(), "mode": "fix" if args.fix else "dry-run",
+                               "priority": (enter_background() if args.fix
+                                            else "unchanged: dry-run")}
+    code: int | None = None
+    try:
+        code = _run(args, receipt)
+        return code
+    finally:
+        record_pass(args, receipt, code)
+
+
+def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
+    global PASS_DEADLINE
+    PASS_DEADLINE = time.monotonic() + PASS_TIMEOUT_S
+    # Every other knob widens or narrows what is examined. These two decide
+    # whether anything is examined at all: a zero age gate deletes every
+    # generated tree the scan reaches the moment it reaches it, and a
+    # non-positive depth makes `find_candidates` return nothing while still
+    # exiting 0, which is a janitor that reports success for doing nothing.
+    if args.maxdepth < 1:
+        print("disk_reclaim: --maxdepth must be at least 1", file=sys.stderr)
+        return 2
+    for name, value in (("--min-age-days", args.min_age_days),
+                        ("--pressure-min-age-days", args.pressure_min_age_days)):
+        if value <= 0:
+            print(f"disk_reclaim: {name} must be greater than zero",
+                  file=sys.stderr)
+            return 2
     # Before anything is printed: this pass appends to that file, and an
     # unbounded receipt on the volume we are protecting is the problem.
     if args.log_path:
@@ -558,10 +1352,19 @@ def main(argv: list[str] | None = None) -> int:
     # the disk it was installed to protect fills up.
     unusable = []
     for root in roots:
-        if not root.is_dir():
-            unusable.append(f"{root} (not a directory)")
-        elif not os.access(root, os.R_OK | os.X_OK):
-            unusable.append(f"{root} (not readable)")
+        if refused_root(root):
+            unusable.append(f"{root} (refused: {refused_root(root)})")
+        else:
+            try:
+                if not bounded_fs_call(root.is_dir, description=f"is_dir {root}"):
+                    unusable.append(f"{root} (not a directory)")
+                elif not bounded_fs_call(
+                    lambda: os.access(root, os.R_OK | os.X_OK),
+                    description=f"access {root}",
+                ):
+                    unusable.append(f"{root} (not readable)")
+            except OSError as exc:
+                unusable.append(f"{root} (probe failed: {exc})")
     if unusable:
         print("disk_reclaim: unusable scan root(s): " + ", ".join(unusable),
               file=sys.stderr)
@@ -569,7 +1372,25 @@ def main(argv: list[str] | None = None) -> int:
 
     now = time.time()
     volumes_before = volumes_free_bytes(roots)
-    free_before = tightest_free_bytes(volumes_before)
+    lease = resolve_lease_path(args.lease_path)
+    # The floor's volumes: the lease volume when a Tart store is declared,
+    # else every scanned volume (the legacy judgement, unchanged).
+    floor_roots = [pathlib.Path(lease["path"])] if lease else roots
+    floor_before = volumes_free_bytes(floor_roots) if lease else volumes_before
+    free_before = tightest_free_bytes(floor_before)
+    boot_path = resolve_boot_volume(args.boot_volume)
+    # A disabled watch measures nothing, so it cannot fail on a stat either.
+    unmeasured = {"root": str(boot_path), "device": None, "free_bytes": None}
+
+    def measure_boot() -> dict[str, Any]:
+        return (volumes_free_bytes([boot_path])[0] if args.boot_floor_gb > 0
+                else unmeasured)
+
+    boot_before = measure_boot()
+    # Below its floor selects the scratch reaper's shorter idle gate. Unknown
+    # keeps the longer one, the same direction the build-dir gate takes.
+    boot_pressure = (args.boot_floor_gb > 0 and boot_before["free_bytes"] is not None
+                     and boot_before["free_bytes"] < args.boot_floor_gb * GIB)
     # An unknown free figure selects the LONGER gate. Guessing "full" here
     # would make an unreadable volume delete more aggressively than a healthy
     # one, which is exactly backwards.
@@ -583,16 +1404,41 @@ def main(argv: list[str] | None = None) -> int:
     pressured_devices = {
         volume["device"] for volume in volumes_before
         if volume["device"] is not None
-        and volume["free_bytes"] is not None
-        and volume["free_bytes"] < args.pressure_free_gb * GIB
+        # The same test the Pulp worktree reaper runs under (see its
+        # docstring for why the percent arm exists).
+        and pulp_reapers.under_pressure(
+            volume["free_bytes"], volume.get("used_percent"),
+            pressure_free_gb=args.pressure_free_gb,
+            pressure_used_percent=args.pressure_used_percent)
     }
     pressure = bool(pressured_devices)
+    # A volume below its floor needs space now: reclaim at normal priority.
+    if (pressure or boot_pressure) and receipt.get("priority") == "darwin_background" \
+            and leave_background():
+        receipt["priority"] = "foreground: a volume is under pressure"
+
+    outputs = checkout_output_settings()
+    receipt["checkout_build_outputs"] = (
+        {"enabled": True, "idle_hours": outputs["idle_hours"], "selected": 0, "kept": {}}
+        if outputs else {"enabled": False})
+
+    def pressured(path: pathlib.Path) -> bool:
+        device = device_id(path)
+        return device is not None and device in pressured_devices
 
     def min_age_for(path: pathlib.Path) -> float:
-        device = device_id(path)
-        if device is None or device not in pressured_devices:
+        if not pressured(path):
             return args.min_age_days
+        if outputs:
+            # The checkout tier (checkout_outputs.py): hours, not days, and only
+            # past its checkout gates, which the caller applies.
+            return min(short_gate, outputs["idle_hours"] / 24.0)
         return short_gate
+
+    def checkout_tier(path: pathlib.Path, gate_days: float) -> bool:
+        """Whether this candidate is judged by the checkout tier's rules."""
+        return bool(outputs) and (checkout_outputs.kind_of(path.name) is not None
+                                  or gate_days < short_gate)
 
     # Reported as the tightest gate any candidate can meet, so the summary
     # line still names a single number; the per-volume detail is in the JSON.
@@ -604,7 +1450,12 @@ def main(argv: list[str] | None = None) -> int:
         f"{'fix' if args.fix else 'dry-run'}, min age {min_age}d", force=True)
 
     active = active_command_lines()
-    candidates = find_candidates(roots, args.maxdepth)
+    # Only a pressured pass looks for the output kinds, so with no pressure the
+    # walk (and which CMake trees it reaches) is exactly the tier-off walk.
+    candidates = (find_candidates(roots, args.maxdepth, output_kinds=True)
+                  if outputs and pressure else find_candidates(roots, args.maxdepth))
+    tier_cwds: list[str] | None | bool = True
+    tier_status: dict = {}
     progress.emit(f"scanned {len(candidates)} candidate(s)", force=True)
 
     deleted: list[dict[str, Any]] = []
@@ -616,11 +1467,42 @@ def main(argv: list[str] | None = None) -> int:
             f"{index}/{len(candidates)} examined, "
             f"{reclaimed / GIB:.1f} GiB so far")
         candidate_min_age = min_age_for(path)
+        if checkout_outputs.kind_of(path.name) and not pressured(path):
+            # The output kinds belong to the checkout tier, which only runs on
+            # a volume under pressure.
+            kept.append({"path": str(path), "reason": "no_pressure", "age_days": 0.0})
+            continue
         delete, reason, age_days = classify(
             path, now=now, min_age_days=candidate_min_age, active=active)
+        if delete and checkout_tier(path, candidate_min_age):
+            if tier_cwds is True:
+                tier_cwds = tmp_checkouts.process_cwds()
+            scan_root = next((root for root in roots
+                              if root == path or root in path.parents), None)
+            checkout = checkout_outputs.enclosing_checkout(path, scan_root)
+            if checkout is not None and active and names_candidate(
+                    active, path_spellings(checkout)):
+                # A live process names a file in this checkout (an MCP server
+                # run as `node /abs/proj/dist/index.js` from $HOME): its
+                # node_modules is in use though nothing names it.
+                refusal = "checkout_named_by_process"
+            else:
+                refusal = checkout_outputs.checkout_gate(
+                    path, now=now, root=scan_root, cwds=tier_cwds,
+                    status_cache=tier_status)
+            if refusal is not None and age_days >= short_gate \
+                    and checkout_outputs.kind_of(path.name) is None:
+                refusal = None  # old enough for the day tier, which has no checkout gates
+            if refusal is not None:
+                delete, reason = False, f"checkout_gate ({refusal})"
+                tier = receipt["checkout_build_outputs"]["kept"]
+                tier[refusal] = tier.get(refusal, 0) + 1
+            else:
+                reason = f"{reason} [checkout tier]"
+                receipt["checkout_build_outputs"]["selected"] += 1
         if not delete:
             kept.append({"path": str(path), "reason": reason,
-                         "age_days": round(age_days, 1)})
+                         "age_days": round(age_days, 2)})
             continue
         size = dir_size_bytes(path)
         record = {"path": str(path), "reason": reason,
@@ -632,10 +1514,21 @@ def main(argv: list[str] | None = None) -> int:
             # line the argv guard cannot see) has touched this tree since, so
             # it no longer clears the gate. One bounded stat walk against an
             # operation that already pays for a recursive unlink.
-            recheck = newest_mtime(path)
+            recheck = newest_mtime(path, RECHECK_MAXDEPTH)
             if recheck is None or \
                     (time.time() - recheck) / 86400.0 < candidate_min_age:
                 record["reason"] = "touched_during_pass"
+                kept.append(record)
+                continue
+            # A checkout can be created inside the tree between the scan and
+            # here, and this is the last moment it can still be saved.
+            nested_now, nested_readable = nested_scan(path)
+            if not nested_readable:
+                record["reason"] = "nested_scan_unreadable"
+                kept.append(record)
+                continue
+            if nested_now is not None:
+                record["reason"] = f"nested_source_tree ({nested_now})"
                 kept.append(record)
                 continue
             # Forced, never rate limited: an rmtree is the longest single
@@ -656,8 +1549,80 @@ def main(argv: list[str] | None = None) -> int:
         reclaimed += size
         deleted.append(record)
 
-    volumes_after = volumes_free_bytes(roots) if args.fix else volumes_before
-    free_after = tightest_free_bytes(volumes_after)
+    # Pulp's own reapers, when this host opted in. After tartci's pass rather
+    # than before, so free_bytes_before stays the true start of the pass, and
+    # before the re-measure, so the floor below is judged on what both freed.
+    # Their gates are theirs; nothing here narrows or widens them.
+    progress.emit("pulp reapers: checking the fleet profile", force=True)
+    pulp_skip = pulp_reapers.skip_reason_for_scan_timeouts(SCAN_TIMEOUTS)
+    pulp = pulp_reapers.run(
+        fix=args.fix, state_dir=state_dir(args), discovered_roots=roots,
+        deadline=PASS_DEADLINE, skip_reason=pulp_skip,
+        pressure_used_percent=args.pressure_used_percent)
+    receipt["pulp_reapers"] = pulp
+    # Finished git checkouts agents left in /tmp (tmp_checkouts.py for the
+    # gates). A live build naming one protects it, exactly as for build dirs;
+    # an unreadable process table protects all of them.
+    progress.emit("stale checkouts: checking the fleet profile", force=True)
+
+    def root_pressured(path: pathlib.Path) -> bool:
+        """The merged-worktree rule's default trigger, judged on the root's own volume."""
+        if pressured(path):
+            return True
+        return pulp_reapers.under_pressure(
+            free_bytes(path), used_percent(path), pressure_free_gb=args.pressure_free_gb,
+            pressure_used_percent=args.pressure_used_percent)
+
+    with background_while(receipt):
+        tmp = tmp_checkouts.run(
+            fix=args.fix, profile=pulp_reapers.default_profile_path(),
+            in_use=None if active is None
+            else (lambda path: names_candidate(active, path_spellings(path))),
+            pressured=root_pressured)
+    receipt["tmp_checkouts"] = tmp
+    # Test and validation scratch in /private/tmp and the per-user temp dir
+    # (scratch_dirs.py): on the boot volume, outside every root above.
+    progress.emit("scratch: checking the fleet profile", force=True)
+    scratch = scratch_dirs.run(fix=args.fix, profile=pulp_reapers.default_profile_path(),
+                               pressure=boot_pressure)
+    receipt["scratch_dirs"] = scratch
+    # Gate ccache entries unused for N days (gate_ccache_trim.py for the
+    # gates): only with no VM running or leased, under the guard's lock.
+    progress.emit("gate ccache: checking the fleet profile", force=True)
+    with foreground_while(receipt):
+        gate_ccache = gate_ccache_trim.run(fix=args.fix,
+                                           profile=pulp_reapers.default_profile_path(),
+                                           state_dir=state_dir(args))
+    receipt["gate_ccache_trim"] = gate_ccache
+    # Which CI and agent paths hold the boot volume, sampled once a day after
+    # the reapers above (boot_usage.py). Read-only.
+    progress.emit("boot usage: sampling CI and agent paths on the boot volume", force=True)
+    receipt["boot_usage"] = boot_usage.run(
+        state_dir=state_dir(args), profile=pulp_reapers.default_profile_path(),
+        boot_volume=boot_path, user_tmp=scratch_dirs.user_temp_dir())
+
+    remeasure = bool(args.fix or pulp.get("runs") or tmp.get("removed")
+                     or scratch.get("removed"))
+    volumes_after = volumes_free_bytes(roots) if remeasure else volumes_before
+    if lease:
+        floor_after = volumes_free_bytes(floor_roots) if remeasure else floor_before
+    else:
+        floor_after = volumes_after
+    free_after = tightest_free_bytes(floor_after)
+    floor_devices = {volume["device"] for volume in floor_after}
+    boot = boot_volume_report(
+        boot_path, boot_before,
+        measure_boot() if remeasure else boot_before,
+        args.boot_floor_gb, floor_devices, args.fail_below_gb)
+    # Scanned volumes the floor does not judge, reported so a low boot disk
+    # stays visible without failing a host whose lease volume is healthy.
+    scan_below_floor = [
+        volume["root"] for volume in volumes_after
+        if lease and args.fail_below_gb > 0
+        and (volume["device"] is None or volume["device"] not in floor_devices)
+        and volume["free_bytes"] is not None
+        and volume["free_bytes"] < args.fail_below_gb * GIB
+    ]
     report = {
         "process_scan_ok": active is not None,
         "roots": [str(root) for root in roots],
@@ -670,6 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
         # in exactly this way until someone measured it by hand.
         "maxdepth": args.maxdepth,
         "candidates": len(candidates),
+        "checkout_build_outputs": receipt["checkout_build_outputs"],
         "deleted": deleted,
         "kept": kept,
         "reclaimed_bytes": reclaimed,
@@ -677,7 +1643,29 @@ def main(argv: list[str] | None = None) -> int:
         "free_bytes_after": free_after,
         "free_bytes_by_volume_before": volumes_before,
         "free_bytes_by_volume_after": volumes_after,
+        # What free_bytes_before/after and the floor were read from.
+        "floor_scope": "lease_volume" if lease else "scan_volumes",
+        "lease_path": lease["path"] if lease else None,
+        "lease_path_source": lease["source"] if lease else None,
+        "free_bytes_by_floor_volume_before": floor_before,
+        "free_bytes_by_floor_volume_after": floor_after,
+        "scan_volumes_below_floor": scan_below_floor,
+        "pulp_reapers": pulp,
+        "tmp_checkouts": tmp,
+        "scratch_dirs": scratch,
+        "gate_ccache_trim": gate_ccache,
+        "boot_volume": boot,
+        # Exit 3 means the pass ran and this volume is still below the floor;
+        # status names it rather than calling the pass "failed".
+        "fail_below_gb": args.fail_below_gb,
+        "tightest_root": tightest_volume_root(volumes_after),
+        # Directories whose listing did not return in time; nothing under them
+        # was judged or removed.
+        "scan_timeouts": list(SCAN_TIMEOUTS),
+        "app_containers_skipped": list(APP_CONTAINERS_SKIPPED),
+        "scan_refused": list(SCAN_REFUSED),
     }
+    receipt["report"] = report
 
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -686,11 +1674,11 @@ def main(argv: list[str] | None = None) -> int:
         freed_verb = "reclaimed" if args.fix else "would reclaim"
         for record in deleted:
             print(f"  {verb} {record['size_bytes'] / GIB:6.1f} GiB  {record['path']}")
-        tightest_root = tightest_volume_root(volumes_after)
+        tightest_root = tightest_volume_root(floor_after)
         free_text = "unknown" if free_after is None else (
             f"{free_after / GIB:.1f} GiB"
-            + (f" on {tightest_root}" if tightest_root and len(volumes_after) > 1
-               else ""))
+            + (f" on {tightest_root}"
+               if tightest_root and (lease or len(floor_after) > 1) else ""))
         print(f"disk_reclaim: {len(candidates)} candidate(s) under "
               f"{', '.join(str(r) for r in roots)}; {verb} {len(deleted)}; "
               f"{freed_verb} {reclaimed / GIB:.1f} GiB; "
@@ -708,6 +1696,12 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 4
 
+    for root in scan_below_floor:
+        print(f"disk_reclaim: note: scanned volume {root} is below the "
+              f"{args.fail_below_gb:g} GiB floor; it does not hold the Tart "
+              f"store ({lease['path']}), so leases are not judged on it.",
+              file=sys.stderr)
+
     if args.fail_below_gb > 0 and free_after is None:
         print("disk_reclaim: could not read free space, so the "
               f"{args.fail_below_gb:g} GiB floor could not be checked.",
@@ -715,13 +1709,27 @@ def main(argv: list[str] | None = None) -> int:
         return 4
 
     if args.fail_below_gb > 0 and free_after < args.fail_below_gb * GIB:
-        tightest_root = tightest_volume_root(volumes_after)
+        tightest_root = tightest_volume_root(floor_after)
         where = f" on {tightest_root}" if tightest_root else ""
         print(f"disk_reclaim: FREE SPACE STILL LOW after reclaim: "
               f"{free_after / GIB:.1f} GiB{where} < {args.fail_below_gb:g} GiB floor. "
               f"This host will refuse leases (disk_capacity_exceeded).",
               file=sys.stderr)
         return 3
+
+    if boot["judged_by"] == "own_floor" and boot["free_bytes_after"] is None:
+        print(f"disk_reclaim: could not read free space on the boot volume "
+              f"{boot['path']}, so its {args.boot_floor_gb:g} GiB floor could not "
+              "be checked.", file=sys.stderr)
+        return 4
+    if boot["below_floor"]:
+        print(f"disk_reclaim: BOOT VOLUME STILL LOW after reclaim: "
+              f"{boot['free_bytes_after'] / GIB:.1f} GiB on {boot['path']} < "
+              f"{args.boot_floor_gb:g} GiB floor. Leases are judged on the Tart "
+              "store and are unaffected; the machine itself is running out of "
+              "disk (check /private/tmp and the per-user temp dir).",
+              file=sys.stderr)
+        return 5
     return 0
 
 

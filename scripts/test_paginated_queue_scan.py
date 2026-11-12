@@ -19,6 +19,38 @@ from math import ceil
 from pathlib import Path
 from typing import Any, Callable
 
+# The scanners prove which credential they are using before they read the
+# queue, so a fake GitHub must answer that question too. 15000/hour is the
+# ceiling a GitHub App installation token reports; 60 would be the anonymous
+# fallback the preflight exists to refuse.
+AUTHENTICATED_RATE_LIMIT = {
+    "resources": {"core": {"limit": 15000, "remaining": 14999, "reset": 1}}
+}
+
+
+# These cases build the scanner in this process, so its preflight would
+# otherwise read and write $HOME/.tartci/state/gh-identity.json -- the live
+# receipt of whatever machine runs the suite. A zero TTL disables the receipt
+# in both directions: no case here can leave a receipt behind, and none can be
+# satisfied by a receipt another case left. That is what keeps a call count a
+# property of the scan rather than of the order the suite happened to run in.
+_RECEIPT_TTL_ENV = "TARTCI_GH_IDENTITY_RECEIPT_TTL_SECS"
+_saved_receipt_ttl: str | None = None
+
+
+def setUpModule() -> None:
+    global _saved_receipt_ttl
+    _saved_receipt_ttl = os.environ.get(_RECEIPT_TTL_ENV)
+    os.environ[_RECEIPT_TTL_ENV] = "0"
+
+
+def tearDownModule() -> None:
+    if _saved_receipt_ttl is None:
+        os.environ.pop(_RECEIPT_TTL_ENV, None)
+    else:
+        os.environ[_RECEIPT_TTL_ENV] = _saved_receipt_ttl
+
+
 ROOT = Path(__file__).resolve().parents[1]
 MODULE_PATH = ROOT / "scripts" / "queue_scan.py"
 SPEC = importlib.util.spec_from_file_location("queue_scan", MODULE_PATH)
@@ -91,6 +123,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
     @staticmethod
     def _base_api(runs: list[dict[str, Any]], eligible_id: int | None) -> Callable[[str], dict[str, Any]]:
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
@@ -141,6 +175,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         job_fetches = 0
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             nonlocal job_fetches
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
@@ -236,6 +272,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
@@ -289,6 +327,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         fetched_page_two: list[int] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=pending" in path or "status=in_progress" in path:
@@ -356,6 +396,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         fetched_page_two: list[int] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=pending" in path or "status=in_progress" in path:
@@ -446,6 +488,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             if "/actions/runs?status=queued" in path:
                 return {"workflow_runs": runs}
@@ -483,6 +527,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api([], None)(path)
 
@@ -499,6 +545,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api([], None)(path)
 
@@ -528,6 +576,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
             calls: list[str] = []
 
             def api(path: str) -> dict[str, Any]:
+                if path == "rate_limit":
+                    return AUTHENTICATED_RATE_LIMIT
                 calls.append(path)
                 if "/actions/workflows/41/runs?" in path:
                     raise queue_scan.GitHubApiError(path, 1, "HTTP 404: Not Found")
@@ -556,6 +606,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         run = _run(999, origin)
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
@@ -597,6 +649,8 @@ class PaginatedQueueScanTests(unittest.TestCase):
         barrier = threading.Barrier(9)
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             with calls_lock:
                 calls.append(path)
             return self._base_api(runs, eligible["id"])(path)
@@ -650,6 +704,9 @@ class PaginatedQueueScanTests(unittest.TestCase):
                 """#!/usr/bin/env python3
 import fcntl, json, os, sys
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 with open(os.environ["CALL_COUNTER"], "a+", encoding="utf-8") as handle:
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     handle.write(path + "\\n")
@@ -758,7 +815,7 @@ print(json.dumps(payload))
                 10,
             )
 
-    def test_distinct_namespaces_share_one_host_observation_slot(self) -> None:
+    def test_slow_namespace_fetch_does_not_block_another_lane(self) -> None:
         origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
         eligible = _run(999, origin)
         active = 0
@@ -766,6 +823,8 @@ print(json.dumps(payload))
         guard = threading.Lock()
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             nonlocal active, peak
             with guard:
                 active += 1
@@ -800,7 +859,115 @@ print(json.dumps(payload))
                 results = list(executor.map(scan, scanners))
 
         self.assertEqual(results, [1, 1, 1])
-        self.assertEqual(peak, 1)
+        self.assertGreater(
+            peak,
+            1,
+            "a slow GitHub fetch must not serialize unrelated host lanes",
+        )
+
+    def test_a_killed_discovery_owner_does_not_block_its_namespace(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                self._base_api([eligible], eligible["id"]),
+                observation_lock_timeout=10.0,
+            )
+            # A fresh marker left by an owner that was SIGKILLed mid-fetch.
+            scanner.discovery_fetch_path.parent.mkdir(parents=True, exist_ok=True)
+            scanner.discovery_fetch_path.write_text(str(dead.pid), encoding="utf-8")
+            started = time.monotonic()
+            self.assertEqual(scanner.scan(), 1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(scanner.discovery_fetch_path.exists())
+        self.assertLess(elapsed, 5, "a dead owner's marker held the namespace")
+
+    def test_a_real_owner_killed_mid_fetch_is_taken_over(self) -> None:
+        # The case above plants the marker by hand, so it cannot see the owner
+        # stop writing its pid. Here a real process claims the namespace
+        # through _discover(), with a fetch that never returns, and is
+        # SIGKILLed mid-fetch, as a lane is by launchd teardown.
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            owner_script = (
+                "import sys, time, unittest\n"
+                "from pathlib import Path\n"
+                "sys.path.insert(0, sys.argv[1])\n"
+                "import test_paginated_queue_scan as t\n"
+                "case = t.PaginatedQueueScanTests('test_a_real_owner_killed_mid_fetch_is_taken_over')\n"
+                "scanner = case._scanner('tart-macos', Path(sys.argv[2]),\n"
+                "                        lambda path: time.sleep(600) or {},\n"
+                "                        observation_lock_timeout=10.0)\n"
+                "scanner._discover()\n"
+            )
+            owner = subprocess.Popen(
+                [sys.executable, "-c", owner_script, str(ROOT / "scripts"), str(root / "lane.json")],
+                env={**os.environ, _RECEIPT_TTL_ENV: "0"},
+            )
+            try:
+                scanner = self._scanner(
+                    "tart-macos",
+                    root / "lane.json",
+                    self._base_api([eligible], eligible["id"]),
+                    observation_lock_timeout=10.0,
+                )
+                marker = scanner.discovery_fetch_path
+                deadline = time.monotonic() + 20
+                while time.monotonic() < deadline:
+                    if marker.exists() and marker.read_text(encoding="utf-8").strip():
+                        break
+                    time.sleep(0.05)
+                self.assertTrue(marker.exists(), "the owner never claimed the namespace")
+                self.assertEqual(
+                    marker.read_text(encoding="utf-8").strip(), str(owner.pid),
+                    "the owner's marker does not name the owner",
+                )
+            finally:
+                owner.kill()
+                owner.wait()
+            started = time.monotonic()
+            self.assertEqual(scanner.scan(), 1)
+            elapsed = time.monotonic() - started
+            self.assertFalse(marker.exists())
+        self.assertLess(elapsed, 5, "a killed owner's fetch held the namespace")
+
+    def test_a_live_discovery_owner_still_holds_its_namespace(self) -> None:
+        origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+        eligible = _run(999, origin)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scanner = self._scanner(
+                "tart-macos",
+                root / "lane.json",
+                self._base_api([eligible], eligible["id"]),
+                observation_lock_timeout=2.0,
+            )
+            # The marker names a live process: the waiter leaves its fetch
+            # alone for the whole lock wait, as before the owner pid was
+            # recorded.
+            live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+            try:
+                scanner.discovery_fetch_path.parent.mkdir(parents=True, exist_ok=True)
+                scanner.discovery_fetch_path.write_text(str(live.pid), encoding="utf-8")
+                started = time.monotonic()
+                # At the lock wait the marker's age and the waiter's deadline
+                # expire together; either ending is fine, a quick one is not.
+                try:
+                    scanner._discover()
+                except RuntimeError:
+                    pass
+                elapsed = time.monotonic() - started
+            finally:
+                live.kill()
+                live.wait()
+        self.assertGreaterEqual(elapsed, 1.5, "a live owner's fetch was taken over")
 
     def test_distinct_process_namespaces_bound_actual_github_children(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -821,7 +988,9 @@ with open(activity, 'a+', encoding='utf-8') as handle:
 try:
     time.sleep(0.02)
     path = sys.argv[-1]
-    if path.endswith('/actions/workflows?per_page=100'):
+    if path == 'rate_limit':
+        payload = {'resources': {'core': {'limit': 15000, 'remaining': 14999}}}
+    elif path.endswith('/actions/workflows?per_page=100'):
         payload = {'workflows': [{'id': 99, 'name': 'Build and Test'}]}
     elif 'status=pending' in path or 'status=queued' in path or 'status=in_progress' in path:
         payload = {'workflow_runs': []}
@@ -862,9 +1031,13 @@ finally:
             results = [process.communicate(timeout=10) for process in processes]
             self.assertEqual([process.returncode for process in processes], [0, 0, 0])
             self.assertEqual([stdout.strip() for stdout, _ in results], ["0", "0", "0"])
-            self.assertEqual(json.loads(activity.read_text(encoding="utf-8"))["peak"], 1)
+            self.assertGreater(
+                json.loads(activity.read_text(encoding="utf-8"))["peak"],
+                1,
+                "unrelated GitHub children should not serialize on the host flock",
+            )
 
-    def test_scanner_death_keeps_host_lock_with_observation_child(self) -> None:
+    def test_scanner_death_does_not_leave_observation_child_holding_host_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             entered = root / "entered"
@@ -873,6 +1046,9 @@ finally:
             stub.write_text(
                 """#!/usr/bin/env python3
 import fcntl, json, os, sys, time
+if sys.argv[-1] == 'rate_limit':
+    print(json.dumps({'resources': {'core': {'limit': 15000, 'remaining': 14999}}}))
+    raise SystemExit(0)
 with open(os.environ['CALLS'], 'a+', encoding='utf-8') as handle:
     fcntl.flock(handle.fileno(), fcntl.LOCK_EX); handle.write(sys.argv[-1] + '\\n'); handle.flush()
 try:
@@ -922,25 +1098,28 @@ print(json.dumps(payload))
                 command("owner/second", "0.1"),
                 text=True, capture_output=True, check=False, env=env,
             )
-            self.assertEqual(denied.returncode, 1)
-            self.assertIn("host queue observation lock timed out", denied.stderr)
-            self.assertEqual(len(calls.read_text(encoding="utf-8").splitlines()), 1)
-
-            time.sleep(1.1)
             recovered = subprocess.run(
-                command("owner/third", "2"),
+                command("owner/second", "2"),
                 text=True, capture_output=True, check=False, env=env,
             )
             self.assertEqual(recovered.returncode, 0, recovered.stderr)
             self.assertEqual(recovered.stdout.strip(), "0")
+            self.assertGreaterEqual(len(calls.read_text(encoding="utf-8").splitlines()), 2)
 
-    def test_host_observation_lock_timeout_fails_closed(self) -> None:
+    def test_host_lock_is_not_held_during_api_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            called = False
+
+            def api(path: str) -> dict[str, Any]:
+                nonlocal called
+                called = True
+                return self._base_api([], None)(path)
+
             scanner = self._scanner(
                 "tart-macos",
                 root / "lane.json",
-                lambda _path: self.fail("API must not run without the lock"),
+                api,
                 observation_lock_file=str(root / "host-observation.lock"),
                 observation_lock_timeout=0.05,
             )
@@ -948,6 +1127,7 @@ print(json.dumps(payload))
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 with self.assertRaisesRegex(RuntimeError, "observation lock timed out"):
                     scanner.scan()
+            self.assertTrue(called, "the host lock blocked the API call")
 
     def test_namespace_lock_wait_shares_the_bounded_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -982,6 +1162,8 @@ print(json.dumps(payload))
         calls: list[str] = []
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             calls.append(path)
             return self._base_api(runs, None)(path)
 
@@ -1010,6 +1192,8 @@ print(json.dumps(payload))
         runs = [_run(1, origin)]
 
         def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return AUTHENTICATED_RATE_LIMIT
             if path.endswith("/actions/workflows?per_page=100"):
                 return {"workflows": [{"id": 99, "name": "Build and Test"}]}
             if "status=queued" in path:
@@ -1035,7 +1219,52 @@ print(json.dumps(payload))
             self.assertIn('scripts/queue_scan.py"', body, runner)
             self.assertIn("--shared-cache-file", body, runner)
             self.assertIn("TARTCI_SHARED_QUEUE_CACHE", body, runner)
-            self.assertIn("2>/dev/null || echo ERR", body, runner)
+            # The contract is that a FAILED scan becomes the `ERR` sentinel, so a
+            # failure is never misread as an empty queue. Whether stderr is
+            # discarded on the way is a separate question — and discarding it is
+            # a defect, not part of this contract (see the macOS test below).
+            self.assertIn("|| echo ERR", body, runner)
+
+    def test_macos_supervisor_keeps_the_scanner_diagnostic(self) -> None:
+        """A blind supervisor must be able to say WHY.
+
+        The scanner prints the reason on stderr and only a count on stdout, so
+        routing that stderr to /dev/null leaves the supervisor able to report
+        that it is blind but never what failed. That cost a multi-hour outage in
+        which every other signal — auth, quota, proxy, launchd state — read
+        healthy and the one line naming the fault had already been thrown away.
+        """
+        body = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("run_scan_capture", body)
+        # Every macOS scan call site routes through the capturing wrapper.
+        self.assertGreaterEqual(body.count("run_scan_capture "), 3)
+        self.assertNotIn("--match-labels 1 2>/dev/null", body)
+
+    def test_scan_diagnostic_keeps_both_ends_of_the_stream(self) -> None:
+        """Keeping a deeper tail is still last-line-wins.
+
+        A wrapper prints the cause first and its own summary last, so any
+        tail-only rule loses the cause as soon as the wrapper is more verbose
+        than the depth chosen — `tail -n 3` keeps a two-line wrapper's cause and
+        loses a four-line one's, and no caller can predict how chatty a wrapper
+        will be. Both ends must be kept, with the elision declared.
+        """
+        macos = RUNNERS[0].read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", macos)
+        self.assertIn("line(s) elided", macos)
+        # The diagnostic must never be captured by a tail-only rule again.
+        self.assertNotIn('tail -n 3 >"$SCAN_ERROR_FILE"', macos)
+        self.assertNotIn('tail -n 1 >"$SCAN_ERROR_FILE"', macos)
+
+        v2 = (RUNNERS[0].parent / "assignment-v2.lib.sh").read_text(encoding="utf-8")
+        self.assertIn("scan_diagnostic_digest", v2)
+        # Scoped to the scanner's own error file. A file-wide ban also catches
+        # unrelated readers of other streams -- the feed rescue summarises its
+        # own stderr the same way -- which makes this fail for a line it is not
+        # about, and the contract here is only that the scan diagnostic is never
+        # captured by a tail-only rule.
+        self.assertNotIn('tail -n 1 "$error_file"', v2)
+        self.assertNotIn('tail -n 3 "$error_file"', v2)
 
     def test_macos_supervisor_passes_opt_in_minimum_queue_age(self) -> None:
         body = RUNNERS[0].read_text(encoding="utf-8")

@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the central persistent-runner healer
+  (scripts/persistent_runner_heal.py). Install it on ONE fleet host that
+  holds an App-identity GitHub CLI (`ghapp`) and ssh access to the runner
+  hosts by their fleet names. Never on a runner's own host.
+
+    mkdir -p "$HOME/Library/Logs/tartci" "$HOME/.config/tartci"
+    $EDITOR "$HOME/.config/tartci/persistent-runners.json"   # see the script docstring
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.persistent-runner-heal.plist.template \
+      --set "HOME=$HOME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.persistent-runner-heal.plist"
+    launchctl bootstrap "gui/$(id -u)" \
+      "$HOME/Library/LaunchAgents/com.danielraffel.tartci.persistent-runner-heal.plist"
+
+  Roll out report-only first: drop `fix` from ProgramArguments, watch the log
+  for a few passes, then add it back.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.persistent-runner-heal</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>runner-heal</string>
+        <string>--fix</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>20</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/persistent-runner-heal.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/persistent-runner-heal.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_GH_CLI</key>
+        <string>ghapp</string>
+    </dict>
+</dict>
+</plist>

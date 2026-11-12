@@ -37,7 +37,10 @@ set -euo pipefail
 TARTCI_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck source=providers/common/pool.lib.sh
 source "$TARTCI_ROOT/providers/common/pool.lib.sh"
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
+# shellcheck source=../common/tart-home.lib.sh
+. "$TARTCI_ROOT/providers/common/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 SSH_KEY_PRIV="${TARTCI_VM_SSH_KEY:-${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}}"
 VM_USER="${TARTCI_VM_USER:-${PULP_VM_USER:-admin}}"
 CACHE_ROOT="${TARTCI_CI_CACHE:-${PULP_CI_CACHE:-$HOME/.cache/tartci}}"
@@ -243,7 +246,7 @@ queued_work(){
 }
 
 run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
-  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_priority
+  local i="$1" vm="linux-ephr-$$-$1" jit="" lease_cores lease_mem lease_priority
   local build_parallel_effective
   local t_start t_booted t_runner_done t_done logdir run_status=0
   local state_dir rpid="" ip=""
@@ -286,6 +289,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     return "$lease_rc"
   }
   lease_cores="${TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}"
+  lease_mem="${TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}"
   build_parallel_effective="$BUILD_PARALLEL_LEVEL"
   if [ "$build_parallel_effective" -gt "$lease_cores" ]; then
     build_parallel_effective="$lease_cores"
@@ -301,8 +305,8 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
   fi
-  if ! tartci_set_tart_vm_cpu "$vm" "$lease_cores"; then
-    note "[$i] failed to set $vm CPU count to lease cores=$lease_cores"
+  if ! tartci_set_tart_vm_size "$vm" "$lease_cores" "$lease_mem"; then
+    note "[$i] failed to size $vm to lease cores=$lease_cores mem_mb=${lease_mem:-golden}"
     discard_current_linux_vm
     runtime_emit_complete fail boot_failed 1 "$vm" "$vm" "" "$logdir"
     return 1
@@ -326,7 +330,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   write_state booted
   local sshok=0
-  for _ in $(seq 1 90); do ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
+  for _ in $(seq 1 90); do ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" true 2>/dev/null && { sshok=1; break; }; sleep 2; done
   if [ "$sshok" != 1 ]; then
     note "[$i] no SSH on $vm after 180s — discarding (won't run a job on an unreachable VM)"
     discard_current_linux_vm
@@ -335,7 +339,7 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   t_booted="$(now_epoch)"
   write_state cache-setup
-  if ! ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  if ! ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "sudo mkdir -p /mnt/host && \
      (sudo mount -t virtiofs com.apple.virtio-fs.automount /mnt/host 2>/dev/null || mountpoint -q /mnt/host) && \
      bash -s -- /mnt/host/ccache" \
@@ -361,7 +365,10 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
       || printf '%s\n' "$admission_json" >"$logdir/admission-clean.json"
     if [ "$admission_rc" -ne 0 ]; then
       write_state "$([ "$admission_rc" -eq 3 ] && printf admission-deferred || printf admission-error)"
-      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off"
+      local admission_detail
+      admission_detail="$(tartci_admission_clean_detail "$admission_json")" \
+        || admission_detail="reason=unreadable"
+      note "[$i] Shipyard admission $([ "$admission_rc" -eq 3 ] && printf deferred || printf failed) — discarding unregistered VM and backing off ($admission_detail)"
       discard_current_linux_vm
       return "$admission_rc"
     fi
@@ -380,13 +387,13 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   fi
   note "[$i] admission clean — minting JIT runner config (labels=$LABELS, ephemeral)"
   local label_args=(); local l; IFS=',' read -ra _ls <<< "$LABELS"
-  for l in "${_ls[@]}"; do label_args+=(-f "labels[]=$l"); done
+  for l in ${_ls[@]+"${_ls[@]}"}; do label_args+=(-f "labels[]=$l"); done
   # Claim uncertain-outcome cleanup before the state-creating POST. If GitHub
   # creates the registration but the response is lost, teardown still queries
   # and removes this exact non-busy name.
   CURRENT_JIT_REGISTERED=1
   jit="$("$GH_CLI" api -X POST "repos/$REPO/actions/runners/generate-jitconfig" \
-        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" "${label_args[@]}" \
+        -f "name=$vm" -F "runner_group_id=$RUNNER_GROUP_ID" ${label_args[@]+"${label_args[@]}"} \
         --jq '.encoded_jit_config')" || {
     tartci_pool_lock_release
     note "[$i] JIT config mint failed — discarding VM"
@@ -405,10 +412,16 @@ run_one(){ # $1=iteration index (unique VM name without Date.now/rand)
   # Write the JIT config and run the agent once. A JIT runner processes exactly
   # one job and deregisters. The host cache binding above is mandatory so a
   # mount regression cannot silently turn every ephemeral job cold.
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
-    "printf '%s' '$jit' > ~/jit.cfg && cd ~/actions-runner && \
-     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK)$/' .env > .env.tartci && \
-     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && mv .env.tartci .env && \
+  # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
+  # cache directory any guest can write (see tart-macos/lane-cache-root.lib.sh).
+  ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+    "printf '%s' '$jit' > ~/jit.cfg && \
+     mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
+     export CCACHE_CONFIGPATH=\"\$HOME/.config/ccache/tartci.conf\" && \
+     cd ~/actions-runner && \
+     touch .env && awk -F= '\$1 !~ /^(CCACHE_DEPEND|CCACHE_NODEPEND|CCACHE_COMPILERCHECK|CCACHE_CONFIGPATH)$/' .env > .env.tartci && \
+     printf '%s\n' 'CCACHE_NODEPEND=true' 'CCACHE_COMPILERCHECK=content' >> .env.tartci && \
+     printf 'CCACHE_CONFIGPATH=%s\n' \"\$HOME/.config/ccache/tartci.conf\" >> .env.tartci && mv .env.tartci .env && \
      export CCACHE_DIR=\"\$HOME/.ccache\" && \
      export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content && unset CCACHE_DEPEND && \
      export CMAKE_BUILD_PARALLEL_LEVEL='$build_parallel_effective' && \

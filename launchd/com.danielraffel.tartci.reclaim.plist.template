@@ -28,8 +28,9 @@
     launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.reclaim"
 
   Scan roots are DISCOVERED, not declared. This template deliberately does not
-  set TARTCI_RECLAIM_ROOTS: the janitor keeps whichever of ~/Code and
-  /Volumes/Workshop/Code the host actually has. A hand-tuned root is the one
+  set TARTCI_RECLAIM_ROOTS: the janitor keeps whichever of ~/Code and the
+  installed fleet profile's [reclaim] code root (m3: /Volumes/<data-volume>/Code,
+  m5studio: /Volumes/<data-volume>/Code) the host actually has. A hand-tuned root is the one
   failure the guards cannot catch, because a root that EXISTS but sits on the
   wrong volume passes every check and reports a clean exit 0 forever while the
   volume it was installed to protect fills up. m3 is exactly that shape: it
@@ -39,7 +40,10 @@
   a healthy disk cannot certify a full one. Pressure is scoped the other way,
   per volume: only build directories that live on a volume under
   TARTCI_RECLAIM_PRESSURE_FREE_GB get the shorter
-  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate. Failing more is the safe
+  TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS gate, and so do those on a volume at
+  least TARTCI_RECLAIM_PRESSURE_USED_PERCENT used (90, under readiness's 92%
+  disk_pressure limit, so a large volume reclaims before the host leaves the
+  fleet). Failing more is the safe
   direction; deleting more is not, and a boot disk dipping below the threshold
   is not a reason to reclaim week-old builds off a volume with terabytes free.
 
@@ -83,6 +87,14 @@
 
   Hourly, not every 5 minutes like the reap agent: a pass walks the scan roots
   and sizes candidates, and disk fills over days rather than seconds.
+
+  Demoted, not confined (ProcessType=Standard, Nice 10, LowPriorityIO): a pass
+  walks and sizes terabytes of build trees on the same volumes gate VMs and
+  builds are using, so it yields CPU and disk bandwidth to them. It is not
+  ProcessType=Background: on Apple silicon that confines the pass to the
+  efficiency cores and throttles it hardest exactly when the host is busy,
+  which turned a 211 s pass into 2446 s on m3. Reclaim is what frees space
+  when a volume is filling, so it has to finish while that still matters.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -109,6 +121,15 @@
     <key>StartInterval</key>
     <integer>3600</integer>
 
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
     <key>StandardOutPath</key>
     <string>$HOME/Library/Logs/tartci/tartci-reclaim.log</string>
 
@@ -117,6 +138,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>
@@ -129,6 +152,8 @@
         <string>200</string>
         <key>TARTCI_RECLAIM_PRESSURE_MIN_AGE_DAYS</key>
         <string>7</string>
+        <key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>
+        <string>90</string>
         <key>TARTCI_RECLAIM_FAIL_BELOW_GB</key>
         <string>60</string>
         <key>TARTCI_RECLAIM_LOG</key>

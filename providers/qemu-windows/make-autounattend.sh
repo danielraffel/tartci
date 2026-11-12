@@ -14,7 +14,7 @@ mkdir -p "$OUT_DIR/media"
 
 # Build the authorized_keys block (one key per line), then XML-escape for embedding.
 AK=""
-for f in "${PUBKEYS[@]}"; do [ -f "$f" ] && AK+="$(cat "$f")"$'\n'; done
+for f in ${PUBKEYS[@]+"${PUBKEYS[@]}"}; do [ -f "$f" ] && AK+="$(cat "$f")"$'\n'; done
 # Each key becomes an `echo >> administrators_authorized_keys` in a FirstLogon cmd.
 KEY_CMDS=""
 order=20

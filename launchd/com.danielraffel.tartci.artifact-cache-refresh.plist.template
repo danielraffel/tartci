@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the artifact-cache mirror refresher.
+
+  Why this agent exists: macOS gate guests mount
+  $TARTCI_CI_CACHE/artifact-cache read-only and use each
+  git/<owner>/<repo>.git bare mirror as a Git alternate, so a job fetches only
+  what the mirror lacks. Nothing kept the mirror current, so every commit that
+  landed on main after the last manual `git-sync` was fetched again by every
+  job. This agent runs `tartci artifact-cache refresh` on a schedule.
+
+  It is safe on a host that never opted in: refresh syncs only mirrors that
+  already exist, creates none, and exits 0 when the cache is absent. It keeps
+  every rule a guest reading the share depends on: fetches only add packs, and
+  a mirror is folded (repack) only when it holds more than --compact-above
+  packs AND Tart reports no running VM at that moment; otherwise compaction is
+  deferred to a later pass, never forced.
+
+  Install shape (scripts/install_artifact_cache_refresh_agent.sh does this,
+  and `tartci setup` runs it):
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.artifact-cache-refresh.plist.template \
+      --set "HOME=$HOME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.artifact-cache-refresh.plist"
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.artifact-cache-refresh.plist"
+
+  Every 6 hours by StartInterval, not by calendar. An interval is counted from
+  when the agent was loaded, so hosts do not all fetch at the same wall-clock
+  minute, and the launchd watchdog derives its staleness bound from
+  StartInterval (two intervals), so a quiet refresher is never read as wedged.
+  RunAtLoad is off so a fleet-wide reinstall does not start four fetches at
+  once.
+
+  Background QoS: ProcessType=Background and LowPriorityIO keep the fetch and
+  any repack off the cores and disk bandwidth that gate VMs and agents use.
+
+  TARTCI_CI_CACHE matches the runner plists, so this refreshes exactly the
+  directory the guests mount.
+
+  The log is a few lines per pass and is not rotated; at four passes a day it
+  grows by kilobytes per day.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.artifact-cache-refresh</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>artifact-cache</string>
+        <string>refresh</string>
+        <string>--compact-above</string>
+        <string>16</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-artifact-cache-refresh.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-artifact-cache-refresh.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_CI_CACHE</key>
+        <string>$HOME/.cache/pulp-ci</string>
+    </dict>
+</dict>
+</plist>

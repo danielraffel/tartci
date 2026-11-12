@@ -1,0 +1,2 @@
+2026-09-26T17:35:03.1922200Z /Users/admin/actions-runner/_work/pulp/pulp/tools/cli/gpu_probe/src/native_recipes.cpp:171:15: error: no type named 'Renderer3DAdapterBackendPreference' in namespace 'pulp::render'
+2026-09-26T17:35:03.1923590Z /Users/admin/actions-runner/_work/pulp/pulp/tools/cli/gpu_probe/src/native_recipes.cpp:177:26: error: no member named 'Renderer3DAdapterBackendPreference' in namespace 'pulp::render'

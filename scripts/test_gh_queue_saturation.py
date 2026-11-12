@@ -115,6 +115,27 @@ class ClassifySaturationTests(unittest.TestCase):
         self.assertTrue(self._classify(154, [_runner("s")], [1800]).reasons)
         self.assertTrue(self._classify(1, [_runner("s")], [0]).reasons)
 
+    def test_queued_preamble_is_reported_even_without_idle_macos_capacity(self):
+        v = sat.classify_saturation(
+            111, [], [1800], queue_trip=TRIP, grace_secs=GRACE,
+            required_labels=REQUIRED,
+            preamble_jobs=[{"name": "resolve-provider", "age_secs": 1800,
+                            "labels": ["ubuntu-latest"]}],
+        )
+        self.assertFalse(v.saturated)
+        self.assertTrue(v.preamble_starved)
+        self.assertEqual(v.preamble_jobs, ["resolve-provider"])
+        self.assertTrue(any("routing preamble queued" in r for r in v.reasons))
+
+    def test_recent_preamble_queue_is_not_a_failure(self):
+        v = sat.classify_saturation(
+            111, [], [1800], queue_trip=TRIP, grace_secs=GRACE,
+            required_labels=REQUIRED,
+            preamble_jobs=[{"name": "classify", "age_secs": 10,
+                            "labels": ["ubuntu-latest"]}],
+        )
+        self.assertFalse(v.preamble_starved)
+
 
 class IsoAgeTests(unittest.TestCase):
     NOW = 1_000_000  # fixed synthetic epoch
@@ -195,7 +216,7 @@ class GatherScopeTests(unittest.TestCase):
             sat._gh, sat._gh_json = original_gh, original_json
 
     def test_an_organization_only_runner_reaches_the_classifier(self) -> None:
-        (queued, runners, ages, complete), seen = self.gather(
+        (queued, runners, ages, complete, preamble), seen = self.gather(
             {
                 "orgs/Generous-Corp/actions/runners": [
                     {"name": "pulp-intel-macmini", "status": "online", "busy": False,
@@ -207,14 +228,16 @@ class GatherScopeTests(unittest.TestCase):
         self.assertIn("orgs/Generous-Corp/actions/runners?per_page=100", seen)
         self.assertEqual([r["name"] for r in runners], ["pulp-intel-macmini"])
         self.assertTrue(complete)
+        self.assertEqual(preamble, [])
 
     def test_an_unreadable_scope_marks_the_census_incomplete(self) -> None:
-        (queued, runners, ages, complete), _ = self.gather(
+        (queued, runners, ages, complete, preamble), _ = self.gather(
             {}, fail={"orgs/Generous-Corp/actions/runners"}
         )
 
         self.assertFalse(complete)
         self.assertEqual(runners, [])
+        self.assertEqual(preamble, [])
 
 
 if __name__ == "__main__":

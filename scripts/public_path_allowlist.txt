@@ -1,0 +1,8 @@
+# Tracked files that still carry a real fleet path, each with its reason.
+# A file leaves this list when the path moves to the private fleet source
+# (fleet_source.py) or becomes a placeholder. New entries need a reason.
+profiles/m1-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m3-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m5-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+profiles/m5studio-macos-fleet.toml	host profile; becomes a template once hosts read their private fleet source
+scripts/test_macos_fleet_lanes.py	asserts the checked-in host profiles; becomes a template test with them

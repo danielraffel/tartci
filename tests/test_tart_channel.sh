@@ -6,6 +6,18 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 mkdir -p "$tmp/bin" "$tmp/home"
+# Every `tartci setup` below runs with a temp HOME and can reach the reclaim
+# installer. Route launchctl to a recording double that the installer's guard
+# judges as the real one: a correct guard refuses before calling it, and a
+# broken guard registers into this double, never into the host's gui/<uid>.
+cat >"$tmp/bin/launchctl-double" <<SH
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >>"$tmp/launchctl.calls"
+exit 1
+SH
+chmod +x "$tmp/bin/launchctl-double"
+export TARTCI_LAUNCHCTL_BIN="$tmp/bin/launchctl-double"
+export TARTCI_LAUNCHD_GUARD_TREAT_AS_REAL=1
 cat >"$tmp/bin/sw_vers" <<'SH'
 #!/usr/bin/env bash
 printf '%s.0\n' "${OS_MAJOR:-26}"
@@ -63,6 +75,24 @@ HOME="$tmp/home" BREW_CALLS="$tmp/brew.calls" OS_MAJOR=14 \
   TARTCI_SW_VERS_BIN="$tmp/bin/sw_vers" PATH="$tmp/bin:/usr/bin:/bin" \
   "$repo_root/tartci" setup >"$tmp/stdout" 2>"$tmp/stderr"
 grep -q 'retaining existing Tart on macOS 14' "$tmp/stderr"
+# This setup succeeds, so it reaches the disk-reclaimer installer with a temp
+# HOME. That must be refused before launchctl is touched: it once bootstrapped
+# $tmp/home's plist into the real gui/<uid> domain, replacing the host's real
+# reclaim agent with one that ran a deleted directory and exited 127 hourly.
+grep -q 'launchd guard: HOME=' "$tmp/stderr"
+if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.reclaim.plist" ]; then
+  echo "setup wrote a reclaim agent into the temp HOME" >&2
+  exit 1
+fi
+if [ -f "$tmp/home/Library/LaunchAgents/com.danielraffel.tartci.artifact-cache-refresh.plist" ]; then
+  echo "setup wrote an artifact-cache refresh agent into the temp HOME" >&2
+  exit 1
+fi
+if [ -s "$tmp/launchctl.calls" ]; then
+  echo "setup reached launchctl from a temp HOME:" >&2
+  cat "$tmp/launchctl.calls" >&2
+  exit 1
+fi
 if grep -q 'openai/tools' "$tmp/brew.calls"; then
   echo "macOS 14 setup attempted the Sequoia-only OpenAI channel" >&2
   exit 1
@@ -104,8 +134,16 @@ if [ -z "$canary_line" ] || [ -z "$pool_on_line" ] || \
   echo "pool participation resumes before the Tart VM canary" >&2
   exit 1
 fi
-if grep -R -qE 'finishes in-flight jobs|drains gracefully' \
-  "$repo_root/README.md" "$repo_root/docs/runbook.md" \
+# Every doc is scanned, not a fixed list: the operator detail moves between
+# README.md, docs/reference.md and docs/agents/ as the docs are reorganised.
+drain_claim='finishes in-flight jobs|drains gracefully'
+printf 'pool off drains gracefully\n' >"$tmp/drain-claim.md"
+if ! grep -R -qE "$drain_claim" "$tmp/drain-claim.md"; then
+  echo "drain-claim grep cannot see its own phrase" >&2
+  exit 1
+fi
+if grep -R -qE "$drain_claim" \
+  "$repo_root/README.md" "$repo_root/docs" \
   "$repo_root/providers/common/pool.lib.sh" "$repo_root/tartci"; then
   echo "pool off still claims to drain in-flight work" >&2
   exit 1

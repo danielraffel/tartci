@@ -37,17 +37,25 @@ class ParentSignalCleanupTests(unittest.TestCase):
                         f"sys.path.insert(0, {str(ROOT / 'scripts')!r}); "
                         "from bounded_subprocess import run_bounded; "
                         "run_bounded([sys.executable, '-c', "
-                        f"\"import os,time; open({str(pid_file)!r},'w').write(str(os.getpid())); time.sleep(60)\""
+                        # Write then rename: open(..., 'w') creates the file
+                        # before the pid is in it, and a loaded host let the
+                        # reader see it empty (int('') in a full-suite run).
+                        f"\"import os,time; open({str(pid_file)!r}+'.tmp','w').write(str(os.getpid())); "
+                        f"os.replace({str(pid_file)!r}+'.tmp',{str(pid_file)!r}); time.sleep(60)\""
                         "], timeout=60, operation='signal-test')"
                     ),
                 ],
                 cwd=ROOT,
             )
-            deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not pid_file.exists():
-                time.sleep(0.01)
-            self.assertTrue(pid_file.exists(), "observation child never started")
-            child_pid = int(pid_file.read_text())
+            # Interpreter start-up alone can take seconds on a loaded host.
+            deadline = time.monotonic() + 30
+            child_pid = None
+            while time.monotonic() < deadline and child_pid is None:
+                text = pid_file.read_text() if pid_file.exists() else ""
+                child_pid = int(text) if text.strip().isdigit() else None
+                if child_pid is None:
+                    time.sleep(0.01)
+            self.assertIsNotNone(child_pid, "observation child never started")
 
             driver.send_signal(signal.SIGTERM)
             self.assertEqual(driver.wait(timeout=5), -signal.SIGTERM)

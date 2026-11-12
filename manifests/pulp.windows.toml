@@ -1,6 +1,7 @@
-# Pulp — Windows build lane (standalone QEMU, ARM64 guest, Win11 24H2). PROVEN:
-# Release build green (~7 min ninja, GPU-off, MSVC arm64) + ctest 99%
-# (7287/7303) (2026-06). Apple Virtualization can't install Windows (no inbox
+# Pulp — Windows build lane (standalone QEMU, ARM64 guest, Win11 24H2). The
+# immutable Windows ARM64 Skia slice is now available for GPU-linked builds;
+# headless compile/scan proof is separate from headed DAW acceptance. Apple
+# Virtualization can't install Windows (no inbox
 # virtio-blk driver), so Windows is first-class on QEMU with an NVMe disk +
 # ramfb display. x86_64 plugins run under Prism; GitHub-hosted windows-latest
 # stays the authoritative x64 gate.
@@ -36,19 +37,33 @@ firmware   = "edk2-aarch64"         # vars seeded from the TEMPLATE, not zeros
 ssh_hostfwd = "2222:22"
 
 [toolchain]
-# Provisioned over SSH with `powershell -EncodedCommand` (scp'd .cmd mis-execute;
-# cmd mangles | / % / >). MSVC: if the VS Installer no-ops silently (phantom
-# partial-instance), nuke BuildTools+Packages+Setup, reboot, clean reinstall.
-msvc   = "14.44"          # cl.exe at VC\Tools\MSVC\14.44.x\bin\Hostarm64\arm64
-cmake  = "system"
-ninja  = "system"
+node = "26.10.0"
 python = "3.12"
+cmake = "system"
+# Provisioned over SSH with PowerShell. If VS Installer leaves a phantom
+# partial instance, remove BuildTools, Packages, and Setup, reboot, reinstall.
+msvc = "14.44"
+ninja = "system"
 
 [choco]
-packages = ["git", "cmake", "ninja", "python3"]
+packages = [
+  "git",
+  "cmake",
+  "ninja",
+  "python3",
+]
 
-# No [skia] — there is no prebuilt Windows Skia archive yet, so Pulp builds
-# GPU-off on Windows (PULP_ENABLE_GPU=OFF) until a windows-* archive exists.
+# BEGIN GENERATED PULP TOOLCHAIN (tools/toolchain/manifest.toml)
+# source_sha256 = aea1faa21cbdf7aa636523474d4613a760448b07080af190c3d324df15c7a6c1
+# generated_platform = windows
+# END GENERATED PULP TOOLCHAIN
+
+[skia]
+platforms = ["windows-arm64", "windows-x64"]
+release_line = "chrome/m153"
+source = "Generous-Corp/pulp dependency manifest"
+gpu_default = "off"
+gpu_opt_in = "--gpu"
 
 [caches]
 sccache_max = "30G"       # sccache, not ccache (ccache+MSVC is unreliable)

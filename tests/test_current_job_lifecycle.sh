@@ -3,7 +3,32 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+
+# Nearly every assertion here is a bare `[ ... ]` or `grep -q` under errexit,
+# so a failure used to end the script with exit 1 and no output at all. The ERR
+# trap (inherited into functions by -E) records where the failing command was;
+# the EXIT trap prints it once, from the main shell only, so a failure inside
+# a command substitution that the script tolerates never prints.
+set -E
+FAILED_AT="" FAILED_IN=""
+trap 'if [ -n "${FUNCNAME[0]:-}" ]; then FAILED_IN="${FUNCNAME[0]}() line ${LINENO}: ${BASH_COMMAND}"; else FAILED_AT="line ${LINENO}: ${BASH_COMMAND}"; fi' ERR
+report_exit(){
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "${BASHPID:-$$}" = "$$" ]; then
+    printf 'current job lifecycle: FAIL (exit %s) at %s%s\n' "$rc" \
+      "${FAILED_AT:-an unrecorded line}" "${FAILED_IN:+ (last failure inside ${FAILED_IN})}" >&2
+    [ ! -s "${EVENTS:-/dev/null}" ] || { printf 'events:\n' >&2; sed 's/^/  /' "$EVENTS" >&2; }
+  fi
+  rm -rf "$TMP"
+}
+trap report_exit EXIT
+
+# The scanner defaults its observation lock to the HOST's real one. This suite
+# runs on machines whose fleet lanes are scanning through that lock right now,
+# so without a private one the test blocks on production, fails with
+# "host queue observation lock timed out", and adds contention to the resource
+# it was starved by.
+export TARTCI_QUEUE_OBSERVATION_LOCK_FILE="$TMP/queue-observation.lock"
 
 # Exercise the production shell functions directly while replacing only their
 # external GitHub/event/heartbeat/cleanup boundaries.
@@ -47,6 +72,10 @@ chmod +x "$TMP/fake-gh"
 
 export TARTCI_ROOT="$ROOT" STATE_DIR="$TMP/state" REPO="Generous-Corp/pulp"
 export GH_CLI="$TMP/fake-gh" WORKFLOW_CONFIG="Build and Test"
+# The production runner initializes this alongside GH_CLI before calling the
+# functions below.  This suite evals only the function definitions, so mirror
+# that initialization explicitly instead of tripping set -u on the scan path.
+export SCAN_GH_CLI="$GH_CLI"
 export CURRENT_REGISTERED_RUNNER="runner-1" RUNNER_NAME="lane-1"
 export LIFECYCLE_STATE="$TMP/api-state" LIFECYCLE_HANG=0
 export LIFECYCLE_POST_LOG="$TMP/posts"
@@ -160,7 +189,12 @@ TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=10 capture_current_job revalidate
 [ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" -gt 0 ]
 
 # Timeout cancellation gets the protected cancel budget even when ordinary
-# discovery exhausted before it learned the run and job IDs.
+# discovery exhausted before it learned the run and job IDs. Each protected
+# budget must be spent on its own counter and never on the exhausted lifecycle
+# one. The budgets are generous rather than tiny: a scan's cost is wall-clock
+# seconds (python start-up plus one fake API call per page), and a one-second
+# budget failed on slower CI runners before the scan could finish, which is a
+# fact about the runner and not about the budget split under test.
 reset_state
 CURRENT_RUN_ID="" CURRENT_JOB_ID=""
 CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
@@ -168,15 +202,17 @@ CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
 printf active >"$LIFECYCLE_STATE"
 posts_before="$(post_count)"
 TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
-TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=1 \
-TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=1 \
-TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=1 \
-TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
+TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=20 \
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=20 cancel_current_run
 [ "$CURRENT_RUN_ID" = 333 ]
 [ "$CURRENT_JOB_ID" = 444 ]
-[ "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" = 1 ]
-[ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" = 1 ]
-[ "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT" = 1 ]
+[ "$CURRENT_JOB_SCAN_SPENT" = 30 ]
+for spent in "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" \
+    "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"; do
+  [ "$spent" -ge 1 ] && [ "$spent" -le 20 ]
+done
 [ "$(post_count)" = "$((posts_before + 1))" ]
 grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
 
@@ -264,5 +300,99 @@ set -e
 [ "$signal_rc" = 143 ]
 grep -q '^supervisor_signal|INT/TERM quarantine=signal_teardown_unknown' "$EVENTS"
 grep -q '^cleanup|signal_teardown_unknown' "$EVENTS"
+
+# A runner log carrying the runner's own closing line is local terminal proof.
+RUNNER_LOG="$TMP/actions-runner.log"
+write_runner_log(){
+  : >"$RUNNER_LOG"
+  printf '%s\n' "2026-09-21 22:58:32Z: Running job: macos" >>"$RUNNER_LOG"
+  [ "${1:-complete}" != complete ] || printf '%s\n' \
+    "2026-09-21 23:40:11Z: Job macos completed with result: Succeeded" >>"$RUNNER_LOG"
+}
+
+# An observation that never resolved is not evidence of a stall. A clean
+# listener exit plus the runner's own completion line is terminal proof, so the
+# job keeps its terminal receipt instead of a quarantine.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*observation=budget_exhausted.*evidence=runner_local.*result=Succeeded' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# The same failed measurement still quarantines when the listener itself exited
+# badly: a nonzero rc is not a clean completion.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*evidence=measurement_failed' "$EVENTS"
+
+# A clean exit without the runner's closing line proves nothing either.
+reset_state
+write_runner_log truncated
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=budget_exhausted.*evidence=measurement_failed' "$EVENTS"
+
+# A missing log is the same absence of proof.
+reset_state
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$TMP/no-such-runner.log"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+
+# A completed observation that saw the workflow still running outranks local
+# terminal proof. Positive stall evidence must still quarantine, or the verdict
+# above would have disarmed quarantine altogether.
+for stalled in active terminal_pending_run; do
+  reset_state
+  write_runner_log complete
+  CURRENT_JOB_CAPTURE_STATUS="$stalled"
+  CURRENT_JOB_RECEIPT="{\"kind\":\"$stalled\"}"
+  record_terminal_job_receipt 0 "$RUNNER_LOG"
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exited_workflow_active ]
+  grep -q "^job_lifecycle_quarantine|.*observation=$stalled.*evidence=github_api" "$EVENTS"
+  if grep -q '^job_terminal_receipt|' "$EVENTS"; then exit 1; fi
+done
+
+# The listener hands its own log to the receipt, so a completed job that never
+# resolved an observation finalizes as terminal end to end.
+reset_state
+write_runner_log complete
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+finalize_listener_receipt 0 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*evidence=runner_local' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# An unpinned host observes on the shipped defaults, so those defaults decide
+# whether a scan can finish at all. Discovery measures 93 to 106 seconds
+# against sixty concurrent runs; the lifecycle budget admits an attempt only
+# while it has time left, and its boundary is the shipped value.
+reset_state
+CURRENT_JOB_SCAN_SPENT=360
+unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+if capture_current_job discover; then exit 1; fi
+[ "$CURRENT_JOB_CAPTURE_STATUS" = budget_exhausted ]
+reset_state
+CURRENT_JOB_SCAN_SPENT=359
+CURRENT_JOB_CAPTURE_STATUS=probe
+capture_current_job discover || true
+[ "$CURRENT_JOB_CAPTURE_STATUS" != budget_exhausted ]
+# A per-attempt budget under the measured scan cost can only ever report a
+# failed measurement, so the shipped attempt timeout has to outlast it.
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}' "$ROOT/providers/tart-macos/runner.sh"
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}' "$ROOT/providers/tart-macos/runner.sh"
 
 printf 'current job lifecycle: ok\n'

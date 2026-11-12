@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Conservative, bounded cleanup of merged Pulp Git worktrees."""
 from __future__ import annotations
-import argparse, datetime as dt, fcntl, json, os, re, shutil, signal, stat, subprocess, tempfile, time
+import argparse, datetime as dt, fcntl, json, os, pwd, re, shutil, signal, stat, subprocess, tempfile, time
 from pathlib import Path
 
 SCHEMA = 1
@@ -15,7 +15,8 @@ def run(command, *, env=None, timeout=30, check=True):
     executable=command[0]
     if executable=="git": command=[GIT,*GIT_CONFIG,*command[1:]]; executable=GIT
     if executable not in ALLOWED: raise Stop(f"external executable is not allowed: {executable}")
-    controlled={**GIT_ENV,"HOME":os.environ.get("HOME","/Users/danielraffel"),"USER":os.environ.get("USER","danielraffel")}
+    account=pwd.getpwuid(os.getuid())
+    controlled={**GIT_ENV,"HOME":os.environ.get("HOME",account.pw_dir),"USER":os.environ.get("USER",account.pw_name)}
     result=subprocess.run(command,text=True,capture_output=True,env=controlled,timeout=timeout,check=False)
     if check and result.returncode: raise Stop(f"command failed ({result.returncode}): {' '.join(command)}: {result.stderr.strip()}")
     return result
@@ -79,6 +80,13 @@ def canonical_directory(path:Path,prefix:Path,device:int):
     if resolved==prefix or prefix not in resolved.parents: raise Stop(f"worktree escapes cleanup prefix: {path}")
     if resolved.stat().st_dev!=device: raise Stop(f"worktree is on another device: {path}")
     return resolved
+
+def authority_paths_ok(primary:Path,prefix:Path)->bool:
+    """The profile's prefix is /Volumes/<volume>/<dir> or deeper and primary is inside it."""
+    def canonical(path,depth):
+        text=str(path)
+        return text.startswith("/Volumes/") and str(Path(text))==text and ".." not in path.parts and len(path.parts)>=depth
+    return canonical(prefix,4) and canonical(primary,5) and prefix in primary.parents
 
 def validate_authority_roots(primary:Path,prefix:Path):
     for label,path in (("primary",primary),("prefix",prefix)):
@@ -216,7 +224,7 @@ def reconcile_pending(args):
     record["after_free_bytes"]=shutil.disk_usage(args.prefix).free; record["finished_at"]=dt.datetime.now(dt.timezone.utc).isoformat(); atomic_json(args.receipt,record); return True
 def main(argv=None):
     p=argparse.ArgumentParser(); p.add_argument("--provider",required=True); p.add_argument("--repo",required=True); p.add_argument("--primary",type=Path,required=True); p.add_argument("--prefix",type=Path,required=True); p.add_argument("--main-ref",required=True); p.add_argument("--receipt",type=Path,required=True); p.add_argument("--lock",type=Path,required=True); p.add_argument("--required-bytes",type=int,required=True); p.add_argument("--before-free-bytes",type=int,required=True); p.add_argument("--max-trees",type=int,default=8); p.add_argument("--max-bytes",type=int,default=512*1024**3); p.add_argument("--timeout",type=int,default=300); p.add_argument("--cooldown",type=int,default=3600); p.add_argument("--apply",action="store_true"); args=p.parse_args(argv)
-    if args.provider!="merged-main-v1" or args.repo!="Generous-Corp/pulp" or args.primary!=Path("/Volumes/Workshop/Code/pulp") or args.prefix!=Path("/Volumes/Workshop/Code") or args.main_ref!="origin/main" or not 1<=args.max_trees<=8 or not 0<args.max_bytes<=512*1024**3 or not 1<=args.timeout<=300 or args.cooldown<0: raise Stop("unsupported cleanup authority")
+    if args.provider!="merged-main-v1" or args.repo!="Generous-Corp/pulp" or not authority_paths_ok(args.primary,args.prefix) or args.main_ref!="origin/main" or not 1<=args.max_trees<=8 or not 0<args.max_bytes<=512*1024**3 or not 1<=args.timeout<=300 or args.cooldown<0: raise Stop("unsupported cleanup authority")
     validate_authority_roots(args.primary,args.prefix)
     started=time.monotonic(); args.lock.parent.mkdir(parents=True,exist_ok=True)
     with args.lock.open("a+") as lock:

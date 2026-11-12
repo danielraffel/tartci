@@ -9,15 +9,24 @@ on:
   push:
     branches: [main]
   pull_request:
+  merge_group:
 
 permissions:
   contents: read
+
+# A new push to a pull request supersedes the run for its previous head, so
+# that run is cancelled. Every other event gets a group of its own (keyed by
+# run id): a group holds at most one pending run and drops older pending ones
+# even without cancel-in-progress, so sharing a group would drop main runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Ensure shellcheck
         run: command -v shellcheck >/dev/null || { sudo apt-get update && sudo apt-get install -y shellcheck; }
@@ -54,5 +63,112 @@ jobs:
       - name: Run shell tests
         run: |
           for test_script in tests/test_*.sh; do
-            bash "$test_script"
+            # Name the script: several end on a bare assertion under errexit.
+            bash "$test_script" || { rc=$?; echo "::error::$test_script exited $rc"; exit 1; }
           done
+
+  python-39-tests:
+    # The fleet's system interpreter is /usr/bin/python3 3.9.6 on all four
+    # hosts (m1, m3, m5, m5studio): the tartci shim's support-manifest check,
+    # the pinned launch interpreter, explicit /usr/bin/python3 call sites and
+    # every tartci_toml_exec_or_python3 fallback on a host without a tomllib
+    # Python run on it. python-floor only compiles under 3.11 and the lint job
+    # runs the tests on ubuntu's 3.12+, so a 3.9-only failure reached a PR four
+    # times on 2026-10-05. setup-python has no 3.9.6 for current ubuntu images,
+    # so this runs the newest 3.9 (same language, same stdlib surface, no
+    # tomllib) on the lint job's OS, and puts it first on PATH so subprocesses
+    # that call `python3` get it too. A test that genuinely needs tomllib says
+    # so (scripts/testing_support.py) and is skipped rather than failing.
+    #
+    # Pinned to ubuntu-24.04, not ubuntu-latest: setup-python can only install
+    # a version it has a build of for the runner image, and it has no 3.9 for
+    # ubuntu-26.04, so on the moved `latest` label this job (and with it the
+    # signing_prompt_guard tests it runs under 3.9) fails at setup. The action
+    # is pinned by SHA (v6.3.0, as in review-verdict.yml) for the same reason:
+    # what this job tests must not move under it.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.9"
+      - name: Refuse anything but a 3.9 interpreter on PATH
+        run: |
+          set -euo pipefail
+          python3 -c 'import sys; v = sys.version_info[:2]; print(sys.version); raise SystemExit(0 if v == (3, 9) else 1)'
+          if python3 -c 'import tomllib' 2>/dev/null; then
+            echo "python3 imports tomllib; this job must run a tomllib-less 3.9" >&2
+            exit 1
+          fi
+      - name: Run the unit tests under Python 3.9 (the hosts' /usr/bin/python3)
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  python-floor:
+    # Fleet hosts run these scripts under their own Homebrew python3, and the
+    # oldest one in service is 3.11 (the tomllib floor). The lint job's
+    # ubuntu-latest python accepts 3.12+ syntax (PEP 701 nested f-string
+    # quotes) that 3.11 rejects at import, so compile under the floor itself.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Compile every tracked Python file under Python 3.11
+        run: |
+          python --version
+          git ls-files -z '*.py' | xargs -0 python -m py_compile
+
+  # The single aggregate check the ruleset requires. It is reported for every
+  # PR head: this workflow has no workflow-level path filters and none of the
+  # aggregated jobs has a job-level `if`, so it always triggers, and `always()`
+  # makes this job run even when a needed job failed, was cancelled or was
+  # skipped. It fails unless EVERY needed job succeeded; no skip is permitted.
+  # The gate derives its job list from toJSON(needs). Add any new CI job to
+  # `needs` here; scripts/test_ci_required_workflow.py fails if one is missing.
+  # ci-cause is advisory and deliberately not aggregated.
+  ci-required:
+    name: ci-required
+    needs: [lint, python-39-tests, python-floor]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/ci_required_gate.sh
+          sparse-checkout-cone-mode: false
+      - name: Require every CI job to have succeeded
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: bash scripts/ci_required_gate.sh "$NEEDS_JSON"
+
+  # Names the cause of each failed job in this run as a `ci.cause/v1` record,
+  # printed as a `::notice title=ci-cause::` annotation. A job's own log can be
+  # downloaded only once it has finished, so this job reads the failed jobs'
+  # finished logs and runs the pinned, checksum-verified
+  # `shipyard cause extract` over each (scripts/ci_cause_notices.sh). It is
+  # advisory: it never gates the run, and none of its failures fail it.
+  ci-cause:
+    name: ci-cause (advisory)
+    needs: [lint, python-39-tests, python-floor]
+    if: ${{ !cancelled() && contains(needs.*.result, 'failure') }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          sparse-checkout: |
+            scripts/ci_cause_notices.sh
+          sparse-checkout-cone-mode: false
+      - name: Name the cause of each failed job
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash scripts/ci_cause_notices.sh

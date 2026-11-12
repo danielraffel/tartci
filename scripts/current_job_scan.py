@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import contextlib
 import concurrent.futures
-import fcntl
 import json
 import math
 import os
@@ -16,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import ObservationError, run_bounded
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 
 PER_PAGE = 100
 
@@ -42,36 +42,20 @@ class CurrentJobScanner:
         self.api_lock = threading.Lock()
         self.page_fingerprints: dict[str, tuple[tuple[int, ...], ...]] = {}
         self.observation_lock_path = Path(args.observation_lock_file)
-        self.lock_wait_timeout = min(
-            args.observation_lock_timeout, args.scan_timeout
-        )
-        self.lock_deadline = time.monotonic() + self.lock_wait_timeout
         self.observation_lock_fd: int | None = None
 
     @contextlib.contextmanager
     def observation_lock(self) -> Any:
-        """Share one bounded GitHub observation authority with queue scans."""
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.observation_lock_path.open("a+", encoding="utf-8") as handle:
-            while True:
-                try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    break
-                except BlockingIOError:
-                    if time.monotonic() >= self.lock_deadline:
-                        raise ScanError(
-                            "host queue observation lock timed out after "
-                            f"{self.lock_wait_timeout}s"
-                        )
-                    time.sleep(0.05)
-            self.observation_lock_fd = os.dup(handle.fileno())
-            os.set_inheritable(self.observation_lock_fd, True)
-            try:
-                yield
-            finally:
-                os.close(self.observation_lock_fd)
-                self.observation_lock_fd = None
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        """Share one fair, bounded GitHub observation authority with queue scans."""
+        with FairObservationLock(
+            str(self.observation_lock_path), self.args.observation_lock_timeout,
+            self.args.repo, getattr(self.args, "observation_backoff_file", None),
+            getattr(self.args, "observation_backoff_seconds", 30.0),
+            getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+        ).hold() as handle:
+            # Descendants must not inherit this flock: a killed scanner's
+            # slow API child cannot starve the other host lanes.
+            yield
 
     def _gh(self, path: str) -> dict[str, Any]:
         with self.api_lock:
@@ -80,18 +64,28 @@ class CurrentJobScanner:
             self.api_calls += 1
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
-            raise ScanError("scan exceeded its overall deadline")
+            raise ObservationTimeout("scan exceeded its overall deadline")
         try:
+            started = time.monotonic()
             result = run_bounded(
                 [self.args.gh_cli, "api", path],
-                timeout=min(self.args.gh_timeout, remaining),
+                timeout=min(
+                    self.args.gh_timeout,
+                    max(0.1, self.args.observation_lock_timeout / 2),
+                    remaining,
+                ),
                 operation="current_job_github_api",
-                pass_fds=(self.observation_lock_fd,)
-                if self.observation_lock_fd is not None
-                else (),
+            )
+            print(
+                f"current-job-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+                file=sys.stderr,
             )
         except ObservationError as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
+        if getattr(result, "timed_out", False):
+            raise ObservationTimeout(
+                f"current_job_github_api:timeout:timed out after {self.args.gh_timeout}s"
+            )
         if result.returncode:
             raise ScanError(f"GitHub API failed for {path}: {result.stderr.strip()}")
         try:
@@ -101,6 +95,16 @@ class CurrentJobScanner:
         if not isinstance(payload, dict):
             raise ScanError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff without reacquiring the host observation flock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     def _pages(self, prefix: str, key: str) -> list[dict[str, Any]]:
         result: list[dict[str, Any]] = []
@@ -253,12 +257,19 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repo", required=True)
     parser.add_argument("--runner", required=True)
+    parser.add_argument(
+        "--lane-id",
+        default=os.environ.get("TARTCI_QUEUE_LANE_ID")
+        or os.environ.get("TARTCI_RUNNER_SLOT")
+        or f"supervisor-{os.getppid()}",
+    )
+    parser.add_argument("--generation", default=os.environ.get("TARTCI_GENERATION") or "unknown")
     parser.add_argument("--workflow", required=True, action="append")
     parser.add_argument("--mode", choices=("discover", "revalidate"), default="discover")
     parser.add_argument("--run-id", type=int)
     parser.add_argument("--job-id", type=int)
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
-    parser.add_argument("--gh-timeout", type=float, default=5)
+    parser.add_argument("--gh-timeout", type=float, default=15)
     parser.add_argument("--max-pages", type=int, default=3)
     parser.add_argument("--scan-timeout", type=float, default=10)
     parser.add_argument("--result-cap", type=int, default=300)
@@ -274,6 +285,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS", "120")),
     )
+    parser.add_argument("--observation-backoff-file", default=os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"))
+    parser.add_argument("--observation-backoff-seconds", type=float, default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_SECS", "30")))
     args = parser.parse_args()
     for field in ("gh_timeout", "max_pages", "scan_timeout", "result_cap", "max_api_calls", "parallelism"):
         if not math.isfinite(getattr(args, field)) or getattr(args, field) <= 0:
@@ -282,6 +295,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--parallelism must be 1 to preserve host observation bounds")
     if not math.isfinite(args.observation_lock_timeout) or args.observation_lock_timeout <= 0:
         parser.error("--observation-lock-timeout must be positive")
+    if args.observation_backoff_file is None:
+        args.observation_backoff_file = str(Path(args.observation_lock_file).with_name("queue-observation-backoff.json"))
+    if not math.isfinite(args.observation_backoff_seconds) or args.observation_backoff_seconds <= 0:
+        parser.error("--observation-backoff-seconds must be positive")
     if args.mode == "revalidate" and (not args.run_id or not args.job_id):
         parser.error("--run-id and --job-id are required for revalidate")
     return args
@@ -291,10 +308,27 @@ def main() -> int:
     try:
         args = parse_args()
         scanner = CurrentJobScanner(args)
-        with scanner.observation_lock():
-            receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
+        # API observation is lock-free. The host flock is reserved for short
+        # claim/state operations; holding it across pagination starves lanes.
+        receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
         print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    except ObservationBackoff as error:
+        scanner.record_timeout(error)
+        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
+    except ObservationTimeout as error:
+        scanner.record_timeout(error)
+        print(json.dumps({"kind": "observation_error", "detail": f"api_timeout: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
+    except TimeoutError as error:
+        scanner.record_timeout(error)
+        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
+                         sort_keys=True, separators=(",", ":")))
+        return 2
     except ScanError as error:
+        scanner.record_timeout(error)
         print(json.dumps({"kind": "observation_error", "detail": str(error)},
                          sort_keys=True, separators=(",", ":")))
         return 2

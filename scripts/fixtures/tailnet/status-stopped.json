@@ -1,0 +1,25 @@
+{
+ "AuthURL": "",
+ "BackendState": "Stopped",
+ "HaveNodeKey": true,
+ "MagicDNSSuffix": "example-tailnet.ts.net",
+ "Peer": null,
+ "Self": {
+  "Active": false,
+  "DNSName": "m3studio.example-tailnet.ts.net.",
+  "HostName": "Daniel\u2019s Mac Studio (m3)",
+  "KeyExpiry": "2026-11-24T21:57:58Z",
+  "LastSeen": "0001-01-01T00:00:00Z",
+  "OS": "macOS",
+  "Online": false,
+  "TailscaleIPs": [
+   "203.0.113.11",
+   "2001:db8::6"
+  ]
+ },
+ "TailscaleIPs": [
+  "203.0.113.11",
+  "2001:db8::6"
+ ],
+ "Version": "1.102.4-t3caf7d9e7-g084ee3b64"
+}

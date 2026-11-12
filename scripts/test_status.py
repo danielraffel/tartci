@@ -10,6 +10,8 @@ import pathlib
 import plistlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -157,6 +159,24 @@ class DiskSpaceTests(unittest.TestCase):
         self.assertIsNone(out["tightest_free_bytes"])
         self.assertIsNone(out["tightest_root"])
 
+    def test_the_lease_volume_is_reported_beside_the_scan_volumes(self):
+        """The floor's volume need not be a scanned one; status must name it."""
+        with tempfile.TemporaryDirectory() as scan, \
+                tempfile.TemporaryDirectory() as vms:
+            out = status.disk_space({"TARTCI_RECLAIM_ROOTS": scan,
+                                     "TARTCI_RECLAIM_LEASE_PATH": vms})
+        self.assertEqual(out["lease_volume"]["root"], vms)
+        self.assertEqual(out["lease_volume"]["source"], "--lease-path")
+        self.assertIsNotNone(out["lease_volume"]["free_bytes"])
+        # Control: nothing declared (and no profile or TART_HOME) names none.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("TART_HOME", "TARTCI_RECLAIM_LEASE_PATH")}
+        env["TARTCI_FLEET_PROFILE"] = "/definitely/no/profile.toml"
+        with tempfile.TemporaryDirectory() as scan, \
+                mock.patch.dict(os.environ, env, clear=True):
+            out_ctl = status.disk_space({"TARTCI_RECLAIM_ROOTS": scan})
+        self.assertIsNone(out_ctl["lease_volume"])
+
     def test_failure_reports_error_rather_than_a_clean_reading(self):
         with mock.patch.object(dr, "parse_roots",
                                side_effect=OSError("volume gone")):
@@ -234,6 +254,46 @@ class StatusOutputTests(unittest.TestCase):
             _, text = self._quiet_main([])
         self.assertIn("launchd not reachable", text)
         self.assertNotIn("installed and loaded", text)
+
+
+class DiskSpaceBoundTests(unittest.TestCase):
+    """A status command must not hang on the volume it is reporting about.
+
+    Root discovery resolves paths and stats the volume each sits on, and one
+    of this fleet's roots is an external mount. Those calls have no timeout of
+    their own, so a wedged mount would block `tartci status` for as long as the
+    mount stays wedged -- during exactly the incident it is being run to
+    explain.
+    """
+
+    def test_a_wedged_volume_scan_returns_instead_of_hanging(self):
+        started = threading.Event()
+
+        def never_answers(_declared):
+            started.set()
+            time.sleep(30)
+            raise AssertionError("unreachable within the test's lifetime")
+
+        with mock.patch.object(
+                status.disk_reclaim, "parse_roots", never_answers):
+            begin = time.monotonic()
+            result = status.disk_space(timeout=0.2)
+            elapsed = time.monotonic() - begin
+        self.assertTrue(started.wait(5), "the scan never started")
+        self.assertLess(elapsed, 10, "disk_space blocked on the wedged scan")
+        self.assertIn("wedged mount", result.get("error", ""))
+
+    def test_a_volume_that_answers_is_reported_normally(self):
+        # THE CONTROL. Every assertion above is also satisfied by a
+        # disk_space() that has stopped measuring anything at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                    os.environ, {"TARTCI_RECLAIM_ROOTS": tmp}):
+                result = status.disk_space()
+        self.assertNotIn("error", result)
+        self.assertTrue(result["roots_declared"])
+        self.assertIsInstance(result["tightest_free_bytes"], int)
+        self.assertGreater(result["tightest_free_bytes"], 0)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the signing-keychain unlocker.
+
+  macOS locks every non-login keychain at login and logout, and a locked
+  keychain on the search list makes securityd raise a password dialog for any
+  GUI-session process that searches it. This agent runs
+  `tartci keychain-unlock` (scripts/keychain_unlock.py) at load, which is each
+  login, and every 15 minutes, so the dedicated signing keychain is unlocked
+  with no auto-lock in the session the dialogs come from. It unlocks only that
+  keychain, with keychain.env's password passed on stdin, and is a no-op on a
+  host without keychain.env.
+
+  Install shape (scripts/install_keychain_unlock_agent.sh does this; `tartci
+  setup` and the launchd watchdog run it):
+
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.keychain-unlock.plist.template \
+      --set "HOME=$HOME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.keychain-unlock.plist"
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.keychain-unlock.plist"
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.keychain-unlock</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>keychain-unlock</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/keychain-unlock.log</string>
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/keychain-unlock.log</string>
+</dict>
+</plist>

@@ -24,7 +24,12 @@ chmod +x "$WORK/.local/bin/shipyard"
 # regression fix, command substitution produced "0\n0" and bash logged
 # "integer expression expected".
 touch -t 202001010000 "$WORK/Library/Application Support/shipyard/daemon/daemon.log"
-output="$(HOME="$WORK" bash "$SCRIPT" 2>&1)"
+rc=0
+output="$(HOME="$WORK" bash "$SCRIPT" 2>&1)" || rc=$?
+if [ "$rc" -ne 0 ]; then
+  echo "FAIL: daemon health script exited $rc: $output" >&2
+  exit 1
+fi
 
 if [ -n "$output" ]; then
   echo "FAIL: daemon health script wrote unexpected stderr/stdout: $output" >&2

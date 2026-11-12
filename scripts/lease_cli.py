@@ -33,12 +33,77 @@ def parse_args(
         command_parser.add_argument(
             "--reserved-gate-cores", type=int, help="cores withheld from non-gate leases"
         )
+        command_parser.add_argument(
+            "--reserved-gate-mem-mb",
+            type=int,
+            help="memory in MB withheld from non-gate leases",
+        )
+        command_parser.add_argument(
+            "--agent-floor-cores",
+            type=int,
+            help="override the per-lease agent floor (0 disables floor leases)",
+        )
+        command_parser.add_argument(
+            "--agent-floor-pool-cores",
+            type=int,
+            help="override the host-wide cap on concurrent floor-lease cores",
+        )
+        command_parser.add_argument(
+            "--agent-floor-qos",
+            choices=("utility", "background"),
+            help="override the QoS a floor lease runs at",
+        )
         command_parser.add_argument("--gate-priority", type=int, default=priority_classes["gate"])
         command_parser.add_argument("--stale-secs", type=int, default=stale_secs)
         command_parser.add_argument("--role", choices=valid_roles)
         command_parser.add_argument("--role-file")
         command_parser.add_argument("--host-cores", type=int)
         command_parser.add_argument("--model")
+        command_parser.add_argument(
+            "--rank-vm-waiters",
+            choices=("on", "off"),
+            help="override the fleet profile's [leases] rank_vm_waiters knob",
+        )
+        command_parser.add_argument(
+            "--fair-share-after-secs",
+            type=int,
+            help="override the fleet profile's [leases] fair_share_after_secs (0 disables)",
+        )
+        command_parser.add_argument(
+            "--waiter-fresh-secs",
+            type=int,
+            help="override how long an unrefreshed VM lease waiter still counts",
+        )
+        command_parser.add_argument(
+            "--dynamic-lending",
+            choices=("on", "off"),
+            help="override the governor's dynamic_lending knob",
+        )
+        command_parser.add_argument(
+            "--vm-slot-lending",
+            choices=("on", "off"),
+            help="override the fleet profile's [leases] vm_slot_lending knob",
+        )
+        command_parser.add_argument(
+            "--macos-vm-cap",
+            type=int,
+            help="macOS guests this host can run at once (default: the role's cap)",
+        )
+        command_parser.add_argument(
+            "--gate-prompt-reserve-cores",
+            type=int,
+            help="override cores kept free for the next gate job while lending",
+        )
+        command_parser.add_argument(
+            "--interactive-share-cores",
+            type=int,
+            help="override the cap on all interactive build leases together",
+        )
+        command_parser.add_argument(
+            "--background-share-cores",
+            type=int,
+            help="override the cap on all background build leases together",
+        )
         command_parser.add_argument("--json", action="store_true")
 
     status = sub.add_parser("status", aliases=["list"], help="show active leases")
@@ -56,6 +121,49 @@ def parse_args(
         help="memory this lease consumes in MB; omitted → cores * per-job estimate",
     )
     acquire_parser.add_argument("--priority", default="build")
+    acquire_parser.add_argument(
+        "--allow-floor",
+        action="store_true",
+        help=(
+            "when a non-gate, non-VM lease is denied on cores, accept a smaller "
+            "floor lease that runs at background QoS and is not charged against "
+            "other leases; the caller must honour the granted size and qos"
+        ),
+    )
+    acquire_parser.add_argument(
+        "--class",
+        dest="build_class",
+        choices=("interactive", "background"),
+        help=(
+            "build class: interactive (someone is waiting; normal QoS, may borrow "
+            "idle gate cores when lending is on, never floored) or background "
+            "(validations/opportunistic; capped at the background share). "
+            "Omitted: the class-less rule every caller had before classes"
+        ),
+    )
+    acquire_parser.add_argument(
+        "--min-cores",
+        type=int,
+        default=0,
+        help=(
+            "accept a partial lease of at least this many cores when the full "
+            "request does not fit; the caller must honour the granted size"
+        ),
+    )
+    acquire_parser.add_argument(
+        "--wait-secs",
+        type=int,
+        default=0,
+        help="retry a denied acquire (locally, every 2 s) for up to this long",
+    )
+    acquire_parser.add_argument(
+        "--memory-only",
+        action="store_true",
+        help=(
+            "hold memory (and disk) but no cores, for a parked pre-booted VM; "
+            "requires --cores 0 and --mem-mb; upgrade later with `resize`"
+        ),
+    )
     acquire_parser.add_argument("--pid", type=int)
     acquire_parser.add_argument("--id")
     acquire_parser.add_argument("--kind", default="unknown")
@@ -63,6 +171,24 @@ def parse_args(
     acquire_parser.add_argument("--label", default="")
     acquire_parser.add_argument("--job-id", default="")
     acquire_parser.add_argument("--vm-name", default="")
+    acquire_parser.add_argument(
+        "--repo", default="",
+        help="repository this VM lease serves (fair share between repositories)",
+    )
+    acquire_parser.add_argument(
+        "--demand-since", type=int, default=0,
+        help="epoch seconds since this lane has had work it could not place",
+    )
+    acquire_parser.add_argument(
+        "--vm-slot-cap", type=int, default=0,
+        help="VM slots on this host, so fair share can keep the last one for a starved lane",
+    )
+    acquire_parser.add_argument(
+        "--waiter-id",
+        default="",
+        help="this lane's VM lease waiter: never ranked against itself, refreshed "
+             "on denial, withdrawn on grant",
+    )
     acquire_parser.add_argument(
         "--disk-path",
         help="VM/overlay store path whose filesystem receives the growth reservation",
@@ -85,6 +211,25 @@ def parse_args(
         help="optional persisted filesystem device identity for --disk-path",
     )
     acquire_parser.add_argument(
+        "--home-floor-path",
+        default="",
+        help="with --disk-path: also judge this path's volume (the home volume) "
+             "against a per-host free-space floor when it is not --disk-path's "
+             "device; a NEW VM lease below it is refused (home_volume_floor.py)",
+    )
+    acquire_parser.add_argument(
+        "--home-floor-mode",
+        choices=("report", "refuse"),
+        default="report",
+        help="report (default): admit and mark the grant would_refuse; refuse: deny it",
+    )
+    acquire_parser.add_argument(
+        "--home-floor-hours",
+        type=float,
+        default=1.0,
+        help="hours until the next reclaim pass; the floor covers that much fill",
+    )
+    acquire_parser.add_argument(
         "--disk-expected-mount-path",
         default="",
         help="optional expected mounted filesystem root for --disk-path",
@@ -93,6 +238,38 @@ def parse_args(
     release_parser = sub.add_parser("release", help="release a lease by id")
     add_common(release_parser)
     release_parser.add_argument("--id", required=True)
+
+    resize_parser = sub.add_parser(
+        "resize",
+        help="atomically change an existing lease's cores/memory/priority (denied: unchanged)",
+    )
+    add_common(resize_parser)
+    resize_parser.add_argument("--id", required=True)
+    resize_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    resize_parser.add_argument("--mem-mb", type=int)
+    resize_parser.add_argument("--priority")
+    resize_parser.add_argument("--label", default="")
+    resize_parser.add_argument("--waiter-id", default="")
+
+    wait_parser = sub.add_parser(
+        "wait",
+        help="register or refresh a VM lane as a lease waiter (no-op unless rank_vm_waiters)",
+    )
+    add_common(wait_parser)
+    wait_parser.add_argument("--id", required=True)
+    wait_parser.add_argument("--cores", dest="cores_requested", type=int, required=True)
+    wait_parser.add_argument("--mem-mb", type=int)
+    wait_parser.add_argument("--priority", default="vm")
+    wait_parser.add_argument("--kind", required=True)
+    wait_parser.add_argument("--pid", type=int)
+    wait_parser.add_argument("--lane", default="")
+    wait_parser.add_argument("--label", default="")
+    wait_parser.add_argument("--repo", default="")
+    wait_parser.add_argument("--demand-since", type=int, default=0)
+
+    withdraw_parser = sub.add_parser("withdraw", help="remove a VM lease waiter by id")
+    add_common(withdraw_parser)
+    withdraw_parser.add_argument("--id", required=True)
 
     heartbeat_parser = sub.add_parser("heartbeat", help="refresh a lease heartbeat")
     add_common(heartbeat_parser)

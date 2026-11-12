@@ -9,6 +9,9 @@
 #   2. python — `py_compile` on every *.py.
 #   3. TOML   — every manifests/*.toml and profiles/*.toml parses (skipped with a note if the
 #               local python predates tomllib / 3.11).
+#   4. public paths — no real home directory, volume or host name.
+#   5. bash 3.2 arrays — no array expansion that macOS /bin/bash 3.2 aborts on
+#               when the array is empty under `set -u`.
 #
 # Portable to macOS's stock bash 3.2 (no `mapfile`, no associative arrays) —
 # tartci's primary host is macOS, so `scripts/lint.sh` must run there too.
@@ -41,7 +44,7 @@ note "Shell scripts: ${#sh_files[@]}"
 have_shellcheck=1
 command -v shellcheck >/dev/null 2>&1 || { have_shellcheck=0; bad "shellcheck not installed"; }
 if [ "${#sh_files[@]}" -gt 0 ]; then
-  for f in "${sh_files[@]}"; do
+  for f in ${sh_files[@]+"${sh_files[@]}"}; do
     bash -n "$f" 2>/dev/null || bad "bash -n: $f"
     if [ "$have_shellcheck" = 1 ]; then
       shellcheck -S warning "$f" || bad "shellcheck: $f"
@@ -56,7 +59,7 @@ while IFS= read -r f; do py_files+=("$f"); done < <(
   find . -path ./.git -prune -o -type f -name '*.py' -print | sort
 )
 if [ "${#py_files[@]}" -gt 0 ]; then
-  if python3 -m py_compile "${py_files[@]}"; then
+  if python3 -m py_compile ${py_files[@]+"${py_files[@]}"}; then
     ok "python: py_compile clean (${#py_files[@]} files)"
   else
     bad "python: py_compile failed"
@@ -89,6 +92,23 @@ for p in paths:
 sys.exit(1 if errs else 0)
 PY
   if [ "$toml_rc" = 0 ]; then ok "manifests: all TOML parse"; else bad "manifests: TOML parse failed"; fi
+fi
+
+# ── 4. public paths ─────────────────────────────────────────────────────────
+# A public repo carries no real home directory, external volume or host name.
+if python3 scripts/public_path_lint.py; then
+  ok "public paths: no real /Users, /Volumes or host names in tracked files"
+else
+  bad "public paths: real paths or host names above (scripts/public_path_lint.py)"
+fi
+
+# ── 5. bash 3.2 empty arrays ────────────────────────────────────────────────
+# macOS /bin/bash 3.2 aborts on "${a[@]}" of an empty array under `set -u`;
+# the bash on this lint host does not, so only a static check sees it.
+if python3 scripts/bash32_array_lint.py; then
+  ok "bash 3.2 arrays: every array expansion under set -u is guarded"
+else
+  bad "bash 3.2 arrays: unguarded expansions above (scripts/bash32_array_lint.py)"
 fi
 
 echo

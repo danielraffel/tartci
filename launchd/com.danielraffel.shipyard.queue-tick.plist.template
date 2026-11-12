@@ -1,39 +1,25 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  launchd template for the per-host Shipyard queue janitor.
+  launchd template for the per-host Shipyard ship-state reaper.
 
-  Runs scripts/shipyard_queue_tick.sh periodically to drive in-flight
-  ship-state to completion (via shipyard's OWN fail-closed `auto-merge`) and
-  reap orphaned records (merged/closed PRs), INDEPENDENT of any interactive
-  session. See planning/2026-06-30-ship-queue-resilience-design.md in the pulp
-  repo for the full design + adversarial review.
+  Runs scripts/shipyard_queue_tick.sh periodically to reap orphaned ship-state
+  records (merged/closed PRs, or PRs confirmed nonexistent), INDEPENDENT of any
+  interactive session. It never merges, enqueues or arms a pull request:
+  landing is the GitHub merge queue's job.
 
-  SAFETY: three-stage rollout, most-reversible first.
-    1. DRY-RUN (APPLY=0)                — logs only; observe the log.
-    2. REAP-ONLY (APPLY=1, REAP_ONLY=1) — acts on the proven path (discard
-       GitHub-confirmed MERGED/CLOSED orphans) but HOLDS the auto-merge action
-       in surface-only mode. Enable this once dry-run has baked.
-    3. FULL-LIVE (APPLY=1, REAP_ONLY=0, QUEUE_AUTHORITY=1) — also drives
-       OPEN+green ship-state PRs through `shipyard auto-merge`. Enable on
-       exactly one fleet host after the auto-merge branch has been observed
-       firing correctly on a real PR.
-  The tick never reimplements merge logic, merges only green+head-matched PRs
-  through `shipyard auto-merge`, and discards only GitHub-confirmed
-  MERGED/CLOSED records.
+  Two modes, most-reversible first:
+    1. DRY-RUN (APPLY=0) - logs what it would reap.
+    2. REAP (APPLY=1)    - discards GitHub-confirmed MERGED/CLOSED records.
   Requires Shipyard 0.80.0 or newer. Install that release before this plist.
 
-  Install shape (run on each CI host — m1/m3/m5):
+  Install shape (run on each CI host):
 
     scripts/install_shipyard_queue_tick.sh
 
-  Run the installer help command for its repo-root, authority, mode, and apply
-  flags.
+  Run the installer help command for its wrapper, mode and install flags.
 
   The installer renders absolute paths, kickstarts the agent, and requires a
-  fresh healthy verdict. After observing the dry-run log, arm exactly one
-  authority in live mode with an explicit GitHub App wrapper. Use reap-only
-  mode for a non-authority host that should clean terminal ship-state. Do not
-  edit the installed plist by hand.
+  fresh healthy verdict. Do not edit the installed plist by hand.
 -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -45,7 +31,8 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$HOME/.local/share/tartci/scripts/shipyard_queue_tick.sh</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>queue-tick</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -65,22 +52,18 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>SHIPYARD_TICK_APPLY</key>
         <string>0</string>
-        <key>SHIPYARD_QUEUE_AUTHORITY</key>
-        <string></string>
         <key>SHIPYARD_QUEUE_REPO_ROOT</key>
         <string></string>
-        <key>SHIPYARD_TICK_REAP_ONLY</key>
-        <string>0</string>
         <key>SHIPYARD_TICK_HEARTBEAT_FRESH_SECS</key>
         <string>300</string>
-        <key>SHIPYARD_TICK_MERGE_METHOD</key>
-        <string>merge</string>
         <key>SHIPYARD_QUEUE_SELF_REPAIR</key>
         <string>1</string>
         <key>SHIPYARD_QUEUE_CANONICAL_CONFIG</key>

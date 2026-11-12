@@ -34,7 +34,7 @@ class DiskDenialReceiptTests(unittest.TestCase):
                 "reason": "disk_capacity_exceeded",
                 "exceeded_axis": {"cores": False, "memory": False, "disk": True},
                 "disk": {
-                    "reservation_path": "/Volumes/Workshop/VMs",
+                    "reservation_path": "/Volumes/Example/VMs",
                     "device_id": "16777235",
                     "free_bytes": 40,
                     "reserved_bytes": 10,
@@ -56,7 +56,7 @@ class DiskDenialReceiptTests(unittest.TestCase):
             self.assertEqual(body["free_bytes"], 40)
             self.assertEqual(body["reserved_bytes"], 10)
             self.assertEqual(body["floor_bytes"], 25)
-            self.assertEqual(body["probe_path"], "/Volumes/Workshop/VMs")
+            self.assertEqual(body["probe_path"], "/Volumes/Example/VMs")
             self.assertEqual(body["device_id"], "16777235")
             self.assertEqual(body["requested_growth_bytes"], 24)
             self.assertEqual(body["required_after_reservations_bytes"], 49)
@@ -70,11 +70,11 @@ class DiskDenialReceiptTests(unittest.TestCase):
             other.write_text("keep\n", encoding="utf-8")
             self.assertEqual(observe(directory, {
                 "ok": False, "reason": "disk_root_unavailable",
-                "disk_path": "/Volumes/Workshop/VMs", "error": "missing",
+                "disk_path": "/Volumes/Example/VMs", "error": "missing",
             }).returncode, 0)
             denied = json.loads((directory / "studio-pulp-gate.disk-admission.json").read_text())
             self.assertEqual((denied["status"], denied["reason"]), ("denied", "disk_probe_failed"))
-            self.assertEqual(denied["probe_path"], "/Volumes/Workshop/VMs")
+            self.assertEqual(denied["probe_path"], "/Volumes/Example/VMs")
             self.assertEqual(denied["error"], "missing")
             self.assertEqual(observe(directory, {"ok": True, "disk": {"reservation_path": "/tmp"}}).returncode, 0)
             body = json.loads((directory / "studio-pulp-gate.disk-admission.json").read_text())

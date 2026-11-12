@@ -204,7 +204,7 @@ arch = "arm64"
 runs_on_json = ["self-hosted", "macOS", "ARM64", "pulp-build", "pulp-build-vm"]
 
 [targets."m5.macos-arm64-vm"]
-description = "M5/blackbook Tart macOS ARM64 overflow build VM."
+description = "M5/laptop Tart macOS ARM64 overflow build VM."
 provider = "tartci"
 host = "m5"
 os = "macos"

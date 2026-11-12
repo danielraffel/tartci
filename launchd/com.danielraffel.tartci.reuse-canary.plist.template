@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the reuse canary.
+
+  Runs scripts/reuse_canary.py every 6 h: once per new origin/main SHA a day,
+  `shipyard run --targets mac` in a dedicated canary worktree at background
+  build priority, then records what `shipyard reuse records` reports for that
+  SHA. See the script docstring.
+
+  Declared per host by the fleet profile's [reuse_canary] table. The agent
+  runs the installed generation's `tartci reuse-canary run`, so self-update
+  refreshes the code.
+
+  RunAtLoad is off: a pass builds Pulp for up to three hours, so loading the
+  agent must not start one, and nothing kickstarts it on install.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.reuse-canary</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>reuse-canary</string>
+        <string>run</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StartInterval</key>
+    <integer>21600</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/reuse-canary.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/reuse-canary.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PULP_BUILD_CLASS</key>
+        <string>background</string>
+    </dict>
+</dict>
+</plist>

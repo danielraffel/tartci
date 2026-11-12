@@ -1,4 +1,9 @@
-# tartci gotchas — symptom → cause → fix
+# tartci gotchas: symptom, cause, fix
+
+Use this page when a command or lane behaves differently from what you expect.
+Each entry starts with the visible symptom, names the likely cause, and ends
+with a fix or a next diagnostic step. The entries describe current behavior;
+dates identify incidents that are useful for historical context.
 
 ## `tartci` looks missing over SSH after it was installed
 
@@ -15,13 +20,200 @@ LaunchAgent, rather than diagnosing from `command -v` alone. Fleet preflight
 reports `daemon-can-reach-*` and `tartci-installed` separately so this PATH
 difference cannot masquerade as missing TartCI.
 
-Hard-won, one bullet each. Grouped by lane. If a build/install behaves
-inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
+So that agents running `ssh host tartci ...` find it, every fleet host puts
+`~/.local/bin` on PATH in `~/.zshenv`, the only startup file a non-interactive
+zsh reads. `~/.zshrc` and `~/.zprofile` do not count: m3 had it in both and
+`ssh m3 'command -v tartci'` still returned nothing (2026-10-05). Use the same
+guarded line on every host:
+
+```sh
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac
+```
+
+Check it from another host with `ssh HOST 'command -v tartci'`, and run the
+same check against a host known to work as the control.
+
+## `fleet-macos install` reports "installed support member failed verification"
+
+**Symptom:** `tartci fleet-macos install PROFILE` run through the installed
+`~/.local/bin/tartci` fails with
+`support-manifest: installed support member failed verification: fleet/README.md`,
+while the running supervisors are healthy.
+
+**Cause:** with no `--support-source`, the installer used its own root as the
+source. Through the installed entrypoint that root is a sealed generation under
+`~/.local/share/tartci-generations/`: its files are mode 0444 and it is not a
+git checkout, so it can never be a support source. The mode mismatch was the
+first thing to trip. Nothing on the host is broken.
+
+**Fix:** the installer now refuses this case with a message that says so. To
+update a host, run `tartci fleet-macos self-update`. To install a specific
+tree, pass `--support-source` with a clean tartci checkout.
+
+## A support generation will not install on macOS 15 (2026-10-05)
+
+*Symptom:* `stage_install` (the self-update install step) fails with
+`PermissionError: [Errno 13]` renaming the staged generation into place.
+*Cause:* macOS 15 refuses to rename a directory whose own mode is 0555, even
+within the same parent; macOS 27 allows it. The installer used to seal the
+staged root to 0555 before the rename. Found on hosted macos-15 (15.7.9); every
+fleet host runs 27. *Guard:* the root is renamed while 0755, then chmodded 0555,
+fsynced and verified immutable under its final name; a generation that fails
+that check is removed rather than left where the next install would refuse it.
+`test_tartci_support_manifest` records the mode at the rename, so the order is
+checked on every host.
+
+## Timer jobs stop running while the lanes look healthy (m3, 2026-10-04)
+
+**Symptom:** a host falls many commits behind main and its self-update log has
+not changed in hours, yet `launchctl print` shows the agent with `last exit
+code = 0` and the watchdog prints a checkmark for it. The lane supervisors keep
+serving jobs.
+
+**Cause:** launchd's gui domain stopped starting StartInterval jobs on its own.
+`launchctl print gui/$UID/<label>` shows `pended nondemand spawn = interval`
+and a `runs` counter that does not move. A clean last exit says nothing about
+whether the job still runs. On m3 the last update attempt had been correctly
+refused (a peer was draining), and launchd never started the retry, so the fix
+for this stall could not install itself.
+
+**Fix:** `scripts/launchd_interval_guard.py` runs inside the lane supervisors
+and kicks any timer agent whose run count has not moved for twice its interval.
+A host on a generation from before that guard needs one manual
+`launchctl kickstart gui/$UID/com.danielraffel.tartci.self-update`; after that
+it heals on its own. To spot it, compare the age of the newest entry in
+`~/Library/Logs/tartci/tartci-self-update.log` with the 30-minute interval,
+not the exit code.
+
+The one agent the guard does not kick is self-update, for as long as the stall
+lasts (`PAUSE_DURING_STALL`): an update stops every supervisor, so no guard
+would run and any lane restart left to launchd would pend. Self-update then
+writes no log line and no attempt for days (m3 from 2026-10-05, 44 commits
+behind). `tartci fleet-macos self-update --status` and `tartci doctor fleet`
+say so (`self_update_paused`, with the stall's start) rather than reading like
+a failed update. The remedy is the stall's: reboot when the lanes are idle.
+Do not kickstart self-update during the stall.
+
+The entries are grouped by the kind of failure they describe. If a fresh host
+does not behave as expected, start with the matching symptom and run the
+diagnostic command shown in that entry.
+
+## A frozen guest holds its slot for two hours (durability audit, 2026-10-09)
+
+**Symptom:** a lane reads `job-running` for up to two hours while its VM is
+frozen; the watchdog's frozen-lane heal skips a host with a running VM, so
+nothing frees the slot before `TARTCI_JOB_TIMEOUT_SECS` (7200).
+
+**Cause:** the host waits on the ssh session that runs the guest's listener. A
+guest that hangs can keep that TCP session open, so the host sees neither
+output nor an exit.
+
+**Fix:** the guest launcher writes `TARTCI_GUEST_HEARTBEAT <epoch>` every
+`TARTCI_GUEST_HEARTBEAT_SECS` (30) into that session. Once the first one
+arrives, the host tears the VM down when the listener log has been silent for
+`TARTCI_GUEST_HEARTBEAT_STALE_SECS`: it records `guest_heartbeat_stale`,
+cancels an assigned job's run, and frees the slot. Every lane in the shipped
+profiles sets it with `guest_heartbeat_stale_seconds = 600`. Before the first
+heartbeat (runner still starting, or a guest launcher from an older
+generation) silence proves nothing and the idle and job timeouts apply.
+Heartbeat lines are dropped from the runner log the host echoes.
+
+## A gate lane sits in `booting` for over an hour with a stale heartbeat (m1, 2026-10-09)
+
+**Symptom:** `tartci doctor fleet` reports `fleet_not_ready` with
+`heartbeat_stale`, while the host still serves jobs on its other lanes. The
+stale lane's state file shows `phase: booting`, its VM has an IP
+(`boot_ip` in the lane's `events.jsonl`), there is no actions-runner log for
+the VM, and `ps` shows the supervisor running one `ssh admin@<vm-ip> true`
+after another, each lasting about a minute.
+
+**Cause:** the boot helper waited for the guest's sshd with 90 attempts and a
+2 s sleep, meant as 180 s. `ConnectTimeout=10` bounds only the TCP connect,
+so a guest that accepts the connection but never finishes the handshake holds
+each attempt for about 60 s. The 90 attempts then take about 93 minutes, and
+nothing writes a heartbeat meanwhile. On m1, `pulp-gate.slot2` sat there for
+71+ minutes.
+
+**Fix:** the wait is bounded by wall-clock time. Each attempt is killed at
+`TARTCI_BOOT_SSH_ATTEMPT_SECS` (default 15) and the whole wait ends at
+`TARTCI_BOOT_SSH_DEADLINE_SECS` (default 180), after which the VM is discarded
+with `boot_failed no_ssh` and `waited_s`/`attempts` fields. Each failed
+attempt refreshes the boot phase's heartbeat, which is honest because the wait
+has a hard end. The doctor's `fleet_not_ready` line now names each problem's
+lane and heartbeat age, for example
+`heartbeat_stale (m1.pulp-gate.slot2, heartbeat 71m old)`.
+A host on a generation from before this fix discards such a VM only after the
+attempts run out; it heals once it self-updates.
+
+## A `while read` loop ends early after a peer read over ssh (2026-10-04)
+
+*Symptom:* the supervisor observed only the first class with young demand;
+every later class in `while read ... done <<< "$classes"` went unobserved, with
+no error. *Cause:* an ssh client forwards its stdin to the remote command, so
+an ssh anywhere under the loop body drains the rest of the loop's input. In
+#371 the ssh was inside a Python helper (`gate_supply.py decide`), which
+inherits stdin. shellcheck's SC2095 (run by `scripts/lint.sh`) catches only an
+ssh written directly in the loop; it cannot see through a function or a
+subprocess. *Guard:* `scripts/ssh_stdin_check.py`, run by
+`scripts/test_ssh_stdin.py` in CI, requires every ssh invocation in the repo
+to state its stdin, wherever it is:
+
+- shell: `ssh -n`, an input redirect on the same command (`</dev/null`,
+  `<<EOF`, `< file`), or ssh as the right side of a pipe (`ssh -G` is exempt);
+- Python: an argv list or tuple whose first element is the ssh client must
+  contain `"-n"`. That is the string `"ssh"` or a path ending in `/ssh`; a
+  name or attribute named like the client (`ssh`, `args.ssh`, `self.ssh_bin`,
+  `ssh_path`, `remote_ssh`); or a name, parameter or argparse option whose
+  value or default is such a string. The rule first matched only `"ssh"` and
+  a bare name `ssh`, so `[args.ssh, "-o", ...]` in `job_claim.gather_peers`
+  passed it without `-n`.
+
+A wrapper whose callers pipe a script into it is the one legitimate exception;
+mark it `# ssh-stdin: <why>` on its line or the line above.
+
+## A test passes in CI and fails on the hosts' Python (2026-10-05)
+
+*Symptom:* a change is green in CI, then its tests fail under
+`/usr/bin/python3` with `No module named 'tomllib'` (#379, #390, #383, #391 on
+one day). *Cause:* `/usr/bin/python3` is 3.9.6 on all four hosts and has no
+tomllib. It runs the tartci shim's support-manifest check, the pinned launch
+interpreter, every explicit `/usr/bin/python3` call site, and each
+`tartci_toml_exec_or_python3` fallback on a host without a tomllib Python;
+interactive ssh shells on m1 also resolve `python3` to it. (Under launchd's
+PATH a bare `python3` is a Homebrew 3.11+ on all four hosts.) CI ran the tests
+only on ubuntu's 3.12+ (`python-floor` only compiles, under 3.11); on
+2026-10-05 main itself failed 203 of 2283 tests under 3.9. *Guard:* the
+`python-39-tests` CI job runs every test module under Python 3.9 (the newest
+3.9 setup-python offers; 3.9.6 itself is not built for current ubuntu
+images), asserted to be 3.9 with no tomllib and first on PATH. A test that genuinely needs tomllib
+says so through `scripts/testing_support.py` and is skipped there, and every
+module that degrades without tomllib has a running test of that branch
+(`scripts/test_no_tomllib_fallbacks.py`):
+
+```python
+import testing_support
+testing_support.skip_module_without_tomllib()   # whole module, before its imports
+
+@testing_support.requires_tomllib                # one test or class
+def test_reads_the_profile(self): ...
+```
+
+Import a tomllib-only module (`macos_fleet_lanes`, `fleet_self_update`, ...)
+inside the test that needs it, not at module level, so the module's other
+tests still run on the hosts' Python.
+
+That skip is not available everywhere. For a module a 3.9 interpreter runs
+(reachable by import from an explicit `/usr/bin/python3` site, or declaring
+itself "3.9-safe"), a skip on 3.9 removes exactly the coverage the job exists
+for, so `scripts/test_system_python_tests_run.py` fails on any
+tomllib-conditional skip in that module's tests unless it is listed in
+`ALLOWED` with the 3.11-only behaviour it guards. Make the test run on 3.9
+first; list it only when what it asserts really needs tomllib.
 
 ## M3 external-volume privacy attribution (2026-09-01)
 
 - **System Settings repeatedly asks about Bash, Node, Python, or `env`, while
-  M3 runner LaunchAgents fail or leave `/Volumes/Workshop/VMs` idle.**
+  M3 runner LaunchAgents fail or leave `/Volumes/<data-volume>/VMs` idle.**
   → *Cause:* launchd started `/bin/bash` directly. macOS attributed external-
   volume access to mutable/shared interpreter identities rather than to TartCI;
   static runner labels and free VM slots could then look healthy while the
@@ -43,6 +235,61 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   canary without another interpreter prompt. Confidence is HIGH for the
   diagnosis and pre-admission detector (live attribution plus focused tests),
   MEDIUM for final TCC durability until that replacement-build canary runs.
+
+## A Tart store that hangs from launchd but answers a shell is tccd (2026-11-11)
+
+- **Every lane on M3 logged "Tart store health is unknown — deferring new VM
+  admission" for four hours; the watchdog's `store-health.json` showed 38
+  consecutive `timeout after 10s`; yet `open()`+`fstat` of `/Volumes/<data-volume>/VMs`
+  from an interactive shell took 0.05 ms.** → *Cause:* a launchd job's open of
+  an external volume waits for a Removable Volumes authorization from sandboxd,
+  which asks the system tccd; tccd had stopped answering, so the opens blocked
+  in the kernel. sandboxd logged `tcc_server_message_request_authorization(kTCCServiceSystemPolicyRemovableVolumes)
+  failed: ... "Failed to create Attribution Chain from message."` (626 lines) at
+  the onset and 47,852 lines in the two minutes of release, and nothing in the
+  3.5 h between: a hanging request logs nothing. The same hang quarantined the
+  lanes on 2026-10-25, where it was misread as Spotlight or Time Machine holding
+  the directory. → *Fix:* `scripts/tcc_wedge.py` names the cause past the
+  failure threshold (internal control path answers + signature in the bounded
+  log window + optional TCC-context probe) and the watchdog runs the one scoped
+  root action, `sudo -n /usr/local/sbin/tartci-heal-tcc` (`killall tccd
+  sandboxd`, once per 30 min), then reprobes. The lanes, the doctor
+  (`tcc_wedge_*`) and the fleet check name the cause and the heal outcome.
+  → *Read:* `tartci doctor fleet`, `python3 scripts/tcc_wedge.py --state`.
+  → *Do not:* widen the grant, kill tccd in a loop, or reboot before reading
+  the heal outcome; a healed store is not a fixed trigger.
+
+## A webhook 403 has three causes and only one is a credential (2026-09-21)
+
+- **`shipyard-daemon-health` clears the token cache and refreshes every five
+  minutes until it hits its escalation limit, and the daemon still cannot
+  register its webhook.** → *Cause:* the GitHub App installation is missing
+  `repository_hooks`. GitHub reports that as HTTP 403 "Resource not accessible
+  by integration", which is byte-for-byte as much a 403 as a dead credential —
+  so the watchdog applied the credential remedy to a credential that was
+  working perfectly, failed identically every cycle, and reported nothing an
+  operator could act on. Three different faults arrive as 403: a missing App
+  permission (a human must grant it), a classic token missing
+  `admin:repo_hook` (a one-time `gh auth refresh`), and a genuinely dead or
+  anonymous credential (the only one worth clearing anything for). → *Fix:* the
+  watchdog now classifies before it heals, and answers a permission fault by
+  escalating and touching nothing. Never read "403" alone as "rotate the
+  credential".
+
+- **Every webhook delivery fails to connect and no alarm fires anywhere.** →
+  *Cause:* this host's tailnet name changed — Tailscale re-registers a
+  duplicate node under a `-N` suffix and the old name stops resolving — while
+  the registered hook kept the old name. The daemon printed a correct tunnel
+  URL and GitHub served a correct hook record; each side was individually
+  truthful and nobody compared them. Nothing consumed the feed either, so its
+  failure had no symptom. → *Fix:* `shipyard daemon reconcile` performs the
+  comparison (exit 0 in sync, 1 warn, 2 alarm, 3 blocked on a human) and the
+  watchdog routes on it. When diagnosing by hand, read the host's own identity
+  from `tailscale status --json` → `.Self.DNSName` (strip the trailing dot).
+  The CLI is **not** on a non-interactive PATH, so `command -v tailscale`
+  returns empty on a perfectly healthy host — resolve
+  `/Applications/Tailscale.app/Contents/MacOS/Tailscale` explicitly and treat a
+  failure to read the identity as UNKNOWN, never as "no drift".
 
 ## Cross-cutting (AVF / QEMU media)
 
@@ -83,6 +330,22 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   Python 3.11+ path in the host's launchd environment when the default
   Homebrew locations do not apply. Verify by *parsing the config*, not by
   checking the file exists.
+
+- **`ssh <host> 'tart list'` shows no gate VMs while the lanes are running
+  them.** → *Cause:* the lanes' LaunchAgents set `TART_HOME` to the host's
+  store (on m1 and m5 `/Users/<you>/VMs`, on m3 `/Volumes/<data-volume>/VMs`); a
+  shell over ssh has none, so `tart` reads its default `~/.tart`. Before
+  2026-10-09 tartci's own commands did the same: over ssh to m1, `tartci
+  doctor --reap --json`, which Shipyard's fleet health probe runs, reported 0
+  running VMs and 2 free slots while two gate VMs ran. → *Fix:* `tartci
+  doctor` and `tartci observe` now export the fleet profile's
+  `[host].tart_home` when the shell has no `TART_HOME`, and print the store
+  they read and where it came from (`tart store: /Users/<you>/VMs
+  ([host].tart_home from ...)`); the reap digest carries it as
+  `config.tart_home`. A shell `TART_HOME` that differs from the profile's is
+  kept but flagged. For raw Tart over ssh, pass the store yourself:
+  `ssh <host> 'TART_HOME=/Users/<you>/VMs /opt/homebrew/bin/tart list'`.
+  `python3 scripts/tart_home.py` prints what a command on that host resolves.
 
 - **`ssh <host> 'tart list'` says `command not found`, but Tart is installed.**
   → *Cause:* non-interactive SSH sessions often do not load Homebrew's PATH.
@@ -132,6 +395,42 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   match. → *Fix:* set the hashing config **identically** in both. Matched config
   yields ~99.93%.
 
+- **Undefined symbol at link, on ONE host only, for a function whose definition
+  is plainly compiled into a linked archive.** (m3, 2026-09-26: every Pulp
+  `macos` gate on a `studio-*` runner failed linking `pulp-osc-render-wav`;
+  m1/m5 built the same commit green.)
+  → *Cause:* the shared host ccache held direct-mode manifests that list ZERO
+  include files but name another source's result (the object for
+  `audio_doctor.cpp` served for `wav_bridge.cpp`). With no includes to
+  re-check, such a manifest matches every lookup, so the archive silently
+  contains the wrong object. How they were written is unproven (concurrent
+  writers or a VM torn down mid-write over virtio-fs are the suspects).
+  → *Detect:* `tartci ccache scan --host-cache` (read-only). By hand:
+  `ccache --inspect <entry>` shows `Entry type: 1 (manifest)` and
+  `File paths (0)`; the raw magic bytes are `cc ac`, not ASCII "ccac". A
+  zero-include manifest is NOT proof of poison: Pulp compiles ~94 include-less
+  TUs (generated `*_control_shipping_marker.cpp`, `placeholder.cpp`), and m1/m5
+  each hold ~5,000 legitimate ones. The discriminator is the result it names:
+  `ccache --extract-result` it and read the `.d`; a list of headers (or a
+  missing result) means the manifest cannot describe that object. The scan
+  reports these as `zero_include_suspect` and the rest as
+  `zero_include_consistent`. Blind spot: a poisoned manifest that names
+  ANOTHER include-less TU's object looks consistent; `--all-zero-include`
+  (and `reset`) quarantine those too, at one preprocessor-mode lookup per
+  include-less TU on the next build.
+  → *Clean:* `tartci ccache quarantine --host-cache` renames suspects into
+  `<cache>-quarantine/<stamp>/` (never deletes; `guard.log` keeps both counts;
+  consistent verdicts are remembered in `verdicts.json`). It scans the legacy
+  root and `tartci-layers-v1/shared`, never the per-job `jobs/`, `green/` or
+  `discard/` layers.
+  `tartci ccache reset --reset` moves the whole cache aside; it refuses while
+  a VM runs or holds a lease unless `--force`. The macOS runner runs the
+  quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;
+  events `ccache_guard` in the lane's event log). A budget-exhausted run
+  records where it stopped in `cursor.json` and the next run resumes there;
+  without that, a cache too large for the budget had its late fan-outs
+  checked only by the runs that happened to finish.
+
 - **Link error: undefined `icu_74::Locale::...` on Ubuntu.**
   → *Cause:* Pulp opts into direct `icu::Locale`/BreakIterator calls when
   `PULP_HAS_SKIA` + ICU public headers are present (true with `libicu-dev`), but
@@ -179,6 +478,43 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   on the Mac and boot with `tart run --rosetta=rosetta <vm>`.
 
 ## Queue and pool control
+
+- **A `launchctl bootstrap` of a present, untouched runner plist fails with
+  `Bootstrap failed: 5: Input/output error`.**
+  → *Cause:* the service is `disable`d in the launchd user domain, and
+  `bootstrap` will not load a disabled service. The error names neither the
+  service nor the cause, survives a settle and a retry, and therefore reads as a
+  transient I/O fault. Confirm with `launchctl print-disabled "gui/$(id -u)" |
+  grep <label>`, which is the only surface that says so.
+  → *Fix:* enable first, then bootstrap — a bare bootstrap cannot work:
+
+  ```sh
+  launchctl enable    "gui/$(id -u)/actions.runner.OWNER-REPO.RUNNER-NAME"
+  launchctl bootstrap "gui/$(id -u)" \
+    "$HOME/Library/LaunchAgents/actions.runner.OWNER-REPO.RUNNER-NAME.plist"
+  ```
+
+  → *How a service got disabled without anyone disabling it:* `tartci pool off`
+  and `tartci pool drain` used to `launchctl disable` every runner agent on
+  disk, while `pool on` re-enables only the services the fleet receipt names.
+  Scoped since; see "a pool transition stops only what it can start" below.
+
+- **A pool transition stops only what it can start.**
+  `pool on` activates exactly the services the installed fleet receipt names and
+  refuses to start unreceipted persistent or legacy runner services, which carry
+  their own install authority. `pool off` and `pool drain` are scoped to that
+  same set, and name on stdout every runner agent they deliberately left alone.
+  → *Why:* the unscoped version took down a foreign repository's persistent
+  Actions runner twice (2026-09-05, 2026-09-21). Both times it was the sole
+  server of a required check, both times the loss was invisible — the plist
+  stayed on disk, so every file-existence check passed — and the second time it
+  blocked PRs for ~18 hours. An operation that stops more than its inverse
+  starts is not a pause, it is a deletion.
+  → *Consequence:* on a receipted host, stopping an unreceipted runner is now a
+  deliberate act with its own authority (`launchctl bootout` it directly, or
+  uninstall it through whatever installed it). `tartci pool status` marks which
+  runner agents are outside the receipt, in text and under `pool_owned` in
+  `--json`.
 
 - **Nothing merges for hours; adding runners does not help.**
   → *Cause:* the merge queue is building more entries in parallel than the runner
@@ -279,6 +615,11 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   scope that went unread is not a scope that was empty.
   → *Fix:* decide capacity from both scopes. A zero from one endpoint is the
   dangerous reading: it looks like there is nothing to protect.
+  → *User-owned repositories* have no organization scope: `orgs/<user>/...`
+  is a 404 by construction. The census confirms the owner is a user account
+  (`users/<owner>` type `User`) and reports that scope `n/a`, so the census
+  stays complete. A 404 for an organization, or an owner type that cannot be
+  read, still leaves the scope UNREACHABLE.
 
 - **A host's role says `dedicated-builder` but it serves no gate work.**
   Same incident: the 28-core Mac Studio (`TARTCI_AGENT_BUILD_CAP_CORES=12`,
@@ -411,7 +752,9 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   visibility and the complete selected-repository list. Unknown/inaccessible
   policy records a contract-keyed denial and boots no further VM for that class.
   The final order is required Shipyard admission-clean → repository-access proof
-  → pool lock and assignment/admission rechecks → JIT mint. Do not use an online org row or
+  → pool lock and assignment/admission rechecks → JIT mint. On macOS the first
+  two are *started* beside the clone and boot and *consumed* in that order at
+  the boundary; a stale or missing parallel result is re-asked synchronously. Do not use an online org row or
   `busy=false` as repository capacity evidence.
 
 - **Each queue query works alone, but several healthy lanes become scan-blind together.**
@@ -429,10 +772,39 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   that a job is terminal.
   Namespace locks still coalesce identical scans; the host lock serializes only
   cache-miss GitHub observation bursts across different namespaces.
+  The host lock remains deliberately global: it is #161's burst guard and
+  licenses `assignment_scan_max_workers` to fan out only after one observer has
+  authority. Acquisition is FIFO across repository namespaces. When a scan
+  times out, that repository records a bounded backoff in the shared state and
+  skips its next attempts, yielding the host slot to other repositories. The
+  backoff is a fairness guard, not a second lock or a per-repository authority;
+  all three scanners (`assignment_scan.py`, `queue_scan.py`, and
+  `current_job_scan.py`) use the same host lock, FIFO queue, and backoff file.
+  The lock's `<path>.owner.json` records the active holder PID, process start,
+  lane, generation, and start time. A contender that observes a holder past
+  `TARTCI_QUEUE_OBSERVATION_LOCK_MAX_AGE_SECS` (default 300 seconds) writes
+  `<path>.escalation.json` with the same evidence. The owner record is removed
+  when the flock is released. At timeout diagnostics enumerate live processes
+  that still have the lock file open, so an exec'd child that inherited the
+  descriptor can be identified when the holder probe reports it; lane and
+  generation metadata come from the owner record. Missing or stale records, or
+  an unavailable holder probe, remain fail-closed and are reported as unknown.
   → *Failure behavior:* lock acquisition is bounded by
-  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default). The
-  exhaustive assignment scanner's total deadline is 180 seconds by default,
-  leaving a serialized waiter time to perform its own scan after the lock opens.
+  `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` (120 seconds by default), and
+  the exhaustive assignment scanner's `TARTCI_ASSIGNMENT_SCAN_TIMEOUT_SECS`
+  (180 seconds by default) budgets the scan that follows it. The two are
+  sequential, not nested: the scan deadline starts when the lock is acquired,
+  so a lane that queued behind four other supervisors still scans with a full
+  budget, and a scan can take at most lock timeout plus scan timeout overall.
+  They were nested until 2026-09-21, which made the budget
+  `180 - however long this host's queue happened to be`. A waiter then ran its
+  exhaustive pass on the remainder and passed that remainder to `gh` as a
+  shortened per-call timeout, so the call was killed mid-pass and the lane
+  reported the queue unobservable. Measured on M1 over 24 hours, 96 scans died
+  on a GitHub call clamped below the lane's configured 30-second limit, with a
+  median of 14.6 seconds left; the failure is invisible in the logs because it
+  arrives as `GitHub API failed ... timed out`, indistinguishable at a glance
+  from a slow API.
   Timeout
   is scan-blind/fail-closed: do not report zero demand, publish partial cache
   state, or start a lower-priority VM. The supervisor retries normally.
@@ -455,8 +827,104 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   exhaustive receipt across VM boot. Cancellation can then cost one bounded
   idle JIT runner, but lower tiers still require live exhaustive pre-mint proof
   and can never bypass newly arrived higher-priority work.
+  Shortening `TARTCI_QUEUE_OBSERVATION_LOCK_TIMEOUT_SECS` is not a throughput
+  lever. Five contending lanes were measured at 120, 60, 30 and 10 seconds and
+  completed the same 12-13 scans each time, because the lock -- not the wait --
+  is what rations observation; only the wasted attempts grew, from 48 to 203.
+  A shorter wait does buy slightly fairer sharing, and caps how long a
+  supervisor's poll can block (that ceiling is the lock timeout plus the scan
+  timeout, so the 120-second default admits a 300-second poll). Choose it for
+  those two properties, never expecting more scans.
   Override `TARTCI_QUEUE_OBSERVATION_LOCK_FILE` only when every provider on the
-  host is explicitly pointed at the same replacement path.
+  host is explicitly pointed at the same replacement path. Tests must always
+  override it: the suite runs on hosts whose lanes are scanning through the
+  default path, so a test that inherits it both fails on production contention
+  and adds to it.
+  What the scan costs depends on the answer, not on the queue. A run listing is
+  walked page by page and each page is handed straight to the job scan, so a
+  matching queued job on the first page ends the scan there: the later pages,
+  the `in_progress` listing, and the snapshot reconciliation that makes an
+  empty listing trustworthy are never bought. Measured against the same
+  fixture, presence costs 3 calls where absence costs 21. Absence is unchanged
+  and still exhaustive, because only looking everywhere can establish it, so an
+  idle lane still pays the full enumeration every poll. A torn listing is
+  therefore fatal only when nothing matched: a scan holding a witness reports
+  it rather than going blind, which on M3 is the `pagination ended before
+  total_count` family, 235 of 956 blind polls.
+  Workflow name to id is the one input that does not change between polls, so
+  it is cached in `~/.tartci/state/assignment-workflow-ids.json` for 3600
+  seconds and shared by every lane on the host. That call alone was 240 of
+  those 956 blind polls, and with the old 300 second lifetime it was still the
+  most common first failed call of a rate-limited scan on every host on
+  2026-11-08. A cached id is only ever spent on its own workflow's listing
+  call. When that listing answers 404 (the workflow was replaced) the scan
+  drops the entry, resolves the ids live once and walks again; a second failure
+  fails closed, so the cache cannot turn a broken lookup into an empty queue.
+  The lifetime bounds the narrower case of a second workflow appearing under an
+  already-cached display name. Set
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_TTL_SECS=0` to disable it and resolve
+  the ids on every poll. The cache is published under its own file lock
+  (`assignment-workflow-ids.json.lock`), never the host observation lock:
+  that lock carries the repository's timeout backoff, and publishing under it
+  failed scans whose reads had all succeeded and left the cache expired, so
+  on 2026-10-25 most SCAN BLIND polls on m3 read `lock_contention: host queue
+  observation lock backoff active` straight after a successful workflow
+  listing. Tests must override
+  `TARTCI_ASSIGNMENT_WORKFLOW_ID_CACHE_FILE` for the same reason they override
+  the lock path, and additionally because a cache shared between tests is a
+  channel between them: one test's resolved id satisfies the next test's
+  lookup, so the listing call that test exists to exercise is never made.
+  A run's job listing is the call an assignment scan makes most: one per
+  queued or in-progress run, for every class, on every lane. The merge-group
+  and PR-head classes of one lane read the same `Build and Test` runs a few
+  seconds apart, and the two gate lanes on a host read them again. A listing
+  that showed NO queued job is therefore kept for 30 seconds in
+  `assignment-job-cache.json` beside the observation lock, keyed by run id plus
+  the run's `updated_at` and `status`, and reused by every class and lane on
+  the host. Only absence is cached: a run that carries a queued job, changed,
+  or has no `updated_at` is always read live, so the cache can never create
+  demand. Its one cost is that a job GitHub queues without touching its run is
+  seen up to 30 seconds plus one scan's duration late, inside the 120 second selection cache the
+  supervisor already replays. `TARTCI_ASSIGNMENT_JOB_CACHE_TTL_SECS` (0-60,
+  0 = off) sets it. A `rate_limited` answer is no longer retried inside the
+  scan: an allowance does not refill in a sub-second backoff, and three
+  refused requests per poll per lane only pressed on the same limit.
+
+- **The Shipyard push feed can rescue a blind scan; it can never report an
+  empty queue.** When `assignment_feed_rescue` is set on an event-class lane,
+  a tier scan that failed closed asks the local Shipyard daemon's
+  `workflow_job` webhook feed whether demand exists before the supervisor
+  idles blind. The feed is a second opinion from outside the GitHub REST API,
+  so it survives exactly the per-call timeouts that make the scan fail.
+  → *The asymmetry is the whole design.* A witness on the feed proves presence
+  and nothing can retract it. Silence proves nothing at all: a severed feed, an
+  unregistered webhook and a genuinely empty queue are the same bytes. So the
+  rescue only ever converts `ERR` into "there is demand"; every refusal leaves
+  the blind verdict exactly as the scanner left it, and `scan_blind` handling —
+  including the ~180s self-restart — runs unchanged.
+  → *It runs only after the scan already failed*, so a healthy lane never
+  consults it and no feed defect can regress one. The exhaustive caller is
+  excluded: a 100-entry replay ring is not a queue census, and that caller
+  wants a magnitude.
+  → *Age comes from the subscriber's own first sighting, not the job.*
+  Shipyard's normalized `workflow_job` payload carries no timestamp
+  (`action`, `run_id`, `job_id`, `repo`, `name`, `status`, `conclusion`,
+  `runner_name`, `labels`) and the daemon replays its ring unstamped, so a
+  frame is undatable. The ledger at
+  `$STATE_DIR/<runner>.feed-ledger.json` records when this subscriber first saw
+  each job id. A webhook cannot arrive before the job was queued, so that
+  measures *less* than the true wait and can only withhold a job that is in
+  fact old enough — never release one that is too young. A lost ledger costs a
+  delay, never a premature boot.
+  → *Every outcome is announced*: `assignment_feed_rescue` on a rescue,
+  `assignment_feed_degraded` with the daemon's own reason on any refusal. A
+  failing feed must never look like a quiet lane.
+  → *Diagnose by hand* with
+  `python3 scripts/shipyard_event_feed.py --repo … --require-label … --labels …
+  --min-observed-age-seconds … --ledger /tmp/probe.json`. Exit 0 means demand
+  was observed; exit 3 means the feed licensed no decision. Exit 3 is **not**
+  "the queue is empty", and the CLI deliberately prints no count at all rather
+  than a `0` a caller could misread.
 
 - **`migrate_macos_gate_agent.sh` can leave a host with NO gate agent at all.**
   A run that ends `legacy label remains loaded; refusing replacement startup` →
@@ -487,13 +955,13 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   `pulp-build-vm-release*`, which are *different label strings* from
   `pulp-build-vm`: an idle release VM cannot absorb gate work.
 
-- **The queue tick is running every five minutes but arms or merges nothing.**
-  → *Cause:* full-live Shipyard execution was launched without
-  `SHIPYARD_QUEUE_REPO_ROOT` or `SHIPYARD_QUEUE_AUTHORITY=1`, so the control
-  plane exits unhealthy and takes no GitHub action.
-  → *Fix:* repair the single authority's environment and alert on that
-  configuration error. Do not treat repeated `merged=0` as proof the queue is
-  healthy, and do not add Orchard as a fallback scheduler.
+- **The queue tick runs every five minutes and never merges anything.**
+  → *Cause:* by design. The tick is a ship-state reaper; the GitHub merge queue
+  lands pull requests. Its health reason counts what it did
+  (`reaped`, `open`, `stalled`, `errs`), not merges.
+  → *Fix:* none needed. If the log or health names
+  `legacy_full_live_ignored`, the host still carries retired full-live
+  settings; re-run the installer in reap mode to drop them.
 
 - **A newly booted VM runs an optional job instead of the required gate.**
   → *Cause:* GitHub chooses among all queued jobs matching the runner's labels;
@@ -521,6 +989,24 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   → *Fix:* do not clean it. Suppressing this false positive is a rollout
   follow-up: the final classification must clear the warning only when the
   same runner identity is busy and its current lease/PID ownership is fresh.
+
+- **A `merge_group` run sits `queued` forever and every scan pass fetches its
+  jobs.**
+  → *Cause:* a dequeued merge queue entry can leave its workflow run reporting
+  `queued` permanently — queue branch deleted, `jobs: []`, cancel saying
+  "already completed", force-cancel saying "not queued", and delete returning
+  403 to both the App and a maintainer. Nothing in the run's status
+  distinguishes it from a live entry and no operation removes it.
+  → *Effect, precisely:* it does **not** inflate a merge-group demand count —
+  its zero jobs match no class label. It costs one extra `runs/<id>/jobs` call
+  on every scan pass of every lane, permanently, and a scan fails closed when
+  any single request exceeds `TARTCI_GH_TIMEOUT_SECS`, so the added call makes
+  a blind scan more likely.
+  → *Fix:* `StaleDemandClassifier` quarantines a `merge_group` run whose queue
+  branch is confirmed absent AND which carries no queued job, on POSITIVE
+  determination only — a timeout still counts the run. Full account:
+  `docs/stale-merge-group-demand.md`.
+
 
 ## Windows (QEMU)
 
@@ -623,6 +1109,25 @@ inexplicably on a fresh Apple Silicon host, the answer is almost certainly here.
   resolved `pipelines*.actions.githubusercontent.com` endpoint and
   `broker.actions.githubusercontent.com` over HTTPS from the guest, record
   both in the proof, and keep hosted fallback enabled until they pass.
+## A disk-refused lease reclaims caches, not trees
+
+A VM lease refused `disk_capacity_exceeded` (only the disk axis) runs the
+lease-denial reclaim once (`scripts/denial_reclaim.py`) and retries admission
+exactly once. It frees only what is regenerable: gate ccache entries unused
+for `denial_reclaim_ccache_max_age_days` (default 14) and OCI cache images no
+profile, lane plist, tartci config or state file references. It never deletes
+a local VM, a worktree or a checkout; the hourly `tartci reclaim` pass owns
+build trees. It runs at most once per `denial_reclaim_interval_minutes`
+(default 30) per host; a cooldown, a held lock or any error leaves the denial
+exactly as it was. Before it existed, m1 refused every lease for hours on
+2026-11-08 while 9 GB of two-week-old ccache and unreferenced OCI images sat
+on the store, and `tartci reclaim --fix` freed nothing.
+
+A lane the DHCP breaker holds back while the verification probe is refused
+for disk logs `vm-lease-denied` and the refusal, not a DHCP outage, and the
+breaker reads `admission_blocked` (doctor `vm_dhcp_probe_blocked_by_admission`).
+Free the disk; do not kickstart bootpd.
+
 ## Worktree cleanup is not a generic low-disk hook
 
 The optional cleanup provider is M3/Pulp-only and accepts only a fresh,
@@ -630,3 +1135,5 @@ machine-readable disk-axis lease denial. Do not broaden it to old receipts,
 CPU/RAM failures, mount probes, timers, arbitrary repositories, or PR scans.
 Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
+
+- **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.

@@ -59,9 +59,9 @@ fi
   || { echo "tart-image-sync: --import requires --apply" >&2; exit 2; }
 
 pick_host() {
-  if ssh -o BatchMode=yes -o ConnectTimeout=3 "$destination" true >/dev/null 2>&1; then
+  if ssh -n -o BatchMode=yes -o ConnectTimeout=3 "$destination" true >/dev/null 2>&1; then
     printf '%s\n' "$destination"
-  elif [ -n "$fallback" ] && ssh -o BatchMode=yes -o ConnectTimeout=5 "$fallback" true >/dev/null 2>&1; then
+  elif [ -n "$fallback" ] && ssh -n -o BatchMode=yes -o ConnectTimeout=5 "$fallback" true >/dev/null 2>&1; then
     printf '%s\n' "$fallback"
   else
     return 1
@@ -92,13 +92,13 @@ PY
 }
 
 read_remote_inventory() {
-  ssh "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart list --format json"
+  ssh -n "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart list --format json"
 }
 
 check_pools_off() {
   local local_pool remote_pool
   local_pool="$(TART_HOME="$source_home" tartci pool status --json 2>/dev/null || true)"
-  remote_pool="$(ssh "$remote" "PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:/usr/bin:/bin /bin/bash -lc 'TART_HOME=\"$destination_home\" tartci pool status --json'" 2>/dev/null || true)"
+  remote_pool="$(ssh -n "$remote" "PATH=/opt/homebrew/bin:/usr/local/bin:\$HOME/.local/bin:/usr/bin:/bin /bin/bash -lc 'TART_HOME=\"$destination_home\" tartci pool status --json'" 2>/dev/null || true)"
   python3 - "$local_pool" "$remote_pool" <<'PY'
 import json, sys
 for side, raw in (("source", sys.argv[1]), ("destination", sys.argv[2])):
@@ -184,9 +184,9 @@ PY
 check_pools_off
 assert_all_stopped source "$(TART_HOME="$source_home" tart list --format json)"
 assert_all_stopped destination "$(read_remote_inventory)"
-ssh "$remote" "mkdir -p '$remote_stage'"
+ssh -n "$remote" "mkdir -p '$remote_stage'"
 rsync -a --partial --partial-dir=.rsync-partial --progress "$archive" "$remote:$remote_archive"
-remote_checksum="$(ssh "$remote" "shasum -a 256 '$remote_archive' | awk '{print \$1}'")"
+remote_checksum="$(ssh -n "$remote" "shasum -a 256 '$remote_archive' | awk '{print \$1}'")"
 [ "$checksum" = "$remote_checksum" ] || {
   echo "tart-image-sync: checksum mismatch; leaving resumable staging artifacts in place" >&2
   exit 5
@@ -205,8 +205,8 @@ fresh_fingerprint="$(python3 "$fingerprint_tool" --tart-home "$source_home" --na
   exit 5
 }
 incoming="${name}.incoming.$(date -u +%Y%m%dT%H%M%SZ)"
-ssh "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart import '$remote_archive' '$incoming'"
-ssh "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart get '$incoming' --format json"
+ssh -n "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart import '$remote_archive' '$incoming'"
+ssh -n "$remote" "PATH='$remote_path' TART_HOME='$destination_home' tart get '$incoming' --format json"
 echo "imported=$incoming"
 echo "activation_unchanged=true"
 echo "Next idle-boundary action is an explicit operator-reviewed rename/canary; this command never replaces $name."

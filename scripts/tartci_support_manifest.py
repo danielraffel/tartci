@@ -24,10 +24,13 @@ GITHUB_REPOSITORY = re.compile(
     r"([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?$"
 )
 ROOT_FILES = {"tartci"}
-ROOT_DIRS = {"launchd", "native", "profiles", "providers", "scripts"}
+ROOT_DIRS = {"fleet", "launchd", "native", "profiles", "providers", "scripts"}
 MANIFEST_NAME = ".tartci-support-manifest.json"
 LAUNCH_NAME = ".tartci-launch"
-TRUSTED_REPOSITORY = "https://github.com/danielraffel/tartci.git"
+TRUSTED_REPOSITORIES = frozenset({
+    "https://github.com/danielraffel/tartci.git",
+    "https://github.com/generous-corp/tartci.git",
+})
 
 
 def fail(message: str) -> None:
@@ -94,7 +97,7 @@ def repository_key(root: Path) -> str:
         fail("support source origin must identify one exact GitHub repository")
     owner, repository = match.groups()
     canonical = f"https://github.com/{owner.lower()}/{repository.lower()}.git"
-    if canonical != TRUSTED_REPOSITORY:
+    if canonical not in TRUSTED_REPOSITORIES:
         fail(f"support source repository is not trusted: {canonical}")
     return canonical
 
@@ -107,7 +110,7 @@ def build(root: Path) -> dict[str, object]:
     tree_modes: dict[str, int] = {}
     tree = _git(
         root, "ls-tree", "-r", "-z", "HEAD", "--",
-        "tartci", "launchd", "native", "profiles", "providers", "scripts",
+        *sorted(ROOT_FILES), *sorted(ROOT_DIRS),
     )
     for record in tree.split("\0"):
         if not record:
@@ -419,20 +422,33 @@ def stage_install(
                 os.fsync(descriptor)
             finally:
                 os.close(descriptor)
-        staged.chmod(0o555)
         descriptor = os.open(staged, os.O_RDONLY)
         try:
             os.fsync(descriptor)
         finally:
             os.close(descriptor)
-        verify(staged, installed_manifest, immutable=True)
         launch_record(launch, destination)
+        # The generation root is sealed only after it has its final name:
+        # macOS 15 refuses to rename a directory whose own mode is 0555
+        # (EACCES, even within one parent), while macOS 27 allows it.
         os.rename(staged, destination)
-        descriptor = os.open(generations_root, os.O_RDONLY)
         try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
+            destination.chmod(0o555)
+            for directory in (destination, generations_root):
+                descriptor = os.open(directory, os.O_RDONLY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+            verify(destination, destination / MANIFEST_NAME, immutable=True)
+        except BaseException:
+            # A generation that failed its seal must not stay under its final
+            # name, where the next install would find it and refuse.
+            for directory in [destination, *destination.rglob("*")]:
+                if directory.is_dir() and not directory.is_symlink():
+                    directory.chmod(0o755)
+            shutil.rmtree(destination)
+            raise
     finally:
         if staged.exists():
             for directory in [staged, *staged.rglob("*")]:

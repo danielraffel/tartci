@@ -44,8 +44,7 @@ packages = []    # [choco] for Windows. Only the table matching `os` is applied.
 
 [skia]
 # Prebuilt Skia pin (danielraffel/skia-builder). linux-x64/linux-arm64/mac-*/
-# ios-* exist; WINDOWS HAS NO PREBUILT — Windows builds GPU-off until a
-# windows-* Skia archive exists. Match the archive arch to `arch`.
+# ios-* and windows-* slices are available. Match the archive arch to `arch`.
 release = "chrome/m153"
 variant = "linux-arm64-gpu"
 

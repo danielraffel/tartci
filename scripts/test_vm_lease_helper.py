@@ -37,6 +37,68 @@ def _run_bash(script: str, *, env: dict[str, str] | None = None) -> subprocess.C
 
 
 class VmLeaseHelperTests(unittest.TestCase):
+    def test_windows_runner_exports_granted_parallelism_to_guest_job(self) -> None:
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "4"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL="4"\n'
+            'Write-Output ("TARTCI_DIAG cmake-build-parallel-level={0}" -f '
+            '$env:CMAKE_BUILD_PARALLEL_LEVEL)\n',
+        )
+
+        positive = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "8"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(positive.returncode, 0, positive.stderr)
+        self.assertIn('CMAKE_BUILD_PARALLEL_LEVEL="8"', positive.stdout)
+        # A zero grant is invalid and must not produce an unusable script.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-build-env-script", "0"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(invalid.returncode, 0)
+
+    def test_the_listener_script_the_job_runs_carries_the_granted_parallelism(self) -> None:
+        # The script the guest runs, not only the fragment printer: the splice
+        # must replace the placeholder, or PowerShell gets it as a command.
+        result = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "6"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('$env:CMAKE_BUILD_PARALLEL_LEVEL="6"\n', result.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", result.stdout)
+        # The parallelism is set before the listener starts the job.
+        self.assertLess(result.stdout.index("CMAKE_BUILD_PARALLEL_LEVEL"),
+                        result.stdout.index("Runner.Listener.exe"))
+        self.assertTrue(result.stdout.rstrip().endswith("exit $LASTEXITCODE"))
+        # An invalid grant sets no default and leaves no placeholder behind.
+        invalid = subprocess.run(
+            [str(WINDOWS_RUNNER), "--print-listener-script", "0"],
+            capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(invalid.returncode, 0, invalid.stderr)
+        self.assertNotIn("CMAKE_BUILD_PARALLEL_LEVEL", invalid.stdout)
+        self.assertNotIn("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__", invalid.stdout)
+        self.assertIn("Runner.Listener.exe", invalid.stdout)
+
+    def test_the_job_runs_the_listener_script_function(self) -> None:
+        # The job must use the function the print-exit tests, not a copy.
+        source = WINDOWS_RUNNER.read_text()
+        self.assertEqual(source.count("__TARTCI_WINDOWS_BUILD_PARALLEL_FRAGMENT__"), 2)
+        self.assertIn('ps_run="$(windows_listener_script "$effective_win_cpus")"', source)
+
     def test_apply_false_cannot_enter_cleanup_provider(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root=Path(td); (root/"scripts").mkdir(); marker=root/"called"
@@ -76,8 +138,8 @@ class VmLeaseHelperTests(unittest.TestCase):
               export TARTCI_DISK_DENIAL_RECEIPT_DIR={receipt_dir}
               export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1
               export TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
-              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp
-              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code
+              export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp
+              export TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code
               export TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
               export TARTCI_WORKTREE_CLEANUP_APPLY=1
               export TARTCI_RUNNER_REPO=Generous-Corp/pulp
@@ -122,7 +184,7 @@ print('{{"ok":true,"reason":"acquired"}}')
                   export TARTCI_ROOT={root} TARTCI_DISK_DENIAL_RECEIPT_DIR={root / "receipts"}
                   export TARTCI_WORKTREE_CLEANUP_PROVIDER=merged-main-v1 TARTCI_WORKTREE_CLEANUP_REPO=Generous-Corp/pulp
                   export TARTCI_WORKTREE_CLEANUP_APPLY=1
-                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Workshop/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Workshop/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
+                  export TARTCI_WORKTREE_CLEANUP_PRIMARY=/Volumes/Example/Code/pulp TARTCI_WORKTREE_CLEANUP_PREFIX=/Volumes/Example/Code TARTCI_WORKTREE_CLEANUP_MAIN_REF=origin/main
                   export TARTCI_RUNNER_REPO=Generous-Corp/pulp TARTCI_RECEIPT_HOST_ID=studio
                   export TARTCI_QUEUE_LANE_ID=studio-pulp-gate
                   mkdir -p "$TARTCI_DISK_DENIAL_RECEIPT_DIR"
@@ -143,8 +205,28 @@ print('{{"ok":true,"reason":"acquired"}}')
                     return {retry_rc}
                   }}
                   tartci_try_worktree_cleanup() {{ return {cleanup_rc}; }}
-                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Workshop/VMs lane runner
+                  export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs
+                  tartci_check_macos_disk_floor_with_cleanup_once /Volumes/Example/VMs lane runner
                   rc=$?; test "$calls" -eq {expected_calls}; test "$rc" -eq {expected_rc}
+                ''')
+                self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_macos_preflight_cleanup_runs_only_for_the_rendered_tart_store(self) -> None:
+        # Without the rendered store, or for any other path, a denial stays a
+        # denial and cleanup is never tried.
+        for exported, path in (("", "/Volumes/Example/VMs"),
+                               ("export TARTCI_WORKTREE_CLEANUP_TART_HOME=/Volumes/Example/VMs",
+                                "/Volumes/Example/Other")):
+            with self.subTest(exported=exported, path=path):
+                result = _run_bash(f'''
+                  source {HELPER}; calls=0; cleaned=0
+                  tartci_check_disk_floor_observed() {{
+                    calls=$((calls+1)); TARTCI_LAST_DISK_ADMISSION_ATTEMPT_JSON='{{"fresh":true}}'; return 75
+                  }}
+                  tartci_try_worktree_cleanup() {{ cleaned=1; return 0; }}
+                  {exported}
+                  tartci_check_macos_disk_floor_with_cleanup_once {path} lane runner
+                  rc=$?; test "$rc" -eq 75; test "$calls" -eq 1; test "$cleaned" -eq 0
                 ''')
                 self.assertEqual(result.returncode, 0, result.stderr)
 
@@ -293,6 +375,90 @@ PY
             proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["vm-tart-linux-vm-unit-vm 2 tart-linux-vm unit-vm self-hosted,Linux", "0"])
+
+    def _ranked_race(self, knob: str) -> tuple[subprocess.CompletedProcess[str], list[dict]]:
+        """slot 2 (120) registers as a waiter, then forge (gate, 100) acquires first."""
+        with tempfile.TemporaryDirectory() as td:
+            profile = Path(td) / "fleet.toml"
+            profile.write_text(f"schema = 1\n[leases]\nrank_vm_waiters = {knob}\n")
+            log = Path(td) / "events.jsonl"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_FLEET_PROFILE={profile}
+                export TARTCI_HOST_CORES=8 TARTCI_HOST_MEM_MB=65536 TARTCI_ROLE=light
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0 TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                unset TARTCI_RANK_VM_WAITERS TARTCI_VM_WAITER_FRESH_SECS
+                note() {{ :; }}
+                event() {{
+                  local kind="$1"; shift; shift
+                  python3 -c 'import json,sys; print(json.dumps({{"event":sys.argv[1],"fields":dict(a.split("=",1) for a in sys.argv[2:] if "=" in a)}}))' "$kind" "$@" >>{log}
+                }}
+                source {HELPER}
+                # The agent build holds the whole 3-core non-gate budget: one core is left.
+                python3 "$TARTCI_ROOT/scripts/leases.py" acquire --id agent --cores 3 \
+                  --mem-mb 1024 --priority 40 --kind pulp-governed-build --pid $$ --json >/dev/null
+                tartci_vm_lease_waiter_register m5-pulp-gate-slot2 1 tart-macos-vm 120 \
+                  self-hosted,pulp-release-tagged 2048
+                SLOT2_WAITER="$TARTCI_VM_WAITER_ID"
+                TARTCI_VM_WAITER_ID=""   # forge is another lane with no waiter of its own
+                rc=0
+                tartci_acquire_vm_lease forge-vm 1 tart-macos-vm gate forge-build 2048 {td} || rc=$?
+                echo "forge=$rc"
+                if [ "$rc" -eq 0 ]; then tartci_release_vm_lease; fi
+                TARTCI_VM_WAITER_ID="$SLOT2_WAITER"
+                rc=0
+                tartci_acquire_vm_lease slot2-vm 1 tart-macos-vm 120 pulp-release-tagged 2048 {td} || rc=$?
+                echo "slot2=$rc waiter_after=${{TARTCI_VM_WAITER_ID:-none}}"
+                [ "$rc" -ne 0 ] || tartci_release_vm_lease
+                """
+            )
+            proc = _run_bash(script)
+            rows = [__import__("json").loads(line) for line in log.read_text().splitlines()] \
+                if log.exists() else []
+        return proc, rows
+
+    def test_ranked_waiter_defers_a_lower_lane_and_names_the_waiter(self) -> None:
+        proc, rows = self._ranked_race("true")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["forge=75", "slot2=0", "waiter_after=none"])
+        deferred = [r for r in rows if r["event"] == "lease_deferred_to_waiter"]
+        self.assertEqual(len(deferred), 1)
+        self.assertEqual(deferred[0]["fields"]["waiter_lane"], "m5-pulp-gate-slot2")
+        self.assertEqual(deferred[0]["fields"]["waiter_priority"], "120")
+        self.assertNotIn("lease_denied", [r["event"] for r in rows])
+        self.assertEqual([r["fields"]["priority"] for r in rows if r["event"] == "lease_acquired"],
+                         ["120"])
+
+    def test_knob_off_the_first_acquire_still_wins(self) -> None:
+        proc, rows = self._ranked_race("false")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.split(), ["forge=0", "slot2=0", "waiter_after=none"])
+        self.assertNotIn("lease_deferred_to_waiter", [r["event"] for r in rows])
+
+    def test_macos_supervisor_waits_from_claim_to_grant(self) -> None:
+        text = MACOS_RUNNER.read_text(encoding="utf-8")
+        run_one = text[text.index("run_one(){"):]
+        claim = run_one.index("tartci_job_claim_acquire")
+        register = run_one.index("tartci_vm_lease_waiter_register")
+        precheck = run_one.index("tartci_admission_clean_enabled")
+        boot = run_one.index('boot_vm_to_ssh "$i"')
+        # Registered after the job is claimed and BEFORE the ~40 s precheck:
+        # that precheck is the window a lower lane's acquire lands in.
+        self.assertLess(claim, register)
+        self.assertLess(register, precheck)
+        self.assertLess(precheck, boot)
+        self.assertEqual(run_one.count("LAST_RUN_LEASE_DENIED=1"), 2)
+        self.assertIn('[ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw',
+                      text)
+        fit = text[text.index("if ! tartci_lease_fit_gate; then"):]
+        self.assertIn("tartci_vm_lease_waiter_hold", fit[:fit.index("continue")])
+        cleanup = text[text.index("cleanup(){"):]
+        self.assertIn("tartci_vm_lease_waiter_withdraw", cleanup[:cleanup.index("}")])
 
     def test_disabled_leases_do_not_touch_store(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -679,12 +845,12 @@ PY
             f"""
             set -euo pipefail
             source {HELPER}
-            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Workshop/Code/tart
+            tartci_vm_lease_disk_expected_mount_path tart-macos /Volumes/Example/Code/tart
             """
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout, "/Volumes/Workshop")
+        self.assertEqual(proc.stdout, "/Volumes/Example")
 
     def test_all_vm_providers_launch_the_writer_through_the_guardian(self) -> None:
         expected = {
@@ -779,6 +945,80 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip().splitlines(), ["12", "5", "6"])
 
+    def test_macos_cores_from_the_gate_reserve_share(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            tartci_profile_value(){{ printf 6; }}
+            tartci_gate_reserve_share_cores(){{ printf '%s' "$(( 8 / $1 ))"; }}
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf 'share=%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            printf 'explicit=%s\\n' "$(TARTCI_MACOS_VM_CORES=5 tartci_vm_lease_cores tart-macos)"
+            printf 'unset=%s\\n' "$(TARTCI_MACOS_VM_CORES_FROM= tartci_vm_lease_cores tart-macos)"
+            tartci_gate_reserve_share_cores(){{ return 1; }}
+            rc=0; failed="$(tartci_vm_lease_cores tart-macos)" || rc=$?
+            printf 'failed=%s rc=%s\\n' "$failed" "$rc"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # A failed derivation never falls back to vm_pool_cores (6 here): that
+        # is the overcommitted size the gate-reserve rule replaces.
+        self.assertEqual(proc.stdout.strip().splitlines(),
+                         ["share=4", "explicit=5", "unset=6", "failed= rc=1"])
+        self.assertIn("gate-reserve VM size unavailable; refusing to size the VM", proc.stderr)
+
+    def test_an_unsized_gate_reserve_lane_boots_nothing_and_probes_unknown(self) -> None:
+        # The boot path: no lease, no clone, when the size cannot be computed.
+        body = MACOS_RUNNER.read_text(encoding="utf-8")
+        boot = body[body.index("boot_vm_to_ssh(){"):body.index("tartci_acquire_vm_lease", body.index("boot_vm_to_ssh(){"))]
+        self.assertIn('if ! lease_cores="$(tartci_vm_lease_cores tart-macos)"; then', boot)
+        self.assertIn("return 1", boot)
+        # The lease-fit probe: unknown (1), and lease_fit.py is never asked.
+        lease_fit = ROOT / "providers" / "tart-macos" / "lease-fit.lib.sh"
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            source {lease_fit}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            tartci_gate_reserve_share_cores(){{ return 1; }}
+            python3(){{ echo "python3 called: $*"; }}
+            rc=0; tartci_lease_fit_probe || rc=$?
+            echo "rc=$rc"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["rc=1"])
+
+    def test_macos_share_matches_the_python_derivation(self) -> None:
+        # The real path: the shell asks gate_reserve_fit.py, so both sides read
+        # the same live host profile on whatever machine runs this.
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            unset TARTCI_MACOS_VM_CORES PULP_MACOS_VM_CORES
+            export TARTCI_MACOS_VM_CORES_FROM=gate-reserve TARTCI_MACOS_VM_CORES_SLOTS=2
+            printf '%s\\n' "$(tartci_vm_lease_cores tart-macos)"
+            python3 "$TARTCI_ROOT/scripts/gate_reserve_fit.py" share-cores --slots 2
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        shell, python = proc.stdout.split()
+        self.assertEqual(shell, python)
+
     def test_is_non_gate_priority_helper(self) -> None:
         script = textwrap.dedent(
             f"""
@@ -812,6 +1052,38 @@ PY
         self.assertEqual(
             proc.stdout.strip().splitlines(),
             ["tagged=gate", "pr-gate=vm", "conflict=vm", "override=vm"],
+        )
+
+    def test_v2_release_classes_rank_with_the_gate_classes(self) -> None:
+        # A v2 gate registration carries pulp-build-vm: tagged 120 > release PR
+        # gate 115 > merge-group 110 > PR-head 100, all gate class. The legacy
+        # release lane carries pulp-build-vm-release and keeps gate/vm.
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            source {HELPER}
+            v2=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm
+            printf 'tagged=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-tagged)"
+            printf 'merge=%s\n' "$(tartci_vm_lease_priority $v2,pulp-build-merge-group)"
+            printf 'pr=%s\n' "$(tartci_vm_lease_priority $v2,pulp-build-pr-head)"
+            printf 'pr-gate=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-pr-gate)"
+            printf 'legacy-tagged=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-tagged)"
+            printf 'legacy-pr-gate=%s\n' "$(tartci_vm_lease_priority self-hosted,macOS,ARM64,pulp-build-vm-release,pulp-release-pr-gate)"
+            printf 'conflict=%s\n' "$(tartci_vm_lease_priority $v2,pulp-release-tagged,pulp-release-pr-gate)"
+            printf 'explicit=%s\n' "$(TARTCI_VM_LEASE_PRIORITY=vm tartci_vm_lease_priority $v2,pulp-release-tagged)"
+            tartci_vm_lease_is_non_gate_priority 120 && echo 120-nongate || echo 120-gate
+            tartci_vm_lease_is_non_gate_priority 100 && echo 100-nongate || echo 100-gate
+            tartci_vm_lease_is_non_gate_priority 115 && echo 115-nongate || echo 115-gate
+            tartci_vm_lease_is_non_gate_priority 90 && echo 90-nongate || echo 90-gate
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(),
+            ["tagged=120", "merge=110", "pr=100", "pr-gate=115",
+             "legacy-tagged=gate", "legacy-pr-gate=vm", "conflict=vm", "explicit=vm",
+             "120-gate", "100-gate", "115-gate", "90-nongate"],
         )
 
     def test_merge_group_lease_sorts_above_pr_head(self) -> None:
@@ -893,6 +1165,238 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "5")  # gate lease unclamped
 
+    def test_derived_guest_memory_inverts_the_guest_job_formula(self) -> None:
+        """Guest memory is the inverse of Pulp's governed-build.sh bound.
+
+        That script derives jobs = mem_mb * 3 / 4 / per_job and takes
+        min(cores, jobs). Sizing at 4/3 * (cores - 1) * per_job therefore makes
+        the guest pick cores - 1 jobs: its full vCPU count less the one job of
+        slack the guest's own link/LTO peak needs.
+        """
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            tartci_profile_value() {{ echo 1536; }}
+            for c in 2 4 7 12; do
+              printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb "$c")"
+            done
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        sizes = [int(line) for line in proc.stdout.strip().splitlines()]
+        # 2 and 4 cores fall on the 8192 floor; 7 derives 4/3*6*1536; 12 would
+        # derive 22528 and is held at the 16384 ceiling.
+        self.assertEqual(sizes, [8192, 8192, 12288, 16384])
+        for cores, mem in zip((2, 4, 7, 12), sizes):
+            guest_jobs = mem * 3 // 4 // 1536
+            self.assertGreaterEqual(guest_jobs, 1)
+            # The guest never derives MORE jobs than it has vCPUs, and for any
+            # lane the ceiling does not bind it gets cores - 1.
+            self.assertLessEqual(min(cores, guest_jobs), cores)
+        self.assertEqual(min(7, sizes[2] * 3 // 4 // 1536), 6)
+
+    def test_derived_guest_memory_honours_floor_and_ceiling_overrides(self) -> None:
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            export TARTCI_VM_LEASE_MIN_MEM_MB=4096
+            export TARTCI_VM_LEASE_MAX_MEM_MB=10240
+            source {HELPER}
+            tartci_profile_value() {{ echo 1536; }}
+            printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb 2)"
+            printf '%s\\n' "$(tartci_vm_lease_derived_mem_mb 24)"
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines(), ["4096", "10240"])
+
+    def test_derived_guest_memory_survives_a_failing_host_profile(self) -> None:
+        """A profile hiccup falls back instead of ending the caller.
+
+        Callers run under `set -e`, where a bare assignment from a command
+        substitution that exits non-zero ends the enclosing function before any
+        fallback can apply. The helper is called DIRECTLY here, not through a
+        substitution: a substitution subshell swallows that abort, which would
+        make this test unable to fail.
+        """
+        script = textwrap.dedent(
+            f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}
+            export TARTCI_ROOT
+            source {HELPER}
+            tartci_profile_value() {{ return 3; }}
+            tartci_vm_lease_derived_mem_mb 7
+            printf '\\nreached-the-end\\n'
+            """
+        )
+        proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # 1536 fallback → 4/3 * 6 * 1536 = 12288, and execution continued.
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["12288", "reached-the-end"]
+        )
+
+    def test_guest_memory_is_derived_after_the_non_gate_core_clamp(self) -> None:
+        """A clamped lane is charged for the cores it GETS, not the ones it asked for.
+
+        Deriving before the clamp would bill a 8-core request against a 3-core
+        non-gate budget as if it had 8 vCPUs.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={Path(td) / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                tartci_profile_value() {{
+                  case "$1" in
+                    non_gate_capacity_cores) echo 3 ;;
+                    per_compile_job_mem_mb) echo 1536 ;;
+                    *) echo 0 ;;
+                  esac
+                }}
+                # No explicit memory → the size must come from the clamped cores.
+                tartci_acquire_vm_lease unit-vm 8 tart-linux-vm vm self-hosted,Linux "" {Path(td)}
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["lease_size_cores"], r["lease_size_mem_mb"])'
+                printf 'exported=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        # Clamped to 3 cores → 4/3 * 2 * 1536 = 4096, held up by the 8192 floor.
+        # Derived from the REQUESTED 8 it would have been 4/3*7*1536 = 14336.
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["3 8192", "exported=8192"]
+        )
+
+    def test_charged_guest_memory_is_the_memory_applied_to_the_clone(self) -> None:
+        """The plumbing invariant: charged memory and booted memory are one number.
+
+        This is the defect the whole change exists to close — admission charged
+        a memory figure and then booted the clone at the golden's baked size,
+        so the guest's own build governor sized itself from a number the host
+        never reserved. The test walks the provider's real sequence: acquire,
+        read the exported size back, size the clone, then compare what the
+        lease store recorded against what `tart set` received.
+        """
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            bindir = tmp / "bin"
+            bindir.mkdir()
+            marker = tmp / "tart-args"
+            _write_exec(
+                bindir / "tart",
+                f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {marker}\n",
+            )
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export PATH={bindir}:$PATH
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={tmp / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                trap tartci_release_vm_lease EXIT
+                lease_cores=7
+                lease_mem=""
+                tartci_acquire_vm_lease demo-vm "$lease_cores" tart-macos-vm gate pulp-build "$lease_mem" {tmp}
+                lease_cores="${{TARTCI_ACTIVE_VM_LEASE_CORES:-$lease_cores}}"
+                lease_mem="${{TARTCI_ACTIVE_VM_LEASE_MEM_MB:-$lease_mem}}"
+                tartci_set_tart_vm_size demo-vm "$lease_cores" "$lease_mem"
+                python3 "$TARTCI_ROOT/scripts/leases.py" status --store-dir "$TARTCI_LEASE_DIR" --json |
+                  python3 -c 'import json,sys; r=json.load(sys.stdin)["leases"][0]; print(r["lease_size_mem_mb"])'
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            charged = int(proc.stdout.strip().splitlines()[-1])
+            applied_lines = marker.read_text(encoding="utf-8").strip().splitlines()
+
+        self.assertEqual(len(applied_lines), 1, applied_lines)
+        match = re.search(r"--memory (\d+)", applied_lines[0])
+        self.assertIsNotNone(
+            match, f"tart was never given a --memory: {applied_lines[0]!r}"
+        )
+        applied = int(match.group(1))
+        self.assertEqual(
+            applied,
+            charged,
+            "the clone booted at a size the host never reserved",
+        )
+        # And the control: the number is the derived one, not some default that
+        # happens to match. 7 cores → 4/3 * 6 * 1536 = 12288.
+        self.assertEqual(charged, 12288)
+
+    def test_release_clears_the_exported_guest_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_LEASE_DIR={tmp / "leases"}
+                export TARTCI_HOST_CORES=16
+                export TARTCI_HOST_MEM_MB=262144
+                export TARTCI_ROLE=dedicated-builder
+                export TARTCI_VM_LEASE_HEARTBEAT_SECS=1
+                export TARTCI_VM_DISK_GROWTH_GB=0
+                export TARTCI_VM_DISK_FREE_FLOOR_GB=0
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease demo-vm 7 tart-macos-vm gate pulp-build "" {tmp}
+                printf 'held=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                tartci_release_vm_lease
+                printf 'released=%s\\n' "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(
+            proc.stdout.strip().splitlines(), ["held=12288", "released="]
+        )
+
+    def test_break_glass_still_exports_a_guest_size(self) -> None:
+        """Leases off still has to hand the provider a size to boot at."""
+        with tempfile.TemporaryDirectory() as td:
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_ROOT={ROOT}
+                export TARTCI_VM_LEASES=0
+                note() {{ :; }}
+                source {HELPER}
+                tartci_acquire_vm_lease demo-vm 7 tart-macos-vm gate pulp-build "" {Path(td)}
+                printf '%s %s\\n' "$TARTCI_ACTIVE_VM_LEASE_CORES" "$TARTCI_ACTIVE_VM_LEASE_MEM_MB"
+                """
+            )
+            proc = _run_bash(script)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip().splitlines()[-1], "7 12288")
+
     def test_provider_mem_overrides_and_fallbacks(self) -> None:
         script = textwrap.dedent(
             f"""
@@ -909,9 +1413,10 @@ PY
         )
         proc = _run_bash(script)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        # macos override; linux bogus → per-guest default 8192; windows from
-        # WIN_MEMORY fallback.
-        self.assertEqual(proc.stdout.strip().splitlines(), ["12288", "8192", "8192"])
+        # macos override used verbatim; linux bogus → EMPTY, so acquisition
+        # derives the size from the cores it actually grants; windows keeps its
+        # caller-supplied WIN_MEMORY fallback (that lane sizes its own guest).
+        self.assertEqual(proc.stdout.strip().splitlines(), ["12288", "", "8192"])
 
     def test_acquire_charges_explicit_vm_memory(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -968,7 +1473,29 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), f"{1024**3} {store_path.resolve()}")
 
-    def test_tart_cpu_set_uses_acquired_core_count(self) -> None:
+    def test_tart_size_set_applies_both_acquired_axes(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            marker = tmp / "tart-args"
+            _write_exec(tmp / "tart", f"#!/usr/bin/env bash\nprintf '%s\\n' \"$*\" >> {marker}\n")
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export PATH={tmp}:$PATH
+                TARTCI_ROOT={ROOT}
+                export TARTCI_ROOT
+                source {HELPER}
+                tartci_set_tart_vm_size demo-vm 4 16384
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                marker.read_text(encoding="utf-8").strip(),
+                "set demo-vm --cpu 4 --memory 16384",
+            )
+
+    def test_tart_cpu_set_alias_still_sizes_only_the_cpu_axis(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
             marker = tmp / "tart-args"
@@ -1019,7 +1546,9 @@ PY
         self.assertEqual(proc.returncode, 0, proc.stderr)
 
 
-class RunningMacosVmsFailClosedTests(unittest.TestCase):
+class RunningMacosVmsInventoryTests(unittest.TestCase):
+    """A slow or failed `tart list` reads as `unknown`, never as a full host."""
+
     @classmethod
     def setUpClass(cls) -> None:
         body = MACOS_RUNNER.read_text(encoding="utf-8")
@@ -1028,31 +1557,57 @@ class RunningMacosVmsFailClosedTests(unittest.TestCase):
             raise AssertionError("running_macos_vms function not found")
         cls.function = match.group(1)
 
-    def _run_with_tart_stub(self, stub: str) -> subprocess.CompletedProcess[str]:
+    def _run_with_tart_stub(
+        self, stub: str, *, timeout: str = "5", retry_timeout: str = "15"
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as td:
             tmp = Path(td)
-            _write_exec(tmp / "tart", stub)
+            _write_exec(tmp / "tart", stub.replace("@TMP@", str(tmp)))
             script = textwrap.dedent(
                 f"""
                 set -euo pipefail
                 export PATH={tmp}:$PATH
                 export TARTCI_ROOT={ROOT}
                 export TARTCI_MACOS_HARD_MAX=2
+                export TARTCI_TART_INVENTORY_TIMEOUT_SECS={timeout}
+                export TARTCI_TART_INVENTORY_RETRY_TIMEOUT_SECS={retry_timeout}
                 {self.function}
                 running_macos_vms
                 """
             )
             return _run_bash(script)
 
-    def test_tart_list_error_counts_as_full_hard_cap(self) -> None:
+    def test_tart_list_error_is_unknown_not_the_hard_cap(self) -> None:
         proc = self._run_with_tart_stub("#!/usr/bin/env bash\nexit 9\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "2")
+        self.assertEqual(proc.stdout.strip(), "unknown")
 
-    def test_malformed_tart_list_json_counts_as_full_hard_cap(self) -> None:
+    def test_malformed_tart_list_json_is_unknown(self) -> None:
         proc = self._run_with_tart_stub("#!/usr/bin/env bash\nprintf '{bad-json'\n")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "2")
+        self.assertEqual(proc.stdout.strip(), "unknown")
+
+    def test_timed_out_listing_is_unknown(self) -> None:
+        proc = self._run_with_tart_stub(
+            "#!/usr/bin/env bash\nsleep 30\n", timeout="0.2", retry_timeout="0.3"
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "unknown")
+
+    def test_slow_first_listing_is_retried_with_the_longer_budget(self) -> None:
+        # The first `tart list` outlives the short budget. The retry answers
+        # after 1 s, which only the longer retry budget can wait out.
+        stub = """#!/usr/bin/env bash
+if [ ! -e @TMP@/first ]; then
+  : > @TMP@/first
+  sleep 30
+fi
+sleep 1
+printf '[{"Name":"idle","State":"stopped"}]'
+"""
+        proc = self._run_with_tart_stub(stub, timeout="0.3", retry_timeout="5")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "0")
 
     def test_valid_tart_list_counts_only_running_macos_guests(self) -> None:
         stub = """#!/usr/bin/env bash
@@ -1069,6 +1624,138 @@ fi
         proc = self._run_with_tart_stub(stub)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "1")
+
+
+class ActiveReservationsPidReuseTests(unittest.TestCase):
+    """A reservation is owned by a process, not just a pid number."""
+
+    CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
+
+    def _count(self, files: dict) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            resv = tmp / "resv"
+            resv.mkdir()
+            for name, body in files.items():
+                (resv / name).write_text(body)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={resv}
+                source {self.CAP_LIB}
+                live="$(tartci_pid_token $$)"
+                now="$(date +%s)"
+                {{
+                  printf '%s %s %s' "$$" "$live" "$now" > {resv}/resv.current
+                  printf '%s %s %s' "$$" "WrongStart2001" "$now" > {resv}/resv.reused
+                  printf '%s %s' "$$" "$now" > {resv}/resv.legacy
+                }}
+                tartci_active_reservations
+                for f in current reused legacy; do [ -e {resv}/resv.$f ] && printf ' %s' "$f"; done
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+    def test_reused_pid_with_different_start_token_is_pruned(self) -> None:
+        self.assertEqual(self._count({}), "2 current legacy")
+
+    def test_claim_writes_pid_token_epoch(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={tmp}/resv TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/none
+                source {ClaimMacosSlotUnknownInventoryTests.CAP_LIB}
+                f="$(tartci_claim_macos_slot 2 0)"
+                cat "$f"
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            fields = proc.stdout.split()
+            self.assertEqual(len(fields), 3, proc.stdout)
+            self.assertTrue(fields[0].isdigit() and fields[2].isdigit())
+
+
+class ClaimMacosSlotUnknownInventoryTests(unittest.TestCase):
+    """An unreadable inventory cannot authorize another clone."""
+
+    CAP_LIB = ROOT / "providers" / "tart-macos" / "macos-vm-cap.lib.sh"
+
+    def _claim(self, live_reservations: int, *, inventory: str, via_arg: bool) -> str:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            resv_dir = tmp / "resv"
+            resv_dir.mkdir()
+            claim = 'tartci_claim_macos_slot 2 "$INV"' if via_arg else "tartci_claim_macos_slot 2"
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={resv_dir}
+                export TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/no-cap-file
+                INV={inventory}
+                running_macos_vms(){{ printf '%s\\n' "$INV"; }}
+                source {self.CAP_LIB}
+                n=0
+                while [ "$n" -lt {live_reservations} ]; do
+                  n=$((n + 1))
+                  printf '%s %s' "$$" "$(date +%s)" > "$TARTCI_MACOS_RESV_DIR/resv.held$n"
+                done
+                {claim}
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return proc.stdout.strip()
+
+    def test_unknown_inventory_refuses_even_with_free_reservations(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertEqual(self._claim(0, inventory="unknown", via_arg=via_arg), "")
+                self.assertEqual(self._claim(1, inventory="unknown", via_arg=via_arg), "")
+
+    def test_unknown_inventory_with_full_reservations_waits(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertEqual(self._claim(2, inventory="unknown", via_arg=via_arg), "")
+
+    def test_a_readable_full_inventory_still_blocks(self) -> None:
+        self.assertEqual(self._claim(0, inventory="2", via_arg=True), "")
+        self.assertEqual(self._claim(0, inventory="2", via_arg=False), "")
+
+    def test_readable_inventory_with_capacity_still_claims(self) -> None:
+        for via_arg in (True, False):
+            with self.subTest(via_arg=via_arg):
+                self.assertIn("resv.", self._claim(0, inventory="0", via_arg=via_arg))
+
+    def test_inventory_recovery_admits_without_stale_refusal_state(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            script = textwrap.dedent(
+                f"""
+                set -euo pipefail
+                export TARTCI_MACOS_RESV_DIR={tmp}/resv
+                export TARTCI_MACOS_LOCKDIR={tmp}/lock.d
+                export TARTCI_MACOS_CAP_FILE={tmp}/no-cap-file
+                source {self.CAP_LIB}
+                running_macos_vms(){{ cat {tmp}/inventory; }}
+                echo unknown > {tmp}/inventory
+                first="$(tartci_claim_macos_slot 2)"
+                [ -z "$first" ]
+                echo 0 > {tmp}/inventory
+                second="$(tartci_claim_macos_slot 2)"
+                [ -f "$second" ]
+                printf 'recovered\\n'
+                """
+            )
+            proc = _run_bash(script)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(proc.stdout.strip(), "recovered")
 
 
 if __name__ == "__main__":

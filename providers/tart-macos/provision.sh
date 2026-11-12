@@ -13,6 +13,9 @@ export TART_HOME="${TART_HOME:-$HOME/VMs}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PULP_MANIFEST="$ROOT/manifests/pulp.macos.toml"
 PULP_READINESS="$ROOT/providers/common/pulp-macos-readiness.py"
+# The readiness reporter imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$ROOT/providers/common/toml-python.lib.sh"
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 die(){ printf '\033[31m✗ %s\033[0m\n' "$*" >&2; exit 1; }
@@ -30,8 +33,9 @@ Usage:
 
 list/resize/tag are generic inventory operations and never certify that a Pulp
 golden matches manifests/pulp.macos.toml. `pulp-readiness` prints the exact
-required source/providers and exits nonzero until receipt-backed verification
-is implemented.
+required source/providers and exits 3 (determined unready) until
+receipt-backed verification is implemented. Exit 2 means it could not decide
+(no tomllib, bad manifest); 127 means no usable Python was found.
 USAGE
 }
 
@@ -64,9 +68,10 @@ case "$cmd" in
     note "generic tag only; this does not certify Pulp render readiness"
     ;;
   pulp-readiness)
-    [ -f "$PULP_MANIFEST" ] || die "Pulp macOS manifest missing: $PULP_MANIFEST"
-    [ -f "$PULP_READINESS" ] || die "Pulp readiness reporter missing: $PULP_READINESS"
-    python3 "$PULP_READINESS" "$PULP_MANIFEST"
+    # Exit 2, not die's 1: the reporter could not decide, which is not "unready" (3).
+    [ -f "$PULP_MANIFEST" ] || { note "Pulp macOS manifest missing: $PULP_MANIFEST"; exit 2; }
+    [ -f "$PULP_READINESS" ] || { note "Pulp readiness reporter missing: $PULP_READINESS"; exit 2; }
+    tartci_toml_python "$PULP_READINESS" "$PULP_MANIFEST"
     ;;
   help|-h|--help)
     usage

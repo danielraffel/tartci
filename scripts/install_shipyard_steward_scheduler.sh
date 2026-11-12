@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the additive, default-off Shipyard stewardship scheduler.
+# Install the single-controller Shipyard carrier scheduler (default off).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
@@ -9,6 +9,7 @@ LABEL="com.danielraffel.shipyard.steward-scheduler"
 MODE="disabled"
 AUTHORITY=0
 APPLY=0
+CLASSES=()
 SHIPYARD="$(command -v shipyard 2>/dev/null || true)"
 LAUNCHCTL="${TARTCI_LAUNCHCTL_BIN:-/bin/launchctl}"
 LAUNCHCTL_INTERPRETER="${TARTCI_LAUNCHCTL_INTERPRETER:-}"
@@ -17,12 +18,14 @@ REPOS=()
 usage() {
   cat <<'EOF'
 usage: install_shipyard_steward_scheduler.sh --repo OWNER/REPO=PATH [...]
-       [--shipyard ABSOLUTE_PATH] [--mode disabled|live] [--authority] [--install]
+       [--shipyard ABSOLUTE_PATH] [--mode disabled|plan|live]
+       [--authority --class redispatch|rearm [...]] [--install]
 
 Prints a plan by default. Installation is disabled by default and leaves the
-legacy queue tick untouched. Live mode requires explicit --authority. The
-scheduler runs one bounded steward apply per repo, then one recovery-worker
-apply; it never launches an agent directly.
+legacy queue tick untouched. Plan mode reads GitHub through `shipyard runner
+carrier` every tick and records each plan; it never passes --apply. Live mode
+requires explicit --authority and at least one --class, and exactly one host
+in the fleet may run it. The scheduler never launches an agent.
 EOF
 }
 
@@ -32,6 +35,7 @@ while [ "$#" -gt 0 ]; do
     --shipyard) SHIPYARD="${2:-}"; shift 2 ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --authority) AUTHORITY=1; shift ;;
+    --class) CLASSES+=("${2:-}"); shift 2 ;;
     --install) APPLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -39,13 +43,23 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$MODE" in
-  disabled) ENABLED=false ;;
+  disabled|plan)
+    [ "$AUTHORITY" = 0 ] || { echo "--authority is only valid with --mode live" >&2; exit 2; }
+    [ "${#CLASSES[@]}" -eq 0 ] || { echo "--class is only valid with --mode live" >&2; exit 2; }
+    ;;
   live)
     [ "$AUTHORITY" = 1 ] || { echo "--mode live requires --authority" >&2; exit 2; }
-    ENABLED=true
+    [ "${#CLASSES[@]}" -ge 1 ] || { echo "--mode live requires at least one --class" >&2; exit 2; }
+    for class in ${CLASSES[@]+"${CLASSES[@]}"}; do
+      case "$class" in
+        redispatch|rearm) ;;
+        *) echo "invalid --class $class: live classes are redispatch and rearm" >&2; exit 2 ;;
+      esac
+    done
     ;;
   *) echo "invalid mode: $MODE" >&2; exit 2 ;;
 esac
+CLASS_LIST="$(IFS=,; echo "${CLASSES[*]:-}")"
 [ "${#REPOS[@]}" -ge 1 ] && [ "${#REPOS[@]}" -le 32 ] || {
   echo "provide 1..32 --repo OWNER/REPO=PATH entries" >&2
   exit 2
@@ -62,8 +76,9 @@ fi
   exit 2
 }
 
-INSTALL_DIR="$HOME/.local/share/tartci/scripts"
-INSTALLED="$INSTALL_DIR/shipyard_steward_scheduler.py"
+# The agent runs the scheduler through ~/.local/bin/tartci, so it follows the
+# installed generation; nothing is copied, and a self-update reaches it.
+ENTRYPOINT="$HOME/.local/bin/tartci"
 CONFIG_DIR="$HOME/.config/shipyard"
 CONFIG="$CONFIG_DIR/steward-scheduler.json"
 PLIST_DIR="$HOME/Library/LaunchAgents"
@@ -87,19 +102,22 @@ for current in (resolved, *resolved.parents):
 if not stat.S_ISREG(resolved.stat().st_mode) or not os.access(resolved, os.X_OK):
     raise SystemExit("Shipyard must be an executable regular file")
 PY
-VERSION="$("$SHIPYARD" --version 2>/dev/null || true)"
-python3 - "$VERSION" <<'PY'
-import re, sys
-match = re.fullmatch(r"shipyard (\d+)\.(\d+)\.(\d+)", sys.argv[1].strip())
-if not match or tuple(map(int, match.groups())) < (0, 113, 0):
-    raise SystemExit("Shipyard 0.113.0 or newer is required")
+CARRIER_PROBE="$("$SHIPYARD" --json runner carrier --replay /dev/null 2>/dev/null || true)"
+python3 - "$CARRIER_PROBE" <<'PY'
+import json, sys
+try:
+    value = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+    raise SystemExit("this Shipyard has no `runner carrier`; install a Shipyard that does")
+if value.get("command") != "runner.carrier" or value.get("plans") != []:
+    raise SystemExit("this Shipyard's `runner carrier --replay` envelope is unexpected")
 PY
 
-echo "Shipyard stewardship scheduler install plan:"
-echo "  mode=$MODE authority=$AUTHORITY"
+echo "Shipyard carrier scheduler install plan:"
+echo "  mode=$MODE authority=$AUTHORITY classes=${CLASS_LIST:-none}"
 echo "  shipyard=$SHIPYARD"
-for repo in "${REPOS[@]}"; do echo "  repo=$repo"; done
-echo "  executable=$INSTALLED"
+for repo in ${REPOS[@]+"${REPOS[@]}"}; do echo "  repo=$repo"; done
+echo "  executable=$ENTRYPOINT steward-scheduler (the installed generation)"
 echo "  config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 echo "  legacy_queue_tick=preserved"
@@ -108,8 +126,8 @@ echo "  legacy_queue_tick=preserved"
 umask 077
 LOG_DIR="$HOME/Library/Logs"
 STATE_DIR="$HOME/.local/state/tartci"
-mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR"
-python3 - "$HOME" "$INSTALL_DIR" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR" <<'PY'
+mkdir -p "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR"
+python3 - "$HOME" "$CONFIG_DIR" "$PLIST_DIR" "$LOG_DIR" "$STATE_DIR" <<'PY'
 import os, pathlib, stat, sys
 home = pathlib.Path(sys.argv[1]).resolve()
 for raw in sys.argv[2:]:
@@ -126,7 +144,6 @@ for raw in sys.argv[2:]:
             raise SystemExit(f"install parent escapes HOME: {current}")
         current = current.parent
 PY
-STAGED_SCRIPT="$(mktemp "$INSTALL_DIR/.shipyard_steward_scheduler.py.XXXXXX")"
 STAGED_CONFIG="$(mktemp "$CONFIG_DIR/.steward-scheduler.json.XXXXXX")"
 STAGED_PLIST="$(mktemp "$PLIST_DIR/.steward-scheduler.plist.XXXXXX")"
 BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/steward-scheduler-install.XXXXXX")"
@@ -142,18 +159,29 @@ launchctl_command() {
   fi
 }
 
+# A RunAtLoad launch is speculative, and launchd can defer it indefinitely on a
+# busy host (`runs = 0`, `pended nondemand spawn = speculative`). Start a job
+# that has never run; leave one that already ran alone, so a tick is never
+# doubled.
+kickstart_if_never_ran() {
+  launchctl_command print "gui/$(id -u)/$LABEL" 2>/dev/null \
+    | grep -Eq '^[[:space:]]*runs = 0[[:space:]]*$' || return 0
+  launchctl_command kickstart "gui/$(id -u)/$LABEL"
+}
+
 rollback() {
   rc=$?
   trap - EXIT
   if [ "$SWITCHED" = 1 ] && [ "$COMMITTED" != 1 ]; then
     set +e
     launchctl_command bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    for name in script config plist; do
-      case "$name" in script) target="$INSTALLED" ;; config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
+    for name in config plist; do
+      case "$name" in config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
       if [ -f "$BACKUP/$name.present" ]; then cp -p "$BACKUP/$name" "$target"; else rm -f "$target"; fi
     done
     if [ "$PRIOR_LOADED" = 1 ] && [ -f "$PLIST" ]; then
       if ! launchctl_command bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 \
+        || ! kickstart_if_never_ran >/dev/null 2>&1 \
         || ! launchctl_command print "gui/$(id -u)/$LABEL" >/dev/null 2>&1
       then
         echo "ROLLBACK FAILURE: prior LaunchAgent files were restored but its registration was not" >&2
@@ -161,17 +189,18 @@ rollback() {
       fi
     fi
   fi
-  rm -f "$STAGED_SCRIPT" "$STAGED_CONFIG" "$STAGED_PLIST"
+  rm -f "$STAGED_CONFIG" "$STAGED_PLIST"
   rm -rf "$BACKUP"
   exit "$rc"
 }
 trap rollback EXIT
-install -m 755 "$SOURCE" "$STAGED_SCRIPT"
-cmp -s "$SOURCE" "$STAGED_SCRIPT" || { echo "staged scheduler differs from source" >&2; exit 1; }
 
-python3 - "$STAGED_CONFIG" "$ENABLED" "$AUTHORITY" "$SHIPYARD" "${REPOS[@]}" <<'PY'
+python3 - "$STAGED_CONFIG" "$MODE" "$AUTHORITY" "$CLASS_LIST" "$SHIPYARD" ${REPOS[@]+"${REPOS[@]}"} <<'PY'
 import json, os, pathlib, re, stat, subprocess, sys
-target, enabled, authority, shipyard, *entries = sys.argv[1:]
+target, mode, authority, class_list, shipyard, *entries = sys.argv[1:]
+classes = [entry for entry in class_list.split(",") if entry]
+if len(set(classes)) != len(classes):
+    raise SystemExit("duplicate --class entries")
 identity_re = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/[A-Za-z0-9._-]+")
 remotes = (
     re.compile(r"https://github\.com/([^/]+)/([^/]+)"),
@@ -198,7 +227,7 @@ for entry in entries:
             break
     if actual is None or actual.casefold() != identity.casefold():
         raise SystemExit(f"checkout origin mismatch for {identity}: {path}")
-    if enabled == "true":
+    if mode != "disabled":
         for current in (path, *path.parents):
             metadata = current.stat()
             if metadata.st_uid not in {0, os.geteuid()} or stat.S_IMODE(metadata.st_mode) & 0o022:
@@ -209,15 +238,15 @@ for entry in entries:
     seen.add(folded)
     rows.append({"repo": identity, "checkout": str(path)})
 value = {
-    "schema_version": 1,
-    "enabled": enabled == "true",
+    "schema_version": 2,
+    "mode": mode,
     "authority": authority == "1",
+    "classes": classes,
     "shipyard": shipyard,
     "repositories": rows,
-    "steward_timeout_seconds": 120,
-    "recovery_timeout_seconds": 900,
-    "max_log_bytes": 5 * 1024 * 1024,
-    "log_generations": 3,
+    "carrier_timeout_seconds": 240,
+    "max_log_bytes": 8 * 1024 * 1024,
+    "log_generations": 4,
 }
 with open(target, "w", encoding="utf-8") as output:
     json.dump(value, output, indent=2, sort_keys=True)
@@ -227,8 +256,8 @@ chmod 600 "$STAGED_CONFIG"
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$STAGED_PLIST"
 plutil -lint "$STAGED_PLIST" >/dev/null
 
-for name in script config plist; do
-  case "$name" in script) target="$INSTALLED" ;; config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
+for name in config plist; do
+  case "$name" in config) target="$CONFIG" ;; plist) target="$PLIST" ;; esac
   if [ -e "$target" ]; then cp -p "$target" "$BACKUP/$name"; : > "$BACKUP/$name.present"; fi
 done
 if launchctl_command print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then PRIOR_LOADED=1; fi
@@ -242,13 +271,13 @@ else
   launchctl_command bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
 fi
 SWITCHED=1
-mv "$STAGED_SCRIPT" "$INSTALLED"
 mv "$STAGED_CONFIG" "$CONFIG"
 mv "$STAGED_PLIST" "$PLIST"
 rm -f "$HEALTH" "$STARTUP"
 launchctl_command bootstrap "gui/$(id -u)" "$PLIST"
+kickstart_if_never_ran
 PRINTED="$(launchctl_command print "gui/$(id -u)/$LABEL")"
-grep -Fq "$INSTALLED" <<<"$PRINTED" && grep -Fq "$CONFIG" <<<"$PRINTED" || {
+grep -Fq "$ENTRYPOINT" <<<"$PRINTED" && grep -Fq "$CONFIG" <<<"$PRINTED" || {
   echo "live launchd registration does not match installed paths" >&2
   exit 1
 }
@@ -258,11 +287,14 @@ for ((attempt=0; attempt<WAIT; attempt++)); do
   if python3 - "$HEALTH" "$STARTUP" "$MODE" <<'PY' >/dev/null 2>&1
 import json, sys
 health_path, startup_path, mode = sys.argv[1:]
-path = startup_path if mode == "live" else health_path
+# A disabled tick finishes at once, so its health receipt is the proof. A plan
+# or live tick reads GitHub for minutes, so the fresh startup receipt is the
+# installation evidence and the first terminal health report is the canary.
+path = health_path if mode == "disabled" else startup_path
 with open(path, encoding="utf-8") as source:
     value = json.load(source)
-expected = "started" if mode == "live" else "disabled"
-raise SystemExit(0 if value.get("status") == expected else 1)
+expected = "disabled" if mode == "disabled" else "started"
+raise SystemExit(0 if value.get("status") == expected and value.get("mode", "disabled") == mode else 1)
 PY
   then healthy=1; break; fi
   sleep 1

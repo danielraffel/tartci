@@ -19,13 +19,36 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
+from slot_demand import DemandDetail
+from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
+from gh_identity import (
+    NO_VALID_CREDENTIALS,
+    AuthPreflightError,
+    GitHubIdentity,
+    classify_failure,
+    forget_identity,
+    remember_unproven,
+    resolve_identity,
+)
 
 RUNS_PER_PAGE = 100
 
 
 class GitHubApiError(RuntimeError):
-    def __init__(self, path: str, returncode: int, stderr: str) -> None:
-        super().__init__(f"GitHub API failed for {path}: {stderr.strip()}")
+    def __init__(
+        self,
+        path: str,
+        returncode: int,
+        stderr: str,
+        identity: "GitHubIdentity | None" = None,
+    ) -> None:
+        # The message leads with a reason code so the cause survives every
+        # hop to the operator log. A scan that reports only that it failed
+        # reads there exactly like a queue with nothing in it.
+        self.reason = classify_failure(
+            f"GitHub API failed for {path}: {stderr.strip()}", identity
+        )
+        super().__init__(str(self.reason))
         self.status = 404 if "HTTP 404" in stderr or "404 Not Found" in stderr else None
         self.returncode = returncode
 
@@ -109,6 +132,9 @@ class QueueScanner:
         self.discovery_lock_path = self.discovery_path.with_suffix(
             f"{self.discovery_path.suffix}.lock"
         )
+        self.discovery_fetch_path = self.discovery_path.with_suffix(
+            f"{self.discovery_path.suffix}.fetching"
+        )
         self.observation_lock_path = Path(args.observation_lock_file)
         self.lock_deadline = time.monotonic() + args.observation_lock_timeout
         self.state: dict[str, Any] = {}
@@ -119,6 +145,45 @@ class QueueScanner:
         self.exclude_assigned = bool(getattr(args, "exclude_assigned", 0))
         self.api_calls = 0
         self.observation_lock_fd: int | None = None
+        # Measured by the preflight and carried into every failure, so a
+        # refusal names which credential hit which ceiling.
+        self.identity: GitHubIdentity | None = None
+
+    def _preflight_identity(self) -> None:
+        """Refuse to read the queue behind a credential GitHub does not accept.
+
+        An unauthenticated gh does not fail: it falls back to anonymous
+        requests, which GitHub meters at 60/hour per IP for every host behind
+        one address. The scan that follows then fails closed for a reason
+        nothing records. The ceiling is read from `rate_limit`, which costs no
+        quota and answers even when the allowance is spent.
+
+        A ceiling that proves anonymity stops the scan. A probe the CLI will
+        not answer does not: `ghapp` refuses an endpoint carrying no repository
+        (the fleet's lanes run from a directory that is not a checkout), and
+        blinding every lane over that would be the outage this exists to
+        prevent. The identity is then carried as unproven, and an anonymous
+        403 is still named from GitHub's own wording.
+        """
+        try:
+            self.identity = resolve_identity(
+                lambda: self._gh("rate_limit"), gh_cli=self.args.gh_cli
+            )
+            return
+        except AuthPreflightError as error:
+            if error.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(error)
+        except (OSError, RuntimeError, ValueError) as error:
+            reason = classify_failure(str(error), None)
+            if reason.reason_code == NO_VALID_CREDENTIALS:
+                raise
+            detail = str(reason)
+        self.identity = remember_unproven(self.args.gh_cli)
+        print(
+            f"queue scan identity unproven, reading the queue anyway: {detail}",
+            file=os.sys.stderr,
+        )
 
     def _gh(self, path: str) -> dict[str, Any]:
         if self.api_calls >= self.args.max_api_calls:
@@ -126,20 +191,39 @@ class QueueScanner:
                 f"GitHub API call budget exhausted ({self.args.max_api_calls})"
             )
         self.api_calls += 1
+        started = time.monotonic()
         result = run_bounded(
             [self.args.gh_cli, "api", path],
-            timeout=self.args.gh_timeout,
+            timeout=min(self.args.gh_timeout, max(0.1, self.args.observation_lock_timeout / 2)),
             operation="queue_scan_github_api",
-            pass_fds=(self.observation_lock_fd,)
-            if self.observation_lock_fd is not None
-            else (),
         )
+        print(
+            f"queue-scan-api path={path} elapsed_s={time.monotonic() - started:.3f}",
+            file=os.sys.stderr,
+        )
+        if getattr(result, "timed_out", False):
+            raise ObservationTimeout(
+                f"queue_scan_github_api:timeout:timed out after {self.args.gh_timeout}s"
+            )
         if result.returncode:
-            raise GitHubApiError(path, result.returncode, result.stderr)
+            error = GitHubApiError(path, result.returncode, result.stderr, self.identity)
+            if error.reason.reason_code == NO_VALID_CREDENTIALS:
+                forget_identity()
+            raise error
         payload = json.loads(result.stdout)
         if not isinstance(payload, dict):
             raise ValueError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def record_timeout(self, error: BaseException) -> None:
+        """Record timeout backoff without reacquiring the host observation flock."""
+        if timed_out(error):
+            FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).mark_timeout()
 
     @staticmethod
     def _load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
@@ -216,21 +300,19 @@ class QueueScanner:
     @contextlib.contextmanager
     def _observation_lock(self) -> Any:
         """Bound concurrent GitHub observation across every lane on this host."""
-        self.observation_lock_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._bounded_lock(
-            self.observation_lock_path, "host queue observation"
-        ) as handle:
-            # Duplicate the locked open-file description into an inheritable
-            # descriptor so every bounded gh/ghapp tree retains the flock if
-            # this scanner is killed. The kernel then releases host authority
-            # only after the old observation tree exits.
-            self.observation_lock_fd = os.dup(handle.fileno())
-            os.set_inheritable(self.observation_lock_fd, True)
-            try:
+        try:
+            with FairObservationLock(
+                str(self.observation_lock_path), self.args.observation_lock_timeout,
+                self.args.repo, getattr(self.args, "observation_backoff_file", None),
+                getattr(self.args, "observation_backoff_seconds", 30.0),
+                getattr(self.args, "lane_id", None), getattr(self.args, "generation", None),
+            ).hold() as handle:
+                # Do not inherit the host lock into gh/ssh descendants. If a
+                # scanner is killed, a slow child must not hold the lock and
+                # starve every other lane; the parent flock is the authority.
                 yield
-            finally:
-                os.close(self.observation_lock_fd)
-                self.observation_lock_fd = None
+        except (TimeoutError, ObservationBackoff) as error:
+            raise RuntimeError(str(error)) from error
 
     def _workflow_id(self, discovery: dict[str, Any]) -> int | None:
         # Keep the focused workflow endpoint for the legacy one-name case.
@@ -393,7 +475,11 @@ class QueueScanner:
         group = groups[key]
         capacity = self.args.max_job_fetches - len(latency)
         selected: list[dict[str, Any]] = []
-        if capacity > 0:
+        # Keep full-page rotation at its existing throughput.  When the
+        # selected page has spare entries, use that spare capacity to reserve
+        # the globally oldest backlog run so a small page cannot starve it.
+        reserved_oldest = capacity > 0 and len(group) < capacity
+        if reserved_oldest:
             selected.append(oldest)
         entry = offsets.get(key)
         if isinstance(entry, dict):
@@ -406,12 +492,14 @@ class QueueScanner:
             # by the backlog capacity, which is coprime to the 100-run page.
             sweep = int(group[0].get("_page_sweep", 0))
             offset = (sweep * capacity) % len(group)
+        consumed = 0
         for step in range(min(capacity - len(selected), len(group))):
+            consumed += 1
             candidate = group[(offset + step) % len(group)]
-            if int(candidate["id"]) != oldest_id:
+            if not reserved_oldest or int(candidate["id"]) != oldest_id:
                 selected.append(candidate)
         offsets[key] = {
-            "offset": (offset + len(selected)) % len(group),
+            "offset": (offset + consumed) % len(group),
             "last_seen": offset_tick,
         }
         if len(offsets) > self.args.page_offset_cap:
@@ -432,46 +520,103 @@ class QueueScanner:
         return [*latency, *selected], [int(run["id"]) for run in selected]
 
     def _discover(self) -> list[dict[str, Any]]:
-        with self._discovery_lock():
-            discovery = self._load_json(
-                self.discovery_path,
-                {"cursor_run_id": None, "run_page_cursor": {}},
-            )
-            fetched_at = int(discovery.get("fetched_at", 0))
-            cached_runs = discovery.get("runs")
-            if (
-                not self.args.force_refresh
-                and isinstance(cached_runs, list)
-                and self.now - fetched_at < self.args.discovery_ttl
-            ):
-                return cached_runs
+        # Claim a single flight under the short discovery lock.  The marker is
+        # deliberately separate from that lock: the owner releases the lock
+        # before doing any GitHub work, while other lanes wait lock-free for the
+        # published snapshot.
+        while True:
+            with self._discovery_lock():
+                discovery = self._load_json(
+                    self.discovery_path,
+                    {"cursor_run_id": None, "run_page_cursor": {}},
+                )
+                fetched_at = int(discovery.get("fetched_at", 0))
+                cached_runs = discovery.get("runs")
+                if (
+                    not self.args.force_refresh
+                    and isinstance(cached_runs, list)
+                    and self.now - fetched_at < self.args.discovery_ttl
+                ):
+                    return cached_runs
+                try:
+                    fd = os.open(
+                        self.discovery_fetch_path,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
+                except FileExistsError:
+                    fd = -1
+                if fd >= 0:
+                    # The owner's pid lets a waiter tell a fetch in flight
+                    # from one whose owner was killed.
+                    os.write(fd, str(os.getpid()).encode())
+                    os.close(fd)
+                    break
+                try:
+                    stale = time.time() - self.discovery_fetch_path.stat().st_mtime
+                except OSError:
+                    stale = 0
+                if (
+                    stale > self.args.observation_lock_timeout
+                    or self._fetch_owner_gone()
+                ):
+                    try:
+                        self.discovery_fetch_path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+            if time.monotonic() >= self.lock_deadline:
+                raise RuntimeError("queue discovery fetch did not complete before observation deadline")
+            time.sleep(0.05)
 
-            # Namespace locks coalesce identical scans. This host-global lock
-            # additionally prevents distinct repos/workflows from launching
-            # simultaneous gh/ghapp bursts. On slower hosts those bursts can
-            # all exceed their subprocess deadline and make healthy lanes look
-            # scan-blind. A bounded wait fails closed instead of hanging the
-            # supervisor or publishing a partial snapshot.
+        # GitHub calls happen outside both the shared discovery lock and the
+        # host-global observation flock. Only the final snapshot publication is
+        # serialized, so a slow fetch cannot block another lane's claim.
+        self.now = int(time.time())
+        self.api_calls = 0
+        try:
+            self._preflight_identity()
+            runs = self._runs(discovery)
+            candidates, backlog_ids = self._candidate_runs(runs, discovery)
+            discovered: list[dict[str, Any]] = []
+            for run in candidates[: self.args.max_job_fetches]:
+                run_id = int(run["id"])
+                jobs = self._gh(
+                    f"repos/{self.args.repo}/actions/runs/{run_id}"
+                    "/jobs?filter=latest&per_page=100"
+                ).get("jobs", [])
+                if not isinstance(jobs, list):
+                    raise ValueError(f"jobs is not a list for run {run_id}")
+                discovered.append({**run, "_jobs": jobs})
+
+            discovery["fetched_at"] = int(time.time())
+            discovery["runs"] = discovered
             with self._observation_lock():
-                self.now = int(time.time())
-                self.api_calls = 0
-                runs = self._runs(discovery)
-                candidates, backlog_ids = self._candidate_runs(runs, discovery)
-                discovered: list[dict[str, Any]] = []
-                for run in candidates[: self.args.max_job_fetches]:
-                    run_id = int(run["id"])
-                    jobs = self._gh(
-                        f"repos/{self.args.repo}/actions/runs/{run_id}"
-                        "/jobs?filter=latest&per_page=100"
-                    ).get("jobs", [])
-                    if not isinstance(jobs, list):
-                        raise ValueError(f"jobs is not a list for run {run_id}")
-                    discovered.append({**run, "_jobs": jobs})
-
-                discovery["fetched_at"] = int(time.time())
-                discovery["runs"] = discovered
                 self._save_json(self.discovery_path, discovery)
-                return discovered
+            return discovered
+        finally:
+            try:
+                self.discovery_fetch_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _fetch_owner_gone(self) -> bool:
+        """Whether the single-flight marker names a process that no longer
+        exists. A marker with no readable pid (an older writer, or one killed
+        between creating and writing it) is judged by age alone."""
+        try:
+            pid = int(self.discovery_fetch_path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError):
+            return False
+        if pid <= 0 or pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
 
     def _scan_locked(self) -> int:
         runs = self._discover()
@@ -488,6 +633,7 @@ class QueueScanner:
 
         last_backlog_id: int | None = None
         matches = 0
+        detail = DemandDetail()
         matched_job_ids: set[int] = set()
         backlog_id_set = set(backlog_ids)
         for run in candidates:
@@ -546,6 +692,7 @@ class QueueScanner:
                             continue
                         matched_job_ids.add(job_id)
                     run_matches += 1
+                    detail.add(run, job)
             if run_matches:
                 matches += run_matches
                 negative.pop(str(run_id), None)
@@ -559,6 +706,10 @@ class QueueScanner:
         if cursor is None and isinstance(self.state.get("cursor_run_id"), int):
             cursor = self.state["cursor_run_id"]
         self._save_state(cursor, negative)
+        # Slot priority's input: the event class and age of what was counted,
+        # from the runs and jobs read above (no further call).
+        if getattr(self.args, "detail_file", None):
+            detail.write(self.args.detail_file)
         return matches
 
     def scan(self) -> int:
@@ -600,6 +751,8 @@ def parse_args() -> argparse.Namespace:
         ),
         help="seconds to wait for the host-global observation lock",
     )
+    parser.add_argument("--observation-backoff-file", default=os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_FILE"))
+    parser.add_argument("--observation-backoff-seconds", type=float, default=float(os.environ.get("TARTCI_QUEUE_OBSERVATION_BACKOFF_SECS", "30")))
     parser.add_argument("--provider", required=True)
     parser.add_argument(
         "--lane-id",
@@ -607,6 +760,7 @@ def parse_args() -> argparse.Namespace:
         or os.environ.get("TARTCI_RUNNER_SLOT")
         or f"supervisor-{os.getppid()}",
     )
+    parser.add_argument("--generation", default=os.environ.get("TARTCI_GENERATION") or "unknown")
     parser.add_argument("--gh-cli", default=os.environ.get("TARTCI_GH_CLI") or "gh")
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--max-run-pages", type=int, default=int(os.environ.get("TARTCI_QUEUE_RUN_PAGES", "2")))
@@ -630,6 +784,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagger-max-seconds", type=int, default=int(os.environ.get("TARTCI_QUEUE_STAGGER_MAX_SECS", "4")))
     parser.add_argument("--negative-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEGATIVE_TTL_SECS", "30")))
     parser.add_argument("--max-age-seconds", type=int, default=0)
+    parser.add_argument(
+        "--detail-file",
+        help="also write the matched jobs' event classes and oldest created_at here "
+        "(scripts/slot_demand.py); makes no extra API call",
+    )
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
     # Off by default: changing what counts as demand is a scheduling decision,
@@ -661,6 +820,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--observation-lock-timeout must be positive")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
+    if args.observation_backoff_file is None:
+        args.observation_backoff_file = str(Path(args.observation_lock_file).with_name("queue-observation-backoff.json"))
+    if not math.isfinite(args.observation_backoff_seconds) or args.observation_backoff_seconds <= 0:
+        parser.error("--observation-backoff-seconds must be positive")
     statuses = {
         status.strip().lower()
         for status in args.job_statuses.split(",")
@@ -695,6 +858,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    scanner: QueueScanner | None = None
     try:
         if args.stagger_max_seconds:
             identity = "\0".join(
@@ -710,7 +874,13 @@ def main() -> int:
                 args.stagger_max_seconds * 1000
             )
             time.sleep(delay_ms / 1000)
-        count = QueueScanner(args).scan()
+        scanner = QueueScanner(args)
+        count = scanner.scan()
+    except AuthPreflightError as exc:
+        if scanner is not None:
+            scanner.record_timeout(exc)
+        print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
+        return 1
     except (
         OSError,
         RuntimeError,
@@ -718,7 +888,14 @@ def main() -> int:
         ValueError,
         json.JSONDecodeError,
     ) as exc:
-        print(f"queue scan failed ({args.provider}): {exc}", file=os.sys.stderr)
+        if scanner is not None:
+            scanner.record_timeout(exc)
+        probed = scanner.identity if scanner is not None else None
+        print(
+            f"queue scan failed ({args.provider}): "
+            f"{classify_failure(str(exc), probed)}",
+            file=os.sys.stderr,
+        )
         return 1
     print(count)
     return 0

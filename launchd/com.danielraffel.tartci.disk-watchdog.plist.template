@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci disk write-latency watchdog.
+
+  Runs `tartci disk watch` every 60 s. Each pass probes every watched volume
+  path with a create+fsync+unlink in a child process it never waits on for
+  more than 10 s. A write over 1 s, or one that does not finish, opens an
+  episode: once per episode the pass saves the APFS/kernel log, the processes
+  in uninterruptible wait and stack samples of any process stuck in open()
+  under ~/.tartci/state/disk-watchdog/evidence/, and opens one GitHub issue
+  through the host-off alert path. The issue closes after three fast probes
+  in a row. A probe that wedges in the kernel is recorded and no second one is
+  started on that path while it lives (outage O10: a create on
+  /Volumes/<data-volume> stalled for hours and a probe sat in __open for 7 h).
+
+  DISK_WATCH_PATHS is the host's host.tart_home and host.cache_root, joined
+  with ":"; support_agents renders it from the fleet profile when the agent is
+  declared there. Install shape by hand:
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.disk-watchdog.plist.template \
+      --set "HOME=$HOME" --set "DISK_WATCH_PATHS=$TART_HOME:$HOME/.cache/pulp-ci" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.disk-watchdog.plist"
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.disk-watchdog.plist"
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.disk-watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>disk</string>
+        <string>watch</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-disk-watchdog.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-disk-watchdog.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+        <key>TARTCI_DISK_WATCH_PATHS</key>
+        <string>$DISK_WATCH_PATHS</string>
+    </dict>
+</dict>
+</plist>

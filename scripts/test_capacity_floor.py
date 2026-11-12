@@ -9,6 +9,7 @@ operator to reach for the override by reflex.
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import json
 import os
 import subprocess
@@ -43,6 +44,48 @@ FAKE_GH = textwrap.dedent(
     json.dump([{"runners": entry["runners"]}], sys.stdout)
     """
 )
+
+# A fake `ssh`: the target is the argument before the remote command, and the
+# fixture maps it to that peer's `pool status --json` (or an exit code).
+FAKE_SSH = textwrap.dedent(
+    """\
+    #!/usr/bin/env python3
+    import json, os, sys
+    fixture = json.load(open(os.environ["FAKE_SSH_FIXTURE"]))
+    entry = fixture.get(sys.argv[-2], {"rc": 255, "stderr": "ssh: connect: Connection refused"})
+    if "status" in entry:
+        json.dump(entry["status"], sys.stdout)
+    sys.stderr.write(entry.get("stderr", ""))
+    sys.exit(entry.get("rc", 0))
+    """
+)
+
+
+def live_status(**fleet_overrides) -> dict:
+    """A peer's `pool status --json` that proves it mints on demand now."""
+    fleet = {
+        "managed": True,
+        "fleet_ready": True,
+        "problems": [],
+        "expected_supervisors": 2,
+        "verified_running_supervisors": 2,
+        "serving": {"blocked": False},
+        "config": {"supply": {"state": "match"}},
+    }
+    fleet.update(fleet_overrides)
+    return {"state": "on", "participating": True, "fleet": fleet}
+
+
+def published(*hosts: str, label: str = GATE, repo: str = REPO) -> dict:
+    """A published supply in which each host declares `label` for `repo`."""
+    return {
+        "hosts": [{"host_id": host, "ssh": f"ssh-{host}"} for host in ("studio", *hosts)],
+        "registrations": [
+            {"host_id": host, "repo": repo, "class_label": label, "labels": BASE + [label]}
+            for host in ("studio", *hosts)
+        ],
+    }
+
 
 PROFILE = textwrap.dedent(
     """\
@@ -207,6 +250,129 @@ class DecisionCoreTests(unittest.TestCase):
         self.assertEqual(decision.reason, capacity_floor.REASON_CAPACITY_UNKNOWN)
 
 
+class OnDemandPeerDecisionTests(unittest.TestCase):
+    """An idle JIT fleet registers no runner, so a declaring live peer is capacity."""
+
+    def decide(self, census_obj, evidence, **kwargs) -> capacity_floor.Decision:
+        asked: list[tuple[str, str]] = []
+
+        def peers(repo: str, label: str):
+            asked.append((repo, label))
+            return evidence
+
+        decision = capacity_floor.classify(
+            host="studio", action="off", protected=PROTECTED,
+            censuses={REPO: census_obj}, owned=owned_studio, peers=peers, **kwargs,
+        )
+        self.asked = asked
+        return decision
+
+    def test_a_declaring_live_peer_serves_the_label(self) -> None:
+        decision = self.decide(
+            census(), [capacity_floor.PeerEvidence("m5", True, "pool on, fleet ready")]
+        )
+
+        self.assertTrue(decision.allowed, decision.message)
+        self.assertFalse(decision.overridden)
+        finding = decision.findings[0]
+        self.assertEqual(finding.verdict, capacity_floor.SERVED_ELSEWHERE)
+        self.assertEqual(finding.remaining, ("m5 (mints on demand)",))
+        self.assertIn("m5 (mints on demand)", decision.message)
+
+    def test_one_live_peer_is_enough_and_every_peer_is_named(self) -> None:
+        decision = self.decide(census([runner(1, "studio-pulp-gate-01-612-7")]), [
+            capacity_floor.PeerEvidence("m1", False, "pool is draining (participating=False)"),
+            capacity_floor.PeerEvidence("m5", True, "pool on, fleet ready"),
+        ])
+
+        self.assertTrue(decision.allowed, decision.message)
+        self.assertIn("m1 not counted (pool is draining", decision.findings[0].detail)
+        self.assertIn("m5 counted", decision.findings[0].detail)
+
+    def test_declaring_peers_that_are_not_provably_live_refuse(self) -> None:
+        for why in ("pool is off (participating=False)",
+                    "pool is draining (participating=False)",
+                    "fleet problems: [{'code': 'heartbeat_stale'}]",
+                    "pool status unreadable via ssh-m5 (exit 255): Connection refused"):
+            with self.subTest(why=why):
+                decision = self.decide(census(), [capacity_floor.PeerEvidence("m5", False, why)])
+
+                self.assertFalse(decision.allowed)
+                self.assertEqual(decision.reason, capacity_floor.REASON_LAST_SERVING_HOST)
+                self.assertEqual(decision.exit_code(), capacity_floor.EXIT_LAST_SERVING_HOST)
+                self.assertIn(f"m5 not counted ({why})", decision.message)
+
+    def test_no_declaring_peer_refuses_and_says_so(self) -> None:
+        decision = self.decide(census(), [])
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, capacity_floor.REASON_LAST_SERVING_HOST)
+        self.assertIn("no other host declares a lane tier for it", decision.message)
+
+    def test_an_online_runner_elsewhere_still_serves_without_asking_peers(self) -> None:
+        decision = self.decide(
+            census([runner(2, "m5-pulp-gate-01-99-1")]),
+            [capacity_floor.PeerEvidence("m5", False, "never consulted")],
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertEqual(decision.findings[0].remaining, ("m5-pulp-gate-01-99-1",))
+        self.assertEqual(self.asked, [])
+
+    def test_a_live_peer_does_not_answer_an_unknown_census(self) -> None:
+        decision = self.decide(
+            census(unreachable=(runner_census.ORGANIZATION_SCOPE,)),
+            [capacity_floor.PeerEvidence("m5", True, "pool on, fleet ready")],
+        )
+
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.reason, capacity_floor.REASON_CAPACITY_UNKNOWN)
+
+    def test_override_still_takes_an_unserved_label_to_zero(self) -> None:
+        decision = self.decide(
+            census(), [capacity_floor.PeerEvidence("m5", False, "pool is off (participating=False)")],
+            allow_last_serving_host=True,
+        )
+
+        self.assertTrue(decision.allowed)
+        self.assertTrue(decision.overridden)
+
+
+class PeerJudgementTests(unittest.TestCase):
+    def test_a_fully_verified_peer_mints_on_demand(self) -> None:
+        self.assertIsNone(capacity_floor.peer_mints_on_demand(live_status()))
+
+    def test_every_unproven_field_disqualifies(self) -> None:
+        cases = {
+            "off": {**live_status(), "state": "off", "participating": False},
+            "draining": {**live_status(), "state": "draining", "participating": False},
+            "no fleet section": {"state": "on", "participating": True},
+            "not ready": live_status(fleet_ready=False),
+            "stale heartbeat": live_status(problems=[{"code": "heartbeat_stale"}]),
+            "supervisor down": live_status(verified_running_supervisors=1),
+            "serving blocked": live_status(serving={"blocked": True}),
+            "supply drift": live_status(config={"supply": {"state": "drift"}}),
+            "unreadable": None,
+        }
+        for name, value in cases.items():
+            with self.subTest(name=name):
+                self.assertIsNotNone(capacity_floor.peer_mints_on_demand(value))
+
+    def test_declaring_hosts_excludes_this_host_and_other_repositories(self) -> None:
+        supply = published("m5", "m1")
+        supply["registrations"].append(
+            {"host_id": "m9", "repo": "other/repo", "class_label": GATE, "labels": [GATE]}
+        )
+
+        self.assertEqual(
+            capacity_floor.declaring_hosts(supply, repo=REPO, label=GATE, exclude="studio"),
+            ("m1", "m5"),
+        )
+        self.assertEqual(
+            capacity_floor.declaring_hosts(supply, repo=REPO, label="unknown", exclude="studio"), ()
+        )
+
+
 class OwnershipTests(unittest.TestCase):
     def matcher(self, profile: dict):
         host = capacity_floor.host_identity(profile)
@@ -321,21 +487,67 @@ class ProtectedLabelTests(unittest.TestCase):
         self.assertIn(capacity_floor.Protected("o/r", "custom"), protected)
 
 
+class PeerSshDestinationTests(unittest.TestCase):
+    """A published supply's `ssh` reaches ssh argv only as a plain destination."""
+
+    def test_a_hostile_published_ssh_is_never_dialled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            marker = root / "pwned"
+            calls = root / "calls"
+            supply = published("m5", "m1")
+            supply["hosts"][1]["ssh"] = f"-oProxyCommand=touch {marker}"   # m5
+            supply_path = root / "advertised-labels.json"
+            supply_path.write_text(json.dumps(supply), encoding="utf-8")
+            ssh = root / "ssh"
+            ssh.write_text("#!/bin/bash\n"
+                           f"printf '%s\\n' \"$*\" >> {str(calls)!r}\n"
+                           f"echo {json.dumps(json.dumps(live_status()))}\n",
+                           encoding="utf-8")
+            ssh.chmod(0o755)
+            resolve = capacity_floor.peer_resolver(supply_path, host="studio", ssh=str(ssh),
+                                                   timeout=20)
+            evidence = {peer.host: peer for peer in resolve(REPO, GATE)}
+            argv = calls.read_text().splitlines()
+
+        # Negative: the hostile value is refused and never handed to ssh.
+        self.assertFalse(evidence["m5"].counted)
+        self.assertIn("refused ssh destination", evidence["m5"].why)
+        self.assertFalse(marker.exists())
+        self.assertFalse(any("ProxyCommand" in line for line in argv), argv)
+        # Positive: the plain alias is read, with "--" before it.
+        self.assertTrue(evidence["m1"].counted, evidence["m1"].why)
+        self.assertEqual(1, len(argv), argv)
+        self.assertIn("-- ssh-m1 " + capacity_floor.PEER_STATUS_COMMAND, argv[0])
+
+
 class CliTests(unittest.TestCase):
     """End-to-end through the process boundary: exit codes and stderr."""
 
-    def run_guard(self, fixture: dict, *extra: str, profile: str = PROFILE):
+    def run_guard(self, fixture: dict, *extra: str, profile: str = PROFILE,
+                  supply: dict | None = None, peers: dict | None = None):
+        # Every run gets a hermetic published supply and a fake ssh, so no test
+        # ever reads the real fleet's peers.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             gh = root / "ghapp"
             gh.write_text(FAKE_GH, encoding="utf-8")
             gh.chmod(0o755)
+            ssh = root / "ssh"
+            ssh.write_text(FAKE_SSH, encoding="utf-8")
+            ssh.chmod(0o755)
             fixture_path = root / "fixture.json"
             fixture_path.write_text(json.dumps(fixture), encoding="utf-8")
+            peers_path = root / "peers.json"
+            peers_path.write_text(json.dumps(peers or {}), encoding="utf-8")
+            supply_path = root / "advertised-labels.json"
+            supply_path.write_text(json.dumps(supply if supply is not None else published()),
+                                   encoding="utf-8")
             profile_path = root / "profile.toml"
             profile_path.write_text(profile, encoding="utf-8")
             env = os.environ.copy()
             env["FAKE_GH_FIXTURE"] = str(fixture_path)
+            env["FAKE_SSH_FIXTURE"] = str(peers_path)
             return subprocess.run(
                 [
                     sys.executable,
@@ -345,12 +557,16 @@ class CliTests(unittest.TestCase):
                     "--config", str(profile_path),
                     "--gh-cli", str(gh),
                     "--timeout", "20",
+                    "--published-supply", str(supply_path),
+                    "--ssh", str(ssh),
+                    "--peer-timeout", "20",
                     "--json",
                     *extra,
                 ],
                 capture_output=True, text=True, env=env, timeout=60,
             )
 
+    @testing_support.requires_tomllib
     def test_last_serving_host_exits_three(self) -> None:
         proc = self.run_guard({REPO_ENDPOINT: {"runners": [runner(1, "studio-pulp-gate-01-612-7")]}})
 
@@ -360,6 +576,47 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["reason"], capacity_floor.REASON_LAST_SERVING_HOST)
         self.assertIn(GATE, payload["message"])
 
+    @testing_support.requires_tomllib
+    def test_idle_fleet_with_a_live_declaring_peer_exits_zero(self) -> None:
+        proc = self.run_guard(
+            {}, supply=published("m5", "m1"),
+            peers={"ssh-m5": {"status": live_status()},
+                   "ssh-m1": {"status": {**live_status(), "state": "off",
+                                         "participating": False}}},
+        )
+
+        self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["allowed"])
+        self.assertFalse(payload["overridden"])
+        self.assertEqual(payload["findings"][0]["remaining"], ["m5 (mints on demand)"])
+        verdicts = {peer["host"]: peer["counted"] for peer in payload["findings"][0]["peers"]}
+        self.assertEqual(verdicts, {"m1": False, "m5": True})
+
+    @testing_support.requires_tomllib
+    def test_idle_fleet_whose_declaring_peers_are_unproven_exits_three(self) -> None:
+        proc = self.run_guard(
+            {}, supply=published("m5", "m1"),
+            peers={"ssh-m5": {"status": live_status(problems=[{"code": "heartbeat_stale"}])}},
+        )
+
+        self.assertEqual(proc.returncode, capacity_floor.EXIT_LAST_SERVING_HOST, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertIn("m5 not counted (fleet problems", payload["message"])
+        self.assertIn("m1 not counted (pool status unreadable via ssh-m1 (exit 255)",
+                      payload["message"])
+
+    @testing_support.requires_tomllib
+    def test_an_unreadable_published_supply_counts_no_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = str(Path(tmp) / "absent.json")
+            proc = self.run_guard({}, "--published-supply", missing,
+                                  peers={"ssh-m5": {"status": live_status()}})
+
+        self.assertEqual(proc.returncode, capacity_floor.EXIT_LAST_SERVING_HOST, proc.stderr)
+        self.assertIn("is unreadable, so no peer can be judged", json.loads(proc.stdout)["message"])
+
+    @testing_support.requires_tomllib
     def test_peer_serving_the_label_exits_zero(self) -> None:
         proc = self.run_guard(
             {
@@ -372,6 +629,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["allowed"])
 
+    @testing_support.requires_tomllib
     def test_peer_only_on_the_organization_exits_zero(self) -> None:
         proc = self.run_guard(
             {
@@ -384,6 +642,7 @@ class CliTests(unittest.TestCase):
         payload = json.loads(proc.stdout)
         self.assertEqual(payload["findings"][0]["remaining"], ["pulp-intel-macmini"])
 
+    @testing_support.requires_tomllib
     def test_unreachable_organization_scope_exits_four(self) -> None:
         proc = self.run_guard(
             {
@@ -395,6 +654,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_INDETERMINATE, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["reason"], capacity_floor.REASON_CAPACITY_UNKNOWN)
 
+    @testing_support.requires_tomllib
     def test_override_exits_zero_and_records_the_override(self) -> None:
         proc = self.run_guard(
             {REPO_ENDPOINT: {"runners": [runner(1, "studio-pulp-gate-01-612-7")]}},
@@ -406,6 +666,7 @@ class CliTests(unittest.TestCase):
         self.assertTrue(payload["allowed"])
         self.assertTrue(payload["overridden"])
 
+    @testing_support.requires_tomllib
     def test_a_profile_declaring_no_gate_label_exits_zero(self) -> None:
         profile = textwrap.dedent(
             """\
@@ -425,6 +686,7 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
         self.assertTrue(json.loads(proc.stdout)["allowed"])
 
+    @testing_support.requires_tomllib
     def test_an_unnameable_persistent_service_exits_four(self) -> None:
         profile = PROFILE.replace(
             'home = "/Users/ci"',

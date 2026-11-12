@@ -25,7 +25,25 @@ class MacosRunnerVersionTest(unittest.TestCase):
         ).strip()
 
     def test_current_default_is_reported(self) -> None:
-        self.assertEqual(self.run_print(), "2.336.0")
+        self.assertEqual(self.run_print(), "2.338.2")
+
+    def test_default_version_has_its_pinned_checksum(self) -> None:
+        source = RUNNER.read_text()
+        self.assertIn("DEFAULT_RUNNER_VERSION=2.338.2\n", source)
+        self.assertIn(
+            "DEFAULT_RUNNER_SHA256="
+            "25a065af409ffa317ab4d5a3b614dd15fc9c40f2172bc1b35a1b1258e919a388\n",
+            source,
+        )
+        self.assertIn(
+            '[ "$RUNNER_VERSION" != "$DEFAULT_RUNNER_VERSION" ] || \\\n'
+            '  RUNNER_SHA256="$DEFAULT_RUNNER_SHA256"',
+            source,
+        )
+
+    def test_retired_runner_is_not_the_default(self) -> None:
+        source = RUNNER.read_text()
+        self.assertNotIn("2.336.0", source)
 
     def test_operator_override_is_reported(self) -> None:
         self.assertEqual(

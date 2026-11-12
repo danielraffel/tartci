@@ -1,0 +1,17 @@
+# The Tart every fleet host runs (scripts/tart_pin.py). Moving it is a reviewed
+# commit: a host upgrades only with `[tart] upgrade = true` in its
+# self-update.toml, only while its pool is off, the canary first, and only when
+# the openai/tools tap offers exactly these versions with these formula
+# checksums (the sha256 of the release tarball the formula downloads, from
+# `brew info --json=v2 openai/tools/tart openai/tools/softnet`). Brew upgrades
+# Softnet with Tart, so it is pinned too.
+
+[tart]
+version = "2.41.1"
+sha256 = "e680a734febccfce7d4e910c1f7f13fc3b00f19a181c945e2d746de3214c32c2"
+formula = "openai/tools/tart"
+
+[softnet]
+version = "0.25.0"
+sha256 = "5a2e8ef779f0a2169b88d273ee806c0d64321ec7714c0dc99bf217523ae9b008"
+formula = "openai/tools/softnet"

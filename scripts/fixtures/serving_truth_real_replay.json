@@ -1,0 +1,1639 @@
+{
+  "source": "infra-review5/data m1,m3,m5,m5s",
+  "cases": {
+    "O3": [
+      {
+        "ts": "2026-10-11T10:20:34Z",
+        "event": "job_terminal_receipt",
+        "runner": "m1-pulp-gate-01",
+        "vm": "m1-pulp-gate-01-77589-8",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T10:20:56Z",
+        "event": "supervisor_signal",
+        "runner": "m1-vellum-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:21:06Z",
+        "event": "supervisor_signal",
+        "runner": "m1-pulp-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:21:07Z",
+        "event": "supervisor_signal",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:21:14Z",
+        "event": "supervisor_signal",
+        "runner": "m1-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:21:14Z",
+        "event": "supervisor_signal",
+        "runner": "m1-spectr-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:22:52Z",
+        "event": "job_assigned",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "m5studio-pulp-gate-slot2-02-93988-6",
+        "detail": "2026-10-11 10:20:33Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:23:01Z",
+        "event": "job_assigned",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "m5studio-pulp-gate-01-93939-10",
+        "detail": "2026-10-11 10:21:12Z: Running job: Smoke darwin-arm64"
+      },
+      {
+        "ts": "2026-10-11T10:23:07Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "m5studio-pulp-gate-01-93939-10",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : lock_contention: host queue observation lock backoff active for 16.1s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-11T10:25:03Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:25:45Z",
+        "event": "job_terminal_receipt",
+        "runner": "studio-pulp-gate-01",
+        "vm": "studio-pulp-gate-01-90008-121",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T10:26:49Z",
+        "event": "admission_precheck",
+        "runner": "m1-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:27:54Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:28:37Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T10:31:43Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-21",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T10:32:05Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "m5studio-pulp-gate-slot2-02-93988-6",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Failed rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T10:32:17Z",
+        "event": "supervisor_signal",
+        "runner": "m5studio-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:32:17Z",
+        "event": "supervisor_signal",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:32:17Z",
+        "event": "supervisor_signal",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:32:17Z",
+        "event": "supervisor_signal",
+        "runner": "m5studio-spectr-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:32:17Z",
+        "event": "supervisor_signal",
+        "runner": "m5studio-vellum-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:32:27Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:34:08Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:35:34Z",
+        "event": "admission_precheck",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T10:35:59Z",
+        "event": "job_assigned",
+        "runner": "m1-pulp-gate-01",
+        "vm": "m1-pulp-gate-01-88470-1",
+        "detail": "2026-10-11 10:35:04Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:36:04Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-25",
+        "detail": "2026-10-11 10:29:45Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:36:23Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T10:36:59Z",
+        "event": "supervisor_signal",
+        "runner": "",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T10:39:10Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-22",
+        "detail": "2026-10-11 10:37:13Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:43:37Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-25",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Failed rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T10:43:47Z",
+        "event": "admission_precheck",
+        "runner": "m5-spectr-gate-01",
+        "vm": "",
+        "detail": "repo=danielraffel/spectr labels=self-hosted,macOS,ARM64,spectr-build,spectr-build-vm,spectr-gate-fast"
+      },
+      {
+        "ts": "2026-10-11T10:44:51Z",
+        "event": "job_assigned",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "m1-pulp-gate-slot2-02-88489-3",
+        "detail": "2026-10-11 10:44:20Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:45:21Z",
+        "event": "job_assigned",
+        "runner": "m5-spectr-gate-01",
+        "vm": "m5-spectr-gate-01-66264-18",
+        "detail": "2026-10-11 10:45:11Z: Running job: Spectr M5 product-acceptance gate"
+      },
+      {
+        "ts": "2026-10-11T10:47:13Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-spectr-gate-01",
+        "vm": "m5-spectr-gate-01-66264-18",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : failure , job_id :114450272917, job_status : completed , kind : terminal , run_conclusion : failure , run_id :38132745033, run_status : completed , runner_name : m5-spectr-gate-01-66264-18 , workflow_id :346341734, workflow_name : Spectr M5 Product Acceptance }"
+      },
+      {
+        "ts": "2026-10-11T10:47:23Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T10:51:33Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-26",
+        "detail": "2026-10-11 10:49:49Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T10:58:30Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-22",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : GitHub API failed for repos/Generous-Corp/pulp/actions/runs/38132298041: timed out after 0.16179s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-11T10:58:51Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      }
+    ],
+    "O9": [
+      {
+        "ts": "2026-10-11T15:51:25Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-38",
+        "detail": "2026-10-11 15:45:08Z: Running job: iOS compile gate (nightly, main)"
+      },
+      {
+        "ts": "2026-10-11T15:51:31Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-38",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T15:51:54Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T15:51:57Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-47",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : success , job_id :114505349091, job_status : completed , kind : terminal , run_conclusion : success , run_id :38151336226, run_status : completed , runner_name : m5-pulp-gate-slot2-02-66223-47 , workflow_id :256999733, workflow_name : Build and Test }"
+      },
+      {
+        "ts": "2026-10-11T15:53:05Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T16:00:23Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-39",
+        "detail": "2026-10-11 15:54:04Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T16:00:48Z",
+        "event": "supervisor_signal",
+        "runner": "m1-vellum-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:00:53Z",
+        "event": "supervisor_signal",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:00:53Z",
+        "event": "supervisor_signal",
+        "runner": "m1-spectr-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:00:57Z",
+        "event": "supervisor_signal",
+        "runner": "m1-pulp-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:00:59Z",
+        "event": "supervisor_signal",
+        "runner": "m1-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:03:58Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-48",
+        "detail": "2026-10-11 15:57:42Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T16:04:31Z",
+        "event": "job_terminal_receipt",
+        "runner": "studio-pulp-gate-01",
+        "vm": "studio-pulp-gate-01-85824-5",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T16:05:47Z",
+        "event": "admission_precheck",
+        "runner": "m1-spectr-gate-01",
+        "vm": "",
+        "detail": "repo=danielraffel/spectr labels=self-hosted,macOS,ARM64,spectr-build,spectr-build-vm,spectr-gate-fast"
+      },
+      {
+        "ts": "2026-10-11T16:07:15Z",
+        "event": "admission_precheck",
+        "runner": "m1-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T16:08:29Z",
+        "event": "supervisor_signal",
+        "runner": "studio-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:08:29Z",
+        "event": "supervisor_signal",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:08:29Z",
+        "event": "supervisor_signal",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:08:29Z",
+        "event": "supervisor_signal",
+        "runner": "studio-spectr-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:08:29Z",
+        "event": "supervisor_signal",
+        "runner": "studio-vellum-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-11T16:10:23Z",
+        "event": "job_assigned",
+        "runner": "m1-spectr-gate-01",
+        "vm": "m1-spectr-gate-01-19404-1",
+        "detail": "2026-10-11 16:09:45Z: Running job: Spectr M5 product-acceptance gate"
+      },
+      {
+        "ts": "2026-10-11T16:12:50Z",
+        "event": "job_assigned",
+        "runner": "m1-pulp-gate-01",
+        "vm": "m1-pulp-gate-01-19366-1",
+        "detail": "2026-10-11 16:10:25Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T16:12:53Z",
+        "event": "job_terminal_receipt",
+        "runner": "m1-spectr-gate-01",
+        "vm": "m1-spectr-gate-01-19404-1",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Failed rerun_eligible=false receipt={ detail : api_timeout: current_job_github_api:timeout:timed out after 4.0s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-11T16:15:31Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-39",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Succeeded rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T16:16:20Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T16:17:34Z",
+        "event": "admission_precheck",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-11T16:19:37Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-48",
+        "detail": "runner_rc=0 observation=budget_exhausted evidence=runner_local result=Failed rerun_eligible=false receipt={ kind : budget_exhausted }"
+      },
+      {
+        "ts": "2026-10-11T16:20:14Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-40",
+        "detail": "2026-10-11 16:18:31Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T16:20:33Z",
+        "event": "admission_precheck",
+        "runner": "m5-spectr-gate-01",
+        "vm": "",
+        "detail": "repo=danielraffel/spectr labels=self-hosted,macOS,ARM64,spectr-build,spectr-build-vm,spectr-gate-fast"
+      },
+      {
+        "ts": "2026-10-11T16:22:14Z",
+        "event": "job_assigned",
+        "runner": "m5-spectr-gate-01",
+        "vm": "m5-spectr-gate-01-66264-20",
+        "detail": "2026-10-11 16:22:01Z: Running job: Spectr M5 product-acceptance gate"
+      },
+      {
+        "ts": "2026-10-11T16:24:10Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-spectr-gate-01",
+        "vm": "m5-spectr-gate-01-66264-20",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : failure , job_id :114515953594, job_status : completed , kind : terminal , run_conclusion : failure , run_id :38154967893, run_status : completed , runner_name : m5-spectr-gate-01-66264-20 , workflow_id :346341734, workflow_name : Spectr M5 Product Acceptance }"
+      },
+      {
+        "ts": "2026-10-11T16:24:21Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-11T16:25:42Z",
+        "event": "job_assigned",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "m1-pulp-gate-slot2-02-19385-1",
+        "detail": "2026-10-11 16:23:18Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-11T16:28:13Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-49",
+        "detail": "2026-10-11 16:26:40Z: Running job: macos"
+      }
+    ],
+    "O10": [
+      {
+        "ts": "2026-10-12T03:20:42Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-spectr-gate-01",
+        "vm": "m5-spectr-gate-01-66264-34",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : host queue observation lock timed out after 30.0s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-12T03:20:49Z",
+        "event": "job_assigned",
+        "runner": "studio-pulp-gate-01",
+        "vm": "studio-pulp-gate-01-47043-25",
+        "detail": "2026-10-12 03:19:30Z: Running job: CLI darwin-x64"
+      },
+      {
+        "ts": "2026-10-12T03:20:57Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-88",
+        "detail": "2026-10-12 03:17:45Z: Running job: iOS compile gate \u2014 v0.954.0"
+      },
+      {
+        "ts": "2026-10-12T03:21:11Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-12T03:23:46Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-79",
+        "detail": "2026-10-12 03:22:42Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-12T03:24:55Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T03:25:57Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T03:26:32Z",
+        "event": "job_terminal_receipt",
+        "runner": "m1-pulp-gate-slot2-02",
+        "vm": "m1-pulp-gate-slot2-02-34131-6",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : api_timeout: current_job_github_api:timeout:timed out after 4.0s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-12T03:29:28Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-91",
+        "detail": "2026-10-12 03:27:19Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-12T03:36:48Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T03:37:00Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-91",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : cancelled , job_id :114649311746, job_status : completed , kind : terminal , run_conclusion : cancelled , run_id :38199405025, run_status : completed , runner_name : m5-pulp-gate-slot2-02-66223-91 , workflow_id :256999733, workflow_name : Build and Test }"
+      },
+      {
+        "ts": "2026-10-12T03:37:41Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T03:37:50Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T03:41:34Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-92",
+        "detail": "2026-10-12 03:40:28Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-12T03:42:49Z",
+        "event": "job_assigned",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "studio-pulp-gate-slot2-02-47084-23",
+        "detail": "2026-10-12 03:39:11Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-12T03:52:55Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-66204-79",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : success , job_id :114648453748, job_status : completed , kind : terminal , run_conclusion : success , run_id :38199130445, run_status : completed , runner_name : m5-pulp-gate-01-66204-79 , workflow_id :256999733, workflow_name : Build and Test }"
+      },
+      {
+        "ts": "2026-10-12T03:55:43Z",
+        "event": "job_terminal_receipt",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "studio-pulp-gate-slot2-02-47084-23",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : success , job_id :114651992278, job_status : completed , kind : terminal , run_conclusion : success , run_id :38200268522, run_status : completed , runner_name : studio-pulp-gate-slot2-02-47084-23 , workflow_id :256999733, workflow_name : Build and Test }"
+      },
+      {
+        "ts": "2026-10-12T03:56:26Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-66223-92",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : failure , job_id :114652508994, job_status : completed , kind : terminal , run_conclusion : failure , run_id :38200414767, run_status : completed , runner_name : m5-pulp-gate-slot2-02-66223-92 , workflow_id :256999733, workflow_name : Build and Test }"
+      }
+    ],
+    "roll": [
+      {
+        "ts": "2026-10-12T17:10:10Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:10:16Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:10:21Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:10:24Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-12T17:10:26Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:10:40Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:10:46Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:11:14Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:11:21Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:11:37Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-12T17:11:57Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:12:01Z",
+        "event": "job_assigned",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "m5studio-pulp-gate-slot2-02-5332-392",
+        "detail": "2026-10-12 17:11:34Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-12T17:12:05Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:12:33Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:12:41Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:13:09Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:13:16Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:13:17Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:13:23Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:13:45Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:13:45Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:13:48Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:13:50Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:13:53Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:13:53Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:14:14Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:14:19Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:14:20Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:14:25Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:14:32Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:14:37Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:14:39Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:14:46Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:14:47Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:14:53Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:03Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:04Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:09Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:11Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:13Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:15Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:18Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:19Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:22Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:22Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:34Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:39Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:40Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:46Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:15:50Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:15:57Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:16:06Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:16:12Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:16:17Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:16:23Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:16:46Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:16:49Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:16:51Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:16:55Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:01Z",
+        "event": "supervisor_signal",
+        "runner": "m1-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-12T17:17:07Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:09Z",
+        "event": "supervisor_signal",
+        "runner": "m1-forge-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-12T17:17:12Z",
+        "event": "supervisor_signal",
+        "runner": "m1-vellum-gate-01",
+        "vm": "",
+        "detail": "INT/TERM quarantine=none"
+      },
+      {
+        "ts": "2026-10-12T17:17:13Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:15Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:20Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:21Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:26Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:39Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:43Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:45Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:48Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:17:53Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:17:58Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:18:11Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:18:11Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:18:16Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:18:17Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:18:40Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:18:44Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:18:46Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:18:50Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:19:00Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:19:05Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:19:34Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:19:40Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:19:48Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:19:53Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:20:07Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:20:12Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:20:19Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:20:24Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:20:27Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:20:33Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:20:35Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:20:40Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:20:52Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:20:58Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:21:04Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:21:08Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:21:09Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:21:14Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:21:25Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:21:32Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:21:33Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:21:37Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:21:45Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:21:52Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:01Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:06Z",
+        "event": "admission_precheck_error",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:08Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:13Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:13Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:21Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:23Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:27Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:36Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:38Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-12T17:22:43Z",
+        "event": "admission_precheck_error",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      },
+      {
+        "ts": "2026-10-12T17:22:43Z",
+        "event": "admission_precheck_error",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "rc=1 pre_clone=true reason=observation_failed error=open PR list failed: gh pr list --repo Generous-Corp/pulp --state open --base main --limit 1000 --json id,number,isDraft..."
+      }
+    ],
+    "quiet": [
+      {
+        "ts": "2026-10-08T11:08:42Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:08:46Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:09:11Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:13:16Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-17670-80",
+        "detail": "2026-10-08 11:11:24Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-08T11:19:04Z",
+        "event": "job_assigned",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "studio-pulp-gate-slot2-02-28559-49",
+        "detail": "2026-10-08 11:17:03Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-08T11:23:46Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:25:15Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:26:01Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T11:27:44Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-08T11:27:59Z",
+        "event": "job_assigned",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "m5-pulp-gate-slot2-02-79776-35",
+        "detail": "2026-10-08 11:26:39Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-08T11:28:08Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5-pulp-gate-01",
+        "vm": "m5-pulp-gate-01-17670-80",
+        "detail": "runner_rc=0 observation=observation_error evidence=runner_local result=Succeeded rerun_eligible=false receipt={ detail : GitHub API failed for repos/Generous-Corp/pulp/actions/jobs/113280328892: timed out after 4s , kind : observation_error }"
+      },
+      {
+        "ts": "2026-10-08T11:28:10Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-08T11:28:57Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-merge-group"
+      },
+      {
+        "ts": "2026-10-08T11:32:01Z",
+        "event": "job_assigned",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "m5studio-pulp-gate-slot2-02-86021-82",
+        "detail": "2026-10-08 11:30:42Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-08T11:45:03Z",
+        "event": "job_terminal_receipt",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "m5studio-pulp-gate-slot2-02-86021-82",
+        "detail": "runner_rc=0 observation=terminal evidence=github_api rerun_eligible=false receipt={ conclusion : success , job_id :113287417008, job_status : completed , kind : terminal , run_conclusion : success , run_id :37770081480, run_status : completed , runner_name : m5studio-pulp-gate-slot2-02-86021-82 , workflow_id :256999733, workflow_name : Build and Test }"
+      },
+      {
+        "ts": "2026-10-08T12:47:51Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T12:48:01Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T12:49:42Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T12:52:55Z",
+        "event": "job_assigned",
+        "runner": "studio-pulp-gate-slot2-02",
+        "vm": "studio-pulp-gate-slot2-02-28559-51",
+        "detail": "2026-10-08 12:51:22Z: Running job: macos"
+      },
+      {
+        "ts": "2026-10-08T12:56:37Z",
+        "event": "admission_precheck",
+        "runner": "m5studio-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T12:57:05Z",
+        "event": "admission_precheck",
+        "runner": "studio-pulp-gate-01",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      },
+      {
+        "ts": "2026-10-08T12:57:36Z",
+        "event": "admission_precheck",
+        "runner": "m5-pulp-gate-slot2-02",
+        "vm": "",
+        "detail": "repo=Generous-Corp/pulp labels=self-hosted,macOS,ARM64,pulp-build,pulp-build-vm,pulp-build-pr-head"
+      }
+    ]
+  }
+}

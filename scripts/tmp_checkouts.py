@@ -1,0 +1,855 @@
+#!/usr/bin/env python3
+"""Remove finished git checkouts from /tmp and the worktree root; report the rest.
+
+Why this exists: agents create Pulp worktrees and clones under /private/tmp
+although the host rule forbids it (pulp_reapers.TMP_WORKTREE_RULE). /tmp is on
+the boot volume, outside every reaper root, so they pile up where nothing
+looks: m5 held 432 git checkouts there on 2026-09-27. The reclaim lane already
+counted them (`worktrees_in_tmp`) and never removed one.
+
+A checkout directly under the scan root is removed only when every gate holds:
+
+  * no process has its cwd inside it and no live build command line names it;
+  * it has been idle for `tmp_checkout_idle_hours` (default 48): the newest
+    mtime of the directory, its top-level entries, and its git index/HEAD;
+  * `git status --porcelain` is empty (untracked files count as dirty);
+  * HEAD is reachable from a remote-tracking ref (or, when those are stale,
+    `git fetch origin main` makes it so, or `git ls-remote origin` advertises its
+    exact SHA, pull refs included; any failure keeps it), and for a plain clone so is
+    every local branch, and the clone has no stash;
+  * a worktree is removed with `git worktree remove` WITHOUT --force, so git's
+    own refusals (submodules, locks, dirt) stand and are reported;
+  * a plain clone (a `.git` directory) is removed with rmtree.
+
+A worktree whose parent repository is gone (its `.git` file points at a
+gitdir that no longer exists) is ORPHANED, and a `.git` directory without a
+HEAD is BROKEN (m5 held 72 such husks). Both are reported, never removed,
+because git can no longer tell us whether they hold unpushed work.
+
+Anything that cannot be measured (lsof, git, a stat) keeps the checkout. The
+pass also has a time budget; checkouts it did not reach are counted as
+`deferred`, never as kept-for-cause.
+
+The same rules apply to the host's worktree root (`worktrees_root`, the
+directory PULP_WORKTREES_ROOT names), where agents are supposed to put their
+checkouts. On m3 on 2026-09-29 it held 1,026 entries and 1.8 TiB, 622 GiB of it
+created in the two days after 09-27, while the Workshop volume went from 70% to
+84% and its I/O stalled. There, three more gates apply to every root:
+
+  * a checkout whose `.pulp-build-active` marker names a live pid is in use;
+  * a clone other worktrees point into is kept (`has_worktrees`): removing it
+    would orphan them;
+  * a branch Pulp's worktree lineage marks `active` is kept (`lineage_active`):
+    its owner decides.
+
+A host whose agents also leave worktrees in a directory that holds real clones
+(m5s's internal ~/Code: 229 worktrees of an old primary checkout, 923 GiB,
+after its worktree root moved to /Volumes/<data-volume>) names it in
+`extra_worktree_roots`. There only linked worktrees are eligible, under every
+gate above; a plain clone is always kept (`clone_in_shared_root`), because in
+a developer's Code directory a clone is someone's checkout, not scratch.
+
+A pass that runs out of budget resumes where it stopped. The checkouts are
+walked in name order starting just after the last one the previous pass
+examined (`scan-cursors.json` next to the verdict cache), wrapping around, so
+the ones a pass deferred are the first the next pass reaches. Without it every
+pass restarted at the top of the alphabet: on m3 each hourly pass re-examined
+the same ~160 of 1,384 checkouts and never reached the other 1,226.
+
+Keep-verdicts that only a change to the checkout can reverse are cached
+(~/.tartci/state/reclaim/checkout-verdicts.json) while the checkout's newest
+mtime is unchanged, for at most a day, so hundreds of idle checkouts are not
+re-`git status`ed every hour. A stale cached verdict can only keep a checkout.
+
+Opt-in per host through the installed fleet profile:
+
+    [reclaim]
+    tmp_checkouts = true              # /private/tmp
+    worktree_root_checkouts = true    # reclaim.worktrees_root
+    tmp_checkout_idle_hours = 48      # optional, 24..720
+    extra_worktree_roots = ["/Users/me/Code"]   # optional; worktrees only
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import pathlib
+import signal
+import shutil
+import subprocess
+import time
+from typing import Any, Callable
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - launchd hosts run 3.11+
+    tomllib = None  # type: ignore[assignment]
+
+import merged_checkouts  # noqa: E402
+
+DEFAULT_ROOT = "/private/tmp"
+DEFAULT_IDLE_HOURS = 48
+MIN_IDLE_HOURS = 24
+MAX_IDLE_HOURS = 720
+GIT_TIMEOUT_S = 120
+DU_TIMEOUT_S = 60
+PASS_BUDGET_S = 1200
+LIST_LIMIT = 20
+# Keep-verdicts that only a change to the checkout can reverse. A verdict is
+# reused while the checkout's newest mtime is unchanged, for at most a day, so
+# a worktree root of hundreds of checkouts is not re-`git status`ed hourly.
+# A stale cached verdict can only keep a checkout longer, never remove one.
+CACHEABLE = frozenset({"dirty", "unpushed", "stash", "has_worktrees", "lineage_active"})
+CACHE_TTL_S = 24 * 3600
+
+Runner = Callable[..., subprocess.CompletedProcess]
+
+
+def _bounded_git(argv: list[str], *, timeout: float,
+                 env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run git without letting timed-out metadata wedge the janitor.
+
+    ``subprocess.run(timeout=...)`` kills the direct child and then waits for
+    its pipes to close. A git helper stuck in filesystem metadata can keep an
+    inherited pipe open after the parent is killed, so that cleanup wait can
+    hang the whole hourly reclaim process. Put git in its own process group,
+    kill the group on timeout, and return without a second unbounded wait.
+    """
+    proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=env,
+                            start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        # Reap when the kernel allows it, but never let cleanup turn the
+        # timeout into a second hang. A process in uninterruptible I/O may
+        # remain until the volume recovers; this pass must still return.
+        try:
+            proc.wait(timeout=0.2)
+        except subprocess.TimeoutExpired:
+            pass
+        raise subprocess.TimeoutExpired(argv, timeout,
+                                        output=exc.output or "",
+                                        stderr=exc.stderr or "") from None
+    return subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+
+
+def validate(table: dict[str, Any]) -> list[str]:
+    """Problems with the tmp_checkouts keys of a `[reclaim]` table."""
+    problems = []
+    enabled = table.get("tmp_checkouts", False)
+    if type(enabled) is not bool:
+        problems.append("reclaim.tmp_checkouts must be a boolean")
+    idle = table.get("tmp_checkout_idle_hours", DEFAULT_IDLE_HOURS)
+    if type(idle) is not int or not MIN_IDLE_HOURS <= idle <= MAX_IDLE_HOURS:
+        problems.append("reclaim.tmp_checkout_idle_hours must be an integer from "
+                        f"{MIN_IDLE_HOURS} through {MAX_IDLE_HOURS}")
+    root = table.get("worktree_root_checkouts", False)
+    if type(root) is not bool:
+        problems.append("reclaim.worktree_root_checkouts must be a boolean")
+    elif root and not isinstance(table.get("worktrees_root"), str):
+        problems.append("reclaim.worktree_root_checkouts needs reclaim.worktrees_root")
+    extra = table.get("extra_worktree_roots", [])
+    if not isinstance(extra, list) or not all(
+            isinstance(r, str) and r.startswith("/") and r.rstrip("/")
+            and ".." not in r.split("/") for r in extra):
+        problems.append("reclaim.extra_worktree_roots must be a list of absolute paths "
+                        "other than /")
+    problems.extend(merged_checkouts.validate(table))
+    return problems
+
+
+def load_settings(profile: pathlib.Path) -> tuple[dict[str, Any] | None, str]:
+    """The enabled settings, else (None, why it is off)."""
+    if tomllib is None:
+        return None, "no tomllib (needs Python 3.11+)"
+    try:
+        with profile.open("rb") as handle:
+            data = tomllib.load(handle)
+    except FileNotFoundError:
+        return None, f"no installed fleet profile at {profile}"
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        return None, f"fleet profile unreadable: {exc}"
+    settings, why = settings_from_table(data.get("reclaim"), str(profile))
+    if settings is not None:
+        settings["scan_app_env"] = merged_checkouts.scan_app_env(data)
+    return settings, why
+
+
+def settings_from_table(table: Any, where: str) -> tuple[dict[str, Any] | None, str]:
+    """`load_settings` past the TOML read, so a test can hand it a table."""
+    merged = (merged_checkouts.settings(table) if isinstance(table, dict)
+              and not validate(table) else None)
+    if not isinstance(table, dict) or (table.get("tmp_checkouts") is not True
+                                       and table.get("worktree_root_checkouts") is not True
+                                       and not table.get("extra_worktree_roots")
+                                       and merged is None):
+        return None, (f"neither [reclaim] tmp_checkouts nor worktree_root_checkouts "
+                      f"is true, no extra_worktree_roots and no worktrees_root, in {where}")
+    problems = validate(table)
+    if problems:
+        return None, "; ".join(problems)
+    roots = []
+    if table.get("tmp_checkouts") is True:
+        roots.append(os.environ.get("TARTCI_TMP_CHECKOUT_ROOT", DEFAULT_ROOT))
+    if table.get("worktree_root_checkouts") is True:
+        roots.append(table["worktrees_root"])
+    extra = [r for r in table.get("extra_worktree_roots", []) if r not in roots]
+    return {"idle_hours": table.get("tmp_checkout_idle_hours", DEFAULT_IDLE_HOURS),
+            "roots": roots + extra, "worktrees_only": extra, "merged": merged}, "enabled"
+
+
+def process_cwds(runner: Runner = subprocess.run) -> list[str] | None:
+    """Every process cwd on the host, or None when lsof could not answer."""
+    try:
+        proc = runner(["lsof", "-w", "-d", "cwd", "-Fn"], capture_output=True, text=True,
+                      timeout=GIT_TIMEOUT_S, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    cwds = [line[1:] for line in proc.stdout.splitlines() if line.startswith("n/")]
+    # lsof exits 1 when some processes could not be inspected; an empty
+    # listing is never a real answer on a live host (lsof itself has a cwd).
+    if not cwds:
+        return None
+    return cwds
+
+
+def _inside(path: str, spellings: set[str]) -> bool:
+    return any(path == s or path.startswith(s + os.sep) for s in spellings)
+
+
+def _spellings(path: pathlib.Path) -> set[str]:
+    out = {str(path)}
+    try:
+        out.add(str(path.resolve()))
+    except OSError:
+        pass
+    # /tmp is a symlink to /private/tmp on macOS; either may appear.
+    for spelling in list(out):
+        if spelling.startswith("/private/tmp/"):
+            out.add(spelling[len("/private"):])
+        elif spelling.startswith("/tmp/"):
+            out.add("/private" + spelling)
+    return out
+
+
+def _git(path: pathlib.Path, *args: str, runner: Runner) -> subprocess.CompletedProcess:
+    # --no-optional-locks: `git status` must not refresh the index, or asking
+    # would itself make the checkout look recently used (the idle gate reads
+    # the index mtime) and hide it from the next pass for another 48 h.
+    argv = ["git", "--no-optional-locks", "-C", str(path), *args]
+    if runner is subprocess.run:
+        return _bounded_git(argv, timeout=GIT_TIMEOUT_S)
+    return runner(argv, capture_output=True, text=True,
+                  timeout=GIT_TIMEOUT_S, check=False)
+
+
+def gitdir_of(checkout: pathlib.Path) -> tuple[str, pathlib.Path | None]:
+    """("clone"|"worktree"|"orphan"|"broken"|"unreadable", the usable gitdir).
+
+    "broken" is a `.git` directory git no longer recognises (no HEAD): a husk
+    left by an interrupted clone or removal, which git cannot vouch for.
+    """
+    dot_git = checkout / ".git"
+    if dot_git.is_dir() and not dot_git.is_symlink():
+        if not (dot_git / "HEAD").is_file():
+            return "broken", None
+        return "clone", dot_git
+    try:
+        text = dot_git.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "unreadable", None
+    line = next((ln for ln in text.splitlines() if ln.startswith("gitdir:")), None)
+    if line is None:
+        return "unreadable", None
+    target = pathlib.Path(line[len("gitdir:"):].strip())
+    if not target.is_absolute():
+        target = checkout / target
+    if not target.is_dir():
+        return "orphan", None
+    return "worktree", target
+
+
+def newest_mtime(checkout: pathlib.Path, gitdir: pathlib.Path) -> float | None:
+    """Newest mtime of the checkout, its top-level entries and git HEAD/index."""
+    newest = 0.0
+    try:
+        newest = checkout.stat().st_mtime
+        for entry in os.scandir(checkout):
+            newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+    except OSError:
+        return None
+    for name in ("index", "HEAD", "logs/HEAD"):
+        try:
+            newest = max(newest, (gitdir / name).stat().st_mtime)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return newest
+
+
+def head_is_on_origin(checkout: pathlib.Path, runner: Runner) -> bool:
+    """True only when origin itself proves HEAD is published.
+
+    The local remote-tracking refs go stale on a host that never fetches, so a
+    worktree whose branch merged long ago looks unpushed. Two read-mostly
+    checks settle it, and any failure or doubt answers False (keep):
+
+      * `git fetch origin main`, then HEAD is reachable from a remote-tracking
+        ref (an ancestor of origin/main, or still on a fetched branch);
+      * `git ls-remote origin` advertises HEAD's exact SHA on some ref (a
+        pushed branch whose tracking ref was never fetched, or refs/pull/N/head).
+
+    Work that exists only in this checkout appears in neither, so it stays.
+    A timeout propagates to the caller, which keeps the checkout.
+    """
+    sha = _git(checkout, "rev-parse", "HEAD", runner=runner)
+    if sha.returncode != 0 or not sha.stdout.strip():
+        return False
+    # Without --no-optional-locks: fetch only touches the shared object store
+    # and refs, never this checkout's index/HEAD, so the idle gate is unaffected.
+    fetched = _git(checkout, "fetch", "-q", "origin", "main", runner=runner)
+    if fetched.returncode == 0:
+        again = _git(checkout, "rev-list", "-1", "HEAD", "--not", "--remotes", runner=runner)
+        if again.returncode == 0 and not again.stdout.strip():
+            return True
+    listed = _git(checkout, "ls-remote", "origin", runner=runner)
+    if listed.returncode != 0:
+        return False
+    target = sha.stdout.strip()
+    return any(line.split("\t", 1)[0] == target for line in listed.stdout.splitlines())
+
+
+def unpushed_reason(checkout: pathlib.Path, kind: str, runner: Runner) -> str | None:
+    """Why this checkout still holds work the remotes do not, or None.
+
+    The gitdir exists (the caller checked), so a git failure here is a real
+    refusal to answer and keeps the checkout.
+    """
+    status = _git(checkout, "status", "--porcelain", runner=runner)
+    if status.returncode != 0:
+        return "git_error"
+    if status.stdout.strip():
+        return "dirty"
+    head = _git(checkout, "rev-list", "-1", "HEAD", "--not", "--remotes", runner=runner)
+    if head.returncode != 0:
+        return "git_error"
+    if head.stdout.strip() and not head_is_on_origin(checkout, runner):
+        return "unpushed"
+    if kind == "clone":
+        # A worktree's other branches and stash live in its parent repository,
+        # which is not being removed; a clone's live nowhere else.
+        branches = _git(checkout, "rev-list", "-1", "--branches", "--not", "--remotes",
+                        runner=runner)
+        if branches.returncode != 0:
+            return "git_error"
+        if branches.stdout.strip():
+            return "unpushed"
+        stash = _git(checkout, "stash", "list", runner=runner)
+        if stash.returncode != 0:
+            return "git_error"
+        if stash.stdout.strip():
+            return "stash"
+    return None
+
+
+def size_bytes(path: pathlib.Path, runner: Runner) -> int | None:
+    try:
+        proc = runner(["du", "-sk", str(path)], capture_output=True, text=True,
+                      timeout=DU_TIMEOUT_S, check=False)
+        return int(proc.stdout.split()[0]) * 1024
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def remove(checkout: pathlib.Path, kind: str, gitdir: pathlib.Path,
+           runner: Runner) -> str | None:
+    """Remove one checkout; returns the refusal, or None when it is gone."""
+    if kind == "worktree":
+        common = _git(checkout, "rev-parse", "--path-format=absolute", "--git-common-dir",
+                      runner=runner)
+        if common.returncode != 0 or not common.stdout.strip():
+            return "git_error"
+        argv = ["git", "--git-dir", common.stdout.strip(), "worktree", "remove",
+                str(checkout)]
+        proc = (_bounded_git(argv, timeout=GIT_TIMEOUT_S)
+                if runner is subprocess.run else
+                runner(argv, capture_output=True, text=True,
+                       timeout=GIT_TIMEOUT_S, check=False))
+        if proc.returncode != 0 or checkout.exists():
+            return "worktree_remove_refused"
+        return None
+    try:
+        shutil.rmtree(checkout)
+    except OSError:
+        return "remove_failed"
+    return None
+
+
+def build_marker_live(checkout: pathlib.Path) -> bool:
+    """Pulp's governed build writes `.pulp-build-active` (pid=...) at the tree
+    root while it runs; a live pid there is a build in progress."""
+    try:
+        text = (checkout / ".pulp-build-active").read_text(errors="replace")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if line.startswith("pid="):
+            try:
+                os.kill(int(line[4:].strip()), 0)
+            except (ValueError, ProcessLookupError):
+                return False
+            except PermissionError:
+                return True
+            return True
+    return False
+
+
+def holds_worktrees(gitdir: pathlib.Path, kind: str) -> str | None:
+    """A clone that other worktrees point into is their repository: removing
+    it would orphan every one of them."""
+    if kind != "clone":
+        return None
+    registered = gitdir / "worktrees"
+    try:
+        return "has_worktrees" if registered.is_dir() and any(registered.iterdir()) else None
+    except OSError:
+        return "has_worktrees"
+
+
+def lineage_active(checkout: pathlib.Path, runner: Runner) -> str | None:
+    """Pulp's worktree lineage (tools/scripts/worktree_lineage.sh) marks a
+    branch `active` while an agent owns it; that owner decides, not us."""
+    branch = _git(checkout, "symbolic-ref", "--short", "-q", "HEAD", runner=runner).stdout.strip()
+    if not branch:
+        return None
+    status = _git(checkout, "config", "--get", f"branch.{branch}.pulpWorktreeStatus",
+                  runner=runner).stdout.strip()
+    return "lineage_active" if status == "active" else None
+
+
+def scan(root: pathlib.Path, *, fix: bool, idle_hours: int,
+         in_use: Callable[[pathlib.Path], bool] | None,
+         runner: Runner = subprocess.run, now: float | None = None,
+         budget_s: float = PASS_BUDGET_S, cwds: list[str] | None | bool = True,
+         cache: dict | None = None, next_cache: dict | None = None,
+         worktrees_only: bool = False, resume_after: str | None = None,
+         merged: "merged_checkouts.Proof | None" = None,
+         ) -> dict[str, Any]:
+    """One pass over the git checkouts directly under `root`.
+
+    `worktrees_only` keeps every plain clone (an extra_worktree_roots root).
+    `resume_after` is the name of the last checkout the previous pass
+    examined; this pass starts at the next name and wraps around. The report's
+    `next_cursor` is the value to hand the next pass: the last checkout this
+    pass examined when the budget deferred some, else None (a full sweep).
+
+    `in_use` is the caller's live-build test (None when the process table
+    could not be read, which removes nothing). `cwds` defaults to lsof.
+    `cache` holds earlier keep-verdicts, `next_cache` receives this pass's.
+
+    `merged` switches the root to the merged rule (merged_checkouts.py): HEAD
+    must have landed rather than merely be pushed, any running command line
+    naming the checkout keeps it, and a squash-landed checkout is queued on
+    `merged.pending` for the pass's one PR read (tmp_checkouts.run finishes it).
+    `idle_hours` is then the merged rule's own gate.
+    """
+    now = time.time() if now is None else now
+    started = time.monotonic()
+    report: dict[str, Any] = {
+        "root": str(root), "mode": "fix" if fix else "dry-run", "idle_hours": idle_hours,
+        "checkouts": 0, "removed": 0, "removed_bytes": 0, "removed_paths": [],
+        "kept": {}, "deferred": 0, "orphaned_worktrees": 0, "orphaned_paths": [],
+        "broken_checkouts": 0, "broken_paths": [],
+        "resumed_after": resume_after, "next_cursor": None,
+    }
+    if merged is not None:
+        report["rule"] = "merged"
+    if cwds is True:
+        cwds = process_cwds(runner)
+    blind = in_use is None or cwds is None or (merged is not None and merged.commands is None)
+    if blind:
+        report["error"] = ("process table unreadable (lsof or pgrep), so no checkout "
+                           "could be proven idle; removed nothing")
+
+    def keep(reason: str) -> None:
+        report["kept"][reason] = report["kept"].get(reason, 0) + 1
+
+    try:
+        entries = sorted(os.scandir(root), key=lambda e: e.name)
+    except OSError as exc:
+        report["error"] = f"cannot list {root}: {exc}"
+        return report
+    if resume_after is not None:
+        entries = ([e for e in entries if e.name > resume_after]
+                   + [e for e in entries if e.name <= resume_after])
+    last_examined: str | None = None
+    for entry in entries:
+        checkout = pathlib.Path(entry.path)
+        if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+            continue
+        if not os.path.lexists(checkout / ".git"):
+            continue
+        report["checkouts"] += 1
+        if time.monotonic() - started > budget_s:
+            report["deferred"] += 1
+            if report["next_cursor"] is None:
+                # Resume here next pass. Nothing examined yet (a zero budget)
+                # keeps the previous cursor rather than restarting at the top.
+                report["next_cursor"] = last_examined or resume_after or ""
+            continue
+        last_examined = entry.name
+        kind, gitdir = gitdir_of(checkout)
+        if kind == "orphan":
+            report["orphaned_worktrees"] += 1
+            if len(report["orphaned_paths"]) < LIST_LIMIT:
+                report["orphaned_paths"].append(str(checkout))
+            continue
+        if kind == "broken":
+            report["broken_checkouts"] += 1
+            if len(report["broken_paths"]) < LIST_LIMIT:
+                report["broken_paths"].append(str(checkout))
+            continue
+        if kind == "unreadable" or gitdir is None:
+            keep("not_git")
+            continue
+        if worktrees_only and kind == "clone":
+            keep("clone_in_shared_root")
+            continue
+        if blind:
+            keep("process_scan_unavailable")
+            continue
+        spellings = _spellings(checkout)
+        assert isinstance(cwds, list)
+        if merged is not None:
+            merged.examined.add(str(checkout))
+        if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
+                or build_marker_live(checkout) \
+                or (merged is not None and merged_checkouts.named_by(
+                    merged.commands or "", spellings)):
+            keep("in_use")
+            continue
+        newest = newest_mtime(checkout, gitdir)
+        if newest is None:
+            keep("unmeasurable")
+            continue
+        if now - newest < idle_hours * 3600:
+            keep("recent")
+            continue
+        remembered = (cache or {}).get(str(checkout))
+        if (isinstance(remembered, dict) and remembered.get("newest") == newest
+                and remembered.get("reason") in CACHEABLE
+                and now - float(remembered.get("at", 0)) < CACHE_TTL_S):
+            # Nothing at the top of the checkout or in its index/HEAD moved
+            # since git last said why it must stay. Re-asked daily regardless.
+            keep(remembered["reason"])
+            if next_cache is not None:
+                next_cache[str(checkout)] = remembered
+            continue
+        item = None
+        try:
+            reason = holds_worktrees(gitdir, kind) or lineage_active(checkout, runner)
+            if not reason and (merged is None or kind == "clone"):
+                # A clone's other branches and stash die with it, so the merged
+                # rule still needs every one of them pushed (and HEAD merged).
+                reason = unpushed_reason(checkout, kind, runner)
+            if not reason and merged is not None:
+                verdict, detail = merged_checkouts.judge(checkout, kind, merged, runner)
+                if verdict == "keep":
+                    reason = detail
+                elif verdict == "pending":
+                    merged.pending.append(dict(detail, root=str(root), newest=newest,
+                                               gitdir=gitdir))
+                    keep("awaiting_pr_proof")
+                    continue
+                else:
+                    item = detail
+        except subprocess.TimeoutExpired:
+            reason = "git_timeout"
+        if reason:
+            keep(reason)
+            if next_cache is not None and reason in CACHEABLE:
+                next_cache[str(checkout)] = {"newest": newest, "reason": reason, "at": now}
+            continue
+        size = size_bytes(checkout, runner)
+        if merged is not None:
+            # The judgement above took time (a fetch, status, du); ask again.
+            late = still_idle(checkout, kind, gitdir, newest, in_use, merged, runner)
+            if late:
+                keep(late)
+                continue
+        if fix:
+            try:
+                refusal = (merged_checkouts.remove(item, merged, runner)
+                           if item is not None and kind == "worktree"
+                           else remove(checkout, kind, gitdir, runner))
+            except subprocess.TimeoutExpired:
+                refusal = "git_timeout"
+            if refusal:
+                keep(refusal)
+                continue
+        count_removed(report, checkout, size, merged)
+    return report
+
+
+def still_idle(checkout: pathlib.Path, kind: str, gitdir: pathlib.Path, newest: float,
+               in_use: Callable[[pathlib.Path], bool] | None,
+               merged: "merged_checkouts.Proof", runner: Runner) -> str | None:
+    """The in-use gates against a process table read NOW, just before removal.
+
+    Also: nothing at the top of the checkout or in its index/HEAD moved since
+    it was judged, and a clone still has no worktrees of its own.
+    """
+    cwds = merged.fresh_cwds()
+    merged.refresh_commands()
+    if in_use is None or cwds is None or merged.commands is None:
+        return "process_scan_unavailable"
+    spellings = _spellings(checkout)
+    if any(_inside(cwd, spellings) for cwd in cwds) or in_use(checkout) \
+            or build_marker_live(checkout) \
+            or merged_checkouts.named_by(merged.commands, spellings):
+        return "in_use"
+    if newest_mtime(checkout, gitdir) != newest:
+        return "changed_before_removal"
+    return holds_worktrees(gitdir, kind)
+
+
+def count_removed(report: dict[str, Any], checkout: pathlib.Path, size: int | None,
+                  merged: "merged_checkouts.Proof | None") -> None:
+    report["removed"] += 1
+    report["removed_bytes"] += size or 0
+    if len(report["removed_paths"]) < LIST_LIMIT:
+        report["removed_paths"].append(str(checkout))
+    if merged is not None:
+        merged.status["removed"] = merged.status.get("removed", 0) + 1
+        merged.status["removed_bytes"] = merged.status.get("removed_bytes", 0) + (size or 0)
+
+
+def finish_pending(merged: "merged_checkouts.Proof", reports: dict[str, dict[str, Any]], *,
+                   fix: bool, in_use: Callable[[pathlib.Path], bool] | None,
+                   runner: Runner = subprocess.run, cwds: list[str] | None | bool = True,
+                   lineage: Callable[..., str | None] | None = None) -> None:
+    """Settle the checkouts that waited for the pass's one PR read.
+
+    Minutes can pass between a checkout's first judgement and this point (the
+    scan of every root, then the read), so every gate is asked again against a
+    fresh process table: in use, unchanged since judged, lineage, clean, HEAD.
+    Only then is the PR answer allowed to remove it.
+    """
+    merged.resolve()
+    if not merged.pending:
+        return
+    if cwds is not True and merged.cwd_reader is None:
+        merged.cwd_reader = lambda: cwds  # a caller-supplied table (tests)
+    lineage = lineage or lineage_active
+    for item in merged.pending:
+        report = reports[item["root"]]
+        checkout, kind, gitdir = item["checkout"], item["kind"], item["gitdir"]
+
+        def settle(reason: str | None) -> None:
+            report["kept"]["awaiting_pr_proof"] -= 1
+            if not report["kept"]["awaiting_pr_proof"]:
+                del report["kept"]["awaiting_pr_proof"]
+            if reason:
+                report["kept"][reason] = report["kept"].get(reason, 0) + 1
+
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
+            continue
+        try:
+            reason = lineage(checkout, runner) or (
+                unpushed_reason(checkout, kind, runner) if kind == "clone" else None)
+            if not reason:
+                verdict, detail = merged_checkouts.judge(checkout, kind, merged, runner)
+                if verdict == "pending":
+                    reason = ("pr_proof_unavailable" if merged_checkouts.unmerged_reason(
+                        checkout, item["branch"], item["head"], merged, runner) == "unmerged"
+                        else "unpushed")
+                elif verdict == "keep":
+                    reason = detail
+                elif detail["head"] != item["head"]:
+                    reason = "changed_before_removal"
+        except subprocess.TimeoutExpired:
+            reason = "git_timeout"
+        if reason:
+            settle(reason)
+            continue
+        size = size_bytes(checkout, runner)
+        late = still_idle(checkout, kind, gitdir, item["newest"], in_use, merged, runner)
+        if late:
+            settle(late)
+            continue
+        if fix:
+            try:
+                refusal = (merged_checkouts.remove(detail, merged, runner) if kind == "worktree"
+                           else remove(checkout, kind, gitdir, runner))
+            except subprocess.TimeoutExpired:
+                refusal = "git_timeout"
+            if refusal:
+                settle(refusal)
+                continue
+        settle(None)
+        count_removed(report, checkout, size, merged)
+
+
+SUMMED = ("checkouts", "removed", "removed_bytes", "deferred", "orphaned_worktrees",
+          "broken_checkouts")
+LISTED = ("removed_paths", "orphaned_paths", "broken_paths")
+
+
+CURSORS_FILE = "scan-cursors.json"
+
+
+def _load_json_dict(path: pathlib.Path) -> dict:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def state_dir() -> pathlib.Path:
+    home = os.environ.get("TARTCI_HOME", str(pathlib.Path.home() / ".tartci"))
+    return pathlib.Path(home).expanduser() / "state" / "reclaim"
+
+
+def combine(reports: list[dict[str, Any]], fix: bool, idle_hours: int) -> dict[str, Any]:
+    """One report with the pass-level shape, plus each root's own under `by_root`."""
+    out: dict[str, Any] = {"mode": "fix" if fix else "dry-run", "idle_hours": idle_hours,
+                           "kept": {}, "by_root": {}}
+    for key in SUMMED:
+        out[key] = sum(int(r.get(key) or 0) for r in reports)
+    for key in LISTED:
+        out[key] = [p for r in reports for p in (r.get(key) or [])][:LIST_LIMIT]
+    errors = []
+    for report in reports:
+        for reason, count in (report.get("kept") or {}).items():
+            out["kept"][reason] = out["kept"].get(reason, 0) + count
+        if report.get("error"):
+            errors.append(f"{report.get('root')}: {report['error']}")
+        out["by_root"][str(report.get("root"))] = {
+            key: report.get(key) for key in (*SUMMED, "kept", "error", "resumed_after",
+                                             "next_cursor")}
+    if errors:
+        out["error"] = "; ".join(errors)
+    out["root"] = ", ".join(str(r.get("root")) for r in reports)
+    return out
+
+
+def merged_plan(settings: dict[str, Any],
+                pressured: Callable[[pathlib.Path], bool] | None
+                ) -> tuple[dict[str, bool], dict[str, Any]]:
+    """{root: clones_ok} for the roots the merged rule covers this pass, and why.
+
+    On by default only while the root's volume is under pressure; the profile
+    key `merged_worktrees = true` turns it on every pass, `false` off.
+    """
+    merged = settings.get("merged")
+    if not merged:
+        return {}, {"enabled": False, "reason": "merged_worktrees = false or no worktree root"}
+    active: dict[str, bool] = {}
+    why: dict[str, str] = {}
+    for root in merged["roots"]:
+        if merged["mode"] == "always":
+            why[root] = "merged_worktrees = true"
+        elif pressured is not None and pressured(pathlib.Path(root)):
+            why[root] = "volume under pressure"
+        else:
+            why[root] = "off: no disk pressure"
+            continue
+        active[root] = root in merged["clone_roots"]
+    return active, {"enabled": bool(active), "mode": merged["mode"],
+                    "idle_hours": merged["idle_hours"], "roots": why}
+
+
+def run(*, fix: bool, profile: pathlib.Path,
+        in_use: Callable[[pathlib.Path], bool] | None,
+        root: pathlib.Path | None = None, runner: Runner = subprocess.run,
+        verdicts: pathlib.Path | None = None,
+        pressured: Callable[[pathlib.Path], bool] | None = None,
+        table: dict[str, Any] | None = None,
+        proof: "merged_checkouts.Proof | None" = None) -> dict[str, Any]:
+    """One opted-in pass over every configured root. Never raises.
+
+    `pressured` says whether a root's volume is under disk pressure (the
+    merged rule's default trigger). `table` stands in for the profile's
+    `[reclaim]` table and `proof` for the pass's merge evidence, in tests.
+    """
+    if table is not None:
+        settings, why = settings_from_table(table, "the given table")
+    else:
+        settings, why = load_settings(profile)
+    if settings is None:
+        return {"enabled": False, "reason": why}
+    plan, merged_report = merged_plan(settings, pressured)
+    if root is not None:
+        roots = [root]
+    else:
+        roots = [pathlib.Path(r) for r in settings["roots"]]
+        roots += [pathlib.Path(r) for r in plan if pathlib.Path(r) not in roots]
+    merged_roots = [one for one in roots if str(one) in plan]
+    if merged_roots and proof is None:
+        proof = merged_checkouts.Proof(runner=runner, app_env=settings.get("scan_app_env"),
+                                       roots=merged_roots)
+    verdicts = verdicts or state_dir() / "checkout-verdicts.json"
+    cache = _load_json_dict(verdicts)
+    next_cache: dict = {}
+    cursors_path = verdicts.with_name(CURSORS_FILE)
+    cursors = _load_json_dict(cursors_path)
+    # Roots this pass does not scan keep their cursors.
+    next_cursors: dict = {key: value for key, value in cursors.items()
+                          if key not in {str(one) for one in roots}}
+    reports = []
+    try:
+        cwds = process_cwds(runner)
+        for one in roots:
+            previous = cursors.get(str(one))
+            is_merged = str(one) in plan
+            report = scan(one, fix=fix,
+                          idle_hours=(merged_report["idle_hours"] if is_merged
+                                      else settings["idle_hours"]),
+                          in_use=in_use, runner=runner, cwds=cwds,
+                          cache=cache, next_cache=next_cache,
+                          worktrees_only=(not plan[str(one)] if is_merged
+                                          else str(one) in settings.get("worktrees_only", [])),
+                          resume_after=previous if isinstance(previous, str) else None,
+                          merged=proof if is_merged else None)
+            if report.get("error") and isinstance(previous, str):
+                # An unlisted root or a blind pass examined nothing for real.
+                next_cursors[str(one)] = previous
+            elif report.get("next_cursor") is not None:
+                next_cursors[str(one)] = report["next_cursor"]
+            reports.append(report)
+        if proof is not None and merged_roots:
+            finish_pending(proof, {r["root"]: r for r in reports}, fix=fix, in_use=in_use,
+                           runner=runner)
+            if fix:
+                merged_checkouts.prune(proof, runner)
+            report_path = verdicts.with_name(merged_checkouts.REPORT_FILE)
+            holding = merged_checkouts.write_report(report_path, proof, time.time())
+            merged_report.update(proof.status, holding_work=holding,
+                                 holding_paths=[e["path"] for e in proof.holding][:LIST_LIMIT],
+                                 report_path=str(report_path))
+    except Exception as exc:  # noqa: BLE001 - a janitor must not take the pass down
+        return {"enabled": True, "error": f"checkout scan failed: {exc}"}
+    # A dry run must not move the cursor past checkouts a --fix pass never saw.
+    writes = [(verdicts, next_cache)] + ([(cursors_path, next_cursors)] if fix else [])
+    for path, body in writes:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(body, sort_keys=True))
+            os.replace(tmp, path)
+        except OSError:
+            pass
+    report = combine(reports, fix, settings["idle_hours"])
+    report["enabled"] = True
+    report["merged_worktrees"] = merged_report
+    return report

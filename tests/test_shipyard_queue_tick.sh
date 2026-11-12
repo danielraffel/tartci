@@ -4,9 +4,9 @@
 # Stubs `shipyard` and `ghapp` on PATH so the janitor's decision matrix runs
 # against canned GitHub / ship-state responses — no network, no real state.
 # Asserts the safety invariants that must never regress:
-#   1. MERGED/CLOSED orphan  -> reaped (discard) when APPLY=1, incl. reap-only.
-#   2. OPEN + green          -> auto-merge ONLY in full-live; HELD in reap-only
-#                               and in dry-run.
+#   1. MERGED/CLOSED orphan  -> reaped (discard) when APPLY=1.
+#   2. OPEN                  -> kept and never merged, reconciled or enqueued,
+#                               even under the retired full-live settings.
 #   3. fresh heartbeat       -> live worker skipped in every mode (no action).
 #   4. GitHub read failure   -> fail-closed skip (errs++), never acts.
 set -uo pipefail
@@ -30,7 +30,6 @@ cat > "$BIN/shipyard" <<STUB
 #!/usr/bin/env bash
 case "\$1 \$2" in
   "--version ") echo "shipyard 0.80.0" ;;
-  "auth export") echo '{"schema_version":1,"command":"auth.export","bundle":{"version":2}}' ;;
   "merge-queue status")
     [ -f "$WORK/control_fail" ] && exit 1
     if [ -f "$WORK/control_malformed" ]; then echo '{'; else echo '{"held":false,"authority_matches":true}'; fi
@@ -56,7 +55,6 @@ STUB
 cat > "$BIN/ghapp" <<STUB
 #!/usr/bin/env bash
 # args: pr view <PR> --repo <REPO> --json <FIELDS> --jq <EXPR>
-[ "\${1:-} \${2:-}" = "auth token" ] && { echo "app-token"; exit 0; }
 [ "\${1:-} \${2:-}" = "pr list" ] && { echo "[]"; exit 0; }
 pr=""; fields=""
 while [ \$# -gt 0 ]; do
@@ -134,28 +132,27 @@ grep -q "101: would reap" <<<"$out" || fail "dry-run should log would-reap for 1
 grep -q "303: live worker" <<<"$out" || fail "should skip live worker 303"
 echo "  ok"
 
-echo "== reap-only: reap merged, HOLD auto-merge, skip live =="
-run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=1 >/dev/null
+echo "== reap: reap merged, keep open, skip live =="
+out="$(run SHIPYARD_TICK_APPLY=1)"
 has  "discard 101"
-hasnt "automerge 202"
-hasnt "discard 303"; hasnt "automerge 303"
+hasnt "automerge"; hasnt "reconcile"
+hasnt "discard 202"; hasnt "discard 303"
+grep -q "202: open — kept" <<<"$out" || fail "202 should be kept open"
 echo "  ok"
 
-echo "== full-live: reap merged AND auto-merge open-green, skip live =="
-out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
+echo "== retired full-live settings: still only reaps, and says so =="
+out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_TICK_REAP_ONLY=0 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
 has  "discard 101"
-has  "automerge 202"
-hasnt "automerge 404"
-hasnt "discard 303"; hasnt "automerge 303"
-grep -q "202: merged" <<<"$out" || fail "202 should report merged"
-grep -q "owner/other#404: outside authority repo Generous-Corp/pulp — skip" <<<"$out" || fail "foreign repo should be skipped"
+hasnt "automerge"; hasnt "reconcile"
+grep -q "legacy_full_live_ignored" <<<"$out" || fail "tick should name the ignored full-live settings"
+grep -q "legacy_full_live_ignored" "$WORK/health.json" || fail "health should name the ignored full-live settings"
 echo "  ok"
 
 echo "== fail-closed: GitHub state read empty -> skip, no action =="
 echo "" > "$WORK/state_101.txt"   # simulate read failure for 101
-out="$(run SHIPYARD_TICK_APPLY=1 SHIPYARD_QUEUE_AUTHORITY=1 SHIPYARD_QUEUE_REPO_ROOT="$REPO")"
+out="$(run SHIPYARD_TICK_APPLY=1)"
 hasnt "discard 101"
-grep -q "101: GitHub read failed — skip (fail closed)" <<<"$out" || fail "101 should fail closed"
+grep -q "101: GitHub read failed (exit 0: no stderr) — skip (fail closed)" <<<"$out" || fail "101 should fail closed"
 echo "MERGED" > "$WORK/state_101.txt"   # restore
 echo "  ok"
 

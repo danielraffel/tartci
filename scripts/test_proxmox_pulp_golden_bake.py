@@ -3,6 +3,10 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+# The bake resolves its Pulp source through providers/common/pulp-source-pin.py,
+# which reads the TOML manifest; under a 3.9 python3 on PATH it cannot.
+testing_support.skip_module_without_tomllib()
 import hashlib
 import json
 import os

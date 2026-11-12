@@ -1,13 +1,15 @@
-# Onboarding a new repo to a tartci CI VM — agent playbook
+# Onboard a repository
 
-Audience: an automation agent (or a human moving fast) standing up a local CI
-VM for a repo that has never used tartci. The human-oriented, gotcha-by-gotcha
-bring-up lives in `runbook.md`; this is the *decision-first* path for wiring an
-existing project into the proven lanes.
+Use this guide when a repository needs TartCI for the first time. It is written
+for both an automation agent and a person setting up the first lane. The
+[runbook](runbook.md) explains host setup; this page explains the repository
+choices that come after a host is ready.
 
-The whole job is: **write one `vm-image` manifest, pick bake-vs-clone, declare
-the run contract, prove one green build, then snapshot a golden.** Everything
-else is already solved in `providers/` + `docs/gotchas.md`.
+The target shape is: **write one `vm-image` manifest, pick bake-vs-clone,
+declare the run contract, prove one green build, then snapshot a golden.** The
+manifest is the intended project contract, but some provider recipes still
+need repository-specific setup. Use `providers/` and `docs/gotchas.md` to see
+which parts are automated today.
 
 ## 0. Decide the shape (answer these before touching a VM)
 
@@ -17,13 +19,13 @@ else is already solved in `providers/` + `docs/gotchas.md`.
    unsupported architecture. Never give two trust classes the same capability
    label or runner group merely because they use the same host.
 2. **Guest arch is ARM64. Always.** Apple Virtualization and QEMU-on-hvf both
-   run ARM64 guests on Apple Silicon — there is no x86 guest. If the project
+   run ARM64 guests on Apple Silicon: there is no x86 guest. If the project
    ships x86_64, set `target_arch = "x86_64"`, `cross = true`, add an
    `[emulation]` table (`emulator = "rosetta"` on Linux, cross `toolchain`,
    `test_labels`), and treat the local lane as *smoke/debug*; keep a
    GitHub-hosted x64 runner as the authoritative gate. Do not pretend a
    cross+emulated local run replaces it. Drive it with `tartci up linux
-   --target-arch x86_64` (the Linux/Rosetta lane is wired — see runbook §3.8
+   --target-arch x86_64` (the Linux/Rosetta lane is wired: see runbook §3.8
    and `manifests/example.x64.toml`).
 3. **bake or configure-on-boot?**
    - `bake` — pre-bake a project golden. Choose for hot repos / slow toolchains
@@ -34,8 +36,16 @@ else is already solved in `providers/` + `docs/gotchas.md`.
    the durable artifact host-mounted across ephemeral clones; build dirs are
    disposable.
 5. **Does it need a prebuilt Skia (or other large baked dep)?** Match the
-   archive arch to the guest arch (`linux-arm64`, not `linux-x64`). There is no
-   prebuilt Windows Skia yet — Windows builds GPU-off until one exists.
+   archive arch to the guest arch (`linux-arm64`, not `linux-x64`). A generic
+   repository may not have a Windows ARM64 Skia slice. Generic Windows lanes
+   default to GPU-off; Pulp's published slice can opt into GPU with `--gpu`
+   after the golden and workflow have been validated.
+6. **Does the repository use [mise](https://mise.jdx.dev/)?** Treat its config
+   and lock files as part of the repository's toolchain contract. Install mise
+   in the golden or the configure-on-boot step, then run `mise install` in the
+   guest before the build. Do not depend on a mise installation on the Mac
+   host. TartCI does not currently install or update mise automatically, so the
+   repository's image recipe must own that step and record the version it uses.
 
 ## 1. Write the manifest
 

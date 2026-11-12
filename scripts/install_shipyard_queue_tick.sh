@@ -1,31 +1,36 @@
 #!/usr/bin/env bash
-# Install the queue tick plus its trusted canonical authority configuration.
+# Install the queue-tick ship-state reaper and its canonical configuration.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")/.." && pwd)"
 SUPPORT="$HERE/scripts/shipyard_queue_tick_support.py"
 
 usage() {
   cat <<'EOF'
-usage: install_shipyard_queue_tick.sh --repo-root PATH [--authority]
-       [--mode dry-run|reap-only|live] [--gh-cli APP-WRAPPER] [--install]
+usage: install_shipyard_queue_tick.sh --gh-cli APP-WRAPPER
+       [--mode dry-run|reap] [--repo-root PATH] [--install]
 
 Validates and prints the install plan by default. --install writes the mode-600
 canonical config, renders the LaunchAgent, bootstraps it, and verifies launchd
-received the expected paths and the first tick reports healthy. Exactly one
-fleet host should use --authority. The default mode is dry-run; live requires
---authority. Every mode requires an explicit GitHub App wrapper.
+received the expected paths and the first tick reports healthy. The default
+mode is dry-run; reap discards ship-state for merged, closed or confirmed
+nonexistent pull requests. The tick never merges: landing is the GitHub merge
+queue's job. --repo-root sets the checkout the merge-queue hold check and the
+superseded merge-group reaper run from; without it the reaper is skipped.
+Every mode requires an explicit GitHub App wrapper.
 EOF
 }
 
 REPO_ROOT=""
-AUTHORITY=0
 APPLY=0
 MODE="dry-run"
 GH_CLI=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --repo-root) REPO_ROOT="${2:-}"; shift 2 ;;
-    --authority) AUTHORITY=1; shift ;;
+    --authority)
+      echo "--authority is retired: the queue tick no longer merges; drop the flag" >&2
+      exit 2
+      ;;
     --mode) MODE="${2:-}"; shift 2 ;;
     --gh-cli) GH_CLI="${2:-}"; shift 2 ;;
     --install) APPLY=1; shift ;;
@@ -34,15 +39,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 case "$MODE" in
-  dry-run) TICK_APPLY=0; REAP_ONLY=0 ;;
-  reap-only) TICK_APPLY=1; REAP_ONLY=1 ;;
+  dry-run) TICK_APPLY=0 ;;
+  reap|reap-only) MODE="reap"; TICK_APPLY=1 ;;
   live)
-    [ "$AUTHORITY" = "1" ] || {
-      echo "--mode live requires --authority" >&2
-      exit 2
-    }
-    TICK_APPLY=1
-    REAP_ONLY=0
+    echo "--mode live is retired: the queue tick no longer merges; use --mode reap" >&2
+    exit 2
     ;;
   *) echo "invalid mode: $MODE" >&2; usage >&2; exit 2 ;;
 esac
@@ -52,35 +53,78 @@ esac
   exit 2
 }
 
-[ -d "$REPO_ROOT/.git" ] || git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1 || {
-  echo "repo root is not a Git checkout: $REPO_ROOT" >&2
-  exit 2
-}
-REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
-REMOTE="$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || true)"
-if ! python3 "$SUPPORT" github-origin "$REMOTE" >/dev/null
-then
-  echo "repo root has no supported GitHub origin: $REPO_ROOT" >&2
-  exit 2
+if [ -n "$REPO_ROOT" ]; then
+  [ -d "$REPO_ROOT" ] || {
+    echo "repo root is not a directory: $REPO_ROOT" >&2
+    exit 2
+  }
+  REPO_ROOT="$(cd "$REPO_ROOT" && pwd -P)"
 fi
 
 TEMPLATE="$HERE/launchd/com.danielraffel.shipyard.queue-tick.plist.template"
 SCRIPT="$HERE/scripts/shipyard_queue_tick.sh"
-INSTALL_DIR="$HOME/.local/share/tartci/scripts"
-INSTALLED_SCRIPT="$INSTALL_DIR/shipyard_queue_tick.sh"
-INSTALLED_SUPPORT="$INSTALL_DIR/shipyard_queue_tick_support.py"
+# The agent runs the tick through ~/.local/bin/tartci, so it follows the
+# installed generation; nothing is copied, and a self-update reaches it.
+ENTRYPOINT="$HOME/.local/bin/tartci"
 CONFIG="$HOME/.config/shipyard/queue-tick.env"
 PLIST="$HOME/Library/LaunchAgents/com.danielraffel.shipyard.queue-tick.plist"
 HEALTH="$HOME/Library/Logs/shipyard-queue-tick.health.json"
-HEALTH_WAIT_SECS="${SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS:-300}"
-case "$HEALTH_WAIT_SECS" in
-  ''|*[!0-9]*|0) echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be a positive integer" >&2; exit 2 ;;
-esac
-[ "$HEALTH_WAIT_SECS" -le 3600 ] || {
-  echo "SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS must be at most 3600" >&2
-  exit 2
-}
+# The install waits for the first tick to FINISH, however long it runs: a tick
+# reads every open pull request, and one that took longer than a fixed wait
+# was read as a failed install and rolled back. HEALTH_WAIT_SECS is how long a
+# tick that is NOT running may go without publishing a verdict (it has not
+# started yet, or it exited without one). TICK_MAX_SECS bounds a running tick.
+HEALTH_WAIT_SECS="${SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS:-120}"
+TICK_MAX_SECS="${SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS:-3600}"
+for setting in HEALTH_WAIT_SECS TICK_MAX_SECS; do
+  case "${!setting}" in
+    ''|*[!0-9]*|0) echo "SHIPYARD_QUEUE_INSTALL_${setting} must be a positive integer" >&2; exit 2 ;;
+  esac
+  [ "${!setting}" -le 3600 ] || {
+    echo "SHIPYARD_QUEUE_INSTALL_${setting} must be at most 3600" >&2
+    exit 2
+  }
+done
 LABEL="com.danielraffel.shipyard.queue-tick"
+DOMAIN="gui/$(id -u)"
+# Exit status when the install failed AND the tick is left unloaded: the host
+# has no queue tick at all until someone bootstraps it.
+EXIT_LEFT_UNLOADED=4
+
+job_loaded() {
+  launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1
+}
+
+job_state() {
+  launchctl print "$DOMAIN/$LABEL" 2>/dev/null \
+    | awk -F' = ' '$1 ~ /^[[:space:]]*state$/ { print $2; exit }'
+}
+
+# `launchctl bootout` returns before the job is gone, and a bootstrap that
+# races it fails with "Bootstrap failed: 5: Input/output error". That is how
+# a rollback once left the tick silently unloaded. Wait for the old job to go,
+# retry, and report whether it is loaded now.
+bootstrap_reliably() {
+  local plist="$1" tries=0
+  while job_loaded && [ "$tries" -lt 20 ]; do
+    sleep 0.5
+    tries=$((tries + 1))
+  done
+  tries=0
+  while [ "$tries" -lt 6 ]; do
+    launchctl bootstrap "$DOMAIN" "$plist" >/dev/null 2>&1 || true
+    job_loaded && return 0
+    sleep $((tries + 1))
+    tries=$((tries + 1))
+  done
+  return 1
+}
+
+publish_unloaded_health() {
+  mkdir -p "$(dirname "$HEALTH")" 2>/dev/null || return 0
+  printf '{"schema_version": 1, "status": "unhealthy", "reason": "agent_unloaded: %s", "observed_at": "%s"}\n' \
+    "$1" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HEALTH" 2>/dev/null || true
+}
 
 [ -f "$TEMPLATE" ] && [ -f "$SCRIPT" ] && [ -f "$SUPPORT" ] || {
   echo "installer must run from a complete tartci checkout" >&2
@@ -88,12 +132,10 @@ LABEL="com.danielraffel.shipyard.queue-tick"
 }
 
 echo "queue tick install plan:"
-echo "  repo_root=$REPO_ROOT"
-echo "  authority=$AUTHORITY"
+echo "  repo_root=${REPO_ROOT:-unset (hold check runs from \$HOME)}"
 echo "  mode=$MODE"
 echo "  gh_cli=${GH_CLI:-unset}"
-echo "  executable=$INSTALLED_SCRIPT (mode 755)"
-echo "  support=$INSTALLED_SUPPORT (mode 644)"
+echo "  executable=$ENTRYPOINT queue-tick (the installed generation)"
 echo "  canonical_config=$CONFIG (mode 600)"
 echo "  launch_agent=$PLIST"
 if [ "$APPLY" != "1" ]; then
@@ -101,9 +143,7 @@ if [ "$APPLY" != "1" ]; then
   exit 0
 fi
 
-mkdir -p "$INSTALL_DIR" "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
-SCRIPT_TMP=""
-SUPPORT_TMP=""
+mkdir -p "$HOME/.config/shipyard" "$HOME/Library/LaunchAgents" "$HOME/Library/Logs"
 CONFIG_TMP=""
 PLIST_TMP=""
 BACKUP=""
@@ -117,10 +157,8 @@ rollback_and_cleanup() {
     set +e
     echo "install failed; rolling back prior queue-tick installation" >&2
     launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1
-    for entry in script support config plist; do
+    for entry in config plist; do
       case "$entry" in
-        script) target="$INSTALLED_SCRIPT" ;;
-        support) target="$INSTALLED_SUPPORT" ;;
         config) target="$CONFIG" ;;
         plist) target="$PLIST" ;;
       esac
@@ -131,56 +169,49 @@ rollback_and_cleanup() {
       fi
     done
     if [ "$PRIOR_LOADED" = "1" ] && [ -f "$PLIST" ]; then
-      launchctl bootstrap "gui/$(id -u)" "$PLIST" >/dev/null 2>&1 || \
-        echo "rollback warning: prior LaunchAgent could not be re-bootstrapped" >&2
+      if ! bootstrap_reliably "$PLIST"; then
+        echo "ROLLBACK FAILED: $LABEL is NOT LOADED; this host has no queue tick." >&2
+        echo "  restore it with: launchctl bootstrap $DOMAIN $PLIST" >&2
+        publish_unloaded_health "rollback could not re-bootstrap $PLIST"
+        rc=$EXIT_LEFT_UNLOADED
+      else
+        # A RunAtLoad launch is speculative and launchd can defer it
+        # indefinitely on a busy host; kickstart makes it an on-demand spawn.
+        launchctl kickstart "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
+        echo "rolled back: the prior $LABEL is loaded again" >&2
+      fi
     fi
   fi
-  rm -f "$SCRIPT_TMP" "$SUPPORT_TMP" "$CONFIG_TMP" "$PLIST_TMP"
+  rm -f "$CONFIG_TMP" "$PLIST_TMP"
   [ -z "$BACKUP" ] || rm -rf "$BACKUP"
   exit "$rc"
 }
 trap rollback_and_cleanup EXIT
-SCRIPT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick.sh.XXXXXX")"
-SUPPORT_TMP="$(mktemp "$INSTALL_DIR/.shipyard_queue_tick_support.py.XXXXXX")"
 CONFIG_TMP="$(mktemp "$HOME/.config/shipyard/.queue-tick.env.XXXXXX")"
 PLIST_TMP="$(mktemp "$HOME/Library/LaunchAgents/.queue-tick.plist.XXXXXX")"
 BACKUP="$(mktemp -d "${TMPDIR:-/tmp}/queue-tick-install-backup.XXXXXX")"
 umask 077
-install -m 755 "$SCRIPT" "$SCRIPT_TMP"
-[ -x "$SCRIPT_TMP" ] && cmp -s "$SCRIPT" "$SCRIPT_TMP" || {
-  echo "staged queue tick executable failed verification" >&2
-  exit 1
-}
-install -m 644 "$SUPPORT" "$SUPPORT_TMP"
-[ -r "$SUPPORT_TMP" ] && cmp -s "$SUPPORT" "$SUPPORT_TMP" || {
-  echo "staged queue tick support module failed verification" >&2
-  exit 1
-}
 {
   printf 'SHIPYARD_QUEUE_REPO_ROOT=%s\n' "$REPO_ROOT"
-  printf 'SHIPYARD_QUEUE_AUTHORITY=%s\n' "$AUTHORITY"
   printf 'SHIPYARD_QUEUE_GH_CLI=%s\n' "$GH_CLI"
 } > "$CONFIG_TMP"
 chmod 600 "$CONFIG_TMP"
 
 sed -e "s|\$HOME|$HOME|g" "$TEMPLATE" > "$PLIST_TMP"
-python3 - "$PLIST_TMP" "$TICK_APPLY" "$REAP_ONLY" <<'PY'
+python3 - "$PLIST_TMP" "$TICK_APPLY" <<'PY'
 import plistlib, sys
-path, apply, reap_only = sys.argv[1:]
+path, apply = sys.argv[1:]
 with open(path, "rb") as source:
     value = plistlib.load(source)
 environment = value["EnvironmentVariables"]
 environment["SHIPYARD_TICK_APPLY"] = apply
-environment["SHIPYARD_TICK_REAP_ONLY"] = reap_only
 with open(path, "wb") as destination:
     plistlib.dump(value, destination, sort_keys=False)
 PY
 plutil -lint "$PLIST_TMP" >/dev/null
 
-for entry in script support config plist; do
+for entry in config plist; do
   case "$entry" in
-    script) target="$INSTALLED_SCRIPT" ;;
-    support) target="$INSTALLED_SUPPORT" ;;
     config) target="$CONFIG" ;;
     plist) target="$PLIST" ;;
   esac
@@ -194,45 +225,67 @@ if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
 fi
 
 SWITCH_STARTED=1
-launchctl bootout "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || true
-mv "$SCRIPT_TMP" "$INSTALLED_SCRIPT"
-mv "$SUPPORT_TMP" "$INSTALLED_SUPPORT"
+launchctl bootout "$DOMAIN/$LABEL" >/dev/null 2>&1 || true
 mv "$CONFIG_TMP" "$CONFIG"
 mv "$PLIST_TMP" "$PLIST"
 
-launchctl bootstrap "gui/$(id -u)" "$PLIST"
 rm -f "$HEALTH"
-launchctl kickstart -k "gui/$(id -u)/$LABEL"
+bootstrap_reliably "$PLIST" || {
+  echo "LaunchAgent $LABEL did not load from $PLIST" >&2
+  exit 1
+}
+launchctl kickstart -k "$DOMAIN/$LABEL"
 
 PRINTED="$(launchctl print "gui/$(id -u)/$LABEL")"
 grep -Fq "$HOME/.config/shipyard/queue-tick.env" <<<"$PRINTED" || {
   echo "LaunchAgent did not receive canonical config path" >&2
   exit 1
 }
-grep -Fq "$INSTALLED_SCRIPT" <<<"$PRINTED" || {
-  echo "LaunchAgent did not receive installed queue tick executable" >&2
+grep -Fq "$ENTRYPOINT" <<<"$PRINTED" || {
+  echo "LaunchAgent does not run the tick through $ENTRYPOINT" >&2
   exit 1
 }
-healthy=0
-attempt=0
-while [ "$attempt" -lt "$HEALTH_WAIT_SECS" ]; do
-  if python3 - "$HEALTH" <<'PY' >/dev/null 2>&1
+# A verdict file the new tick wrote: healthy commits, anything else fails now.
+verdict() {
+  python3 - "$HEALTH" <<'PY' 2>/dev/null
 import json, sys
-with open(sys.argv[1]) as source:
-    value = json.load(source)
-if not isinstance(value, dict) or value.get("status") != "healthy":
-    raise SystemExit(1)
+try:
+    with open(sys.argv[1]) as source:
+        value = json.load(source)
+except (OSError, ValueError):
+    raise SystemExit(0)
+if isinstance(value, dict):
+    print(value.get("status") or "unknown", value.get("reason") or "")
 PY
-  then
-    healthy=1
+}
+started="$(date +%s)"
+idle_since="$started"
+last_note="$started"
+while :; do
+  now="$(date +%s)"
+  read -r status reason <<<"$(verdict)" || true
+  if [ "$status" = "healthy" ]; then
     break
+  elif [ -n "$status" ]; then
+    echo "queue tick published an unhealthy verdict: $status ${reason:-}" >&2
+    exit 1
+  fi
+  if [ "$(job_state)" = "running" ]; then
+    idle_since="$now"
+    if [ $((now - started)) -ge "$TICK_MAX_SECS" ]; then
+      echo "queue tick still running after ${TICK_MAX_SECS}s without a verdict: $HEALTH" >&2
+      exit 1
+    fi
+    if [ $((now - last_note)) -ge 60 ]; then
+      echo "  waiting for the first tick to finish ($((now - started))s so far)"
+      last_note="$now"
+    fi
+  elif [ $((now - idle_since)) -ge "$HEALTH_WAIT_SECS" ]; then
+    echo "queue tick did not publish a fresh healthy verdict: $HEALTH" \
+      "(not running for ${HEALTH_WAIT_SECS}s)" >&2
+    exit 1
   fi
   sleep 1
-  attempt=$((attempt + 1))
 done
-[ "$healthy" = "1" ] || {
-  echo "queue tick did not publish a fresh healthy verdict: $HEALTH" >&2
-  exit 1
-}
 COMMITTED=1
 echo "installed and started $LABEL in $MODE mode; fresh health verdict is healthy"

@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -23,7 +24,8 @@ def _write_exec(path: Path, body: str) -> None:
 
 
 FAKE = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, sys, time
+time.sleep(float(os.environ.get("FAKE_DELAY", "0")))
 from urllib.parse import parse_qs, urlparse
 p = urlparse("https://x/" + sys.argv[-1]); path = p.path; page = int(parse_qs(p.query).get("page", ["1"])[0])
 kind = os.environ.get("FAKE_KIND", "active")
@@ -56,8 +58,17 @@ else: raise SystemExit(4)
 '''
 
 
+# A scan here makes about 107 fake API calls, each a new python3 process:
+# 5-7 s on a quiet host against the scanner's 10 s default budget, and past it
+# under a loaded full-suite run, where the receipt read observation_error.
+# These tests are about classification, so they give the scan budgets far
+# beyond any load; the deadline itself is pinned by its own test.
+BUDGETS = ("--scan-timeout", "600", "--gh-timeout", "120")
+
+
 class CurrentJobScanTests(unittest.TestCase):
-    def _scan(self, kind: str = "active", *extra: str) -> subprocess.CompletedProcess[str]:
+    def _scan(self, kind: str = "active", *extra: str, budgets: tuple[str, ...] = BUDGETS,
+              delay: float = 0) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as directory:
             fake = Path(directory) / "fake-gh"
             _write_exec(fake, FAKE)
@@ -66,8 +77,9 @@ class CurrentJobScanTests(unittest.TestCase):
                  "--runner", RUNNER_NAME, "--workflow", "Build and Test",
                  "--gh-cli", str(fake),
                  "--observation-lock-file", str(Path(directory) / "observation.lock"),
-                 *extra],
-                env={**os.environ, "FAKE_KIND": kind}, text=True, capture_output=True, check=False,
+                 *budgets, *extra],
+                env={**os.environ, "FAKE_KIND": kind, "FAKE_DELAY": str(delay)},
+                text=True, capture_output=True, check=False,
             )
 
     def test_assignment_beyond_first_repository_run_page_is_exactly_confirmed(self) -> None:
@@ -80,6 +92,29 @@ class CurrentJobScanTests(unittest.TestCase):
         receipt = json.loads(self._scan("unexpected").stdout)
         self.assertEqual(receipt["kind"], "unexpected_assignment")
         self.assertEqual(receipt["workflow_name"], "Surprise")
+
+    def test_classification_survives_a_slow_api(self) -> None:
+        # 50 ms more per call stands in for a loaded host: under the 10 s
+        # default this read observation_error.
+        receipt = json.loads(self._scan("unexpected", delay=0.05).stdout)
+        self.assertEqual(receipt["kind"], "unexpected_assignment")
+
+    def test_a_scan_past_its_deadline_is_an_observation_error(self) -> None:
+        # The deadline is a wall-clock budget by design; 0.3 s cannot cover
+        # the scan's ~107 process spawns on any host.
+        result = self._scan("unexpected", budgets=("--scan-timeout", "0.3"))
+        receipt = json.loads(result.stdout)
+        self.assertEqual(receipt["kind"], "observation_error")
+        # Either the overall deadline or the call it cut short reports it.
+        self.assertRegex(receipt["detail"], r"overall deadline|timed out after")
+
+    def test_api_timeout_is_typed_separately_from_lock_contention(self) -> None:
+        result = self._scan(
+            "unexpected", budgets=("--scan-timeout", "5", "--gh-timeout", "1"), delay=2
+        )
+        receipt = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(receipt["detail"].startswith("api_timeout:"), receipt)
 
     def test_ambiguous_assignment_is_typed(self) -> None:
         receipt = json.loads(self._scan("ambiguous").stdout)
@@ -175,7 +210,7 @@ else: raise SystemExit(4)
         self.assertEqual(result.returncode, 2)
         self.assertIn("--parallelism must be 1", result.stderr)
 
-    def test_host_lock_timeout_fails_closed_before_api_call(self) -> None:
+    def test_host_lock_is_not_held_during_api_observation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / "observation.lock"
             marker = Path(directory) / "called"
@@ -187,12 +222,42 @@ else: raise SystemExit(4)
                     ["python3", str(SCANNER), "--repo", "x/y", "--runner", "r",
                      "--workflow", "w", "--gh-cli", str(fake),
                      "--observation-lock-file", str(lock),
-                     "--observation-lock-timeout", "0.1"],
+                     # Each call is capped at half the lock wait: 0.1 s
+                     # killed the fake before it started on a loaded host.
+                     "--observation-lock-timeout", "2"],
                     text=True, capture_output=True, check=False,
                 )
+            called = marker.exists()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("host queue observation lock timed out", result.stdout)
-        self.assertFalse(marker.exists())
+        self.assertIn("observation_error", result.stdout)
+        self.assertTrue(called, "the host lock blocked the API call")
+
+    def test_slow_api_observation_starts_while_host_lock_is_held(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / "observation.lock"
+            marker = root / "called"
+            fake = root / "slow-gh"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, time\n"
+                f"pathlib.Path({str(marker)!r}).write_text('yes')\n"
+                "time.sleep(2)\n"
+                "print('{\\\"total_count\\\":0,\\\"workflows\\\":[]}')\n"
+            )
+            fake.chmod(0o755)
+            with lock.open("a+") as handle:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                result = subprocess.run(
+                    [sys.executable, str(SCANNER), "--repo", "x/y", "--runner", "r",
+                     "--workflow", "Build and Test", "--gh-cli", str(fake),
+                     "--scan-timeout", "5", "--gh-timeout", "3",
+                     "--observation-lock-file", str(lock),
+                     "--observation-lock-timeout", "2"],
+                    text=True, capture_output=True, check=False,
+                )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertTrue(marker.exists(), "slow API call waited on the host lock")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

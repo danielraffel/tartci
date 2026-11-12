@@ -7,8 +7,9 @@
     <string>com.danielraffel.network.http-connect-ssh-relay</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>$HOME/.local/share/tartci/scripts/http_connect_ssh_relay.py</string>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>network-relay</string>
         <string>--allow-route</string>
         <string>127.0.0.0/8=127.0.0.1</string>
         <string>--allow-route</string>
@@ -36,16 +37,33 @@
         <string>--allow-host-suffix</string>
         <string>api.vcvrack.com</string>
         <string>--allow-host-suffix</string>
+        <string>pypi.org</string>
+        <string>--allow-host-suffix</string>
+        <string>files.pythonhosted.org</string>
+        <string>--allow-host-suffix</string>
         <string>blob.core.windows.net</string>
         <string>--allow-host-suffix</string>
         <string>crates.io</string>
         <string>--allow-host-suffix</string>
         <string>sigstore.dev</string>
+        <string>--allow-host-suffix</string>
+        <string>googlechromelabs.github.io</string>
+        <string>--log-path</string>
+        <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
+    <!-- A relay that cannot bind (another process holds the port) exits 75;
+         KeepAlive respawns any exit, so this spaces those retries. -->
+    <key>ThrottleInterval</key>
+    <integer>60</integer>
     <key>StandardOutPath</key>
     <string>$HOME/Library/Logs/tartci/http-connect-ssh-relay.log</string>
     <key>StandardErrorPath</key>

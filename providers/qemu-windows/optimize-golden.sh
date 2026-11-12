@@ -11,7 +11,7 @@ ARCHES="${TARTCI_WIN_VCVARS_ARCHES:-${TARTCI_WIN_VCVARS_ARCH:-arm64}}"
 RUNNER_VERSION="${TARTCI_RUNNER_VERSION:-${PULP_RUNNER_VERSION:-2.335.1}}"
 
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes -o BatchMode=yes)
-SSH=(ssh "${SSH_OPTS[@]}" -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
+SSH=(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$KEY" -p "$PORT" "$USER@127.0.0.1")
 
 note(){ printf '\033[36m• %s\033[0m\n' "$*" >&2; }
 
@@ -172,12 +172,12 @@ tmp_remote='C:\actions-runner\tartci-optimize-golden.ps1'
 tmp_remote_b64='C:\actions-runner\tartci-optimize-golden.ps1.b64'
 script_b64="$(printf '%s' "$ps_script" | base64 | tr -d '\n')"
 
-"${SSH[@]}" "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path 'C:\actions-runner' | Out-Null\""
-"${SSH[@]}" "powershell -NoProfile -Command \"Set-Content -LiteralPath '$tmp_remote_b64' -Value '' -NoNewline\""
+${SSH[@]+"${SSH[@]}"} "powershell -NoProfile -Command \"New-Item -ItemType Directory -Force -Path 'C:\actions-runner' | Out-Null\""
+${SSH[@]+"${SSH[@]}"} "powershell -NoProfile -Command \"Set-Content -LiteralPath '$tmp_remote_b64' -Value '' -NoNewline\""
 while [ -n "$script_b64" ]; do
   chunk="${script_b64:0:3000}"
   script_b64="${script_b64:3000}"
-  "${SSH[@]}" "powershell -NoProfile -Command \"Add-Content -LiteralPath '$tmp_remote_b64' -Value '$chunk' -NoNewline\""
+  ${SSH[@]+"${SSH[@]}"} "powershell -NoProfile -Command \"Add-Content -LiteralPath '$tmp_remote_b64' -Value '$chunk' -NoNewline\""
 done
 
 run_enc="$(printf '%s' '$ErrorActionPreference="Stop"
@@ -188,4 +188,4 @@ $bytes=[Convert]::FromBase64String((Get-Content -LiteralPath $b64 -Raw))
 & powershell -NoProfile -ExecutionPolicy Bypass -File $p
 exit $LASTEXITCODE' | iconv -t UTF-16LE | base64)"
 
-"${SSH[@]}" "powershell -NoProfile -EncodedCommand $run_enc"
+${SSH[@]+"${SSH[@]}"} "powershell -NoProfile -EncodedCommand $run_enc"

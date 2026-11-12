@@ -14,6 +14,12 @@ as unreachable and makes the whole census incomplete, so a caller can tell
 "no runner carries this label" apart from "no runner was observed". An
 incomplete census answers UNKNOWN for a label it did not find, never UNSERVED.
 
+The one exception is a repository owned by a user account: it has no
+organization, so `orgs/<owner>/actions/runners` is a 404 by construction. That
+404 is confirmed against `users/<owner>` before the scope is recorded as not
+applicable; a 404 for an owner that is an organization, or whose type cannot be
+read, stays an unreachable scope.
+
 Registrations are per-scope: a repository runner and an organization runner can
 share a numeric id and are still two different machines, so records are keyed by
 (scope, id) and each record carries the endpoint that owns it. Delete or inspect
@@ -26,6 +32,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -40,6 +47,78 @@ UNSERVED = "unserved"
 UNKNOWN = "unknown"
 
 _REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*/[A-Za-z0-9_.-]+$")
+
+# Named census failures. A census that fails for an identity reason must say
+# so: both of these read as "capacity unknown" otherwise, and both have been
+# misdiagnosed as a missing GitHub permission.
+CENSUS_UNAUTHENTICATED = "census_unauthenticated"
+CENSUS_IDENTITY_LACKS_ACCESS = "census_identity_lacks_access"
+_ANONYMOUS_RATE_LIMIT = re.compile(
+    r"rate limit exceeded for \d{1,3}(?:\.\d{1,3}){3}\b"
+    r"|authenticated requests get a higher rate limit", re.I)
+_UNAUTHENTICATED = re.compile(
+    r"bad credentials|requires authentication|http 401|401 unauthorized"
+    r"|must authenticate|gh auth login|not logged in", re.I)
+_INTEGRATION_FORBIDDEN = re.compile(r"resource not accessible by integration", re.I)
+
+# The environment a GitHub App wrapper binds its installation from. Shipyard's
+# ghapp reads SHIPYARD_GHAPP_REPO, then GH_REPO, and only then falls back to
+# the checkout it runs in; SHIPYARD_GH_APP_REPO is the name tartci's own lane
+# plists and runner.sh export. Setting all three pins the installation to the
+# queried repository wherever the census happens to be run from.
+IDENTITY_ENV_NAMES = ("SHIPYARD_GHAPP_REPO", "GH_REPO", "SHIPYARD_GH_APP_REPO")
+
+
+def identity_env(repo: str) -> dict[str, str]:
+    split_repo(repo)
+    return {name: repo for name in IDENTITY_ENV_NAMES}
+
+
+def bind_identity(repo: str) -> dict[str, str | None]:
+    """Bind the GitHub identity env for one call; returns what to restore.
+
+    Callers supply their own runner (bounded, budgeted, argv-rewriting), so
+    the binding travels in the environment every child inherits rather than
+    in argv, whose shape several callers rely on. Pair with restore_identity
+    in a finally. A plain try/finally, not a generator context manager: the
+    bounded runner raises frozen exceptions that generator.throw cannot
+    annotate. Census calls are sequential; this is not for concurrent use.
+    """
+    saved = {name: os.environ.get(name) for name in IDENTITY_ENV_NAMES}
+    os.environ.update(identity_env(repo))
+    return saved
+
+
+def restore_identity(saved: dict[str, str | None]) -> None:
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+
+
+def classify_census_failure(text: str, *, cli: str, repo: str) -> tuple[str, str] | None:
+    """(reason, operator message) for an identity failure, else None."""
+    message = (text or "").strip()
+    excerpt = message[:300]
+    if _ANONYMOUS_RATE_LIMIT.search(message) or _UNAUTHENTICATED.search(message):
+        return CENSUS_UNAUTHENTICATED, (
+            f"`{cli}` reached GitHub without a valid credential while reading runners "
+            f"for {repo} (anonymous requests share one 60/hour allowance per IP "
+            f"across every host behind it). Fix: run with TARTCI_GH_CLI=ghapp, or "
+            f"repair `{cli}` authentication. This is not a capacity or permission "
+            f"problem. GitHub said: {excerpt}"
+        )
+    if _INTEGRATION_FORBIDDEN.search(message):
+        return CENSUS_IDENTITY_LACKS_ACCESS, (
+            f"the GitHub App identity `{cli}` used, requested for {repo}, cannot read "
+            f"that scope's runners. Check which installation `{cli}` minted a token "
+            f"for: the census binds it to {repo} through "
+            f"{'/'.join(IDENTITY_ENV_NAMES)}, and a token minted for another "
+            f"repository's installation is refused here even when {repo}'s "
+            f"installation holds org runner read. GitHub said: {excerpt}"
+        )
+    return None
 
 
 class CensusScopeError(RuntimeError):
@@ -148,12 +227,17 @@ class ScopeCensus:
     reachable: bool
     error: str = ""
     runners: tuple[RunnerRecord, ...] = field(default_factory=tuple)
+    # False only for the organization scope of a user-owned repository, which
+    # cannot hold registrations. A scope that does not exist is not a scope
+    # that went unread.
+    applicable: bool = True
 
     def as_dict(self) -> dict:
         return {
             "scope": self.scope,
             "endpoint": self.endpoint,
             "reachable": self.reachable,
+            "applicable": self.applicable,
             "error": self.error,
             "count": len(self.runners) if self.reachable else None,
         }
@@ -179,11 +263,13 @@ class RunnerCensus:
 
     @property
     def complete(self) -> bool:
-        return all(scope.reachable for scope in self.scopes)
+        return all(scope.reachable or not scope.applicable for scope in self.scopes)
 
     @property
     def unreachable(self) -> tuple[ScopeCensus, ...]:
-        return tuple(scope for scope in self.scopes if not scope.reachable)
+        return tuple(
+            scope for scope in self.scopes if not scope.reachable and scope.applicable
+        )
 
     def unreachable_detail(self) -> str:
         return "; ".join(
@@ -202,16 +288,52 @@ class RunnerCensus:
 
 Fetch = Callable[[str, str], Iterable[dict]]
 
+USER_OWNER = "User"
+
+
+def _is_not_found(error: str) -> bool:
+    return bool(re.search(r"http 404|\b404 not found\b|\bnot found \(http 404\)", error, re.I))
+
+
+def _organization_scope_absent(fetch: Fetch, repo: str, error: str) -> bool:
+    """Whether a failed organization read is the 404 of a user-owned repo.
+
+    Only a 404 qualifies, and only when the fetcher can confirm the owner is a
+    user account. Any other failure, or an owner type that cannot be read,
+    leaves the scope unreachable.
+    """
+    if not _is_not_found(error):
+        return False
+    owner_type = getattr(fetch, "owner_type", None)
+    if not callable(owner_type):
+        return False
+    try:
+        return owner_type(split_repo(repo)[0]) == USER_OWNER
+    except Exception:  # noqa: BLE001 - an unread owner type proves nothing
+        return False
+
 
 def collect(repo: str, fetch: Fetch, *, scopes: Sequence[str] = SCOPES) -> RunnerCensus:
     """Read every scope. One scope failing never aborts the others."""
     results: list[ScopeCensus] = []
+    # A fetcher that can bind its GitHub identity binds it to THIS repo, so an
+    # App wrapper never mints for whatever checkout the caller stands in.
+    bind = getattr(fetch, "bind_repo", None)
+    if callable(bind):
+        fetch = bind(repo)
     for scope in scopes:
         endpoint = scope_endpoint(scope, repo)
         try:
             rows = fetch(scope, endpoint)
         except CensusScopeError as exc:
             detail = f"{exc.code}: {exc.detail}" if exc.detail else exc.code
+            if scope == ORGANIZATION_SCOPE and _organization_scope_absent(fetch, repo, detail):
+                results.append(ScopeCensus(
+                    scope, endpoint, reachable=False, applicable=False,
+                    error=f"not applicable: {split_repo(repo)[0]} is a user account, "
+                          "which has no organization runners",
+                ))
+                continue
             results.append(ScopeCensus(scope, endpoint, reachable=False, error=detail))
             continue
         except Exception as exc:  # noqa: BLE001 — any failure is an unread scope
@@ -238,15 +360,36 @@ def cli_fetcher(cli: str, *, run_json: Callable[[list[str]], Any], per_page: int
     imposing one.
     """
 
-    def fetch(scope: str, endpoint: str) -> list[dict]:
-        argv = [cli, "api", f"{endpoint}?per_page={per_page}", "--paginate", "--slurp"]
-        try:
-            payload = run_json(argv)
-        except Exception as exc:  # noqa: BLE001
-            code = getattr(exc, "problem_code", "") or type(exc).__name__
-            raise CensusScopeError(scope, endpoint, str(code), str(exc)) from exc
-        return extract_runners(payload)
+    def fetcher_for(repo: str | None):
+        def fetch(scope: str, endpoint: str) -> list[dict]:
+            argv = [cli, "api", f"{endpoint}?per_page={per_page}", "--paginate", "--slurp"]
+            saved = bind_identity(repo) if repo is not None else {}
+            try:
+                payload = run_json(argv)
+            except Exception as exc:  # noqa: BLE001
+                named = classify_census_failure(str(exc), cli=cli, repo=repo or "?")
+                if named is not None:
+                    raise CensusScopeError(scope, endpoint, named[0], named[1]) from exc
+                code = getattr(exc, "problem_code", "") or type(exc).__name__
+                raise CensusScopeError(scope, endpoint, str(code), str(exc)) from exc
+            finally:
+                restore_identity(saved)
+            return extract_runners(payload)
 
+        def owner_type(owner: str) -> str | None:
+            saved = bind_identity(repo) if repo is not None else {}
+            try:
+                payload = run_json([cli, "api", f"users/{owner}"])
+            finally:
+                restore_identity(saved)
+            value = payload.get("type") if isinstance(payload, dict) else None
+            return value if isinstance(value, str) else None
+
+        fetch.owner_type = owner_type  # type: ignore[attr-defined]
+        return fetch
+
+    fetch = fetcher_for(None)
+    fetch.bind_repo = fetcher_for  # type: ignore[attr-defined]
     return fetch
 
 
@@ -312,8 +455,25 @@ def _default_run_json(argv: list[str]) -> Any:
     return json.loads(proc.stdout or "null")
 
 
-def github_cli() -> str:
-    return os.environ.get("TARTCI_GH_CLI") or "gh"
+def github_cli(env: dict[str, str] | None = None) -> str:
+    """TARTCI_GH_CLI, else ghapp (PATH or ~/.local/bin), else gh.
+
+    Bare `gh` is the last resort, not the default: on a host whose gh login is
+    broken it silently goes anonymous and spends the fleet's shared 60/hour
+    allowance. The App wrapper is the identity the fleet actually runs as.
+    """
+    environ = os.environ if env is None else env
+    configured = (environ.get("TARTCI_GH_CLI") or "").strip()
+    if configured:
+        return configured
+    found = shutil.which("ghapp", path=environ.get("PATH"))
+    if found:
+        return found
+    home = environ.get("HOME") or os.path.expanduser("~")
+    local = os.path.join(home, ".local", "bin", "ghapp")
+    if os.path.isfile(local) and os.access(local, os.X_OK):
+        return local
+    return "gh"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -322,7 +482,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--repo", required=True, help="OWNER/REPO")
     parser.add_argument("--label", action="append", default=[], help="report this label's status")
-    parser.add_argument("--gh-cli", default="", help="GitHub CLI wrapper (default: $TARTCI_GH_CLI)")
+    parser.add_argument("--gh-cli", default="",
+                        help="GitHub CLI wrapper (default: $TARTCI_GH_CLI, else ghapp, else gh)")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -336,7 +497,12 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         for scope in census.scopes:
-            state = f"{len(scope.runners)} runner(s)" if scope.reachable else f"UNREACHABLE ({scope.error})"
+            if scope.reachable:
+                state = f"{len(scope.runners)} runner(s)"
+            elif not scope.applicable:
+                state = f"n/a ({scope.error})"
+            else:
+                state = f"UNREACHABLE ({scope.error})"
             print(f"{scope.scope:<13} {scope.endpoint}: {state}")
         for status in statuses:
             names = ", ".join(record.name for record in status.online) or "-"

@@ -81,6 +81,9 @@ import json
 import sys
 
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 names = ["Release CLI", "Release-path PR gate", "Sign and Release", "Other"]
 if "/actions/runs?status=queued" in path:
     print(json.dumps({"workflow_runs": [
@@ -218,6 +221,9 @@ import os
 import sys
 
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 if path.endswith("/actions/workflows?per_page=100"):
     print(json.dumps({"workflows": [{"id": 99, "name": "Build and Test"}]}))
 elif "/actions/workflows/99/runs?status=queued" in path:
@@ -276,6 +282,9 @@ import json
 import sys
 
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 runs = [
     {"id": 1, "name": "Release-path PR gate", "status": "queued",
      "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z"},
@@ -365,6 +374,9 @@ import os
 import sys
 
 path = sys.argv[-1]
+if path == "rate_limit":
+    print(json.dumps({"resources": {"core": {"limit": 15000, "remaining": 14999}}}))
+    raise SystemExit(0)
 high_visible = os.path.exists(os.path.join(os.environ["HOME"], "high-visible"))
 if path.endswith("/actions/workflows?per_page=100"):
     print(json.dumps({"workflows": [{"id": 99, "name": "Release-path PR gate"}]}))

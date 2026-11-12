@@ -8,23 +8,20 @@ import os
 import pathlib
 import shutil
 import sys
+import threading
 from typing import Any
 
 
-def _record_int(record: dict[str, Any], key: str, default: int = 0) -> int:
-    try:
-        return int(record.get(key, default))
-    except (TypeError, ValueError):
-        return default
+DISK_PROBE_TIMEOUT_S = 15.0
 
 
-def disk_probe(
+def _disk_probe_impl(
     path_text: str,
     *,
     expected_device_id: str = "",
     expected_mount_path: str = "",
 ) -> dict[str, Any]:
-    """Resolve an existing storage root to its device and current free space."""
+    """Unbounded filesystem probe body, run behind ``disk_probe``'s deadline."""
     logical = pathlib.Path(path_text).expanduser()
     if not logical.is_absolute():
         logical = pathlib.Path.cwd() / logical
@@ -73,6 +70,45 @@ def disk_probe(
         "probe_path": str(requested),
         "free_bytes": int(free),
     }
+
+
+def _record_int(record: dict[str, Any], key: str, default: int = 0) -> int:
+    try:
+        return int(record.get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def disk_probe(
+    path_text: str,
+    *,
+    expected_device_id: str = "",
+    expected_mount_path: str = "",
+) -> dict[str, Any]:
+    """Resolve a storage root, failing closed when a volume stalls."""
+    result: dict[str, Any] = {}
+    error: list[BaseException] = []
+
+    def probe() -> None:
+        try:
+            result.update(_disk_probe_impl(
+                path_text,
+                expected_device_id=expected_device_id,
+                expected_mount_path=expected_mount_path,
+            ))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on caller thread
+            error.append(exc)
+
+    worker = threading.Thread(target=probe, name="tartci disk probe", daemon=True)
+    worker.start()
+    worker.join(DISK_PROBE_TIMEOUT_S)
+    if worker.is_alive():
+        raise TimeoutError(
+            f"disk root probe timed out after {DISK_PROBE_TIMEOUT_S:.0f}s: {path_text!r}"
+        )
+    if error:
+        raise error[0]
+    return result
 
 
 def record_disk_bytes(record: dict[str, Any]) -> int:

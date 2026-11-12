@@ -1,0 +1,7 @@
+Verbatim copies of Generous-Corp/pulp origin/main 2c59049881b78980c7483010947bfb855f4f22ba:
+  tools/scripts/clean_build_cov.sh
+  tools/scripts/clean_worktree_builds.sh
+  tools/ci/build_dir_lock.py
+Used only by scripts/test_pulp_reapers.py to prove the reclaim pass drives the
+real reapers end to end. Production never runs these copies: it runs a fresh
+origin/main checkout of the configured Pulp repository.

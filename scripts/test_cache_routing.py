@@ -46,6 +46,21 @@ class CacheRoutingTests(unittest.TestCase):
             self.assertIn('--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro"', body)
             self.assertNotIn("export FETCHCONTENT_BASE_DIR", body)
 
+    def test_jit_guest_mounts_a_persistent_configure_check_cache(self) -> None:
+        """Pulp's configure-check replay only helps when its directory outlives
+        the disposable guest: the host dir is prepared and mounted, the guest
+        symlinks the default cache path onto the mount, and the runner .env
+        names it so the workflow's cmake finds it."""
+        body = MAC_JIT.read_text(encoding="utf-8")
+        lib = (ROOT / "providers/tart-macos/lane-cache-root.lib.sh").read_text(encoding="utf-8")
+        self.assertIn('tartci_prepare_lane_cache_mounts "$CACHE_ROOT"', body)
+        self.assertIn('tartci_prepare_disk_root "$root/configure-checks"', lib)
+        self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks"', body)
+        self.assertIn("ln -sfn '/Volumes/My Shared Files/configure-checks'", body)
+        self.assertIn("PULP_CONFIGURE_CHECK_CACHE_DIR=%s", body)
+        # The re-rendered .env must drop a stale value of the key.
+        self.assertRegex(body, r"awk -F= .*PULP_CONFIGURE_CHECK_CACHE_DIR.*\.env > \.env\.tartci")
+
     def test_jit_guest_uses_isolated_copy_of_read_only_host_seed(self) -> None:
         body = MAC_JIT.read_text(encoding="utf-8")
         self.assertIn(

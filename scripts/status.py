@@ -4,10 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import os
+import pathlib
 import platform
 import plistlib
+import re
 import shutil
 import subprocess
 import time
@@ -16,6 +19,7 @@ from typing import Any
 
 import disk_reclaim
 import leases
+import reclaim_status
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -88,12 +92,12 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     is normally run from an interactive shell and launchd's job carries its
     own. The failure this exists to surface is a host that never got the agent,
     or got an older generation of it: m1 and m5 carry no VM janitor at all, and
-    nothing in `tartci status` said so. The settings prefix is a parameter
-    because each janitor carries its own (`TARTCI_RECLAIM_*`, `TARTCI_REAP_*`)
+    nothing in tartci status said so. The settings prefix is a parameter
+    because each janitor carries its own (TARTCI_RECLAIM_*, TARTCI_REAP_*)
     and reporting one janitor's knobs under another's name would be worse than
     reporting none.
 
-    `loaded` is deliberately three-valued. False means launchd was asked and
+    loaded is deliberately three-valued. False means launchd was asked and
     does not hold the job; None means the question could not be put (no
     launchctl, as on the Linux CI host). Collapsing those would let an
     unanswerable question read as a definite "not running".
@@ -105,6 +109,14 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     probe = run(["launchctl", "print", f"gui/{os.getuid()}/{label}"], timeout=5)
     if probe["returncode"] != 127:
         out["loaded"] = probe["ok"]
+    if probe["ok"]:
+        # launchd's own record of which plist it loaded. A label loaded from
+        # anywhere else is a leaked registration shadowing this one (a test
+        # that ran an installer with a temporary HOME), so "loaded" alone
+        # would report the wrong job as this janitor.
+        match = re.search(r"^\tpath = (.+)$", probe["stdout"], re.M)
+        out["loaded_plist"] = match.group(1).strip() if match else None
+        out["shadowed"] = out["loaded_plist"] != str(path)
     if not out["installed"]:
         return out
     try:
@@ -130,31 +142,61 @@ def janitor_agent(label: str = RECLAIM_LABEL,
     return out
 
 
-def disk_space(settings: dict[str, Any] | None = None) -> dict[str, Any]:
+def disk_space(settings: dict[str, Any] | None = None,
+               timeout: float = 5.0) -> dict[str, Any]:
     """Free space on the volumes the reclaim janitor actually scans.
 
     Root discovery is disk_reclaim's own, not a second list, because a status
     that measures a volume the janitor never scans is the one fault nothing
-    downstream can catch. That is not hypothetical: a `$HOME/Code` root
+    downstream can catch. That is not hypothetical: a $HOME/Code root
     reported a clean pass forever on a host that keeps its code on Workshop,
     while Workshop filled.
 
     For the same reason the installed plist's roots win over this shell's
     environment when the two disagree -- the janitor runs under the plist.
+
+    Bounded, like every other outbound call here. Root discovery resolves the
+    paths and then stats the volume each one sits on, and on this fleet one of
+    those is external. A wedged or stale mount blocks those calls in the
+    kernel with no timeout of their own, which would hang tartci status
+    exactly during the incident someone runs it to understand. The worker is
+    abandoned rather than joined on timeout, because a thread parked in an
+    uninterruptible stat cannot be recalled -- only stopped waiting for.
     """
     declared = (settings or {}).get("TARTCI_RECLAIM_ROOTS") \
         or os.environ.get("TARTCI_RECLAIM_ROOTS")
+
+    lease = disk_reclaim.resolve_lease_path(
+        (settings or {}).get("TARTCI_RECLAIM_LEASE_PATH")
+        or os.environ.get("TARTCI_RECLAIM_LEASE_PATH"))
+
+    def measure() -> tuple[list[Any], list[dict[str, Any]], dict[str, Any] | None]:
+        found = disk_reclaim.parse_roots(declared)
+        # The volume the reclaim floor and lease admission judge, which need
+        # not be one the janitor scans (m3: VMs on Workshop, ~/Code on boot).
+        lease_volume = None
+        if lease:
+            lease_volume = dict(disk_reclaim.volumes_free_bytes(
+                [pathlib.Path(lease["path"])])[0], source=lease["source"])
+        return found, disk_reclaim.volumes_free_bytes(found), lease_volume
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        roots = disk_reclaim.parse_roots(declared)
-        volumes = disk_reclaim.volumes_free_bytes(roots)
+        roots, volumes, lease_volume = executor.submit(measure).result(timeout=timeout)
+    except concurrent.futures.TimeoutError:
+        return {"error": f"volume scan did not answer within {timeout}s; "
+                         "a scan root may be on a wedged mount"}
     except Exception as exc:  # noqa: BLE001
         return {"error": str(exc)}
+    finally:
+        executor.shutdown(wait=False)
     return {
         "roots": [str(root) for root in roots],
         "roots_declared": bool(declared),
         "volumes": volumes,
         "tightest_free_bytes": disk_reclaim.tightest_free_bytes(volumes),
         "tightest_root": disk_reclaim.tightest_volume_root(volumes),
+        "lease_volume": lease_volume,
     }
 
 
@@ -197,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         "leases": lease_status(),
         "janitors": janitors,
         "disk": disk_space(janitors["reclaim"].get("settings")),
+        "reclaim_last_pass": reclaim_status.status(),
         "notes": [
             "status is host-local and does not acquire provider capacity",
             "lease status may take the host lease lock and reap dead-owner records",
@@ -221,12 +264,21 @@ def main(argv: list[str] | None = None) -> int:
                 free = volume["free_bytes"]
                 figure = "unknown" if free is None else f"{free / GIB:.1f} GiB free"
                 print(f"disk: {volume['root']}  {figure}")
+        lease_volume = disk.get("lease_volume")
+        if not disk.get("error") and lease_volume:
+            free = lease_volume["free_bytes"]
+            figure = "unknown" if free is None else f"{free / GIB:.1f} GiB free"
+            print(f"disk: {lease_volume['root']}  {figure} "
+                  "(Tart store: lease admission and the reclaim floor)")
         for name, _label, _prefix, description in JANITORS:
             agent = data["janitors"][name]
             if not agent["installed"]:
                 state = "NOT INSTALLED"
             elif agent["loaded"] is None:
                 state = "installed, launchd not reachable from here"
+            elif agent.get("shadowed"):
+                state = (f"installed, but launchd holds a DIFFERENT plist "
+                         f"({agent.get('loaded_plist')}): leaked registration")
             else:
                 state = "installed and loaded" if agent["loaded"] else \
                     "installed but NOT loaded"
@@ -234,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
             when = "never observed" if last is None else \
                 f"last pass {(time.time() - last) / 3600:.1f}h ago"
             print(f"{description}: {state}; {when}")
+        print(reclaim_status.describe(data["reclaim_last_pass"]))
         lease_capacity = (data.get("leases") or {}).get("capacity") or {}
         if lease_capacity:
             print(

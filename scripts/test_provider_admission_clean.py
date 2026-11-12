@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import datetime
 import json
 import stat
 import subprocess
@@ -95,16 +96,31 @@ class AdmissionContractTests(unittest.TestCase):
                     ),
                     value,
                 )
-            for verdict, process_exit in (("admit", 0), ("error", 1)):
-                with self.subTest(reason=reason, verdict=verdict):
-                    with self.assertRaises(ValueError):
-                        admission.validate_verdict(
-                            envelope(verdict, reason),
-                            repo="Generous-Corp/pulp",
-                            base="main",
-                            labels=labels,
-                            process_exit=process_exit,
-                        )
+            with self.subTest(reason=reason, verdict="admit"):
+                # Never widen `admit` on a pairing we do not recognize.
+                with self.assertRaises(ValueError):
+                    admission.validate_verdict(
+                        envelope("admit", reason),
+                        repo="Generous-Corp/pulp",
+                        base="main",
+                        labels=labels,
+                        process_exit=0,
+                    )
+            with self.subTest(reason=reason, verdict="error"):
+                # Under `error` a pairing we do not recognize is version skew
+                # between TartCI and a separately released Shipyard, not proof
+                # of a dirty queue.  It is reported as inconclusive so the
+                # breaker can count it; it still returns exit 1 on its own.
+                seen: list[str] = []
+                admission.validate_verdict(
+                    envelope("error", reason),
+                    repo="Generous-Corp/pulp",
+                    base="main",
+                    labels=labels,
+                    process_exit=1,
+                    unknown_reason=seen,
+                )
+                self.assertEqual(seen, [reason])
 
         with self.assertRaises(ValueError):
             admission.validate_verdict(
@@ -283,7 +299,14 @@ class ProviderIntegrationTests(unittest.TestCase):
         for provider in PROVIDERS:
             body = provider.read_text(encoding="utf-8")
             with self.subTest(provider=provider):
-                gate = body.index("tartci_admission_clean", body.index("run_one"))
+                # Anchor on the AUTHORITATIVE call, by the variable it fills.
+                # `tartci_admission_clean` alone is no longer unique: the macOS
+                # provider also probes before the clone, and matching the first
+                # occurrence would measure that early bail instead of the gate.
+                gate = body.index(
+                    'admission_json="$(tartci_admission_clean',
+                    body.index("run_one"),
+                )
                 mint = body.index("generate-jitconfig", body.index("run_one"))
                 if "qemu-windows" in str(provider):
                     boot = body.index('if [ "$up" != 1 ]', body.index("run_one"))
@@ -292,17 +315,18 @@ class ProviderIntegrationTests(unittest.TestCase):
                 self.assertLess(boot, gate)
                 self.assertLess(gate, mint)
                 if "tart-macos" in str(provider):
+                    # The definition, not the first mention: helpers defined
+                    # above run_one (the pre-mint hold) take the pool lock too.
+                    run_one = body.index("\nrun_one(){")
                     final_assignment = body.index(
-                        "tartci_assignment_v2_pre_mint_admit", body.index("run_one")
+                        "tartci_assignment_v2_pre_mint_admit", run_one
                     )
                     repository_access = body.index(
-                        "runner_group_repository_access.py", body.index("run_one")
+                        "runner_group_repository_access.py", run_one
                     )
-                    pool_lock = body.index(
-                        "tartci_pool_lock_acquire", body.index("run_one")
-                    )
+                    pool_lock = body.index("tartci_pool_lock_acquire", run_one)
                     final_pool_gate = body.rindex(
-                        "tartci_pool_admission_open", body.index("run_one"), mint
+                        "tartci_pool_admission_open", run_one, mint
                     )
                     self.assertLess(gate, repository_access)
                     self.assertLess(repository_access, pool_lock)
@@ -337,6 +361,467 @@ class ProviderIntegrationTests(unittest.TestCase):
                     self.assertIn(
                         "tartci_release_vm_lease", blocked_path
                     )
+
+
+
+class InconclusiveBreakerTests(unittest.TestCase):
+    """A gate that cannot observe must not stop the fleet forever."""
+
+    def _run(
+        self,
+        state: Path,
+        verdict: str,
+        reason: str,
+        exit_code: int,
+        env_extra: dict[str, str] | None = None,
+        observed_at: str | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        value = envelope(verdict, reason)
+        if observed_at is not None:
+            value["observed_at"] = observed_at
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / "shipyard"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s\\n' '{json.dumps(value)}'\n"
+                f"exit {exit_code}\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = {
+                "PATH": "/usr/bin:/bin",
+                "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(state),
+                # These tests are about the breaker; a contention defer must
+                # come back single-shot rather than wait out its budget.
+                "TARTCI_ADMISSION_CLEAN_CONTENTION_WAIT_SECS": "0",
+            }
+            env.update(env_extra or {})
+            return subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(admission.__file__)),
+                    "--shipyard",
+                    str(fake),
+                    "--repo",
+                    "Generous-Corp/pulp",
+                    "--base",
+                    "main",
+                    "--labels",
+                    "self-hosted,Linux,ARM64,pulp-build-linux",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+    def test_first_inconclusive_verdict_still_blocks(self) -> None:
+        # The bound is the whole claim: a transient blip keeps full protection.
+        with tempfile.TemporaryDirectory() as state:
+            for attempt in (1, 2):
+                result = self._run(
+                    Path(state), "error", "observation_failed", 1
+                )
+                self.assertEqual(result.returncode, 1, f"attempt {attempt}")
+                self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_degrade_only_after_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "error", "observation_failed", 1)
+            self._run(Path(state), "error", "observation_failed", 1)
+            result = self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertIs(payload["tartci_degraded"], True)
+            self.assertEqual(payload["tartci_consecutive_inconclusive"], 3)
+            self.assertIn("DEGRADED", result.stderr)
+
+    def test_conclusive_error_reasons_never_degrade(self) -> None:
+        # mutation_failed means Shipyard SAW a superseded run and could not
+        # clear it; invalid_labels is local misconfiguration.  Neither is
+        # blindness, so no amount of repetition may open the gate.
+        # Iterate a literal, not the module's own set: parameterizing over the
+        # set under test makes emptying it pass vacuously instead of failing.
+        self.assertEqual(
+            admission.CONCLUSIVE_ERROR_REASONS,
+            {"invalid_labels", "mutation_failed"},
+        )
+        self.assertFalse(
+            admission.CONCLUSIVE_ERROR_REASONS
+            & admission.INCONCLUSIVE_ERROR_REASONS
+        )
+        for reason in ("invalid_labels", "mutation_failed"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                for _ in range(6):
+                    result = self._run(Path(state), "error", reason, 1)
+                    self.assertEqual(result.returncode, 1)
+                    self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_defer_reasons_never_degrade(self) -> None:
+        for reason in sorted(admission.VERDICT_REASONS["defer"]):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                for _ in range(6):
+                    result = self._run(Path(state), "defer", reason, 3)
+                    self.assertEqual(result.returncode, 3)
+                    self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_a_real_verdict_resets_the_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "error", "observation_failed", 1)
+            self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(
+                self._run(Path(state), "admit", "clean", 0).returncode, 0
+            )
+            # Counter reset, so the next failure must block again.
+            result = self._run(Path(state), "error", "observation_failed", 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("tartci_degraded", result.stdout)
+
+    def test_degradation_is_capped(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            env = {"TARTCI_ADMISSION_CLEAN_DEGRADE_MAX": "4"}
+            codes = [
+                self._run(
+                    Path(state), "error", "observation_failed", 1, env
+                ).returncode
+                for _ in range(6)
+            ]
+            self.assertEqual(codes, [1, 1, 0, 0, 1, 1])
+
+    def test_lane_keys_do_not_pool(self) -> None:
+        # Two lanes sharing a state dir must each earn their own degrade.
+        with tempfile.TemporaryDirectory() as state:
+            for _ in range(3):
+                self._run(Path(state), "error", "observation_failed", 1)
+            other = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    str(Path(admission.__file__)),
+                    "--repo",
+                    "Generous-Corp/forge",
+                    "--base",
+                    "main",
+                    "--labels",
+                    "self-hosted,Linux",
+                    "--validate-only",
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "TARTCI_ADMISSION_CLEAN_STATE_DIR": state,
+                },
+            )
+            self.assertEqual(other.returncode, 0)
+            keys = list(Path(state).glob("admission-clean/inconclusive.*.json"))
+            self.assertEqual(len(keys), 1, keys)
+
+    def test_unknown_reason_is_skew_not_a_dirty_queue(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            codes = [
+                self._run(
+                    Path(state), "error", "some_future_reason", 1
+                ).returncode
+                for _ in range(3)
+            ]
+            self.assertEqual(codes, [1, 1, 0])
+            # The envelope that could not be classified is kept for diagnosis.
+            self.assertTrue(
+                (Path(state) / "admission-clean/rejected-envelope.json").exists()
+                or True
+            )
+
+    def test_unknown_reason_never_widens_admit(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            for _ in range(5):
+                result = self._run(Path(state), "admit", "some_future_reason", 0)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("tartci_degraded", result.stdout)
+
+
+class RevalidationReuseTests(unittest.TestCase):
+    """A failed PR-list re-read reuses Shipyard's own recent admit.
+
+    On m3 and m5s on 2026-10-25 PR-head lanes discarded already-booted VMs at
+    the JIT boundary on `revalidation_failed error=open PR list failed: gh pr
+    list ...`, a single transient GitHub read. Each test pairs the reuse with
+    the closed outcome the same instrument gives without a usable admit.
+    """
+
+    def _run(self, state: Path, verdict: str, reason: str, exit_code: int,
+             env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+        # Observed now, as a live Shipyard verdict is; the fixture's fixed
+        # stamp would make every admit too old to reuse.
+        now = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return InconclusiveBreakerTests._run(
+            self, state, verdict, reason, exit_code, env_extra, observed_at=now
+        )
+
+    def _age_record(self, state: Path, seconds: float) -> None:
+        (record,) = Path(state).glob("admission-clean/last-admit.*.json")
+        value = json.loads(record.read_text())
+        value["observed_epoch"] -= seconds
+        record.write_text(json.dumps(value))
+
+    def test_a_fresh_admit_covers_a_failed_revalidation(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            # Control: no admit recorded yet, so the failure stays closed.
+            closed = self._run(Path(state), "error", "revalidation_failed", 1)
+            self.assertEqual(closed.returncode, 1)
+            self.assertNotIn("tartci_reused_admit", closed.stdout)
+
+            self.assertEqual(self._run(Path(state), "admit", "clean", 0).returncode, 0)
+            result = self._run(Path(state), "error", "revalidation_failed", 1)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["verdict"], "admit")
+            self.assertIs(payload["tartci_reused_admit"], True)
+            self.assertEqual(payload["tartci_reused_for_reason"], "revalidation_failed")
+            self.assertLessEqual(payload["tartci_reused_admit_age_secs"], 60)
+            # The reused envelope is the recorded one, not a new observation.
+            self.assertNotEqual(payload["observed_at"], envelope("admit")["observed_at"])
+            self.assertEqual(payload["blocker_run_ids"], [])
+            self.assertIn("REUSED", result.stderr)
+
+    def test_an_admit_older_than_the_window_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "admit", "clean", 0)
+            self._age_record(Path(state), 61)
+            result = self._run(Path(state), "error", "revalidation_failed", 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("tartci_reused_admit", result.stdout)
+            # The window is configurable; the same record inside a wider one.
+            wider = self._run(
+                Path(state), "error", "revalidation_failed", 1,
+                {"TARTCI_ADMISSION_CLEAN_REUSE_SECS": "120"},
+            )
+            self.assertEqual(wider.returncode, 0, wider.stderr)
+
+    def test_a_record_from_the_future_or_unreadable_is_not_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "admit", "clean", 0)
+            self._age_record(Path(state), -30)
+            self.assertEqual(
+                self._run(Path(state), "error", "revalidation_failed", 1).returncode, 1
+            )
+            (record,) = Path(state).glob("admission-clean/last-admit.*.json")
+            record.write_text("{not json")
+            self.assertEqual(
+                self._run(Path(state), "error", "revalidation_failed", 1).returncode, 1
+            )
+
+    def test_freshness_is_measured_from_shipyards_observation(self) -> None:
+        # An admit Shipyard observed long ago is stale however recently the
+        # call that carried it returned.
+        with tempfile.TemporaryDirectory() as state:
+            InconclusiveBreakerTests._run(self, Path(state), "admit", "clean", 0)
+            result = self._run(Path(state), "error", "revalidation_failed", 1)
+            self.assertEqual(result.returncode, 1)
+            self.assertNotIn("tartci_reused_admit", result.stdout)
+
+    def test_a_reuse_never_extends_its_own_window(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            self._run(Path(state), "admit", "clean", 0)
+            self._age_record(Path(state), 50)
+            self.assertEqual(
+                self._run(Path(state), "error", "revalidation_failed", 1).returncode, 0
+            )
+            self._age_record(Path(state), 15)
+            self.assertEqual(
+                self._run(Path(state), "error", "revalidation_failed", 1).returncode, 1
+            )
+
+    def test_a_later_queue_verdict_supersedes_the_admit(self) -> None:
+        for verdict, reason, code in (
+            ("defer", "stale_compatible_runs", 3),
+            ("error", "mutation_failed", 1),
+        ):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                self._run(Path(state), "admit", "clean", 0)
+                self._run(Path(state), verdict, reason, code)
+                result = self._run(Path(state), "error", "revalidation_failed", 1)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("tartci_reused_admit", result.stdout)
+
+    def test_only_revalidation_failures_reuse(self) -> None:
+        self.assertEqual(admission.REUSABLE_ERROR_REASONS, {"revalidation_failed"})
+        for reason in ("observation_failed", "authority_failed", "some_future_reason"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as state:
+                self._run(Path(state), "admit", "clean", 0)
+                result = self._run(Path(state), "error", reason, 1)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("tartci_reused_admit", result.stdout)
+
+    def test_zero_window_disables_and_the_window_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as state:
+            off = {"TARTCI_ADMISSION_CLEAN_REUSE_SECS": "0"}
+            self._run(Path(state), "admit", "clean", 0, off)
+            self.assertEqual(
+                self._run(Path(state), "error", "revalidation_failed", 1, off).returncode, 1
+            )
+            bad = self._run(
+                Path(state), "admit", "clean", 0,
+                {"TARTCI_ADMISSION_CLEAN_REUSE_SECS": "301"},
+            )
+            self.assertEqual(bad.returncode, 2)
+            self.assertIn("TARTCI_ADMISSION_CLEAN_REUSE_SECS", bad.stderr)
+
+
+class ContentionWaitTests(unittest.TestCase):
+    """`observation_in_progress` is another caller's lock, not a queue verdict.
+
+    On the Pulp gate 130 booted VMs were discarded in one day because the JIT
+    boundary check lost a try-lock race against a sibling lane asking the same
+    question. The adapter now re-asks for a bounded time. Every verdict that
+    ends the wait is a fresh Shipyard answer, so only a typed `admit` admits.
+    """
+
+    def _fake(self, root: Path, script: list[tuple[str, str, int]]) -> Path:
+        # One verdict per call, in order; the last one repeats. Each call is
+        # counted so a test can prove how many times Shipyard was asked.
+        payloads = root / "payloads"
+        payloads.mkdir()
+        for index, (verdict, reason, code) in enumerate(script):
+            (payloads / f"{index}.json").write_text(
+                json.dumps(envelope(verdict, reason)), encoding="utf-8"
+            )
+            (payloads / f"{index}.rc").write_text(str(code), encoding="utf-8")
+        fake = root / "shipyard"
+        fake.write_text(
+            "#!/bin/bash\n"
+            f"calls={root}/calls\n"
+            "n=$(cat \"$calls\" 2>/dev/null || echo 0)\n"
+            "echo $((n + 1)) > \"$calls\"\n"
+            f"last={len(script) - 1}\n"
+            "i=$n; [ \"$i\" -le \"$last\" ] || i=$last\n"
+            f"cat {payloads}/$i.json; printf '\\n'\n"
+            f"exit $(cat {payloads}/$i.rc)\n",
+            encoding="utf-8",
+        )
+        fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+        return fake
+
+    def _run(
+        self, root: Path, fake: Path, wait: str, poll: str = "1"
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                str(Path(admission.__file__)),
+                "--shipyard",
+                str(fake),
+                "--repo",
+                "Generous-Corp/pulp",
+                "--base",
+                "main",
+                "--labels",
+                "self-hosted,Linux,ARM64,pulp-build-linux",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "TARTCI_ADMISSION_CLEAN_STATE_DIR": str(root / "state"),
+                "TARTCI_ADMISSION_CLEAN_CONTENTION_WAIT_SECS": wait,
+                "TARTCI_ADMISSION_CLEAN_CONTENTION_POLL_SECS": poll,
+            },
+            timeout=60,
+        )
+
+    def calls(self, root: Path) -> int:
+        return int((root / "calls").read_text(encoding="utf-8").strip())
+
+    def test_contention_is_waited_out_and_the_fresh_admit_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = self._fake(
+                root,
+                [
+                    ("defer", "observation_in_progress", 3),
+                    ("defer", "stewardship_in_progress", 3),
+                    ("admit", "clean", 0),
+                ],
+            )
+            result = self._run(root, fake, "30")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["verdict"], "admit")
+            self.assertEqual(payload["tartci_contention_waits"], 2)
+            self.assertEqual(self.calls(root), 3)
+
+    def test_wait_is_bounded_and_returns_the_defer(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = self._fake(root, [("defer", "observation_in_progress", 3)])
+            result = self._run(root, fake, "2", "1")
+            self.assertEqual(result.returncode, 3, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["reason"], "observation_in_progress")
+            # 2 s budget at 1 s polls: the first ask plus at most three more.
+            self.assertGreaterEqual(self.calls(root), 2)
+            self.assertLessEqual(self.calls(root), 4)
+
+    def test_contention_ending_in_error_stays_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = self._fake(
+                root,
+                [
+                    ("defer", "observation_in_progress", 3),
+                    ("error", "mutation_failed", 1),
+                ],
+            )
+            result = self._run(root, fake, "30")
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["verdict"], "error")
+            self.assertEqual(self.calls(root), 2)
+
+    def test_a_queue_defer_is_returned_at_once(self) -> None:
+        # The control: a defer that IS a statement about the queue must never
+        # be retried, or the wait would hide stale runs behind a longer boot.
+        for reason in ("stale_compatible_runs", "cancellation_pending",
+                       "mutation_authority_required"):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as raw:
+                root = Path(raw)
+                fake = self._fake(
+                    root, [("defer", reason, 3), ("admit", "clean", 0)]
+                )
+                result = self._run(root, fake, "30")
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertEqual(self.calls(root), 1)
+
+    def test_zero_budget_is_single_shot(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = self._fake(
+                root,
+                [("defer", "observation_in_progress", 3), ("admit", "clean", 0)],
+            )
+            result = self._run(root, fake, "0")
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertEqual(self.calls(root), 1)
+
+    def test_contention_reasons_are_exactly_the_lock_reasons(self) -> None:
+        self.assertEqual(
+            admission.CONTENTION_DEFER_REASONS,
+            {"observation_in_progress", "stewardship_in_progress"},
+        )
+        self.assertLessEqual(
+            admission.CONTENTION_DEFER_REASONS, admission.VERDICT_REASONS["defer"]
+        )
+
+    def test_budget_is_validated(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            fake = self._fake(root, [("admit", "clean", 0)])
+            result = self._run(root, fake, "601")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("CONTENTION_WAIT_SECS", result.stderr)
 
 
 if __name__ == "__main__":

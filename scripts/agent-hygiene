@@ -1,0 +1,91 @@
+#!/bin/zsh
+# agent-hygiene: report (and on request reap) idle agent sessions and their MCP fan-out.
+#   agent-hygiene              one-line status; exit 1 if a threshold is crossed
+#   agent-hygiene --report     per-session table (age, child processes, RSS)
+#   agent-hygiene --reap DAYS  terminate inactive Codex/Claude CLI sessions older than DAYS days
+#                              (selected by transcript activity; asks for confirmation)
+# Thresholds (env): AH_PROC_PCT=60 (of maxprocperuid), AH_SWAP_PCT=80, AH_STALE_DAYS=2, AH_STALE_MAX=10
+# Context: pulp-planning/2026-10-11-agent-session-resource-exhaustion.md
+# AH_TRANSCRIPT_DIRS is a colon-separated list of transcript roots. The newest
+# matching file (PID in its name or path) is the session's last activity.
+# AH_VICTIMS_LOG records every confirmed victim and a resume command.
+emulate -L zsh; setopt extendedglob
+mode=$1; arg2=$2; arg3=$3
+PROC_PCT=${AH_PROC_PCT:-60}; SWAP_PCT=${AH_SWAP_PCT:-80}; STALE_DAYS=${AH_STALE_DAYS:-2}; STALE_MAX=${AH_STALE_MAX:-10}
+me=$(id -un)
+maxp=$(launchctl limit maxproc | awk '{print $2}')
+nproc=$(ps -U $me -o pid= | wc -l | tr -d ' ')
+swap=$(sysctl -n vm.swapusage | awk '{gsub("M","",$3);gsub("M","",$6); if($3+0>0) printf "%d", $6*100/$3; else print 0}')
+days_of() { local e=$1; [[ $e == *-* ]] && print ${e%%-*} || print 0; }
+# One ps snapshot; descendants computed from the ppid tree (MCP servers run in their own process groups).
+if [[ -n ${AH_PS_SNAPSHOT_FILE:-} && -f $AH_PS_SNAPSHOT_FILE ]]; then
+  snap=$(cat "$AH_PS_SNAPSHOT_FILE")
+else
+  snap=$(ps -U $me -o pid=,ppid=,etime=,rss=,command=)
+fi
+desc() { print -r -- "$snap" | awk -v root=$1 '{pid[NR]=$1; pp[NR]=$2; rss[NR]=$4} END{n=NR; inset[root]=1; changed=1; while(changed){changed=0; for(i=1;i<=n;i++) if(!(pid[i] in inset) && (pp[i] in inset)){inset[pid[i]]=1; changed=1}} for(i=1;i<=n;i++) if(pid[i] in inset){c++; r+=rss[i]; l=l" "pid[i]} printf "%d %d%s", c, r/1024, l}'; }
+activity_epoch() {
+  local pid=$1 roots=${AH_TRANSCRIPT_DIRS:-"$HOME/.claude/projects:$HOME/.codex/sessions"} root file newest=0 mtime
+  for root in ${(s/:/)roots}; do
+    [[ -d $root ]] || continue
+    while IFS= read -r file; do
+      [[ $file == *$pid* ]] || continue
+      mtime=$(stat -f %m "$file" 2>/dev/null || print 0)
+      (( mtime > newest )) && newest=$mtime
+    done < <(find "$root" -type f -maxdepth 8 -print 2>/dev/null)
+  done
+  print $newest
+}
+activity_age_days() {
+  local stamp=$(activity_epoch $1) now=$(date +%s)
+  (( stamp > 0 )) || { print -1; return; }
+  print $(( (now - stamp) / 86400 ))
+}
+live_protected_child() {
+  local root=$1; print -r -- "$snap" | awk -v root=$root 'BEGIN{IGNORECASE=1} {pid[NR]=$1;pp[NR]=$2;cmd[NR]=$5; for(i=6;i<=NF;i++)cmd[NR]=cmd[NR]" "$i} END{changed=1; while(changed){changed=0; for(i=1;i<=NR;i++) if(!(pid[i] in seen) && (pp[i] in seen || pp[i]==root)){seen[pid[i]]=1; changed=1}} for(i=1;i<=NR;i++) if(seen[pid[i]] && pid[i]!=root && cmd[i] ~ /(subagent|teammate)/){exit 0} exit 1}'
+}
+resume_command() {
+  local pid=$1; print -r -- "agent-hygiene resume --pid $pid"
+}
+sessions=("${(@f)$(print -r -- "$snap" | awk '$5 ~ /\/\.local\/bin\/(codex|claude)$/ {print $1, $5}')}")
+stale=0; rows=(); typeset -A tree activity
+for s in $sessions; do
+  [[ -z $s ]] && continue
+  local -a f; f=(${=s}); pid=$f[1]; cmd=$f[2]
+  d=$(activity_age_days $pid)
+  local -a dd; dd=(${=$(desc $pid)}); kids=$dd[1]; rss=$dd[2]; tree[$pid]="${dd[3,-1]}"
+  activity[$pid]=$d
+  (( d >= STALE_DAYS )) && (( stale++ ))
+  rows+=("$pid ${d}d $kids ${rss}MB ${cmd:t}")
+done
+case $mode in
+  --report)
+    print "pid age procs rss cmd"; print -l $rows | sort -k2 -rn ;;
+  --reap)
+    days=${arg2:?usage: --reap DAYS [--yes]}
+    targets=(); for r in $rows; do local -a f; f=(${=r}); pid=$f[1]; age=${f[2]%d}; (( age >= days )) || continue; live_protected_child $pid && { print "skip pid $pid: live subagent/teammate child" >&2; continue; }; targets+=($pid); done
+    print "sessions older than ${days}d: ${#targets}"
+    (( ${#targets} == 0 )) && exit 0
+    # Human-only: on 10-11 an agent ran `--reap 5 --yes` over ssh and killed every
+    # active Claude session on m3 and M5. Process age is not idleness, so a reap
+    # needs a person at a terminal who has read the candidate list.
+    if [[ ! -t 0 || ! -t 1 || -n $CLAUDECODE || -n $CODEX_SANDBOX || -n $CODEX_HOME_SESSION ]]; then
+      print -u2 "agent-hygiene: --reap is human-only (needs an interactive terminal). Candidates:"
+      for t in $targets; do print -u2 "  pid $t: $(ps -o etime=,command= -p $t | cut -c1-120)"; done
+      print -u2 "Ask Daniel to run: agent-hygiene --reap ${days}"; exit 2
+    fi
+    [[ $arg3 == --yes ]] && print -u2 "agent-hygiene: --yes is ignored; confirm interactively."
+    read -q "?terminate these process groups? [y/N] " || exit 0; print
+    all=(); victims_log=${AH_VICTIMS_LOG:-$HOME/.local/state/agent-hygiene/victims.log}; mkdir -p "${victims_log:h}";
+    for t in $targets; do print "$(date -u +%FT%TZ) pid=$t activity_age_days=${activity[$t]} resume=$(resume_command $t)" >>| "$victims_log"; all+=(${=tree[$t]}); done
+    kill -TERM $all 2>/dev/null; sleep 5; kill -KILL $all 2>/dev/null
+    print "done; victims log: $victims_log" ;;
+  *)
+    pp=$(( nproc * 100 / maxp ))
+    msg="procs ${nproc}/${maxp} (${pp}%) swap ${swap}% sessions ${#rows} stale(>=${STALE_DAYS}d) ${stale}"
+    print "$(date -u +%FT%TZ) $msg"
+    if (( pp >= PROC_PCT || swap >= SWAP_PCT || stale >= STALE_MAX )); then
+      [[ -n $AH_NOTIFY ]] && osascript -e "display notification \"$msg — run: agent-hygiene --report\" with title \"agent-hygiene: $(hostname -s)\"" 2>/dev/null
+      exit 1
+    fi ;;
+esac

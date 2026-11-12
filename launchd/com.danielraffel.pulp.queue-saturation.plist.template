@@ -23,6 +23,10 @@
   SIGNAL. The structural cure (flip PULP_PREAMBLE_RUNS_ON_JSON in the pulp repo)
   stays an operator decision.
 
+  The launchd watchdog re-renders an installed, loaded copy from this
+  template whenever it differs, keeping the host's own PULP_SAT_* values, so
+  a template change reaches every host on its next self-update.
+
   Install shape (run on one always-on host — e.g. m5):
 
     mkdir -p "$HOME/Library/Logs"
@@ -45,8 +49,9 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>$HOME/.local/share/tartci/scripts/gh_queue_saturation.py</string>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>queue-saturation</string>
         <string>--status</string>
     </array>
 
@@ -67,6 +72,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>

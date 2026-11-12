@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the schedule backstop.
+
+  Runs scripts/schedule_backstop.py every 300 s. GitHub delays and drops
+  `schedule` events under load; on Generous-Corp/pulp every hourly-or-faster
+  cron fires about once every five hours. This agent calls workflow_dispatch on
+  each workflow listed in the repository's .github/schedule-backstop.json once
+  the newest run of that workflow on main (from any event) is older than its
+  cadence and none is queued or running. See the script docstring.
+
+  WHY ON THE MAC, NOT A GITHUB WORKFLOW: a workflow cannot fix GitHub's own
+  scheduler, and a long-lived "ticker" job would hold a hosted-runner slot the
+  safety nets themselves compete for. This agent only makes API calls; the
+  dispatched workflows still run on GitHub-hosted runners.
+
+  FAIL OPEN: the crons stay in place. With this agent off, erroring, or its host
+  down, the repository behaves exactly as it does without it.
+
+  SAFETY: installed on exactly ONE always-on host, the one whose fleet
+  profile says `schedule_backstop = "live"` (m3). `tartci setup` renders this
+  template with scripts/install_schedule_backstop_agent.sh, which sets
+  TARTCI_BACKSTOP_APPLY and TARTCI_BACKSTOP_AUTHORITY from the profile ("live"
+  1/1, "dry-run" 0/0, "off" installs nothing). The values below are the
+  dry-run default. Turn it off with
+  `scripts/install_schedule_backstop_agent.sh --uninstall`.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.pulp.schedule-backstop</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>schedule-backstop</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/pulp-schedule-backstop.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/pulp-schedule-backstop.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_BACKSTOP_REPO</key>
+        <string>Generous-Corp/pulp</string>
+        <key>TARTCI_BACKSTOP_GH_CLI</key>
+        <string>ghapp</string>
+        <key>TARTCI_BACKSTOP_APPLY</key>
+        <string>0</string>
+        <key>TARTCI_BACKSTOP_AUTHORITY</key>
+        <string>0</string>
+    </dict>
+</dict>
+</plist>

@@ -58,6 +58,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>HOME</key>
         <string>$HOME</string>
         <key>PATH</key>

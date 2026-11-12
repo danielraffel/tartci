@@ -65,11 +65,13 @@ rollback() {
     if [ -f "$backup/new.plist" ]; then cp -p "$backup/new.plist" "$NEW_PLIST"; else rm -f "$NEW_PLIST"; fi
     if [ -f "$backup/old.plist" ]; then cp -p "$backup/old.plist" "$OLD_PLIST"; else rm -f "$OLD_PLIST"; fi
     if [ "$new_loaded" = 1 ]; then
-      launchctl bootstrap "$DOMAIN" "$NEW_PLIST" >/dev/null 2>&1 \
+      { launchctl bootstrap "$DOMAIN" "$NEW_PLIST" >/dev/null 2>&1 \
+        && launchctl kickstart "$DOMAIN/$NEW_LABEL" >/dev/null 2>&1; } \
         || echo "ROLLBACK FAILED: could not bootstrap prior replacement $NEW_LABEL" >&2
     fi
     if [ "$old_loaded" = 1 ]; then
       if ! launchctl bootstrap "$DOMAIN" "$OLD_PLIST" >/dev/null 2>&1 \
+        || ! launchctl kickstart "$DOMAIN/$OLD_LABEL" >/dev/null 2>&1 \
         || ! launchctl print "$DOMAIN/$OLD_LABEL" >/dev/null 2>&1; then
         echo "ROLLBACK FAILED: legacy agent $OLD_LABEL was not restored" >&2
       fi

@@ -5,21 +5,36 @@ The listener accepts CONNECT only from explicitly allowed local networks and
 carries each stream through the first healthy SSH relay. Connections do not
 reuse an SSH control master: a live-but-wedged multiplex socket previously left
 controllers pointing at a listener that could not complete TLS.
+
+Opening a bridge is retried within a bounded budget: a small number of passes
+over the relay hosts, a short backoff between passes, and a total deadline far
+below any client's CONNECT timeout. Retries happen only before the client is
+told "200 Connection Established", so no client byte is ever relayed twice.
+Every failed attempt, retry, and exhaustion is written to stderr as one
+timestamped tartci-relay-event JSON line.
+
+The deployed interpreter is macOS's /usr/bin/python3 (3.9), where
+socket.timeout is NOT a subclass of TimeoutError; socket errors are
+therefore caught as OSError.
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import errno
 import ipaddress
+import json
 import select
 import socket
 import socketserver
 import subprocess
+import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 
 @dataclass(frozen=True)
@@ -37,6 +52,28 @@ class RelayConfig:
     header_timeout: int
     tunnel_idle_timeout: int
     write_timeout: int
+    connect_passes: int = 2
+    connect_deadline: float = 30.0
+    retry_backoff: float = 0.25
+
+
+EVENT_PREFIX = "tartci-relay-event"
+_event_lock = threading.Lock()
+
+
+def emit_event(event: str, **fields: object) -> None:
+    record = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "event": event,
+        **fields,
+    }
+    line = f"{EVENT_PREFIX} {json.dumps(record, sort_keys=True)}\n"
+    with _event_lock:
+        try:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except (OSError, ValueError):
+            pass
 
 
 def parse_connect_target(request: bytes) -> tuple[str, int] | None:
@@ -104,26 +141,57 @@ def remote_bridge_command(host: str, port: int, timeout: int) -> str:
     )
 
 
-def read_ready(stream: socket.socket) -> bool:
+def read_ready_status(stream: socket.socket) -> str:
+    """Return "ready", "eof", "timeout", "error", or "bad-marker"."""
     marker = b""
     try:
         while len(marker) < 6:
             chunk = stream.recv(6 - len(marker))
             if not chunk:
-                return False
+                return "eof"
             marker += chunk
-    except TimeoutError:
-        return False
-    return marker == b"READY\n"
+    except (TimeoutError, socket.timeout):
+        return "timeout"
+    except OSError:
+        return "error"
+    return "ready" if marker == b"READY\n" else "bad-marker"
 
 
-def open_bridge(
-    config: RelayConfig, host: str, port: int
-) -> tuple[subprocess.Popen[bytes], socket.socket] | None:
-    for relay_host in config.relay_hosts:
-        local_stream, ssh_stream = socket.socketpair()
+def read_ready(stream: socket.socket) -> bool:
+    return read_ready_status(stream) == "ready"
+
+
+def stop_bridge(bridge: subprocess.Popen[bytes]) -> int | None:
+    bridge.terminate()
+    try:
+        return bridge.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        bridge.kill()
+        try:
+            return bridge.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+
+
+def stderr_tail(sink: object, limit: int = 300) -> str:
+    try:
+        sink.seek(0)  # type: ignore[attr-defined]
+        text = sink.read().decode("utf-8", "replace")  # type: ignore[attr-defined]
+    except (OSError, ValueError):
+        return ""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    return (lines[-1] if lines else "")[:limit]
+
+
+def attempt_bridge(
+    config: RelayConfig, relay_host: str, host: str, port: int, ready_timeout: float
+) -> tuple[tuple[subprocess.Popen[bytes], socket.socket] | None, dict[str, object]]:
+    """Try one relay host once; return the bridge or a failure description."""
+    local_stream, ssh_stream = socket.socketpair()
+    stderr_sink = tempfile.TemporaryFile()
+    try:
         bridge = subprocess.Popen(
-            [
+            [  # ssh-stdin: stdin is the bridge socket, forwarded on purpose
                 config.ssh,
                 "-o", "BatchMode=yes",
                 "-o", f"ConnectTimeout={config.connect_timeout}",
@@ -134,22 +202,102 @@ def open_bridge(
             ],
             stdin=ssh_stream.fileno(),
             stdout=ssh_stream.fileno(),
-            stderr=subprocess.DEVNULL,
+            stderr=stderr_sink.fileno(),
             bufsize=0,
         )
-        ssh_stream.close()
-        # SSH establishment and the remote destination connect are sequential;
-        # each owns the configured timeout budget.
-        local_stream.settimeout(config.connect_timeout * 2 + 2)
-        if read_ready(local_stream) and bridge.poll() is None:
-            local_stream.settimeout(None)
-            return bridge, local_stream
+    except OSError as error:
         local_stream.close()
-        bridge.terminate()
-        try:
-            bridge.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            bridge.kill()
+        ssh_stream.close()
+        stderr_sink.close()
+        return None, {"reason": "spawn-failed", "detail": str(error)}
+    ssh_stream.close()
+    local_stream.settimeout(ready_timeout)
+    status = read_ready_status(local_stream)
+    if status == "ready" and bridge.poll() is None:
+        local_stream.settimeout(None)
+        # The child holds its own descriptor; later stderr stays bounded and
+        # is discarded with the unlinked file.
+        stderr_sink.close()
+        return (bridge, local_stream), {}
+    local_stream.close()
+    returncode = stop_bridge(bridge)
+    failure: dict[str, object] = {
+        "reason": status if status != "ready" else "exited-after-ready",
+        "ssh_returncode": returncode,
+        "detail": stderr_tail(stderr_sink),
+    }
+    stderr_sink.close()
+    return None, failure
+
+
+def open_bridge(
+    config: RelayConfig,
+    host: str,
+    port: int,
+    *,
+    attempt: Callable[..., tuple[object, dict[str, object]]] = attempt_bridge,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    emit: Callable[..., None] = emit_event,
+) -> tuple[subprocess.Popen[bytes], socket.socket] | None:
+    """Open a bridge, retrying connect-phase failures within a bounded budget.
+
+    Nothing has been sent to the client yet, so a retry cannot duplicate data.
+    """
+    started = clock()
+    deadline = started + config.connect_deadline
+    per_attempt = config.connect_timeout * 2 + 2
+    attempts = 0
+    for pass_index in range(max(1, config.connect_passes)):
+        if pass_index:
+            remaining = deadline - clock()
+            if remaining <= config.retry_backoff + 1:
+                break
+            backoff = config.retry_backoff * pass_index
+            emit(
+                "bridge_retry_pass",
+                target=f"{host}:{port}",
+                pass_number=pass_index + 1,
+                backoff_seconds=backoff,
+                attempts_so_far=attempts,
+            )
+            sleep(backoff)
+        for relay_host in config.relay_hosts:
+            remaining = deadline - clock()
+            # SSH establishment and the remote destination connect are
+            # sequential; each owns the configured timeout budget, clipped to
+            # what is left of the overall deadline.
+            if remaining < 1:
+                break
+            attempts += 1
+            opened, failure = attempt(
+                config, relay_host, host, port, min(per_attempt, remaining)
+            )
+            if opened is not None:
+                if attempts > 1:
+                    emit(
+                        "bridge_opened_after_retry",
+                        target=f"{host}:{port}",
+                        relay_host=relay_host,
+                        attempts=attempts,
+                        elapsed_seconds=round(clock() - started, 3),
+                    )
+                return opened  # type: ignore[return-value]
+            emit(
+                "bridge_attempt_failed",
+                target=f"{host}:{port}",
+                relay_host=relay_host,
+                attempt=attempts,
+                pass_number=pass_index + 1,
+                elapsed_seconds=round(clock() - started, 3),
+                **failure,
+            )
+    emit(
+        "bridge_exhausted",
+        target=f"{host}:{port}",
+        attempts=attempts,
+        elapsed_seconds=round(clock() - started, 3),
+    )
     return None
 
 
@@ -198,11 +346,19 @@ class ConnectHandler(socketserver.BaseRequestHandler):
                 if not chunk:
                     return
                 request += chunk
-        except TimeoutError:
+        except OSError:
+            # Includes socket.timeout, which is not a TimeoutError on 3.9.
             return
         finally:
             self.request.settimeout(None)
 
+        try:
+            self.relay(request)
+        except OSError:
+            # The client went away before or while being answered.
+            return
+
+    def relay(self, request: bytes) -> None:
         target = parse_connect_target(request)
         if target is None:
             self.request.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
@@ -210,6 +366,7 @@ class ConnectHandler(socketserver.BaseRequestHandler):
         if target[1] != 443 or not host_is_allowed(
             target[0], self.config.allowed_host_suffixes
         ):
+            emit_event("connect_denied", target=f"{target[0]}:{target[1]}")
             self.request.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             return
         host, port = target
@@ -218,12 +375,12 @@ class ConnectHandler(socketserver.BaseRequestHandler):
             self.request.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
             return
         bridge, local_stream = opened
-        self.request.settimeout(self.config.write_timeout)
-        local_stream.settimeout(self.config.write_timeout)
-        self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         sockets = [self.request, local_stream]
         last_activity = time.monotonic()
         try:
+            self.request.settimeout(self.config.write_timeout)
+            local_stream.settimeout(self.config.write_timeout)
+            self.request.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             while True:
                 readable, _, _ = select.select(sockets, [], [], 1.0)
                 if (
@@ -246,15 +403,13 @@ class ConnectHandler(socketserver.BaseRequestHandler):
                     else:
                         local_stream.shutdown(socket.SHUT_WR)
                         sockets.remove(self.request)
-        except TimeoutError:
+        except OSError:
+            # Reset, broken pipe, or write timeout on either side ends the
+            # tunnel; it is never re-opened once data has flowed.
             pass
         finally:
             local_stream.close()
-            bridge.terminate()
-            try:
-                bridge.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                bridge.kill()
+            stop_bridge(bridge)
 
 
 class ThreadingServer(socketserver.ThreadingTCPServer):
@@ -283,6 +438,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--listen-host", default="0.0.0.0")
     parser.add_argument("--listen-port", type=int, default=49125)
     parser.add_argument(
+        "--log-path",
+        default="",
+        help="launchd log to rotate aside at startup once it reaches --log-max-bytes",
+    )
+    parser.add_argument("--log-max-bytes", type=int, default=8 * 1024 * 1024)
+    parser.add_argument("--log-generations", type=int, default=3)
+    parser.add_argument(
         "--allow-route",
         action="append",
         required=True,
@@ -297,11 +459,76 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--tunnel-idle-timeout", type=int, default=300)
     parser.add_argument("--write-timeout", type=int, default=30)
     parser.add_argument("--max-handlers", type=int, default=64)
+    parser.add_argument("--connect-passes", type=int, default=2)
+    parser.add_argument("--connect-deadline", type=float, default=30.0)
+    parser.add_argument("--retry-backoff", type=float, default=0.25)
     return parser.parse_args(argv)
+
+
+# EX_TEMPFAIL: another process holds the listen port. launchd's KeepAlive
+# respawns on any exit, so the plist's ThrottleInterval is what spaces retries.
+EXIT_PORT_IN_USE = 75
+
+
+def port_holder(port: int, run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> str:
+    """Who listens on port, as "pid N (command)", or why that is unknown."""
+    try:
+        result = run(
+            ["/usr/sbin/lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fpc"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unknown (lsof failed: {error})"
+    holders, pid = [], None
+    for line in (result.stdout or "").splitlines():
+        if line.startswith("p"):
+            pid = line[1:]
+        elif line.startswith("c") and pid is not None:
+            holders.append(f"pid {pid} ({line[1:]})")
+            pid = None
+    return ", ".join(holders) or "unknown (lsof found no listener)"
+
+
+def serve(args: argparse.Namespace,
+          holder: Callable[[int], str] | None = None) -> int:
+    """Bind and serve, or refuse loudly when another process holds the port.
+
+    A port held by another process does not free itself on a respawn: on
+    2026-10-02 m3's relay lost 49125 to a hand-installed legacy bridge and
+    launchd respawned it every ~10 s for days, 64,728 runs and a 220 MB log
+    of identical tracebacks, while the attestation only said "last exit 1".
+    """
+    try:
+        server = ThreadingServer(
+            (args.listen_host, args.listen_port),
+            ConnectHandler,
+            max_handlers=args.max_handlers,
+        )
+    except OSError as error:
+        if error.errno != errno.EADDRINUSE:
+            raise
+        who = (holder or port_holder)(args.listen_port)
+        emit_event("listen_port_in_use", port=args.listen_port, holder=who)
+        print(
+            f"http-connect-ssh-relay: REFUSING TO START: {args.listen_host}:{args.listen_port} "
+            f"is already held by {who}; stop that listener or move this relay's port",
+            file=sys.stderr,
+        )
+        return EXIT_PORT_IN_USE
+    with server:
+        server.serve_forever()
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.log_path:
+        import pathlib  # noqa: PLC0415 - only the launchd entry point rotates
+
+        from disk_reclaim import rotate_log  # noqa: PLC0415 - sibling module
+
+        rotate_log(pathlib.Path(args.log_path).expanduser(),
+                   args.log_max_bytes, args.log_generations)
     if (
         not 1 <= args.listen_port <= 65535
         or args.connect_timeout < 1
@@ -309,6 +536,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         or args.tunnel_idle_timeout < 1
         or args.write_timeout < 1
         or args.max_handlers < 1
+        or not 1 <= args.connect_passes <= 5
+        or not 1 <= args.connect_deadline <= 120
+        or not 0 <= args.retry_backoff <= 5
     ):
         raise SystemExit("ports and timeouts must be positive and bounded")
     ConnectHandler.config = RelayConfig(
@@ -322,14 +552,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         header_timeout=args.header_timeout,
         tunnel_idle_timeout=args.tunnel_idle_timeout,
         write_timeout=args.write_timeout,
+        connect_passes=args.connect_passes,
+        connect_deadline=args.connect_deadline,
+        retry_backoff=args.retry_backoff,
     )
-    with ThreadingServer(
-        (args.listen_host, args.listen_port),
-        ConnectHandler,
-        max_handlers=args.max_handlers,
-    ) as server:
-        server.serve_forever()
-    return 0
+    return serve(args)
 
 
 if __name__ == "__main__":

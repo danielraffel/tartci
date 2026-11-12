@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import pathlib
 import plistlib
+import signal
 import stat
 import subprocess
 import tempfile
@@ -25,8 +26,10 @@ import os
 import pathlib
 import plistlib
 import signal
+import signal
 import subprocess
 import sys
+import time
 
 state_path = pathlib.Path(os.environ["FAKE_LAUNCHCTL_STATE"])
 log_path = pathlib.Path(os.environ["FAKE_LAUNCHCTL_LOG"])
@@ -87,9 +90,13 @@ if args[:2] == ["kickstart", "-k"] and len(args) == 3:
     state = load()
     with open(state["plist"], "rb") as stream:
         command = plistlib.load(stream)["ProgramArguments"]
-    proc = subprocess.Popen(command, env=os.environ.copy())
+    # launchd runs each job in its own process group and tears the whole group
+    # down on bootout.  Model that, or a job's children outlive the test.
+    proc = subprocess.Popen(command, env=os.environ.copy(), start_new_session=True)
     state["pid"] = proc.pid
     save(state)
+    with open(os.environ["FAKE_LAUNCHCTL_PGIDS"], "a", encoding="utf-8") as stream:
+        stream.write(f"{proc.pid}\n")
     raise SystemExit(0)
 
 if args[:1] == ["bootout"] and len(args) == 2:
@@ -97,9 +104,21 @@ if args[:1] == ["bootout"] and len(args) == 2:
     pid = state.get("pid")
     if pid:
         try:
-            os.kill(pid, signal.SIGTERM)
+            os.killpg(pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                os.killpg(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
     state_path.unlink(missing_ok=True)
     raise SystemExit(0)
 
@@ -107,11 +126,71 @@ raise SystemExit(2)
 """
 
 
+# The fake runner blocks at most this long, so a teardown miss cannot leave a
+# process running for days.
+FAKE_RUNNER_MAX_SECS = 30
+
+
+def processes_tagged(tag: str, pgids: frozenset = frozenset()) -> list[tuple[int, int, str]]:
+    """Return (pid, pgid, command) for live processes belonging to a test.
+
+    A process belongs when its argv or environment holds tag, or it shares a
+    process group with one that does, or its group is listed in pgids.  The
+    group rules catch children such as `/bin/bash ./run.sh` whose argv never
+    names the tag and whose environment `ps e` cannot show (platform binaries on macOS).
+    """
+    output = subprocess.run(
+        ["/bin/ps", "axwwe", "-o", "pid=,pgid=,stat=,command="],
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout
+    rows = []
+    for line in output.splitlines():
+        fields = line.split(None, 3)
+        if len(fields) < 4:
+            continue
+        pid, pgid, state = int(fields[0]), int(fields[1]), fields[2]
+        if pid == os.getpid() or state.startswith("Z"):
+            continue
+        rows.append((pid, pgid, fields[3]))
+    own_pgid = os.getpgid(0)
+    groups = set(pgids) | {pgid for _, pgid, command in rows if tag in command}
+    groups.discard(own_pgid)
+    return [row for row in rows if tag in row[2] or row[1] in groups]
+
+
+def reap_tagged(tag: str, pgids: frozenset = frozenset(), timeout: float = 5.0) -> list[tuple[int, int, str]]:
+    """SIGKILL every process group belonging to a test; return what was alive."""
+    found = processes_tagged(tag, pgids)
+    own_pgid = os.getpgid(0)
+    for pid, pgid, _ in found:
+        try:
+            if pgid != own_pgid:
+                os.killpg(pgid, signal.SIGKILL)
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + timeout
+    while processes_tagged(tag, pgids) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return found
+
+
 class AquaRunnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.home = pathlib.Path(self.temp.name)
+        self.expect_reaped = False
+        # Outside the tmp dir so the record survives temp.cleanup.
+        pgid_fd, pgid_name = tempfile.mkstemp(prefix="tartci-aqua-pgids-")
+        os.close(pgid_fd)
+        self.pgid_log = pathlib.Path(pgid_name)
+        self.addCleanup(self.pgid_log.unlink, missing_ok=True)
+        # Registered after temp.cleanup, so it runs first: the tmp path is the
+        # tag that identifies everything this test spawned.
+        self.addCleanup(self.reap_and_check)
         self.bin = self.home / "bin"
         self.bin.mkdir()
         self.launchctl = self.bin / "launchctl"
@@ -154,6 +233,7 @@ class AquaRunnerTest(unittest.TestCase):
                 "HOME": str(self.home),
                 "FAKE_LAUNCHCTL_STATE": str(self.home / "launchctl-state.json"),
                 "FAKE_LAUNCHCTL_LOG": str(self.home / "launchctl.log"),
+                "FAKE_LAUNCHCTL_PGIDS": str(self.pgid_log),
                 "TARTCI_GUEST_LAUNCHCTL": str(self.launchctl),
                 "TARTCI_GUEST_STAT": str(self.fake_stat),
                 "TARTCI_GUEST_PGREP": str(self.fake_pgrep),
@@ -166,6 +246,33 @@ class AquaRunnerTest(unittest.TestCase):
                 "FAKE_PROCESS_ASID": "100123",
             }
         )
+
+    def job_pgids(self) -> frozenset:
+        try:
+            text = self.pgid_log.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return frozenset()
+        return frozenset(int(line) for line in text.split())
+
+    def owned_processes(self) -> list[tuple[int, int, str]]:
+        return processes_tagged(str(self.home), self.job_pgids())
+
+    def reap_and_check(self) -> None:
+        pgids = self.job_pgids()
+        leaked = reap_tagged(str(self.home), pgids)
+        survivors = processes_tagged(str(self.home), pgids)
+        if survivors:
+            self.fail(f"processes survived SIGKILL teardown: {survivors}")
+        if leaked and not self.expect_reaped:
+            self.fail(f"test leaked processes (now reaped): {leaked}")
+
+    def wait_until_untagged(self, timeout: float = 10.0) -> list[tuple[int, int, str]]:
+        deadline = time.monotonic() + timeout
+        while True:
+            alive = self.owned_processes()
+            if not alive or time.monotonic() >= deadline:
+                return alive
+            time.sleep(0.1)
 
     def invoke(self, command: str, label: str = "com.tartci.test") -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -190,7 +297,7 @@ class AquaRunnerTest(unittest.TestCase):
                 case "$(ps -p $$ -o command=)" in *top-secret-jit*) exit 90 ;; esac
                 printf 'Running job: Aqua test\\n'
                 printf success > {str(marker)!r}
-                {"while :; do sleep 1; done" if block else ":"}
+                {f"for _ in $(seq {FAKE_RUNNER_MAX_SECS}); do sleep 1; done" if block else ":"}
                 """
             ),
             encoding="utf-8",
@@ -298,6 +405,57 @@ class AquaRunnerTest(unittest.TestCase):
         self.assertFalse((self.home / "launchctl-state.json").exists())
         calls = (self.home / "launchctl.log").read_text(encoding="utf-8")
         self.assertIn(f"bootout gui/{os.getuid()}/com.tartci.test", calls)
+
+    def test_disconnect_leaves_no_runner_process_behind(self) -> None:
+        # The runner-child shell defers its TERM trap while ./run.sh runs in
+        # the foreground, so only a process-group teardown stops a blocked run.
+        marker = self.home / "runner-ran"
+        self.install_fake_runner(marker, block=True)
+        self.put_jit()
+        process = subprocess.Popen(
+            [str(GUEST), "run", "com.tartci.test"],
+            env=self.env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        for _ in range(50):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        self.assertTrue(marker.exists(), "mock runner never reached its live state")
+        self.assertTrue(
+            any("run.sh" in command and "runner-child" not in command for _, _, command in self.owned_processes()),
+            "instrument control: the live runner-child must be visible to the scan",
+        )
+        process.terminate()
+        process.communicate(timeout=10)
+        self.assertEqual(self.wait_until_untagged(), [])
+
+    def test_teardown_reaps_a_detached_process_group(self) -> None:
+        sleeper = self.home / "leaky.sh"
+        sleeper.write_text("#!/bin/bash\nsleep 300 &\nwait\n", encoding="utf-8")
+        sleeper.chmod(0o700)
+        subprocess.Popen(
+            [str(sleeper)],
+            env=self.env,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        deadline = time.monotonic() + 5
+        while True:
+            owned = self.owned_processes()
+            if any("sleep 300" in command for _, _, command in owned):
+                break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+        self.assertTrue(any("sleep 300" in command for _, _, command in owned), owned)
+        group = {pgid for _, pgid, _ in owned}
+        self.expect_reaped = True
+        self.doCleanups()
+        self.assertEqual(processes_tagged(str(sleeper), frozenset(group)), [])
 
     def test_supervisor_mints_only_after_preflight_and_never_places_jit_on_command_line(self) -> None:
         supervisor = SUPERVISOR.read_text(encoding="utf-8")

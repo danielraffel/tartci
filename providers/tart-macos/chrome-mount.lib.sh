@@ -29,7 +29,7 @@ configure_chrome_mount(){
 install_and_preflight_chrome(){
   local ip="$1"
   [ -n "$CHROME_MOUNT_ARG" ] || return 0
-  ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "set -e; mounted='/Volumes/My Shared Files/google-chrome'; target='/Applications/Google Chrome.app'; executable='Contents/MacOS/Google Chrome'; \
      test -x \"\$mounted/\$executable\"; \
      if [ -L \"\$target\" ]; then \

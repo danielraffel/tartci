@@ -16,19 +16,26 @@
     1. Copy the Windows golden qcow2 into this host's $TARTCI_GOLDENS
        (default $HOME/.tartci/goldens). The supervisor install-if-missing the
        win-arm64 runner agent into the clone, so the golden need not pre-bake it.
-    2. Install tartci into a home-backed path so launchd does not depend on a
-       mounted workspace:
+    2. Install tartci with `./tartci setup` from a checkout. It installs the
+       ~/.local/bin/tartci shim onto the installed generation, which self-update
+       keeps current. Never hand-copy a tartci checkout under ~/.local/share:
+       nothing refreshes it, and agents running from it go stale.
 
-         mkdir -p "$HOME/.local/share/tartci" "$HOME/Library/Logs/tartci"
-         rsync -a ./ "$HOME/.local/share/tartci/"
-
-    3. Copy this file to ~/Library/LaunchAgents/, replacing $TARTCI_REPO, $HOME, and
+    3. Copy this file to ~/Library/LaunchAgents/, replacing $HOME, this host's label and
        $TARTCI_GOLDENS with absolute paths (launchd does NOT expand shell vars):
 
-         sed -e "s|\$TARTCI_REPO|$HOME/.local/share/tartci|g" -e "s|\$HOME|$HOME|g" \
+         sed -e "s|\$HOME|$HOME|g" \
+             -e "s|\$TARTCI_HOST_LABEL|pulp-host-<this host>|g" \
              -e "s|\$TARTCI_GOLDENS|$HOME/.tartci/goldens|g" \
            launchd/com.danielraffel.pulp.qemu-runner-windows.plist.template \
            > ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
+
+       Never re-run this render over an installed plist: it resets every
+       host value to this template's default. That includes the host label,
+       the golden store, TARTCI_VM_POLL and the ghapp-shim PATH entry. A
+       render of the stock template on m1 would have produced a lane labelled
+       pulp-host-macstudio with the wrong golden store (2026-10-03). To move an installed
+       plist forward, change only the keys that changed and keep the rest.
 
     4. Load:   launchctl load ~/Library/LaunchAgents/com.danielraffel.pulp.qemu-runner-windows.plist
        Verify: launchctl list | grep qemu-runner-windows ; tail -F ~/Library/Logs/tartci/qemu-runner-windows.log
@@ -37,7 +44,7 @@
 
   PILOT: the default labels include the non-required shared pool label
   `pulp-build-windows` and a host-specific label. Use `pulp-host-macstudio` on
-  the primary Mac Studio and `pulp-host-m5` on the overflow M5/blackbook. Windows
+  the primary Mac Studio and `pulp-host-m5` on the overflow M5/laptop. Windows
   VMs are QEMU (not Tart) and uncapped; each job gets a throwaway qcow2 overlay.
   The serve loop scans queued and in-progress workflow runs for queued jobs and
   ignores queued jobs older than TARTCI_RUNNER_MAX_QUEUED_AGE_SECONDS (six hours
@@ -76,14 +83,16 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$TARTCI_REPO/providers/qemu-windows/runner.sh</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>serve</string>
+        <string>windows</string>
         <string>--loop</string>
         <string>--labels</string>
-        <string>self-hosted,Windows,ARM64,pulp-build-windows,pulp-host-macstudio</string>
+        <string>self-hosted,Windows,ARM64,pulp-build-windows,$TARTCI_HOST_LABEL</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>$TARTCI_REPO</string>
+    <string>$HOME</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -99,6 +108,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>

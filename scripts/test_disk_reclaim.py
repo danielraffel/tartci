@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Behavioral tests for scripts/disk_reclaim.py.
+"""Behavioral tests for scripts/dr.py.
 
 The janitor deletes directories, so every negative assertion here is paired
 with a control in the same tree that MUST be deleted. A test that only proves
@@ -11,6 +11,12 @@ Run:  python3 -m unittest scripts.test_disk_reclaim   (or via discover)
 
 from __future__ import annotations
 
+import os as _os
+
+# disk_reclaim.main demotes a --fix pass to macOS background priority; the
+# suite must not demote the test runner itself.
+_os.environ.setdefault("TARTCI_RECLAIM_FOREGROUND", "1")
+import testing_support  # noqa: E402
 import errno
 import io
 import json
@@ -29,6 +35,47 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import disk_reclaim as dr  # noqa: E402
 
 DAY = 86400.0
+
+_ISOLATION: tempfile.TemporaryDirectory | None = None
+_SAVED_ENV: dict[str, str | None] = {}
+
+
+def setUpModule():
+    """Keep every pass in this module off the host it runs on.
+
+    dr.main now writes a receipt under $TARTCI_HOME and reads the INSTALLED
+    fleet profile to decide whether to run Pulp's reapers. On a fleet host
+    with `[reclaim] pulp_worktree_builds = true`, a test pass that reached
+    the real profile would run the real reapers against the real worktrees.
+    """
+    global _ISOLATION
+    _ISOLATION = tempfile.TemporaryDirectory()
+    iso = pathlib.Path(_ISOLATION.name)
+    # The floor reads the lease volume from these; the host's own Tart store
+    # must not decide which volume a test pass judges.
+    for key in ("TART_HOME", "TARTCI_RECLAIM_LEASE_PATH"):
+        _SAVED_ENV[key] = os.environ.pop(key, None)
+    for key, value in (("TARTCI_HOME", str(iso / "tartci")),
+                       ("TARTCI_RECLAIM_STATE_DIR", str(iso / "tartci" / "state" / "reclaim")),
+                       ("TARTCI_FLEET_PROFILE", str(iso / "no-such-profile.toml")),
+                       # The boot-volume watch would judge the real boot disk;
+                       # test_scratch_dirs.BootVolumeWatch covers it hermetically.
+                       ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0"),
+                       # Likewise the boot-usage sensor would measure the real
+                       # home; test_boot_usage covers it hermetically.
+                       ("TARTCI_BOOT_USAGE", "0")):
+        _SAVED_ENV[key] = os.environ.get(key)
+        os.environ[key] = value
+
+
+def tearDownModule():
+    for key, value in _SAVED_ENV.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    if _ISOLATION is not None:
+        _ISOLATION.cleanup()
 
 
 def make_build_tree(path: pathlib.Path, *, age_days: float = 0.0,
@@ -360,6 +407,77 @@ class ClassifyTests(unittest.TestCase):
         delete, reason, _ = self.classify(control)
         self.assertTrue(delete, reason)
 
+    def test_a_fetched_dependency_checkout_stops_the_delete(self):
+        """A build tree is deleted whole, so what is INSIDE it is at stake.
+
+        The depth-0 marker check answers "is this directory a source tree" and
+        cannot answer this: a build tree that fetched its dependencies holds
+        real checkouts at `_deps/<name>-src/.git`, and a dependency carrying
+        local edits, or one with no `.git` of its own, does not come back.
+        """
+        for depth, parts in enumerate((
+            ("mywork",),                       # a worktree parked inside
+            ("_deps", "dawn-src"),             # the FetchContent shape
+            ("_deps", "dawn-src", "third"),    # one level deeper again
+        )):
+            with self.subTest(parts=parts):
+                path = make_build_tree(self.root / f"d{depth}" / "build",
+                                       age_days=400)
+                nested = path.joinpath(*parts)
+                nested.mkdir(parents=True)
+                (nested / "CMakeLists.txt").write_text("project(dep)")
+                (nested / ".git").write_text("gitdir: elsewhere")
+                age(path, 400)
+                delete, reason, _ = self.classify(path)
+                self.assertFalse(delete, reason)
+                self.assertTrue(reason.startswith("nested_source_tree"), reason)
+        # Control. Every refusal above is also satisfied by a classifier that
+        # has stopped deleting anything at all, so the same tree carrying the
+        # same nested directory WITHOUT a source marker must still be taken.
+        control = make_build_tree(self.root / "control" / "build",
+                                  age_days=400)
+        plain = control / "_deps" / "dawn-src"
+        plain.mkdir(parents=True)
+        (plain / "dawn.cpp").write_text("int main(){}")
+        age(control, 400)
+        delete, reason, _ = self.classify(control)
+        self.assertTrue(delete, reason)
+
+    def test_a_nested_scan_that_was_refused_is_not_an_absence(self):
+        # Same refusal-versus-answer rule the age and process scans follow. A
+        # subtree we could not read could hold a checkout.
+        path = make_build_tree(self.root / "locked" / "build", age_days=400)
+        (path / "_deps").mkdir()
+        (path / "_deps" / "dep-src").mkdir()
+        age(path, 400)
+        real_scandir = dr.os.scandir
+
+        def refusing(target):
+            # Refused at depth two, which the age scan's shallower walk never
+            # enters. Refusing higher would make `newest_mtime` answer
+            # "unmeasured" first and this test would never reach the scan it
+            # names -- which is how it was first written, and how it failed.
+            if str(target).endswith("dep-src"):
+                raise PermissionError(errno.EACCES, "refused", str(target))
+            return real_scandir(target)
+
+        with unittest.mock.patch.object(dr.os, "scandir", refusing):
+            delete, reason, _ = self.classify(path)
+        self.assertFalse(delete)
+        self.assertEqual(reason, "nested_scan_unreadable")
+        # Control: the identical tree, readable, is taken.
+        delete, reason, _ = self.classify(path)
+        self.assertTrue(delete, reason)
+
+    def test_the_nested_scan_does_not_mistake_the_tree_for_its_own_content(self):
+        # The candidate's OWN markers are guard-0's job. If this scan counted
+        # them the generated-marker path would never delete anything, and the
+        # control in every test above would be the thing that broke.
+        path = make_build_tree(self.root / "plain" / "build", age_days=400)
+        found, readable = dr.nested_source_marker(path)
+        self.assertTrue(readable)
+        self.assertIsNone(found)
+
     def test_live_build_command_line_protects_the_tree(self):
         path = make_build_tree(self.root / "wt" / "build", age_days=400)
         cmdline = f"66665 cmake --build {path} --target all\n"
@@ -390,8 +508,17 @@ class ClassifyTests(unittest.TestCase):
         """`pgrep` exits 1 with no output when nothing matches."""
         result = dr.active_command_lines("zzz-no-process-matches-this-zzz")
         self.assertEqual(result, "")
-        # Control: a pattern that must match this very test process.
-        self.assertNotEqual(dr.active_command_lines("python"), "")
+        # Control: a process this test starts, with a marker only it carries.
+        # Matching "python" instead depends on the host: macOS's own python
+        # runs as ".../Python.app/Contents/MacOS/Python", which pgrep -f's
+        # case-sensitive match misses, so a clean runner had nothing to find.
+        marker = f"tartci-pgrep-control-{os.getpid()}-{time.monotonic_ns()}"
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", marker])
+        self.addCleanup(child.wait)
+        self.addCleanup(child.kill)
+        # Non-empty, not "contains the marker": Linux's pgrep -l prints the
+        # process name without its arguments.
+        self.assertNotEqual(dr.active_command_lines(marker), "")
 
     def test_an_unreadable_build_tree_is_never_reclaimable(self):
         """An age we could not measure must not be spent as an old age."""
@@ -677,6 +804,37 @@ class FailClosedTests(unittest.TestCase):
         self.assertEqual(len(report_ctl["deleted"]), 1)
         self.assertFalse(stale.is_dir())
 
+    def test_a_zero_age_gate_is_refused_rather_than_obeyed(self):
+        """The two knobs that decide whether anything is examined at all.
+
+        A zero age gate deletes every generated tree the scan reaches the
+        moment it reaches it, and a depth below one makes the scan return
+        nothing while still exiting 0 - a janitor reporting success for having
+        looked nowhere. Both are refusals, not defaults to clamp, because a
+        clamped value would run a pass the operator did not ask for.
+        """
+        stale = make_build_tree(self.root / "wt" / "build", age_days=400)
+        for argv in (("--min-age-days", "0"),
+                     ("--min-age-days", "-1"),
+                     ("--pressure-min-age-days", "0"),
+                     ("--maxdepth", "0")):
+            with self.subTest(argv=argv):
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = dr.main(["--roots", str(self.root), "--json",
+                                    "--fix", *argv])
+                self.assertEqual(code, 2)
+                self.assertEqual(buffer.getvalue(), "",
+                                 "a refused run must not emit a report")
+                self.assertTrue(stale.is_dir(), argv)
+        # Control: the same --fix run with both knobs positive does delete,
+        # so the refusals above are the flags and not the fixture.
+        code, report = self.run_json("--fix", "--min-age-days", "7",
+                                     "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(report["deleted"]), 1)
+        self.assertFalse(stale.is_dir())
+
     def test_unknown_free_space_selects_the_longer_age_gate(self):
         make_build_tree(self.root / "wt" / "build", age_days=400)
         # A pressure threshold no real volume can satisfy: if free space were
@@ -698,6 +856,160 @@ class FailClosedTests(unittest.TestCase):
         with unittest.mock.patch.object(dr, "free_bytes", return_value=None):
             code, _ = self.run_json("--fail-below-gb", "60")
         self.assertEqual(code, 4)
+
+
+class SpentPassDeadlineTests(unittest.TestCase):
+    """m3, 2026-10-22: two git calls timed out at 300 s each and a listing at
+    120 s, so the 900 s pass deadline was spent before the post-pass
+    re-measure. That re-measure went through the same deadline and refused
+    without calling statfs, free space read as unknown, and every pass
+    exited 4 while the volume sat at 92%."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, dr, "PASS_DEADLINE", dr.PASS_DEADLINE)
+
+    def test_free_space_is_read_after_the_pass_deadline(self):
+        dr.PASS_DEADLINE = time.monotonic() - 1
+        self.assertIsNotNone(dr.free_bytes(self.root))
+        # Control, same instrument: the budget that remains for a listing
+        # is still spent, so only the one statfs is exempt.
+        with self.assertRaises(OSError):
+            dr.bounded_scandir(self.root)
+
+    def test_a_pass_that_outruns_its_deadline_still_checks_the_floor(self):
+        make_build_tree(self.root / "wt" / "build", age_days=400)
+        real = dr.find_candidates
+
+        def slow_scan(roots, maxdepth):
+            found = real(roots, maxdepth)
+            dr.PASS_DEADLINE = time.monotonic() - 1   # the scan used it all
+            return found
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(dr, "find_candidates", slow_scan), \
+                redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(self.root), "--json", "--fix",
+                            "--min-age-days", "7", "--pressure-free-gb", "0",
+                            "--fail-below-gb", "1"])
+        report = json.loads(buffer.getvalue())
+        self.assertIsNotNone(report["free_bytes_after"])
+        self.assertEqual(code, 0)
+
+
+class UsedPercentPressureTests(unittest.TestCase):
+    """Pressure by percent used, not only by free GiB.
+
+    m3's 3.6 TiB volume reached TartCI's 92% readiness limit with ~290 GiB
+    free, above the 200 GiB pressure threshold, so reclaim kept its 30-day
+    gate while readiness had already taken the host out of the fleet."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = pathlib.Path(self.tmp.name).resolve()
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_json(self, *argv):
+        buffer = io.StringIO()
+        with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
+            code = dr.main(["--roots", str(self.root), "--json", *argv])
+        return code, json.loads(buffer.getvalue())
+
+    BASE = ("--min-age-days", "30", "--pressure-min-age-days", "7",
+            "--pressure-free-gb", "0")
+
+    def test_a_volume_over_the_used_percent_takes_the_short_gate(self):
+        path = make_build_tree(self.root / "wt" / "build", age_days=10)
+        # Any real volume is more than 0.0001% used.
+        code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0.0001")
+        self.assertEqual(code, 0)
+        self.assertTrue(report["pressure"])
+        self.assertEqual([d["path"] for d in report["deleted"]], [str(path)])
+        # Control: the percent trigger off, the same tree is too recent.
+        code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0")
+        self.assertFalse(report["pressure"])
+        self.assertEqual([k["reason"] for k in report["kept"]], ["too_recent"])
+
+    def test_the_percent_threshold_reaches_the_pulp_worktree_reaper(self):
+        # The Pulp worktree reaper judges pressure with the same helper, but
+        # only if the pass hands it the threshold: without it a 92%-full
+        # volume with ~280 GiB free never ran clean_worktree_builds.
+        seen: list = []
+
+        def fake_run(**kwargs):
+            seen.append(kwargs.get("pressure_used_percent"))
+            return {"enabled": False, "reason": "stub"}
+
+        with unittest.mock.patch.object(dr.pulp_reapers, "run", fake_run):
+            code, _ = self.run_json("--pressure-used-percent", "90")
+            self.assertEqual(code, 0)
+            with unittest.mock.patch.dict(os.environ,
+                                          {"TARTCI_RECLAIM_PRESSURE_USED_PERCENT": "87.5"}):
+                code, _ = self.run_json()
+            self.assertEqual(code, 0)
+        self.assertEqual(seen, [90.0, 87.5])
+
+    def test_unknown_free_space_never_selects_pressure_by_percent(self):
+        make_build_tree(self.root / "wt" / "build", age_days=10)
+        with unittest.mock.patch.object(dr, "free_bytes", return_value=None):
+            code, report = self.run_json(*self.BASE, "--pressure-used-percent", "0.0001")
+        self.assertFalse(report["pressure"])
+        self.assertEqual(report["min_age_days"], 30)
+
+    def test_the_installed_agent_sets_the_percent_below_readiness(self):
+        try:
+            import macos_fleet_lanes
+        except ImportError as exc:  # tomllib: the launchd python is 3.9
+            self.skipTest(f"macos_fleet_lanes needs Python 3.11+: {exc}")
+        text = (pathlib.Path(__file__).resolve().parent.parent / "launchd"
+                / "com.danielraffel.tartci.reclaim.plist.template").read_text()
+        import re
+        match = re.search(r"<key>TARTCI_RECLAIM_PRESSURE_USED_PERCENT</key>\s*"
+                          r"<string>([0-9.]+)</string>", text)
+        self.assertIsNotNone(match, "the agent must set the percent trigger")
+        value = float(match.group(1))
+        self.assertLess(value, macos_fleet_lanes.DISK_PROBLEM_PERCENT)
+        self.assertGreater(value, macos_fleet_lanes.DISK_WARN_PERCENT)
+
+
+class GeneratedTestScratchTests(unittest.TestCase):
+    """Pulp writes test projects to ${CMAKE_BINARY_DIR}/test-tmp/<name>/
+    (tools/cli/CMakeLists.txt). Their CMakeLists.txt read as a parked source
+    tree and kept m3's 55 GiB pulp-p0a-failure-proof/build forever."""
+
+    setUp = MainTests.setUp
+    run_main = MainTests.run_main
+
+    def build_with(self, *rel):
+        tree = self.root / "wt" / "build"
+        tree.mkdir(parents=True)
+        (tree / "CMakeCache.txt").write_text("x")
+        for name in rel:
+            target = tree / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if name.endswith(".git"):
+                target.mkdir()
+            else:
+                target.write_text("project(t)")
+        age(tree, 400)
+        return tree
+
+    def test_a_generated_test_project_does_not_protect_the_tree(self):
+        tree = self.build_with("test-tmp/cli-dsp-capabilities-write/CMakeLists.txt")
+        code, _ = self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertEqual(code, 0)
+        self.assertFalse(tree.exists())
+
+    def test_a_checkout_inside_test_tmp_still_protects_it(self):
+        tree = self.build_with("test-tmp/parked/.git", "test-tmp/parked/CMakeLists.txt")
+        self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertTrue(tree.is_dir())
+
+    def test_a_project_elsewhere_in_the_tree_still_protects_it(self):
+        tree = self.build_with("scratch/proj/CMakeLists.txt")
+        self.run_main("--fix", "--min-age-days", "7", "--pressure-free-gb", "0")
+        self.assertTrue(tree.is_dir())
 
 
 class ProgressTests(unittest.TestCase):
@@ -776,14 +1088,8 @@ class ProgressWiringTests(MainTests):
         self.assertNotIn("removing ", err_dry)
 
 
-class MultiVolumeTests(unittest.TestCase):
-    """Every volume the scan spans must be measured, not just the first.
-
-    The janitor used to read free space from roots[0] alone, so a host that
-    scans a boot disk and an external volume judged pressure and the
-    --fail-below-gb floor on whichever happened to be listed first. On m3 that
-    is the boot disk, while the volume that actually fills is Workshop.
-    """
+class TwoRootHarness(unittest.TestCase):
+    """Two scan roots, with per-root volume facts that can be faked."""
 
     def setUp(self):
         self.first = tempfile.TemporaryDirectory()
@@ -825,6 +1131,16 @@ class MultiVolumeTests(unittest.TestCase):
 
     def separate_volumes(self):
         return {str(self.a): 101, str(self.b): 202}
+
+
+class MultiVolumeTests(TwoRootHarness):
+    """Every volume the scan spans must be measured, not just the first.
+
+    The janitor used to read free space from roots[0] alone, so a host that
+    scans a boot disk and an external volume judged pressure and, when no
+    Tart store is declared, the --fail-below-gb floor on whichever happened
+    to be listed first.
+    """
 
     def test_the_short_gate_applies_only_to_the_pressured_volume(self):
         """A low boot disk must not shorten the gate on a healthy volume.
@@ -898,6 +1214,21 @@ class MultiVolumeTests(unittest.TestCase):
         self.assertFalse(report_ctl["pressure"])
         self.assertEqual(report_ctl["min_age_days"], 30)
 
+    def test_a_pressured_pass_returns_to_the_foreground(self):
+        def priority_for(free_b):
+            receipts = []
+            with unittest.mock.patch.object(dr, "enter_background",
+                                            return_value="darwin_background"), \
+                    unittest.mock.patch.object(dr, "leave_background", return_value=True), \
+                    unittest.mock.patch.object(
+                        dr, "record_pass", side_effect=lambda a, r, c: receipts.append(r)):
+                self.run_json("--fix", "--pressure-free-gb", "200",
+                              free={str(self.a): 900 * dr.GIB, str(self.b): free_b},
+                              devices=self.separate_volumes())
+            return receipts[0]["priority"]
+        self.assertEqual(priority_for(10 * dr.GIB), "foreground: a volume is under pressure")
+        self.assertEqual(priority_for(900 * dr.GIB), "darwin_background")   # control
+
     def test_one_unreadable_volume_cannot_certify_the_floor(self):
         code, _ = self.run_json(
             "--fail-below-gb", "60",
@@ -927,6 +1258,96 @@ class MultiVolumeTests(unittest.TestCase):
         self.assertEqual(
             [v["root"] for v in report_ctl["free_bytes_by_volume_before"]],
             [str(self.a), str(self.b)])
+
+
+class LeaseVolumeFloorTests(TwoRootHarness):
+    """The floor is judged on the volume that holds the Tart store.
+
+    Lease admission probes $TART_HOME, so "this host will refuse leases" is a
+    statement about that volume alone. m3 keeps its VMs on Workshop and scans
+    a boot-disk ~/Code whose volume is mostly personal data the janitor must
+    never touch; judging the floor there failed every pass on a host that was
+    leasing fine.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.vms = self.b / "VMs"
+        self.vms.mkdir()
+
+    def free_table(self, a, b):
+        return {str(self.a): a, str(self.b): b, str(self.vms): b}
+
+    def test_a_low_scan_volume_off_the_lease_volume_does_not_fail(self):
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["floor_scope"], "lease_volume")
+        self.assertEqual(report["free_bytes_after"], 900 * dr.GIB)
+        self.assertEqual(report["scan_volumes_below_floor"], [str(self.a)])
+        # Both scanned volumes are still reported, separately.
+        self.assertEqual(
+            [v["root"] for v in report["free_bytes_by_volume_after"]],
+            [str(self.a), str(self.b)])
+        # Control: starve the lease volume instead and the floor must fire.
+        code_ctl, report_ctl = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(900 * dr.GIB, 3 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 3)
+        self.assertEqual(report_ctl["free_bytes_after"], 3 * dr.GIB)
+        self.assertEqual(report_ctl["scan_volumes_below_floor"], [])
+
+    def test_a_lease_volume_shared_with_the_scan_still_fails(self):
+        """m5's shape: Tart store and ~/Code on one internal disk."""
+        same = {str(self.a): 101, str(self.b): 101}
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", str(self.vms),
+            free=self.free_table(3 * dr.GIB, 3 * dr.GIB), devices=same)
+        self.assertEqual(code, 3)
+        self.assertEqual(report["scan_volumes_below_floor"], [])
+
+    def test_tart_home_names_the_lease_volume(self):
+        with unittest.mock.patch.dict(os.environ, {"TART_HOME": str(self.vms)}):
+            code, report = self.run_json(
+                "--fail-below-gb", "60",
+                free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+                devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lease_path_source"], "TART_HOME")
+        # Control: nothing declared keeps the legacy every-volume floor.
+        code_ctl, report_ctl = self.run_json(
+            "--fail-below-gb", "60",
+            free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+            devices=self.separate_volumes())
+        self.assertEqual(code_ctl, 3)
+        self.assertEqual(report_ctl["floor_scope"], "scan_volumes")
+
+    @testing_support.requires_tomllib
+    def test_the_fleet_profile_names_the_lease_volume(self):
+        profile = self.a / "profile.toml"
+        profile.write_text(f'[host]\ntart_home = "{self.vms}"\n')
+        with unittest.mock.patch.dict(
+                os.environ, {"TARTCI_FLEET_PROFILE": str(profile)}):
+            code, report = self.run_json(
+                "--fail-below-gb", "60",
+                free=self.free_table(3 * dr.GIB, 900 * dr.GIB),
+                devices=self.separate_volumes())
+        self.assertEqual(code, 0)
+        self.assertEqual(report["lease_path"], str(self.vms))
+        self.assertIn("[host].tart_home", report["lease_path_source"])
+
+    def test_an_unavailable_lease_volume_cannot_certify_the_floor(self):
+        missing = str(self.b / "unmounted" / "VMs")
+        free = self.free_table(900 * dr.GIB, 900 * dr.GIB)
+        free[missing] = None
+        code, report = self.run_json(
+            "--fail-below-gb", "60", "--lease-path", missing,
+            free=free, devices=self.separate_volumes())
+        self.assertEqual(code, 4)
+        self.assertIsNone(report["free_bytes_after"])
 
 
 class RootDiscoveryTests(unittest.TestCase):
@@ -960,6 +1381,31 @@ class RootDiscoveryTests(unittest.TestCase):
                 dr, "DEFAULT_ROOT_CANDIDATES", (str(self.absent),)):
             self.assertEqual(dr.parse_roots(None), [])
 
+    @testing_support.requires_tomllib
+    def test_profile_reclaim_paths_add_the_external_volume_root(self):
+        """A host whose external volume is not named Workshop is still scanned.
+
+        m5studio keeps code on /Volumes/Store; the root comes from the
+        installed profile's [reclaim] repo/worktrees_root, not a volume name.
+        """
+        code = self.base / "atelier" / "Code"
+        (code / "pulp").mkdir(parents=True)
+        profile = self.base / "profile.toml"
+        profile.write_text(
+            "[reclaim]\n"
+            f'repo = "{code}/pulp"\n'
+            f'worktrees_root = "{code}/agent-worktrees"\n')
+        with unittest.mock.patch.dict(os.environ, {"TARTCI_FLEET_PROFILE": str(profile)}), \
+                unittest.mock.patch.object(
+                    dr, "DEFAULT_ROOT_CANDIDATES", (str(self.present_a),)):
+            self.assertEqual(dr.parse_roots(None), [self.present_a, code])
+        # Control: without the profile only the built-in candidate remains.
+        with unittest.mock.patch.dict(
+                os.environ, {"TARTCI_FLEET_PROFILE": str(self.absent)}), \
+                unittest.mock.patch.object(
+                    dr, "DEFAULT_ROOT_CANDIDATES", (str(self.present_a),)):
+            self.assertEqual(dr.parse_roots(None), [self.present_a])
+
     def test_an_explicitly_declared_missing_root_is_still_a_fault(self):
         """Discovery must not soften the declared-root contract."""
         buffer = io.StringIO()
@@ -971,6 +1417,18 @@ class RootDiscoveryTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
             code_ctl = dr.main(["--roots", str(self.present_a), "--json"])
         self.assertEqual(code_ctl, 0)
+
+    def test_stalled_root_metadata_probe_fails_closed(self):
+        """A wedged root probe must not leave reclaim orphaned in os.access."""
+        def stalled(_operation, *, description, timeout=dr.ROOT_PROBE_TIMEOUT_S):
+            raise OSError(errno.ETIMEDOUT, f"{description} timed out")
+
+        buffer = io.StringIO()
+        with unittest.mock.patch.object(dr, "bounded_fs_call", side_effect=stalled), \
+                redirect_stdout(io.StringIO()), redirect_stderr(buffer):
+            code = dr.main(["--roots", str(self.present_a), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("probe failed", buffer.getvalue())
 
     def test_a_host_matching_no_candidate_exits_two(self):
         with unittest.mock.patch.object(
@@ -1132,6 +1590,330 @@ class LogRotationWiringTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual((self.root / "tartci-reclaim.log.1").read_text(),
                          "o" * 64)
+
+
+
+class BoundedScandirTests(unittest.TestCase):
+    """A directory listing that never returns is abandoned, named, and not judged."""
+
+    def setUp(self) -> None:
+        import threading
+        self.release = threading.Event()
+        self.addCleanup(self.release.set)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.blocked = self.root / "stuck"
+        self.blocked.mkdir()
+        real = os.scandir
+
+        def scandir(path):
+            if pathlib.Path(path) == self.blocked:
+                self.release.wait(30)   # m1 on 2026-10-02: open() never returned
+            return real(path)
+        self.patch(dr.os, "scandir", scandir)
+        self.patch(dr, "SCANDIR_TIMEOUT_S", 0.2)
+        self.patch(dr, "SCAN_TIMEOUTS", [])
+
+    def patch(self, owner, name, value) -> None:
+        original = getattr(owner, name)
+        setattr(owner, name, value)
+        self.addCleanup(setattr, owner, name, original)
+
+    def test_a_listing_that_never_returns_times_out_and_is_named(self) -> None:
+        started = time.monotonic()
+        with self.assertRaises(OSError) as raised:
+            dr.bounded_scandir(self.blocked)
+        self.assertEqual(raised.exception.errno, errno.ETIMEDOUT)
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
+
+    def test_a_normal_listing_returns_its_entries(self) -> None:
+        # Control, same instrument: an unblocked directory lists normally.
+        (self.root / "build").mkdir()
+        names = sorted(e.name for e in dr.bounded_scandir(self.root))
+        self.assertEqual(names, ["build", "stuck"])
+        self.assertEqual(dr.SCAN_TIMEOUTS, [])
+
+    def test_a_timed_out_tree_is_unmeasured_never_old(self) -> None:
+        # newest_mtime None keeps the tree; reading the timeout as "empty"
+        # would make it look maximally idle and delete it.
+        self.assertIsNone(dr.newest_mtime(self.blocked))
+
+    def test_the_candidate_scan_finishes_past_a_stuck_directory(self) -> None:
+        (self.root / "other" / "build").mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=4)
+        self.assertEqual(found, [self.root / "other" / "build"])
+        self.assertEqual(dr.SCAN_TIMEOUTS, [str(self.blocked)])
+
+
+class AppContainerSkipTests(unittest.TestCase):
+    """Other apps' data containers are never listed: listing one prompts."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = pathlib.Path(self.tmp.name)
+        self.listed: list[str] = []
+        real = os.scandir
+
+        def scandir(path):
+            self.listed.append(str(path))
+            return real(path)
+        for owner, name, value in ((dr.os, "scandir", scandir), (dr, "APP_CONTAINERS_SKIPPED", [])):
+            original = getattr(owner, name)
+            setattr(owner, name, value)
+            self.addCleanup(setattr, owner, name, original)
+
+    def test_a_containers_tree_is_skipped_unlisted(self) -> None:
+        # m1 on 2026-10-02: a listing under launchd waited forever on the
+        # "access data from other apps" consent prompt.
+        containers = self.root / "Library" / "Containers" / "com.example.app" / "build"
+        containers.mkdir(parents=True)
+        group = self.root / "Library" / "Group Containers" / "group.example" / "build"
+        group.mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [])
+        self.assertFalse(any("Containers" in path for path in self.listed), self.listed)
+        self.assertEqual(sorted(dr.APP_CONTAINERS_SKIPPED),
+                         [str(self.root / "Library" / "Containers"),
+                          str(self.root / "Library" / "Group Containers")])
+
+    def test_a_skipped_container_is_unmeasured_never_old(self) -> None:
+        path = self.root / "Library" / "Containers" / "com.example.app"
+        path.mkdir(parents=True)
+        self.assertIsNone(dr.newest_mtime(path))
+
+    def test_ordinary_directories_are_still_scanned(self) -> None:
+        # Control, same instrument: a build tree outside any container is found,
+        # including one under a Library that is not a container directory.
+        (self.root / "Library" / "Caches" / "build").mkdir(parents=True)
+        (self.root / "proj" / "build").mkdir(parents=True)
+        found = dr.find_candidates([self.root], maxdepth=6)
+        self.assertEqual(found, [self.root / "Library" / "Caches" / "build",
+                                 self.root / "proj" / "build"])
+        self.assertEqual(dr.APP_CONTAINERS_SKIPPED, [])
+
+
+class HomeRootGuardTests(unittest.TestCase):
+    """No pass may walk the home directory: ~/Library prompts under launchd."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = pathlib.Path(self.tmp.name).resolve() / "home"
+        (self.home / "Code" / "pulp").mkdir(parents=True)
+        (self.home / "Library" / "Mail").mkdir(parents=True)
+        self.profile = pathlib.Path(self.tmp.name) / "profile.toml"
+        for patcher in (unittest.mock.patch.dict(os.environ, {"HOME": str(self.home),
+                                                              "TARTCI_FLEET_PROFILE": str(self.profile)}),
+                        unittest.mock.patch.object(dr, "DEFAULT_ROOT_CANDIDATES", ())):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def roots(self, repo: str, worktrees_root: str) -> tuple[list[pathlib.Path], str]:
+        if dr.tomllib is None:
+            self.skipTest("profile roots need tomllib (Python 3.11+), as on the fleet")
+        self.profile.write_text(f'[reclaim]\nrepo = "{repo}"\nworktrees_root = "{worktrees_root}"\n')
+        err = io.StringIO()
+        with redirect_stderr(err):
+            roots = dr.parse_roots(None)
+        return roots, err.getvalue()
+
+    def test_m1s_profile_scans_code_not_home(self) -> None:
+        # m1 and m5 set worktrees_root = ~/Code; its parent is $HOME, and every
+        # pass walked ~/Library and hung on the "data from other apps" prompt.
+        code = self.home / "Code"
+        roots, err = self.roots(f"{code}/pulp", str(code))
+        self.assertEqual(roots, [code])
+        # Not merely filtered by the guard: home is never a candidate at all.
+        self.assertNotIn(str(self.home), dr.profile_root_candidates())
+        self.assertNotIn("REFUSED", err)
+
+    def test_a_profile_root_at_home_is_refused_loudly(self) -> None:
+        roots, err = self.roots(f"{self.home}/pulp", str(self.home))
+        self.assertEqual(roots, [])
+        self.assertIn("REFUSED scan root", err)
+        self.assertIn("home directory", err)
+
+    def test_an_explicit_home_root_fails_the_pass(self) -> None:
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = dr.main(["--roots", str(self.home), "--json"])
+        self.assertEqual(code, 2)
+        self.assertIn("refused", err.getvalue())
+
+    def test_every_fleet_profile_yields_its_code_directory(self) -> None:
+        # The four [reclaim] tables as deployed on 2026-10-02 (home and the
+        # external volumes stand in under this test's temporary directory).
+        base = pathlib.Path(self.tmp.name).resolve()
+        workshop, atelier = base / "Workshop" / "Code", base / "Atelier" / "Code"
+        for code in (workshop, atelier):
+            (code / "agent-worktrees").mkdir(parents=True)
+        home_code = self.home / "Code"
+        cases = {
+            "m3": (f"{workshop}/pulp", f"{workshop}/agent-worktrees", [workshop]),
+            "m5studio": (f"{atelier}/pulp", f"{atelier}/agent-worktrees", [atelier]),
+            "m1": (f"{home_code}/pulp", str(home_code), [home_code]),
+            "m5": (f"{home_code}/pulp", str(home_code), [home_code]),
+        }
+        for host, (repo, worktrees_root, expected) in cases.items():
+            with self.subTest(host=host):
+                roots, err = self.roots(repo, worktrees_root)
+                self.assertEqual(roots, expected)
+                self.assertNotIn("REFUSED", err)
+
+    def test_a_whole_volume_root_is_refused(self) -> None:
+        self.assertIn("whole volume", dr.refused_root(pathlib.Path("/Volumes/Example")))
+
+    def test_a_refused_listing_is_named_never_silent(self) -> None:
+        code = self.home / "Code"
+        locked = code / "locked"
+        locked.mkdir()
+        (code / "proj" / "build").mkdir(parents=True)
+        real = os.scandir
+
+        def scandir(path):
+            if pathlib.Path(path) == locked:
+                raise PermissionError(errno.EPERM, "Operation not permitted", str(path))
+            return real(path)
+        with unittest.mock.patch.object(dr.os, "scandir", scandir), \
+                unittest.mock.patch.object(dr, "SCAN_REFUSED", []):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                found = dr.find_candidates([code], maxdepth=4)
+            self.assertEqual(found, [code / "proj" / "build"])
+            self.assertEqual(dr.SCAN_REFUSED, [str(locked)])
+            self.assertIn(f"skipped {locked}", err.getvalue())
+
+    def test_a_root_nested_in_another_is_walked_once(self) -> None:
+        # m3 and m5studio: worktrees_root (…/Code/agent-worktrees) sits inside
+        # repo's parent (…/Code).
+        code = self.home / "Code"
+        (code / "agent-worktrees").mkdir()
+        roots, _ = self.roots(f"{code}/pulp", f"{code}/agent-worktrees")
+        self.assertEqual(roots, [code])
+
+    def test_roots_inside_or_above_library_are_refused(self) -> None:
+        self.assertIsNotNone(dr.refused_root(self.home / "Library" / "Mail"))
+        self.assertIsNotNone(dr.refused_root(pathlib.Path("/")))
+        # An ordinary directory above home still contains ~/Library.
+        self.assertIn("contains", dr.refused_root(self.home.parent))
+        # Control: a code directory under home is a valid root.
+        self.assertIsNone(dr.refused_root(self.home / "Code"))
+
+    def test_the_walk_never_lists_home_library(self) -> None:
+        with self.assertRaises(OSError) as raised:
+            dr.bounded_scandir(self.home / "Library" / "Mail")
+        self.assertEqual(raised.exception.errno, errno.EPERM)
+
+class BackgroundPriorityTests(unittest.TestCase):
+    """The hourly --fix pass yields CPU, disk and network to the gate VMs."""
+
+    def test_a_macos_pass_enters_darwin_background(self) -> None:
+        calls = []
+        result = dr.enter_background("darwin", {}, lambda *a: calls.append(a))
+        self.assertEqual(result, "darwin_background")
+        self.assertEqual(calls, [(dr.PRIO_DARWIN_PROCESS, 0, dr.PRIO_DARWIN_BG)])
+
+    def test_the_operator_can_keep_it_in_the_foreground(self) -> None:
+        calls = []
+        result = dr.enter_background("darwin", {dr.FOREGROUND_ENV: "1"},
+                                     lambda *a: calls.append(a))
+        self.assertEqual((result, calls), (f"unchanged: {dr.FOREGROUND_ENV}=1", []))
+
+    def test_other_platforms_and_failures_are_reported_not_raised(self) -> None:
+        self.assertEqual(dr.enter_background("linux", {}, None), "unchanged: not macOS")
+
+        def refuse(*_a):
+            raise PermissionError("EPERM")
+        self.assertIn("setpriority failed", dr.enter_background("darwin", {}, refuse))
+
+    def test_only_a_fix_pass_is_demoted_and_the_receipt_says_so(self) -> None:
+        receipts = []
+        for argv, want_calls in ((["--fix"], 1), ([], 0)):
+            calls = []
+            with unittest.mock.patch.object(dr, "enter_background",
+                                   side_effect=lambda: calls.append(1) or "darwin_background"), \
+                    unittest.mock.patch.object(dr, "_run", return_value=0), \
+                    unittest.mock.patch.object(dr, "record_pass",
+                                      side_effect=lambda a, r, c: receipts.append(r)):
+                self.assertEqual(dr.main(["--roots", "/nonexistent", *argv]), 0)
+            self.assertEqual(len(calls), want_calls, argv)
+        self.assertEqual([r["priority"] for r in receipts],
+                         ["darwin_background", "unchanged: dry-run"])
+        self.assertEqual(dr.pass_summary(receipts[0], 0)["priority"], "darwin_background")
+
+    def test_the_ccache_trim_runs_in_the_foreground_then_returns(self) -> None:
+        calls = []
+        with unittest.mock.patch.object(dr, "leave_background",
+                                        side_effect=lambda: calls.append("fg") or True), \
+                unittest.mock.patch.object(dr, "enter_background",
+                                           side_effect=lambda: calls.append("bg")):
+            with dr.foreground_while({"priority": "darwin_background"}):
+                calls.append("trim")
+            with dr.foreground_while({"priority": "unchanged: dry-run"}):
+                calls.append("trim")
+        self.assertEqual(calls, ["fg", "trim", "bg", "trim"])
+
+    def test_the_checkout_sweep_stays_in_the_background_under_pressure(self) -> None:
+        calls = []
+        with unittest.mock.patch.object(dr, "leave_background",
+                                        side_effect=lambda: calls.append("fg") or True), \
+                unittest.mock.patch.object(dr, "enter_background",
+                                           side_effect=lambda: calls.append("bg")
+                                           or "darwin_background"):
+            pressured = {"mode": "fix", "priority": "foreground: a volume is under pressure"}
+            with dr.background_while(pressured):
+                calls.append("sweep")
+            # Already background, or a dry run: nothing to change.
+            for receipt in ({"mode": "fix", "priority": "darwin_background"},
+                            {"mode": "dry-run", "priority": "unchanged: dry-run"}):
+                with dr.background_while(receipt):
+                    calls.append("sweep")
+        self.assertEqual(calls, ["bg", "sweep", "fg", "sweep", "sweep"])
+        self.assertEqual(pressured["checkout_sweep_priority"], "darwin_background")
+
+    def test_the_merged_worktree_rule_writes_a_metrics_line(self) -> None:
+        merged = {"enabled": True, "mode": "pressure", "removed": 2,
+                  "removed_bytes": 3 * dr.GIB, "holding_work": 1,
+                  "pr_lookup": "ok: acme/widget, 1 branch(es)"}
+        receipt = {"started_ts": 1.0, "mode": "fix", "priority": "darwin_background",
+                   "tmp_checkouts": {"enabled": True, "mode": "fix", "removed": 2,
+                                     "merged_worktrees": merged}}
+        with tempfile.TemporaryDirectory() as tmp:
+            args = dr.build_parser().parse_args(["--state-dir", tmp])
+            dr.record_pass(args, receipt, 0, stream=io.StringIO())
+            lines = [json.loads(line) for line in
+                     (pathlib.Path(tmp) / dr.EVENTS_NAME).read_text().splitlines()]
+        events = {line["event"]: line for line in lines}
+        self.assertIn("merged worktrees removed 2 (3.0 GiB)",
+                      events["reclaim_pass"]["detail"])
+        self.assertEqual(events["merged_worktrees"]["fields"]["removed"], 2)
+        self.assertIn("1 holding unpushed work", events["merged_worktrees"]["detail"])
+
+    def test_leave_background_restores_normal_priority(self) -> None:
+        calls = []
+        self.assertTrue(dr.leave_background(lambda *a: calls.append(a)))
+        self.assertEqual(calls, [(dr.PRIO_DARWIN_PROCESS, 0, 0)])
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS task policy")
+    def test_children_inherit_the_background_priority(self) -> None:
+        # Run in a child so this test runner keeps its own priority.
+        script = (
+            "import os, subprocess, sys; sys.path.insert(0, sys.argv[1]);"
+            "import disk_reclaim as dr; os.environ.pop(dr.FOREGROUND_ENV, None);"
+            "print(dr.enter_background());"
+            "print(subprocess.run(['/bin/sh', '-c', 'ps -o pri= -p $$'],"
+            " capture_output=True, text=True).stdout.strip())")
+        out = subprocess.run([sys.executable, "-c", script,
+                              str(pathlib.Path(dr.__file__).resolve().parent)],
+                             capture_output=True, text=True, timeout=300,
+                             env={k: v for k, v in os.environ.items()
+                                  if k != dr.FOREGROUND_ENV})
+        lines = out.stdout.split()
+        self.assertEqual(lines[0], "darwin_background", out.stderr)
+        self.assertEqual(lines[1], "4", out.stdout)   # macOS reports background as 4
 
 
 if __name__ == "__main__":

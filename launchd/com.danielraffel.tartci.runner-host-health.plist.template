@@ -1,0 +1,67 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the host-local health check of ONE persistent
+  GitHub Actions runner (scripts/runner_host_health.sh). Install it on the
+  runner's own host, which needs no tartci checkout and no GitHub credential:
+
+    mkdir -p "$HOME/.local/bin" "$HOME/Library/Logs/tartci"
+    install -m 0755 scripts/runner_host_health.sh "$HOME/.local/bin/"
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.runner-host-health.plist.template \
+      --set "HOME=$HOME" --set "RUNNER_DIR=$HOME/actions-runner" \
+      --set "RUNNER_SERVICE=actions.runner.OWNER-REPO.NAME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.runner-host-health.plist"
+    launchctl bootstrap "gui/$(id -u)" \
+      "$HOME/Library/LaunchAgents/com.danielraffel.tartci.runner-host-health.plist"
+
+  Every 5 minutes, at background priority: restart a configured runner whose
+  listener is not running, and mark a deconfigured one for the central
+  re-registration job (scripts/persistent_runner_heal.py) on a fleet host.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.runner-host-health</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/runner_host_health.sh</string>
+        <string>$RUNNER_DIR</string>
+        <string>$RUNNER_SERVICE</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>Nice</key>
+    <integer>20</integer>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/runner-host-health.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/runner-host-health.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

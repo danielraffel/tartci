@@ -117,6 +117,32 @@ def _launchctl_print(
         ) from error
 
 
+def _launchctl_list(launchctl: str, *, timeout_seconds: float) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [launchctl, "list"],
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError(
+            f"launchctl list timed out after {timeout_seconds:g}s"
+        ) from error
+
+
+def _listed_labels(text: str) -> set[str]:
+    labels: set[str] = set()
+    for raw in text.splitlines():
+        fields = raw.split()
+        if len(fields) >= 3 and fields[-1] != "Label":
+            label = fields[-1]
+            if re.fullmatch(r"[A-Za-z0-9_.-]+", label):
+                labels.add(label)
+    return labels
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--current-label", required=True)
@@ -139,21 +165,18 @@ def main() -> int:
         os.path.join(os.path.abspath(os.path.expanduser(args.state_dir)), f"{args.runner_name}.state.json"),
     )
     try:
-        domain_print = _launchctl_print(
-            launchctl, domain, timeout_seconds=args.launchctl_timeout_seconds
-        )
+        listed = _launchctl_list(launchctl, timeout_seconds=args.launchctl_timeout_seconds)
     except RuntimeError as error:
         print(f"identity guard cannot enumerate loaded services: {error}", file=sys.stderr)
         return 2
-    if domain_print.returncode != 0:
-        print(f"identity guard cannot enumerate loaded services in {domain}", file=sys.stderr)
+    if listed.returncode != 0:
+        print("identity guard cannot enumerate loaded services with launchctl list", file=sys.stderr)
         return 2
-    # The GUI domain contains hundreds of unrelated Apple/application services.
-    # Inspecting every one made concurrent lane startup take minutes. Disk-backed
-    # candidates are added below; only plausible runner labels from the domain
-    # need a per-service launchctl query.
+    # Enumerate labels first, then inspect only plausible Tart candidates. Never
+    # dump the GUI domain: on a busy host it is thousands of lines and can time
+    # out while launchd is settling.
     loaded_labels = {
-        label for label in _service_labels(domain_print.stdout)
+        label for label in _listed_labels(listed.stdout)
         if _plausible_runner_label(label)
     }
     disk_specs: dict[str, dict] = {}
@@ -240,7 +263,7 @@ def main() -> int:
                 f"resolve to runner={identity[0]} state={identity[1]}",
                 file=sys.stderr,
             )
-        return 2
+        return 1
     return 0
 
 

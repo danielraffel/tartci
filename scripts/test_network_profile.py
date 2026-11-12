@@ -68,6 +68,10 @@ class NetworkProfileTests(unittest.TestCase):
         )
         self._pool_lock_env.start()
         self.addCleanup(self._pool_lock_env.stop)
+        # Never read the developer machine's launchd enablement.
+        self._disabled = mock.patch.object(network, "_disabled_labels", return_value=set())
+        self._disabled.start()
+        self.addCleanup(self._disabled.stop)
 
     def test_stock_python_fallback_keeps_absent_profile_noop(self) -> None:
         with tempfile.TemporaryDirectory() as td, mock.patch.object(network, "tomllib", None):
@@ -101,6 +105,24 @@ class NetworkProfileTests(unittest.TestCase):
         body = (ROOT / "tartci").read_text(encoding="utf-8")
         self.assertIn('network_args=(reconcile --json)', body)
         self.assertIn("printf '%s\\n' \"$network_output\"", body)
+
+    def test_a_busy_host_exits_deferred_and_a_failure_exits_1(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            args = ["reconcile", "--profile", str(Path(td) / "p.toml"), "--quiet"]
+            busy = network.TransitionBusy("pool transition busy: /x/pool-transition.lock")
+            with mock.patch.object(network, "reconcile", side_effect=busy):
+                self.assertEqual(network.main(args), network.EXIT_DEFERRED)
+            deferred = {"ok": False, "deferred": True, "reason": "reload deferred"}
+            with mock.patch.object(network, "reconcile", return_value=deferred):
+                self.assertEqual(network.main(args), network.EXIT_DEFERRED)
+            # Controls: a real failure, including an unrelated timeout, stays 1.
+            with mock.patch.object(network, "reconcile",
+                                   return_value={"ok": False, "reason": "relay probe failed"}):
+                self.assertEqual(network.main(args), 1)
+            with mock.patch.object(network, "reconcile", side_effect=TimeoutError("socket")):
+                self.assertEqual(network.main(args), 1)
+            with mock.patch.object(network, "reconcile", return_value={"ok": True}):
+                self.assertEqual(network.main(args), 0)
 
     def test_controller_scope_matches_pool_controlled_namespaces(self) -> None:
         pulp = {"Label": "com.danielraffel.pulp.tart-runner-macos-gate", "ProgramArguments": ["tartci", "serve", "macos"]}
@@ -190,6 +212,69 @@ class NetworkProfileTests(unittest.TestCase):
             self.assertFalse(result["ok"])
             self.assertIn("deferred", result["reason"])
             self.assertEqual(mac.read_bytes(), before)
+
+    def _converged_then_disabled(self, root: Path, *, loaded: bool, vm_running: bool,
+                                 runs: int = 1) -> tuple[list[dict], list[str], Path]:
+        """Converge one controller, then disable it in launchd and reconcile again."""
+        agents = root / "agents"
+        agents.mkdir()
+        profile = root / "profile.toml"
+        write_profile(profile)
+        label = "com.danielraffel.pulp.tart-runner-macos-release-secondary"
+        mac = agents / "mac.plist"
+        write_controller(mac, label)
+        relay = agents / f"{network.RELAY_LABEL}.plist"
+        common = (
+            mock.patch.object(network, "authenticated_probe", return_value=(True, "authenticated")),
+            mock.patch.object(network.Path, "home", return_value=Path("/Users/tester")),
+        )
+        with common[0], common[1], \
+                mock.patch.object(network, "_loaded_path",
+                                  side_effect=lambda l: relay if l == network.RELAY_LABEL else mac), \
+                mock.patch.object(network, "_reload", return_value=True), \
+                mock.patch.object(network, "_any_tart_vm_running", return_value=False):
+            self.assertTrue(network.reconcile(profile, agents)["ok"])
+        # The retired lane is re-marked pending, as a reconcile interrupted
+        # before it could stage it leaves it.
+        receipt_path = network.applied_receipt_path(profile)
+        receipt = network._load_receipt(receipt_path)
+        receipt["agents"][label]["state"] = "pending"
+        network._write_receipt(receipt_path, receipt)
+        results: list[dict] = []
+        reloaded: list[str] = []
+        with common[0], common[1], \
+                mock.patch.object(network, "_disabled_labels", return_value={label}), \
+                mock.patch.object(network, "_loaded_path",
+                                  side_effect=lambda l: relay if l == network.RELAY_LABEL
+                                  else (mac if loaded else None)), \
+                mock.patch.object(network, "_reload",
+                                  side_effect=lambda l, path, dry: reloaded.append(l) or True), \
+                mock.patch.object(network, "_any_tart_vm_running", return_value=vm_running):
+            for _ in range(runs):
+                results.append(network.reconcile(profile, agents))
+        return results, reloaded, receipt_path
+
+    def test_disabled_unloaded_controller_is_staged_while_a_vm_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            results, reloaded, receipt_path = self._converged_then_disabled(
+                Path(td), loaded=False, vm_running=True, runs=2)
+            first, second = results
+            self.assertTrue(first["ok"], first)
+            self.assertEqual([c["action"] for c in first["changes"]], ["stage-disabled"])
+            self.assertEqual(reloaded, [])
+            state = network._load_receipt(receipt_path)["agents"][
+                "com.danielraffel.pulp.tart-runner-macos-release-secondary"]["state"]
+            self.assertEqual(state, "staged")
+            self.assertTrue(second["ok"], second)
+            self.assertEqual(second["changes"], [])
+
+    def test_disabled_but_loaded_controller_still_waits_for_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            results, reloaded, _ = self._converged_then_disabled(
+                Path(td), loaded=True, vm_running=True)
+            self.assertFalse(results[0]["ok"])
+            self.assertIn("deferred", results[0]["reason"])
+            self.assertEqual(reloaded, [])
 
     def test_unavailable_inventory_is_not_reported_as_a_running_vm(self) -> None:
         with tempfile.TemporaryDirectory() as td:

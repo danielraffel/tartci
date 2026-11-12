@@ -16,7 +16,6 @@
 #     [--rosetta|--no-rosetta]
 set -euo pipefail
 
-export TART_HOME="${TART_HOME:-/Volumes/Workshop/VMs}"
 VM_USER="${PULP_VM_USER:-admin}"
 SSH_KEY="${PULP_VM_SSH_KEY:-$HOME/.ssh/id_ed25519}"
 BASE="ghcr.io/cirruslabs/ubuntu:24.04"   # pin to a @sha256 digest for a stable golden
@@ -26,6 +25,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 MANIFEST="$ROOT/manifests/pulp.linux.toml"
 COMMON="$ROOT/providers/common"
 SOURCE_PIN_RESOLVER="$COMMON/pulp-source-pin.py"
+# The resolver imports tomllib; an operator ssh shell may resolve python3 to 3.9.
+# shellcheck source=../common/toml-python.lib.sh
+. "$COMMON/toml-python.lib.sh"
+# shellcheck source=../common/tart-home.lib.sh
+. "$COMMON/tart-home.lib.sh"
+TART_HOME="$(tartci_default_tart_home)" || exit 1
+export TART_HOME
 RENDER_VERIFIER="$COMMON/pulp-render-generation.py"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
 
@@ -49,7 +55,7 @@ esac; done
 for required in "$MANIFEST" "$SOURCE_PIN_RESOLVER" "$RENDER_VERIFIER"; do
   [ -f "$required" ] || die "versioned golden input missing: $required"
 done
-source_identity="$(python3 "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
+source_identity="$(tartci_toml_python "$SOURCE_PIN_RESOLVER" "$MANIFEST" \
   --require-skia-release chrome/m153 \
   --require-v8-disposition baked-provider-only)" \
   || die "could not resolve immutable Pulp source from $MANIFEST"
@@ -73,13 +79,13 @@ if [ "$ENABLE_ROSETTA" = 1 ]; then
 fi
 TART_RUN_ARGS=(--no-graphics)
 [ "$ENABLE_ROSETTA" = 1 ] && TART_RUN_ARGS+=(--rosetta=rosetta)
-RPID=""; tart run "${TART_RUN_ARGS[@]}" "$NAME" >/dev/null 2>&1 & RPID=$!
+RPID=""; tart run ${TART_RUN_ARGS[@]+"${TART_RUN_ARGS[@]}"} "$NAME" >/dev/null 2>&1 & RPID=$!
 trap '[ -n "$RPID" ] && kill "$RPID" 2>/dev/null || true' EXIT
 IP=""; for _ in $(seq 1 60); do IP="$(tart ip "$NAME" 2>/dev/null || true)"; [ -n "$IP" ] && break; sleep 2; done
 [ -n "$IP" ] || die "no IP for $NAME"
 GUEST_TRANSPORT=""
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
+  if ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" true 2>/dev/null; then GUEST_TRANSPORT="ssh"; break; fi
   if tart exec "$NAME" true >/dev/null 2>&1; then GUEST_TRANSPORT="tart-exec"; break; fi
   sleep 2
 done
@@ -88,7 +94,8 @@ note "vm up at $IP via $GUEST_TRANSPORT — provisioning deps + Skia in-guest"
 
 run_guest_script(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+    # ssh-stdin: the guest script is fed by `run_guest_script <<'GUEST'`
+    ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" \
       "SRC_REPO='$SRC_REPO' PULP_SHA='$PULP_SHA' SKIA_PLATFORM='$SKIA_PLATFORM' ENABLE_ROSETTA='$ENABLE_ROSETTA' PARENT_IDENTITY='$BASE' bash -s"
   else
     tart exec -i "$NAME" env \
@@ -100,7 +107,7 @@ run_guest_script(){
 
 install_render_verifier(){
   if [ "$GUEST_TRANSPORT" = "ssh" ]; then
-    ssh "${SSH_OPTS[@]}" -i "$SSH_KEY" "$VM_USER@$IP" \
+    ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" \
       'mkdir -p "$HOME/.local/lib/tartci" && cat >"$HOME/.local/lib/tartci/pulp-render-generation.py"' \
       <"$RENDER_VERIFIER"
   else

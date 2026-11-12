@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
 import argparse
 import hashlib
 import importlib.util
@@ -264,6 +265,7 @@ class PulpRenderGenerationTests(unittest.TestCase):
 
 
 class PulpRenderManifestTests(unittest.TestCase):
+    @testing_support.requires_tomllib
     def test_macos_and_linux_share_one_immutable_m153_source(self) -> None:
         import tomllib
 

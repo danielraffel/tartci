@@ -1,0 +1,7 @@
+# name|aliases|tailscale|lan|wifi|user|identity_file   (empty field = that path does not exist)
+m1|m1 mbp|203.0.113.10|192.0.2.50|192.0.2.76|ci|~/.ssh/id_fleet
+m3|m3 m3studio|203.0.113.11|192.0.2.175|192.0.2.173|ci|~/.ssh/id_fleet
+m5|m5 laptop|203.0.113.12|192.0.2.81|192.0.2.60|ci|~/.ssh/id_fleet
+m5s|m5s m5studio|203.0.113.13|192.0.2.174|192.0.2.67|ci|~/.ssh/id_fleet
+macmini|macmini mini|203.0.113.14|192.0.2.20|192.0.2.77|ci|~/.ssh/id_fleet
+macpro|macpro||192.0.2.43||root|~/.ssh/id_fleet

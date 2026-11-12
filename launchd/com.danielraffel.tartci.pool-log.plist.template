@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd template for the tartci pool-log agent.
+
+  Runs `tartci pool log` every 300 s. Each pass reads this generation's
+  `tartci pool status --json` and appends one record to
+  ~/.tartci/state/pool-log/events.jsonl when the host's state, participation
+  or fleet.config problems changed, plus one heartbeat an hour. The log
+  rotates at 2 MiB to events.jsonl.1. It is read-only towards everything else:
+  no ssh, no GitHub, no writes outside its state directory. `tartci pool log
+  --status` prints the last record.
+
+  Declare `pool-log` in the host profile's [support_agents] declared list to
+  install it through support_agents. Install shape by hand:
+
+    mkdir -p "$HOME/Library/Logs/tartci"
+    python3 scripts/render_launchd_template.py \
+      launchd/com.danielraffel.tartci.pool-log.plist.template \
+      --set "HOME=$HOME" \
+      > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.pool-log.plist"
+    launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.pool-log.plist"
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.danielraffel.tartci.pool-log</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>pool</string>
+        <string>log</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>$HOME</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>StandardOutPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-pool-log.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>$HOME/Library/Logs/tartci/tartci-pool-log.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
+        <key>HOME</key>
+        <string>$HOME</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TARTCI_HOME</key>
+        <string>$HOME/.tartci</string>
+    </dict>
+</dict>
+</plist>

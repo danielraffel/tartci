@@ -9,7 +9,6 @@ import json
 import os
 import re
 import signal
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -24,20 +23,6 @@ RFC3339_PATTERN = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T"
     r"[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]{1,9})?(?:Z|[+-][0-9]{2}:[0-9]{2})"
-)
-GITHUB_REMOTE_PATTERNS = (
-    re.compile(
-        r"git@github\.com:([A-Za-z0-9_.-]+)/"
-        r"([A-Za-z0-9_.-]+?)(?:\.git)?"
-    ),
-    re.compile(
-        r"ssh://git@github\.com/([A-Za-z0-9_.-]+)/"
-        r"([A-Za-z0-9_.-]+?)(?:\.git)?"
-    ),
-    re.compile(
-        r"https://github\.com/([A-Za-z0-9_.-]+)/"
-        r"([A-Za-z0-9_.-]+?)(?:\.git)?"
-    ),
 )
 
 
@@ -107,37 +92,6 @@ def command_validate_tunables(args: argparse.Namespace) -> None:
         1 <= int(args.threshold) <= 100000
     ):
         raise ValueError("invalid threshold must be 1..100000")
-    if not re.fullmatch(r"[0-9]+", args.command_timeout) or not (
-        1 <= int(args.command_timeout) <= 300
-    ):
-        raise ValueError("command timeout must be 1..300 seconds")
-
-
-def command_run_bounded(args: argparse.Namespace) -> None:
-    if not args.argv:
-        raise ValueError("bounded command must not be empty")
-    process = subprocess.Popen(args.argv, start_new_session=True)
-    try:
-        returncode = process.wait(timeout=args.timeout)
-    except subprocess.TimeoutExpired as error:
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            process.wait()
-        print(
-            f"{args.argv[0]} timed out after {args.timeout}s",
-            file=sys.stderr,
-        )
-        raise SystemExit(124) from error
-    raise SystemExit(returncode)
 
 
 def command_ledger_validate(args: argparse.Namespace) -> None:
@@ -192,114 +146,14 @@ def command_version_compatible(args: argparse.Namespace) -> None:
     )
 
 
-def parse_github_origin(remote: str) -> str:
-    remote = remote.strip()
-    for pattern in GITHUB_REMOTE_PATTERNS:
-        match = pattern.fullmatch(remote)
-        if match:
-            return f"{match.group(1)}/{match.group(2)}"
-    raise ValueError("unsupported GitHub origin")
-
-
-def command_github_origin(args: argparse.Namespace) -> None:
-    print(parse_github_origin(args.remote))
-
-
 def command_control_flags(_: argparse.Namespace) -> None:
     value = _json_stdin()
     if not isinstance(value, dict):
         raise ValueError("control must be an object")
     held = value.get("held")
-    authority = value.get("authority_matches")
-    if type(held) is not bool or type(authority) is not bool:
-        raise ValueError("control booleans must be exact JSON booleans")
-    print(f"{int(held)}|{int(authority)}")
-
-
-def command_auth_mode(args: argparse.Namespace) -> None:
-    value = _json_stdin()
-    if (
-        not isinstance(value, dict)
-        or _exact_int(value.get("schema_version"), "schema_version") != 1
-        or value.get("command") != "auth.export"
-        or not isinstance(value.get("bundle"), dict)
-    ):
-        raise ValueError("invalid auth export envelope")
-    github = value["bundle"].get("github", {})
-    if not isinstance(github, dict):
-        raise ValueError("invalid GitHub auth bundle")
-    auth = github.get("auth")
-    if auth is None or auth == {} or (
-        isinstance(auth, dict) and auth.get("source", "gh-cli") == "gh-cli"
-    ):
-        print("inject")
-        return
-    if (
-        isinstance(auth, dict)
-        and auth.get("source") == "command"
-        and isinstance(auth.get("token_command"), list)
-        and auth["token_command"]
-        and os.path.realpath(
-            shutil.which(str(auth["token_command"][0]))
-            or str(auth["token_command"][0])
-        )
-        == os.path.realpath(shutil.which(args.gh) or args.gh)
-    ):
-        print("configured")
-        return
-    raise ValueError(
-        "Shipyard auth is not bound to the configured App wrapper"
-    )
-
-
-def command_app_token(args: argparse.Namespace) -> None:
-    completed = subprocess.run(
-        [args.gh, "auth", "token"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    token = completed.stdout.strip()
-    if (
-        completed.returncode != 0
-        or not token
-        or re.search(r"[\x00-\x20\x7f]", token)
-    ):
-        raise ValueError("App wrapper did not return a bounded token")
-    sys.stdout.write(token)
-
-
-def command_authority_read(args: argparse.Namespace) -> None:
-    completed = subprocess.run(
-        [
-            args.gh,
-            "pr",
-            "list",
-            "--repo",
-            args.repo,
-            "--limit",
-            "1",
-            "--json",
-            "number",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    if completed.returncode != 0:
-        raise RuntimeError("authority repository read failed")
-    value = json.loads(completed.stdout)
-    if not isinstance(value, list):
-        raise ValueError("expected array")
-    for row in value:
-        if (
-            not isinstance(row, dict)
-            or type(row.get("number")) is not int
-        ):
-            raise ValueError("expected typed PR number rows")
-    sys.stdout.write(completed.stdout)
+    if type(held) is not bool:
+        raise ValueError("control hold must be an exact JSON boolean")
+    print(int(held))
 
 
 def _timestamp_epoch(value: Any, field: str) -> int:
@@ -364,98 +218,99 @@ def command_state_rows(args: argparse.Namespace) -> None:
         print("\t".join(row))
 
 
-def command_mergeability(_: argparse.Namespace) -> None:
-    value = _json_stdin()
-    if not isinstance(value, dict):
-        raise ValueError("mergeability result must be an object")
-    mergeable = value.get("mergeable")
-    status = value.get("mergeStateStatus")
-    draft = value.get("isDraft")
-    if mergeable not in {"MERGEABLE", "CONFLICTING", "UNKNOWN"}:
-        raise ValueError("unexpected mergeable enum")
-    if status not in {
-        "BEHIND",
-        "BLOCKED",
-        "CLEAN",
-        "DIRTY",
-        "DRAFT",
-        "HAS_HOOKS",
-        "UNKNOWN",
-        "UNSTABLE",
-    }:
-        raise ValueError("unexpected merge-state enum")
-    if type(draft) is not bool:
-        raise ValueError("draft must be boolean")
-    print(f"{mergeable}|{status}|{str(draft).lower()}")
+# How long one `shipyard rescue --superseded-merge-group` may take before the
+# tick gives up on it for this pass.
+REAP_TIMEOUT_SECONDS = 60
 
 
-def command_reconcile_ok(args: argparse.Namespace) -> None:
-    value = _json_stdin()
-    results = value.get("results") if isinstance(value, dict) else None
-    ok = (
-        isinstance(value, dict)
-        and type(value.get("schema_version")) is int
-        and value["schema_version"] == 1
-        and value.get("command") == "ship-state:reconcile"
-        and isinstance(results, list)
-        and len(results) == 1
-        and isinstance(results[0], dict)
-        and type(results[0].get("pr")) is int
-        and results[0]["pr"] == args.pr
-        and results[0].get("ok") is True
-        and isinstance(results[0].get("changes"), list)
-        and all(
-            isinstance(change, str) for change in results[0]["changes"]
+def _reap_payload(stdout: str) -> dict[str, Any]:
+    data = json.loads(stdout)
+    if not isinstance(data, dict):
+        raise ValueError("rescue output is not a JSON object")
+    inner = data.get("data")
+    data = inner if isinstance(inner, dict) else data
+    if not isinstance(data.get("runs"), list):
+        raise ValueError("rescue output carries no runs list")
+    return data
+
+
+def _reason(row: dict[str, Any]) -> str:
+    evidence = row.get("evidence")
+    if isinstance(evidence, str) and evidence:
+        return evidence
+    if isinstance(evidence, dict):
+        for key in ("reason", "detail", "why"):
+            if isinstance(evidence.get(key), str) and evidence[key]:
+                return evidence[key]
+        return json.dumps(evidence, sort_keys=True)[:240]
+    return "queue ref absent"
+
+
+def command_reap_superseded(args: argparse.Namespace) -> None:
+    """Run Shipyard's superseded merge-group reaper for one repository.
+
+    Never fails the tick: every failure, timeout or unreadable answer prints a
+    one-line summary and returns. `--apply` is passed only when `apply` is 1.
+    Each cancelled (or, in a dry run, would-cancel) run gets one line in the
+    log file: time, host, repository, run id, ref, status and reason.
+    """
+    command = [args.shipyard, "rescue", "--superseded-merge-group", "--repo", args.repo, "--json"]
+    if args.apply == "1":
+        command.append("--apply")
+    mode = "apply" if args.apply == "1" else "dry-run"
+    try:
+        # Its own process group, so a timeout kills every child it started and
+        # nothing is left holding the output pipes open.
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            start_new_session=True,
         )
-    )
-    print("1" if ok else "0")
-
-
-def command_auto_merge_event(args: argparse.Namespace) -> None:
-    value = _json_stdin()
-    if not isinstance(value, dict):
-        raise ValueError("expected object")
-    if (
-        type(value.get("schema_version")) is not int
-        or value["schema_version"] != 1
-        or value.get("command") != "auto-merge"
-        or type(value.get("pr")) is not int
-        or value["pr"] != args.pr
-        or type(value.get("event")) is not str
-    ):
-        raise ValueError("unexpected auto-merge envelope")
-    event = value["event"]
-    required: dict[str, set[str]] = {
-        "already-merged": set(),
-        "enqueued": set(),
-        "pr-not-found": set(),
-        "in-flight": {"evidence"},
-        "target-failed": {"failing_targets", "evidence"},
-        "merge-failed": {"error"},
-        "superseded-sha": {"validated", "current"},
-        "merged": set(),
-    }
-    if event not in required or not required[event].issubset(value):
-        raise ValueError("unsupported auto-merge event")
-    if event in {"in-flight", "target-failed"} and not (
-        isinstance(value["evidence"], dict)
-        and all(
-            isinstance(key, str) and isinstance(item, str)
-            for key, item in value["evidence"].items()
-        )
-    ):
-        raise ValueError("evidence must be a string map")
-    if event == "target-failed" and not (
-        isinstance(value["failing_targets"], list)
-        and all(
-            isinstance(item, str) for item in value["failing_targets"]
-        )
-    ):
-        raise ValueError("failing_targets must be strings")
-    for field in ("error", "validated", "current", "cleanup_warning"):
-        if field in value and not isinstance(value[field], str):
-            raise ValueError(f"{field} must be string")
-    print(event)
+    except OSError as error:
+        print(f"reap-superseded {args.repo}: mode={mode} could not run shipyard ({error}); skipped")
+        return
+    try:
+        stdout, stderr = process.communicate(timeout=args.timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            pass
+        process.communicate()
+        print(f"reap-superseded {args.repo}: mode={mode} timed out after {args.timeout}s; skipped")
+        return
+    completed = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+    try:
+        payload = _reap_payload(completed.stdout)
+    except (ValueError, json.JSONDecodeError):
+        line = next((part for part in completed.stderr.splitlines() if part.strip()), "no stderr")
+        print(f"reap-superseded {args.repo}: mode={mode} exit {completed.returncode}, "
+              f"unreadable output ({line[:200]}); skipped")
+        return
+    acted = [
+        row for row in payload["runs"]
+        if isinstance(row, dict) and row.get("status") in ("cancelled", "would-cancel", "failed")
+    ]
+    lines = [
+        "\t".join((
+            args.now, args.host, args.repo, str(row.get("run_id")), str(row.get("branch")),
+            str(row.get("status")), _reason(row).replace("\t", " ").replace("\n", " "),
+        ))
+        for row in acted
+    ]
+    if lines:
+        try:
+            log = Path(args.log)
+            log.parent.mkdir(parents=True, exist_ok=True)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write("\n".join(lines) + "\n")
+        except OSError as error:
+            print(f"reap-superseded {args.repo}: could not write {args.log} ({error})")
+    counts: dict[str, int] = {}
+    for row in payload["runs"]:
+        if isinstance(row, dict):
+            counts[str(row.get("status"))] = counts.get(str(row.get("status")), 0) + 1
+    summary = " ".join(f"{key}={value}" for key, value in sorted(counts.items())) or "no candidates"
+    print(f"reap-superseded {args.repo}: mode={mode} exit {completed.returncode} {summary}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -473,13 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     tunables = commands.add_parser("validate-tunables")
     tunables.add_argument("fresh")
     tunables.add_argument("threshold")
-    tunables.add_argument("command_timeout")
     tunables.set_defaults(func=command_validate_tunables)
-
-    bounded = commands.add_parser("run-bounded")
-    bounded.add_argument("timeout", type=int, choices=range(1, 301))
-    bounded.add_argument("argv", nargs=argparse.REMAINDER)
-    bounded.set_defaults(func=command_run_bounded)
 
     ledger_validate = commands.add_parser("ledger-validate")
     ledger_validate.add_argument("path")
@@ -497,40 +346,23 @@ def build_parser() -> argparse.ArgumentParser:
     version.add_argument("required")
     version.set_defaults(func=command_version_compatible)
 
-    origin = commands.add_parser("github-origin")
-    origin.add_argument("remote")
-    origin.set_defaults(func=command_github_origin)
-
     control = commands.add_parser("control-flags")
     control.set_defaults(func=command_control_flags)
-
-    auth = commands.add_parser("auth-mode")
-    auth.add_argument("gh")
-    auth.set_defaults(func=command_auth_mode)
-
-    token = commands.add_parser("app-token")
-    token.add_argument("gh")
-    token.set_defaults(func=command_app_token)
-
-    authority = commands.add_parser("authority-read")
-    authority.add_argument("gh")
-    authority.add_argument("repo")
-    authority.set_defaults(func=command_authority_read)
 
     rows = commands.add_parser("state-rows")
     rows.add_argument("path")
     rows.set_defaults(func=command_state_rows)
 
-    mergeability = commands.add_parser("mergeability")
-    mergeability.set_defaults(func=command_mergeability)
+    reap = commands.add_parser("reap-superseded")
+    reap.add_argument("shipyard")
+    reap.add_argument("repo")
+    reap.add_argument("apply", choices=("0", "1"))
+    reap.add_argument("log")
+    reap.add_argument("host")
+    reap.add_argument("now")
+    reap.add_argument("--timeout", type=float, default=REAP_TIMEOUT_SECONDS)
+    reap.set_defaults(func=command_reap_superseded)
 
-    reconcile = commands.add_parser("reconcile-ok")
-    reconcile.add_argument("pr", type=int)
-    reconcile.set_defaults(func=command_reconcile_ok)
-
-    auto_merge = commands.add_parser("auto-merge-event")
-    auto_merge.add_argument("pr", type=int)
-    auto_merge.set_defaults(func=command_auto_merge_event)
     return parser
 
 
@@ -542,7 +374,6 @@ def main(argv: list[str] | None = None) -> int:
         json.JSONDecodeError,
         OSError,
         RuntimeError,
-        subprocess.SubprocessError,
         ValueError,
     ) as error:
         print(error, file=sys.stderr)

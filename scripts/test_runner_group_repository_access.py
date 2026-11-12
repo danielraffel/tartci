@@ -31,7 +31,14 @@ if state.get("api_error"):
     print("gh: Resource not accessible by integration (HTTP 403)", file=sys.stderr)
     raise SystemExit(1)
 if "/repositories?" not in path:
-    print(json.dumps({"id": 3, "visibility": state.get("visibility", "selected")}))
+    if path.startswith("repos/"):
+        print(json.dumps({"visibility": state.get("repository_visibility", "private")}))
+    else:
+        print(json.dumps({
+            "id": 3,
+            "visibility": state.get("visibility", "selected"),
+            "allows_public_repositories": state.get("allows_public_repositories", True),
+        }))
     raise SystemExit(0)
 parsed = urlparse("https://example.invalid/" + path)
 page = int(parse_qs(parsed.query).get("page", ["1"])[0])
@@ -96,17 +103,43 @@ class RunnerGroupRepositoryAccessTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3)
         self.assertEqual(json.loads(result.stdout)["verdict"], "deny")
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4)
         self.assertTrue(all(call["repo"] == "Generous-Corp/pulp" for call in calls))
         self.assertTrue(all(call["gh_repo"] == "Generous-Corp/pulp" for call in calls))
 
     def test_selected_org_group_admits_only_exact_single_repository(self) -> None:
-        result = self.run_check(3, {"pages": [["Generous-Corp/pulp"]]})
+        result = self.run_check(
+            3,
+            {"pages": [["Generous-Corp/pulp"]], "repository_visibility": "private"},
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             json.loads(result.stdout)["registration_scope"],
             "organization-single-repository",
         )
+
+    def test_public_repository_is_denied_when_group_disallows_public(self) -> None:
+        result = self.run_check(
+            8,
+            {
+                "allows_public_repositories": False,
+                "repository_visibility": "public",
+                "pages": [["Generous-Corp/vellum"]],
+            },
+        )
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("disallows public repositories", json.loads(result.stdout)["reason"])
+
+    def test_live_shaped_public_vellum_group_is_denied(self) -> None:
+        result = self.run_check(
+            8,
+            {
+                "allows_public_repositories": False,
+                "repository_visibility": "public",
+                "pages": [["Generous-Corp/vellum"]],
+            },
+        )
+        self.assertEqual(json.loads(result.stdout)["verdict"], "deny")
 
     def test_unknown_policy_and_api_denial_fail_closed(self) -> None:
         for state in ({"visibility": "mystery"}, {"api_error": True}):

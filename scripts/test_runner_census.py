@@ -225,6 +225,108 @@ class ShapeTests(unittest.TestCase):
         )
 
 
+USER_REPO = "danielraffel/spectr"
+USER_REPO_ENDPOINT = "repos/danielraffel/spectr/actions/runners"
+USER_ORG_ENDPOINT = "orgs/danielraffel/actions/runners"
+
+
+def owner_fetcher(pages: dict[str, list[dict]], *, not_found: set[str],
+                  owner_types: dict[str, str | Exception]):
+    """A fetcher whose organization reads 404 and which can name owner types."""
+
+    def fetch(scope: str, endpoint: str) -> list[dict]:
+        if endpoint in not_found:
+            raise runner_census.CensusScopeError(
+                scope, endpoint, "RuntimeError", "gh: Not Found (HTTP 404)")
+        return pages.get(endpoint, [])
+
+    def owner_type(owner: str) -> str | None:
+        value = owner_types[owner]
+        if isinstance(value, Exception):
+            raise value
+        return value
+
+    fetch.owner_type = owner_type  # type: ignore[attr-defined]
+    return fetch
+
+
+class UserOwnedRepositoryTests(unittest.TestCase):
+    """A user account has no organization scope; its 404 is not an unread scope."""
+
+    def test_a_user_owned_repository_census_is_complete(self) -> None:
+        census = runner_census.collect(
+            USER_REPO,
+            owner_fetcher(
+                {USER_REPO_ENDPOINT: [runner(5, "m5-spectr-gate-01", labels=["spectr-gate-fast"])]},
+                not_found={USER_ORG_ENDPOINT},
+                owner_types={"danielraffel": "User"},
+            ),
+        )
+
+        self.assertTrue(census.complete)
+        self.assertEqual(census.unreachable, ())
+        org = next(scope for scope in census.scopes if scope.scope == runner_census.ORGANIZATION_SCOPE)
+        self.assertFalse(org.applicable)
+        self.assertIn("user account", org.error)
+        # With the only real scope read, an absent label is a real answer.
+        self.assertEqual(
+            runner_census.label_status(census, GATE_LABEL).status, runner_census.UNSERVED
+        )
+
+    def test_an_organization_404_stays_an_unread_scope(self) -> None:
+        census = runner_census.collect(
+            REPO,
+            owner_fetcher({REPO_ENDPOINT: []}, not_found={ORG_ENDPOINT},
+                          owner_types={"Generous-Corp": "Organization"}),
+        )
+
+        self.assertFalse(census.complete)
+        self.assertEqual(runner_census.label_status(census, GATE_LABEL).status, runner_census.UNKNOWN)
+
+    def test_an_unreadable_owner_type_stays_an_unread_scope(self) -> None:
+        census = runner_census.collect(
+            USER_REPO,
+            owner_fetcher({USER_REPO_ENDPOINT: []}, not_found={USER_ORG_ENDPOINT},
+                          owner_types={"danielraffel": RuntimeError("timed out")}),
+        )
+
+        self.assertFalse(census.complete)
+
+    def test_a_non_404_organization_failure_is_never_excused(self) -> None:
+        fetch = fetcher({USER_REPO_ENDPOINT: []}, fail={USER_ORG_ENDPOINT: "Resource not accessible"})
+        fetch.owner_type = lambda owner: "User"  # type: ignore[attr-defined]
+
+        census = runner_census.collect(USER_REPO, fetch)
+
+        self.assertFalse(census.complete)
+
+    def test_cli_fetcher_asks_for_the_owner_type_only_after_a_404(self) -> None:
+        seen: list[str] = []
+
+        def run_json(argv: list[str]) -> object:
+            seen.append(argv[2])
+            if argv[2].startswith("orgs/"):
+                raise RuntimeError("gh: Not Found (HTTP 404)")
+            if argv[2] == "users/danielraffel":
+                return {"login": "danielraffel", "type": "User"}
+            return {"runners": []}
+
+        census = runner_census.collect(
+            USER_REPO, runner_census.cli_fetcher("ghapp", run_json=run_json)
+        )
+
+        self.assertTrue(census.complete)
+        self.assertEqual(
+            seen,
+            [f"{USER_REPO_ENDPOINT}?per_page=100", f"{USER_ORG_ENDPOINT}?per_page=100",
+             "users/danielraffel"],
+        )
+        seen.clear()
+        runner_census.collect(REPO, runner_census.cli_fetcher(
+            "ghapp", run_json=lambda argv: seen.append(argv[2]) or {"runners": []}))
+        self.assertNotIn("users/Generous-Corp", seen)
+
+
 class CliTests(unittest.TestCase):
     def test_cli_exits_nonzero_on_an_incomplete_census(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

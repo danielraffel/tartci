@@ -9,7 +9,11 @@
 #   2. admission state                   -> provider loops refuse to mint a new
 #      JIT runner while draining/off, without disturbing an assigned job.
 #   3. runner LaunchAgents               -> drain disables restart and lets the
-#      current exact job finish; off bootouts immediately.
+#      current exact job finish; off bootouts immediately (and so refuses
+#      while an owned lane is mid-job unless --now names that consequence). Both halves are
+#      scoped to the services this host's pool receipt can restore, because an
+#      operation that stops more than its inverse starts is not a pause, it is
+#      a deletion (see tartci_pool_owned_runner_agents).
 #
 # Pure logic lives here (participation r/w, agent enumeration) so it is unit
 # testable; the dispatcher's cmd_pool wires launchctl + JSON on top.
@@ -19,6 +23,34 @@ TARTCI_POOL_PARTICIPATION_FILE="${TARTCI_POOL_PARTICIPATION_FILE:-$HOME/.config/
 TARTCI_POOL_STATE_FILE="${TARTCI_POOL_STATE_FILE:-$HOME/.config/tartci/pool-state}"
 TARTCI_POOL_PERSISTENT_HOLD_FILE="${TARTCI_POOL_PERSISTENT_HOLD_FILE:-$HOME/.config/tartci/persistent-runner-admission-hold}"
 TARTCI_POOL_TRANSITION_LOCK="${TARTCI_POOL_TRANSITION_LOCK:-$HOME/.config/tartci/pool-transition.lock}"
+TARTCI_POOL_FLEET_RECEIPT="${TARTCI_POOL_FLEET_RECEIPT:-$HOME/.config/tartci/macos-fleet-install.json}"
+# The plist glob that is tartci's own by construction: the installer renders
+# exactly these, so they stay in scope even when the receipt is unreadable.
+TARTCI_POOL_FLEET_PLIST_GLOB='com.danielraffel.tartci.tart-runner-macos-fleet.*.plist'
+# Per-lane mid-job probe shared with `tartci launchd reload` (one definition of
+# "mid-job": the label's launchd pid owns a `tart run` or Runner.Worker).
+TARTCI_POOL_LANE_BUSY="${TARTCI_POOL_LANE_BUSY:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../scripts" 2>/dev/null && pwd)/lane_busy.py}"
+
+# Resolve the verified interpreter supplied by tartci. Standalone callers use
+# the fixed system interpreter; PATH python3 is never accepted.
+tartci_pool_python() {
+  if declare -F tartci_verified_python >/dev/null 2>&1; then
+    local verified
+    if verified="$(tartci_verified_python)"; then
+      printf '%s\n' "$verified"
+      return
+    fi
+  fi
+  local python="${TARTCI_PYTHON:-/usr/bin/python3}" implementation
+  implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  if [ "$implementation" != cpython ] && [ -n "${TARTCI_PYTHON:-}" ]; then
+    echo "tartci: pool helper interpreter failed verification: $python (expected cpython, got ${implementation:-unavailable}); using /usr/bin/python3" >&2
+    python=/usr/bin/python3
+    implementation="$("$python" -c 'import sys; print(sys.implementation.name)' 2>/dev/null || true)"
+  fi
+  [ "$implementation" = cpython ] || return 127
+  printf '%s\n' "$python"
+}
 
 # Read participation: 1 = participating, 0 = opted out. Absent means
 # participating — opting out is an explicit act, and a missing/garbage file must
@@ -111,8 +143,175 @@ tartci_pool_runner_agents() {
   done
 }
 
+# The service labels named by the installed macOS fleet receipt: its rendered
+# lane plists plus the persistent runner plists the profile declares. This is a
+# cheap structural read, deliberately NOT the full cohort verification `pool on`
+# performs — a receipt that fails verification still records which services this
+# host installed, and the destructive half of a transition must keep working on
+# a host whose cohort has drifted. Prints nothing when the receipt is absent,
+# unreadable, or malformed.
+tartci_pool_receipt_services() {
+  local receipt="${1:-$TARTCI_POOL_FLEET_RECEIPT}"
+  [ -f "$receipt" ] || return 0
+  "$(tartci_pool_python)" - "$receipt" 2>/dev/null <<'PY' || true
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        receipt = json.load(handle)
+except Exception:
+    raise SystemExit(0)
+if not isinstance(receipt, dict):
+    raise SystemExit(0)
+names = set()
+for key in ("plists", "persistent_plists"):
+    value = receipt.get(key)
+    if isinstance(value, dict):
+        names.update(name for name in value if isinstance(name, str))
+    elif isinstance(value, list):
+        names.update(name for name in value if isinstance(name, str))
+for name in sorted(names):
+    print(name[:-6] if name.endswith(".plist") else name)
+PY
+}
+
+# Is this host's runner fleet receipt-managed at all? A host with neither a
+# receipt nor an installed fleet plist is a legacy/unmanaged host, where
+# `pool on` enumerates and activates every runner agent it finds.
+tartci_pool_fleet_managed() {
+  local dir="${1:-$HOME/Library/LaunchAgents}"
+  local receipt="${2:-$TARTCI_POOL_FLEET_RECEIPT}"
+  [ -f "$receipt" ] && return 0
+  [ -d "$dir" ] || return 1
+  [ -n "$(find "$dir" -maxdepth 1 -name "$TARTCI_POOL_FLEET_PLIST_GLOB" -print -quit 2>/dev/null)" ]
+}
+
+# The runner agents a pool transition owns — exactly the set `pool on` can bring
+# back.
+#
+# `tartci pool on` activates only the services named by the installed fleet
+# receipt: "unreceipted persistent or legacy runner services require their own
+# explicit install/activation authority; this fleet transaction will not start
+# them incidentally." That restraint is correct, and it binds the destructive
+# half too. When `pool off` booted out and disabled every runner agent on disk,
+# it deleted lanes `pool on` would never restore — a foreign repository's
+# persistent Actions runner went down with the fleet, stayed `disabled` in the
+# launchd user domain across reboots, and the loss was invisible because the
+# plist was still on disk. An operation that stops more than its inverse starts
+# is not a pause, it is a deletion.
+#
+# Ownership therefore resolves the same way activation does:
+#   * unmanaged host  -> every enumerated runner agent (what `pool on` activates)
+#   * receipt present -> the services that receipt names
+#   * receipt broken  -> the rendered fleet plists, which are tartci's own by
+#                        construction; everything else keeps its own authority
+#                        until the receipt is repaired, which is the safe
+#                        direction (capacity is left running, and reported).
+tartci_pool_owned_runner_agents() {
+  local dir="${1:-$HOME/Library/LaunchAgents}"
+  local receipt="${2:-$TARTCI_POOL_FLEET_RECEIPT}"
+  local all owned
+  all="$(tartci_pool_runner_agents "$dir")"
+  [ -n "$all" ] || return 0
+  if ! tartci_pool_fleet_managed "$dir" "$receipt"; then
+    printf '%s\n' "$all"
+    return 0
+  fi
+  owned="$(tartci_pool_receipt_services "$receipt")"
+  if [ -z "$owned" ]; then
+    owned="$(printf '%s\n' "$all" \
+      | grep '^com[.]danielraffel[.]tartci[.]tart-runner-macos-fleet[.]' || true)"
+  fi
+  [ -n "$owned" ] || return 0
+  # Intersect with what is actually installed: a receipt may name a service
+  # whose plist has since been removed, and a transition only acts on services
+  # this host still carries.
+  printf '%s\n' "$all" | grep -Fx -f <(printf '%s\n' "$owned") || true
+}
+
+# The runner agents present on this host that a pool transition does NOT own —
+# the inverse of tartci_pool_owned_runner_agents over the same enumeration.
+# `pool off` reports these by name instead of stopping them, so the capacity it
+# deliberately leaves alone is never silent.
+tartci_pool_unowned_runner_agents() {
+  local dir="${1:-$HOME/Library/LaunchAgents}"
+  local receipt="${2:-$TARTCI_POOL_FLEET_RECEIPT}"
+  local all owned
+  all="$(tartci_pool_runner_agents "$dir")"
+  [ -n "$all" ] || return 0
+  owned="$(tartci_pool_owned_runner_agents "$dir" "$receipt")"
+  if [ -z "$owned" ]; then
+    printf '%s\n' "$all"
+    return 0
+  fi
+  printf '%s\n' "$all" | grep -Fxv -f <(printf '%s\n' "$owned") || true
+}
+
+# Exact-line membership in a newline-separated set, without a pipe.
+# `printf '%s\n' "$set" | grep -Fxq "$label"` looks equivalent and is not: grep
+# exits on the first match, printf takes SIGPIPE, and under `set -o pipefail`
+# the pipeline then reports failure for a MATCH. It is size-dependent, so it
+# reads as correct until the set outgrows the pipe buffer.
+tartci_pool_label_in_set() {
+  local label="$1" haystack="$2" nl=$'\n'
+  case "${nl}${haystack}${nl}" in
+    *"${nl}${label}${nl}"*) return 0 ;;
+  esac
+  return 1
+}
+
+# Name, on stdout, every runner agent a transition deliberately did not touch.
+# Both outages this scoping prevents were invisible precisely because nothing
+# said this: the plist stayed on disk, so every file-existence check passed
+# while the lane was gone. Reporting the untouched set by name is what keeps
+# the ownership boundary an explicit decision rather than a silent one.
+tartci_pool_report_unowned() {
+  local action="$1" dir="${2:-$HOME/Library/LaunchAgents}" unowned label state
+  unowned="$(tartci_pool_unowned_runner_agents "$dir")"
+  [ -n "$unowned" ] || return 0
+  echo "not touched by pool $action (outside this host's pool receipt, so \`pool on\`"
+  echo "cannot restore them; stop them with their own install authority if needed):"
+  while IFS= read -r label; do
+    [ -n "$label" ] || continue
+    state=stopped
+    tartci_pool_agent_loaded "$label" && state="still running"
+    printf '  %-56s %s\n' "$label" "$state"
+  done <<EOF
+$unowned
+EOF
+}
+
 tartci_pool_launchd_target() {
   printf 'gui/%s/%s\n' "${TARTCI_POOL_UID:-$(id -u)}" "$1"
+}
+
+# Wait until launchd no longer holds TARGET (gui/<uid>/<label>).
+#
+# `launchctl bootout` returns as soon as launchd has SENT the stop: measured
+# on a throwaway job whose TERM handler takes 6 s, bootout exited 0 in 0.04 s
+# and `launchctl print` kept finding the service for 6 more seconds. A lane
+# supervisor's TERM handler runs its whole cleanup (release the lease, retire
+# the runner, tear down a VM), bounded only by the plist's ExitTimeOut (30 s).
+# So a caller that acts on "pool off returned" while a slow lane is still
+# exiting sees it loaded: every host's first self-update install was refused
+# on exactly that ("refusing fleet install while target LaunchAgent is loaded:
+# ...forge-gate" on m5 and m1, "...vellum-gate" on m3) and only the retry,
+# seconds later, applied. Returns 0 once the service is absent, 1 if it is
+# still held after TARTCI_POOL_UNLOAD_WAIT_SECS (default 40: ExitTimeOut plus
+# launchd's own reap margin).
+tartci_pool_wait_unloaded() {
+  local target="$1" output deadline
+  deadline=$(( $(date +%s) + ${TARTCI_POOL_UNLOAD_WAIT_SECS:-40} ))
+  while :; do
+    if ! output="$(launchctl print "$target" 2>&1)"; then
+      case "$output" in
+        *"Could not find service"*|*"service not found"*) return 0 ;;
+      esac
+    fi
+    [ "$(date +%s)" -lt "$deadline" ] || return 1
+    sleep "${TARTCI_POOL_UNLOAD_POLL_SECS:-0.25}"
+  done
 }
 
 tartci_pool_agent_loaded() {
@@ -160,7 +359,7 @@ tartci_pool_lock_release() {
 
 tartci_pool_lock_identity() {
   local lock="${1:-$TARTCI_POOL_TRANSITION_LOCK}"
-  python3 - "$lock" <<'PY'
+  "$(tartci_pool_python)" - "$lock" <<'PY'
 import os, stat, sys
 try:
  s=os.lstat(sys.argv[1])
@@ -210,7 +409,7 @@ EOF
 }
 
 tartci_pool_lock_health_json() {
-  tartci_pool_lock_health "${1:-$TARTCI_POOL_TRANSITION_LOCK}" | python3 -c '
+  tartci_pool_lock_health "${1:-$TARTCI_POOL_TRANSITION_LOCK}" | "$(tartci_pool_python)" -c '
 import json, sys
 fields = {}
 for raw in sys.stdin:
@@ -309,7 +508,7 @@ tartci_pool_zero_running_vms() {
     printf '%s\n' "$qemu_processes" | grep -Eq '(^|[[:space:]/])qemu-system-' && return 1
     return 0
   fi
-  python3 - "$tart" <<'PY'
+  "$(tartci_pool_python)" - "$tart" <<'PY'
 import json, subprocess, sys
 try:
  result=subprocess.run([sys.argv[1], "list", "--format", "json"], check=True,
@@ -346,6 +545,28 @@ tartci_pool_lock_handoff_to_listener() {
   tartci_pool_lock_release
 }
 
+# Which runner agents this host's pool owns are mid-job right now. Prints one
+# `label<TAB>state<TAB>detail` row per owned agent (state busy|idle|absent|
+# unknown) and returns 0 when none is busy or unknown, 1 when one is busy, 2
+# when any answer is unknown (including a probe that could not run at all).
+# Read-only: `launchctl print` plus one process-table read.
+tartci_pool_mid_job() {
+  local dir="${1:-$HOME/Library/LaunchAgents}" labels label rc=0
+  local -a argv=()
+  labels="$(tartci_pool_owned_runner_agents "$dir")"
+  while IFS= read -r label; do
+    [ -n "$label" ] && argv+=("$label")
+  done <<EOF
+$labels
+EOF
+  [ "${#argv[@]}" -gt 0 ] || return 0
+  "$(tartci_pool_python)" "$TARTCI_POOL_LANE_BUSY" --agents-dir "$dir" ${argv[@]+"${argv[@]}"} || rc=$?
+  case "$rc" in
+    0|1|2) return "$rc" ;;
+    *) printf 'lane busy probe failed (exit %s)\n' "$rc"; return 2 ;;
+  esac
+}
+
 # Return success when PARENT owns a Runner.Worker descendant. Inspection errors
 # fail closed as busy; a drain must never stop a job because process evidence
 # was unavailable.
@@ -371,9 +592,14 @@ tartci_pool_pid_tree_has_worker() {
 # idle. The supported CLI does not currently ship that producer; never invent
 # the receipt locally. Only then may tartci perform the provider-side bootout.
 # No second scheduler lives here.
+#
+# Scoped to receipt-owned agents for the same reason `off` is: this watcher
+# bootouts a persistent listener, and `pool on` restores only what the receipt
+# names. A persistent runner belonging to another repository's install authority
+# is not this drain's to stop.
 tartci_pool_quiesce_persistent_agents_unlocked() {
   local dir="${1:-$HOME/Library/LaunchAgents}" label pid pending=0 target persistent=""
-  persistent="$(tartci_pool_runner_agents "$dir" | grep '^actions[.]runner[.]' || true)"
+  persistent="$(tartci_pool_owned_runner_agents "$dir" | grep '^actions[.]runner[.]' || true)"
   [ -n "$persistent" ] || return 0
   tartci_pool_persistent_hold_ready || return 1
   while IFS= read -r label; do

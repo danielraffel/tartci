@@ -70,7 +70,11 @@ class GhCliKnobBehavior(unittest.TestCase):
             _write_exec(tmp / "myghapp",
                         "#!/usr/bin/env bash\n"
                         f'echo "$@" >> "{marker}"\n'
-                        'printf \'{"workflow_runs": []}\'\n')
+                        'case "$*" in\n'
+                        '  *rate_limit*) printf \'{"resources":{"core":'
+                        '{"limit":15000,"remaining":14999}}}\' ;;\n'
+                        '  *) printf \'{"workflow_runs": []}\' ;;\n'
+                        'esac\n')
             r = self._run_print_queue(tmp, {"TARTCI_GH_CLI": "myghapp"})
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), "0", r.stdout + r.stderr)

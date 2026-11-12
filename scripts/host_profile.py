@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
+import plistlib
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -218,6 +220,9 @@ def resolve_role(
     env_role = os.environ.get("TARTCI_ROLE")
     if env_role:
         return normalize_role(env_role), "environment"
+    governor_role = governor_settings().values.get("role")
+    if isinstance(governor_role, str) and governor_role.strip():
+        return normalize_role(governor_role), f"file:{governor_file_path()}"
     path = role_file_path(role_file)
     try:
         text = path.read_text(encoding="utf-8").strip()
@@ -233,8 +238,642 @@ def resolve_role(
     return "dev-overflow", "default"
 
 
+# --- governor: one per-host config surface --------------------------------
+#
+# Every tuning knob of the build governor lives in ONE host-local file,
+# ~/.config/tartci/governor.toml, flat [governor] table. tartci governor
+# show|set|explain reads and edits it; tartci host-profile derives every
+# exported number from it. Precedence per key: CLI flag > TARTCI_GOV_<KEY>
+# environment > governor.toml > legacy source (role file; fleet profile
+# `[host] agent_floor_cores`) > role default. The TARTCI_GOV_ prefix keeps the
+# overrides apart from host-profile's own exported names, so a shell that
+# evaluated tartci host-profile cannot feed its outputs back in as inputs.
+#
+# A malformed value is ignored (with a note in `problems`), never raised: this
+# runs on every lease admission, and a typo in an optional knob must never
+# deny a lease.
+GOVERNOR_ENV = "TARTCI_GOVERNOR_FILE"
+GOVERNOR_ENV_PREFIX = "TARTCI_GOV_"
+AUTO = "auto"
+BUILD_CLASSES = ("interactive", "background")
+
+# key -> kind. "cores" accepts a non-negative int or "auto"; "int" is a plain
+# non-negative int; "bool" true/false; "role" one of VALID_ROLES.
+GOVERNOR_KEYS: dict[str, str] = {
+    "role": "role",
+    "human_reserved_cores": "int",
+    "gate_guarantee_cores": "cores",
+    "gate_prompt_reserve_cores": "cores",
+    "interactive_share_cores": "cores",
+    "background_share_cores": "cores",
+    "interactive_min_cores": "int",
+    "interactive_wait_secs": "int",
+    "agent_floor_cores": "int",
+    "agent_floor_pool_cores": "int",
+    "dynamic_lending": "bool",
+    "fleet_hosts": "str",
+}
+
+GOVERNOR_HELP: dict[str, str] = {
+    "role": "dedicated-builder | dev-overflow | light; picks the defaults below",
+    "human_reserved_cores": "cores never leased: left for the person at the keyboard",
+    "gate_guarantee_cores": "static cores a gate lease is always guaranteed (today's reserve)",
+    "gate_prompt_reserve_cores": "cores kept free for the NEXT gate job while lending (auto: one gate VM)",
+    "interactive_share_cores": "cap on all interactive build leases together (auto: lease capacity)",
+    "background_share_cores": "cap on all background build leases together",
+    "interactive_min_cores": "smallest partial lease an interactive build accepts",
+    "interactive_wait_secs": "how long an interactive build waits for that before going leaseless",
+    "agent_floor_cores": "background-QoS floor lease for a denied background build (0 = off)",
+    "agent_floor_pool_cores": "host-wide cap on concurrent floor-lease cores",
+    "dynamic_lending": "lend idle gate-reserved cores to interactive builds (preemptible)",
+    "fleet_hosts": "comma-separated SSH aliases tartci governor fleet reads",
+}
+
+
+def governor_file_path(path: str | None = None) -> Path:
+    if path:
+        return Path(path).expanduser()
+    return Path(
+        os.environ.get(
+            GOVERNOR_ENV,
+            str(Path.home() / ".config" / "tartci" / "governor.toml"),
+        )
+    ).expanduser()
+
+
+def parse_governor_value(key: str, raw: Any) -> Any:
+    """Validate one governor value. Raises ValueError with a reason."""
+    kind = GOVERNOR_KEYS.get(key)
+    if kind is None:
+        raise ValueError(f"unknown governor key {key!r}; known: {', '.join(GOVERNOR_KEYS)}")
+    text = raw.strip() if isinstance(raw, str) else raw
+    if kind == "role":
+        return normalize_role(str(text))
+    if kind == "str":
+        return str(text)
+    if kind == "bool":
+        if isinstance(text, bool):
+            return text
+        lowered = str(text).lower()
+        if lowered in ("true", "1", "on", "yes"):
+            return True
+        if lowered in ("false", "0", "off", "no"):
+            return False
+        raise ValueError(f"{key} must be true or false, got {raw!r}")
+    if kind == "cores" and isinstance(text, str) and text.lower() == AUTO:
+        return AUTO
+    if isinstance(text, bool):
+        raise ValueError(f"{key} must be a non-negative integer, got {raw!r}")
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        allowed = "a non-negative integer or \"auto\"" if kind == "cores" else "a non-negative integer"
+        raise ValueError(f"{key} must be {allowed}, got {raw!r}") from None
+    if value < 0:
+        raise ValueError(f"{key} must be non-negative, got {raw!r}")
+    return value
+
+
+def _parse_governor_table(text: str) -> dict[str, Any]:
+    """Raw [governor] table. tomllib when present; a flat scan on 3.9."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("governor") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {"__invalid__": True}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[governor]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] == '"':
+                values[key.strip()] = value[1:-1]
+            elif value in ("true", "false"):
+                values[key.strip()] = value == "true"
+            else:
+                values[key.strip()] = value
+    return values
+
+
+class GovernorSettings:
+    """Resolved governor.toml + TARTCI_GOV_* values, with their sources."""
+
+    def __init__(self, values: dict[str, Any], sources: dict[str, str],
+                 problems: list[str], path: Path) -> None:
+        self.values = values
+        self.sources = sources
+        self.problems = problems
+        self.path = path
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self.values.get(key, default)
+
+
+def governor_settings(path: str | None = None) -> GovernorSettings:
+    file_path = governor_file_path(path)
+    values: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    problems: list[str] = []
+    try:
+        table = _parse_governor_table(file_path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if table.pop("__invalid__", False):
+        problems.append(f"governor_file_unparseable:{file_path}")
+    for key, raw in table.items():
+        try:
+            values[key] = parse_governor_value(key, raw)
+            sources[key] = f"file:{file_path}"
+        except ValueError as exc:
+            problems.append(f"governor_value_ignored:{exc}")
+    for key in GOVERNOR_KEYS:
+        raw_env = os.environ.get(GOVERNOR_ENV_PREFIX + key.upper())
+        if raw_env is None or not raw_env.strip():
+            continue
+        try:
+            values[key] = parse_governor_value(key, raw_env)
+            sources[key] = "environment"
+        except ValueError as exc:
+            problems.append(f"governor_env_ignored:{exc}")
+    return GovernorSettings(values, sources, problems, file_path)
+
+
+def fleet_profile_serves_gate(fleet_profile: str | None = None) -> bool:
+    """True when the installed fleet profile declares a gate-priority lane.
+
+    Read from the profile text, not from live state: a host whose gate lanes
+    are momentarily idle still serves the gate and must keep a prompt reserve.
+    """
+    import re
+
+    try:
+        text = fleet_profile_path(fleet_profile).read_text(encoding="utf-8")
+    except OSError:
+        return False
+    in_lane = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_lane = line == "[[lane]]"
+            continue
+        if not in_lane:
+            continue
+        if re.match(r'^priority\s*=\s*"gate"', line):
+            return True
+        if re.match(r'^id\s*=\s*"[^"]*-gate"', line):
+            return True
+    return False
+
+
+# --- agent core floor --------------------------------------------------------
+#
+# When the non-gate core budget is exhausted, a build lease is denied and the
+# caller (Pulp's governed-build.sh) falls back to a leaseless -j2. On m3 on
+# 2026-09-24 a single 12-core governed build held the whole non-gate budget
+# while the 14-core gate reserve sat idle, so every other agent build on the
+# host ran at -j2. The floor is an OPT-IN, per-host knob that lets such a build
+# instead take a small "floor" lease that runs at background QoS and is NOT
+# charged against any other lease's admission: gate and VM leases admit
+# exactly as if it did not exist. CPU is the only oversubscribed axis, which is
+# what background QoS arbitrates. Memory cannot be arbitrated by QoS, so the
+# pool is clamped to the host's unleased memory headroom (OS headroom + the flat
+# link/LTO reserve) and each floor lease is still checked against the non-gate
+# memory limit. 0 (the default) keeps today's behaviour.
+FLEET_PROFILE_ENV = "TARTCI_FLEET_PROFILE"
+AGENT_FLOOR_KEYS = ("agent_floor_cores", "agent_floor_pool_cores")
+# QoS a floor lease runs at. "background" also throttles disk I/O and biases the
+# work to the lowest core tier, which made floor builds on m5studio (2026-09-30)
+# take minutes per file; "utility" still yields to CI at default QoS without the
+# I/O throttle. Anything else falls back to the default.
+AGENT_FLOOR_QOS_VALUES = ("utility", "background")
+AGENT_FLOOR_QOS_DEFAULT = "background"
+
+
+def fleet_profile_path(path: str | None = None) -> Path:
+    if path:
+        return Path(path).expanduser()
+    return Path(
+        os.environ.get(
+            FLEET_PROFILE_ENV,
+            str(Path.home() / ".config" / "tartci" / "macos-fleet-profile.toml"),
+        )
+    ).expanduser()
+
+
+def _parse_host_ints(text: str, keys: tuple[str, ...]) -> dict[str, int]:
+    """Read integer keys from the [host] table.
+
+    tomllib is used when present; the lease store is also launched by a stock
+    python3 (3.9 on these hosts), where a two-key scan of the [host] table is
+    enough. A malformed value is ignored rather than raised: this runs on every
+    lease admission, and a typo in an optional knob must never deny a lease.
+    """
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    values: dict[str, Any] = {}
+    if tomllib is not None:
+        try:
+            values = dict((tomllib.loads(text).get("host") or {}))
+        except (tomllib.TOMLDecodeError, AttributeError):
+            values = {}
+    else:
+        in_host = False
+        for raw in text.splitlines():
+            line = raw.split("#", 1)[0].strip()
+            if line.startswith("["):
+                in_host = line == "[host]"
+                continue
+            if in_host and "=" in line:
+                key, _, value = line.partition("=")
+                if key.strip() in keys and value.strip().isdigit():
+                    values[key.strip()] = int(value.strip())
+    return {
+        key: values[key]
+        for key in keys
+        if type(values.get(key)) is int and values[key] >= 0
+    }
+
+
+def agent_floor_settings(fleet_profile: str | None = None) -> tuple[dict[str, int], str]:
+    """Return ({agent_floor_cores, agent_floor_pool_cores}, source).
+
+    Environment variables win over the installed fleet profile so an operator
+    can try the floor on one shell without reinstalling the fleet.
+    """
+    settings: dict[str, int] = {}
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        settings = _parse_host_ints(path.read_text(encoding="utf-8"), AGENT_FLOOR_KEYS)
+        if settings:
+            source = f"file:{path}"
+    except OSError:
+        settings = {}
+    # The governor file supersedes the fleet profile's legacy [host] keys.
+    governor = governor_settings()
+    for key in AGENT_FLOOR_KEYS:
+        if isinstance(governor.get(key), int):
+            settings[key] = governor.get(key)
+            source = governor.sources.get(key, source)
+    for key in AGENT_FLOOR_KEYS:
+        raw = os.environ.get(f"TARTCI_{key.upper()}")
+        if raw is not None and raw.strip().isdigit():
+            settings[key] = int(raw.strip())
+            source = "environment"
+    return settings, source
+
+
+def _parse_host_str(text: str, key: str) -> str | None:
+    """Read one string key from the [host] table (same contract as _parse_host_ints)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            value = (tomllib.loads(text).get("host") or {}).get(key)
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return None
+        return value if isinstance(value, str) else None
+    in_host = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_host = line == "[host]"
+            continue
+        if in_host and "=" in line:
+            name, _, value = line.partition("=")
+            value = value.strip()
+            if name.strip() == key and len(value) >= 2 and value[0] == value[-1] == '"':
+                return value[1:-1]
+    return None
+
+
+def agent_floor_qos_setting(fleet_profile: str | None = None) -> str:
+    """Return the floor-lease QoS: TARTCI_AGENT_FLOOR_QOS, then [host], then default.
+
+    An unknown value is ignored rather than raised, like the integer knobs: this
+    runs on every lease admission.
+    """
+    raw = os.environ.get("TARTCI_AGENT_FLOOR_QOS")
+    if raw is not None and raw.strip() in AGENT_FLOOR_QOS_VALUES:
+        return raw.strip()
+    try:
+        value = _parse_host_str(
+            fleet_profile_path(fleet_profile).read_text(encoding="utf-8"), "agent_floor_qos"
+        )
+    except OSError:
+        value = None
+    return value if value in AGENT_FLOOR_QOS_VALUES else AGENT_FLOOR_QOS_DEFAULT
+
+
+# --- VM lease waiter ranking ---------------------------------------------------
+#
+# Opt-in `[leases]` table of the fleet profile. With rank_vm_waiters on, a VM
+# lane that wants a lease registers as a waiter in the lease store, and a VM
+# acquisition is deferred while a strictly higher-priority waiter that fits now
+# would no longer fit after it (scripts/leases.py). Off (the default) the store
+# neither reads nor writes waiters. waiter_fresh_secs bounds how long a waiter
+# counts without being refreshed. TARTCI_RANK_VM_WAITERS (0/1) and
+# TARTCI_VM_WAITER_FRESH_SECS override the file for one shell.
+#
+# vm_slot_lending (default off): the non-gate macOS VM lease that takes the
+# host's LAST guest slot is admitted against the host totals instead of the
+# non-gate budget. All or nothing: while any slot is free for a gate guest,
+# every non-gate lease keeps the static budget (see leases.py, "VM slot
+# lending"). Agent builds always stay within the static budget.
+# TARTCI_VM_SLOT_LENDING (0/1) overrides the file for one shell.
+LEASE_POLICY_DEFAULT_FRESH_SECS = 90
+# `slot_priority` ranks the lanes that want the next free macOS VM slot
+# (scripts/slot_priority.py): "off" (default), "shadow" (log only) or "on".
+# TARTCI_SLOT_PRIORITY overrides the file for one shell.
+SLOT_PRIORITY_MODES = ("off", "shadow", "on")
+SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS = 2700
+# `slot_priority_release_first` (default false): with slot priority on, a lane
+# about to serve a tagged-release class ranks ahead of merge-group.
+# TARTCI_SLOT_PRIORITY_RELEASE_FIRST (0/1) overrides the file for one shell.
+# `fair_share_after_secs` (scripts/fair_share.py): a VM lane that has had work
+# it could not place for this long is ranked ahead of other repositories on the
+# host. 0 (the default) is off. TARTCI_FAIR_SHARE_AFTER_SECS overrides the file.
+
+
+def _parse_leases_table(text: str) -> dict[str, Any]:
+    """Read the [leases] table. Malformed input yields {} (knob off), never a raise."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("leases") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[leases]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            value = value.strip()
+            if value in ("true", "false"):
+                values[key.strip()] = value == "true"
+            elif value.isdigit():
+                values[key.strip()] = int(value)
+            elif len(value) >= 2 and value[0] == value[-1] == '"' and '"' not in value[1:-1]:
+                values[key.strip()] = value[1:-1]
+    return values
+
+
+def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
+    """Return {rank_vm_waiters, vm_waiter_fresh_secs, vm_slot_lending, lease_policy_source}."""
+    enabled = False
+    fresh = LEASE_POLICY_DEFAULT_FRESH_SECS
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        table = _parse_leases_table(path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if type(table.get("rank_vm_waiters")) is bool:
+        enabled = table["rank_vm_waiters"]
+        source = f"file:{path}"
+    if type(table.get("waiter_fresh_secs")) is int and table["waiter_fresh_secs"] > 0:
+        fresh = table["waiter_fresh_secs"]
+    raw = os.environ.get("TARTCI_RANK_VM_WAITERS")
+    if raw is not None and raw.strip() in ("0", "1"):
+        enabled = raw.strip() == "1"
+        source = "environment"
+    raw = os.environ.get("TARTCI_VM_WAITER_FRESH_SECS")
+    if raw is not None and raw.strip().isdigit() and int(raw.strip()) > 0:
+        fresh = int(raw.strip())
+    slot_lending = type(table.get("vm_slot_lending")) is bool and table["vm_slot_lending"]
+    raw = os.environ.get("TARTCI_VM_SLOT_LENDING")
+    if raw is not None and raw.strip() in ("0", "1"):
+        slot_lending = raw.strip() == "1"
+    slot_priority = table.get("slot_priority")
+    if slot_priority not in SLOT_PRIORITY_MODES:
+        slot_priority = "off"
+    raw = os.environ.get("TARTCI_SLOT_PRIORITY")
+    if raw is not None and raw.strip() in SLOT_PRIORITY_MODES:
+        slot_priority = raw.strip()
+    promote = table.get("slot_priority_promote_after_secs")
+    if type(promote) is not int or promote < 0:
+        promote = SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS
+    release_first = type(table.get("slot_priority_release_first")) is bool \
+        and table["slot_priority_release_first"]
+    raw = os.environ.get("TARTCI_SLOT_PRIORITY_RELEASE_FIRST")
+    if raw is not None and raw.strip() in ("0", "1"):
+        release_first = raw.strip() == "1"
+    fair = table.get("fair_share_after_secs")
+    if type(fair) is not int or fair < 0:
+        fair = 0
+    raw = os.environ.get("TARTCI_FAIR_SHARE_AFTER_SECS")
+    if raw is not None and raw.strip().isdigit():
+        fair = int(raw.strip())
+    return {
+        "rank_vm_waiters": enabled,
+        "vm_waiter_fresh_secs": fresh,
+        "vm_slot_lending": slot_lending,
+        "lease_policy_source": source,
+        "slot_priority": slot_priority,
+        "slot_priority_promote_after_secs": promote,
+        "slot_priority_release_first": release_first,
+        "fair_share_after_secs": fair,
+    }
+
+
+# --- guest DNS resolvers --------------------------------------------------------
+#
+# Opt-in `[guest_network]` table of the fleet profile. A Tart guest takes its
+# resolver from the host's vmnet DHCP (192.168.64.1), which the host answers by
+# forwarding to its own resolver. On a host whose resolver is Tailscale MagicDNS
+# that is the tailnet's global nameserver, one remote AdGuard node: on
+# 2026-09-28 03:48-03:51Z it stopped answering and every host's Tailscale
+# forwarder logged "context deadline exceeded" against it at the same minute,
+# failing npm/cargo/curl lookups in gate VMs on four hosts at once. Setting
+# `dns_servers` makes the runner configure those resolvers inside each guest
+# before it registers, so a guest no longer shares the host's single upstream.
+# Absent (the default) the guest keeps the DHCP resolver. A malformed value
+# reads as absent here (never a raise on a lease path); the fleet validator
+# rejects it at install time. TARTCI_GUEST_DNS_SERVERS overrides the file for
+# one shell ("off" or empty turns it off).
+GUEST_DNS_MAX_SERVERS = 4
+
+
+def normalize_guest_dns_servers(values: Any) -> list[str] | None:
+    """Return the validated resolver list, or None when `values` is unusable."""
+    import ipaddress
+
+    if not isinstance(values, list) or not 1 <= len(values) <= GUEST_DNS_MAX_SERVERS:
+        return None
+    servers: list[str] = []
+    for value in values:
+        if not isinstance(value, str):
+            return None
+        try:
+            address = ipaddress.ip_address(value.strip())
+        except ValueError:
+            return None
+        if address.is_loopback or address.is_unspecified or address.is_multicast \
+                or address.is_link_local:
+            return None
+        text = str(address)
+        if text in servers:
+            return None
+        servers.append(text)
+    return servers
+
+
+def _parse_guest_network_table(text: str) -> dict[str, Any]:
+    """Read the [guest_network] table. Malformed input yields {} (knob off)."""
+    try:
+        import tomllib  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover - exercised on 3.9 hosts
+        tomllib = None  # type: ignore[assignment]
+    if tomllib is not None:
+        try:
+            table = tomllib.loads(text).get("guest_network") or {}
+        except (tomllib.TOMLDecodeError, AttributeError):
+            return {}
+        return dict(table) if isinstance(table, dict) else {}
+    values: dict[str, Any] = {}
+    in_table = False
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if line.startswith("["):
+            in_table = line == "[guest_network]"
+            continue
+        if in_table and "=" in line:
+            key, _, value = line.partition("=")
+            try:
+                values[key.strip()] = json.loads(value.strip())
+            except ValueError:
+                continue
+    return values
+
+
+def guest_network_settings(fleet_profile: str | None = None) -> dict[str, Any]:
+    """Return {guest_dns_servers (space-separated, "" = off), guest_dns_source}."""
+    servers: list[str] = []
+    source = "default"
+    path = fleet_profile_path(fleet_profile)
+    try:
+        table = _parse_guest_network_table(path.read_text(encoding="utf-8"))
+    except OSError:
+        table = {}
+    if "dns_servers" in table:
+        parsed = normalize_guest_dns_servers(table["dns_servers"])
+        if parsed is not None:
+            servers = parsed
+            source = f"file:{path}"
+        else:
+            source = f"invalid:{path}"
+    raw = os.environ.get("TARTCI_GUEST_DNS_SERVERS")
+    if raw is not None:
+        words = [w for w in raw.replace(",", " ").split() if w]
+        if not words or words == ["off"]:
+            servers, source = [], "environment"
+        else:
+            parsed = normalize_guest_dns_servers(words)
+            if parsed is not None:
+                servers, source = parsed, "environment"
+    return {"guest_dns_servers": " ".join(servers), "guest_dns_source": source}
+
+
 def _clamp_at_least(value: int, minimum: int, maximum: int) -> int:
     return min(max(value, minimum), max(minimum, maximum))
+
+
+# Background-class share per role, as a function of the guaranteed non-gate
+# budget N. A laptop keeps opportunistic validations small so the person's own
+# builds find cores; a dedicated builder gives them half.
+def _default_background_share(role: str, non_gate_capacity: int) -> int:
+    if role == "dedicated-builder":
+        return max(1, non_gate_capacity // 2)
+    if role == "dev-overflow":
+        return max(1, min(4, non_gate_capacity))
+    return max(1, min(2, non_gate_capacity))
+
+
+INTERACTIVE_MIN_CORES_DEFAULT = 2
+INTERACTIVE_WAIT_SECS_DEFAULT = 90
+
+
+def build_class_settings(
+    governor: GovernorSettings,
+    *,
+    role: str,
+    lease_capacity: int,
+    reserved_gate: int,
+    non_gate_capacity: int,
+    vm_pool: int,
+    fleet_profile: str | None = None,
+) -> dict[str, Any]:
+    """Derive the build-class and lending numbers (see leases.py admission).
+
+    * interactive: a person or agent is waiting. Normal QoS, may accept a
+      partial lease, and with dynamic_lending may borrow idle gate-reserved
+      cores (that excess is "lent" and preemptible by a gate lease).
+    * background: Shipyard-local validations and other opportunistic work.
+      Capped at background_share_cores, never borrows, keeps the role QoS.
+    """
+    serves_gate = fleet_profile_serves_gate(fleet_profile)
+    lending = governor.get("dynamic_lending")
+    lending = bool(lending) if isinstance(lending, bool) else False
+
+    prompt = governor.get("gate_prompt_reserve_cores", AUTO)
+    prompt_auto = prompt == AUTO
+    if prompt_auto:
+        # One gate VM while this host serves gate lanes; the lease store
+        # refines this with the size of the last gate lease it admitted.
+        prompt = min(vm_pool, reserved_gate) if serves_gate else 0
+    prompt = min(max(0, int(prompt)), reserved_gate)
+
+    interactive_share = governor.get("interactive_share_cores", AUTO)
+    if interactive_share == AUTO:
+        interactive_share = lease_capacity
+    interactive_share = _clamp_at_least(int(interactive_share), 1, lease_capacity)
+
+    background_share = governor.get("background_share_cores", AUTO)
+    if background_share == AUTO:
+        background_share = _default_background_share(role, non_gate_capacity)
+    background_share = _clamp_at_least(int(background_share), 1, non_gate_capacity)
+
+    min_cores = governor.get("interactive_min_cores")
+    min_cores = min_cores if isinstance(min_cores, int) and min_cores > 0 else INTERACTIVE_MIN_CORES_DEFAULT
+    min_cores = min(min_cores, interactive_share)
+    wait_secs = governor.get("interactive_wait_secs")
+    wait_secs = wait_secs if isinstance(wait_secs, int) else INTERACTIVE_WAIT_SECS_DEFAULT
+
+    return {
+        "governor_schema": 1,
+        "serves_gate": serves_gate,
+        "dynamic_lending": lending,
+        "gate_prompt_reserve_cores": prompt,
+        "gate_prompt_reserve_auto": prompt_auto,
+        "interactive_share_cores": interactive_share,
+        "interactive_build_jobs": interactive_share,
+        "interactive_min_cores": min_cores,
+        "interactive_wait_secs": wait_secs,
+        "interactive_qos": "normal",
+        "background_share_cores": background_share,
+    }
 
 
 def build_profile(
@@ -244,6 +883,7 @@ def build_profile(
     model: str | None = None,
     role_file: str | None = None,
     memory_mb: int | None = None,
+    fleet_profile: str | None = None,
 ) -> dict[str, Any]:
     host_cores = cores if cores is not None else detect_cores()
     if host_cores <= 0:
@@ -259,14 +899,34 @@ def build_profile(
         model=host_model,
     )
     defaults = ROLE_DEFAULTS[resolved_role]
+    governor = governor_settings()
 
-    headroom = _clamp_at_least(defaults.headroom_cores, 1, max(1, host_cores - 1))
+    human_reserved = governor.get("human_reserved_cores")
+    headroom = _clamp_at_least(
+        human_reserved if isinstance(human_reserved, int) else defaults.headroom_cores,
+        1,
+        max(1, host_cores - 1),
+    )
     lease_capacity = max(1, host_cores - headroom)
     agent_cap = _clamp_at_least(defaults.agent_build_cap_cores, 1, lease_capacity)
     vm_pool = _clamp_at_least(defaults.vm_pool_cores, 1, lease_capacity)
     reserved_gate = max(0, lease_capacity - agent_cap)
+    guarantee = governor.get("gate_guarantee_cores")
+    if isinstance(guarantee, int):
+        # An explicit static gate guarantee; non-gate keeps at least one core.
+        reserved_gate = min(guarantee, max(0, lease_capacity - 1))
+        agent_cap = min(agent_cap, max(1, lease_capacity - reserved_gate))
     non_gate_capacity = max(1, lease_capacity - reserved_gate)
     runner_job_cores = agent_cap
+    classes = build_class_settings(
+        governor,
+        role=resolved_role,
+        lease_capacity=lease_capacity,
+        reserved_gate=reserved_gate,
+        non_gate_capacity=non_gate_capacity,
+        vm_pool=vm_pool,
+        fleet_profile=fleet_profile,
+    )
 
     # Memory axis. lease_capacity_mem = physical - headroom - flat link/LTO
     # reserve. 0 when RAM can't be read → the axis stays off and admission is
@@ -282,6 +942,36 @@ def build_profile(
     else:
         lease_capacity_mem_mb = 0
     pulp_build_mem_budget_mb = lease_capacity_mem_mb
+
+    # Memory mirror of reserved_gate_cores: the slice of the memory budget a
+    # non-gate lease may not consume. Held proportional to the core reserve —
+    # the gate's reserved share of the host is the same share on both axes.
+    # Without it the memory axis carries no priority term at all, so a non-gate
+    # build can fill the budget a gate VM needs and darken a required-gate slot
+    # while the gate's reserved CORES sit idle. Clamped so non-gate work always
+    # keeps at least one compile job's worth, mirroring the core reserve's own
+    # "non-gate never drops below 1" clamp.
+    if lease_capacity_mem_mb > PER_COMPILE_JOB_MEM_MB and reserved_gate > 0:
+        reserved_gate_mem_mb = min(
+            lease_capacity_mem_mb * reserved_gate // lease_capacity,
+            lease_capacity_mem_mb - PER_COMPILE_JOB_MEM_MB,
+        )
+    else:
+        reserved_gate_mem_mb = 0
+    non_gate_capacity_mem_mb = max(0, lease_capacity_mem_mb - reserved_gate_mem_mb)
+
+    floor_settings, floor_source = agent_floor_settings(fleet_profile)
+    agent_floor = min(max(0, floor_settings.get("agent_floor_cores", 0)), lease_capacity)
+    agent_floor_pool = floor_settings.get("agent_floor_pool_cores", agent_floor)
+    agent_floor_pool = min(max(agent_floor, agent_floor_pool), lease_capacity)
+    if agent_floor and host_mem_mb > 0:
+        # Floor leases are invisible to other leases' admission, so their memory
+        # can only come out of what no lease is ever granted.
+        unleased_mem_mb = min(host_mem_mb, headroom_mem_mb + link_lto_reserve_mem_mb)
+        agent_floor_pool = min(agent_floor_pool, unleased_mem_mb // PER_COMPILE_JOB_MEM_MB)
+        agent_floor = min(agent_floor, agent_floor_pool)
+    if agent_floor <= 0:
+        agent_floor = agent_floor_pool = 0
 
     return {
         "schema": 2,
@@ -304,9 +994,20 @@ def build_profile(
         "headroom_mem_mb": headroom_mem_mb,
         "link_lto_reserve_mem_mb": link_lto_reserve_mem_mb,
         "lease_capacity_mem_mb": lease_capacity_mem_mb,
+        "reserved_gate_mem_mb": reserved_gate_mem_mb,
+        "non_gate_capacity_mem_mb": non_gate_capacity_mem_mb,
         "per_compile_job_mem_mb": PER_COMPILE_JOB_MEM_MB,
         "pulp_build_mem_budget_mb": pulp_build_mem_budget_mb,
         "qos": defaults.qos,
+        "agent_floor_cores": agent_floor,
+        "agent_floor_pool_cores": agent_floor_pool,
+        "agent_floor_qos": agent_floor_qos_setting(fleet_profile),
+        "agent_floor_source": floor_source,
+        **lease_policy_settings(fleet_profile),
+        **guest_network_settings(fleet_profile),
+        **classes,
+        "governor_file": str(governor.path),
+        "governor_problems": list(governor.problems),
         "watch_lock_limit": defaults.watch_lock_limit,
         "macos_vm_cap": defaults.macos_vm_cap,
         "notes": [
@@ -331,13 +1032,298 @@ def shell_exports(profile: dict[str, Any]) -> str:
         "TARTCI_MACOS_VM_CAP": profile["macos_vm_cap"],
         "TARTCI_AGENT_QOS": profile["qos"],
         "PULP_BUILD_JOBS": profile["pulp_build_jobs"],
+        "TARTCI_AGENT_FLOOR_CORES": profile["agent_floor_cores"],
+        "TARTCI_AGENT_FLOOR_POOL_CORES": profile["agent_floor_pool_cores"],
+        "TARTCI_AGENT_FLOOR_QOS": profile["agent_floor_qos"],
         "TARTCI_HOST_MEM_MB": profile["mem_mb"],
         "TARTCI_LEASE_CAPACITY_MEM_MB": profile["lease_capacity_mem_mb"],
+        "TARTCI_GATE_RESERVED_MEM_MB": profile["reserved_gate_mem_mb"],
+        "TARTCI_NON_GATE_CAPACITY_MEM_MB": profile["non_gate_capacity_mem_mb"],
         "TARTCI_LINK_LTO_RESERVE_MEM_MB": profile["link_lto_reserve_mem_mb"],
         "TARTCI_PER_JOB_MEM_MB": profile["per_compile_job_mem_mb"],
         "PULP_BUILD_MEM_BUDGET_MB": profile["pulp_build_mem_budget_mb"],
+        # Build classes + dynamic lending (tartci governor). A consumer that
+        # sees TARTCI_GOVERNOR_SCHEMA may pass `leases acquire --class`.
+        "TARTCI_GOVERNOR_SCHEMA": profile["governor_schema"],
+        "TARTCI_DYNAMIC_LENDING": int(bool(profile["dynamic_lending"])),
+        "TARTCI_SERVES_GATE": int(bool(profile["serves_gate"])),
+        "TARTCI_GATE_PROMPT_RESERVE_CORES": profile["gate_prompt_reserve_cores"],
+        "TARTCI_INTERACTIVE_SHARE_CORES": profile["interactive_share_cores"],
+        "TARTCI_INTERACTIVE_BUILD_JOBS": profile["interactive_build_jobs"],
+        "TARTCI_INTERACTIVE_MIN_CORES": profile["interactive_min_cores"],
+        "TARTCI_INTERACTIVE_WAIT_SECS": profile["interactive_wait_secs"],
+        "TARTCI_INTERACTIVE_QOS": profile["interactive_qos"],
+        "TARTCI_BACKGROUND_SHARE_CORES": profile["background_share_cores"],
+        "TARTCI_BACKGROUND_QOS": profile["qos"],
     }
     return "\n".join(f"{key}={value}" for key, value in values.items())
+
+
+# --- how code actually reaches this host ------------------------------------
+#
+# Two hosts can run the same lane from entirely different artifacts. A
+# generation host execs a staged, write-stripped copy of the repo; a sealed
+# host execs a Developer ID bundle that carries its own copy of the repo
+# inside its signed seal. They are installed by different commands and they
+# go stale independently, and nothing on either host said which it was --
+# so "deploy to m3" was a reasonable conclusion to reach twice about a host
+# where `fleet-macos install --apply` writes a generation nothing ever execs.
+#
+# Everything below is derived from the live plist. A hostname is not evidence.
+
+FLEET_LABEL_PREFIX = "com.danielraffel.tartci.tart-runner-macos-fleet."
+GENERATIONS_SEGMENT = "/.local/share/tartci-generations/"
+LAUNCHER_SUFFIX = "/Contents/MacOS/tartci-launcher"
+GENERATION_MANIFEST = ".tartci-support-manifest.json"
+SEALED_BUNDLE_MARKER = "Contents/Resources/bundle.json"
+
+
+LAUNCHER_V2_POLICY = "Contents/Resources/policy.json"
+LAUNCH_SET_NAME = ".tartci-launch-set.json"
+
+
+def launcher_v2_identity(policy: dict) -> dict:
+    """A v2 lane runs the generation its pointer names; read the version there."""
+    pointer = _read_json(Path(str(policy.get("pointer", ""))))
+    generation = (pointer or {}).get("generation")
+    if not isinstance(generation, str) or not generation:
+        return {"source_commit": None, "layout": "v2",
+                "detail": f"no readable launcher pointer at {policy.get('pointer')}"}
+    root = Path(generation)
+    try:
+        manifest_bytes = (root / GENERATION_MANIFEST).read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, ValueError):
+        return {"source_commit": None, "layout": "v2", "generation": root.name,
+                "detail": f"unreadable generation manifest at {root / GENERATION_MANIFEST}"}
+    launch = _read_json(root / LAUNCH_SET_NAME) or {}
+    return {
+        "source_commit": manifest.get("source_commit") if isinstance(manifest, dict) else None,
+        "support_manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "layout": "v2",
+        "generation": root.name,
+        "launch_set_sequence": launch.get("sequence"),
+        "sealed_lane_ids": sorted((launch.get("lanes") or {}).keys()) or None,
+        "detail": None,
+    }
+
+
+def agents_dir() -> Path:
+    return Path(os.environ.get("TARTCI_AGENTS_DIR") or Path.home() / "Library/LaunchAgents")
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def classify_delivery(arguments: list[str]) -> dict:
+    """Name the delivery mechanism from a plist's ProgramArguments alone.
+
+    The two shapes are structurally distinct, so neither needs a hostname:
+    a sealed lane execs <bundle>.app/Contents/MacOS/tartci-launcher, a
+    generation lane execs <generations-root>/<GEN>/.tartci-launch.
+    """
+    for argument in arguments:
+        if argument.endswith(LAUNCHER_SUFFIX):
+            return {
+                "delivery": "sealed-bundle",
+                "root": argument[: -len(LAUNCHER_SUFFIX)],
+                "entrypoint": argument,
+            }
+    for argument in arguments:
+        if GENERATIONS_SEGMENT in argument and argument.endswith("/.tartci-launch"):
+            return {
+                "delivery": "generation",
+                "root": str(Path(argument).parent),
+                "entrypoint": argument,
+            }
+    return {"delivery": "unknown", "root": None, "entrypoint": None}
+
+
+def in_force_identity(classified: dict) -> dict:
+    """Read the version marker out of the artifact the plist actually execs."""
+    root = classified.get("root")
+    if root is None:
+        return {"source_commit": None, "detail": "no recognised launch entrypoint"}
+    root_path = Path(root)
+    if classified["delivery"] == "sealed-bundle":
+        policy = _read_json(root_path / LAUNCHER_V2_POLICY)
+        if policy is not None and policy.get("schema") == 2:
+            return launcher_v2_identity(policy)
+        bundle = _read_json(root_path / SEALED_BUNDLE_MARKER)
+        if bundle is None:
+            return {
+                "source_commit": None,
+                "detail": f"unreadable sealed marker at {root_path / SEALED_BUNDLE_MARKER}",
+            }
+        lanes = _read_json(root_path / "Contents/Resources/lanes.json") or {}
+        return {
+            "source_commit": bundle.get("source_commit"),
+            "support_manifest_sha256": bundle.get("support_manifest_sha256"),
+            "profile_policy_sha256": bundle.get("profile_policy_sha256"),
+            "sealed_lane_ids": sorted((lanes.get("lanes") or {}).keys()) or None,
+            "detail": None,
+        }
+    manifest = _read_json(root_path / GENERATION_MANIFEST)
+    if manifest is None:
+        return {
+            "source_commit": None,
+            "detail": f"unreadable generation manifest at {root_path / GENERATION_MANIFEST}",
+        }
+    return {
+        "source_commit": manifest.get("source_commit"),
+        "repository": manifest.get("repository"),
+        "generation": root_path.name,
+        "detail": None,
+    }
+
+
+def repo_head(repo_root: Path) -> str | None:
+    value = _run_text(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+    return value or None
+
+
+def staleness(in_force_commit: str | None, head: str | None, repo_root: Path) -> dict:
+    """Never guess. An unknown commit and an up-to-date one are not the same."""
+    if head is None:
+        return {"stale": None, "detail": "repo HEAD unavailable from this checkout"}
+    if in_force_commit is None:
+        return {"stale": None, "detail": "no commit recorded in the running artifact"}
+    if in_force_commit == head:
+        return {"stale": False, "detail": None, "repo_head": head}
+    behind = _run_text([
+        "git", "-C", str(repo_root), "rev-list", "--count",
+        f"{in_force_commit}..{head}",
+    ])
+    return {
+        "stale": True,
+        "repo_head": head,
+        "behind_by": int(behind) if behind.isdigit() else None,
+        "detail": (
+            None if behind.isdigit()
+            else "the running commit is not present in this checkout"
+        ),
+    }
+
+
+def build_delivery_report(
+    *, agents: Path | None = None, repo_root: Path | None = None
+) -> dict:
+    """Per-lane delivery mechanism, version in force, and staleness."""
+    agents = agents or agents_dir()
+    repo_root = repo_root or Path(__file__).resolve().parents[1]
+    head = repo_head(repo_root)
+    try:
+        all_plists = sorted(path for path in agents.glob("*.plist"))
+    except OSError:
+        all_plists = []
+    fleet_plists = [
+        path for path in all_plists if path.name.startswith(FLEET_LABEL_PREFIX)
+    ]
+    lanes = []
+    for path in fleet_plists:
+        label = path.name.removesuffix(".plist")
+        try:
+            plist = plistlib.loads(path.read_bytes())
+        except (OSError, ValueError) as exc:
+            lanes.append({
+                "label": label, "delivery": "unknown",
+                "detail": f"unreadable plist: {exc}",
+            })
+            continue
+        arguments = [str(item) for item in (plist.get("ProgramArguments") or [])]
+        classified = classify_delivery(arguments)
+        identity = in_force_identity(classified)
+        # A v2 lane is a stable app running the pointer's generation, which an
+        # install repoints, so it updates like a generation lane.
+        sealed = (classified["delivery"] == "sealed-bundle"
+                  and identity.get("layout") != "v2")
+        lanes.append({
+            "label": label,
+            "delivery": classified["delivery"],
+            "program_arguments": arguments,
+            "artifact_root": classified["root"],
+            "in_force": identity,
+            "staleness": staleness(identity.get("source_commit"), head, repo_root),
+            # The whole reason this report exists.
+            "accepts_generation_install": None if classified["delivery"] == "unknown" else not sealed,
+            "how_to_update": (
+                "rebuild and re-sign the launcher bundle "
+                "(scripts/build_macos_launcher.sh), then re-approve and reinstall; "
+                "tartci fleet-macos install --apply stages a generation this "
+                "lane never execs"
+                if sealed else
+                "tartci fleet-macos install --apply <profile> stages a new "
+                "generation and repoints this lane at it"
+                if classified["delivery"] == "generation" else
+                "tartci fleet-macos install --apply <profile> stages a new "
+                "generation and moves the launcher v2 pointer to its signed launch set"
+                if identity.get("layout") == "v2" else
+                "unrecognised launch entrypoint; inspect ProgramArguments"
+            ),
+        })
+    return {
+        "schema": 1,
+        "hostname": _run_text(["hostname", "-s"]) or None,
+        "agents_dir": str(agents),
+        "repo_root": str(repo_root),
+        "repo_head": head,
+        "lanes": lanes,
+        # The control for the zero case: no fleet lanes beside a nonzero plist
+        # count is a host with no lanes; beside a zero count it is a directory
+        # this process could not read. They must not render identically.
+        "plists_seen": len(all_plists),
+        "fleet_plists_seen": len(fleet_plists),
+    }
+
+
+def delivery_report_text(report: dict) -> str:
+    lines = [
+        f"host: {report['hostname'] or '?'}",
+        f"repo: {report['repo_root']} @ {(report['repo_head'] or 'unknown')[:12]}",
+        f"launch agents: {report['agents_dir']} "
+        f"({report['fleet_plists_seen']} fleet of {report['plists_seen']} plists)",
+    ]
+    if not report["lanes"]:
+        lines.append(
+            "  no fleet lanes on this host"
+            if report["plists_seen"]
+            else "  BLIND: no plists readable at all in that directory"
+        )
+    for lane in report["lanes"]:
+        identity = lane.get("in_force") or {}
+        stale = lane.get("staleness") or {}
+        commit = identity.get("source_commit")
+        if stale.get("stale") is None:
+            verdict = f"staleness unknown ({stale.get('detail')})"
+        elif stale["stale"]:
+            behind = stale.get("behind_by")
+            verdict = (
+                f"STALE, behind repo by {behind} commit(s)" if behind is not None
+                else f"STALE ({stale.get('detail')})"
+            )
+        else:
+            verdict = "current with repo HEAD"
+        lines.append("")
+        lines.append(f"lane {lane['label']}")
+        lines.append(f"  delivery: {lane['delivery']}")
+        lines.append(f"  artifact: {lane.get('artifact_root') or '-'}")
+        lines.append(f"  in force: {commit or 'unknown'} ({verdict})")
+        accepts = lane.get("accepts_generation_install")
+        lines.append(
+            "  fleet-macos install --apply: "
+            + ("updates this lane" if accepts
+               else "NO-OP for this lane" if accepts is False
+               else "unknown")
+        )
+        lines.append(f"  to update: {lane['how_to_update']}")
+        if identity.get("detail"):
+            lines.append(f"  note: {identity['detail']}")
+    return "\n".join(lines)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -347,11 +1333,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--role-file", help="role file path; defaults to ~/.config/tartci/role")
     parser.add_argument("--cores", type=int, help="override detected core count")
     parser.add_argument("--model", help="override detected host model")
+    parser.add_argument(
+        "--delivery", action="store_true",
+        help="report how code reaches each lane on this host, and whether it is stale",
+    )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    if args.delivery:
+        report = build_delivery_report()
+        print(
+            json.dumps(report, indent=2, sort_keys=True) if args.json
+            else delivery_report_text(report)
+        )
+        return 0
     profile = build_profile(
         role=args.role,
         cores=args.cores,

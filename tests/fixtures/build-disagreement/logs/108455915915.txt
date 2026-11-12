@@ -1,0 +1,4 @@
+2026-09-26T18:26:31.1543770Z /Users/admin/actions-runner/_work/pulp/pulp/test/test_agent_capability_compile.cpp:913:23: error: variable 'binding_207' with type 'volatile auto' has incompatible initializer of type '<overloaded function type>'
+2026-09-26T18:26:31.1551550Z /Users/admin/actions-runner/_work/pulp/pulp/core/timebase/include/pulp/timebase/groove_timing_reach.hpp:16:15: error: member reference base type 'const long long' is not a structure or union
+2026-09-26T18:26:31.1555670Z /Users/admin/actions-runner/_work/pulp/pulp/core/timebase/include/pulp/timebase/groove_timing_reach.hpp:20:33: error: member reference base type 'const long long' is not a structure or union
+2026-09-26T18:26:31.1557570Z /Users/admin/actions-runner/_work/pulp/pulp/core/timebase/include/pulp/timebase/groove_timing_reach.hpp:26:35: error: member reference base type 'const long long' is not a structure or union

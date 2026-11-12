@@ -98,14 +98,14 @@ rm -f "$boot_log"
 
 sshok=0
 for _ in $(seq 1 90); do
-  if ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
+  if ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$IP" true 2>/dev/null; then sshok=1; break; fi
   sleep 2
 done
 [ "$sshok" = 1 ] || die "ssh did not become ready for $VM at $IP"
 note "vm $VM up at $IP — running build ($BUILD_TYPE) + ctest in guest"
 
 set +e
-ssh "${SSH_OPTS[@]}" -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
+ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$IP" \
   "BUILD_TYPE='$BUILD_TYPE' BUILD_TARGET='$BUILD_TARGET' CMAKE_ARGS='$CMAKE_ARGS' CTEST_ARGS='$CTEST_ARGS' bash -s" <<'GUEST'
 set -euo pipefail
 eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -127,6 +127,9 @@ done
 }
 
 export CCACHE_DIR="$HOME/ccache"
+# The guest reads a local ccache config, never one planted in the shared cache.
+mkdir -p "$HOME/.config/ccache" && touch "$HOME/.config/ccache/tartci.conf"
+export CCACHE_CONFIGPATH="$HOME/.config/ccache/tartci.conf"
 export CCACHE_TEMPDIR="$HOME/.ccache-tmp"
 mkdir -p "$CCACHE_TEMPDIR"
 export CCACHE_BASEDIR="$HOME/src"
@@ -161,5 +164,7 @@ set -e
 
 note "in-guest exit=$RC"
 echo "=== host ccache after job (durable across clones) ==="
-CCACHE_DIR="$CACHE_ROOT/ccache" ccache --show-stats 2>/dev/null | grep -iE 'cache size|hits|misses|hit rate' || true
+# The guest can write $CACHE_ROOT/ccache/ccache.conf; read no config from it.
+CCACHE_DIR="$CACHE_ROOT/ccache" CCACHE_CONFIGPATH=/dev/null ccache --show-stats 2>/dev/null \
+  | grep -iE 'cache size|hits|misses|hit rate' || true
 exit "$RC"

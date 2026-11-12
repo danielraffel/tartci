@@ -1,0 +1,4 @@
+2026-09-26T10:08:26.3310960Z Undefined symbols for architecture arm64:
+2026-09-26T10:08:26.3311600Z   "pulp::test::audio::write_scenario_wav(pulp::test::audio::ScenarioResult const&, std::__1::basic_string<char, std::__1::char_traits<char>, std::__1::allocator<char>> const&, pulp::audio::WavBitDepth)", referenced from:
+2026-09-26T10:08:26.3318170Z ld: symbol(s) not found for architecture arm64
+2026-09-26T10:08:26.3318510Z clang++: error: linker command failed with exit code 1 (use -v to see invocation)

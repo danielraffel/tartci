@@ -42,14 +42,16 @@ GUI to toggle them.
 
 The macOS lane must not point launchd at a `/Volumes` checkout or VM store. On
 2026-06-09 the Studio proof showed the existing Pulp plist crash-looping with
-exit 126 because launchd could not `getcwd` under `/Volumes/Workshop/Code/pulp`
-or read `/Volumes/Workshop/Code/pulp/tools/ci/tart-runner.sh`. The green proof
+exit 126 because launchd could not `getcwd` under `/Volumes/<data-volume>/Code/pulp`
+or read `/Volumes/<data-volume>/Code/pulp/tools/ci/tart-runner.sh`. The green proof
 used `WorkingDirectory=$HOME`, a wrapper under `$HOME/.local/bin`, and
 `TART_HOME=$HOME/VMs`; launchd booted a macOS clone and exited 0.
 
 Use `com.danielraffel.pulp.tart-runner-macos.plist.template` as the replacement
-shape: install tartci into `$HOME/.local/share/tartci`, expose a small
-`$HOME/.local/bin/tartci` wrapper, and keep macOS goldens under `$HOME/VMs`.
+shape: install tartci with `./tartci setup`, which puts the
+`$HOME/.local/bin/tartci` entry point on the installed generation that
+self-update keeps current, and keep macOS goldens under `$HOME/VMs`. Never run
+an agent from a hand-copied checkout: nothing refreshes it.
 Only use `/Volumes` for macOS launchd through the opt-in, receipt-bound native
 launcher described below. Do not grant broad access to Bash, Node, Python, or
 `env`: those interpreter identities are shared by unrelated tools and produce
@@ -58,20 +60,26 @@ Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
 wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
 capacity and supervisor health will be read from different Tart homes.
 
-### External-volume responsible process (Daniel's M3 profile only)
+### External-volume responsible process (Daniel's M3 and m5studio profiles)
 
 `profiles/m3-macos-fleet.toml` deliberately keeps its 4 TiB Tart store at
-`/Volumes/Workshop/VMs`. Its managed LaunchAgents therefore start the stable
+`/Volumes/<data-volume>/VMs`, and `profiles/m5studio-macos-fleet.toml` keeps its
+store at `/Volumes/<data-volume>/VMs`. The volume name is the profile's, not the
+code's: the build seals the profile's own `tart_home` into the bundle
+(`bundle.json`), the launcher probes and enforces that store, and each host has
+its own approval digest (`~/.config/tartci/<host>-launcher-approved.sha256`).
+Their managed LaunchAgents therefore start the stable
 Developer-ID-signed `TartCILauncher.app` at
 `~/.local/libexec/TartCILauncher.app`. Its signature seals the exact TartCI
-support cohort and five rendered M3 lane environments. The resident launcher
+support cohort and that host's rendered lane environments. The resident launcher
 accepts only `--lane <sealed-enum>` or the fixed `--probe-store`, spawns no
 caller-selected executable or arguments, owns the child process group, and
 bounds TERM-to-KILL cleanup inside launchd's 30-second exit window. It contains
 no scheduler, queue, GitHub, listener, or capacity policy.
 
 Build/sign the artifact on a controlled signing surface, never during fleet
-installation:
+installation. Set `TARTCI_PYTHON` to the pinned Python 3.11+ interpreter; the
+explicit option keeps this manual build aligned with the installed launchd path:
 
 ```sh
 scripts/build_macos_launcher.sh \
@@ -79,13 +87,16 @@ scripts/build_macos_launcher.sh \
   --approval-output /absolute/staging/TartCILauncher.sha256 \
   --identity '<Developer ID Application identity>' \
   --support-root /absolute/immutable/tartci-generation \
-  --profile profiles/m3-macos-fleet.toml
+  --profile profiles/m3-macos-fleet.toml \
+  --python "${TARTCI_PYTHON:?set TARTCI_PYTHON to a Python 3.11+ interpreter}"
+# Use `profiles/m5studio-macos-fleet.toml` in both profile arguments when signing m5studio.
 scripts/macos_launcher_identity.py verify /absolute/staging/TartCILauncher.app \
   --identifier com.danielraffel.tartci.launcher \
-  --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256>
+  --team-id 95CX6P84C4 --sha256 <profile-pinned-sha256> \
+  --tart-home <the profile's tart_home>
 ```
 
-The M3 profile pins path, identifier, Team ID, exact profile policy, and the
+Each such profile pins path, identifier, Team ID, exact profile policy, and the
 path to an owned mode-0600 approval digest produced by the signing build.
 The bundle binds the same exact TartCI source commit as the installed support
 cohort. The installer accepts it with `--launch-helper-source`, atomically
@@ -98,7 +109,7 @@ retain the ordinary launch path.
 `tartci pool on` runs a one-shot LaunchAgent probe through this same identity
 before loading any fleet supervisor or opening participation. The probe must
 write, read back, and delete a temporary file in the declared Tart store. Its
-first M3 run may require one explicit Removable Volumes consent; TartCI never
+first run on each host may require one explicit Removable Volumes consent; TartCI never
 edits TCC databases or invokes `tccutil`. Denial, timeout, signature drift, or
 digest drift leaves the pool off. `$HOME/VMs` is the safe rollback while the
 external-volume identity is unavailable.
@@ -220,13 +231,22 @@ tri-state (`running`, `idle`, or `unavailable`) and resolves
 `TARTCI_TART_CLI`, PATH, then the canonical Homebrew locations. It preserves an
 explicit `TART_HOME` or derives `[host].tart_home` from the installed fleet
 profile; it never treats Tart's unrelated default store as authoritative. The
-watchdog still refuses alive-but-frozen recovery when inventory is unavailable,
-so this diagnostic distinction does not weaken the long-build guard. Do not put relay hostnames,
+watchdog refuses both alive-but-frozen and crash-loop recovery when inventory is
+unavailable, so this diagnostic distinction does not weaken the long-build
+guard. That refusal is only as good as the rendered `TART_HOME`: a LaunchAgent
+inherits no login shell, so an agent installed without it reads Tart's default
+store, reports an empty inventory, and reads every long build as an idle host. Do not put relay hostnames,
 GitHub tokens, or proxy variables in shell startup files; the profile records
 only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
 While pool participation is off, reconciliation loads and proves only the
 relay, writes controller intent to disk, and records it as staged; it never
 starts a disabled controller. `pool on` then bootstraps those exact files.
+A pool transition stops only the services its receipt can restore, so on a
+receipted host an unreceipted legacy controller stays loaded through `pool off`
+and staging refuses with `pool-off controller is still loaded`, naming it.
+Stop that controller under its own authority (`launchctl bootout` its exact
+service target) rather than widening the pool transition, which would disable
+services nothing re-enables.
 
 ```sh
 python3 scripts/render_launchd_template.py \
@@ -284,8 +304,16 @@ can catch it — recovery must live outside the wedged agent. The watchdog
 (`scripts/tartci_launchd_watchdog.py`) discovers every tartci LaunchAgent, and
 for each reads `launchctl print` (`last exit code`, `state`) plus the log mtime.
 It heals crash-looping agents when they **exited non-zero AND their log has gone
-stale** (the two together distinguish the invisible crash-loop from a healthy
-between-jobs idle, whose "waiting" log is always fresh). Healing is the same full
+stale AND no VM is running** (the first two together distinguish the invisible
+crash-loop from a healthy between-jobs idle, whose "waiting" log is always
+fresh; the third separates it from a supervisor that is simply quiet inside a
+long build). The VM condition is load-bearing rather than belt-and-braces: a
+`serve --loop` exits `EX_TEMPFAIL` by design and launchd reports that non-zero
+code for the whole life of the respawned job, so a supervisor that writes
+nothing for the 30-minute stale threshold while a required gate job builds is
+indistinguishable from a crash-loop on exit code and log age alone. Healing it
+boots out the supervisor under that live job and takes its guest with it. An
+inventory that cannot be read is reported `unknown` and never healed. Healing is the same full
 bootout+bootstrap+kickstart, rate-limited (default: max 3 heals per label per
 hour) so a genuinely broken plist logs loudly to
 `~/Library/Logs/tartci/tartci-launchd-watchdog.log` instead of thrashing. It
@@ -319,11 +347,14 @@ skipped run. An absent, zero, negative, or non-integer `StartInterval` yields no
 bound rather than a zero one, because a zero would collapse the threshold and
 make every agent read as wedged.
 
-A reload is also refused outright for an interval agent that is currently
-`running`. Such an agent is running its one job, not serving a loop that can be
-interrupted anywhere: the reclaimer is mid-`rmtree`, and booting it out there
-leaves a half-deleted tree no later pass can classify. The watchdog logs the
-refusal and lets the next interval start it cleanly.
+A reload is also refused outright for a `running` agent named in
+`UNINTERRUPTIBLE_AGENTS`. Such an agent is running one job that cannot be cut
+anywhere: the reclaimer is mid-`rmtree`, and booting it out there leaves a
+half-deleted tree no later pass can classify. The watchdog logs the refusal and
+lets the next interval start it cleanly. Membership is declared rather than
+inferred from the plist carrying a `StartInterval`, because every supervisor
+tick on these hosts is an interval agent too and those are safe to cut -
+inferring it would retire the alive-but-frozen heal for all of them.
 
 Not every nonzero exit is a wedge. Some agents exit with a code that reports an
 application condition: the program ran to completion and is naming something a
@@ -346,8 +377,10 @@ plist should be active.
 
 ```
 mkdir -p "$HOME/Library/Logs/tartci"
-sed -e "s|\$HOME|$HOME|g" \
+: "${TART_HOME:?declare this host's Tart VM store}"
+python3 scripts/render_launchd_template.py \
   launchd/com.danielraffel.tartci.launchd-watchdog.plist.template \
+  --set "TART_HOME=$TART_HOME" --set "HOME=$HOME" \
   > "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.tartci.launchd-watchdog.plist"
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog"
@@ -382,22 +415,104 @@ Use the GitHub App wrapper for API and registration-token calls so a stripped
 SSH shell or personal-token quota cannot create a false diagnosis. If GitHub
 reports busy or returns unknown state, stop; do not replace the registration.
 
+## Disk write-latency watchdog
+
+`com.danielraffel.tartci.disk-watchdog.plist.template` runs `tartci disk watch`
+every 60 s. On m5studio on 2026-10-12 every create on `/Volumes/<data-volume>`
+stalled about 6 s for hours while reads stayed instant, and the kernel log
+had rotated before anyone looked (outage O10). Each pass:
+
+- probes every watched path (`TARTCI_DISK_WATCH_PATHS`, rendered from the
+  profile's `host.tart_home` and `host.cache_root`) with a create, a one-byte
+  write, `fsync` and `unlink`, in a child process it waits on for at most
+  10 s. The pass itself never touches the volume. A probe that outlives
+  SIGKILL is in the kernel; it is recorded as outstanding, and no second probe
+  starts on that path while it lives;
+- treats a write over 1 s, or one that does not finish, as the start or
+  continuation of an episode. Once per episode it saves
+  `~/.tartci/state/disk-watchdog/evidence/<path>-<start>/`: `log-show.txt`
+  (`/usr/bin/log show --last 5m`, APFS and kernel), `ps-blocked.txt`
+  (processes in state D or U), `sample-<pid>.txt` for the stuck probe and up
+  to five blocked processes, and `evidence.json` naming the ones whose stack
+  is in `open()`. Every capture is bounded and abandoned, never waited on;
+- reports through the host-off alert path: a `disk_latency_slow` event in
+  `~/.tartci/state/disk-watchdog/events.jsonl` and one GitHub issue per
+  episode, closed with `disk_latency_recovered` after three fast probes in a
+  row. `TARTCI_DISK_WATCH_ISSUE=0` keeps the evidence and the event but opens
+  no issue.
+
+The same pass checks Xcode's device filesystem. CoreDevice mounts a
+network-paired iPhone at `~/Library/Developer/CoreDevice/DeviceFS` (type
+`devicefs`); when its DeviceFS helper wedges, every stat of the mount blocks in
+the kernel for good, so `rg`/`find` over `$HOME`, `lsof` with a path and `du`
+leak unkillable processes (m3 from 2026-10-18; m5studio on 2026-10-22, where it
+read as an external-volume failure). Each pass lists devicefs mounts from the
+kernel mount table and stats each in a bounded child probe. A wedge is
+confirmed by a probe the kernel keeps past SIGKILL, or by no answer on two
+passes in a row; one slow listing is never acted on. On a confirmed wedge the
+pass saves evidence first, then SIGKILLs only the DeviceFS helpers `ps` shows
+stuck in the kernel (state U), force-unmounts the wedged mount (never starting
+a second `umount -f` while an earlier one is stuck), and opens one
+`devicefs_wedged` episode, closed after three healthy passes. Processes
+blocked on the mount are released once the stuck helper is killed (a SIGKILL
+to its pid freed a 19 h `rg` on m5studio with no reboot); any still stuck after
+that need a reboot, and the issue counts them. Once three probes
+are stuck the pass stops probing: it takes no action, keeps the episode open
+and says a reboot is needed. A `mount` that does not answer counts as unknown,
+never healthy. `TARTCI_DEVICEFS_REMEDIATE=0` reports without acting.
+
+`tartci disk status [--json]` prints each path's last probe stamped with its
+own time, its open episode and its evidence directory, and the device
+filesystem's last check. A last probe older than 10 minutes
+(`TARTCI_DISK_STALE_S`) is marked STALE: the agent is not running, and the
+reading is history, not a current fault. The agent is a support agent: declare
+`disk-watchdog` in the host profile's `[support_agents] declared` list to
+install it through `support_agents`.
+
+## Pool-status log
+
+`com.danielraffel.tartci.pool-log.plist.template` runs `tartci pool log` every
+300 s. `tartci pool status` says what a host is doing now and keeps no
+history, so a watcher that reads it could only be judged live; this log lets
+host signals be scored against what actually happened. Each pass:
+
+- reads this generation's `tartci pool status --json` in a child it waits on
+  for at most 60 s, and nothing else (no ssh, no GitHub);
+- condenses it to what a host reader classifies: `host`, `state`,
+  `participating` and `problems` (each `fleet.config` section's problem, first
+  500 characters);
+- appends one record to `~/.tartci/state/pool-log/events.jsonl` when that
+  changed, a `"heartbeat": true` record once an hour when it did not (so a gap
+  means the agent was down), and `{"at", "error"}` once per distinct read
+  failure;
+- rotates the log at 2 MiB (`TARTCI_POOL_LOG_MAX_BYTES`) to `events.jsonl.1`,
+  so a host keeps at most two files.
+
+`tartci pool log --status [--json]` prints the log's sizes, its last record and
+the age of the last write. Declare `pool-log` in the host profile's
+`[support_agents] declared` list to install it through `support_agents`;
+dropping the declaration boots it out and keeps the log.
+
 ## GitHub-hosted queue-saturation detector
 
 `com.danielraffel.pulp.queue-saturation.plist.template` runs
-`scripts/gh_queue_saturation.py` on a `StartInterval` (default 300s) to catch the
-inverse of a wedge: the required self-hosted gate sits **online and idle** while
-its GitHub-hosted routing preamble is starved behind a saturated shared pool, so
-the required check reads `pending` for reasons that have nothing to do with the
-code or the runners. A runner-health check sees green runners and reports "fine";
-this detector sees the triad — deep repo-wide queue **and** an idle required-gate
-runner **and** a required check pending past a grace window — and says
-"GitHub-hosted starvation." It runs here, on the always-on Mac, precisely because
-a scheduled workflow on `ubuntu-latest` would queue behind the saturation it is
-meant to report. Dry-run by default (`PULP_SAT_APPLY=0`, logs the verdict); set
-`PULP_SAT_APPLY=1` to open/update a single tracking issue once the log has baked.
+`scripts/gh_queue_saturation.py` (as `tartci queue-saturation`, from the
+installed generation) on a `StartInterval` (default 300s). It catches both
+queue starvation and the earlier routing-preamble failure: queued
+`resolve-provider` or `classify` jobs in a Build and Test run are sampled and a
+job older than the grace window is reported as `preamble_starved`, even when
+the Tart macOS census is empty. This prevents a supervisor's `queued=0` from
+being mistaken for end-to-end health while the preamble is still pinned to a
+hosted label. The original triad remains: deep repo-wide queue **and** idle
+required-gate capacity **and** a required check pending past grace reports
+GitHub-hosted starvation. The detector runs on the always-on Mac because a
+scheduled workflow on `ubuntu-latest` would queue behind the saturation it is
+meant to report. Dry-run is the default (`PULP_SAT_APPLY=0`); set
+`PULP_SAT_APPLY=1` to open/update a tracking issue for either condition.
 Decision logic is covered hermetically by `scripts/test_gh_queue_saturation.py`
-(no network, no `gh`, no clock). Design:
+(no network, no `gh`, no clock); live sampling is bounded to eight queued Build
+and Test runs, uses at most four concurrent API calls, and ignores API failures
+fail-closed. Design:
 `planning/2026-07-06-ci-queue-saturation-watchdog.md` in the pulp repo. Install:
 
 ```
@@ -408,6 +523,216 @@ sed -e "s|\$HOME|$HOME|g" \
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/com.danielraffel.pulp.queue-saturation.plist"
 launchctl kickstart -k "gui/$(id -u)/com.danielraffel.pulp.queue-saturation"
 ```
+
+After install, the launchd watchdog keeps a loaded copy rendered from this
+template (keeping the host's `PULP_SAT_*` values), so a template change reaches
+the host on its next self-update without a hand re-render.
+
+## Schedule backstop for throttled safety-net crons
+
+GitHub delays `schedule` events under load and drops the ones that pile up. On
+Generous-Corp/pulp every hourly-or-faster cron fires about once every five
+hours (7 or 8 runs in 41 h for a `*/15` or `*/30` workflow), while daily crons
+still fire daily, five to seven hours late. Run numbers stay contiguous, so the
+runs are never created; nothing in the repository disables them.
+
+`com.danielraffel.pulp.schedule-backstop.plist.template` runs
+`scripts/schedule_backstop.py` every 300 s. It reads the repository's
+`.github/schedule-backstop.json` (kept consistent with each workflow's cron,
+dispatch inputs, concurrency group, and hosted runner by the repository's
+`schedule_backstop_check.py`) and calls `workflow_dispatch` on a listed
+workflow when the newest run on `main`, from any event, is at least
+`cadence_minutes` old, none is queued or running, and this agent has not
+dispatched it within the cadence. It only dispatches: runs stay on
+GitHub-hosted runners and the crons stay as a backstop, so off, erroring, or
+host-down means exactly today's behaviour.
+
+Run reads deliberately omit the server-side `branch=` filter: a cold
+`branch=main` read intermittently returns a page weeks old, which would read as
+overdue. The ref is selected client-side from an unfiltered page instead.
+
+Install on exactly one always-on host, chosen by the fleet profile's top-level
+`schedule_backstop` key (above the first table):
+
+| value | agent installed by `tartci setup` |
+|---|---|
+| `"live"` | yes, `TARTCI_BACKSTOP_APPLY=1` and `TARTCI_BACKSTOP_AUTHORITY=1` |
+| `"dry-run"` | yes, both `0`: logs `would_dispatch`, paced as apply would pace it |
+| `"off"` (default, key unset) | nothing |
+
+Only `profiles/m3-macos-fleet.toml` says `"live"`; there is no standby host, so
+with m3 down the crons carry on alone. `tartci setup` runs
+`scripts/install_schedule_backstop_agent.sh --install` (non-fatal; `--plan`
+shows what it would do and writes nothing). It reads the installed profile
+snapshot (`~/.config/tartci/macos-fleet-profile.toml`, or
+`TARTCI_FLEET_PROFILE`), renders the template so the agent runs
+`~/.local/bin/tartci schedule-backstop` (the installed generation, so a
+self-update carries the script), and bootstraps and kickstarts it only when the
+rendered agent differs or is not loaded. It refuses a temporary HOME before any
+launchctl call. When the profile says `"off"` but an agent is present it is
+reported and left alone, because a profile snapshot older than the key reads as
+off; a mode it cannot read (no tomllib, an invalid value) changes nothing and
+exits 5. The backstop's state, `~/.local/state/tartci/schedule-backstop.json`,
+is never touched, so its own-dispatch pacing survives a reinstall. The launchd
+watchdog also re-renders a loaded agent that drifted from the template, keeping
+its `TARTCI_BACKSTOP_*` switches.
+
+Steady state is about 50 App API calls per hour. Decision logic is covered
+hermetically by `scripts/test_schedule_backstop.py`, the installer and profile
+gate by `scripts/test_install_schedule_backstop_agent.py`.
+
+Undo on a host:
+
+```
+scripts/install_schedule_backstop_agent.sh --uninstall
+# equivalently:
+launchctl bootout "gui/$(id -u)/com.danielraffel.pulp.schedule-backstop"
+rm "$HOME/Library/LaunchAgents/com.danielraffel.pulp.schedule-backstop.plist"
+```
+
+then set `schedule_backstop = "off"` (or remove the key) in that host's profile
+so the next `tartci setup` does not reinstall it.
+
+A daily workflow is listed with `cadence_minutes` 1440 (the only value
+allowed above 60): it is dispatched only when no run on the ref is a day old,
+so a check that counts consecutive days, such as the read audit's Stage 0
+streak, cannot lose a day to a dropped cron. Its late cron can still fire
+right after such a dispatch; the workflow's concurrency group keeps that to
+one run.
+
+Judge it by runs per listed workflow per day against `1440 / cadence_minutes`,
+with total Actions runs and minutes as the control.
+
+## Declared support agents
+
+The fleet profile names the support LaunchAgents a host carries:
+
+```toml
+[support_agents]
+declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "launchd-watchdog", "reap"]
+bootstrap = ["reap"]
+```
+
+`scripts/support_agents.py` holds the registry of declarable agents (today the
+disk reclaimer, the artifact-cache refresher, the keychain unlocker, the
+schedule backstop, the reuse canary, the launchd self-heal watchdog and the
+Tier-2 reaper). The watchdog and the reaper render with `TART_HOME` from the
+profile's `[host].tart_home`, so each host's agent reads its own Tart store;
+they used to be rendered by hand from this file, which is how m5studio was
+brought up serving gate VMs with no watchdog (no heal pass, no skew or tool
+freshness refresh). Every shipped profile declares both, so a host missing one
+reads `missing` in the plan receipt and `tartci doctor fleet` reports
+`host_agents_missing`. Each with an install script renders with exactly the `render_launchd_template.py`
+arguments its `install_*_agent.sh` uses, so a host those scripts installed
+reads byte-identical; `scripts/test_support_agents.py` proves that per agent.
+An agent's own settings stay where they are (`schedule_backstop`, `[reclaim]`);
+this table only says which agents the host carries. `schedule-backstop` must be
+declared exactly when `schedule_backstop` is `live` or `dry-run`, and
+`reuse-canary` exactly when `[reuse_canary] enabled = true`.
+
+The watchdog's frozen-lane threshold comes from the profile too:
+
+```toml
+[launchd_watchdog]
+stale_log_seconds = 4500   # 600-14400; absent = the watchdog's 1800 default
+```
+
+It renders as `TARTCI_WATCHDOG_STALE_LOG_SECONDS` in the watchdog's
+environment, which `tartci launchd heal` reads as its `--stale-log-seconds`
+default (an explicit flag still wins). Every shipped profile sets 4500. Before
+this, m1, m5 and m5studio carried `--stale-log-seconds 4500` only in
+hand-edited plists, so any re-render from this file restored the 1800 default
+and the heals that #191 diagnosed (#195).
+
+After self-update verifies the lanes it runs `tartci fleet-macos support-agents
+auto`. With `bootstrap = false` that is a plan: it compares each declared
+agent's installed plist with its render (`match_bytes`, `match_plist` for key
+order only, `differs` with each key path named, `missing`), lists every agent
+under the `com.danielraffel.tartci.` and `com.danielraffel.tmp.` prefixes that
+is neither declared, a lane, nor owned by another named installer, and writes
+`~/.tartci/state/support-agents/last.json`. Nothing on the host changes. With
+`bootstrap = true` it renders every declared agent first (one failing render
+changes nothing in the pass), then writes and (re)bootstraps what is missing or
+differs, kickstarting only agents whose template has `RunAtLoad`, and leaves a
+matching, loaded agent alone. A declaration dropped from a present table, that
+the previous receipt shows declared under a present table, is booted out and its
+plist moved to `~/.local/share/tartci-support-agents.retired-<date>/`; its log
+stays. An absent table manages and removes nothing.
+
+`bootstrap` may also be a list of declared names: only those agents are
+written and (re)bootstrapped, every other declared agent is planned and
+reported exactly as with `false`, and a list never drops an agent. Every
+shipped profile uses `bootstrap = ["reap"]`. On 2026-10-09 every profile
+declared the VM janitor and only m3 had it, because `false` kept the step to a
+plan; the list installs the janitor on the next self-update without touching
+the other agents. `tartci doctor fleet` reports `vm_janitor_missing` (PROBLEM)
+while the janitor is undeclared, missing or not loaded, and `vm_janitor_loaded`
+once it is.
+
+Taking an agent out of a `bootstrap` list does not unload it: the agent goes
+back to plan-only, and a host that already has it keeps it loaded and running
+the plist it was last given. To remove it from a host, drop it from `declared`
+(the next apply boots it out and retires its plist, as above), or `launchctl
+bootout gui/$(id -u)/<label>` by hand.
+
+The step never fails the update: a failure is a receipt step with `ok=false`
+and a `tartci doctor fleet` finding (`support_agents_pending`,
+`support_agents_drift`, `undeclared_fleet_agent`). Before draining, self-update
+refuses a target whose checkout cannot render a declared agent. The
+`install_*_agent.sh` scripts and their `tartci setup` calls remain until
+`bootstrap = true` is proven across the fleet.
+
+## Reuse canary for Shipyard's bindable mac records
+
+Shipyard binds a pull request's mac validation to an earlier run of the same
+tree only when a bindable record for that tree exists on a host whose Shipyard
+runs in `shadow_compare` mode. Pull requests run only the fast tier, so nothing
+else writes one.
+
+`com.danielraffel.tartci.reuse-canary.plist.template` runs
+`scripts/reuse_canary.py` every 6 h (`RunAtLoad` off: a pass builds Pulp for up
+to three hours, so loading the agent must not start one). Each pass:
+
+- does nothing when another pass holds its lock;
+- refuses, touching nothing, when pool participation is off or draining (which
+  covers a self-update in progress);
+- reads origin/main's head with `git ls-remote` and skips it when today's
+  ledger holds a completed (`ran`) pass for that SHA or two starts of it; a
+  failed, timed-out or unrecorded pass, or a half-run, may retry within that cap;
+- refuses unless `shipyard --json reuse records` reports
+  `changed_surface_execution_mode` = `shadow_compare`;
+- checks out a dedicated worktree, `<worktrees_root>/pulp-reuse-canary`, at the
+  SHA (lineage-marked active; never another disk when the root's volume is not
+  mounted);
+- runs `shipyard run --targets mac` there with `PULP_BUILD_CLASS=background`,
+  in its own process group, bounded at three hours, with a progress line in
+  `~/Library/Logs/tartci/reuse-canary.log` every two minutes;
+- records `shipyard --json reuse records` for the SHA verbatim. Only that
+  output says whether the pass is bindable; an empty list after a pass means
+  the store filed nothing;
+- writes a receipt under `~/.tartci/state/reuse-canary/attempts/` and one
+  terminal event in `events.jsonl` beside it.
+
+It is enabled per host by the fleet profile:
+
+```toml
+[reuse_canary]
+enabled = true
+repo = "/Volumes/<data-volume>/Code/pulp"
+worktrees_root = "/Volumes/<data-volume>/Code/agent-worktrees"
+```
+
+Only the m3 and m1 profiles enable it, and declare `reuse-canary` in their
+`[support_agents]` table; it is installed through that declaration (there is no
+separate install script), so it reaches a host only once that host's
+`bootstrap` is on.
+
+The agent is in `UNINTERRUPTIBLE_AGENTS`: a `shipyard run` cut mid-way leaves a
+half-run no later pass can classify. The interval guard kicks it like any fleet
+timer when launchd stops starting timers, so a stalled host still runs it within
+12 h. `tartci doctor fleet` reports `reuse_canary_stale` when no pass has been
+recorded for 13 h and `reuse_canary_no_bindable` when no pass has produced a
+bindable record for 36 h. Tests: `scripts/test_reuse_canary.py`.
 
 ## Release CLI macOS launchd rule
 
@@ -466,9 +791,9 @@ release agent per workflow.
 
 The Windows lane uses QEMU directly, so every participating Apple Silicon host
 needs Homebrew QEMU on the service PATH, the same Windows qcow2 golden in a
-local golden store, and the tartci scripts installed under a home-backed path.
-Use the qemu template's install recipe, which points launchd at
-`$HOME/.local/share/tartci` rather than a mounted workspace.
+local golden store, and tartci installed with `./tartci setup`. The qemu
+template runs `$HOME/.local/bin/tartci serve windows`, the installed
+generation, rather than a mounted workspace.
 
 Leave `TARTCI_RUNNER_QUEUE_MATCH_LABELS=1` unless you are debugging the queue
 poller. With that default, the supervisor only boots QEMU when a fresh queued
@@ -591,6 +916,27 @@ and nothing was certified. Both are failures, but 3 asks for disk and 4 asks why
 the janitor cannot see. Exit 2 means no scan root resolved, and 0 means the pass
 ran and the host is above its floor.
 
+The boot data volume (`/System/Volumes/Data`) has its own floor,
+`TARTCI_RECLAIM_BOOT_FLOOR_GB` (30), judged whenever the lease floor above does
+not already cover that volume. That is m3, whose Tart store is on Workshop:
+judging the lease floor on the Tart store's volume is right for leases, but it
+left nothing watching m3's boot disk, which went from 57 GiB free to 2 GiB on
+2026-10-01. A pass that leaves the boot volume below its floor exits 5 (the
+lease volume wins with 3 when both are low), status reports `boot_low`, and the
+doctor reports `reclaim_boot_low`. On hosts whose Tart store is on the boot
+disk the lease floor already judges it, and the receipt says `lease_floor`.
+
+The same pass removes test and validation scratch from the two temp roots on
+the boot volume, which no scan root reaches (`scripts/scratch_dirs.py`, opt-in
+with `[reclaim] scratch_dirs = true`): Shipyard's per-run
+`/private/tmp/shipyard-validation-*`, the Pulp test prefixes it names in the
+per-user temp dir, and Chrome's `code_sign_clone.*` app-bundle copies. Only
+named patterns are examined; an entry goes only when it is ours, nothing has a
+file open in it, no process command line or environment names it, and nothing
+in it changed for `scratch_idle_hours` (12; 4 while the boot volume is below its
+floor). Directories a test left read-only are made writable first, which is
+what every earlier cleanup lacked.
+
 This agent prevents a slow fill; it does not rescue a host that filled today.
 The age gates are the binding constraint, by design: measured against m5's real
 tree on 2026-09-10, right after the outage was cleared by hand, a 30-day pass
@@ -615,7 +961,9 @@ step tells you what the rollout is actually worth on that host. Under `--fix`
 the same figure is what was freed.
 
 Scan roots are discovered rather than declared: the janitor keeps whichever of
-`~/Code` and `/Volumes/Workshop/Code` the host actually has, and measures free
+`~/Code` and the installed fleet profile's `[reclaim]` code root (the parent
+of `repo` / `worktrees_root`, e.g. `/Volumes/<data-volume>/Code` on m3,
+`/Volumes/<data-volume>/Code` on m5studio) the host actually has, and measures free
 space on every volume those roots span. The `TARTCI_RECLAIM_FAIL_BELOW_GB`
 floor is judged against the tightest of those volumes, so a healthy disk cannot
 certify a full one. Pressure is scoped per volume instead: only candidates on a
@@ -639,7 +987,13 @@ number names the same pattern on m3, m5 and m1, while a nest list rots the next
 time a worktree root moves.
 
 Scanning deeper does not weaken the guards, since the marker, source-marker,
-live-process and age tests are all depth independent. Measured on m3's Workshop
+live-process and age tests are all depth independent. A build tree is removed
+whole, so the source-marker test is asked twice: once about the directory
+itself, and once about everything up to four levels below it. A build tree that
+fetched its dependencies holds real checkouts at `_deps/<name>-src/.git`, and
+one carrying local edits - or one with no `.git` of its own - does not come
+back. A subtree that cannot be read counts as a possible checkout, not as an
+absent one, so the tree is kept. Measured on m3's Workshop
 root, depth 5 exposes 94 build-named directories that depth 3 never saw, and 88
 of them are refused for carrying no generated-tree marker: that is precisely
 what `external/skia-build/build`, cargo `target/debug/build`, and
@@ -691,6 +1045,32 @@ so status cannot disagree with the janitor about which volumes are scanned, and
 it prints `unknown` rather than a figure when a volume cannot be read. An
 unreadable volume is not a healthy one.
 
+With the fleet profile's `[reclaim] pulp_worktree_builds` on, the pass also
+runs Pulp's own reapers from a fresh origin/main (`scripts/pulp_reapers.py`):
+`clean_build_cov.sh` every pass over `worktrees_root`, and
+`clean_worktree_builds.sh` there only under pressure. The cheap coverage reaper
+additionally runs, every pass, over each discovered scan root that holds
+worktrees of any clone of this repository: a direct child whose `.git` is a
+gitdir file and whose repository's `remote.origin.url` normalizes to the
+configured repo's (`git@host:path`, `ssh://`, and `https://` forms compare equal).
+The pass warns `worktrees_outside_profile_root root=… count=N` for each. m5studio's
+boot volume filled to 99% on 2026-10-04 with coverage dirs in `~/Code` worktrees
+while the reaper ran only over its Atelier root, and those worktrees belong to a
+second clone (`~/Code/pulp`), so matching the configured clone alone missed them.
+If the configured repo's origin cannot be read, nothing outside the profile root
+is scanned and the receipt says `configured_origin_unreadable`; a child whose
+origin cannot be read is never counted. The receipt's `pulp_reapers.discovery`
+records the roots scanned and the children seen, so "scanned N, matched 0" reads
+differently from "did not run", and `outside_profile_roots` plus each run's
+`reason` and `worktrees_root` are kept in `last-run.json`. A clone's in-repo
+agent worktrees (`<clone>/.claude/worktrees`) lie under none of those roots, the
+configured clone's included (the reaper's own repo root is the materialized
+checkout), so where that directory exists the same script runs once more over
+it (`configured_clone_agent_worktrees` / `discovered_clone_agent_worktrees`). The heavier reaper never
+follows a discovered root. The root-level check is not a per-child filter:
+`clean_build_cov.sh` removes `build-cov*` under any direct child of a root it
+runs over, as it always has for `worktrees_root`.
+
 Pulp ships its own `tools/scripts/clean_build_cov.sh`, which covers only
 `build-cov*` inside one checkout. That stays: it is the repo-local convenience
 for an external cloner who has no tartci. This agent is the fleet-wide job, and
@@ -714,75 +1094,99 @@ ghapp api repos/Generous-Corp/pulp --jq .full_name
 A missing wrapper is a deployment failure; do not let the unattended process
 fall back to ambient `gh`.
 
-## Shipyard queue janitor
+## Shipyard queue tick (ship-state reaper)
 
 `com.danielraffel.shipyard.queue-tick.plist.template` runs
-`scripts/shipyard_queue_tick.sh` every 5 min to make the Shipyard ship-queue
-progress **independent of any interactive session** — so a cmux restart or a
-Claude session running out of quota can no longer strand a validated PR or leak
-ship-state. Per active ship-state whose worker is not live, it: reaps records
-whose PR GitHub reports merged/closed (`shipyard ship-state discard`), drives
-open green PRs to merge via shipyard's own fail-closed `auto-merge` (no-op
-unless all targets green and the live head matches the validated SHA), and
-surfaces (does not auto-rebase) behind/DIRTY PRs.
+`scripts/shipyard_queue_tick.sh` every 5 min so leaked ship-state gets cleaned
+up **independent of any interactive session**. Per ship-state record whose
+worker is not live, it reads the pull request's state from GitHub and discards
+the record (`shipyard ship-state discard`) when the pull request is merged or
+closed, or after three consecutive explicit not-found reads. It keeps OPEN
+records and never merges, enqueues or arms a pull request: landing is the
+GitHub merge queue's job.
 
-Safe-by-construction: acts only on PRs that already have a ship-state record,
-never reimplements merge logic, never edits state files, fails closed on any
-GitHub read error, and skips live/fresh workers. It defaults to **DRY-RUN**
-(`SHIPYARD_TICK_APPLY=0`) — deploy observe-only first, watch
-`~/Library/Logs/shipyard-queue-tick.log`, then flip `SHIPYARD_TICK_APPLY=1`.
-Use the installer to keep the authority checkout in a mode-600 canonical
-configuration that survives LaunchAgent drift:
+It never edits state files, fails closed on any GitHub read error, skips
+live/fresh workers, and logs the first stderr line of every failed GitHub or
+Shipyard call. It defaults to **DRY-RUN** (`SHIPYARD_TICK_APPLY=0`); watch
+`~/Library/Logs/shipyard-queue-tick.log`, then install in reap mode:
 
 ```sh
 scripts/install_shipyard_queue_tick.sh \
-  --repo-root /absolute/path/to/pulp \
-  --authority \
   --gh-cli /absolute/path/to/ghapp \
   --mode dry-run
-# Re-run with --install only after reviewing the plan.
+# Re-run with --mode reap --install after reviewing the plan.
 ```
 
 The installer removes any previous health verdict before kickstart and succeeds
-only after the newly started tick publishes a fresh healthy verdict. After the
-dry-run log and health file are clean, arm the single authority explicitly:
+only after the newly started tick publishes a fresh healthy verdict. It waits
+for that tick to finish however long it runs (a tick reads every open pull
+request), up to `SHIPYARD_QUEUE_INSTALL_TICK_MAX_SECS` (default 3600). It
+fails after `SHIPYARD_QUEUE_INSTALL_HEALTH_WAIT_SECS` (default 120) only when
+the tick is not running and has published nothing. A failed install restores
+the prior files and re-bootstraps the prior agent, retrying the bootstrap
+that races launchd's asynchronous bootout. If the agent still is not loaded,
+the installer says `ROLLBACK FAILED … NOT LOADED`, writes an `unhealthy`
+`agent_unloaded` health verdict, and exits 4, so the host is never left
+without a tick in silence. The launchd watchdog reinstalls a loaded tick
+whose copy differs from the running tartci (`scripts/queue_tick_refresh.py`),
+and never switches an unloaded one back on. Every mode
+requires `--gh-cli` pointing to an executable GitHub App wrapper; unattended
+operation never falls back to ambient `gh`. `--repo-root` sets the checkout
+the merge-queue hold check and the superseded merge-group reaper run from. The
+reaper needs it (Shipyard resolves its GitHub credential from that checkout's
+remote), so without it the reaper is skipped and says so. `--mode live` and
+`--authority` are retired and refused. Never hand-edit the installed plist;
+re-run the installer.
 
-```sh
-scripts/install_shipyard_queue_tick.sh \
-  --repo-root /absolute/path/to/pulp \
-  --authority \
-  --gh-cli /absolute/path/to/ghapp \
-  --mode live \
-  --install
-```
-
-Use `--mode reap-only` on a non-authority host that should clean terminal
-ship-state without merging. Every mode requires `--gh-cli` pointing to an
-executable GitHub App wrapper; unattended operation never falls back to ambient
-`gh`. Never hand-edit the installed plist to change mode; re-run the installer
-so the rendered mode and fresh health proof stay coupled.
-
-Full-live additionally requires `SHIPYARD_QUEUE_AUTHORITY=1`; set that on
-exactly one host whose Shipyard runner tag matches
-`[merge_queue].mutation_machine`. Other CI Macs may remain dry-run or reap-only
-but cannot become queue writers. Set `SHIPYARD_QUEUE_REPO_ROOT` to the
-authority's repository checkout; the tick runs Shipyard from that directory
-and requires `authority_matches=true` before full-live operation. An
-authority-local `shipyard merge-queue hold` causes the configured authority
-tick to exit before any GitHub read; during an incident, run it on that
-authority (and propagate it fleet-wide for consistent operator status). This
-integration requires Shipyard 0.80.0 or newer; install that release before
-deploying the script or plist. Missing authority configuration is a hard
-unhealthy exit, never a silent downgrade to reap-only. The last machine verdict
-is written to `~/Library/Logs/shipyard-queue-tick.health.json`; inability to
+An install from before the reaper-only tick may still set
+`SHIPYARD_TICK_REAP_ONLY=0` or `SHIPYARD_QUEUE_AUTHORITY=1`. The tick accepts
+them, reaps only, and writes `legacy_full_live_ignored` into every tick log
+line and health verdict until the installer is re-run. This integration
+requires Shipyard 0.80.0 or newer. The last machine verdict is written to
+`~/Library/Logs/shipyard-queue-tick.health.json`, and its reason says what the
+tick did (`mode=reap reaped=N open=N stalled=N live=N errs=N`); inability to
 write that verdict is itself loud and nonzero. Unreadable or malformed queue
 control and ship-state observations are unhealthy rather than successful
-no-ops. A ship-state is
-recoverably archived only after three consecutive, explicit GitHub not-found
-responses; generic GitHub errors remain fail-closed and do not increment that
-counter. Re-bootstrap after changing the installed plist.
+no-ops. Re-bootstrap after changing the installed plist.
 Design + adversarial review: pulp
 `planning/2026-06-30-ship-queue-resilience-design.md`.
+
+### Superseded merge-group runs
+
+Each tick also runs `shipyard rescue --superseded-merge-group --repo <repo>
+--json` for every repository in `SHIPYARD_QUEUE_REAP_REPOS` (default
+`Generous-Corp/pulp`). A `merge_group` run whose `gh-readonly-queue/*` ref no
+longer exists validates a batch the queue already dropped, and holds a gate VM
+until it ends. Shipyard decides which runs those are: it trusts only a ref
+listing that includes `HEAD`, keeps any run whose ref is live, and skips runs
+that hold no runner. The tick only runs it.
+
+- It cancels only while `~/.config/tartci/reap-superseded-merge-groups.enabled`
+  exists (`SHIPYARD_QUEUE_REAP_OPT_IN` names another path). Without the file
+  it only reports. Remove the file to roll back.
+- Each cancelled run (or, when reporting, each run it would cancel) is one
+  tab-separated line in `~/Library/Logs/tartci/superseded-merge-groups.log`:
+  time, host, repository, run id, ref, status and reason.
+- It never fails the tick. A Shipyard error, unreadable output or a run past
+  `SHIPYARD_QUEUE_REAP_TIMEOUT_SECS` (default 60) is one line in the tick log,
+  and the rest of the tick goes on. A held merge queue skips it with the rest
+  of the tick.
+
+Enable it on the host whose queue tick runs, with the tick installed from
+a checkout of the reaped repository:
+
+```sh
+scripts/install_shipyard_queue_tick.sh --gh-cli "$HOME/.local/bin/ghapp" \
+  --mode reap --repo-root <checkout of Generous-Corp/pulp> --install
+touch ~/.config/tartci/reap-superseded-merge-groups.enabled
+```
+
+Without `--repo-root`, each tick logs `reap-superseded <repo>: skipped: no
+repo root configured` and never runs Shipyard. An install from before the
+reaper ran from the repo root has none, so it skips every tick until the
+operator reinstalls it with `--repo-root`; that reinstall is a required step,
+not something self-update does. One root serves one repository: with more than
+one in `SHIPYARD_QUEUE_REAP_REPOS` the tick skips the reaper and says so.
 
 ## Retire Orchard on upgrades
 

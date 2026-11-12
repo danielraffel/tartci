@@ -1,0 +1,216 @@
+{
+  "total_count": 14,
+  "jobs": [
+    {
+      "id": 106962829113,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "classify",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": "GitHub Actions 1000116411",
+      "runner_group_name": "GitHub Actions",
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106962829525,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "resolve-provider",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": "GitHub Actions 1000116412",
+      "runner_group_name": "GitHub Actions",
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106962830506,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "Pulp repository-isolation local proof",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:33Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-build-merge-group"
+      ]
+    },
+    {
+      "id": 106962901146,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "Windows MIDI Services SDK compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "windows-latest"
+      ]
+    },
+    {
+      "id": 106962901488,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "Windows MSVC release-path gate",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "windows-latest"
+      ]
+    },
+    {
+      "id": 106962901556,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "Windows BLE compile-gate (advisory)",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "windows-latest"
+      ]
+    },
+    {
+      "id": 106962903435,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "protected-receipt-reuse",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-22T22:24:02Z",
+      "runner_name": "GitHub Actions 1000116413",
+      "runner_group_name": "GitHub Actions",
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106962904838,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "(github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch') && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true') && 'macos' || 'macos-pr-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106962905395,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "a2t-protected-event",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:23:48Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-build-merge-group"
+      ]
+    },
+    {
+      "id": 106962969303,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "macos",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-22T23:07:35Z",
+      "runner_name": "studio-pulp-gate-01-42272-1",
+      "runner_group_name": "Default",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "pulp-build",
+        "pulp-build-vm",
+        "pulp-build-merge-group"
+      ]
+    },
+    {
+      "id": 106962969331,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "Linux (x64) [github-hosted]",
+      "status": "completed",
+      "conclusion": "success",
+      "completed_at": "2026-09-22T23:07:58Z",
+      "runner_name": "GitHub Actions 1000116414",
+      "runner_group_name": "GitHub Actions",
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106962971146,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "github.event_name == 'merge_group' && (needs.resolve-provider.result != 'success' || needs.classify.result != 'success' || needs.classify.outputs.native_build_required != 'true' || needs.protected-receipt-reuse.outputs.macos_reused == 'true') && 'macos' || 'macos-merge-unused'",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T22:24:02Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106974983198,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "linux",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T23:07:58Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "ubuntu-latest"
+      ]
+    },
+    {
+      "id": 106974983425,
+      "run_id": 35792120939,
+      "workflow_name": "Build and Test",
+      "name": "windows",
+      "status": "completed",
+      "conclusion": "skipped",
+      "completed_at": "2026-09-22T23:07:58Z",
+      "runner_name": null,
+      "runner_group_name": null,
+      "labels": [
+        "ubuntu-latest"
+      ]
+    }
+  ]
+}

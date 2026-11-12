@@ -14,19 +14,26 @@
 
     1. Bake the golden: it must carry the actions-runner agent at ~/actions-runner
        (actions-runner-linux-arm64). Copy the Linux golden into this host's TART_HOME.
-    2. Install tartci into a home-backed path so launchd does not depend on a
-       mounted workspace:
+    2. Install tartci with `./tartci setup` from a checkout. It installs the
+       ~/.local/bin/tartci shim onto the installed generation, which self-update
+       keeps current. Never hand-copy a tartci checkout under ~/.local/share:
+       nothing refreshes it, and agents running from it go stale.
 
-         mkdir -p "$HOME/.local/share/tartci" "$HOME/Library/Logs/tartci"
-         rsync -a ./ "$HOME/.local/share/tartci/"
-
-    3. Copy this file to ~/Library/LaunchAgents/, replacing $TARTCI_REPO, $HOME, and
+    3. Copy this file to ~/Library/LaunchAgents/, replacing $HOME, this host's label and
        $TART_HOME with absolute paths — launchd does NOT expand shell variables:
 
-         sed -e "s|\$TARTCI_REPO|$HOME/.local/share/tartci|g" -e "s|\$HOME|$HOME|g" \
+         sed -e "s|\$HOME|$HOME|g" \
+             -e "s|\$TARTCI_HOST_LABEL|pulp-host-<this host>|g" \
              -e "s|\$TART_HOME|$HOME/VMs|g" \
            launchd/com.danielraffel.pulp.tart-runner-linux.plist.template \
            > ~/Library/LaunchAgents/com.danielraffel.pulp.tart-runner-linux.plist
+
+       Never re-run this render over an installed plist: it resets every
+       host value to this template's default. That includes the host label,
+       the golden store, TARTCI_VM_POLL and the ghapp-shim PATH entry. A
+       render of the stock template on m1 would have produced a lane labelled
+       pulp-host-macstudio with the wrong golden store (2026-10-03). To move an installed
+       plist forward, change only the keys that changed and keep the rest.
 
        Set TART_HOME to the absolute path where this host's Tart goldens live.
     4. Grant Full Disk Access if TART_HOME is on /Volumes (TCC; exit 126 without).
@@ -38,7 +45,7 @@
   PILOT vs GRADUATE: the default labels routed below include the non-required
   shared pool label `pulp-build-linux` and a host-specific label. Use
   `pulp-host-macstudio` on the primary Mac Studio and `pulp-host-m5` on the
-  overflow M5/blackbook. The workflow resolver should choose the Mac Studio
+  overflow M5/laptop. The workflow resolver should choose the Mac Studio
   selector first, the M5 selector second, and GitHub-hosted when each local
   selector is already at its configured in-progress capacity; queued Actions jobs
   cannot change `runs-on` after dispatch.
@@ -60,14 +67,16 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>$TARTCI_REPO/providers/tart-linux/runner.sh</string>
+        <string>$HOME/.local/bin/tartci</string>
+        <string>serve</string>
+        <string>linux</string>
         <string>--loop</string>
         <string>--labels</string>
-        <string>self-hosted,Linux,ARM64,pulp-build-linux,pulp-host-macstudio</string>
+        <string>self-hosted,Linux,ARM64,pulp-build-linux,$TARTCI_HOST_LABEL</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>$TARTCI_REPO</string>
+    <string>$HOME</string>
 
     <key>RunAtLoad</key>
     <true/>
@@ -83,6 +92,8 @@
 
     <key>EnvironmentVariables</key>
     <dict>
+        <key>TARTCI_LAUNCHD</key>
+        <string>1</string>
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>TARTCI_GH_CLI</key>

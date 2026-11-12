@@ -11,8 +11,11 @@ Run:  python3 scripts/test_tartci_launchd_watchdog.py
 
 from __future__ import annotations
 
+import testing_support  # noqa: E402
+import json
 import os
 import plistlib
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -22,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tartci_launchd_watchdog as wd  # noqa: E402
 
 FAILS: list[str] = []
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def check(cond: bool, msg: str) -> None:
@@ -85,13 +89,17 @@ check(disabled == {"com.example.retired"},
 STALE = wd.DEFAULT_STALE_LOG_S
 RESTART_GRACE = wd.DEFAULT_RESTART_GRACE_S
 
-# The incident signature: non-zero exit + a 2-week-stale log → wedged.
+# The incident signature: non-zero exit + a 2-week-stale log + NO VM running →
+# wedged. `vm_running` is stated explicitly because it is part of the signature,
+# not an incidental default: the wedged agent exited 126 before its script could
+# run, so nothing was ever built and no VM existed.
 v, _ = wd.classify("spawn scheduled", 126, log_age_s=14 * 24 * 3600,
-                   stale_log_s=STALE)
+                   stale_log_s=STALE, vm_running=False)
 check(v == "wedged", f"exit126 + stale log must be wedged, got {v}")
 
 # Missing log alongside a non-zero exit → wedged (died before it could log).
-v, _ = wd.classify("spawn scheduled", 126, log_age_s=None, stale_log_s=STALE)
+v, _ = wd.classify("spawn scheduled", 126, log_age_s=None, stale_log_s=STALE,
+                   vm_running=False)
 check(v == "wedged", f"exit126 + missing log must be wedged, got {v}")
 
 # Non-zero exit but a FRESH log → a live restart, not the invisible wedge.
@@ -170,6 +178,73 @@ v, _ = wd.classify(None, 0, log_age_s=STALE + 1, stale_log_s=STALE, vm_running=F
 check(v == "healthy", f"unloaded exit0 agent must be healthy, got {v}")
 
 
+# ── the VM guard on the crash-loop signature ────────────────────────────────
+# `serve --loop` exits EX_TEMPFAIL (75) BY DESIGN so launchd hands the respawn a
+# fresh App-auth environment, and launchd keeps reporting that non-zero code for
+# the whole life of the respawned supervisor. A long gate job then writes nothing
+# for its duration, so "sticky non-zero exit + stale log" describes a perfectly
+# healthy mid-build supervisor exactly as loudly as it describes a crash-loop.
+# Healing one is a bootout, which SIGTERMs the supervisor and tears the guest
+# down under a live job. The VM probe is the only signal that separates them.
+v, reason = wd.classify(
+    "running", 75, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=True,
+)
+check(v != "wedged",
+      f"sticky EX_TEMPFAIL + stale log WHILE a VM builds must not be wedged, got {v}: {reason}")
+check(v == "healthy",
+      f"sticky EX_TEMPFAIL + stale log while a VM builds must be healthy, got {v}: {reason}")
+
+# Any sticky non-zero exit, not only 75: a supervisor that exited 1, respawned,
+# and is now mid-build presents the identical signature.
+v, _ = wd.classify(
+    "running", 1, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=True,
+)
+check(v == "healthy", f"sticky exit 1 + stale log while a VM builds must be healthy, got {v}")
+
+# Fail-safe, exactly as the alive-but-frozen branch does: an unavailable
+# inventory is neither idle nor busy, so refuse rather than guess. Destroying a
+# live gate VM is not recoverable; declining to heal is.
+v, reason = wd.classify(
+    "running", 75, log_age_s=STALE + 200, stale_log_s=STALE,
+    vm_running=None, vm_probe_reason="Tart executable unavailable",
+)
+check(v == "unknown", f"blind VM probe must refuse crash-loop recovery, got {v}: {reason}")
+check(v != "wedged", f"blind VM probe must never heal a crash-loop, got {v}")
+check("Tart executable unavailable" in reason,
+      f"unavailable inventory cause must survive classification: {reason}")
+
+# Missing log is the same decision: a VM is building, so this is not the wedge.
+v, _ = wd.classify(
+    "running", 75, log_age_s=None, stale_log_s=STALE, vm_running=True,
+)
+check(v == "healthy", f"missing log while a VM builds must not be wedged, got {v}")
+
+# ...and the real detector is NOT neutered. No VM is running in the incident
+# signature (the script never ran), so these must still heal.
+v, _ = wd.classify(
+    "spawn scheduled", 126, log_age_s=14 * 24 * 3600, stale_log_s=STALE,
+    vm_running=False,
+)
+check(v == "wedged", f"exit126 + stale log + NO VM must still be wedged, got {v}")
+
+v, _ = wd.classify(
+    "spawn scheduled", 126, log_age_s=None, stale_log_s=STALE, vm_running=False,
+)
+check(v == "wedged", f"exit126 + missing log + NO VM must still be wedged, got {v}")
+
+v, _ = wd.classify(
+    "spawn scheduled", 75, log_age_s=STALE + 200, stale_log_s=STALE, vm_running=False,
+)
+check(v == "wedged", f"exit75 + stale log + NO VM must still be wedged, got {v}")
+
+# A fresh log still short-circuits to healthy before the probe is consulted, so
+# a blind probe cannot turn an ordinary live restart into a refusal.
+v, _ = wd.classify(
+    "running", 75, log_age_s=5.0, stale_log_s=STALE, vm_running=None,
+)
+check(v == "healthy", f"non-zero exit + fresh log must stay healthy even when blind, got {v}")
+
+
 # ── Tart executable + inventory probe ───────────────────────────────────────
 with tempfile.TemporaryDirectory() as td:
     tart_home = Path(td) / "VMs"
@@ -192,33 +267,66 @@ with tempfile.TemporaryDirectory() as td:
     check(probe.tart_home == str(tart_home),
           f"probe must report the exact Tart store it inspected: {probe}")
 
+# A wedged Tart store must become an unavailable probe, not hang the watchdog.
 with tempfile.TemporaryDirectory() as td:
-    tart_home = Path(td) / "custom-store"
+    tart_home = Path(td) / "VMs"
     tart_home.mkdir()
-    observed_home = Path(td) / "observed-home"
     fake_tart = Path(td) / "tart"
-    fake_tart.write_text(
-        f"#!/bin/sh\nprintf '%s' \"$TART_HOME\" > '{observed_home}'\nprintf '[null]\\n'\n"
-    )
+    fake_tart.write_text("#!/bin/sh\nsleep 2\n")
     fake_tart.chmod(0o755)
-    profile = Path(td) / "macos-fleet-profile.toml"
-    profile.write_text(f'[host]\ntart_home = "{tart_home}"\n')
     with mock.patch.dict(
         os.environ,
         {
             "PATH": "/usr/bin:/bin",
             "TARTCI_TART_CLI": str(fake_tart),
-            "TART_HOME": "",
-            "TARTCI_MACOS_FLEET_PROFILE": str(profile),
+            "TART_HOME": str(tart_home),
         },
-    ):
+    ), mock.patch.object(wd, "TART_INVENTORY_TIMEOUT_S", 0.01):
         probe = wd.probe_tart_vm_running()
-    check(observed_home.read_text() == str(tart_home),
-          "inventory command must receive the installed profile's custom Tart store")
-    check(probe.running is None,
-          f"malformed inventory entries must be unavailable, not idle: {probe}")
-    check("non-object entry" in probe.reason,
-          f"malformed inventory cause must survive the probe: {probe.reason}")
+    check(probe.running is None, f"timed-out Tart inventory must be unavailable: {probe}")
+    check("timed out" in probe.reason, f"timeout cause must survive the probe: {probe.reason}")
+
+# The installed profile names a custom Tart store; reading it needs tomllib.
+if testing_support.HAVE_TOMLLIB:
+    with tempfile.TemporaryDirectory() as td:
+        tart_home = Path(td) / "custom-store"
+        tart_home.mkdir()
+        observed_home = Path(td) / "observed-home"
+        fake_tart = Path(td) / "tart"
+        fake_tart.write_text(
+            f"#!/bin/sh\nprintf '%s' \"$TART_HOME\" > '{observed_home}'\nprintf '[null]\\n'\n"
+        )
+        fake_tart.chmod(0o755)
+        profile = Path(td) / "macos-fleet-profile.toml"
+        profile.write_text(f'[host]\ntart_home = "{tart_home}"\n')
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PATH": "/usr/bin:/bin",
+                "TARTCI_TART_CLI": str(fake_tart),
+                "TART_HOME": "",
+                "TARTCI_MACOS_FLEET_PROFILE": str(profile),
+            },
+        ):
+            probe = wd.probe_tart_vm_running()
+        check(observed_home.read_text() == str(tart_home),
+              "inventory command must receive the installed profile's custom Tart store")
+        check(probe.running is None,
+              f"malformed inventory entries must be unavailable, not idle: {probe}")
+        check("non-object entry" in probe.reason,
+              f"malformed inventory cause must survive the probe: {probe.reason}")
+
+# A failed storage gate must short-circuit Tart inventory entirely. This keeps
+# the watchdog bounded when Tart itself is blocked inside a wedged mount.
+with mock.patch.object(wd, "probe_tart_vm_running") as inventory:
+    probe = wd.probe_tart_vm_running_after_storage({
+        "state": "draining", "path": "/Volumes/Example/VMs",
+        "last_result": {"reason": "timeout after 10s"},
+    })
+check(probe.running is None, f"unhealthy storage must be unavailable: {probe}")
+check("timeout after 10s" in probe.reason,
+      f"storage reason must survive inventory short-circuit: {probe.reason}")
+check(not inventory.called, "unhealthy storage must not invoke Tart inventory")
 
 with tempfile.TemporaryDirectory() as td:
     fake_tart = Path(td) / "tart"
@@ -240,6 +348,46 @@ with tempfile.TemporaryDirectory() as td:
           f"malformed profile shape must be unavailable, not crash or idle: {probe}")
     check("Tart store unavailable" in probe.reason,
           f"malformed profile must preserve a typed store cause: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nexit 0\n")
+    fake_tart.chmod(0o755)
+    with (
+        mock.patch.dict(
+            os.environ,
+            {
+                "TARTCI_TART_CLI": str(fake_tart),
+                "TART_HOME": str(tart_home),
+            },
+        ),
+        mock.patch.object(
+            wd,
+            "_run_tart_inventory",
+            side_effect=subprocess.TimeoutExpired([str(fake_tart), "list"], 30),
+        ),
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None,
+          f"timed out Tart inventory must be unavailable, not idle: {probe}")
+    check("timed out" in probe.reason.lower(),
+          f"timed out Tart inventory must preserve its cause: {probe.reason}")
+
+with tempfile.TemporaryDirectory() as td:
+    with mock.patch.object(
+        wd.store_health,
+        "run_bounded",
+        return_value=subprocess.CompletedProcess(["tart", "list", "--format", "json"], 0, "[]", ""),
+    ) as run:
+        wd._run_tart_inventory("/bin/tart", td)
+    check(run.call_args.kwargs.get("timeout") == 30,
+          f"Tart inventory must enforce a 30s subprocess timeout: {run.call_args}")
+    check(run.call_args.kwargs.get("operation") == "tart_inventory",
+          f"Tart inventory must identify its bounded operation: {run.call_args}")
+    check(run.call_args.kwargs["env"]["TART_HOME"] == td,
+          f"Tart inventory must pass the resolved Tart home: {run.call_args}")
 
 with (
     mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": ""}),
@@ -323,6 +471,15 @@ with tempfile.TemporaryDirectory() as td:
     check(
         "runtime health is owned by Shipyard" in health.reason,
         "persistent Actions services must never enter TartCI stale-log healing",
+    )
+    # A delegation may only pass when it names the ARTIFACT carrying the other
+    # side's verdict. The bare sentence printed a checkmark for three months
+    # over a service crash-looping with no registration file; naming the file
+    # is what lets a reader tell "the other side is looking" apart from
+    # "delegated into the void".
+    check(
+        "host-attestation.json" in health.reason,
+        f"delegation must name the artifact it delegates to, got {health.reason!r}",
     )
 
 # Missing runner + participation ON is the fleet-offline incident: it must heal.
@@ -587,8 +744,44 @@ with tempfile.TemporaryDirectory() as td:
     check(label_control.verdict == "wedged",
           f"control: exit 3 from another label is still a wedge, got {label_control}")
 
-# A running interval agent is running its ONE job. bootout lands mid-rmtree and
-# leaves a half-deleted tree no later pass can classify.
+# An interval agent that exited non-zero and wrote its log a minute ago FAILED
+# a minute ago; the fresh log is that run, not a restart in progress. This
+# printed a checkmark ("reap exited 1 but log fresh") on every pass.
+with tempfile.TemporaryDirectory() as td:
+    root = Path(td)
+    log = root / "reap.log"
+    log.write_text("reap: failed\n")
+    os.utime(log, (wd.utcnow() - 60, wd.utcnow() - 60))
+    label = "com.danielraffel.tartci.reap"        # not in APPLICATION_EXIT_CODES
+    interval = _agent_plist(root, label, log, interval=3600)
+    keepalive = _agent_plist(root, label + "-keepalive", log)
+    original_run = wd._run
+    try:
+        wd._run = lambda _cmd: (0, _print_output("not running", "1"), "")
+        failed_run = wd.gather_health(label, str(interval), STALE, vm_running=False)
+        # Control, same exit and log age: a KeepAlive job mid-restart.
+        restarting = wd.gather_health(label + "-keepalive", str(keepalive), STALE,
+                                      vm_running=False)
+        # Control, same interval agent and log: a clean exit is healthy.
+        wd._run = lambda _cmd: (0, _print_output("not running", "0"), "")
+        clean = wd.gather_health(label, str(interval), STALE, vm_running=False)
+    finally:
+        wd._run = original_run
+    check(failed_run.verdict == "attention",
+          f"an interval agent's non-zero exit must not render healthy, got {failed_run}")
+    check("exited 1" in failed_run.reason,
+          f"the reason must name the exit: {failed_run.reason}")
+    check(restarting.verdict == "healthy",
+          f"control: a KeepAlive job with a fresh log is mid-restart, got {restarting}")
+    check(clean.verdict == "healthy",
+          f"control: a clean interval run is healthy, got {clean}")
+
+# A running agent declared uninterruptible must not be cut: bootout lands
+# mid-rmtree and leaves a half-deleted tree no later pass can classify. The
+# controls pin the refusal to the DECLARATION, not to the plist shape -- every
+# supervisor tick on this host is an interval agent too, and inferring the
+# refusal from the interval would retire the alive-but-frozen heal for all of
+# them without a single test going red.
 with tempfile.TemporaryDirectory() as td:
     root = Path(td)
     log = root / "reclaim.log"
@@ -596,6 +789,11 @@ with tempfile.TemporaryDirectory() as td:
     hourly = _agent_plist(root, "com.danielraffel.tartci.reclaim", log,
                           interval=3600)
     plain = _agent_plist(root, "com.danielraffel.tartci.orchard-worker", log)
+    # Same plist SHAPE as the reclaimer -- an hourly interval agent -- but not
+    # declared uninterruptible. This is the control that fails if the refusal
+    # is ever re-derived from the StartInterval.
+    ticker = _agent_plist(root, "com.danielraffel.tartci.queue-tick", log,
+                          interval=3600)
 
     def _reloader(state: str):
         seen: list[list[str]] = []
@@ -621,21 +819,29 @@ with tempfile.TemporaryDirectory() as td:
     try:
         wd._run, calls_running = _reloader("running")
         refused = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
-        # Control 1: the same running state with no declared interval reloads.
+        # Control 1: the same running state, no declared interval, reloads.
         wd._run, calls_plain = _reloader("running")
         plain_ok = wd.reload_agent("com.danielraffel.tartci.orchard-worker",
                                    str(plain))
+        # Control 1b: a running agent with the SAME hourly interval that is not
+        # declared uninterruptible still heals.
+        wd._run, calls_tick = _reloader("running")
+        tick_ok = wd.reload_agent("com.danielraffel.tartci.queue-tick",
+                                  str(ticker))
         # Control 2: the same interval agent NOT running is reloaded, so the
         # refusal above is the running state and not the plist.
         wd._run, calls_idle = _reloader("not running")
         idle_ok = wd.reload_agent("com.danielraffel.tartci.reclaim", str(hourly))
     finally:
         wd._run = original_run
-    check(not refused, "a running interval agent must refuse reload")
+    check(not refused, "a running uninterruptible agent must refuse reload")
     check(not any(c[1] == "bootout" for c in calls_running),
           "the refusal must happen before bootout, not after")
     check(plain_ok and any(c[1] == "bootout" for c in calls_plain),
           "control: a running agent with no interval still reloads")
+    check(tick_ok and any(c[1] == "bootout" for c in calls_tick),
+          "control: a running interval agent that is NOT declared "
+          "uninterruptible still heals")
     check(idle_ok and any(c[1] == "bootout" for c in calls_idle),
           "control: an idle interval agent still reloads")
 
@@ -703,6 +909,22 @@ check(wd.should_heal([NOW - 4000, NOW - 5000, NOW - 6000], NOW, WINDOW, MAXH),
 # heals_in_window prunes correctly.
 kept = wd.heals_in_window([NOW - 10, NOW - 4000], NOW, WINDOW)
 check(kept == [NOW - 10], f"heals_in_window prune: {kept}")
+
+# Smoke the real entrypoint on macOS after the serving-truth alert pass was
+# removed; Linux has no launchctl and cannot run this process-level path.
+if sys.platform == "darwin":
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "tartci_launchd_watchdog.py"),
+         "--status", "--json"], capture_output=True, text=True, check=False, timeout=30,
+    )
+    # ``--status`` is an attention report: a healthy process exits 0, while a
+    # real host condition intentionally exits 1 after still emitting JSON.
+    check(proc.returncode in (0, 1),
+          f"watchdog status entrypoint failed: {proc.stderr}")
+    try:
+        json.loads(proc.stdout)
+    except ValueError as exc:
+        check(False, f"watchdog status did not emit JSON: {exc}")
 
 
 if FAILS:

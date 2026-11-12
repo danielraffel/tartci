@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 
 TIMEOUT_EXIT_CODE = 124
@@ -113,6 +113,7 @@ def run_bounded(
     timeout: float,
     operation: str,
     pass_fds: Sequence[int] = (),
+    env: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a trusted read-only controller command with bounded capture.
 
@@ -135,6 +136,7 @@ def run_bounded(
                 stderr=stderr_file,
                 start_new_session=True,
                 pass_fds=tuple(pass_fds),
+                env=None if env is None else dict(env),
             )
         except OSError as exc:
             raise ObservationError(operation, "spawn_failed", str(exc)) from exc
@@ -196,7 +198,10 @@ def run_bounded(
         if leaked_descendant:
             detail = "unexpected descendant survived observation leader"
             stderr = f"{stderr.rstrip()}\n{detail}".lstrip()
-        return subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(command, returncode, stdout, stderr)
+        # The bound and the command can both exit 124; only this says which.
+        result.timed_out = timed_out  # type: ignore[attr-defined]
+        return result
 
 
 def require_success(
