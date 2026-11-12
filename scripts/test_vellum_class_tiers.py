@@ -13,13 +13,17 @@ from __future__ import annotations
 import re
 import subprocess
 import sys
-import tomllib
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 
+import testing_support  # noqa: E402
+
+testing_support.skip_module_without_tomllib()
+
+import tomllib  # noqa: E402
 import macos_fleet_lanes as fleet  # noqa: E402
 
 PROFILES = {h: ROOT / "profiles" / f"{h}-macos-fleet.toml" for h in ("m1", "m3", "m5", "m5studio")}
