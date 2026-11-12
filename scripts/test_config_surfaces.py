@@ -52,7 +52,7 @@ class ReadinessCarriesConfigTests(unittest.TestCase):
         self.assertIn("host.github_api_timeout_seconds", drift["keys"])
         supply = self._readiness(MISMATCHED)["config"]["supply"]
         self.assertEqual(supply["state"], "mismatch")
-        self.assertIn("vellum-gate=LABELS_DIFFER", supply["mismatched"])
+        self.assertIn("vellum-gate[vellum-build-macos]=LABELS_DIFFER", supply["mismatched"])
 
     def test_drift_never_clears_fleet_ready_by_itself(self) -> None:
         value = self._readiness(DRIFTED)

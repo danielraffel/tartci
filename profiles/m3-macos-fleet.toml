@@ -278,19 +278,35 @@ golden = "pulp-build-runner:latest"
 priority = "vm"
 supervisors = 1
 min_queued_age_seconds = 0
-labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos", "vellum-host-m3"]
-workflows = ["Locked macOS GPU proof"]
+labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
 # every host (31 of 65 Vellum boots got no job, 2026-11-01..04).
 assignment_fleet_claim_peers = true
 # Claims are keyed by the labels the Vellum job requests, not the host pin,
 # so every host's lane shares one key.
-job_claim_labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos"]
+# The class label is appended per tier (job-claim.lib.sh), so merge-group and
+# PR-head claims never cover each other.
+job_claim_labels = ["self-hosted", "macOS", "ARM64"]
 runner_idle_timeout_seconds = 60
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
+
+# Two classes, merge-group first: a merge-group "Locked macOS GPU proof" job
+# requests vellum-build-macos-merge-group, every other event requests
+# vellum-build-macos. A runner registers with exactly one class label, so it
+# can only take a job of that class. With no merge-group job queued the lane
+# serves the PR class on the same scan.
+[[lane.tier]]
+label = "vellum-build-macos-merge-group"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
+
+[[lane.tier]]
+label = "vellum-build-macos"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
 
 # The support LaunchAgents this host carries (scripts/support_agents.py).
 # Self-update renders and compares them after every update; with bootstrap =

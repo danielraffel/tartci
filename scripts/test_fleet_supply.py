@@ -115,8 +115,11 @@ class VerifySupplyTests(unittest.TestCase):
         self.assertEqual(result["state"], "match")
         self.assertEqual(result["host_id"], "studio")
         # One row per registration: pulp-gate's four classes (two gate, two
-        # release) plus the spectr, forge and vellum lanes.
-        self.assertEqual(len(result["lanes"]), 7)
+        # release), the spectr and forge lanes, and vellum's two classes.
+        self.assertEqual(len(result["lanes"]), 8)
+        self.assertEqual(
+            sorted(row["class_label"] for row in result["lanes"] if row["lane"] == "vellum-gate"),
+            ["vellum-build-macos", "vellum-build-macos-merge-group"])
         self.assertEqual(
             sorted(row["class_label"] for row in result["lanes"] if row["lane"] == "pulp-gate"),
             ["pulp-build-merge-group", "pulp-build-pr-head",
@@ -186,7 +189,7 @@ class VerifySupplyTests(unittest.TestCase):
             M3.read_text().replace('"vellum-host-m3"]', '"x"]'))
         bad = finding()
         self.assertEqual((bad.state, bad.code), (doctor.PROBLEM, "supply_mismatch"))
-        self.assertIn("vellum-gate=LABELS_DIFFER", bad.detail)
+        self.assertIn("vellum-gate[vellum-build-macos]=LABELS_DIFFER", bad.detail)
         (config / "macos-fleet-profile.toml").write_text(
             M3.read_text().replace('id = "studio"', 'id = "nohost"', 1))
         self.assertEqual(finding().code, "supply_unknown")
