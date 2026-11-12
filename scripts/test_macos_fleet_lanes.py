@@ -2421,7 +2421,7 @@ class MacosFleetLaneTests(unittest.TestCase):
             for body in fleet.rendered_plists(fleet.load(profile)).values():
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 lane = env.get("TARTCI_QUEUE_LANE_ID")
-                is_vellum = "vellum-build-macos" in env.get("TARTCI_RUNNER_LABELS", "").split(",")
+                is_vellum = env.get("TARTCI_RUNNER_REPO") == "Generous-Corp/vellum"
                 with self.subTest(profile=profile.name, lane=lane):
                     if not is_vellum:
                         self.assertNotIn("TARTCI_JOB_CLAIM_FLEET_PEERS", env)
@@ -2442,7 +2442,7 @@ class MacosFleetLaneTests(unittest.TestCase):
 
     def test_job_claim_labels_must_be_shared_advertised_labels(self) -> None:
         base = CONFIG.read_text()
-        good = 'job_claim_labels = ["self-hosted", "macOS", "ARM64", "vellum-build-macos"]'
+        good = 'job_claim_labels = ["self-hosted", "macOS", "ARM64"]'
         self.assertEqual(base.count(good), 1)
         with tempfile.TemporaryDirectory() as td:
             for value in ('["self-hosted", "not-advertised"]', "[]", '"self-hosted"',
