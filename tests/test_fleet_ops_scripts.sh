@@ -337,11 +337,11 @@ expect_rc 64 "heal installer: unknown flag" -- bash "$HEAL_INSTALL" --bogus
   # Real directories, mode read the way the installer reads it.
   for m in 0755 0700; do
     d="$tmp/mode-$m"; mkdir "$d"; chmod "$m" "$d"
-    heal_mode_ok "$(stat -f %Lp "$d" 2>/dev/null || stat -c %a "$d")" || fail "heal mode: dir $m must be accepted"
+    heal_mode_ok "$(mode_of "$d")" || fail "heal mode: dir $m must be accepted"
   done
   for m in 0775 0757; do
     d="$tmp/mode-$m"; mkdir "$d"; chmod "$m" "$d"
-    ! heal_mode_ok "$(stat -f %Lp "$d" 2>/dev/null || stat -c %a "$d")" || fail "heal mode: dir $m must be refused"
+    ! heal_mode_ok "$(mode_of "$d")" || fail "heal mode: dir $m must be refused"
   done
 ) || exit 1
 
