@@ -35,7 +35,8 @@ import support_agents as sa  # noqa: E402
 import tcc_wedge as tw  # noqa: E402
 
 ENV = "TARTCI_TCC_CONTEXT_PROBE"
-STORE = "/Volumes/Workshop/VMs"
+# The validator tests splice into the m3 profile, so the store is m3's own.
+STORE = sa.load_profile(ROOT / "profiles" / "m3-macos-fleet.toml")[0]["host"]["tart_home"]
 GOOD = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost",
         "/usr/bin/python3 -c 'import os,sys; os.close(os.open(sys.argv[1], "
         "os.O_RDONLY | os.O_DIRECTORY))' " + STORE]
@@ -136,7 +137,7 @@ class ValidatorTests(unittest.TestCase):
             ["/usr/bin/true"],                                         # one word
             [STORE + "/probe"],                                        # one word, even on the store
             ["/usr/bin/ssh", "localhost", "/usr/bin/true"],            # reaches the host only
-            ["/usr/bin/stat", "/Volumes/Workshop"],                    # the volume, not the store
+            ["/usr/bin/stat", str(Path(STORE).parent)],               # the volume, not the store
             ["/usr/bin/stat", STORE + "X"],                            # a look-alike prefix
             ["/usr/bin/stat", "/tmp/" + STORE],                        # store as a suffix
             ["ssh", "localhost", "stat " + STORE],                     # relative program
@@ -152,7 +153,7 @@ class ValidatorTests(unittest.TestCase):
             self.check("[launchd_watchdog]\nstale_log_seconds = 4500\ncontext_probe = []\n")
 
     def test_the_store_comes_from_this_hosts_profile(self) -> None:
-        problem = sa.context_probe_problem(["/usr/bin/stat", "/Volumes/Atelier/VMs"], STORE)
+        problem = sa.context_probe_problem(["/usr/bin/stat", "/Volumes/Example/VMs"], STORE)
         self.assertIsNotNone(problem)
         self.assertIsNone(sa.context_probe_problem(["/usr/bin/stat", STORE], STORE))
         self.assertIsNotNone(sa.context_probe_problem(["/usr/bin/stat", STORE], None))
