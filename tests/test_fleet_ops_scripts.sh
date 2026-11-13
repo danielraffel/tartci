@@ -324,4 +324,25 @@ expect_rc 77 "heal installer: apply refuses without root" -- env -u SUDO_USER ba
 has err "run with sudo"
 expect_rc 64 "heal installer: unknown flag" -- bash "$HEAL_INSTALL" --bogus
 
+# The chain check's mode predicate (stat prints octal; bash must read base 8).
+# Owner is root only in real use, so only the mode is tested here.
+# shellcheck source=../fleet/ops/install-tartci-heal-tcc.sh
+( source "$HEAL_INSTALL"
+  for m in 755 700 555 644; do
+    heal_mode_ok "$m" || fail "heal mode: $m must be accepted"
+  done
+  for m in 775 757 777 770 722 "" 7x5 abc -755 "7 5"; do
+    ! heal_mode_ok "$m" || fail "heal mode: '$m' must be refused"
+  done
+  # Real directories, mode read the way the installer reads it.
+  for m in 0755 0700; do
+    d="$tmp/mode-$m"; mkdir "$d"; chmod "$m" "$d"
+    heal_mode_ok "$(stat -f %Lp "$d" 2>/dev/null || stat -c %a "$d")" || fail "heal mode: dir $m must be accepted"
+  done
+  for m in 0775 0757; do
+    d="$tmp/mode-$m"; mkdir "$d"; chmod "$m" "$d"
+    ! heal_mode_ok "$(stat -f %Lp "$d" 2>/dev/null || stat -c %a "$d")" || fail "heal mode: dir $m must be refused"
+  done
+) || exit 1
+
 echo 'fleet ops scripts: ok'
