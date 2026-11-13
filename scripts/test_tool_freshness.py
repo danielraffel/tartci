@@ -119,7 +119,7 @@ def settings(**overrides) -> dict:
              "host_class": "studio",
              # This fake host is the canary unless a test says otherwise, so
              # the apply tests below exercise the apply itself.
-             "canary_host": "studio",
+             "tool_rollout": {"canary": "studio", "steward_hosts": []},
              "tools": {name: dict(tool, enabled=True) for name, tool in tf.DEFAULT_TOOLS.items()}}
     value.update(overrides)
     return value
@@ -574,7 +574,8 @@ class ToolFreshnessTests(unittest.TestCase):
         path.write_text(body)
         os.utime(path, (written, written))
         value = tf.load_settings(self.home, path)
-        value["host_class"] = value["canary_host"] = "studio"
+        value["host_class"] = "studio"
+        value["tool_rollout"] = {"canary": "studio", "steward_hosts": []}
         return value
 
     HOLD = "[tools.shipyard]\n# held: canary failed\nauto_apply = false\n"

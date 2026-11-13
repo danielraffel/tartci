@@ -308,9 +308,10 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
                     "not_ready_alert_hours", "hold_max_hours", "canary_soak_hours"):
             if key in data:
                 settings[key] = float(data[key])
-        for key in ("host_class", "canary_host", "canary_ssh"):
-            if isinstance(data.get(key), str):
-                settings[key] = data[key]
+        if isinstance(data.get("host_class"), str):
+            settings["host_class"] = data["host_class"]
+        # The canary and steward hosts are not settings: every host reads them
+        # from the published fleet/advertised-labels.json (tool_rollout).
         for name, override in (data.get("tools") or {}).items():
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
@@ -823,7 +824,8 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
         return None
     if tool.get("canary_gate"):
         soaked = soaked_candidates(row, now, float(settings["apply_after_minutes"]))
-        candidate, note = canary.gate_candidate(name, soaked, home, now, settings, state, run, gate)
+        candidate, note = canary.gate_candidate(name, tool, soaked, home, now, settings, state,
+                                                run, gate)
         if candidate is None:
             row["apply"] = row["canary_wait"] = note
             gate.setdefault("notes", []).append(f"{name}: {note}")
@@ -909,8 +911,16 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             settings: dict | None = None,
             run: Callable[[list[str], float], tuple[int, str]] = run_command,
             feed: Callable[[str], str] = fetch_feed,
-            probe: Callable[[str, str], dict] | None = None) -> dict:
-    """Measure every enabled tool, apply where allowed, record deployments."""
+            probe: Callable[[str, str], dict] | None = None,
+            clock: Callable[[], float] | None = None) -> dict:
+    """Measure every enabled tool, apply where allowed, record deployments.
+
+    `clock` reads the time after an apply (the swap time the steward check
+    judges ticks against); it defaults to the wall clock, or to `now` when a
+    test fixes `now`.
+    """
+    if clock is None:
+        clock = time.time if now is None else (lambda: now)  # type: ignore[assignment,return-value]
     now = time.time() if now is None else now
     settings = settings or load_settings(home)
     state = state_dir_for(home)
@@ -923,7 +933,17 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     attempts = _read_json(state / "attempts.json") or {}
     pending = _read_json(state / "pending.json") or {}
     steward = _read_json(state / "steward.json") or {}
+    unverified = _read_json(state / "unverified.json") or {}
     gate: dict[str, Any] = {"notes": []}
+
+    def save() -> None:
+        # After every tool, so a pass the watchdog kills at its time limit
+        # (a rollback and an apply can each take APPLY_TIMEOUT_S) still keeps
+        # what already happened: a rollback's rejected release above all.
+        _write_json(state / "attempts.json", attempts)
+        _write_json(state / "pending.json", pending)
+        _write_json(state / "steward.json", steward)
+        _write_json(state / "unverified.json", unverified)
     tools: dict[str, dict] = {}
     for name, tool in settings["tools"].items():
         if not tool.get("enabled", True):
@@ -937,12 +957,13 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                       publication_filter)
         before = {key: prior.get(key) for key in ("installed", "generation")} if prior else {}
         before_effective = (prior or {}).get("effective")
-        by = "observed"
+        by, swapped_at = "observed", now
         rolled_back = tool.get("steward_check") and tool.get("apply_command") and \
             canary.steward_pass(name, tool, row, home, now, settings, steward, attempts,
                                 lambda event: _append_event(state, event),
                                 lambda tag: _rollback(tool, home, settings, tag, run))
         if rolled_back:
+            save()
             applied = None
             before = {key: row.get(key) for key in ("installed", "generation")}
             problem = row.get("steward_problem")
@@ -958,10 +979,12 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             by = "auto_apply"
             before = {key: row.get(key) for key in ("installed", "generation")}
             before_effective = row.get("effective")
+            swapped_at = clock()  # type: ignore[misc]
             notes = {key: row[key] for key in ("apply", "canary") if key in row}
             row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
                           publication_filter)
             row.update(notes)
+        verified_states = ("current", "behind")
         for key, component in (("installed", "cli"), ("generation", "auth_generation")):
             old, new = before.get(key), row.get(key)
             if old and new and old != new:
@@ -977,14 +1000,32 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                     # Readers (the other hosts' canary gate) then wait for a
                     # clean tick on this release, not for the fixed soak.
                     event["steward_host"] = True
-                    canary.record_deploy(steward, name, new, before_effective or old, by, now)
+                    canary.record_deploy(steward, name, new, before_effective or old, by,
+                                         swapped_at)
                 _append_event(state, event)
+                if component == "cli":
+                    unverified.pop(name, None)
+                    if event["verify"] not in verified_states:
+                        # The canary gate counts only a verified deploy; a
+                        # measure that failed right after the swap is re-done
+                        # on the next pass rather than stranding the fleet.
+                        unverified[name] = {key: event[key] for key in
+                                            ("from", "to", "by", "steward_host") if key in event}
+        entry = unverified.get(name)
+        if isinstance(entry, dict) and row.get("installed") is not None:
+            if row.get("installed") != entry.get("to"):
+                unverified.pop(name, None)  # moved on; that deploy is history
+            elif row.get("state") in verified_states:
+                _append_event(state, dict(entry, event="tool_deployed", tool=name,
+                                          component="cli", at=_iso(now),
+                                          latest=row.get("latest"), downgrade=False,
+                                          verify=str(row["state"]), rerecorded=True))
+                unverified.pop(name, None)
         tools[name] = row
+        save()
     value = {"measured_at": _iso(now), "stale_hours": settings["stale_hours"], "tools": tools}
     _write_json(state / "state.json", value)
-    _write_json(state / "attempts.json", attempts)
-    _write_json(state / "pending.json", pending)
-    _write_json(state / "steward.json", steward)
+    save()
     canary.log_gate(state, now, gate["notes"])
     return value
 

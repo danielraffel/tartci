@@ -3522,7 +3522,35 @@ def published_snapshot(root: Path | None = None) -> dict:
         source.repository or ADVERTISED_LABELS_REPO)
     if not snapshot["registrations"] and not snapshot["hosts"]:
         raise ValueError("fleet source publishes no registrations or hosts")
+    rollout = tool_rollout(source.root / "fleet" / TOOL_ROLLOUT_FILE,
+                           {row["host_id"] for row in snapshot["hosts"]})
+    if rollout is not None:
+        # Additive to v1: which host applies Shipyard and pulp releases first and
+        # which hosts run the merge steward (scripts/tool_freshness_canary.py).
+        # One published copy, so no two hosts can name different canaries.
+        snapshot["tool_rollout"] = rollout
     return snapshot
+
+
+TOOL_ROLLOUT_FILE = "tool-rollout.json"
+
+
+def tool_rollout(path: Path, hosts: set[str]) -> dict | None:
+    """The validated tool rollout roles, or None when the source has no file."""
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"{path}: unreadable: {exc}") from exc
+    if not isinstance(value, dict) or set(value) - {"canary", "steward_hosts"}:
+        raise ValueError(f"{path}: must be an object with canary and steward_hosts only")
+    canary, stewards = value.get("canary"), value.get("steward_hosts", [])
+    if canary not in hosts:
+        raise ValueError(f"{path}: canary {canary!r} is not a published host ({sorted(hosts)})")
+    if not isinstance(stewards, list) or any(h not in hosts for h in stewards):
+        raise ValueError(f"{path}: steward_hosts {stewards!r} must list published hosts")
+    return {"canary": canary, "steward_hosts": list(stewards)}
 
 
 def render_published(snapshot: dict) -> str:

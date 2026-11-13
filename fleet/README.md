@@ -37,6 +37,11 @@ fleet hosts reach it by (null means the convention `tartci-<host_id>`); `tartci
 fleet-macos self-update` reads it to check its peers one host at a time.
 `persistent_runners` is additive to v1: host-owned Actions services whose
 labels are set at registration outside tartci, so only their name is declared.
+`tool_rollout` (additive) is copied from `fleet/tool-rollout.json`: the
+`canary` host that applies Shipyard and pulp releases first and the
+`steward_hosts` that run the merge steward. Tool-freshness reads it on every
+host, so the order is one committed decision (runbook: Shipyard and pulp CLI
+freshness); the generator refuses a role that is not a published host.
 
 ## Reachability rule
 

@@ -661,5 +661,11 @@
       "host_id": "m5studio",
       "ssh": "m5s"
     }
-  ]
+  ],
+  "tool_rollout": {
+    "canary": "m5",
+    "steward_hosts": [
+      "studio"
+    ]
+  }
 }
