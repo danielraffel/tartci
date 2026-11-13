@@ -776,7 +776,7 @@ class LaunchdProbeTests(unittest.TestCase):
                     result = argv[argv.index("--result") + 1]
                     value = {"phase": phase, "pid": 1, "internal_latency_ms": 0.02}
                     if opened_ago is not None:
-                        value["root_open_started"] = time.time() - opened_ago
+                        value[tw.ROOT_OPEN_STAMP] = time.monotonic() - opened_ago
                     Path(result).write_text(json.dumps(value))
                 return subprocess.CompletedProcess(argv, submit_rc, stdout="",
                                                    stderr="" if submit_rc == 0 else "denied")
@@ -815,6 +815,81 @@ class LaunchdProbeTests(unittest.TestCase):
                 self.assertEqual(self.calls[1][2], record["label"])
                 self.assertTrue(record["job_removed"])
                 self.assertEqual(os.listdir(Path(self.td.name) / tw.LAUNCHD_PROBE_DIR), [])
+
+    def injected(self, *, stamp_at=None, remove=None):
+        """A launchctl fake on an injected monotonic clock. `stamp_at`: the
+        clock reading at which the child records internal_ok and its stamp."""
+        t = {"clock": 0.0, "sleeps": 0}
+        paths: dict = {}
+
+        def clock():
+            return t["clock"]
+
+        def sleep(seconds):
+            t["sleeps"] += 1
+            t["clock"] += seconds
+            if stamp_at is not None and t["clock"] >= stamp_at \
+                    and not os.path.exists(paths["result"]):
+                Path(paths["result"]).write_text(json.dumps(
+                    {"phase": "internal_ok", "pid": 1, tw.ROOT_OPEN_STAMP: t["clock"]}))
+
+        def run(argv, *, timeout, operation):
+            self.calls.append(list(argv))
+            if argv[1] == "submit":
+                paths["result"] = argv[argv.index("--result") + 1]
+            elif remove is not None:
+                remove(paths["result"], t)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return t, clock, sleep, run
+
+    def test_an_answer_written_during_a_slow_remove_is_never_a_hang(self) -> None:
+        # The race the review reproduced (span_race.py): launchd starts the
+        # job 12 s late, the child answers root_ok 9 s into a 10 s bound, and
+        # the remove then takes 3 s. Measuring the span after the remove read
+        # 10.9 s and reported hung_on_root.
+        def slow_remove(path, t):
+            value = json.loads(Path(path).read_text())
+            value.update(phase="root_ok", root_latency_ms=9000.0)
+            Path(path).write_text(json.dumps(value))
+            t["clock"] += 3.0
+        t, clock, sleep, run = self.injected(stamp_at=12.0, remove=slow_remove)
+        record = tw.launchd_probe("/Volumes/Example/VMs", self.td.name, 10.0, runner=run,
+                                  python="/usr/bin/python3", sleep=sleep, clock=clock)
+        self.assertNotEqual(record["outcome"], "hung_on_root", record)
+        self.assertEqual(record["outcome"], "inconclusive")
+        self.assertLess(record["root_open_s"], 10.0)
+
+    def test_an_answer_after_the_last_poll_is_read_before_the_remove(self) -> None:
+        reads = iter([{"phase": "internal_ok", tw.ROOT_OPEN_STAMP: -50.0},
+                      {"phase": "root_ok", tw.ROOT_OPEN_STAMP: -50.0,
+                       "root_latency_ms": 9000.0}])
+        t, clock, sleep, run = self.injected()
+        with mock.patch.object(tw, "_read_json", lambda path: next(reads)):
+            record = tw.launchd_probe("/Volumes/Example/VMs", self.td.name, 10.0, runner=run,
+                                      python="/usr/bin/python3", sleep=sleep, clock=clock)
+        self.assertEqual(record["outcome"], "answered")
+
+    def test_the_poll_stops_as_soon_as_the_stamped_open_reaches_the_bound(self) -> None:
+        t, clock, sleep, run = self.injected(stamp_at=1.0)
+        record = tw.launchd_probe("/Volumes/Example/VMs", self.td.name, 2.0, runner=run,
+                                  python="/usr/bin/python3", sleep=sleep, clock=clock,
+                                  grace_s=600.0)
+        self.assertEqual(record["outcome"], "hung_on_root")
+        # Stamp at 1.0 s, bound 2.0 s: done near 3.0 s, not at the 602 s cap.
+        self.assertLess(t["clock"], 3.5)
+        self.assertGreaterEqual(record["root_open_s"], 2.0)
+
+    def test_a_wall_clock_step_does_not_stretch_the_span(self) -> None:
+        wall = {"now": NOW}
+
+        def stepping_now():
+            wall["now"] += 3600.0
+            return wall["now"]
+        # The open has run about 0.5 s of a 1 s bound when the cap ends the
+        # poll; a wall clock jumping an hour per read must not make it a hang.
+        record = self.probe(self.runner("internal_ok", opened_ago=-0.5), timeout_s=1.0,
+                            now=stepping_now, grace_s=0.0)
+        self.assertEqual(record["outcome"], "inconclusive")
 
     def test_submit_argv_opens_the_volume_root_from_the_internal_dir(self) -> None:
         self.probe(self.runner("root_ok"))
@@ -870,7 +945,8 @@ class LaunchdProbeTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         value = json.loads(result.read_text())
         self.assertEqual(value["phase"], "root_ok")
-        self.assertIsInstance(value["root_open_started"], float)
+        self.assertIsInstance(value[tw.ROOT_OPEN_STAMP], float)
+        self.assertLessEqual(value[tw.ROOT_OPEN_STAMP], time.monotonic())
         result.unlink()
         subprocess.run(args + ["--root", str(Path(self.td.name) / "absent")], check=False)
         value = json.loads(result.read_text())

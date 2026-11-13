@@ -69,6 +69,9 @@ def main(argv: list | None = None) -> int:
     record = {"pid": os.getpid(), "phase": "internal_ok",
               "internal_latency_ms": open_dir(args.internal)}
     # The parent times the root open from this stamp, not from its submit.
+    # Monotonic: system-wide, shared with the parent, immune to clock steps.
+    # The wall-clock stamp is evidence only.
+    record["root_open_started_monotonic"] = time.monotonic()
     record["root_open_started"] = time.time()
     write_result(args.result, record)
     try:

@@ -182,6 +182,10 @@ LAUNCHD_POLL_S = 0.1
 # How long launchd may take to start the job and reach its root open, past
 # the root-open bound itself, before the reading is inconclusive.
 LAUNCHD_START_GRACE_S = 10.0
+# The child's time.monotonic() as it starts the root open. The monotonic clock
+# is system-wide (mach absolute time on macOS), so parent and child share it,
+# and a wall-clock step cannot stretch the span into a false hang.
+ROOT_OPEN_STAMP = "root_open_started_monotonic"
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tcc_launchd_probe_child.py")
 # Outcomes of the launchd probe that say the root answered (or failed fast):
 # the store is not hanging on an authorization from that context, so the
@@ -308,6 +312,10 @@ def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
     seen: Optional[dict] = None
     submitted = False
     began = clock()
+    # The clock reading the root-open span is measured at: taken with the
+    # last read of the child's result, BEFORE the remove (which can take up to
+    # LAUNCHCTL_TIMEOUT_S), never after it.
+    read_at: Optional[float] = None
     try:
         with open(os.path.join(probe_dir, label + ".label"), "w") as marker:
             marker.write(f"{started_epoch}\n")
@@ -327,14 +335,20 @@ def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
             cap = began + timeout_s + grace_s
             while True:
                 seen = _read_json(result_path)
+                opened = (seen or {}).get(ROOT_OPEN_STAMP)
                 if seen and seen.get("phase") in ("root_ok", "root_error"):
                     break
-                opened = (seen or {}).get("root_open_started")
-                if isinstance(opened, (int, float)) and now() - opened >= timeout_s:
+                if isinstance(opened, (int, float)) and clock() - opened >= timeout_s:
                     break
                 if clock() >= cap:
                     break
                 sleep(LAUNCHD_POLL_S)
+            # One last read, then freeze: an answer that landed after the last
+            # poll counts, and the span is fixed here, before the remove.
+            latest = _read_json(result_path)
+            if latest:
+                seen = latest
+            read_at = clock()
     finally:
         removed, why = _remove_job(label, runner)
         record["job_removed"] = removed
@@ -348,7 +362,7 @@ def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
     phase = (seen or {}).get("phase")
     record["phase"] = phase
     for key in ("internal_latency_ms", "root_latency_ms", "errno", "error",
-                "root_open_started"):
+                "root_open_started", ROOT_OPEN_STAMP):
         if seen and key in seen:
             record[key] = seen[key]
     if phase == "root_ok":
@@ -356,8 +370,9 @@ def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
     elif phase == "root_error":
         record["outcome"] = "root_error"
     elif phase == "internal_ok":
-        opened = (seen or {}).get("root_open_started")
-        span = now() - opened if isinstance(opened, (int, float)) else None
+        opened = (seen or {}).get(ROOT_OPEN_STAMP)
+        span = (read_at - opened
+                if isinstance(opened, (int, float)) and read_at is not None else None)
         record["root_open_s"] = None if span is None else round(span, 3)
         if span is not None and span >= timeout_s:
             record["outcome"] = "hung_on_root"
