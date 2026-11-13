@@ -123,8 +123,9 @@ def _published() -> dict:
 def rollout(settings: dict) -> dict:
     """{"canary", "steward_hosts", "error"} from the published supply.
 
-    `settings["tool_rollout"]` replaces the file (load_settings fills it from
-    the file; tests inject it). tool-freshness.toml cannot set it.
+    `settings["tool_rollout"]`, when present, replaces the file (tests inject
+    it); otherwise the published file is read here. tool-freshness.toml cannot
+    set it.
     """
     published = _published()
     value = settings.get("tool_rollout")
@@ -284,7 +285,11 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
         return newest, f"canary {canary}: applies first"
     # (host, needs a clean steward tick): the canary, then for a tool with a
     # steward check every steward host other than this one.
-    required = [(canary, False)]
+    # A canary that is also a published steward host must show a clean steward
+    # tick, whatever its own deploy event says: that flag is written by the
+    # canary's checkout, and a stale one there would weaken every reader's gate.
+    required = [(canary, bool(tool.get("steward_check"))
+                 and canary in roles["steward_hosts"])]
     if tool.get("steward_check"):
         required += [(host, True) for host in roles["steward_hosts"]
                      if host not in (me, canary)]

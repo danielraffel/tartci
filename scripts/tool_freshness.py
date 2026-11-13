@@ -293,6 +293,10 @@ def _append_event(state: Path, event: dict) -> None:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
 
 
+# Keys tool-freshness.toml may not override for a tool (see load_settings).
+GATE_KEYS = ("canary_gate", "steward_check")
+
+
 def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
     """Defaults merged with ~/.config/tartci/tool-freshness.toml when present."""
     settings: dict[str, Any] = {
@@ -313,6 +317,10 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         # The canary and steward hosts are not settings: every host reads them
         # from the published fleet/advertised-labels.json (tool_rollout).
         for name, override in (data.get("tools") or {}).items():
+            # The release gates are fleet policy, not a host setting: a per-host
+            # file must not switch off the canary soak or the steward stage.
+            override = {k: v for k, v in (override if isinstance(override, dict) else {}).items()
+                        if k not in GATE_KEYS}
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
             default_on = bool(settings["tools"][name].get("auto_apply"))

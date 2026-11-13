@@ -468,6 +468,41 @@ class CanaryGateTests(_Fleet):
         self.assertNotIn("canary_host", value)
         self.assertNotIn("tool_rollout", value)
 
+    def test_tool_freshness_toml_cannot_switch_off_the_gates(self) -> None:
+        if tf.tomllib is None:
+            self.skipTest("needs tomllib")
+        path = self.home / "tool-freshness.toml"
+        path.write_text('[tools.shipyard]\ncanary_gate = false\nsteward_check = false\n'
+                        'auto_apply = true\n')
+        value = tf.load_settings(self.home, path)
+        self.assertTrue(value["tools"]["shipyard"]["canary_gate"])
+        self.assertTrue(value["tools"]["shipyard"]["steward_check"])
+        # Control: other per-tool keys still apply.
+        self.assertTrue(value["tools"]["shipyard"]["auto_apply"])
+
+    def test_a_canary_that_is_also_a_steward_host_needs_a_clean_tick(self) -> None:
+        # Its deploy event lacks steward_host (a stale checkout wrote it); the
+        # 2 h soak alone must not clear it for the other hosts.
+        unflagged = deployed("0.221.1", NOW - 3 * HOUR)
+        verified = {"event": "tool_steward_verified", "tool": "shipyard",
+                    "at": iso(NOW - HOUR), "version": "0.221.1"}
+        studio = canary_events(deployed("0.221.1", NOW - 3 * HOUR, steward_host=True), verified)
+        host = self.behind({"m5": canary_events(unflagged), "m3": studio})
+        row = self.refresh(host, "m1", stewards=["m5", "studio"])["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), [])
+        self.assertIn("canary m5", row["apply"])
+        self.assertIn("steward tick", row["apply"])
+        # Control: with a clean tick on the canary too, the release applies.
+        self.switch_host()
+        host = self.behind({"m5": canary_events(unflagged, verified), "m3": studio})
+        self.refresh(host, "m1", stewards=["m5", "studio"])
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        # Control: a canary that is not a steward host clears on the soak alone.
+        self.switch_host()
+        host = self.behind({"m5": canary_events(unflagged), "m3": studio})
+        self.refresh(host, "m1", stewards=["studio"])
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
     # ── a deploy whose verification failed is re-recorded ──
 
     def test_a_deploy_measured_unknown_is_re_recorded_once_verified(self) -> None:
