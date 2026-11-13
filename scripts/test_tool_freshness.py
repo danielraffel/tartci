@@ -426,7 +426,7 @@ class ToolFreshnessTests(unittest.TestCase):
         # With the canary gate on, a host that cannot name itself is never the
         # canary: it waits (fail closed) and never applies.
         row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
-        self.assertIn("waiting for canary studio (this host's id is unknown)", row["apply"])
+        self.assertIn("waiting: this host's id is unknown", row["apply"])
         self.assertFalse(any("fleet-update" in call for call in host.calls))
         no_class["tools"]["shipyard"]["canary_gate"] = False
         row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
