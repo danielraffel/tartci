@@ -1052,6 +1052,13 @@ class DoctorContextTests(unittest.TestCase):
         self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=draining, context="ctx",
                                               now=NOW).code, "store_context_disagree")
 
+    def test_a_future_watchdog_timestamp_is_unknown_not_ok(self) -> None:
+        future = {"state": "healthy", "consecutive_failures": 0,
+                  "updated_at": NOW + 3600}
+        finding = fd.check_store_stall(self.OWN_OK, watchdog=future, context="ctx", now=NOW)
+        self.assertEqual((finding.state, finding.code), (fd.UNKNOWN, "store_watchdog_stale"))
+        self.assertIn("timestamp is in the future", finding.detail)
+
     def test_one_watchdog_failure_is_not_all_clear(self) -> None:
         suspect = {"state": "suspect", "consecutive_failures": 1, "updated_at": NOW,
                    "last_result": {"reason": "timeout after 10s"}}

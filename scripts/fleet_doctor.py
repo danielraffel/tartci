@@ -1217,11 +1217,13 @@ def watchdog_store_reading(value: dict | None, now: float | None = None) -> dict
     now = time.time() if now is None else now
     context = str(value.get("probe_context") or "launchd watchdog (launchd job)")
     updated = value.get("updated_at")
+    future_dated = isinstance(updated, (int, float)) and updated > now
     age = (f", {int(now - updated)}s ago" if isinstance(updated, (int, float))
            and updated <= now else "")
     # The watchdog rewrites the file every pass; past two passes (plus slack)
     # the reading says nothing about now, whatever state it last had.
-    stale = (not isinstance(updated, (int, float))
+    stale = (future_dated
+             or not isinstance(updated, (int, float))
              or now - updated > WATCHDOG_STALE_AFTER_PASSES * tcc_wedge.WATCHDOG_INTERVAL_S + 60)
     last = value.get("last_result") if isinstance(value.get("last_result"), dict) else {}
     text = f"{context}: {state}{age}"
@@ -1231,7 +1233,9 @@ def watchdog_store_reading(value: dict | None, now: float | None = None) -> dict
         kind = (value.get("classification") or {}).get("kind")
         if kind:
             text += f", classified {kind}"
-    if stale:
+    if future_dated:
+        text += " (stale: the launchd watchdog timestamp is in the future)"
+    elif stale:
         text += " (stale: the launchd watchdog has not rewritten it for over "\
                 f"{WATCHDOG_STALE_AFTER_PASSES} passes)"
     return {"state": state, "text": text, "consecutive_failures": failures,
