@@ -91,6 +91,9 @@ class FakeSystem(su.System):
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
         self.peer_status_errors: dict[str, str] = {}
+        # A peer's launchd watchdog store-health.json, keyed by SSH target.
+        # Absent: a healthy reading taken just now. None: no file. An int: ssh exit code.
+        self.peer_store: dict[str, object] = {}
         self.peer_markers: dict[str, dict] = {}
         self.peer_waiting: dict[str, dict] = {}   # a peer's waiting.json ticket
         self.peer_clock: dict[str, float] = {}
@@ -286,6 +289,13 @@ class FakeSystem(su.System):
             return ok()
         if a[:2] == ["pgrep", "-f"] and a[2] == tart_pin.TART_RUN_PATTERN:
             return su.Result(0, "4242 tart run m5-gate\n") if self.tart_running else su.Result(1)
+        if a[0] == "ssh" and a[-1] == su.PEER_STORE_HEALTH_COMMAND:
+            peer = a[a.index("--") + 1]
+            value = self.peer_store.get(peer, {"state": "healthy", "consecutive_failures": 0,
+                                               "updated_at": int(self.clock) - 60})
+            if isinstance(value, int):
+                return su.Result(value, "", "ssh: unreachable")
+            return ok(f"{int(self.clock)}\n" + (json.dumps(value) if value else ""))
         if a[0] == "ssh" and a[-1] == su.TART_VERIFIED_SCRIPT:
             if self.peer_tart_rc:
                 return su.Result(self.peer_tart_rc, "", "ssh: connect timed out")
@@ -1105,6 +1115,42 @@ class OnDemandSupplyTests(Base):
         # An older tartci, or a status the probe cannot read, is not capability.
         self.sys.peers["m5"] = {"state": "on", "participating": True}
         self.assertRefusedWithoutMutation("no fleet section")
+
+    def test_a_covering_peer_whose_store_cannot_admit_does_not_cover(self) -> None:
+        # m5's drain on 2026-11-13 counted studio as covering while studio's
+        # watchdog read its store as draining (a TCC wedge): no VM could start.
+        # Here the covering peer is m5.
+        wedged = {"state": "draining", "consecutive_failures": 4, "drain_required": True,
+                  "updated_at": int(self.sys.clock) - 60,
+                  "last_result": {"ok": False, "reason": "timeout after 10s"},
+                  "classification": {"kind": "stalled_unclassified"}}
+        cases = {
+            "draining": wedged,
+            "wedged": dict(wedged, classification={"kind": "tcc_attribution_wedge"}),
+            "suspect": dict(wedged, state="suspect", consecutive_failures=1),
+            "no state file": None,
+            "unreachable": 255,
+            "stale healthy": {"state": "healthy", "consecutive_failures": 0,
+                              "updated_at": int(self.sys.clock) - 3600},
+        }
+        fragments = {"draining": "store health is draining",
+                     "wedged": "tcc_attribution_wedge", "suspect": "store health is suspect",
+                     "no state file": "no Tart store health reading",
+                     "unreachable": "Tart store health unreadable",
+                     "stale healthy": "stale"}
+        for name, value in cases.items():
+            with self.subTest(name):
+                self.sys.peer_store["m5"] = value
+                self.assertRefusedWithoutMutation(fragments[name])
+
+    def test_a_healthy_store_lets_the_covering_peer_count(self) -> None:
+        # The control for the test above: the same peer, its store healthy.
+        self.sys.peer_store["m5"] = {"state": "healthy", "consecutive_failures": 0,
+                                     "updated_at": int(self.sys.clock) - 120}
+        self.assertUpdated(self.apply())
+        reads = [a for a, _ in self.sys.calls
+                 if a[0] == "ssh" and a[-1] == su.PEER_STORE_HEALTH_COMMAND]
+        self.assertEqual([a[a.index("--") + 1] for a in reads], ["m5"])
 
     def test_capacity_unknown_still_refuses(self) -> None:
         self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}

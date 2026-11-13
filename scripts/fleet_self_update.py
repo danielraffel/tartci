@@ -2693,6 +2693,8 @@ def census_env(repository: str | None = None) -> dict[str, str]:
 # The capacity floor owns the judgement of whether a peer can mint on demand;
 # this module reuses it so the two never disagree about the same peer.
 peer_mints_on_demand = capacity_floor.peer_mints_on_demand
+peer_store_admits = capacity_floor.peer_store_admits
+PEER_STORE_HEALTH_COMMAND = capacity_floor.PEER_STORE_HEALTH_COMMAND
 
 
 def on_demand_supply(cfg: Config, sys_: System, me: str,
@@ -2726,6 +2728,13 @@ def on_demand_supply(cfg: Config, sys_: System, me: str,
                 value = None
             health[host_id] = (peer_mints_on_demand(value) if value is not None
                                else f"pool status unreadable (exit {status.rc})")
+            if health[host_id] is None:
+                # A host whose Tart store the watchdog reads as draining admits
+                # no VM, however healthy its pool reads; unreadable is not
+                # covering either.
+                store = sys_.run([*ssh, PEER_STORE_HEALTH_COMMAND], timeout=60)
+                health[host_id] = (peer_store_admits(store.out) if store.rc == 0
+                                   else f"Tart store health unreadable (exit {store.rc})")
         return health[host_id]
 
     covered: dict[str, list[str]] = {}
