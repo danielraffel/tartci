@@ -126,16 +126,27 @@ def rollout(settings: dict) -> dict:
     `settings["tool_rollout"]` replaces the file (load_settings fills it from
     the file; tests inject it). tool-freshness.toml cannot set it.
     """
+    published = _published()
     value = settings.get("tool_rollout")
     if value is None:
-        value = _published().get("tool_rollout")
+        value = published.get("tool_rollout")
     if not isinstance(value, dict) or not isinstance(value.get("canary"), str) \
             or not value["canary"]:
         return {"canary": None, "steward_hosts": [],
                 "error": f"no tool_rollout canary in {PUBLISHED}"}
-    hosts = value.get("steward_hosts") or []
-    return {"canary": value["canary"],
-            "steward_hosts": [h for h in hosts if isinstance(h, str) and h], "error": None}
+    rows = published.get("hosts")
+    known = {row["host_id"] for row in rows
+             if isinstance(row, dict) and isinstance(row.get("host_id"), str)
+             and row["host_id"]} if isinstance(rows, list) else set()
+    hosts = value.get("steward_hosts")
+    # Reject the entire role set: filtering bad entries could silently remove
+    # a required steward and let a release pass after only the canary soak.
+    if value["canary"] not in known or not isinstance(hosts, list) or not hosts \
+            or any(not isinstance(h, str) or h not in known for h in hosts):
+        return {"canary": None, "steward_hosts": [],
+                "error": f"invalid tool_rollout in {PUBLISHED}: canary and a non-empty "
+                         "steward_hosts list must name published hosts"}
+    return {"canary": value["canary"], "steward_hosts": hosts, "error": None}
 
 
 def self_host_id(home: Path, settings: dict) -> str | None:

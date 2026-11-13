@@ -110,7 +110,8 @@ class _Fleet(unittest.TestCase):
     def refresh(self, host: Host, me: str, now: float = NOW, stewards: list | None = None,
                 clock: Any = None, **overrides) -> dict:
         value = settings(**{"host_class": me,
-                            "tool_rollout": {"canary": "m5", "steward_hosts": stewards or []},
+                            "tool_rollout": {"canary": "m5",
+                                             "steward_hosts": ["studio"] if stewards is None else stewards},
                             "ssh_targets": {"m5": "m5", "studio": "m3"}, **overrides})
         value["tools"].pop("tart", None)
         ready = {"ready": True, "missing": [], "sums": None, "detail": "ready"}
@@ -186,7 +187,7 @@ class CanaryGateTests(_Fleet):
         # The gate fails closed on its own, whether or not the apply command
         # later needs {host_class}.
         host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
-        value = settings(**{"host_class": None, "tool_rollout": {"canary": "m5", "steward_hosts": []},
+        value = settings(**{"host_class": None, "tool_rollout": {"canary": "m5", "steward_hosts": ["studio"]},
                             "ssh_targets": {"m5": "m5"}})
         soaked = [{"version": "0.221.1", "tag": "v0.221.1"}]
         got, note = canary.gate_candidate("shipyard", {"canary_gate": True}, soaked, self.home,
@@ -403,6 +404,60 @@ class CanaryGateTests(_Fleet):
         # No published canary: nobody applies, not even the host named m5.
         self.assertEqual(host.fleet_updates(), [])
         self.assertIn("no tool_rollout canary", row["shipyard"]["apply"])
+
+    def test_malformed_runtime_roles_block_even_a_cleared_canary(self) -> None:
+        # All peers have healthy evidence: malformed roles must block before
+        # reading them, rather than silently dropping the steward stage.
+        verified = {"event": "tool_steward_verified", "tool": "shipyard",
+                    "at": iso(NOW - HOUR), "version": "0.221.1"}
+        cleared = canary_events(deployed("0.221.1", NOW - 3 * HOUR), verified)
+        invalid = [{"canary": "m5"}] + [
+            {"canary": "m5", "steward_hosts": value}
+            for value in (None, [], "studio", {"studio": True}, 1, False,
+                          [None], [""], ["m9"], ["studio", None],
+                          ["studio", "m9"], [["studio"]], [{"host_id": "studio"}])]
+        invalid.append({"canary": "m9", "steward_hosts": ["studio"]})
+        published = json.loads(canary.PUBLISHED.read_text())
+        for roles in invalid:
+            for from_file in (False, True):
+                with self.subTest(roles=roles, from_file=from_file):
+                    value = settings(host_class="m1", tool_rollout=roles)
+                    if from_file:
+                        value.pop("tool_rollout")
+                    with mock.patch.object(canary, "_published", return_value={
+                            **published, "tool_rollout": roles}):
+                        parsed = canary.rollout(value)
+                        self.assertIsNotNone(parsed["error"])
+                        self.assertEqual(parsed["steward_hosts"], [])
+                        for me in ("m5", "studio", "m1"):
+                            value["host_class"] = me
+                            host = self.behind(cleared)
+                            got, note = canary.gate_candidate(
+                                "shipyard", {"steward_check": True},
+                                [{"version": "0.221.1", "tag": "v0.221.1"}],
+                                self.home, NOW, value, self.state, host.run, {})
+                            self.assertIsNone(got)
+                            self.assertIn("tool_rollout", note)
+                            self.assertEqual(host.calls, [])
+                    self.switch_host()
+                    host = self.behind(cleared)
+                    row = self.refresh(host, "m1", tool_rollout=roles)["tools"]["shipyard"]
+                    self.assertEqual(host.fleet_updates(), [])
+                    self.assertIn("tool_rollout", row["apply"])
+        # Positive control: the same release applies when both published roles
+        # are valid and the steward has verified it.
+        self.switch_host()
+        host = self.behind(cleared)
+        self.refresh(host, "m1", stewards=["studio"])
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
+    def test_runtime_roles_require_a_published_host_inventory(self) -> None:
+        roles = {"canary": "m5", "steward_hosts": ["studio"]}
+        for hosts in (None, [], "studio", {"studio": {}}, [None],
+                      [{"host_id": "m5"}], [{"host_id": ["studio"]}]):
+            with self.subTest(hosts=hosts), mock.patch.object(
+                    canary, "_published", return_value={"hosts": hosts, "tool_rollout": roles}):
+                self.assertIsNotNone(canary.rollout({})["error"])
 
     def test_tool_freshness_toml_cannot_name_the_canary(self) -> None:
         if tf.tomllib is None:
