@@ -1002,7 +1002,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                 downgrade = _version(new) < _version(old)  # type: ignore[operator]
                 event = {
                     "event": "tool_deployed", "tool": name, "component": component,
-                    "at": _iso(now), "from": old, "to": new, "latest": row.get("latest"),
+                    "at": _iso(swapped_at), "from": old, "to": new, "latest": row.get("latest"),
                     "by": by, "downgrade": downgrade,
                     "verify": "current" if row.get("state") == "current"
                     else str(row.get("state"))}

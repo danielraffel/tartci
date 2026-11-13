@@ -338,6 +338,14 @@ class ToolFreshnessTests(unittest.TestCase):
         # pulp is already current, so it is not installed.
         self.assertFalse(any("pulp-install" in c for c in host.calls))
 
+    def test_auto_apply_records_the_post_apply_swap_time(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+
+        self.refresh(host, clock=lambda: NOW + 5 * 60)
+
+        self.assertEqual(self.events()[0]["at"], iso(NOW + 5 * 60))
+
     def test_a_behind_pulp_cli_is_installed_from_its_pinned_release_installer(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
         host.apply_installs["pulp"] = "0.877.2"
