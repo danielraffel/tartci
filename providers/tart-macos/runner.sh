@@ -1738,6 +1738,27 @@ discard_current_vm(){
 # failure TARTCI_DELETE_EVIDENCE holds rc, elapsed_ms, bounded, load1 and the
 # last stderr lines (scripts/delete_evidence.py) for the delete_unproved event.
 TARTCI_DELETE_EVIDENCE=""
+# A foreground child would defer the INT/TERM trap until it returns, and the
+# pending-delete retry can run for a minute: past launchd's ExitTimeOut, so a
+# pool-off, self-update or reload would SIGKILL the supervisor before cleanup.
+# Long teardown children run in the background and are waited on instead; the
+# trap interrupts `wait` at once and handle_supervisor_signal terminates the
+# child (bounded_command.py kills its process group on SIGTERM).
+TARTCI_FOREGROUND_CHILD=""
+tartci_wait_foreground_child(){
+  local rc=0
+  TARTCI_FOREGROUND_CHILD="$1"
+  wait "$1" || rc=$?
+  TARTCI_FOREGROUND_CHILD=""
+  return "$rc"
+}
+tartci_stop_foreground_child(){
+  local pid="${TARTCI_FOREGROUND_CHILD:-}"
+  [ -n "$pid" ] || return 0
+  TARTCI_FOREGROUND_CHILD=""
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+}
 tartci_tart_delete(){
   local vm="$1" bound="${2:-$TEARDOWN_STEP_TIMEOUT}" status err rc=0
   TARTCI_DELETE_EVIDENCE=""
@@ -1745,7 +1766,8 @@ tartci_tart_delete(){
   err="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-stderr.XXXXXX")" || { rm -f "$status"; return 1; }
   python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
     --timeout "$bound" --operation tart-delete --status-file "$status" -- \
-    tart delete "$vm" >/dev/null 2>"$err" || rc=$?
+    tart delete "$vm" >/dev/null 2>"$err" &
+  tartci_wait_foreground_child $! || rc=$?
   if [ "$rc" -ne 0 ]; then
     TARTCI_DELETE_EVIDENCE="$(python3 "$TARTCI_ROOT/scripts/delete_evidence.py" \
       --status "$status" --stderr "$err" 2>/dev/null)" || TARTCI_DELETE_EVIDENCE="evidence=unavailable"
@@ -1763,11 +1785,18 @@ tartci_tart_delete(){
 # verdict (absent, present or unreadable) for events and the self-check.
 TARTCI_ABSENCE_VERDICT=""
 tart_vm_proved_absent(){
-  local attempts="${2:-1}" rc=0
-  TARTCI_ABSENCE_VERDICT="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
-    --timeout-seconds "$TEARDOWN_STEP_TIMEOUT" --tart-home "$TART_HOME" \
+  local attempts="${2:-1}" rc=0 out dir_args=()
+  # The directory proof reads the store unbounded, so only a store that the
+  # storage-health probe last found healthy may answer for a hung listing.
+  [ "${STORAGE_HEALTH_STATE:-unknown}" != ok ] || dir_args=(--tart-home "$TART_HOME")
+  out="$(mktemp "${TMPDIR:-/tmp}/tartci-absence.XXXXXX")" || { TARTCI_ABSENCE_VERDICT=unreadable; return 75; }
+  python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+    --timeout-seconds "$TEARDOWN_STEP_TIMEOUT" ${dir_args[@]+"${dir_args[@]}"} \
     --attempts "$attempts" --backoff-seconds "${DELETE_PROOF_BACKOFF_SECS:-2}" \
-    --vm-absent "$1" 2>/dev/null)" || rc=$?
+    --vm-absent "$1" >"$out" 2>/dev/null &
+  tartci_wait_foreground_child $! || rc=$?
+  TARTCI_ABSENCE_VERDICT="$(cat "$out" 2>/dev/null)"
+  rm -f "$out"
   case "$TARTCI_ABSENCE_VERDICT" in absent|present|unreadable) ;; *) TARTCI_ABSENCE_VERDICT=unreadable ;; esac
   return "$rc"
 }
@@ -1810,6 +1839,9 @@ tartci_record_incident(){
 tartci_held_slot_self_check(){
   local now held q
   [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 1
+  # An unreadable observation is not an absent VM: only a store the health
+  # probe last found readable lets "nothing has seen it" mean anything.
+  [ "${STORAGE_HEALTH_STATE:-unknown}" = ok ] || return 1
   now="$(date +%s)"
   held=$(( now - ${PENDING_DELETE_LAST_SEEN:-${PENDING_DELETE_SINCE:-$now}} ))
   [ "$held" -ge "$HELD_SLOT_SELF_CHECK_SECS" ] || return 1
@@ -1838,8 +1870,19 @@ reconcile_pending_delete(){
   PENDING_DELETE_ATTEMPTS=$((PENDING_DELETE_ATTEMPTS + 1))
   [ -n "$PENDING_DELETE_SINCE" ] || PENDING_DELETE_SINCE="$(date +%s)"
   TARTCI_ABSENCE_VERDICT=""
+  # The retry can outlast the heartbeat-staleness bound readers apply, so a
+  # keepalive refreshes the teardown-pending phase while it runs.
+  local proved=0
+  if declare -F heartbeat >/dev/null && declare -F tartci_heartbeat_keepalive_start >/dev/null; then
+    heartbeat teardown-pending
+    tartci_heartbeat_keepalive_start
+  fi
   if tartci_tart_delete "$CURRENT_VM" "$PENDING_DELETE_TIMEOUT" \
     || tart_vm_proved_absent "$CURRENT_VM" "$DELETE_PROOF_ATTEMPTS"; then
+    proved=1
+  fi
+  ! declare -F tartci_heartbeat_keepalive_stop >/dev/null || tartci_heartbeat_keepalive_stop
+  if [ "$proved" = 1 ]; then
     note "pending-delete VM $CURRENT_VM proved gone (attempt $PENDING_DELETE_ATTEMPTS) — releasing its capacity"
     event teardown_reconciled "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS"
     tartci_release_pending_delete
@@ -1897,6 +1940,7 @@ cleanup(){
 }
 
 handle_supervisor_signal(){
+  tartci_stop_foreground_child
   if [ -n "$CURRENT_RUN_ID" ] || [ -n "$CURRENT_SCAN_PID" ] || [ "${assigned:-0}" = 1 ]; then
     CURRENT_ASSIGNMENT_QUARANTINE="signal_teardown_unknown"
     CURRENT_JOB_CAPTURE_STATUS="terminal_unknown"
