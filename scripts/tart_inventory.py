@@ -91,14 +91,17 @@ def vm_dir_absent(name: str, tart_home: str) -> bool | None:
     asking `tart` (which is what times out on a loaded host). The store root is
     the control: it must be a readable directory with at least one entry (a
     real store always holds its goldens). An unreadable, missing or empty root
-    returns None, so a wrong TART_HOME can never read as "absent".
+    returns None, so a wrong TART_HOME can never read as "absent". Only a VM
+    directory counts as an entry: a stray file such as .DS_Store does not.
+    The caller passes TART_HOME only when the store's health probe last
+    succeeded, because these reads are not bounded.
     """
     if not name or "/" in name or name in (".", ".."):
         return None
     root = os.path.join(tart_home, "vms")
     try:
         with os.scandir(root) as entries:
-            if next(entries, None) is None:
+            if not any(entry.is_dir(follow_symlinks=False) for entry in entries):
                 return None
     except OSError:
         return None

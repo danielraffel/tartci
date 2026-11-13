@@ -164,6 +164,8 @@ class TartVmAbsentRecheckTests(unittest.TestCase):
             if store is not None:
                 home = root / "home"
                 (home / "vms").mkdir(parents=True)
+                if store == "stray-file":
+                    (home / "vms" / ".DS_Store").write_text("x")
                 if store in ("populated", "with-vm"):
                     (home / "vms" / "golden:latest").mkdir()
                 if store == "with-vm":
@@ -201,6 +203,11 @@ class TartVmAbsentRecheckTests(unittest.TestCase):
     def test_empty_store_proves_nothing(self) -> None:
         # A wrong TART_HOME (an empty vms directory) must never read as absent.
         result = self._run("exec sleep 30\n", store="empty")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.stdout.strip(), "unreadable")
+
+    def test_a_store_holding_only_a_stray_file_proves_nothing(self) -> None:
+        result = self._run("exec sleep 30\n", store="stray-file")
         self.assertEqual(result.returncode, 75, result.stderr)
         self.assertEqual(result.stdout.strip(), "unreadable")
 
