@@ -75,6 +75,12 @@ DEFAULT_PUBLISHED_SUPPLY = fleet_source.resolve(ROOT, allow_environment=False).p
 # A peer with no `ssh` in the published supply is reached through this alias.
 SSH_ALIAS_CONVENTION = "tartci-{host_id}"
 PEER_STATUS_COMMAND = "cd ~ && ~/.local/bin/tartci pool status --json"
+# The peer's own clock, then its launchd watchdog's Tart store reading. Read-only.
+PEER_STORE_HEALTH_COMMAND = ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/'
+                             'store-health.json" 2>/dev/null || true')
+# The watchdog rewrites store-health.json every pass (5 min); a reading older
+# than this says nothing about whether the peer can admit a VM now.
+STORE_HEALTH_STALE_S = 30 * 60
 DEFAULT_PEER_TIMEOUT = 60.0
 
 # Verdicts a single (repo, label) pair can reach.
@@ -329,6 +335,42 @@ def peer_mints_on_demand(value: Any) -> str | None:
     if not isinstance(supply, dict) or supply.get("state") != "match":
         return ("installed supply does not match the published supply "
                 f"({supply.get('state') if isinstance(supply, dict) else 'unreported'})")
+    return None
+
+
+def peer_store_admits(output: str) -> str | None:
+    """None when a peer's launchd watchdog last read its Tart store as healthy, recently.
+
+    `output` is PEER_STORE_HEALTH_COMMAND's: the peer's epoch, then its
+    store-health.json. A peer whose store is draining or suspect admits no VM
+    however healthy its pool status reads (m3, 2026-11-13: a TCC wedge held
+    every lane at "store health unknown" while pool status read on and
+    fleet-ready, and a peer's drain counted it as covering). A missing,
+    unreadable or stale reading is not capability either.
+    """
+    first, _, rest = (output or "").partition("\n")
+    try:
+        clock = int(first.strip())
+    except ValueError:
+        return "Tart store health unreadable"
+    try:
+        value = json.loads(rest) if rest.strip() else None
+    except ValueError:
+        value = None
+    if not isinstance(value, dict) or not value.get("state"):
+        return "no Tart store health reading (store-health.json missing or unreadable)"
+    state = value.get("state")
+    if state != "healthy":
+        last = value.get("last_result") if isinstance(value.get("last_result"), dict) else {}
+        kind = (value.get("classification") or {}).get("kind") \
+            if isinstance(value.get("classification"), dict) else None
+        return (f"cannot admit a VM: Tart store health is {state} "
+                f"({value.get('consecutive_failures')} failure(s), last: {last.get('reason')}"
+                + (f", {kind}" if kind else "") + ")")
+    updated = value.get("updated_at")
+    if not isinstance(updated, (int, float)) or clock - updated > STORE_HEALTH_STALE_S:
+        return (f"Tart store health reading is stale (updated_at {updated}, peer clock {clock}); "
+                "the launchd watchdog is not probing")
     return None
 
 
@@ -666,7 +708,16 @@ def peer_resolver(
         why = peer_mints_on_demand(value)
         if why is not None:
             return PeerEvidence(peer, False, why)
-        return PeerEvidence(peer, True, live_summary(value))
+        try:
+            store = run_bounded(argv[:-1] + [PEER_STORE_HEALTH_COMMAND], timeout=timeout,
+                                operation="peer_store_health")
+        except (ObservationError, OSError) as exc:
+            return PeerEvidence(peer, False, f"Tart store health unreadable via {target}: {exc}")
+        why = (peer_store_admits(store.stdout) if store.returncode == 0
+               else f"Tart store health unreadable via {target} (exit {store.returncode})")
+        if why is not None:
+            return PeerEvidence(peer, False, why)
+        return PeerEvidence(peer, True, live_summary(value) + ", Tart store healthy")
 
     def resolve(repo: str, label: str) -> Sequence[PeerEvidence]:
         if supply is None:

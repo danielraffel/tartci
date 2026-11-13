@@ -64,6 +64,7 @@ class ClientsSendOnlyAllowedCommands(unittest.TestCase):
     def test_job_claim_and_capacity_floor(self) -> None:
         self.assertEqual(self.allowed["job-claim-status"], job_claim.PEER_STATUS_COMMAND)
         self.assertEqual(self.allowed["pool-status"], capacity_floor.PEER_STATUS_COMMAND)
+        self.assertEqual(self.allowed["store-health"], capacity_floor.PEER_STORE_HEALTH_COMMAND)
 
 
 class Dispatch(unittest.TestCase):
