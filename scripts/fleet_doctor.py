@@ -162,6 +162,7 @@ CODES: tuple[str, ...] = (
     "store_ok",
     "store_stalled",
     "store_unprobed",
+    "store_watchdog_stale",
     "supply_match",
     "supply_mismatch",
     "supply_unknown",
@@ -1202,17 +1203,26 @@ def reading_context(env: dict | None = None, ppid: int | None = None) -> str:
     return "this doctor (interactive shell)"
 
 
+WATCHDOG_STALE_AFTER_PASSES = 2
+
+
 def watchdog_store_reading(value: dict | None, now: float | None = None) -> dict:
     """The launchd watchdog's store-health state, summarized with its context and age."""
     value = value if isinstance(value, dict) else {}
     state = value.get("state")
     if not state:
         return {"state": None, "text": "launchd watchdog: no store-health state on this host"}
+    import tcc_wedge
+
     now = time.time() if now is None else now
     context = str(value.get("probe_context") or "launchd watchdog (launchd job)")
     updated = value.get("updated_at")
     age = (f", {int(now - updated)}s ago" if isinstance(updated, (int, float))
            and updated <= now else "")
+    # The watchdog rewrites the file every pass; past two passes (plus slack)
+    # the reading says nothing about now, whatever state it last had.
+    stale = (not isinstance(updated, (int, float))
+             or now - updated > WATCHDOG_STALE_AFTER_PASSES * tcc_wedge.WATCHDOG_INTERVAL_S + 60)
     last = value.get("last_result") if isinstance(value.get("last_result"), dict) else {}
     text = f"{context}: {state}{age}"
     failures = value.get("consecutive_failures")
@@ -1221,8 +1231,11 @@ def watchdog_store_reading(value: dict | None, now: float | None = None) -> dict
         kind = (value.get("classification") or {}).get("kind")
         if kind:
             text += f", classified {kind}"
+    if stale:
+        text += " (stale: the launchd watchdog has not rewritten it for over "\
+                f"{WATCHDOG_STALE_AFTER_PASSES} passes)"
     return {"state": state, "text": text, "consecutive_failures": failures,
-            "context": context}
+            "context": context, "stale": stale}
 
 
 def check_store_stall(value: dict | None, watchdog: dict | None = None,
@@ -1248,6 +1261,8 @@ def check_store_stall(value: dict | None, watchdog: dict | None = None,
         return Finding("store_stall", PROBLEM, "store_context_disagree",
                        detail + "; this doctor's context answered, launchd-context opens did not",
                        facts)
+    if reading.get("stale"):
+        return Finding("store_stall", UNKNOWN, "store_watchdog_stale", detail, facts)
     if reading["state"] == "suspect":
         return Finding("store_stall", UNKNOWN, "store_context_suspect", detail, facts)
     if value.get("state") == "ok":

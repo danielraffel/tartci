@@ -1896,7 +1896,7 @@ def store_health_pass(
                 state, previous, control_path=os.path.dirname(state_path),
                 store_timeout_s=timeout_s, dry_run=dry_run or status_only,
                 heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0",
-                context_probe=tcc_wedge.context_probe_from_env(),
+                context_probe=tcc_wedge.context_probe_from_env(timeout_s=timeout_s),
                 launchd_probe=tcc_wedge.launchd_probe_from_env(
                     tart_home, os.path.dirname(state_path), timeout_s))
         except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive

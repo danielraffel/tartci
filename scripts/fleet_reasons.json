@@ -577,6 +577,12 @@
       "remedy": "Run `tartci doctor fleet` with the pinned interpreter on a managed host.",
       "do_not": "Do not read unprobed as healthy."
     },
+    "store_watchdog_stale": {
+      "summary": "The launchd watchdog's store-health.json has not been rewritten for over two watchdog passes.",
+      "why": "The watchdog rewrites its store reading every pass (5 minutes). An old file, even one that reads healthy, says nothing about whether launchd-context opens of the store answer now; a dead or wedged watchdog leaves its last reading standing.",
+      "remedy": "Check the launchd_timers finding and `launchctl print gui/$(id -u)/com.danielraffel.tartci.launchd-watchdog`; once the watchdog runs again the reading refreshes.",
+      "do_not": "Do not read a stale healthy reading as ok, and do not edit the state file by hand."
+    },
     "supply_match": {
       "summary": "Every registration this host's installed profile mints matches the published declared supply.",
       "why": "The published fleet/advertised-labels.json is what other projects read to learn which labels this fleet serves; it is generated from git, so only a comparison with the installed profile says the machine serves what git publishes."

@@ -470,11 +470,19 @@ lines (`path: launchd_root_hang`): a fresh launchd job (`launchctl submit` of
 removed, with leftovers from a killed pass removed on the next) opens an
 internal directory and then the store's volume ROOT; it must answer the
 internal open and hang on the root; the internal control path must answer; and
-the `TARTCI_TCC_CONTEXT_PROBE` context must answer for the same store. With no
-context probe configured this path never classifies, so set it on a host that
-needs the heal. A bounded `log show --info --debug` over the probe's window
-counts sandboxd `tcc_send_request_authorization() IPC` requests whose thread
-takes no next step within 5 s; that count is recorded and named in the verdict
+the `TARTCI_TCC_CONTEXT_PROBE` context must answer for the same store. That
+command runs under the same bound as the store probe
+(`--store-health-timeout-seconds`, 10 s by default), so it must open the store
+path itself (not just reach the host) within that bound: it is the reading that
+tells a TCC stall from a slow volume, and a store that answers in 15 s from
+every context reads as not answering here too. The launchd probe times the
+root open from the job's own stamp, so a slow `launchctl submit` or job start
+is `inconclusive`, never a hang. With no context probe configured this path
+never classifies, and the launchd job and its log scan are skipped (the
+verdict says so); set it on a host that needs the heal. A bounded `log show --info --debug` over the probe's window
+counts sandboxd `tcc_send_request_authorization() IPC` lines whose thread
+logs no next step within 5 s (a hint that the request did not go out, not a
+proof that tccd never saw it); that count is recorded and named in the verdict
 as corroboration, but neither required nor a veto, because the same wedge
 logged one such request on one probe and no IPC line at all on the next.
 Readings that disagree fail closed: a fresh launchd job that opens the root or
@@ -505,7 +513,9 @@ are written to `~/.tartci/state/store-health.json` (`classification`), and:
   usually an interactive or ssh shell that already holds an authorization.
   When the doctor's probe answers and the watchdog reads `draining`, the
   finding is `store_context_disagree` (a problem), never `store_ok`;
-  `suspect` gives `store_context_suspect`.
+  `suspect` gives `store_context_suspect`, and a state file the watchdog has
+  not rewritten for over two passes gives `store_watchdog_stale` (unknown),
+  whatever state it last recorded.
 
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs

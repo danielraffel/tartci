@@ -68,6 +68,8 @@ def main(argv: list | None = None) -> int:
         return 0
     record = {"pid": os.getpid(), "phase": "internal_ok",
               "internal_latency_ms": open_dir(args.internal)}
+    # The parent times the root open from this stamp, not from its submit.
+    record["root_open_started"] = time.time()
     write_result(args.result, record)
     try:
         record["root_latency_ms"] = open_dir(args.root)

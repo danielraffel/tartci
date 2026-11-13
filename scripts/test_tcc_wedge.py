@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -575,7 +576,8 @@ class NoSignatureWedgeFixtureTests(unittest.TestCase):
         self.assertEqual(verdict["kind"], tw.KIND)
         self.assertEqual(verdict["path"], "launchd_root_hang")
         self.assertIn("/Volumes/Example", verdict["reason"])
-        self.assertIn("1 authorization request(s) tccd never received", verdict["reason"])
+        self.assertIn("1 authorization request(s) whose thread logged no next step",
+                      verdict["reason"])
         self.assertEqual(verdict["evidence"]["log_scan"]["total"], 0)
         self.assertEqual(verdict["evidence"]["launchd_probe"]["outcome"], "hung_on_root")
 
@@ -663,6 +665,49 @@ class DisagreeingReadingsNeverHealTests(unittest.TestCase):
                 self.assertNotEqual(state["classification"]["kind"], tw.KIND, name)
                 self.assertNotIn("heal", state, name)
 
+    def test_without_a_context_probe_the_launchd_job_is_not_run(self) -> None:
+        calls: list = []
+        state = {"state": "draining", "consecutive_failures": 3, "drain_required": True,
+                 "failure_threshold": 2, "path": "/Volumes/Example/VMs",
+                 "last_result": {"ok": False, "reason": "timeout after 10s"}}
+        scans: list = []
+        verdict = tw.classify(consecutive_failures=3, failure_threshold=2,
+                              last_reason="timeout after 10s", failing_since=NOW - 900,
+                              control_path="/internal/state", now=NOW, scan=scan_with(0),
+                              control=ok_control, context_probe=None,
+                              launchd_probe=lambda: calls.append(1) or dict(self.HUNG),
+                              ipc_scan=lambda start, end: scans.append(1) or {})
+        self.assertEqual(calls, [], "no launchd job without a context probe")
+        self.assertEqual(scans, [], "no IPC log scan without a context probe")
+        self.assertEqual(verdict["kind"], "stalled_unclassified")
+        self.assertIn("skipped because no context with TCC access", verdict["reason"])
+        self.assertEqual(verdict["evidence"]["launchd_probe"]["outcome"], "skipped")
+        del state
+
+    def test_a_context_slower_than_the_store_timeout_never_heals(self) -> None:
+        # A slow volume answers every context in more than the store timeout.
+        # The context command must be cut at that same bound, or the launchd
+        # hang plus a late "context ok" would read as a TCC wedge.
+        probe = tw.context_probe_from_env({"TARTCI_TCC_CONTEXT_PROBE": "/bin/sleep 3"},
+                                          timeout_s=0.5)
+        started = time.monotonic()
+        state, healed = self.run_step(launchd=self.HUNG, context=probe)
+        self.assertLess(time.monotonic() - started, 2.5, "the context probe was not bounded")
+        self.assertEqual(healed, [])
+        self.assertEqual(state["classification"]["kind"], "stalled_unclassified")
+        self.assertFalse(state["classification"]["evidence"]["tcc_context_probe"]["ok"])
+        # Control: the same command inside the bound answers and heals.
+        quick = tw.context_probe_from_env({"TARTCI_TCC_CONTEXT_PROBE": "/bin/sleep 0.1"},
+                                          timeout_s=2.0)
+        state, healed = self.run_step(launchd=self.HUNG, context=quick)
+        self.assertEqual(len(healed), 1)
+
+    def test_the_watchdog_bounds_the_context_probe_by_the_store_timeout(self) -> None:
+        source = (ROOT / "scripts" / "tartci_launchd_watchdog.py").read_text()
+        self.assertIn("context_probe_from_env(timeout_s=timeout_s)", source)
+        self.assertNotIn("LOG_SCAN_TIMEOUT_S", (ROOT / "scripts" / "tcc_wedge.py").read_text()
+                         .split("def context_probe_from_env", 1)[1].split("def describe", 1)[0])
+
     def test_the_existing_signature_path_still_heals(self) -> None:
         for launchd in (None, self.HUNG, {"outcome": "not_external"},
                         {"outcome": "did_not_start", "volume_root": "/Volumes/Example"}):
@@ -723,22 +768,38 @@ class LaunchdProbeTests(unittest.TestCase):
         self.addCleanup(self.td.cleanup)
         self.calls: list = []
 
-    def runner(self, phase=None, submit_rc=0, remove_rc=0):
+    def runner(self, phase=None, submit_rc=0, remove_rc=0, opened_ago=100.0):
         def run(argv, *, timeout, operation):
             self.calls.append(list(argv))
             if argv[1] == "submit":
                 if phase:
                     result = argv[argv.index("--result") + 1]
-                    Path(result).write_text(json.dumps({"phase": phase, "pid": 1,
-                                                        "internal_latency_ms": 0.02}))
+                    value = {"phase": phase, "pid": 1, "internal_latency_ms": 0.02}
+                    if opened_ago is not None:
+                        value["root_open_started"] = time.time() - opened_ago
+                    Path(result).write_text(json.dumps(value))
                 return subprocess.CompletedProcess(argv, submit_rc, stdout="",
                                                    stderr="" if submit_rc == 0 else "denied")
             return subprocess.CompletedProcess(argv, remove_rc, stdout="", stderr="")
         return run
 
     def probe(self, runner, timeout_s=0.3, **kwargs):
+        kwargs.setdefault("grace_s", 0.2)
         return tw.launchd_probe("/Volumes/Example/VMs", self.td.name, timeout_s, runner=runner,
                                 python="/usr/bin/python3", **kwargs)
+
+    def test_a_hang_is_timed_from_the_childs_root_open_stamp(self) -> None:
+        # Open long enough: a hang. Never stamped, or stamped too recently
+        # (launchd was slow to start the job): inconclusive, never a hang.
+        hung = self.probe(self.runner("internal_ok", opened_ago=5.0), timeout_s=1.0)
+        self.assertEqual(hung["outcome"], "hung_on_root")
+        self.assertGreaterEqual(hung["root_open_s"], 1.0)
+        for opened_ago in (None, -100.0):
+            with self.subTest(opened_ago=opened_ago):
+                record = self.probe(self.runner("internal_ok", opened_ago=opened_ago),
+                                    timeout_s=1.0)
+                self.assertEqual(record["outcome"], "inconclusive")
+                self.assertIn("not observed for the full", record["detail"])
 
     def verbs(self):
         return [argv[1] for argv in self.calls]
@@ -769,7 +830,7 @@ class LaunchdProbeTests(unittest.TestCase):
         def boom(_seconds):
             raise KeyboardInterrupt
         with self.assertRaises(KeyboardInterrupt):
-            self.probe(self.runner("internal_ok"), timeout_s=5, sleep=boom)
+            self.probe(self.runner("internal_ok", opened_ago=None), timeout_s=5, sleep=boom)
         self.assertEqual(self.verbs(), ["submit", "remove"])
 
     def test_a_failed_submit_is_inconclusive_and_still_removed(self) -> None:
@@ -807,7 +868,9 @@ class LaunchdProbeTests(unittest.TestCase):
         out = subprocess.run(args + ["--root", self.td.name], capture_output=True, text=True,
                              check=False)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertEqual(json.loads(result.read_text())["phase"], "root_ok")
+        value = json.loads(result.read_text())
+        self.assertEqual(value["phase"], "root_ok")
+        self.assertIsInstance(value["root_open_started"], float)
         result.unlink()
         subprocess.run(args + ["--root", str(Path(self.td.name) / "absent")], check=False)
         value = json.loads(result.read_text())
@@ -852,6 +915,25 @@ class DoctorContextTests(unittest.TestCase):
         finding = fd.check_store_stall(stalled, watchdog={"state": "draining"}, context="ctx")
         self.assertEqual(finding.code, "store_stalled")
         self.assertEqual(fd.check_tcc_wedge(healthy, now=NOW).code, "tcc_wedge_none")
+
+    def test_a_stale_watchdog_reading_is_unknown_not_ok(self) -> None:
+        old = NOW - 2 * 300 - 61
+        healthy = {"state": "healthy", "consecutive_failures": 0, "updated_at": old}
+        finding = fd.check_store_stall(self.OWN_OK, watchdog=healthy, context="ctx", now=NOW)
+        self.assertEqual((finding.state, finding.code), (fd.UNKNOWN, "store_watchdog_stale"))
+        self.assertIn("stale", finding.detail)
+        self.assertIn("store_watchdog_stale", fd.load_reasons())
+        undated = {"state": "healthy", "consecutive_failures": 0}
+        self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=undated, context="ctx",
+                                              now=NOW).code, "store_watchdog_stale")
+        # Control: a reading inside two passes is current.
+        fresh = dict(healthy, updated_at=NOW - 2 * 300 + 30)
+        self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=fresh, context="ctx",
+                                              now=NOW).code, "store_ok")
+        # A stale draining reading stays a problem, not merely unknown.
+        draining = dict(healthy, state="draining", consecutive_failures=5)
+        self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=draining, context="ctx",
+                                              now=NOW).code, "store_context_disagree")
 
     def test_one_watchdog_failure_is_not_all_clear(self) -> None:
         suspect = {"state": "suspect", "consecutive_failures": 1, "updated_at": NOW,
