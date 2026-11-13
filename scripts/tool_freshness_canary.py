@@ -328,14 +328,19 @@ def steward_log(home: Path, tool: dict) -> Path:
     return _home_path(home, str(tool.get("steward_log") or STEWARD_LOG))
 
 
-def steward_repos(home: Path, tool: dict) -> set[str]:
-    """The repositories every tick passes over (fleet-repos.txt); empty when unreadable."""
+def steward_repos(home: Path, tool: dict) -> tuple[set[str], float]:
+    """(the repositories every tick passes over, when that list last changed).
+
+    Empty when fleet-repos.txt is unreadable. A tick reads the list when it
+    starts, so the list proves a tick complete only if it has not changed since.
+    """
+    path = _home_path(home, str(tool.get("steward_repos") or STEWARD_REPOS))
     try:
-        text = _home_path(home, str(tool.get("steward_repos") or STEWARD_REPOS)).read_text()
+        text, changed = path.read_text(), path.stat().st_mtime
     except OSError:
-        return set()
-    return {line.strip() for line in text.splitlines()
-            if line.strip() and not line.strip().startswith("#")}
+        return set(), 0.0
+    return ({line.strip() for line in text.splitlines()
+             if line.strip() and not line.strip().startswith("#")}, changed)
 
 
 def _read_tail(path: Path) -> str | None:
@@ -414,10 +419,13 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     if text is None:
         return "pending", "steward summary log unreadable"
     ticks = parse_ticks(text)
-    repos = steward_repos(home, tool)
+    repos, repos_changed = steward_repos(home, tool)
     # A tick is complete once a later one started (ticks run one at a time) or
-    # every fleet repository has its final line.
-    complete = [i < len(ticks) - 1 or bool(repos and repos <= ticks[i]["done"])
+    # every fleet repository has its final line. The list counts only when it
+    # has not changed since the tick started: a repository removed mid-tick
+    # would otherwise mark the tick complete before its last line is written.
+    complete = [i < len(ticks) - 1
+                or bool(repos and repos_changed <= ticks[i]["at"] and repos <= ticks[i]["done"])
                 for i in range(len(ticks))]
     # The baseline must have finished before the swap: the tick after it
     # started at or before the swap. The last tick stamped before the swap may
@@ -425,6 +433,13 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     baseline = [ticks[i] for i in range(len(ticks) - 1)
                 if ticks[i + 1]["at"] <= deployed_at]
     preexisting = _failures(baseline[-1]) if baseline else set()
+    # The tick in flight at the swap is not a baseline for invariants (its later
+    # repositories may have run the new binary), but if every repository in it
+    # errored, the ones that ran before the swap errored too: the steward was
+    # already down (a GitHub outage), and that is not the release's fault.
+    in_flight = [t for t in ticks if t["at"] < deployed_at][-1:]
+    if in_flight and STEWARD_ERROR in _failures(in_flight[0]):
+        preexisting.add(STEWARD_ERROR)
     stamp = lambda t: _iso(t["at"])  # noqa: E731
     for i, tick in enumerate(ticks):
         if tick["at"] < deployed_at or not complete[i]:
@@ -452,10 +467,14 @@ def record_deploy(steward: dict, name: str, version: str, previous: str | None,
 
 def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, settings: dict,
                  steward: dict, attempts: dict, append: Callable[[dict], None],
-                 rollback: Callable[[str], tuple[bool, str]]) -> bool:
+                 rollback: Callable[[str], tuple[bool, str, bool]]) -> bool:
     """Judge a recorded deploy against the steward's ticks. True when rolled back.
 
-    `rollback(tag)` runs the governed rollout to `tag` and returns (landed, detail).
+    `rollback(tag)` runs the governed rollout to `tag` and returns (landed,
+    detail, not_ready); not_ready means nothing was installed because a
+    download failed, which is retried on every pass and never counts toward
+    giving up. Once a deploy has failed, that verdict stands: later passes only
+    retry the rollback, so a clean tick after an outage cannot un-fail it.
     """
     entry = steward.get(name)
     if not isinstance(entry, dict):
@@ -472,7 +491,10 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
     if deployed_at is None:
         steward.pop(name, None)
         return False
-    verdict, detail = steward_verdict(home, tool, version, deployed_at)
+    if entry.get("failure_recorded"):
+        verdict, detail = "failed", str(entry.get("detail") or "steward check failed")
+    else:
+        verdict, detail = steward_verdict(home, tool, version, deployed_at)
     if verdict == "ok":
         append({"event": "tool_steward_verified", "tool": name, "at": _iso(now),
                 "version": version, "detail": detail})
@@ -493,8 +515,8 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
         row["steward_problem"] = f"{name} {version}: {detail} (deployed by hand; not rolled back)"
         return False
     tag = f"v{entry['from']}"
-    landed, result = rollback(tag)
-    tries = int(entry.get("rollback_tries") or 0) + 1
+    landed, result, not_ready = rollback(tag)
+    tries = int(entry.get("rollback_tries") or 0) + (0 if not_ready else 1)
     attempts[name] = {"target": f"v{version}", "at": _iso(now), "rejected": True,
                       "result": f"FAILED ({detail}); rolled back to {tag}"}
     if not entry.get("failure_recorded"):
@@ -502,6 +524,7 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
                 "from": entry["from"], "target": version, "verdict": "steward_invariants",
                 "detail": detail})
         entry["failure_recorded"] = True
+        entry["detail"] = detail
     append({"event": "tool_rolled_back", "tool": name, "at": _iso(now), "from": version,
             "to": entry["from"], "landed": landed, "detail": result[-300:], "reason": detail})
     if landed:
@@ -510,5 +533,7 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
         entry["rollback_tries"] = tries
         entry["gave_up"] = tries >= ROLLBACK_MAX_TRIES
     row["steward_problem"] = (f"{name} {version}: {detail}; rollback to {tag} "
-                              + ("landed" if landed else f"FAILED (try {tries}): {result[-160:]}"))
+                              + ("landed" if landed else
+                                 f"not ready yet, retried every pass: {result[-160:]}"
+                                 if not_ready else f"FAILED (try {tries}): {result[-160:]}"))
     return True

@@ -3550,6 +3550,12 @@ def tool_rollout(path: Path, hosts: set[str]) -> dict | None:
         raise ValueError(f"{path}: canary {canary!r} is not a published host ({sorted(hosts)})")
     if not isinstance(stewards, list) or any(h not in hosts for h in stewards):
         raise ValueError(f"{path}: steward_hosts {stewards!r} must list published hosts")
+    if not stewards:
+        # An empty list silently drops the steward stage for the whole fleet:
+        # a Shipyard release that breaks the merge steward would reach every
+        # host after the canary's soak. Name the host that runs the steward.
+        raise ValueError(f"{path}: steward_hosts must name at least one host that runs "
+                         "the merge steward")
     return {"canary": canary, "steward_hosts": list(stewards)}
 
 

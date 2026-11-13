@@ -3048,7 +3048,8 @@ arrive, and a host that did not get it is loud:
   least loaded build host; `steward_hosts`, the hosts that run the merge
   steward, `studio`). Every host reads the same committed copy, so no two can
   name different canaries; the generator refuses a role that is not a
-  published host, and `tool-freshness.toml` cannot set either. A missing or
+  published host and an empty `steward_hosts` (which would drop the steward
+  stage fleet-wide), and `tool-freshness.toml` cannot set either. A missing or
   unreadable role list fails closed: no host applies. To move the canary,
   edit `fleet/tool-rollout.json`, regenerate the published file and merge.
   The canary applies a release at 30 minutes, as above. Every other host
@@ -3073,9 +3074,10 @@ arrive, and a host that did not get it is loud:
   for cleared. Those hosts are read over fleet ssh (`ssh -n -o BatchMode=yes
   <target> tail events.jsonl`, once per pass each); the target is the host's
   published row in `fleet/advertised-labels.json`, else `tartci-<host_id>`. It
-  fails closed: an unreadable host, an unsafe target, or a host that cannot
-  name itself (no fleet profile `host.id` and no `host_class`) waits and never
-  applies. The wait reads `waiting for canary m5: ...` (or `steward host
+  fails closed: an unreadable host or an unsafe target waits, and a host that
+  cannot name itself (no fleet profile `host.id` and no `host_class`) waits
+  without reading anyone, since it cannot tell whether it is the canary or a
+  steward host. None of them applies. The wait reads `waiting for canary m5: ...` (or `steward host
   studio`) on the tool's line, is appended to the stale problem once the tool
   goes STALE, and every waiting pass writes exactly one line to
   `~/.tartci/state/tool-freshness/canary-gate.log`. There is no urgent-release
@@ -3096,7 +3098,9 @@ arrive, and a host that did not get it is loud:
   per repository over several minutes, so it counts once a later tick has
   started or every repository in
   `~/.local/share/shipyard-steward/fleet-repos.txt` has its final line (`rc=`,
-  `ERROR`, `skipped=`). A tick judges the release when it started after the
+  `ERROR`, `skipped=`); the list counts only if it has not changed since the
+  tick started, since a repository removed mid-tick would otherwise complete
+  the tick before its last line is written. A tick judges the release when it started after the
   swap and either ran it (`ver=`) or could not run the steward at all (only
   `ERROR rc=` lines, no pass). The baseline is the last tick known to have
   finished before the swap (the tick after it also started before the swap);
@@ -3112,12 +3116,20 @@ arrive, and a host that did not get it is loud:
     swap; the previous release is the older of the CLI and its ghapp
     generation, what really ran), recorded as `tool_apply_failed` (verdict
     `steward_invariants`) and `tool_rolled_back`, and that release is never
-    retried on the host (`attempts.json` marks it rejected). Tool-freshness
+    retried on the host (`attempts.json` marks it rejected). Once recorded, the
+    failure stands: later passes only retry the rollback, so a clean tick after
+    the fact (or a truncated log) cannot verify it. A steward outage that
+    predates the swap is not the release's fault: when the tick in flight at
+    the swap had only `ERROR` lines too, ERROR-only ticks after it are
+    inconclusive rather than a failure. Tool-freshness
     state is written after the rollback and after every tool, so a pass the
     watchdog kills at its 600 s limit keeps it. A rollback counts as landed
     only when fleet-update exits 0 with a `verified` verdict and the re-read
-    version equals the previous release; otherwise it is retried on the next
-    two passes, then left as a `roll back by hand` problem.
+    version equals the previous release. A rollback whose download failed
+    before installing anything (fleet-update exit 75, a GitHub outage) is
+    retried on every pass and never counts toward giving up; any other
+    failure is retried on the next two passes, then left as a `roll back by
+    hand` problem.
   - `invariants=ERROR` (the tick could not read its own pass output) and a
     tick where only some repositories wrote `ERROR` are inconclusive: they
     neither verify nor fail, and the next complete tick decides.

@@ -41,7 +41,8 @@ labels are set at registration outside tartci, so only their name is declared.
 `canary` host that applies Shipyard and pulp releases first and the
 `steward_hosts` that run the merge steward. Tool-freshness reads it on every
 host, so the order is one committed decision (runbook: Shipyard and pulp CLI
-freshness); the generator refuses a role that is not a published host.
+freshness); the generator refuses a role that is not a published host, and an
+empty `steward_hosts`.
 
 ## Reachability rule
 

@@ -429,6 +429,7 @@ class StewardCheckTests(_Fleet):
             path.unlink()
         else:
             path.write_text("# fleet repos\n" + "".join(n + "\n" for n in names))
+            os.utime(path, (NOW - 24 * HOUR, NOW - 24 * HOUR))  # unchanged since long before
 
     def log(self, *lines: str) -> None:
         path = self.home / canary.STEWARD_LOG
@@ -572,6 +573,61 @@ class StewardCheckTests(_Fleet):
         self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
         self.assertIn("the steward could not run", row["steward_problem"])
 
+    def test_a_steward_outage_that_predates_the_swap_is_not_the_releases_fault(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "ok")
+        # The tick in flight at the swap errored everywhere, including the
+        # repositories that ran before the swap: GitHub was already down.
+        self.log(*(f"{stamp(NOW - 5 * MIN)} {repo} ERROR rc=1 api.github.com 503" for repo in REPOS))
+        host = self.behind()
+        self.refresh(host, "m5")
+        self.log(*(f"{stamp(NOW + 5 * MIN)} {repo} ERROR rc=1 api.github.com 503" for repo in REPOS))
+        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.assertIn("no conclusive complete steward tick", row["steward"])
+        # A real regression after the outage still fails it.
+        self.tick(NOW + 15 * MIN, "0.221.1", "FAIL:arming")
+        self.refresh(host, "m5", now=NOW + 20 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
+
+    def test_a_rollback_that_cannot_download_is_retried_and_the_failure_stands(self) -> None:
+        host = self.deploy_on_steward_host()
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:arming")
+        outage = canary.ROLLBACK_MAX_TRIES + 2
+        host.fleet_update_results = [(75, "not ready: download failed")] * outage
+        for n in range(outage):
+            row = self.refresh(host, "m5", now=NOW + (10 + n) * MIN)["tools"]["shipyard"]
+            self.assertIn("not ready yet, retried every pass", row["steward_problem"])
+            if n == 1:
+                # GitHub recovers for the steward first, and the failing tick
+                # has left the log (truncated): a clean tick must not un-fail a
+                # release whose failure is already on record.
+                (self.home / canary.STEWARD_LOG).write_text("")
+                self.tick(NOW + (10 + n) * MIN + 30, "0.221.1", "ok")
+        self.assertNotIn("roll back by hand", row["steward_problem"])
+        self.assertNotIn("tool_steward_verified", self.kinds())
+        self.assertFalse(json.loads((self.state / "steward.json").read_text())["shipyard"]
+                         .get("gave_up"))
+        row = self.refresh(host, "m5", now=NOW + 30 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.versions["shipyard"], "0.221.0")
+        self.assertIn("rollback to v0.221.0 landed", row["steward_problem"])
+        self.assertEqual(self.kinds().count("tool_apply_failed"), 1)
+
+    def test_a_repo_list_changed_after_the_tick_started_does_not_complete_it(self) -> None:
+        host = self.deploy_on_steward_host()
+        at = NOW + 5 * MIN
+        self.log(f"{stamp(at)} fleet invariants=ok",
+                 f"{stamp(at)} danielraffel/tartci rc=0 took=9s ver=0.221.1 invariants=ok",
+                 f"{stamp(at)} Generous-Corp/pulp rc=0 took=9s ver=0.221.1 invariants=ok")
+        # danielraffel/Shipyard is removed from the list while the tick runs it.
+        self.repos(REPOS[:2])
+        os.utime(self.home / canary.STEWARD_REPOS, (at + 60, at + 60))
+        self.refresh(host, "m5", now=NOW + 8 * MIN)
+        self.assertNotIn("tool_steward_verified", self.kinds())
+        # Control: the same list, unchanged since before the tick, completes it.
+        os.utime(self.home / canary.STEWARD_REPOS, (at - 60, at - 60))
+        self.refresh(host, "m5", now=NOW + 9 * MIN)
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+
     def test_ticks_are_judged_from_the_swap_not_the_start_of_the_pass(self) -> None:
         # The apply took 3 minutes; a tick that started 1 minute in still ran
         # the old binary, and its errors are not the new release's.
@@ -681,8 +737,10 @@ class PublishedRolloutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "tool-rollout.json"
             self.assertIsNone(fleet.tool_rollout(path, hosts))
-            for bad in ({"canary": "m9"}, {"canary": "m5", "steward_hosts": ["m9"]},
-                        {"canary": "m5", "extra": 1}, ["m5"]):
+            for bad in ({"canary": "m9", "steward_hosts": ["studio"]},
+                        {"canary": "m5", "steward_hosts": ["m9"]},
+                        {"canary": "m5", "extra": 1}, ["m5"],
+                        {"canary": "m5", "steward_hosts": []}, {"canary": "m5"}):
                 path.write_text(json.dumps(bad))
                 with self.assertRaises(ValueError):
                     fleet.tool_rollout(path, hosts)

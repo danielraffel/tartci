@@ -894,17 +894,22 @@ def _run_apply(tool: dict, home: Path, tag: str, klass: str, platform: str, loca
 
 
 def _rollback(tool: dict, home: Path, settings: dict, tag: str,
-              run: Callable[[list[str], float], tuple[int, str]]) -> tuple[bool, str]:
-    """Move the tool back to `tag` with its governed apply; (landed, detail)."""
+              run: Callable[[list[str], float], tuple[int, str]]) -> tuple[bool, str, bool]:
+    """Move the tool back to `tag` with its governed apply; (landed, detail, not_ready).
+
+    not_ready is an exit NOT_READY_EXIT: a download failed before anything was
+    installed (a GitHub outage), so the caller retries without counting it.
+    """
     klass = host_class(home, settings) or ""
     if "{host_class}" in " ".join(tool["apply_command"]) and not klass:
-        return False, "refused: no host class"
+        return False, "refused: no host class", False
     rc, out, verdict = _run_apply(tool, home, tag, klass, host_platform(), "", run)
     after = read_versions(tool, home, run)
     effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
         if after["installed"] else None
     landed = rc == 0 and _vstr(effective) == tag.lstrip("v") and verdict in (None, "verified")
-    return landed, f"exit {rc}, verdict {verdict}, installed {_vstr(effective)}: {out[-200:]}"
+    return (landed, f"exit {rc}, verdict {verdict}, installed {_vstr(effective)}: {out[-200:]}",
+            not landed and rc == NOT_READY_EXIT)
 
 
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
