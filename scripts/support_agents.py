@@ -63,11 +63,13 @@ import hashlib
 import json
 import os
 import plistlib
+import re
+import shlex
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -101,18 +103,152 @@ def _tart_home(profile: Dict[str, Any]) -> Dict[str, str]:
     return {"TART_HOME": tart_home} if isinstance(tart_home, str) and tart_home else {}
 
 
-def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
-    """The frozen-lane threshold from `[launchd_watchdog] stale_log_seconds`.
+WATCHDOG_KEYS = {"stale_log_seconds", "tcc_context_probe"}
+CONTEXT_PROBE_ENV = "TARTCI_TCC_CONTEXT_PROBE"
+_DIRECT_PROBE_PROGRAMS = {"/usr/bin/stat", "/bin/ls"}
+_PYTHON_PROBE_PROGRAM = "/usr/bin/python3"
+_SSH_PROBE_PROGRAM = "/usr/bin/ssh"
+_SSH_PROBE_OPTIONS = {"BatchMode=yes", "ConnectTimeout=5"}
+_SHELL_CONTROL_WORDS = {";", "&&", "||", "|", "|&", "&", ">", ">>", "<", "<<"}
+_PYTHON_OPEN_CODE = re.compile(
+    r"^import\s+os\s*,\s*sys;\s*"
+    r"os\.close\(os\.open\(sys\.argv\[1\],\s*"
+    r"os\.O_RDONLY\s*\|\s*os\.O_DIRECTORY\)\)\s*$"
+)
 
-    It used to live only on hand-edited plists (m1, m5 and m5studio carried
-    `--stale-log-seconds 4500`; the template rendered the 1800 default), so a
-    re-render brought back the kills it was set to stop. Absent, the watchdog
-    keeps its own default.
+
+def _has_parent_path_segment(word: str) -> bool:
+    """Whether a shell-split word contains a path traversal component."""
+    return ".." in word.split("/")
+
+
+def _names_store(word: str, store: PurePosixPath) -> bool:
+    """Whether an absolute word names the store or something below it."""
+    if not word.startswith("/") or _has_parent_path_segment(word):
+        return False
+    path = PurePosixPath(word)
+    return path == store or store in path.parents
+
+
+def _direct_probe_problem(words: List[str], store: PurePosixPath,
+                          *, remote: bool = False) -> Optional[str]:
+    """Validate one command that directly opens the configured store."""
+    if not words:
+        return "launchd_watchdog.tcc_context_probe must name a store-opening command"
+    program = words[0]
+    if program in _DIRECT_PROBE_PROGRAMS:
+        if remote and any(
+            token in _SHELL_CONTROL_WORDS
+            or any(operator in token for operator in (
+                "&&", "||", "|&", ";", "`", "$(", ">", "<"
+            ))
+            for token in words[1:]
+        ):
+            return "launchd_watchdog.tcc_context_probe must not contain shell control tokens"
+        if not any(_names_store(word, store) for word in words[1:]):
+            return ("launchd_watchdog.tcc_context_probe must open the store itself: "
+                    f"no word names host.tart_home ({store})")
+        return None
+    if program == _PYTHON_PROBE_PROGRAM:
+        if len(words) != 4 or words[1] != "-c" or not _PYTHON_OPEN_CODE.fullmatch(words[2]):
+            return ("launchd_watchdog.tcc_context_probe Python probes must use "
+                    "os.open(..., os.O_RDONLY | os.O_DIRECTORY)")
+        if not _names_store(words[3], store):
+            return ("launchd_watchdog.tcc_context_probe must open the store itself: "
+                    f"no word names host.tart_home ({store})")
+        return None
+    return ("launchd_watchdog.tcc_context_probe must use /usr/bin/stat, /bin/ls, "
+            "/usr/bin/python3, or /usr/bin/ssh with an approved store probe")
+
+
+def _ssh_probe_problem(value: List[str], store: PurePosixPath) -> Optional[str]:
+    """Validate the local ssh form used when sshd supplies TCC access."""
+    words: List[str] = []
+    for word in value[1:]:
+        try:
+            words.extend(shlex.split(word))
+        except ValueError:
+            return "launchd_watchdog.tcc_context_probe has an unbalanced quote"
+    index = 0
+    while index < len(words) and words[index] == "-o":
+        if index + 1 >= len(words) or words[index + 1] not in _SSH_PROBE_OPTIONS:
+            return "launchd_watchdog.tcc_context_probe ssh options are not approved"
+        index += 2
+    if index >= len(words) or words[index] != "localhost":
+        return ("launchd_watchdog.tcc_context_probe ssh probes must target localhost "
+                "so the TCC-granted context is local")
+    remote = words[index + 1:]
+    if not remote:
+        return "launchd_watchdog.tcc_context_probe ssh command must open the store"
+    if any(token in _SHELL_CONTROL_WORDS for token in remote):
+        return "launchd_watchdog.tcc_context_probe must not contain shell control tokens"
+    return _direct_probe_problem(remote, store, remote=True)
+
+
+def context_probe_problem(value: Any, tart_home: Any) -> Optional[str]:
+    """Why `[launchd_watchdog] tcc_context_probe` is unusable; None when fine.
+
+    The probe is the reading that lets the watchdog run the root TCC heal
+    (scripts/tcc_wedge.py), so it must use an approved command that opens this
+    host's Tart store. Direct `stat` and `ls` probes are allowed; an ssh probe
+    must target localhost and run the fixed Python `os.open` form. Traversal
+    paths and shell control tokens are rejected before the argv is rendered.
+    """
+    if (not isinstance(value, list) or len(value) < 2
+            or not all(isinstance(word, str) and word.strip() for word in value)):
+        return "launchd_watchdog.tcc_context_probe must be a list of two or more non-empty strings"
+    if any(ch in word for word in value for ch in ("\x00", "\n", "\r")):
+        return "launchd_watchdog.tcc_context_probe must not contain NUL or line breaks"
+    if not value[0].startswith("/"):
+        return "launchd_watchdog.tcc_context_probe must start with an absolute program path"
+    if not isinstance(tart_home, str) or not tart_home.startswith("/"):
+        return "launchd_watchdog.tcc_context_probe needs host.tart_home to name the store it probes"
+    if _has_parent_path_segment(tart_home):
+        return "launchd_watchdog.tcc_context_probe host.tart_home must not contain '..'"
+    store = PurePosixPath(tart_home)
+    words: List[str] = []
+    for word in value:
+        try:
+            words.extend(shlex.split(word))
+        except ValueError:
+            return "launchd_watchdog.tcc_context_probe has an unbalanced quote"
+    if any(_has_parent_path_segment(word) for word in words):
+        return "launchd_watchdog.tcc_context_probe paths must not contain '..'"
+    if value[0] == _SSH_PROBE_PROGRAM:
+        return _ssh_probe_problem(value, store)
+    return _direct_probe_problem(words, store)
+
+
+def _context_probe_env(profile: Dict[str, Any], table: Dict[str, Any]) -> Dict[str, str]:
+    """TARTCI_TCC_CONTEXT_PROBE, which tcc_wedge shell-splits back to this argv.
+
+    Rendered only from a value the validator accepts, so a malformed key in a
+    profile that skipped validation renders nothing (the heal stays off)
+    rather than a probe that does not name the store.
+    """
+    value = table.get("tcc_context_probe")
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    if value is None or context_probe_problem(value, host.get("tart_home")) is not None:
+        return {}
+    return {CONTEXT_PROBE_ENV: shlex.join(value)}
+
+
+def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The watchdog's per-host settings from the profile's `[launchd_watchdog]`.
+
+    `stale_log_seconds` is the frozen-lane threshold. It used to live only on
+    hand-edited plists (m1, m5 and m5studio carried `--stale-log-seconds
+    4500`; the template rendered the 1800 default), so a re-render brought back
+    the kills it was set to stop. Absent, the watchdog keeps its own default.
+
+    `tcc_context_probe` is the command that opens the store from a context
+    holding TCC access; without it the silent-wedge classifier never fires.
     """
     table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
     stale = table.get("stale_log_seconds")
     environment = ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
                    if type(stale) is int else {})
+    environment.update(_context_probe_env(profile, table))
     configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
     if configured_root:
         source = fleet_source.resolve(ROOT)
