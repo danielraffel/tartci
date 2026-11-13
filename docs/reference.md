@@ -219,6 +219,27 @@ reservation, so capacity stays occupied, and retries the delete (or a readable
 `TARTCI_PENDING_DELETE_RETRY_SECS` (default 10) apart, does it fall back to the
 fail-closed `exit 75` restart. A live guardian or a refused teardown still
 restarts immediately.
+
+The in-loop retry bounds `tart delete` at `TARTCI_PENDING_DELETE_TIMEOUT_SECS`
+(default 60, at most 600), not the 5 s teardown step bound: deleting a large
+clone on a loaded host can outlast 5 s, and a delete killed at the bound every
+time never finishes. Its absence proof re-checks
+`TARTCI_DELETE_PROOF_ATTEMPTS` times (default 3) with doubling backoff from
+`TARTCI_DELETE_PROOF_BACKOFF_SECS` (default 2). When the listing itself times
+out, a missing `$TART_HOME/vms/<vm>` directory under a readable, non-empty
+store is also proof; an unreadable or empty store proves nothing. Each
+`delete_unproved` event carries `absence=absent|present|unreadable`. When the
+retries are exhausted the lane records a `delete_unproved_incident` event and
+an incident line before restarting.
+
+Held-slot self-check: if no observation has found the pending-delete VM (not
+listed by tart, no directory in the store) for `TARTCI_HELD_SLOT_SELF_CHECK_SECS`
+(default 300) while the lane has queued work, the lane releases its lease and
+reservation itself and records a `held_slot_released` event and incident line.
+A VM that is still listed, or whose directory still exists, resets the clock and
+keeps its slot. Incident lines go to `~/.tartci/state/incidents.jsonl`
+(`TARTCI_INCIDENTS_FILE`), one JSON object per line with `ts`, `incident`,
+`host`, `runner` and `detail`, for any monitor to tail.
 `tartci up linux [--ref <git-ref>] [--no-gpu]
 [--keep]` clones the `pulp-linux-build` golden, mounts the host ccache, and
 builds + ctests in-guest. `tartci up windows [--ref <git-ref>] [--smoke] [--gpu]
