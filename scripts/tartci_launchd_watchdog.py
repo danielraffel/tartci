@@ -1892,13 +1892,16 @@ def store_health_pass(
         # status pass classifies and records, but never heals.
         recovered = None
         try:
+            launchd_probe = tcc_wedge.launchd_probe_from_env(
+                tart_home, os.path.dirname(state_path), timeout_s)
             recovered = tcc_wedge.watchdog_step(
                 state, previous, control_path=os.path.dirname(state_path),
                 store_timeout_s=timeout_s, dry_run=dry_run or status_only,
                 heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0",
                 context_probe=tcc_wedge.context_probe_from_env(timeout_s=timeout_s),
-                launchd_probe=tcc_wedge.launchd_probe_from_env(
-                    tart_home, os.path.dirname(state_path), timeout_s))
+                launchd_probe=launchd_probe,
+                launchd_probe_disabled=(launchd_probe is None and
+                                        os.environ.get("TARTCI_TCC_LAUNCHD_PROBE", "1") == "0"))
         except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive
             state["classification"] = {"kind": "classifier_error", "reason": str(exc)[:300],
                                        "evidence": {}, "classified_at": _iso(time.time())}

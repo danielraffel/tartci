@@ -504,6 +504,7 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
              control: Optional[Callable[[str, float], dict]] = None,
              context_probe: Optional[Callable[[], dict]] = None,
              launchd_probe: Optional[Callable[[], dict]] = None,
+             launchd_probe_disabled: bool = False,
              ipc_scan: Optional[Callable[[float, float], dict]] = None) -> dict[str, Any]:
     """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}.
 
@@ -553,7 +554,11 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                        f"the internal control path {control_path} also fails "
                        f"({ctl.get('reason')}); not a TCC verdict")
     launchd: dict[str, Any] = {"outcome": "not_run"}
-    if launchd_probe is not None and context_probe is None:
+    if launchd_probe_disabled:
+        launchd = {"outcome": "disabled",
+                   "detail": "TARTCI_TCC_LAUNCHD_PROBE=0; the launchd reading is disabled"}
+        evidence["launchd_probe"] = launchd
+    elif launchd_probe is not None and context_probe is None:
         # Without a context with TCC access the launchd path can never
         # classify, so the hanging job and the IPC scan would buy nothing.
         launchd = {"outcome": "skipped",
@@ -611,7 +616,9 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
         signature_text = (f"no sandboxd/tccd Removable Volumes failure in the last {minutes} min "
                           f"({log.get('total')} other TCC failure line(s))")
     if outcome != "hung_on_root":
-        detail = {"not_run": "", "not_external": "; the store is not on an external volume",
+        detail = {"not_run": "", "disabled": "; the fresh launchd probe was disabled by "
+                  "TARTCI_TCC_LAUNCHD_PROBE=0; the launchd reading is missing",
+                  "not_external": "; the store is not on an external volume",
                   "skipped": "; the fresh launchd probe was skipped because no context with "
                              "TCC access is configured (TARTCI_TCC_CONTEXT_PROBE), without "
                              "which a hang that logs no error cannot be attributed",
@@ -776,7 +783,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
                   heal_fn: Callable[..., dict] = heal,
                   reprobe: Optional[Callable[..., dict]] = None,
                   context_probe: Optional[Callable[[], dict]] = None,
-                  launchd_probe: Optional[Callable[[], dict]] = None) -> Optional[dict]:
+                  launchd_probe: Optional[Callable[[], dict]] = None,
+                  launchd_probe_disabled: bool = False) -> Optional[dict]:
     """Classify, heal once, and reprobe. Mutates `state`; returns a recovered
     probe result when the heal brought the store back, else None.
 
@@ -812,7 +820,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         last_reason=last_result.get("reason"), failing_since=state["failing_since"],
         control_path=control_path, now=now, store_timeout_s=store_timeout_s,
         healed_at=healed_at if isinstance(healed_at, (int, float)) else None,
-        context_probe=context_probe, launchd_probe=launchd_probe)
+        context_probe=context_probe, launchd_probe=launchd_probe,
+        launchd_probe_disabled=launchd_probe_disabled)
     state["classification"] = classification
     if classification.get("kind") != KIND:
         return None

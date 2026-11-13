@@ -199,6 +199,15 @@ class TccWedgeWatchdogTests(unittest.TestCase):
         self.assertEqual(heal_calls, [])
         self.assertEqual(second["classification"]["kind"], "stalled_unclassified")
 
+    def test_a_disabled_launchd_probe_is_named_in_the_classification(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            (_, second), _, _, _ = self.launchd_passes(
+                td, {"TARTCI_TCC_LAUNCHD_PROBE": "0"})
+        evidence = second["classification"]["evidence"]["launchd_probe"]
+        self.assertEqual(evidence["outcome"], "disabled")
+        self.assertIn("TARTCI_TCC_LAUNCHD_PROBE=0", evidence["detail"])
+        self.assertIn("TARTCI_TCC_LAUNCHD_PROBE=0", second["classification"]["reason"])
+
     def test_the_second_wedge_within_the_interval_is_rate_limited(self) -> None:
         import tcc_wedge
         with tempfile.TemporaryDirectory() as td:
