@@ -326,8 +326,10 @@ tcc_context_probe = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeou
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
 # Converge the VM janitor and the disk reclaimer (so reclaim fixes such as the
-# 90%-used pressure trigger reach the host); every other declared agent stays plan-only.
-bootstrap = ["reap", "reclaim"]
+# 90%-used pressure trigger reach the host), and the launchd watchdog, so its
+# TCC context probe (and TART_HOME, which the hand-installed plist lacked)
+# reach it; every other declared agent stays plan-only.
+bootstrap = ["reap", "reclaim", "launchd-watchdog"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse
