@@ -460,8 +460,39 @@ authorization failure (lines written after the last heal are ignored, so the
 burst a release writes cannot justify the next heal); and, when
 `TARTCI_TCC_CONTEXT_PROBE` names a command that probes the store from a context
 with TCC access (for example over `ssh localhost`, whose sshd holds Full Disk
-Access), that command must exit 0. Only every configured reading agreeing
-yields `tcc_attribution_wedge`; otherwise the
+Access), that command must exit 0. Set it per host as `[launchd_watchdog]
+tcc_context_probe` in the fleet profile (launchd/README.md), which the
+support-agents step renders into the watchdog plist; never edit the plist by
+hand. Only every configured reading agreeing
+yields `tcc_attribution_wedge` (`path: error_signature`).
+
+A wedge can also log nothing at all (m3, 2026-11-13: no refusal line for
+hours). For that shape the classifier takes positive readings instead of error
+lines (`path: launchd_root_hang`): a fresh launchd job (`launchctl submit` of
+`scripts/tcc_launchd_probe_child.py`, bounded by the store timeout and always
+removed, with leftovers from a killed pass removed on the next) opens an
+internal directory and then the store's volume ROOT; it must answer the
+internal open and hang on the root; the internal control path must answer; and
+the `TARTCI_TCC_CONTEXT_PROBE` context must answer for the same store. That
+command runs under the same bound as the store probe
+(`--store-health-timeout-seconds`, 10 s by default), so it must open the store
+path itself (not just reach the host) within that bound: it is the reading that
+tells a TCC stall from a slow volume, and a store that answers in 15 s from
+every context reads as not answering here too. The launchd probe times the
+root open from the job's own stamp, so a slow `launchctl submit` or job start
+is `inconclusive`, never a hang. With no context probe configured this path
+never classifies, and the launchd job and its log scan are skipped (the
+verdict says so); set it on a host that needs the heal. A bounded `log show --info --debug` over the probe's window
+counts sandboxd `tcc_send_request_authorization() IPC` lines whose thread
+logs no next step within 5 s (a hint that the request did not go out, not a
+proof that tccd never saw it); that count is recorded and named in the verdict
+as corroboration, but neither required nor a veto, because the same wedge
+logged one such request on one probe and no IPC line at all on the next.
+Readings that disagree fail closed: a fresh launchd job that opens the root or
+fails fast on it, or a TCC-granted context that hangs too, vetoes both paths.
+`TARTCI_TCC_LAUNCHD_PROBE=0` turns the launchd probe off;
+`python3 scripts/tcc_wedge.py --launchd-probe <store>` runs one now and prints
+it. Otherwise the
 verdict is `stalled_unclassified` (volume stalled, cause unproven) or
 `host_unresponsive`, and nothing privileged runs. The verdict and its evidence
 are written to `~/.tartci/state/store-health.json` (`classification`), and:
@@ -477,7 +508,17 @@ are written to `~/.tartci/state/store-health.json` (`classification`), and:
 - `tartci doctor fleet` carries a `tcc_wedge` finding: `tcc_wedge_healed`,
   `tcc_wedge_unhealed` (the detail names `wrapper_missing`, `not_permitted`,
   `rate_limited`, `wrapper_rate_limited`, `timeout`, `failed`, or a restart
-  after which the store still hangs), or `tcc_wedge_none`.
+  after which the store still hangs), `tcc_wedge_unclassified` (the watchdog is
+  draining and no fresh wedge verdict names the cause), or `tcc_wedge_none`;
+- its `store_stall` finding shows the watchdog's `store-health.json` reading
+  (state, failures, classification, age) beside its own probe, and names the
+  context of each: the doctor's own probe runs from wherever it was started,
+  usually an interactive or ssh shell that already holds an authorization.
+  When the doctor's probe answers and the watchdog reads `draining`, the
+  finding is `store_context_disagree` (a problem), never `store_ok`;
+  `suspect` gives `store_context_suspect`, and a state file the watchdog has
+  not rewritten for over two passes gives `store_watchdog_stale` (unknown),
+  whatever state it last recorded.
 
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs

@@ -25,6 +25,16 @@ What this module adds to the plain timeout:
         (``context_probe``); a store that does not answer there either is a
         stalled volume, not a wedged daemon.
     Only all three agreeing yield ``tcc_attribution_wedge``.
+
+    A hang that logs no refusal at all (m3, 2026-11-13) is attributed only by
+    positive readings: a fresh launchd job (``launchd_probe``, `launchctl
+    submit`, always removed) hangs on the volume ROOT while its own internal
+    open answers, the internal control path answers, and the configured
+    context with TCC access answers for the same store. A bounded `log show`
+    of sandboxd's ``tcc_send_request_authorization() IPC`` lines over that
+    probe's window (``scan_ipc``) is recorded as corroboration. Readings that
+    disagree (the launchd job opens the root, or fails fast on it) veto both
+    paths: no root heal.
   * ``heal``: one scoped root action, ``sudo -n /usr/local/sbin/tartci-heal-tcc``,
     which restarts tccd and sandboxd and nothing else, at most once per
     ``HEAL_INTERVAL_S`` (the wrapper keeps its own root-owned stamp as well).
@@ -130,9 +140,10 @@ def signature_hits(text: str, *, before: Optional[str] = None) -> dict[str, Any]
 
 def window_seconds(failing_since: Optional[float], now: float) -> int:
     """How far back to scan: the whole streak plus a margin, within bounds."""
-    if not isinstance(failing_since, (int, float)) or failing_since > now:
+    since = store_health.finite_epoch(failing_since, now)
+    if since is None:
         return MIN_WINDOW_S
-    return int(min(MAX_WINDOW_S, max(MIN_WINDOW_S, now - failing_since + MIN_WINDOW_S)))
+    return int(min(MAX_WINDOW_S, max(MIN_WINDOW_S, now - since + MIN_WINDOW_S)))
 
 
 def scan_log(window_s: int, *, before: Optional[str] = None,
@@ -154,6 +165,327 @@ def scan_log(window_s: int, *, before: Optional[str] = None,
     return hits
 
 
+# ── The fresh-launchd-job probe and the IPC signature ───────────────────────
+#
+# A wedge does not always log the refusals above: on 2026-11-13 m3's
+# launchd-context opens of its store volume hung for hours with no error line
+# at all, because a request that merely hangs logs nothing. The positive
+# reading that does not depend on error lines is to open the volume ROOT from a
+# context that has no cached decision, a fresh launchd job, while an internal
+# path answers in the same job and a context that already holds authorization
+# answers for the same volume.
+
+LAUNCHCTL = "/bin/launchctl"
+LAUNCHCTL_TIMEOUT_S = 10.0
+LAUNCHD_LABEL_PREFIX = "com.danielraffel.tartci.tcc-probe"
+LAUNCHD_PROBE_DIR = "tcc-probe"
+LAUNCHD_POLL_S = 0.1
+# How long launchd may take to start the job and reach its root open, past
+# the root-open bound itself, before the reading is inconclusive.
+LAUNCHD_START_GRACE_S = 10.0
+# The child's reading of the shared clock as it starts the root open. It must
+# be a SYSTEM-WIDE clock: time.monotonic() is not one on every interpreter
+# (Apple's /usr/bin/python3 3.9 counts it from process start, 3.12+ from
+# boot), so a 3.9 child's stamp read by any parent would look like an open
+# that began at boot, a false hang. CLOCK_UPTIME_RAW (mach_absolute_time) is
+# system-wide on every Python since 3.8 and immune to wall-clock steps.
+# tcc_launchd_probe_child.shared_clock reads the same clock.
+ROOT_OPEN_STAMP = "root_open_started_uptime"
+
+
+def shared_clock() -> float:
+    """Seconds on the system-wide uptime clock, the same in every process."""
+    clock_id = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clock_id is None:            # not macOS: CLOCK_MONOTONIC is system-wide there
+        clock_id = time.CLOCK_MONOTONIC
+    return time.clock_gettime(clock_id)
+CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tcc_launchd_probe_child.py")
+# Outcomes of the launchd probe that say the root answered (or failed fast):
+# the store is not hanging on an authorization from that context, so the
+# readings disagree with a wedge and nothing privileged may run.
+LAUNCHD_DISAGREES = frozenset({"answered", "root_error"})
+# An IPC line sandboxd logs as it asks tccd, and how long its own thread has to
+# take the next step (the "activating connection" to tccd, a SEND, or the second
+# IPC to the per-user tccd) before the request counts as unanswered. Answered
+# requests take that step within ~20 ms on m3.
+IPC_ANSWER_S = 5.0
+IPC_SCAN_TIMEOUT_S = 30.0
+IPC_PREDICATE = ('(process == "sandboxd" AND eventMessage CONTAINS[c] "tcc") OR '
+                 '(process == "tccd" AND eventMessage CONTAINS "REQUEST")')
+_LOG_LINE = re.compile(
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(\.\d+)?\s+\S+\s+"
+    r"(sandboxd|tccd)\[(\d+):([0-9a-fA-F]+)\]\s?(.*)$")
+_IPC = "tcc_send_request_authorization() IPC"
+
+
+def volume_root(path: str) -> str:
+    """The mount point of an external volume, lexically ("/" when internal).
+
+    Never a stat: the path may be the one that hangs."""
+    parts = os.path.normpath(str(path)).split(os.sep)
+    if len(parts) >= 3 and parts[0] == "" and parts[1] == "Volumes" and parts[2]:
+        return os.sep.join(parts[:3])
+    return "/"
+
+
+def _read_json(path: str) -> Optional[dict]:
+    try:
+        with open(path) as handle:
+            value = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _remove_job(label: str, runner: Callable[..., Any]) -> tuple[bool, str]:
+    try:
+        completed = runner([LAUNCHCTL, "remove", label], timeout=LAUNCHCTL_TIMEOUT_S,
+                           operation="tcc_launchd_remove")
+    except (OSError, ValueError) as exc:
+        return False, str(exc)[:200]
+    if completed.returncode == 0:
+        return True, ""
+    detail = (completed.stderr or completed.stdout or "").strip()
+    # A job that is already gone is removed.
+    if "No such process" in detail or completed.returncode == 3:
+        return True, detail[:200]
+    return False, (detail or f"exit {completed.returncode}")[:200]
+
+
+def _forget(probe_dir: str, label: str) -> None:
+    for suffix in (".label", ".json", ".json.tmp"):
+        try:
+            os.unlink(os.path.join(probe_dir, label + suffix))
+        except OSError:
+            pass
+
+
+def _remove_leftovers(probe_dir: str, runner: Callable[..., Any]) -> list:
+    """Remove jobs an earlier pass submitted and could not remove (a killed
+    watchdog, a failed remove). Each submit leaves a `<label>.label` marker
+    until its job is gone."""
+    removed = []
+    try:
+        names = sorted(os.listdir(probe_dir))
+    except OSError:
+        return removed
+    for name in names:
+        if not (name.endswith(".label") and name.startswith(LAUNCHD_LABEL_PREFIX + ".")):
+            continue
+        label = name[:-len(".label")]
+        ok, _ = _remove_job(label, runner)
+        if ok:
+            _forget(probe_dir, label)
+            removed.append(label)
+    return removed
+
+
+def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
+                  runner: Callable[..., Any] = run_bounded,
+                  python: Optional[str] = None,
+                  sleep: Callable[[float], None] = time.sleep,
+                  clock: Callable[[], float] = shared_clock,
+                  now: Callable[[], float] = time.time,
+                  grace_s: float = LAUNCHD_START_GRACE_S) -> dict[str, Any]:
+    """Open the store's volume root from a fresh launchd job, bounded.
+
+    Outcomes: answered, root_error (a fast error, not a hang), hung_on_root
+    (the internal path answered in the same job, and the root open, timed from
+    the child's own stamp, did not return within `timeout_s`), did_not_start (no phase recorded: launchd did not run it, or
+    even its internal open hung), inconclusive (launchctl failed), not_external
+    (the store is on the boot volume; nothing to probe). The job is removed on
+    every path, including an exception.
+    """
+    root = volume_root(store_path)
+    record: dict[str, Any] = {"context": "fresh launchd job (launchctl submit)",
+                              "volume_root": root, "timeout_s": timeout_s}
+    if root == "/":
+        record.update(outcome="not_external",
+                      detail=f"{store_path} is not on an external volume")
+        return record
+    probe_dir = os.path.join(internal_dir, LAUNCHD_PROBE_DIR)
+    try:
+        os.makedirs(probe_dir, exist_ok=True)
+    except OSError as exc:
+        record.update(outcome="inconclusive", detail=f"{probe_dir}: {exc}"[:300])
+        return record
+    leftovers = _remove_leftovers(probe_dir, runner)
+    if leftovers:
+        record["removed_leftover_jobs"] = leftovers
+    started_epoch = now()
+    label = f"{LAUNCHD_LABEL_PREFIX}.{os.getpid()}.{int(started_epoch * 1000)}"
+    result_path = os.path.join(probe_dir, label + ".json")
+    if python is None:
+        from python_child import child_python
+        python = child_python()
+    argv = [LAUNCHCTL, "submit", "-l", label, "--", python, CHILD,
+            "--root", root, "--internal", probe_dir, "--result", result_path,
+            "--hold", str(int(math.ceil(timeout_s)) + 30)]
+    record.update(label=label, started_at=_iso(started_epoch), started_epoch=started_epoch)
+    seen: Optional[dict] = None
+    submitted = False
+    began = clock()
+    # The clock reading the root-open span is measured at: taken with the
+    # last read of the child's result, BEFORE the remove (which can take up to
+    # LAUNCHCTL_TIMEOUT_S), never after it.
+    read_at: Optional[float] = None
+    try:
+        with open(os.path.join(probe_dir, label + ".label"), "w") as marker:
+            marker.write(f"{started_epoch}\n")
+        try:
+            completed = runner(argv, timeout=LAUNCHCTL_TIMEOUT_S, operation="tcc_launchd_submit")
+            require_success(completed, operation="tcc_launchd_submit")
+            submitted = True
+        except ObservationError as exc:
+            record.update(outcome="inconclusive",
+                          detail=f"launchctl submit {exc.kind}: {exc.detail}"[:300])
+        except (OSError, ValueError) as exc:
+            record.update(outcome="inconclusive", detail=f"launchctl submit: {exc}"[:300])
+        if submitted:
+            # The bound is on the root open itself, from the child's own stamp:
+            # time spent in launchctl or in launchd starting the job is not a
+            # hang on the volume.
+            cap = began + timeout_s + grace_s
+            while True:
+                seen = _read_json(result_path)
+                opened = (seen or {}).get(ROOT_OPEN_STAMP)
+                if seen and seen.get("phase") in ("root_ok", "root_error"):
+                    break
+                if isinstance(opened, (int, float)) and clock() - opened >= timeout_s:
+                    break
+                if clock() >= cap:
+                    break
+                sleep(LAUNCHD_POLL_S)
+            # One last read, then freeze: an answer that landed after the last
+            # poll counts, and the span is fixed here, before the remove.
+            latest = _read_json(result_path)
+            if latest:
+                seen = latest
+            read_at = clock()
+    finally:
+        removed, why = _remove_job(label, runner)
+        record["job_removed"] = removed
+        if removed:
+            _forget(probe_dir, label)
+        else:
+            record["remove_error"] = why
+    record["waited_s"] = round(clock() - began, 3)
+    if not submitted:
+        return record
+    phase = (seen or {}).get("phase")
+    record["phase"] = phase
+    for key in ("internal_latency_ms", "root_latency_ms", "errno", "error",
+                "root_open_started", ROOT_OPEN_STAMP):
+        if seen and key in seen:
+            record[key] = seen[key]
+    if phase == "root_ok":
+        record["outcome"] = "answered"
+    elif phase == "root_error":
+        record["outcome"] = "root_error"
+    elif phase == "internal_ok":
+        opened = (seen or {}).get(ROOT_OPEN_STAMP)
+        span = (read_at - opened
+                if isinstance(opened, (int, float)) and read_at is not None else None)
+        record["root_open_s"] = None if span is None else round(span, 3)
+        if span is not None and span >= timeout_s:
+            record["outcome"] = "hung_on_root"
+        else:
+            record["outcome"] = "inconclusive"
+            record["detail"] = ("the root open was not observed for the full "
+                                f"{timeout_s:g}s bound (open for {record['root_open_s']}s)")
+    else:
+        record["outcome"] = "did_not_start"
+    return record
+
+
+def launchd_probe_from_env(store_path: str, internal_dir: str, timeout_s: float,
+                           env: Optional[dict] = None) -> Optional[Callable[[], dict]]:
+    """The probe the watchdog runs, unless TARTCI_TCC_LAUNCHD_PROBE=0."""
+    env = os.environ if env is None else env
+    if str(env.get("TARTCI_TCC_LAUNCHD_PROBE", "1")) == "0":
+        return None
+    return lambda: launchd_probe(store_path, internal_dir, timeout_s)
+
+
+def _local_epoch(stamp: str, fraction: Optional[str]) -> float:
+    return time.mktime(time.strptime(stamp, "%Y-%m-%d %H:%M:%S")) + float(fraction or 0)
+
+
+def ipc_hits(text: str, *, end_epoch: Optional[float] = None,
+             answer_s: float = IPC_ANSWER_S) -> dict[str, Any]:
+    """Unanswered sandboxd authorization requests in `log show --style compact` text.
+
+    A sandboxd thread asks tccd with a `tcc_send_request_authorization() IPC`
+    line and, when the request goes out, logs its next step on the same thread
+    within milliseconds. A thread whose first IPC is followed by nothing from
+    that thread within `answer_s` sent a request that never reached tccd.
+    tccd's REQUEST lines carry only a msgID that sandboxd prints on few threads,
+    so the thread's own next step stands in for "a matching tccd REQUEST";
+    tccd's REQUEST lines are counted to show tccd itself is alive. An IPC within
+    `answer_s` of `end_epoch` is pending: the log ends before it can be judged.
+    """
+    threads: dict[tuple, list] = {}
+    order = 0
+    tccd_requests = 0
+    for line in text.splitlines():
+        match = _LOG_LINE.match(line)
+        if not match:
+            continue
+        stamp, fraction, process, pid, tid, message = match.groups()
+        if process == "tccd":
+            if "REQUEST" in message:
+                tccd_requests += 1
+            continue
+        epoch = _local_epoch(stamp, fraction)
+        threads.setdefault((pid, tid), []).append((epoch, order, _IPC in message, stamp))
+        order += 1
+    answered = unanswered = pending = 0
+    first_unanswered: Optional[str] = None
+    for rows in threads.values():
+        rows.sort(key=lambda row: (row[0], row[1]))
+        for index, (epoch, _, is_ipc, stamp) in enumerate(rows):
+            if not is_ipc:
+                continue
+            if index and epoch - rows[index - 1][0] <= answer_s:
+                continue        # a later step of a request already judged
+            if any(later[0] - epoch <= answer_s for later in rows[index + 1:]):
+                answered += 1
+            elif end_epoch is not None and epoch + answer_s > end_epoch:
+                pending += 1
+            else:
+                unanswered += 1
+                first_unanswered = first_unanswered or stamp
+    if unanswered:
+        state = "unanswered"
+    elif answered:
+        state = "all_answered"
+    elif pending:
+        state = "pending"
+    else:
+        state = "absent"
+    return {"state": state, "answered": answered, "unanswered": unanswered,
+            "pending": pending, "tccd_requests": tccd_requests,
+            "first_unanswered": first_unanswered, "answer_s": answer_s}
+
+
+def scan_ipc(start_epoch: float, end_epoch: float, *,
+             runner: Callable[..., Any] = run_bounded) -> dict[str, Any]:
+    """Bounded `log show` of sandboxd's authorization IPC over one probe's window."""
+    argv = [LOG_SHOW, "show", "--start", local_stamp(start_epoch),
+            "--end", local_stamp(end_epoch + 1), "--info", "--debug",
+            "--predicate", IPC_PREDICATE, "--style", "compact"]
+    try:
+        completed = runner(argv, timeout=IPC_SCAN_TIMEOUT_S, operation="tcc_ipc_scan")
+        require_success(completed, operation="tcc_ipc_scan")
+    except ObservationError as exc:
+        return {"state": "unavailable", "error": f"{exc.kind}: {exc.detail}"[:300]}
+    except (OSError, ValueError) as exc:
+        return {"state": "unavailable", "error": str(exc)[:300]}
+    hits = ipc_hits(completed.stdout or "", end_epoch=end_epoch + 1)
+    hits.update(start=local_stamp(start_epoch), end=local_stamp(end_epoch + 1))
+    return hits
+
+
 def control_probe(path: str, timeout_s: float, *,
                   probe: Callable[..., dict] = store_health.probe) -> dict[str, Any]:
     """The same bounded open+fstat, on an internal path that must answer."""
@@ -171,18 +503,44 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
              store_timeout_s: float = 10.0, healed_at: Optional[float] = None,
              scan: Optional[Callable[..., dict]] = None,
              control: Optional[Callable[[str, float], dict]] = None,
-             context_probe: Optional[Callable[[], dict]] = None) -> dict[str, Any]:
-    """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}."""
+             context_probe: Optional[Callable[[], dict]] = None,
+             launchd_probe: Optional[Callable[[], dict]] = None,
+             launchd_probe_disabled: bool = False,
+             ipc_scan: Optional[Callable[[float, float], dict]] = None) -> dict[str, Any]:
+    """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}.
+
+    Two paths reach `tcc_attribution_wedge`; every other combination is
+    `stalled_unclassified` (or `host_unresponsive`) and runs nothing privileged:
+
+      * error_signature: sandboxd/tccd logged Removable Volumes refusals over
+        the streak (the 10-25 and 11-11 shape), and no reading contradicts it.
+      * launchd_root_hang: no error lines, but a fresh launchd job hangs on the
+        volume root while its own internal open answers, AND a context that
+        already holds authorization (TARTCI_TCC_CONTEXT_PROBE) answers for the
+        same store (the 11-13 shape). Without that configured reading the
+        verdict stays unproven.
+
+    Disagreement fails closed: a fresh launchd job that opens the root, or
+    fails fast on it, and an authorized context that hangs too, each veto both
+    paths. The sandboxd IPC signature (an authorization request that never
+    left sandboxd) is recorded and named as corroboration, never required and
+    never a veto: on 2026-11-13 the same wedge showed an unanswered IPC on one
+    probe and no IPC line at all on the next, so its absence proves nothing.
+    """
     now = time.time() if now is None else now
     scan = scan_log if scan is None else scan
     control = control_probe if control is None else control
+    ipc_scan = scan_ipc if ipc_scan is None else ipc_scan
     evidence: dict[str, Any] = {"consecutive_failures": consecutive_failures,
                                 "failure_threshold": failure_threshold,
                                 "last_reason": last_reason}
 
-    def verdict(kind: str, reason: str) -> dict[str, Any]:
-        return {"kind": kind, "reason": reason, "evidence": evidence,
-                "classified_at": _iso(now)}
+    def verdict(kind: str, reason: str, path: Optional[str] = None) -> dict[str, Any]:
+        value = {"kind": kind, "reason": reason, "evidence": evidence,
+                 "classified_at": _iso(now)}
+        if path:
+            value["path"] = path
+        return value
 
     if consecutive_failures < failure_threshold:
         return verdict("not_classified",
@@ -196,42 +554,113 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
         return verdict("host_unresponsive",
                        f"the internal control path {control_path} also fails "
                        f"({ctl.get('reason')}); not a TCC verdict")
+    launchd: dict[str, Any] = {"outcome": "not_run"}
+    if launchd_probe_disabled:
+        launchd = {"outcome": "disabled",
+                   "detail": "TARTCI_TCC_LAUNCHD_PROBE=0; the launchd reading is disabled"}
+        evidence["launchd_probe"] = launchd
+    elif launchd_probe is not None and context_probe is None:
+        # Without a context with TCC access the launchd path can never
+        # classify, so the hanging job and the IPC scan would buy nothing.
+        launchd = {"outcome": "skipped",
+                   "detail": "no context with TCC access is configured (TARTCI_TCC_CONTEXT_PROBE)"}
+        evidence["launchd_probe"] = launchd
+    elif launchd_probe is not None:
+        launchd = launchd_probe()
+        evidence["launchd_probe"] = launchd
+        started = launchd.get("started_epoch")
+        if launchd.get("outcome") == "hung_on_root" and isinstance(started, (int, float)):
+            evidence["ipc_scan"] = ipc_scan(started, started + float(
+                launchd.get("waited_s") or launchd.get("timeout_s") or store_timeout_s))
     window = window_seconds(failing_since, now)
-    before = local_stamp(healed_at) if isinstance(healed_at, (int, float)) else None
+    healed = store_health.finite_epoch(healed_at, now)
+    before = local_stamp(healed) if healed is not None else None
     log = scan(window, before=before)
     evidence["log_scan"] = log
     minutes = max(1, int(math.ceil(window / 60.0)))
-    if not log.get("ok"):
+    outcome = launchd.get("outcome")
+    root = launchd.get("volume_root")
+    if outcome in LAUNCHD_DISAGREES:
+        how = ("opened" if outcome == "answered"
+               else f"failed fast on ({launchd.get('error')})")
         return verdict("stalled_unclassified",
-                       f"log show unavailable ({log.get('error')}); the store is stalled "
-                       "but the cause is unproven")
-    removable = int((log.get("by_signature") or {}).get("removable_volumes_auth_failed") or 0)
-    if removable == 0:
+                       f"a fresh launchd job {how} the volume root {root} while the store probe "
+                       "timed out: the readings disagree, so the cause is unproven and nothing "
+                       "privileged runs")
+    removable = 0
+    if log.get("ok"):
+        removable = int((log.get("by_signature") or {}).get("removable_volumes_auth_failed") or 0)
+    ctx: Optional[dict] = None
+
+    def authorized_context() -> Optional[dict]:
+        nonlocal ctx
+        if ctx is None and context_probe is not None:
+            ctx = context_probe()
+            evidence["tcc_context_probe"] = ctx
+        return ctx
+
+    if removable > 0:
         # "Failed to create Attribution Chain" is logged for any TCC service;
         # only the Removable Volumes request line ties the failure to the store.
-        return verdict("stalled_unclassified",
-                       f"no sandboxd/tccd Removable Volumes failure in the last {minutes} min "
-                       f"({log.get('total')} other TCC failure line(s)); the store is stalled "
-                       "but the cause is unproven")
-    if context_probe is not None:
-        ctx = context_probe()
-        evidence["tcc_context_probe"] = ctx
-        if not ctx.get("ok"):
+        reading = authorized_context()
+        if reading is not None and not reading.get("ok"):
             return verdict("stalled_unclassified",
                            "the store did not answer from a context with TCC access either "
-                           f"({ctx.get('reason')}); the volume, not tccd, is stalled")
+                           f"({reading.get('reason')}); the volume, not tccd, is stalled")
+        return verdict(KIND,
+                       f"{removable} sandboxd/tccd Removable Volumes authorization "
+                       f"failure(s) in the last {minutes} min while the internal control path "
+                       "answers: launchd-context opens of the store hang on tccd",
+                       path="error_signature")
+    if not log.get("ok"):
+        signature_text = f"log show unavailable ({log.get('error')})"
+    else:
+        signature_text = (f"no sandboxd/tccd Removable Volumes failure in the last {minutes} min "
+                          f"({log.get('total')} other TCC failure line(s))")
+    if outcome != "hung_on_root":
+        detail = {"not_run": "", "disabled": "; the fresh launchd probe was disabled by "
+                  "TARTCI_TCC_LAUNCHD_PROBE=0; the launchd reading is missing",
+                  "not_external": "; the store is not on an external volume",
+                  "skipped": "; the fresh launchd probe was skipped because no context with "
+                             "TCC access is configured (TARTCI_TCC_CONTEXT_PROBE), without "
+                             "which a hang that logs no error cannot be attributed",
+                  "did_not_start": "; the fresh launchd probe recorded nothing",
+                  "inconclusive": f"; the fresh launchd probe was inconclusive "
+                                  f"({launchd.get('detail')})"}.get(str(outcome), "")
+        return verdict("stalled_unclassified",
+                       f"{signature_text}{detail}; the store is stalled but the cause is unproven")
+    reading = authorized_context()
+    if reading is None:
+        return verdict("stalled_unclassified",
+                       f"a fresh launchd job hangs on the volume root {root} while its internal "
+                       f"open answers, and {signature_text}; no context with TCC access is "
+                       "configured (TARTCI_TCC_CONTEXT_PROBE), so the cause is unproven and "
+                       "nothing privileged runs")
+    if not reading.get("ok"):
+        return verdict("stalled_unclassified",
+                       "the store did not answer from a context with TCC access either "
+                       f"({reading.get('reason')}); the volume, not tccd, is stalled")
+    ipc = evidence.get("ipc_scan") or {}
+    corroboration = (f"; sandboxd logged {ipc.get('unanswered')} authorization request(s) "
+                     f"whose thread logged no next step within {ipc.get('answer_s')}s "
+                     f"(first at {ipc.get('first_unanswered')})"
+                     if ipc.get("state") == "unanswered" else
+                     f"; sandboxd IPC signature {ipc.get('state') or 'not read'}")
     return verdict(KIND,
-                   f"{removable} sandboxd/tccd Removable Volumes authorization "
-                   f"failure(s) in the last {minutes} min while the internal control path "
-                   "answers: launchd-context opens of the store hang on tccd")
+                   f"a fresh launchd job hangs on the volume root {root} while its internal "
+                   "open and the internal control path answer, and the store answers from a "
+                   f"context with TCC access{corroboration}: launchd-context opens wait on a "
+                   "Removable Volumes authorization", path="launchd_root_hang")
 
 
 def heal_allowed(last_heal: Optional[dict], now: float) -> tuple[bool, str]:
     """tartci's own rate limit, independent of the wrapper's root-owned stamp."""
     if not isinstance(last_heal, dict):
         return True, ""
-    at = last_heal.get("at_epoch")
-    if not isinstance(at, (int, float)) or at > now:
+    # An unreadable stamp (NaN, an infinity, the future) is no record: the
+    # wrapper's own root-owned stamp still holds the 30-minute bound.
+    at = store_health.finite_epoch(last_heal.get("at_epoch"), now)
+    if at is None:
         return True, ""
     if now - at < HEAL_INTERVAL_S:
         return False, (f"last heal {int(now - at)}s ago, under the "
@@ -357,7 +786,9 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
                   classify_fn: Callable[..., dict] = classify,
                   heal_fn: Callable[..., dict] = heal,
                   reprobe: Optional[Callable[..., dict]] = None,
-                  context_probe: Optional[Callable[[], dict]] = None) -> Optional[dict]:
+                  context_probe: Optional[Callable[[], dict]] = None,
+                  launchd_probe: Optional[Callable[[], dict]] = None,
+                  launchd_probe_disabled: bool = False) -> Optional[dict]:
     """Classify, heal once, and reprobe. Mutates `state`; returns a recovered
     probe result when the heal brought the store back, else None.
 
@@ -373,8 +804,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         if isinstance(previous.get("last_heal"), dict):
             state["last_heal"] = previous["last_heal"]
         return None
-    since = previous.get("failing_since")
-    if isinstance(since, (int, float)) and since <= now:
+    since = store_health.finite_epoch(previous.get("failing_since"), now)
+    if since is not None:
         state["failing_since"] = since
     else:
         # No recorded start (first pass after a rollout mid-wedge): the earlier
@@ -392,8 +823,9 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         failure_threshold=int(state.get("failure_threshold") or 2),
         last_reason=last_result.get("reason"), failing_since=state["failing_since"],
         control_path=control_path, now=now, store_timeout_s=store_timeout_s,
-        healed_at=healed_at if isinstance(healed_at, (int, float)) else None,
-        context_probe=context_probe)
+        healed_at=store_health.finite_epoch(healed_at, now),
+        context_probe=context_probe, launchd_probe=launchd_probe,
+        launchd_probe_disabled=launchd_probe_disabled)
     state["classification"] = classification
     if classification.get("kind") != KIND:
         return None
@@ -429,13 +861,21 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
 
 
 def context_probe_from_env(env: Optional[dict] = None,
-                           runner: Callable[..., Any] = run_bounded) -> Optional[Callable[[], dict]]:
+                           runner: Callable[..., Any] = run_bounded,
+                           timeout_s: float = store_health.DEFAULT_TIMEOUT_S,
+                           ) -> Optional[Callable[[], dict]]:
     """A probe from a context with TCC access, when the host configures one.
 
     TARTCI_TCC_CONTEXT_PROBE is an argv (shell-split) that exits 0 when the
     store answers from that context, for example an `ssh localhost ...` whose
     sshd holds Full Disk Access. Unset, the reading is skipped and recorded
     as not configured.
+
+    It is bounded by the STORE timeout, the same bound the store probe and the
+    launchd probe use. This reading is what tells a TCC stall from a slow
+    volume: a store that answers in 15 s from every context must read as
+    "did not answer" here too, or a slow disk would look like a wedged tccd
+    and earn a root heal.
     """
     import shlex
     env = os.environ if env is None else env
@@ -446,13 +886,13 @@ def context_probe_from_env(env: Optional[dict] = None,
 
     def probe() -> dict:
         try:
-            completed = runner(argv, timeout=LOG_SCAN_TIMEOUT_S, operation="tcc_context_probe")
+            completed = runner(argv, timeout=timeout_s, operation="tcc_context_probe")
             require_success(completed, operation="tcc_context_probe")
         except ObservationError as exc:
             return {"ok": False, "reason": f"{exc.kind}: {exc.detail}"[:200], "argv": argv}
         except (OSError, ValueError) as exc:
             return {"ok": False, "reason": str(exc)[:200], "argv": argv}
-        return {"ok": True, "argv": argv}
+        return {"ok": True, "argv": argv, "timeout_s": timeout_s}
     return probe
 
 
@@ -508,6 +948,10 @@ def main(argv: Optional[list] = None) -> int:
                       help="run the bounded signature scan now and print it")
     mode.add_argument("--state", action="store_true",
                       help="print the watchdog's classification and heal records")
+    mode.add_argument("--launchd-probe", metavar="STORE",
+                      help="open STORE's volume root from a fresh launchd job now (bounded, "
+                           "the job is always removed) and print the reading")
+    parser.add_argument("--timeout-seconds", type=float, default=10.0)
     parser.add_argument("--last-minutes", type=int, default=MIN_WINDOW_S // 60)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
@@ -516,7 +960,11 @@ def main(argv: Optional[list] = None) -> int:
         if text:
             print(text)
         return 0
-    if args.scan_log:
+    if args.launchd_probe:
+        root = os.environ.get("TARTCI_HOME") or os.path.join(os.path.expanduser("~"), ".tartci")
+        value = launchd_probe(args.launchd_probe, os.path.join(root, "state"),
+                              args.timeout_seconds)
+    elif args.scan_log:
         value = scan_log(max(60, args.last_minutes * 60))
     else:
         state = read_state()

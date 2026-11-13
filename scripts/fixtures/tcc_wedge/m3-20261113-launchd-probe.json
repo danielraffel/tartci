@@ -1,0 +1,13 @@
+{
+  "context": "fresh launchd job (launchctl submit)",
+  "volume_root": "/Volumes/Example",
+  "timeout_s": 10.0,
+  "label": "com.danielraffel.tartci.tcc-probe.76285.1794550583805",
+  "started_at": "2026-11-13T06:02:32Z",
+  "started_epoch": 1794549752.5,
+  "job_removed": true,
+  "waited_s": 10.08,
+  "phase": "internal_ok",
+  "internal_latency_ms": 0.2,
+  "outcome": "hung_on_root"
+}

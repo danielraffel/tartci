@@ -367,8 +367,14 @@ def peer_store_admits(output: str) -> str | None:
         return (f"cannot admit a VM: Tart store health is {state} "
                 f"({value.get('consecutive_failures')} failure(s), last: {last.get('reason')}"
                 + (f", {kind}" if kind else "") + ")")
-    updated = value.get("updated_at")
-    if not isinstance(updated, (int, float)) or clock - updated > STORE_HEALTH_STALE_S:
+    from store_health import finite_epoch  # noqa: PLC0415 - shared timestamp check
+
+    raw = value.get("updated_at")
+    # NaN or an infinity compares false against every bound and would read as
+    # fresh; a time more than a minute past the peer's own clock is corrupt.
+    updated = finite_epoch(raw, clock, future_slack_s=60)
+    if updated is None or clock - updated > STORE_HEALTH_STALE_S:
+        updated = raw
         return (f"Tart store health reading is stale (updated_at {updated}, peer clock {clock}); "
                 "the launchd watchdog is not probing")
     return None

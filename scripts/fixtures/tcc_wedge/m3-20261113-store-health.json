@@ -1,0 +1,23 @@
+{
+  "classification": {
+    "classified_at": "2026-11-13T06:01:51Z",
+    "evidence": {
+      "consecutive_failures": 3,
+      "control_probe": {"latency_ms": 0.045, "ok": true, "path": "/Users/example/.tartci/state", "reason": null},
+      "failure_threshold": 2,
+      "last_reason": "timeout after 10s",
+      "log_scan": {"before": null, "by_signature": {"attribution_chain": 0, "removable_volumes_auth_failed": 0},
+                   "first": null, "ignored_after_heal": 0, "last": null, "ok": true, "total": 0, "window_s": 963}
+    },
+    "kind": "stalled_unclassified",
+    "reason": "no sandboxd/tccd Removable Volumes failure in the last 17 min (0 other TCC failure line(s)); the store is stalled but the cause is unproven"
+  },
+  "consecutive_failures": 3,
+  "drain_required": true,
+  "failing_since": 1794548993.411585,
+  "failure_threshold": 2,
+  "last_result": {"kind": "timeout", "ok": false, "path": "/Volumes/Example/VMs", "reason": "timeout after 10s"},
+  "path": "/Volumes/Example/VMs",
+  "state": "draining",
+  "updated_at": 1794549711
+}
