@@ -41,8 +41,11 @@ APPROVED_BOOTSTRAP = {
     # disk_pressure with hundreds of GiB of idle build trees it would have
     # removed.
     "m1-macos-fleet.toml": ["reap", "reclaim"],
-    "m3-macos-fleet.toml": ["reap", "reclaim"],
+    "m3-macos-fleet.toml": ["reap", "reclaim", "launchd-watchdog"],
     "m5-macos-fleet.toml": ["reap", "reclaim"],
+    # m3 also converges its launchd watchdog, so the TCC context probe that
+    # enables the root TCC heal is rendered by the installer, not hand-edited.
+    # Needs the owner's approval on the PR that adds it.
     # 2026-10-22: m5studio only. A hand-installed disk watchdog is not
     # reconciled, and m5studio ran none for days.
     "m5studio-macos-fleet.toml": ["reap", "disk-watchdog", "reclaim"],
