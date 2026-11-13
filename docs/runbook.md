@@ -439,6 +439,20 @@ the event's `fields.reason` (`probe_timeout`, `health_supervisor_timeout`,
 timed-out probe is killed together with any child it started in its own
 session, so a probe stuck in `open()` is not left behind as an orphan.
 
+`health_supervisor_timeout` means the lane's worker overran its deadline
+(`--timeout` plus 2 s). When the supervisor kills and reaps that worker, the
+worker was slow, not stuck on the store, so it counts as one failed probe for
+that lane only: the lane refuses this poll and quarantines itself after
+`failure_threshold` in a row, and the other lanes keep admitting. Only a worker
+that cannot be reaped (or a probe child that cannot, `probe_timeout_unreaped`),
+an unnamed observer, or a state file that cannot be locked within 1 s raises the
+host-wide `.quarantine` marker that holds every lane for its own recovery
+window. On m1 (2026-11-10..13) 468 reaped overruns, 84% of them while the
+persistent `Shipyard-m1-01` host runner ran `cargo test`, each held all five
+lanes in `recovery_check_pending` while the watchdog read the store in under a
+millisecond. A host whose lanes keep logging this reason is CPU- or I/O-starved
+by work outside the lease governor; look at what else runs on it.
+
 **A store that times out from launchd but answers an interactive shell is a
 wedged tccd, not a slow disk (m3, 2026-10-25 and 2026-11-11).** Every `open()`
 of an external volume from a launchd job needs a Removable Volumes

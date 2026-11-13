@@ -257,6 +257,83 @@ class ObserverHysteresisTests(unittest.TestCase):
                 storage_health.run_worker(args)
             self.assertEqual(seen, ["free"])
 
+    def supervisor_timeout(self, host: Host, observer: str, *, reaped: bool = True) -> tuple[int, dict]:
+        """One lane's supervisor killing a worker that overran its deadline,
+        with the lane's default (internal-volume) state path."""
+        class OverrunWorker:
+            pid = 12345
+            stdout = None
+            stderr = None
+
+            def communicate(self, **_kwargs):
+                raise storage_health.subprocess.TimeoutExpired("worker", 7)
+
+        args = argparse.Namespace(path=str(host.root), state="", observer=observer,
+                                  timeout=5.0, failure_threshold=2, recovery_threshold=3)
+        out = io.StringIO()
+        with patch.object(storage_health.subprocess, "Popen", return_value=OverrunWorker()), \
+                patch.object(storage_health, "reap_after_kill", return_value=reaped), \
+                patch.object(storage_health, "default_state", return_value=host.state), \
+                contextlib.redirect_stdout(out):
+            rc = storage_health.run(args)
+        return rc, json.loads(out.getvalue())
+
+    def test_reaped_supervisor_timeout_holds_only_its_own_lane(self):
+        """m1, 2026-11-13: workers overran the 7 s supervisor deadline while a
+        host runner's cargo test loaded the machine (468 in four days, the
+        watchdog reading the store in 0.07 ms). Each one raised the host marker
+        and held all five lanes in recovery_check_pending."""
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(temp)
+            host.probe("m1-pulp-gate", OK)
+            rc, first = self.supervisor_timeout(host, "m1-forge-gate")
+            self.assertEqual(rc, storage_health.DEGRADED, first)
+            self.assertEqual(first["reason"], "health_supervisor_timeout")
+            self.assertFalse(host.marker.exists(),
+                             "a reaped worker is not evidence about the store")
+            gate_rc, gate = host.probe("m1-pulp-gate", OK)
+            self.assertEqual(gate_rc, storage_health.HEALTHY, gate)
+            document = json.loads(host.state.read_text())
+            self.assertIn("m1-pulp-gate", document["observers"],
+                          "the timeout must not discard sibling lanes' records")
+            rc, second = self.supervisor_timeout(host, "m1-forge-gate")
+            self.assertEqual(rc, storage_health.QUARANTINED, second)
+            self.assertFalse(host.marker.exists())
+            # The timed-out lane itself must see the store recover before admitting.
+            for expected in (storage_health.QUARANTINED, storage_health.QUARANTINED,
+                             storage_health.HEALTHY):
+                rc, _ = host.probe("m1-forge-gate", OK)
+                self.assertEqual(rc, expected)
+
+    def test_unreaped_supervisor_timeout_still_quarantines_the_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(temp)
+            host.probe("m1-pulp-gate", OK)
+            rc, _ = self.supervisor_timeout(host, "m1-forge-gate", reaped=False)
+            self.assertEqual(rc, storage_health.QUARANTINED)
+            self.assertTrue(host.marker.exists())
+            rc, _ = host.probe("m1-pulp-gate", OK)
+            self.assertEqual(rc, storage_health.QUARANTINED)
+
+    def test_unnamed_supervisor_timeout_still_quarantines_the_host(self):
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(temp)
+            rc, _ = self.supervisor_timeout(host, "")
+            self.assertEqual(rc, storage_health.QUARANTINED)
+            self.assertTrue(host.marker.exists())
+
+    def test_supervisor_timeout_fails_closed_when_the_state_lock_is_held(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as temp:
+            host = Host(temp)
+            lock_path = host.state.with_suffix(host.state.suffix + ".lock")
+            with lock_path.open("a+") as lock, \
+                    patch.object(storage_health, "SUPERVISOR_LOCK_WAIT_SECONDS", 0.05):
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+                rc, _ = self.supervisor_timeout(host, "m1-forge-gate")
+            self.assertEqual(rc, storage_health.QUARANTINED)
+            self.assertTrue(host.marker.exists())
+
     def test_runner_names_its_lane_as_the_observer(self):
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         body = runner[runner.index("tartci_storage_health_check(){"):]
