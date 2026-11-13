@@ -273,7 +273,29 @@ PENDING_DELETE_MAX_ATTEMPTS="${TARTCI_PENDING_DELETE_MAX_ATTEMPTS:-5}"
 case "$PENDING_DELETE_MAX_ATTEMPTS" in ''|*[!0-9]*|0) PENDING_DELETE_MAX_ATTEMPTS=5 ;; esac
 PENDING_DELETE_RETRY_SECS="${TARTCI_PENDING_DELETE_RETRY_SECS:-10}"
 case "$PENDING_DELETE_RETRY_SECS" in ''|*[!0-9]*|0) PENDING_DELETE_RETRY_SECS=10 ;; esac
+# The in-loop retry is not racing launchd's exit timeout, so its `tart delete`
+# gets a longer bound than TEARDOWN_STEP_TIMEOUT: deleting a 40+ GB clone on a
+# loaded host can take longer than 5 s, and killing it at the bound every time
+# means it never finishes.
+PENDING_DELETE_TIMEOUT="${TARTCI_PENDING_DELETE_TIMEOUT_SECS:-60}"
+case "$PENDING_DELETE_TIMEOUT" in ''|*[!0-9]*|0) PENDING_DELETE_TIMEOUT=60 ;; esac
+[ "$PENDING_DELETE_TIMEOUT" -le 600 ] || PENDING_DELETE_TIMEOUT=600
+# Absence proof for a pending-delete VM: re-checks with doubling backoff
+# (scripts/tart_inventory.py --vm-absent --attempts/--backoff-seconds).
+DELETE_PROOF_ATTEMPTS="${TARTCI_DELETE_PROOF_ATTEMPTS:-3}"
+case "$DELETE_PROOF_ATTEMPTS" in ''|*[!0-9]*|0) DELETE_PROOF_ATTEMPTS=3 ;; esac
+[ "$DELETE_PROOF_ATTEMPTS" -le 10 ] || DELETE_PROOF_ATTEMPTS=10
+DELETE_PROOF_BACKOFF_SECS="${TARTCI_DELETE_PROOF_BACKOFF_SECS:-2}"
+case "$DELETE_PROOF_BACKOFF_SECS" in ''|*[!0-9]*) DELETE_PROOF_BACKOFF_SECS=2 ;; esac
+[ "$DELETE_PROOF_BACKOFF_SECS" -le 30 ] || DELETE_PROOF_BACKOFF_SECS=30
+# Held-slot self-check: a pending-delete VM that no observation has found
+# (listed by tart, or its directory in the store) for this long, while this
+# lane has queued work, stops holding the slot (tartci_held_slot_self_check).
+HELD_SLOT_SELF_CHECK_SECS="${TARTCI_HELD_SLOT_SELF_CHECK_SECS:-300}"
+case "$HELD_SLOT_SELF_CHECK_SECS" in ''|*[!0-9]*|0) HELD_SLOT_SELF_CHECK_SECS=300 ;; esac
 PENDING_DELETE_ATTEMPTS=0
+PENDING_DELETE_SINCE=""
+PENDING_DELETE_LAST_SEEN=""
 CURRENT_TEARDOWN_PENDING=""
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
@@ -1717,12 +1739,12 @@ discard_current_vm(){
 # last stderr lines (scripts/delete_evidence.py) for the delete_unproved event.
 TARTCI_DELETE_EVIDENCE=""
 tartci_tart_delete(){
-  local vm="$1" status err rc=0
+  local vm="$1" bound="${2:-$TEARDOWN_STEP_TIMEOUT}" status err rc=0
   TARTCI_DELETE_EVIDENCE=""
   status="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-status.XXXXXX")" || return 1
   err="$(mktemp "${TMPDIR:-/tmp}/tartci-delete-stderr.XXXXXX")" || { rm -f "$status"; return 1; }
   python3 "$TARTCI_ROOT/scripts/bounded_command.py" \
-    --timeout "$TEARDOWN_STEP_TIMEOUT" --operation tart-delete --status-file "$status" -- \
+    --timeout "$bound" --operation tart-delete --status-file "$status" -- \
     tart delete "$vm" >/dev/null 2>"$err" || rc=$?
   if [ "$rc" -ne 0 ]; then
     TARTCI_DELETE_EVIDENCE="$(python3 "$TARTCI_ROOT/scripts/delete_evidence.py" \
@@ -1734,10 +1756,73 @@ tartci_tart_delete(){
 
 # A timed-out `tart delete` is killed with its process group, so it is no
 # longer mutating anything; a readable local inventory that no longer lists the
-# VM is then proof it is gone. An unreadable inventory proves nothing.
+# VM is then proof it is gone. When the listing itself cannot be read (it times
+# out on a loaded host as readily as the delete does), a missing VM directory
+# under a readable store is proof too. An optional second argument re-checks
+# that many times with doubling backoff. TARTCI_ABSENCE_VERDICT keeps the last
+# verdict (absent, present or unreadable) for events and the self-check.
+TARTCI_ABSENCE_VERDICT=""
 tart_vm_proved_absent(){
-  python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
-    --timeout-seconds "$TEARDOWN_STEP_TIMEOUT" --vm-absent "$1" >/dev/null 2>&1
+  local attempts="${2:-1}" rc=0
+  TARTCI_ABSENCE_VERDICT="$(python3 "$TARTCI_ROOT/scripts/tart_inventory.py" \
+    --timeout-seconds "$TEARDOWN_STEP_TIMEOUT" --tart-home "$TART_HOME" \
+    --attempts "$attempts" --backoff-seconds "${DELETE_PROOF_BACKOFF_SECS:-2}" \
+    --vm-absent "$1" 2>/dev/null)" || rc=$?
+  case "$TARTCI_ABSENCE_VERDICT" in absent|present|unreadable) ;; *) TARTCI_ABSENCE_VERDICT=unreadable ;; esac
+  return "$rc"
+}
+
+# Release the capacity a pending-delete VM held: its VM lease and its macOS
+# slot reservation, and forget the VM.
+tartci_release_pending_delete(){
+  CURRENT_VM=""
+  CURRENT_IP=""
+  CURRENT_AQUA_LABEL=""
+  CURRENT_TEARDOWN_PENDING=""
+  PENDING_DELETE_ATTEMPTS=0
+  PENDING_DELETE_SINCE=""
+  PENDING_DELETE_LAST_SEEN=""
+  tartci_release_vm_lease
+  [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
+  CURRENT_RESV=""
+}
+
+# One line per incident in a host-wide file that any monitor can tail, in
+# addition to the lane's own events.jsonl.
+tartci_record_incident(){
+  local kind="$1" detail file
+  # JSON-safe: a double quote or backslash in the detail becomes a single quote.
+  detail="$(printf '%s' "$2" | tr '"\\' "''")"
+  file="${TARTCI_INCIDENTS_FILE:-$HOME/.tartci/state/incidents.jsonl}"
+  mkdir -p "$(dirname "$file")" 2>/dev/null || true
+  printf '{"ts":"%s","incident":"%s","host":"%s","runner":"%s","detail":"%s"}\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$kind" "$(hostname -s 2>/dev/null || echo unknown)" \
+    "${RUNNER_NAME:-}" "$detail" >>"$file" 2>/dev/null || true
+}
+
+# Held-slot self-check. A pending-delete VM keeps this lane's slot until its
+# deletion is proved. If no observation has found the VM for
+# HELD_SLOT_SELF_CHECK_SECS (not listed by tart, no directory in the store),
+# and this lane has queued work it cannot place, the hold is costing real jobs
+# for a VM nothing can see: release it and record one held_slot_released
+# incident. A VM that is still listed, or whose directory still exists, resets
+# the clock, so a real VM never loses its slot here.
+tartci_held_slot_self_check(){
+  local now held q
+  [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 1
+  now="$(date +%s)"
+  held=$(( now - ${PENDING_DELETE_LAST_SEEN:-${PENDING_DELETE_SINCE:-$now}} ))
+  [ "$held" -ge "$HELD_SLOT_SELF_CHECK_SECS" ] || return 1
+  q="$(queued_work 2>/dev/null)"
+  case "$q" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$q" -gt 0 ] || return 1
+  note "held slot for $CURRENT_VM: no VM seen for ${held}s with $q queued — releasing it"
+  event held_slot_released "vm=$CURRENT_VM held_s=$held queued=$q verdict=$TARTCI_ABSENCE_VERDICT" \
+    held_s="$held" queued="$q"
+  tartci_record_incident held_slot_released \
+    "vm=$CURRENT_VM held_s=$held queued=$q verdict=$TARTCI_ABSENCE_VERDICT"
+  tartci_release_pending_delete
+  return 0
 }
 
 # Pending-delete: a teardown whose guardian is terminal but whose deletion was
@@ -1751,23 +1836,24 @@ tart_vm_proved_absent(){
 reconcile_pending_delete(){
   [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ] || return 2
   PENDING_DELETE_ATTEMPTS=$((PENDING_DELETE_ATTEMPTS + 1))
-  if tartci_tart_delete "$CURRENT_VM" \
-    || tart_vm_proved_absent "$CURRENT_VM"; then
+  [ -n "$PENDING_DELETE_SINCE" ] || PENDING_DELETE_SINCE="$(date +%s)"
+  TARTCI_ABSENCE_VERDICT=""
+  if tartci_tart_delete "$CURRENT_VM" "$PENDING_DELETE_TIMEOUT" \
+    || tart_vm_proved_absent "$CURRENT_VM" "$DELETE_PROOF_ATTEMPTS"; then
     note "pending-delete VM $CURRENT_VM proved gone (attempt $PENDING_DELETE_ATTEMPTS) — releasing its capacity"
     event teardown_reconciled "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS"
-    CURRENT_VM=""
-    CURRENT_IP=""
-    CURRENT_AQUA_LABEL=""
-    CURRENT_TEARDOWN_PENDING=""
-    PENDING_DELETE_ATTEMPTS=0
-    tartci_release_vm_lease
-    [ -n "${CURRENT_RESV:-}" ] && rm -f "$CURRENT_RESV" 2>/dev/null || true
-    CURRENT_RESV=""
+    tartci_release_pending_delete
     return 0
   fi
-  event delete_unproved "vm=$CURRENT_VM site=pending_delete attempt=$PENDING_DELETE_ATTEMPTS $TARTCI_DELETE_EVIDENCE"
+  # Only an observation of the VM keeps the self-check clock from running.
+  [ "$TARTCI_ABSENCE_VERDICT" != present ] || PENDING_DELETE_LAST_SEEN="$(date +%s)"
+  event delete_unproved "vm=$CURRENT_VM site=pending_delete attempt=$PENDING_DELETE_ATTEMPTS absence=$TARTCI_ABSENCE_VERDICT $TARTCI_DELETE_EVIDENCE"
+  tartci_held_slot_self_check && return 0
   if [ "$PENDING_DELETE_ATTEMPTS" -ge "$PENDING_DELETE_MAX_ATTEMPTS" ]; then
     note "pending-delete VM $CURRENT_VM still unproved after $PENDING_DELETE_ATTEMPTS attempts — falling back to a fail-closed restart"
+    event delete_unproved_incident "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS absence=$TARTCI_ABSENCE_VERDICT"
+    tartci_record_incident delete_unproved \
+      "vm=$CURRENT_VM attempts=$PENDING_DELETE_ATTEMPTS absence=$TARTCI_ABSENCE_VERDICT"
     return 2
   fi
   note "pending-delete VM $CURRENT_VM still unproved (attempt $PENDING_DELETE_ATTEMPTS/$PENDING_DELETE_MAX_ATTEMPTS); capacity stays held"
@@ -3606,6 +3692,8 @@ if [ "$LOOP" = 1 ]; then
       [ "${LAST_RUN_LEASE_DENIED:-0}" = 1 ] || tartci_vm_lease_waiter_withdraw
       if [ -n "$CURRENT_VM" ] && [ "$CURRENT_TEARDOWN_PENDING" = delete ]; then
         PENDING_DELETE_ATTEMPTS=0
+        PENDING_DELETE_SINCE="$(date +%s)"
+        PENDING_DELETE_LAST_SEEN=""
         note "teardown of $CURRENT_VM left deletion unproved — keeping it as pending-delete with its lease and reservation; reconciling in-loop instead of restarting"
         event teardown_pending_delete "vm=$CURRENT_VM rc=$run_rc"
         CURRENT_LABELS="$LABELS"
