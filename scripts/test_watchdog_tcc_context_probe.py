@@ -9,7 +9,7 @@ tcc_context_probe` now renders it through the support-agents step.
 
 Pins: the shipped m3 profile renders the variable, and tcc_wedge splits it back
 to exactly the profile's argv; a profile without the key renders nothing; the
-validator refuses a probe that cannot open the store (no store word, a
+validator refuses a probe that does not name and open the store (no store word, a
 look-alike prefix, a relative program, a string instead of a list) at install
 time; and a value that skipped validation still renders nothing.
 
@@ -84,7 +84,7 @@ class RenderTests(unittest.TestCase):
         self.assertIn(data["host"]["tart_home"], " ".join(declared))
 
     def test_quotes_and_spaces_survive_the_round_trip(self) -> None:
-        tricky = ["/bin/sh", "-c", "test -d \"$1\" && echo 'it''s' ok", "probe", STORE + "/a b"]
+        tricky = ["/bin/ls", "-d", STORE + "/a b"]
         env = render_env(profile_with(tricky))
         self.assertEqual(shlex.split(env[ENV]), tricky)
 
@@ -99,7 +99,7 @@ class RenderTests(unittest.TestCase):
 
     def test_an_unvalidated_bad_value_renders_nothing(self) -> None:
         # A profile that skipped the installer's validator must not render a
-        # probe that cannot fail: the heal stays off instead.
+        # probe that does not name the store: the heal stays off instead.
         for bad in ("/usr/bin/true " + STORE, ["/usr/bin/true"], ["/usr/bin/ssh", "localhost", "true"]):
             with self.subTest(bad=bad):
                 self.assertNotIn(ENV, render_env(profile_with(bad)))
@@ -130,16 +130,22 @@ class ValidatorTests(unittest.TestCase):
         self.check(self.toml(GOOD))
         self.check(self.toml(["/usr/bin/stat", "-f", "%d", STORE + "/"]))
         self.check(self.toml(["/bin/ls", "-d", STORE + "/pulp-vm-01"]))
+        self.check(self.toml(["/usr/bin/ssh", "localhost", "/usr/bin/stat", STORE]))
 
     def test_a_probe_that_cannot_open_the_store_is_refused(self) -> None:
         for bad in (
             "/usr/bin/ssh localhost /usr/bin/stat " + STORE,          # a string, not an argv
             ["/usr/bin/true"],                                         # one word
+            ["/usr/bin/true", STORE],                                  # does not open the store
+            ["/bin/echo", STORE],                                      # does not open the store
             [STORE + "/probe"],                                        # one word, even on the store
             ["/usr/bin/ssh", "localhost", "/usr/bin/true"],            # reaches the host only
+            ["/usr/bin/ssh", "localhost", "/usr/bin/stat " + STORE + " || true"],
+            ["/usr/bin/ssh", "localhost", "/usr/bin/stat " + STORE + "; true"],
             ["/usr/bin/stat", str(Path(STORE).parent)],               # the volume, not the store
             ["/usr/bin/stat", STORE + "X"],                            # a look-alike prefix
             ["/usr/bin/stat", "/tmp/" + STORE],                        # store as a suffix
+            ["/usr/bin/stat", STORE + "/../escape"],                  # traversal escapes the store
             ["ssh", "localhost", "stat " + STORE],                     # relative program
             ["/usr/bin/stat", ""],                                     # empty word
             ["/usr/bin/stat", STORE + "\n/usr/bin/true"],              # line break

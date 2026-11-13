@@ -658,8 +658,8 @@ which `tcc_wedge` splits back to the same list). The validator refuses a value
 that is not an argv list of non-empty strings, whose program is not an absolute
 path, or none of whose words (shell-split, so the remote command of an `ssh`
 counts) names `host.tart_home` or a path below it: the reading must open the
-store itself, because a probe that only reaches the host, or that cannot fail,
-would approve a root heal for a slow or broken volume. Absent, nothing renders
+store itself, because a probe that only reaches the host or does not name the
+store would approve a root heal for a slow or broken volume. Absent, nothing renders
 and the classifier records the reading as not configured. Validate a new value
 from both contexts before declaring it: a plain shell, and a `launchctl submit`
 job (removed afterwards), which is the context the watchdog runs in. A
