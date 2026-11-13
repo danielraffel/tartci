@@ -151,5 +151,72 @@ printf '%s\\n' '[{"Name":"other","State":"stopped"}]'
             self.assertNotIn("absent", result.stdout)
 
 
+class TartVmAbsentRecheckTests(unittest.TestCase):
+    """--attempts re-checks with backoff; --tart-home adds the directory proof."""
+
+    def _run(self, body: str, *extra: str, store: str | None = None) -> subprocess.CompletedProcess[str]:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            fake = root / "tart"
+            write_fake(fake, body.replace("@COUNT@", str(root / "count")))
+            args = [str(INVENTORY), "--tart", str(fake), "--timeout-seconds", "0.3",
+                    "--vm-absent", "gone-vm", *extra]
+            if store is not None:
+                home = root / "home"
+                (home / "vms").mkdir(parents=True)
+                if store in ("populated", "with-vm"):
+                    (home / "vms" / "golden:latest").mkdir()
+                if store == "with-vm":
+                    (home / "vms" / "gone-vm").mkdir()
+                args += ["--tart-home", str(home)]
+            return subprocess.run(args, text=True, capture_output=True, check=False, timeout=10)
+
+    FLAKY = (
+        'n=$(cat @COUNT@ 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > @COUNT@\n'
+        '[ "$n" -gt 1 ] || exec sleep 30\n'
+        "printf '%s\\n' '[]'\n"
+    )
+
+    def test_a_timed_out_listing_is_rechecked_with_backoff(self) -> None:
+        result = self._run(self.FLAKY, "--attempts", "3", "--backoff-seconds", "0.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "absent")
+
+    def test_a_single_attempt_does_not_recheck(self) -> None:
+        # Control for the re-check: the same flaky listing, one attempt.
+        result = self._run(self.FLAKY, "--attempts", "1")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.stdout.strip(), "unreadable")
+
+    def test_missing_vm_directory_proves_absence_when_listing_hangs(self) -> None:
+        result = self._run("exec sleep 30\n", store="populated")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "absent")
+
+    def test_existing_vm_directory_is_present_when_listing_hangs(self) -> None:
+        result = self._run("exec sleep 30\n", store="with-vm")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.strip(), "present")
+
+    def test_empty_store_proves_nothing(self) -> None:
+        # A wrong TART_HOME (an empty vms directory) must never read as absent.
+        result = self._run("exec sleep 30\n", store="empty")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.stdout.strip(), "unreadable")
+
+    def test_a_listed_vm_wins_over_a_missing_directory(self) -> None:
+        result = self._run(
+            "printf '%s\\n' '[{\"Name\":\"gone-vm\",\"State\":\"running\"}]'\n",
+            store="populated",
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout.strip(), "present")
+
+    def test_attempt_bounds_are_validated(self) -> None:
+        for value in ("0", "11"):
+            result = self._run("exit 0\n", "--attempts", value)
+            self.assertEqual(result.returncode, 2, value)
+
+
 if __name__ == "__main__":
     unittest.main()
