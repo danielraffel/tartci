@@ -1,0 +1,404 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+TMP="$(mktemp -d)"
+
+# Nearly every assertion here is a bare `[ ... ]` or `grep -q` under errexit,
+# so a failure used to end the script with exit 1 and no output at all. The ERR
+# trap (inherited into functions by -E) records where the failing command was;
+# the EXIT trap prints it once, from the main shell only, so a failure inside
+# a command substitution that the script tolerates never prints.
+set -E
+FAILED_AT="" FAILED_IN=""
+trap 'if [ -n "${FUNCNAME[0]:-}" ]; then FAILED_IN="${FUNCNAME[0]}() line ${LINENO}: ${BASH_COMMAND}"; else FAILED_AT="line ${LINENO}: ${BASH_COMMAND}"; fi' ERR
+report_exit(){
+  local rc=$?
+  if [ "$rc" -ne 0 ] && [ "${BASHPID:-$$}" = "$$" ]; then
+    printf 'current job lifecycle: FAIL (exit %s) at %s%s\n' "$rc" \
+      "${FAILED_AT:-an unrecorded line}" "${FAILED_IN:+ (last failure inside ${FAILED_IN})}" >&2
+    [ ! -s "${EVENTS:-/dev/null}" ] || { printf 'events:\n' >&2; sed 's/^/  /' "$EVENTS" >&2; }
+  fi
+  rm -rf "$TMP"
+}
+trap report_exit EXIT
+
+# The scanner defaults its observation lock to the HOST's real one. This suite
+# runs on machines whose fleet lanes are scanning through that lock right now,
+# so without a private one the test blocks on production, fails with
+# "host queue observation lock timed out", and adds contention to the resource
+# it was starved by.
+export TARTCI_QUEUE_OBSERVATION_LOCK_FILE="$TMP/queue-observation.lock"
+
+# Exercise the production shell functions directly while replacing only their
+# external GitHub/event/heartbeat/cleanup boundaries.
+eval "$(
+  {
+    sed -n '/^tartci_wait_foreground_child(){/,/^tartci_tart_delete(){/p' \
+      "$ROOT/providers/tart-macos/runner.sh" | sed '$d'
+    sed -n '/^handle_supervisor_signal(){/,/^ensure_runner_version(){/p' \
+      "$ROOT/providers/tart-macos/runner.sh" | sed '$d'
+  }
+)"
+
+cat >"$TMP/fake-gh" <<'PY'
+#!/usr/bin/env python3
+import json, os, sys, time
+state = os.environ["LIFECYCLE_STATE"]
+args = sys.argv[1:]
+path = args[-1]
+if os.environ.get("LIFECYCLE_HANG") == "1":
+    time.sleep(20)
+if "-X" in args and "POST" in args:
+    with open(os.environ["LIFECYCLE_POST_LOG"], "a", encoding="utf-8") as stream:
+        stream.write("POST\n")
+    open(state, "w", encoding="utf-8").write("cancelled")
+    print("{}")
+elif path.endswith("/actions/workflows?per_page=100&page=1"):
+    print(json.dumps({"total_count":1,"workflows":[{"id":99,"name":"Build and Test"}]}))
+elif path.endswith("/actions/jobs/444"):
+    terminal = open(state, encoding="utf-8").read().strip() == "cancelled"
+    print(json.dumps({"id":444,"status":"completed" if terminal else "in_progress",
+                      "conclusion":"cancelled" if terminal else None,"runner_name":"runner-1"}))
+elif path.endswith("/actions/runs/333"):
+    terminal = open(state, encoding="utf-8").read().strip() == "cancelled"
+    print(json.dumps({"id":333,"workflow_id":99,"name":"Build and Test",
+                      "status":"completed" if terminal else "in_progress",
+                      "conclusion":"cancelled" if terminal else None}))
+elif "/actions/runs?status=in_progress" in path:
+    print(json.dumps({"total_count":1,"workflow_runs":[
+        {"id":333,"workflow_id":99,"name":"Build and Test","status":"in_progress"}]}))
+elif "/actions/runs/333/jobs?filter=latest" in path:
+    print(json.dumps({"total_count":1,"jobs":[
+        {"id":444,"status":"in_progress","runner_name":"runner-1"}]}))
+else:
+    print(json.dumps({"total_count":0,"jobs":[]}))
+PY
+chmod +x "$TMP/fake-gh"
+
+export TARTCI_ROOT="$ROOT" STATE_DIR="$TMP/state" REPO="Generous-Corp/pulp"
+export GH_CLI="$TMP/fake-gh" WORKFLOW_CONFIG="Build and Test"
+# The production runner initializes this alongside GH_CLI before calling the
+# functions below.  This suite evals only the function definitions, so mirror
+# that initialization explicitly instead of tripping set -u on the scan path.
+export SCAN_GH_CLI="$GH_CLI"
+export CURRENT_REGISTERED_RUNNER="runner-1" RUNNER_NAME="lane-1"
+export LIFECYCLE_STATE="$TMP/api-state" LIFECYCLE_HANG=0
+export LIFECYCLE_POST_LOG="$TMP/posts"
+mkdir -p "$STATE_DIR"
+printf active >"$LIFECYCLE_STATE"
+: >"$LIFECYCLE_POST_LOG"
+EVENTS="$TMP/events"
+: >"$EVENTS"
+export EVENT_LOG="$EVENTS"
+event(){ printf '%s|%s\n' "$1" "${2:-}" >>"$EVENTS"; }
+heartbeat(){ printf 'heartbeat|%s\n' "$1" >>"$EVENTS"; }
+cleanup(){
+  [ -z "${CURRENT_SCAN_PID:-}" ] || kill "$CURRENT_SCAN_PID" 2>/dev/null || true
+  [ -z "${CURRENT_SCAN_TMP:-}" ] || rm -f "$CURRENT_SCAN_TMP" 2>/dev/null || true
+  printf 'cleanup|%s\n' "${CURRENT_ASSIGNMENT_QUARANTINE:-}" >>"$EVENTS"
+}
+
+reset_state(){
+  # Consumed by production functions loaded through eval above.
+  # shellcheck disable=SC2034
+  CURRENT_RUN_ID=333 CURRENT_JOB_ID=444 CURRENT_WORKFLOW_NAME="Build and Test"
+  CURRENT_JOB_CAPTURE_STATUS=active CURRENT_JOB_RECEIPT='{"kind":"active"}'
+  # shellcheck disable=SC2034
+  CURRENT_JOB_SCAN_SPENT=30 CURRENT_JOB_SCAN_FAILURES=0 CURRENT_JOB_SCAN_NEXT_AT=0
+  CURRENT_CANCEL_DISCOVERY_SCAN_SPENT=0
+  CURRENT_CANCEL_REVALIDATION_SCAN_SPENT=0
+  CURRENT_CANCEL_TERMINAL_SCAN_SPENT=0 CURRENT_ASSIGNMENT_QUARANTINE=none
+  CURRENT_SCAN_PID="" CURRENT_SCAN_TMP=""
+  : >"$EVENTS"
+}
+
+post_count(){
+  wc -l <"$LIFECYCLE_POST_LOG" | tr -d '[:space:]'
+}
+
+assert_pre_cancel_invalid(){
+  local variable="$1" value="$2" detail="$3" quarantine="$4" clear_ids="$5"
+  local posts_before
+  reset_state
+  if [ "$clear_ids" = 1 ]; then
+    CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+  fi
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "$variable=$value"
+  if cancel_current_run; then
+    unset "$variable"
+    exit 1
+  fi
+  unset "$variable"
+  [ "$(post_count)" = "$posts_before" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = "{\"kind\":\"invalid_budget\",\"detail\":\"$detail\"}" ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = "$quarantine" ]
+  grep -q '^run_cancel_suppressed|.*rerun_eligible=false' "$EVENTS"
+}
+
+assert_post_cancel_invalid(){
+  local value="$1" posts_before
+  reset_state
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=$value"
+  if cancel_current_run; then
+    unset TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS
+    exit 1
+  fi
+  unset TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS
+  [ "$(post_count)" = "$((posts_before + 1))" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = '{"kind":"invalid_budget","detail":"cancel_terminal_observation_budget"}' ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = cancel_terminal_unknown ]
+  grep -q '^run_cancel_requested|.*rerun_eligible=pending-terminal' "$EVENTS"
+  grep -q '^run_cancel_unknown|.*observation=invalid_budget.*rerun_eligible=false' "$EVENTS"
+  if grep -q '^run_cancel_terminal|' "$EVENTS"; then exit 1; fi
+}
+
+assert_lifecycle_invalid(){
+  local value="$1" posts_before
+  reset_state
+  CURRENT_JOB_SCAN_SPENT=0
+  printf active >"$LIFECYCLE_STATE"
+  posts_before="$(post_count)"
+  export "TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=$value"
+  if capture_current_job discover; then
+    unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+    exit 1
+  fi
+  unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+  [ "$(post_count)" = "$posts_before" ]
+  [ "$CURRENT_JOB_CAPTURE_STATUS" = invalid_budget ]
+  [ "$CURRENT_JOB_RECEIPT" = '{"kind":"invalid_budget","detail":"lifecycle_budget"}' ]
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = observation_invalid_budget ]
+  grep -qx 'job_observation_error|kind=invalid_budget mode=discover parameter=lifecycle_budget' "$EVENTS"
+}
+
+# Every timeout that reaches shell arithmetic is a canonical positive decimal.
+for value in 1 8 10 300; do
+  tartci_is_canonical_positive_decimal "$value" || exit 1
+done
+for value in "" 0 00 09 +1 -1 " 1" "1 " 1:2 1a; do
+  if tartci_is_canonical_positive_decimal "$value"; then exit 1; fi
+done
+
+# Discovery exhaustion must not consume mandatory pre-cancel authority.
+reset_state
+TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=10 capture_current_job revalidate
+[ "$CURRENT_JOB_CAPTURE_STATUS" = active ]
+[ "$CURRENT_JOB_SCAN_SPENT" = 30 ]
+[ "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" -gt 0 ]
+
+# Timeout cancellation gets the protected cancel budget even when ordinary
+# discovery exhausted before it learned the run and job IDs. Each protected
+# budget must be spent on its own counter and never on the exhausted lifecycle
+# one. The budgets are generous rather than tiny: a scan's cost is wall-clock
+# seconds (python start-up plus one fake API call per page), and a one-second
+# budget failed on slower CI runners before the scan could finish, which is a
+# fact about the runner and not about the budget split under test.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+printf active >"$LIFECYCLE_STATE"
+posts_before="$(post_count)"
+TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS=30 \
+TARTCI_CANCEL_DISCOVERY_BUDGET_SECS=20 \
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_OBSERVATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=20 cancel_current_run
+[ "$CURRENT_RUN_ID" = 333 ]
+[ "$CURRENT_JOB_ID" = 444 ]
+[ "$CURRENT_JOB_SCAN_SPENT" = 30 ]
+for spent in "$CURRENT_CANCEL_DISCOVERY_SCAN_SPENT" "$CURRENT_CANCEL_REVALIDATION_SCAN_SPENT" \
+    "$CURRENT_CANCEL_TERMINAL_SCAN_SPENT"; do
+  [ "$spent" -ge 1 ] && [ "$spent" -le 20 ]
+done
+[ "$(post_count)" = "$((posts_before + 1))" ]
+grep -q '^run_cancel_terminal|.*rerun_eligible=true' "$EVENTS"
+
+# Every malformed class reaches each actual configuration path. Ordinary
+# lifecycle observation, protected cancellation discovery, mandatory
+# revalidation, per-attempt, and terminal-deadline failures precede POST;
+# terminal-observation failure follows exactly one POST and stays
+# non-rerunnable. Explicit empty is load-bearing: it detects a mutation from
+# `${VAR-30}` to `${VAR:-30}` on the ordinary lifecycle path.
+for malformed in 0 00 09 +1 -1 " 1" "1 " 1:2 1a ""; do
+  assert_lifecycle_invalid "$malformed"
+  assert_pre_cancel_invalid TARTCI_CANCEL_DISCOVERY_BUDGET_SECS \
+    "$malformed" cancel_discovery_budget pre_cancel_discovery_invalid_budget 1
+  assert_pre_cancel_invalid TARTCI_CANCEL_REVALIDATION_BUDGET_SECS \
+    "$malformed" cancel_revalidation_budget pre_cancel_invalid_budget 0
+  assert_pre_cancel_invalid TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS \
+    "$malformed" attempt_timeout pre_cancel_invalid_budget 0
+  assert_pre_cancel_invalid TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS \
+    "$malformed" cancel_terminal_timeout pre_cancel_invalid_budget 0
+  assert_post_cancel_invalid "$malformed"
+done
+
+# A setup failure overwrites a stale active receipt and fails closed.
+reset_state
+CURRENT_JOB_SCAN_SPENT=0
+mktemp(){ return 1; }
+if capture_current_job discover; then exit 1; fi
+unset -f mktemp
+[ "$CURRENT_JOB_CAPTURE_STATUS" = setup_error ]
+[ "$CURRENT_JOB_RECEIPT" = '{"kind":"setup_error","detail":"mktemp_failed"}' ]
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = observation_setup_error ]
+
+# POST is not success: only the subsequent exact terminal receipt makes the
+# timed-out workflow rerun-eligible.
+reset_state
+printf active >"$LIFECYCLE_STATE"
+posts_before="$(post_count)"
+TARTCI_CANCEL_REVALIDATION_BUDGET_SECS=20 \
+TARTCI_CANCEL_TERMINAL_TIMEOUT_SECS=10 cancel_current_run
+[ "$(post_count)" = "$((posts_before + 1))" ]
+grep -q '^run_cancel_requested|.*rerun_eligible=pending-terminal' "$EVENTS"
+grep -q '^run_cancel_terminal|.*rerun_eligible=true.*"run_conclusion":"cancelled"' "$EVENTS"
+[ "$CURRENT_JOB_CAPTURE_STATUS" = terminal ]
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+
+# Listener teardown telemetry cannot call an active/error observation terminal.
+CURRENT_JOB_CAPTURE_STATUS=active
+CURRENT_JOB_RECEIPT='{"kind":"active"}'
+record_terminal_job_receipt 1
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exited_workflow_active ]
+CURRENT_JOB_CAPTURE_STATUS=observation_error
+CURRENT_JOB_RECEIPT='{"kind":"observation_error"}'
+record_terminal_job_receipt 1
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=active.*listener_exited_workflow_active' "$EVENTS"
+grep -q '^job_lifecycle_quarantine|.*observation=observation_error.*listener_exit_terminal_unknown' "$EVENTS"
+
+# A listener that exits after assignment but before ID discovery is not allowed
+# to skip the terminal receipt/quarantine transaction.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=not-attempted
+CURRENT_JOB_RECEIPT='{"kind":"not-attempted"}'
+finalize_listener_receipt 1 1
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=not-attempted.*listener_exit_terminal_unknown' "$EVENTS"
+
+# A signal during a live API observation owns the scanner child/temp file and
+# leaves a typed terminal-unknown quarantine instead of stale active telemetry.
+reset_state
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+printf active >"$LIFECYCLE_STATE"
+LIFECYCLE_HANG=1
+export LIFECYCLE_HANG
+(
+  trap 'handle_supervisor_signal' TERM
+  capture_current_job cancel_discover
+) & signal_pid=$!
+sleep 1
+kill -TERM "$signal_pid"
+set +e
+wait "$signal_pid"
+signal_rc=$?
+set -e
+[ "$signal_rc" = 143 ]
+grep -q '^supervisor_signal|INT/TERM quarantine=signal_teardown_unknown' "$EVENTS"
+grep -q '^cleanup|signal_teardown_unknown' "$EVENTS"
+
+# A runner log carrying the runner's own closing line is local terminal proof.
+RUNNER_LOG="$TMP/actions-runner.log"
+write_runner_log(){
+  : >"$RUNNER_LOG"
+  printf '%s\n' "2026-09-21 22:58:32Z: Running job: macos" >>"$RUNNER_LOG"
+  [ "${1:-complete}" != complete ] || printf '%s\n' \
+    "2026-09-21 23:40:11Z: Job macos completed with result: Succeeded" >>"$RUNNER_LOG"
+}
+
+# An observation that never resolved is not evidence of a stall. A clean
+# listener exit plus the runner's own completion line is terminal proof, so the
+# job keeps its terminal receipt instead of a quarantine.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*observation=budget_exhausted.*evidence=runner_local.*result=Succeeded' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# The same failed measurement still quarantines when the listener itself exited
+# badly: a nonzero rc is not a clean completion.
+reset_state
+write_runner_log complete
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*evidence=measurement_failed' "$EVENTS"
+
+# A clean exit without the runner's closing line proves nothing either.
+reset_state
+write_runner_log truncated
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+grep -q '^job_lifecycle_quarantine|.*observation=budget_exhausted.*evidence=measurement_failed' "$EVENTS"
+
+# A missing log is the same absence of proof.
+reset_state
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+record_terminal_job_receipt 0 "$TMP/no-such-runner.log"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exit_terminal_unknown ]
+
+# A completed observation that saw the workflow still running outranks local
+# terminal proof. Positive stall evidence must still quarantine, or the verdict
+# above would have disarmed quarantine altogether.
+for stalled in active terminal_pending_run; do
+  reset_state
+  write_runner_log complete
+  CURRENT_JOB_CAPTURE_STATUS="$stalled"
+  CURRENT_JOB_RECEIPT="{\"kind\":\"$stalled\"}"
+  record_terminal_job_receipt 0 "$RUNNER_LOG"
+  [ "$CURRENT_ASSIGNMENT_QUARANTINE" = listener_exited_workflow_active ]
+  grep -q "^job_lifecycle_quarantine|.*observation=$stalled.*evidence=github_api" "$EVENTS"
+  if grep -q '^job_terminal_receipt|' "$EVENTS"; then exit 1; fi
+done
+
+# The listener hands its own log to the receipt, so a completed job that never
+# resolved an observation finalizes as terminal end to end.
+reset_state
+write_runner_log complete
+CURRENT_RUN_ID="" CURRENT_JOB_ID=""
+CURRENT_JOB_CAPTURE_STATUS=budget_exhausted
+CURRENT_JOB_RECEIPT='{"kind":"budget_exhausted"}'
+CURRENT_ASSIGNMENT_QUARANTINE=stale_sentinel
+finalize_listener_receipt 0 1 "$RUNNER_LOG"
+[ "$CURRENT_ASSIGNMENT_QUARANTINE" = none ]
+grep -q '^job_terminal_receipt|.*evidence=runner_local' "$EVENTS"
+if grep -q '^job_lifecycle_quarantine|' "$EVENTS"; then exit 1; fi
+
+# An unpinned host observes on the shipped defaults, so those defaults decide
+# whether a scan can finish at all. Discovery measures 93 to 106 seconds
+# against sixty concurrent runs; the lifecycle budget admits an attempt only
+# while it has time left, and its boundary is the shipped value.
+reset_state
+CURRENT_JOB_SCAN_SPENT=360
+unset TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS
+if capture_current_job discover; then exit 1; fi
+[ "$CURRENT_JOB_CAPTURE_STATUS" = budget_exhausted ]
+reset_state
+CURRENT_JOB_SCAN_SPENT=359
+CURRENT_JOB_CAPTURE_STATUS=probe
+capture_current_job discover || true
+[ "$CURRENT_JOB_CAPTURE_STATUS" != budget_exhausted ]
+# A per-attempt budget under the measured scan cost can only ever report a
+# failed measurement, so the shipped attempt timeout has to outlast it.
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_ATTEMPT_TIMEOUT_SECS-120}' "$ROOT/providers/tart-macos/runner.sh"
+grep -q 'TARTCI_CAPTURE_CURRENT_JOB_LIFECYCLE_BUDGET_SECS-360}' "$ROOT/providers/tart-macos/runner.sh"
+
+printf 'current job lifecycle: ok\n'
