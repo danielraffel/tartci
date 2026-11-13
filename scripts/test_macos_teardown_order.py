@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import tempfile
@@ -45,6 +46,8 @@ class MacosTeardownOrderTests(unittest.TestCase):
             f"{name}(){{\n{function_body(source, name)}}}"
             for name in (
                 "bounded_teardown_command",
+                "tartci_wait_foreground_child",
+                "tartci_stop_foreground_child",
                 "tartci_tart_delete",
                 "terminate_current_guardian",
                 "stop_current_aqua_runner",
@@ -100,6 +103,8 @@ class MacosTeardownOrderTests(unittest.TestCase):
             f"{name}(){{\n{function_body(source, name)}}}"
             for name in (
                 "bounded_teardown_command",
+                "tartci_wait_foreground_child",
+                "tartci_stop_foreground_child",
                 "tartci_tart_delete",
                 "terminate_current_guardian",
                 "stop_current_aqua_runner",
@@ -195,6 +200,8 @@ class PendingDeleteTests(unittest.TestCase):
 
     FUNCTIONS = (
         "bounded_teardown_command",
+        "tartci_wait_foreground_child",
+        "tartci_stop_foreground_child",
         "tartci_tart_delete",
         "terminate_current_guardian",
         "stop_current_aqua_runner",
@@ -204,6 +211,7 @@ class PendingDeleteTests(unittest.TestCase):
         "tartci_record_incident",
         "tartci_held_slot_self_check",
         "reconcile_pending_delete",
+        "handle_supervisor_signal",
     )
 
     def _run(
@@ -219,6 +227,9 @@ class PendingDeleteTests(unittest.TestCase):
         incidents: list[str] | None = None,
         delete_sleep: int = 0,
         list_hangs_once: bool = False,
+        storage_ok: bool = True,
+        signal_after: float | None = None,
+        timings: dict | None = None,
     ) -> tuple[int, str, bool]:
         """Run the shipped teardown functions against a fake tart.
 
@@ -246,7 +257,7 @@ class PendingDeleteTests(unittest.TestCase):
                 "case \"$1\" in\n"
                 "  stop) exit 0 ;;\n"
                 "  delete)\n"
-                + ("    exec sleep 30 ;;\n" if delete_hangs else
+                + (f"    echo $$ > {str(root / 'delete.pid')!r}; exec sleep 30 ;;\n" if delete_hangs else
                    f"    sleep {int(delete_sleep)}\n"
                    f"    n=$(cat {str(count)!r} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" > {str(count)!r}\n"
                    f"    [ \"$n\" -gt {delete_failures} ] || exit 1\n"
@@ -284,6 +295,10 @@ class PendingDeleteTests(unittest.TestCase):
                 "CURRENT_TEARDOWN_PENDING=\nPENDING_DELETE_ATTEMPTS=0\n"
                 "PENDING_DELETE_SINCE=\nPENDING_DELETE_LAST_SEEN=\n"
                 "PENDING_DELETE_MAX_ATTEMPTS=3\n"
+                f"STORAGE_HEALTH_STATE={'ok' if storage_ok else 'unknown'}\n"
+                "TARTCI_FOREGROUND_CHILD=\nCURRENT_RUN_ID=\nCURRENT_SCAN_PID=\n"
+                "CURRENT_ASSIGNMENT_QUARANTINE=none\n"
+                "cleanup(){ printf 'cleanup-ran\\n'; }\n"
                 f"queued_work(){{ echo {int(queued)}; }}\n"
                 "note(){ printf 'note: %s\\n' \"$*\"; }\n"
                 "event(){ printf 'event: %s\\n' \"$*\"; }\n"
@@ -292,9 +307,24 @@ class PendingDeleteTests(unittest.TestCase):
                 f"{steps}\n"
             )
             harness.chmod(0o755)
-            result = subprocess.run(
-                [str(harness)], text=True, capture_output=True, check=False, timeout=60
-            )
+            if signal_after is None:
+                result = subprocess.run(
+                    [str(harness)], text=True, capture_output=True, check=False, timeout=60
+                )
+            else:
+                proc = subprocess.Popen(
+                    [str(harness)], text=True,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                )
+                time.sleep(signal_after)
+                sent = time.monotonic()
+                proc.terminate()
+                stdout, _ = proc.communicate(timeout=60)
+                if timings is not None:
+                    timings["exit_after_term"] = time.monotonic() - sent
+                    pid_file = root / "delete.pid"
+                    timings["delete_pid"] = int(pid_file.read_text()) if pid_file.exists() else None
+                result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, "")
             # Read inside the temporary directory: it is gone after the block.
             if incidents is not None and incidents_file.exists():
                 incidents.extend(incidents_file.read_text().splitlines())
@@ -448,6 +478,59 @@ class PendingDeleteTests(unittest.TestCase):
         self.assertIn("teardown_reconciled", out)
         self.assertFalse(resv_exists)
 
+    def test_term_during_a_hung_pending_delete_reaches_cleanup_promptly(self) -> None:
+        # launchd SIGKILLs after its ExitTimeOut; the trap must not wait for the
+        # minute-long pending-delete bound before cleanup runs.
+        timings: dict = {}
+        rc, out, _ = self._run(
+            delete_failures=0, listed=True, delete_hangs=True,
+            signal_after=1.5, timings=timings,
+            steps=(
+                "TEARDOWN_STEP_TIMEOUT=5; PENDING_DELETE_TIMEOUT=30\n"
+                "trap handle_supervisor_signal INT TERM\n"
+                "CURRENT_TEARDOWN_PENDING=delete\n"
+                "reconcile_pending_delete\n"
+                "echo NOT-INTERRUPTED\n"
+            ),
+        )
+        self.assertEqual(rc, 143, out)
+        self.assertIn("cleanup-ran", out)
+        self.assertNotIn("NOT-INTERRUPTED", out)
+        self.assertLess(timings["exit_after_term"], 5.0, out)
+        pid = timings["delete_pid"]
+        self.assertIsNotNone(pid, "the fake tart delete never started")
+        time.sleep(0.5)
+        with self.assertRaises(ProcessLookupError, msg="tart delete outlived the supervisor"):
+            os.kill(pid, 0)
+
+    def test_shutdown_path_delete_keeps_the_teardown_step_bound(self) -> None:
+        # discard_current_vm runs under launchd's exit timeout: its delete must
+        # stay bounded by TEARDOWN_STEP_TIMEOUT, not the in-loop retry bound.
+        rc, out, _ = self._run(
+            delete_failures=0, listed=True, delete_sleep=3,
+            steps=(
+                "TEARDOWN_STEP_TIMEOUT=1; PENDING_DELETE_TIMEOUT=10\n"
+                "discard_current_vm && exit 150\n"
+                "[ \"$CURRENT_TEARDOWN_PENDING\" = delete ] || exit 151\n"
+            ),
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("reason=delete_unproved", out)
+
+    def test_directory_proof_needs_a_healthy_store(self) -> None:
+        rc, out, resv_exists = self._run(
+            delete_failures=0, listed=True, delete_hangs=True, list_hangs=True,
+            store="without-vm", storage_ok=False,
+            steps=(
+                "CURRENT_TEARDOWN_PENDING=delete\n"
+                "rc=0; reconcile_pending_delete || rc=$?\n"
+                "[ \"$rc\" = 1 ] || exit 160\n"
+            ),
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertIn("absence=unreadable", out)
+        self.assertTrue(resv_exists)
+
     def test_timed_out_listing_with_no_store_proves_nothing(self) -> None:
         # Control for the directory proof: no readable store, no proof.
         rc, out, resv_exists = self._run(
@@ -529,6 +612,19 @@ class PendingDeleteTests(unittest.TestCase):
         self.assertTrue(resv_exists)
         self.assertEqual(incidents, [])
 
+    def test_unhealthy_store_keeps_the_hold(self) -> None:
+        # Unreadable is not absent: without a healthy store the self-check
+        # cannot tell "gone" from "cannot look".
+        rc, out, resv_exists = self._run(
+            delete_failures=0, listed=True, delete_hangs=True, list_hangs=True,
+            store="missing", queued=4, storage_ok=False,
+            steps=self.STALE + "rc=0; reconcile_pending_delete || rc=$?\n"
+            "[ \"$rc\" = 1 ] || exit 170\n",
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("held_slot_released", out)
+        self.assertTrue(resv_exists)
+
     def test_no_queued_work_keeps_the_hold(self) -> None:
         rc, out, resv_exists = self._run(
             delete_failures=0, listed=True, delete_hangs=True, list_hangs=True,
@@ -551,6 +647,31 @@ class PendingDeleteTests(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertNotIn("held_slot_released", out)
         self.assertTrue(resv_exists)
+
+
+class PendingDeleteConfigTests(unittest.TestCase):
+    """The pending-delete bound is clamped exactly as documented."""
+
+    def _bound(self, value: str) -> str:
+        source = RUNNER.read_text()
+        match = re.search(
+            r'^PENDING_DELETE_TIMEOUT="\$\{TARTCI_PENDING_DELETE_TIMEOUT_SECS.*?\n(?:.*PENDING_DELETE_TIMEOUT.*\n)+?\[ "\$PENDING_DELETE_TIMEOUT" -le 600 \][^\n]*\n',
+            source, re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "pending-delete bound config block not found")
+        result = subprocess.run(
+            ["/bin/bash", "-c", match.group(0) + 'printf %s "$PENDING_DELETE_TIMEOUT"'],
+            env={"TARTCI_PENDING_DELETE_TIMEOUT_SECS": value, "PATH": "/usr/bin:/bin"},
+            text=True, capture_output=True, check=True,
+        )
+        return result.stdout
+
+    def test_bound_defaults_caps_and_rejects_garbage(self) -> None:
+        self.assertEqual(self._bound(""), "60")
+        self.assertEqual(self._bound("abc"), "60")
+        self.assertEqual(self._bound("0"), "60")
+        self.assertEqual(self._bound("120"), "120")
+        self.assertEqual(self._bound("5000"), "600")
 
 
 class PendingDeleteLoopWiringTests(unittest.TestCase):
