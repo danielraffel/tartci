@@ -14,6 +14,8 @@ verb a client may send instead:
                         (fleet_self_update.read_canary_verified)
   job-claim-status      cd ~ && ~/.local/bin/tartci job-claim status --publish
                         (job_claim.gather_peers)
+  store-health          the launchd watchdog's store-health.json read
+                        (capacity_floor, fleet_self_update coverage check)
 
 An allowed command runs through /bin/sh exactly as the full-shell key ran it,
 so its output is byte-identical. Anything else (an empty command, a shell, a
@@ -51,6 +53,7 @@ def allowed_commands() -> dict[str, str]:
         "fleet-source-verified": ('date +%s; cat "${TARTCI_HOME:-$HOME/.tartci}/state/self-update/'
                                   + su.FLEET_SOURCE_VERIFIED + '" 2>/dev/null || true'),
         "job-claim-status": JOB_CLAIM_STATUS,
+        "store-health": su.PEER_STORE_HEALTH_COMMAND,
     }
 
 

@@ -11,6 +11,19 @@
 # The grant names the user who ran sudo (SUDO_USER): the account whose
 # LaunchAgents run the tartci watchdog, which is the only caller.
 set -euo pipefail
+
+# True when $1 (the octal string `stat -f %Lp` prints, e.g. "755") is all octal
+# digits and has neither the group nor the other write bit. `stat` prints octal
+# digits, but bash arithmetic reads "755" as decimal, so force base 8.
+heal_mode_ok() {
+  local m="${1:-}"
+  [[ "$m" =~ ^[0-7]+$ ]] || return 1
+  (( (8#$m & 8#022) == 0 ))
+}
+
+# Sourced (by the tests) only for the functions above; run nothing.
+[[ "${BASH_SOURCE[0]}" == "$0" ]] || return 0
+
 src=$(cd "$(dirname "$0")" && pwd -P)
 WRAPPER_DST=/usr/local/sbin/tartci-heal-tcc
 SUDOERS_DST=/etc/sudoers.d/tartci-heal-tcc
@@ -67,7 +80,8 @@ for node in / /usr /usr/local /usr/local/sbin; do
   owner=$(stat -f %u "$node"); mode=$(stat -f %Lp "$node")
   [[ -L "$node" ]] && { echo "refusing: $node is a symlink" >&2; exit 1; }
   [[ "$owner" == 0 ]] || { echo "refusing: $node is owned by uid $owner, not root; a NOPASSWD wrapper under it could be replaced" >&2; exit 1; }
-  (( (mode & 022) == 0 )) || { echo "refusing: $node is writable by group or other (mode $mode)" >&2; exit 1; }
+  [[ "$mode" =~ ^[0-7]+$ ]] || { echo "refusing: cannot read the mode of $node (got '$mode')" >&2; exit 1; }
+  heal_mode_ok "$mode" || { echo "refusing: $node is writable by group or other (mode $mode)" >&2; exit 1; }
 done
 install -o root -g wheel -m 0755 "$src/tartci-heal-tcc" "$WRAPPER_DST"
 echo "installed $WRAPPER_DST (root:wheel 0755; chain / -> /usr/local/sbin is root-owned)"
