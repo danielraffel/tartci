@@ -226,18 +226,31 @@ clone on a loaded host can outlast 5 s, and a delete killed at the bound every
 time never finishes. Its absence proof re-checks
 `TARTCI_DELETE_PROOF_ATTEMPTS` times (default 3) with doubling backoff from
 `TARTCI_DELETE_PROOF_BACKOFF_SECS` (default 2). When the listing itself times
-out, a missing `$TART_HOME/vms/<vm>` directory under a readable, non-empty
-store is also proof; an unreadable or empty store proves nothing. Each
+out and the storage-health probe last found the store healthy, a missing
+`$TART_HOME/vms/<vm>` directory under a store holding at least one VM
+directory is also proof; an unhealthy, unreadable or empty store proves
+nothing. The delete and the proof run as waited-on background children, so an
+INT/TERM (pool off, self-update, reload) interrupts them at once and the
+signal handler terminates them before cleanup, well inside launchd's exit
+timeout. A heartbeat keepalive refreshes the `teardown-pending` phase while
+they run. With the defaults a VM that stays unproved reaches the fail-closed
+restart after about 7.5 minutes (5 attempts of up to 60 s delete, about 21 s
+of proof and a 10 s pause), not about 2 minutes as before. Each
 `delete_unproved` event carries `absence=absent|present|unreadable`. When the
 retries are exhausted the lane records a `delete_unproved_incident` event and
 an incident line before restarting.
 
-Held-slot self-check: if no observation has found the pending-delete VM (not
-listed by tart, no directory in the store) for `TARTCI_HELD_SLOT_SELF_CHECK_SECS`
-(default 300) while the lane has queued work, the lane releases its lease and
-reservation itself and records a `held_slot_released` event and incident line.
-A VM that is still listed, or whose directory still exists, resets the clock and
-keeps its slot. Incident lines go to `~/.tartci/state/incidents.jsonl`
+Held-slot self-check: if no readable observation has shown the pending-delete
+VM (listed by tart, or its directory in the store) for
+`TARTCI_HELD_SLOT_SELF_CHECK_SECS` (default 300) while the lane has queued work
+and the storage-health probe last found the store healthy, the lane releases
+its lease and reservation itself and records a `held_slot_released` event and
+incident line. A VM that is still listed, or whose directory still exists,
+resets the clock and keeps its slot. With the defaults the check is reachable
+from the fourth or fifth retry onward (about 5 minutes after parking): a
+readable listing or a healthy store normally proves absence first, so it
+fires only when every listing kept timing out and the directory proof could
+not decide. Incident lines go to `~/.tartci/state/incidents.jsonl`
 (`TARTCI_INCIDENTS_FILE`), one JSON object per line with `ts`, `incident`,
 `host`, `runner` and `detail`, for any monitor to tail.
 `tartci up linux [--ref <git-ref>] [--no-gpu]

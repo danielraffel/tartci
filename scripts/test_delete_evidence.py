@@ -27,8 +27,10 @@ RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 def run_delete(fake_tart: str, timeout: str = "1") -> tuple[int, str]:
     """Run the runner's own tartci_tart_delete against a fake `tart`."""
     body = RUNNER.read_text()
-    start = body.index('TARTCI_DELETE_EVIDENCE=""\ntartci_tart_delete(){')
-    end = body.index("\n}\n", start) + 3
+    # The delete waits through the foreground-child helpers, so take them too.
+    start = body.index('TARTCI_DELETE_EVIDENCE=""\n')
+    fn = body.index("\ntartci_tart_delete(){", start)
+    end = body.index("\n}\n", fn) + 3
     with tempfile.TemporaryDirectory() as tmp:
         bindir = Path(tmp) / "bin"
         bindir.mkdir()

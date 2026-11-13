@@ -32,8 +32,14 @@ export TARTCI_QUEUE_OBSERVATION_LOCK_FILE="$TMP/queue-observation.lock"
 
 # Exercise the production shell functions directly while replacing only their
 # external GitHub/event/heartbeat/cleanup boundaries.
-eval "$(sed -n '/^handle_supervisor_signal(){/,/^ensure_runner_version(){/p' \
-  "$ROOT/providers/tart-macos/runner.sh" | sed '$d')"
+eval "$(
+  {
+    sed -n '/^tartci_wait_foreground_child(){/,/^tartci_tart_delete(){/p' \
+      "$ROOT/providers/tart-macos/runner.sh" | sed '$d'
+    sed -n '/^handle_supervisor_signal(){/,/^ensure_runner_version(){/p' \
+      "$ROOT/providers/tart-macos/runner.sh" | sed '$d'
+  }
+)"
 
 cat >"$TMP/fake-gh" <<'PY'
 #!/usr/bin/env python3
