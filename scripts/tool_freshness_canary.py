@@ -262,6 +262,11 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
         return None, f"waiting: {roles['error']}"
     canary = roles["canary"]
     me = self_host_id(home, settings)
+    if not me:
+        # Fail closed: a host that cannot name itself cannot tell whether it is
+        # the canary or a steward host, so it never applies a gated release.
+        return None, ("waiting: this host's id is unknown (install a fleet profile "
+                      "or set host_class in tool-freshness.toml)")
     if me == canary:
         return newest, f"canary {canary}: applies first"
     # (host, needs a clean steward tick): the canary, then for a tool with a
@@ -272,13 +277,12 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
                      if host not in (me, canary)]
     reads = context.setdefault("reads", {})
     soak = float(settings.get("canary_soak_hours", CANARY_SOAK_HOURS))
-    unknown = "" if me else " (this host's id is unknown)"
     for host, _ in required:
         if host not in reads:
             reads[host] = read_host(host, me, settings, state, now, run)
         if "error" in reads[host]:
             role = "canary" if host == canary else "steward host"
-            return None, f"waiting for {role} {host}{unknown}: unreadable ({reads[host]['error']})"
+            return None, f"waiting for {role} {host}: unreadable ({reads[host]['error']})"
     why = ""
     for candidate in reversed(soaked):
         version = str(candidate.get("version"))
@@ -288,7 +292,7 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
                                     soak, require_steward=steward)
             role = "canary" if host == canary else "steward host"
             if not ok:
-                blocked = f"{role} {host}{unknown}: {candidate.get('tag')} {why_one}"
+                blocked = f"{role} {host}: {candidate.get('tag')} {why_one}"
                 break
             notes.append(f"{role} {host}: {why_one}")
         if blocked is None:

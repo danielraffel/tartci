@@ -170,6 +170,34 @@ class CanaryGateTests(_Fleet):
         self.assertEqual(soaked.fleet_updates(), ["v0.221.1"])
         self.assertIn("cleared by canary m5", row["canary"])
 
+    def test_an_unidentified_host_never_applies_even_once_the_canary_cleared(self) -> None:
+        # No fleet profile and no host_class: this host cannot tell whether it is
+        # the canary or a steward host, so it must not apply a cleared release.
+        verified = {"event": "tool_steward_verified", "tool": "shipyard",
+                    "at": iso(NOW - 2 * HOUR), "version": "0.221.1"}
+        host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR, steward_host=True),
+                                         verified))
+        row = self.refresh(host, None, stewards=["m5"])["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), [])
+        self.assertIn("this host's id is unknown", row["apply"])
+        self.assertFalse(any(c[0] == "ssh" for c in host.calls), "nothing to read until identified")
+
+    def test_the_gate_itself_refuses_an_unidentified_host(self) -> None:
+        # The gate fails closed on its own, whether or not the apply command
+        # later needs {host_class}.
+        host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
+        value = settings(**{"host_class": None, "tool_rollout": {"canary": "m5", "steward_hosts": []},
+                            "ssh_targets": {"m5": "m5"}})
+        soaked = [{"version": "0.221.1", "tag": "v0.221.1"}]
+        got, note = canary.gate_candidate("shipyard", {"canary_gate": True}, soaked, self.home,
+                                          NOW, value, self.state, host.run, {})
+        self.assertIsNone(got)
+        self.assertIn("this host's id is unknown", note)
+        value["host_class"] = "studio"  # the same cleared canary releases an identified host
+        got, _ = canary.gate_candidate("shipyard", {"canary_gate": True}, soaked, self.home,
+                                       NOW, value, self.state, host.run, {})
+        self.assertEqual(got, soaked[-1])
+
     def test_a_deploy_that_did_not_verify_does_not_clear(self) -> None:
         host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR, verify="unknown")))
         self.refresh(host, "studio")
