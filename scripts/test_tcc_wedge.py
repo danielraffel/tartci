@@ -11,6 +11,7 @@ import json
 import os
 import subprocess
 import sys
+import shutil
 import tempfile
 import time
 import unittest
@@ -776,7 +777,7 @@ class LaunchdProbeTests(unittest.TestCase):
                     result = argv[argv.index("--result") + 1]
                     value = {"phase": phase, "pid": 1, "internal_latency_ms": 0.02}
                     if opened_ago is not None:
-                        value[tw.ROOT_OPEN_STAMP] = time.monotonic() - opened_ago
+                        value[tw.ROOT_OPEN_STAMP] = tw.shared_clock() - opened_ago
                     Path(result).write_text(json.dumps(value))
                 return subprocess.CompletedProcess(argv, submit_rc, stdout="",
                                                    stderr="" if submit_rc == 0 else "denied")
@@ -817,7 +818,7 @@ class LaunchdProbeTests(unittest.TestCase):
                 self.assertEqual(os.listdir(Path(self.td.name) / tw.LAUNCHD_PROBE_DIR), [])
 
     def injected(self, *, stamp_at=None, remove=None):
-        """A launchctl fake on an injected monotonic clock. `stamp_at`: the
+        """A launchctl fake on an injected clock. `stamp_at`: the
         clock reading at which the child records internal_ok and its stamp."""
         t = {"clock": 0.0, "sleeps": 0}
         paths: dict = {}
@@ -936,6 +937,47 @@ class LaunchdProbeTests(unittest.TestCase):
                                                     env={"TARTCI_TCC_LAUNCHD_PROBE": "0"}))
         self.assertIsNotNone(tw.launchd_probe_from_env("/Volumes/Example/VMs", "/x", 10, env={}))
 
+    def interpreters(self) -> list:
+        """Every interpreter on this host a parent or a child may run under:
+        Apple's /usr/bin/python3 (3.9, tartci's floor), this one, and any
+        other python3.x on PATH."""
+        found = []
+        for name in ["/usr/bin/python3", sys.executable] + [
+                f"python3.{minor}" for minor in range(9, 16)]:
+            path = shutil.which(name) if not os.path.isabs(name) else name
+            if path and os.access(path, os.X_OK) and os.path.realpath(path) not in {
+                    os.path.realpath(p) for p in found}:
+                found.append(path)
+        return found
+
+    def test_a_child_stamp_reads_the_same_clock_in_every_parent(self) -> None:
+        # time.monotonic() on Apple's 3.9 counts from process start, on 3.12+
+        # from boot: a 3.9 child's stamp read by a 3.13 parent was an open
+        # "started at boot", a false hang on the first poll. The child under
+        # every interpreter, read by a parent under every interpreter, must
+        # agree to within seconds.
+        pythons = self.interpreters()
+        self.assertTrue(pythons)
+        clock_code = ("import sys; sys.path.insert(0, sys.argv[1]); import tcc_wedge; "
+                      "print(repr(tcc_wedge.shared_clock()))")
+        for child_python in pythons:
+            result = Path(self.td.name) / "stamp.json"
+            if result.exists():
+                result.unlink()
+            out = subprocess.run(
+                [child_python, str(ROOT / "scripts" / "tcc_launchd_probe_child.py"),
+                 "--internal", self.td.name, "--result", str(result), "--hold", "0",
+                 "--root", self.td.name], capture_output=True, text=True, check=False)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            stamp = json.loads(result.read_text())[tw.ROOT_OPEN_STAMP]
+            for parent_python in pythons:
+                with self.subTest(child=child_python, parent=parent_python):
+                    parent = subprocess.run([parent_python, "-c", clock_code,
+                                             str(ROOT / "scripts")],
+                                            capture_output=True, text=True, check=False)
+                    self.assertEqual(parent.returncode, 0, parent.stderr)
+                    self.assertLess(abs(float(parent.stdout) - stamp), 5.0)
+
     def test_the_child_records_each_phase(self) -> None:
         result = Path(self.td.name) / "r.json"
         args = [sys.executable, str(ROOT / "scripts" / "tcc_launchd_probe_child.py"),
@@ -946,7 +988,6 @@ class LaunchdProbeTests(unittest.TestCase):
         value = json.loads(result.read_text())
         self.assertEqual(value["phase"], "root_ok")
         self.assertIsInstance(value[tw.ROOT_OPEN_STAMP], float)
-        self.assertLessEqual(value[tw.ROOT_OPEN_STAMP], time.monotonic())
         result.unlink()
         subprocess.run(args + ["--root", str(Path(self.td.name) / "absent")], check=False)
         value = json.loads(result.read_text())

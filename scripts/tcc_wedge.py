@@ -182,10 +182,22 @@ LAUNCHD_POLL_S = 0.1
 # How long launchd may take to start the job and reach its root open, past
 # the root-open bound itself, before the reading is inconclusive.
 LAUNCHD_START_GRACE_S = 10.0
-# The child's time.monotonic() as it starts the root open. The monotonic clock
-# is system-wide (mach absolute time on macOS), so parent and child share it,
-# and a wall-clock step cannot stretch the span into a false hang.
-ROOT_OPEN_STAMP = "root_open_started_monotonic"
+# The child's reading of the shared clock as it starts the root open. It must
+# be a SYSTEM-WIDE clock: time.monotonic() is not one on every interpreter
+# (Apple's /usr/bin/python3 3.9 counts it from process start, 3.12+ from
+# boot), so a 3.9 child's stamp read by any parent would look like an open
+# that began at boot, a false hang. CLOCK_UPTIME_RAW (mach_absolute_time) is
+# system-wide on every Python since 3.8 and immune to wall-clock steps.
+# tcc_launchd_probe_child.shared_clock reads the same clock.
+ROOT_OPEN_STAMP = "root_open_started_uptime"
+
+
+def shared_clock() -> float:
+    """Seconds on the system-wide uptime clock, the same in every process."""
+    clock_id = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clock_id is None:            # not macOS: CLOCK_MONOTONIC is system-wide there
+        clock_id = time.CLOCK_MONOTONIC
+    return time.clock_gettime(clock_id)
 CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tcc_launchd_probe_child.py")
 # Outcomes of the launchd probe that say the root answered (or failed fast):
 # the store is not hanging on an authorization from that context, so the
@@ -271,7 +283,7 @@ def launchd_probe(store_path: str, internal_dir: str, timeout_s: float, *,
                   runner: Callable[..., Any] = run_bounded,
                   python: Optional[str] = None,
                   sleep: Callable[[float], None] = time.sleep,
-                  clock: Callable[[], float] = time.monotonic,
+                  clock: Callable[[], float] = shared_clock,
                   now: Callable[[], float] = time.time,
                   grace_s: float = LAUNCHD_START_GRACE_S) -> dict[str, Any]:
     """Open the store's volume root from a fresh launchd job, bounded.

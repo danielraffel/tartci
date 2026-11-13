@@ -33,6 +33,17 @@ import time
 FINAL = ("root_ok", "root_error")
 
 
+def shared_clock() -> float:
+    """The system-wide uptime clock tcc_wedge.shared_clock reads too.
+
+    Not time.monotonic(): on Apple's /usr/bin/python3 3.9 that counts from
+    process start, so it means nothing to another process."""
+    clock_id = getattr(time, "CLOCK_UPTIME_RAW", None)
+    if clock_id is None:
+        clock_id = time.CLOCK_MONOTONIC
+    return time.clock_gettime(clock_id)
+
+
 def write_result(path: str, value: dict) -> None:
     temporary = path + ".tmp"
     with open(temporary, "w") as handle:
@@ -69,9 +80,9 @@ def main(argv: list | None = None) -> int:
     record = {"pid": os.getpid(), "phase": "internal_ok",
               "internal_latency_ms": open_dir(args.internal)}
     # The parent times the root open from this stamp, not from its submit.
-    # Monotonic: system-wide, shared with the parent, immune to clock steps.
-    # The wall-clock stamp is evidence only.
-    record["root_open_started_monotonic"] = time.monotonic()
+    # The system-wide uptime clock, shared with the parent whatever its
+    # interpreter, immune to clock steps. The wall-clock stamp is evidence only.
+    record["root_open_started_uptime"] = shared_clock()
     record["root_open_started"] = time.time()
     write_result(args.result, record)
     try:
