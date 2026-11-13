@@ -157,6 +157,8 @@ CODES: tuple[str, ...] = (
     "signing_prompts_ok",
     "signing_prompts_risk",
     "signing_prompts_unknown",
+    "store_context_disagree",
+    "store_context_suspect",
     "store_ok",
     "store_stalled",
     "store_unprobed",
@@ -170,6 +172,7 @@ CODES: tuple[str, ...] = (
     "support_agents_unreadable",
     "tcc_wedge_healed",
     "tcc_wedge_none",
+    "tcc_wedge_unclassified",
     "tcc_wedge_unhealed",
     "tool_freshness_current",
     "tool_freshness_stale",
@@ -1182,15 +1185,71 @@ def check_launchd_timers(value: dict | None) -> Finding:
     return Finding("launchd_timers", OK, "launchd_timers_ok", detail, facts)
 
 
-def check_store_stall(value: dict | None) -> Finding:
-    """Whether the VM store or repository volume answers at all (store_stall.py)."""
+def reading_context(env: dict | None = None, ppid: int | None = None) -> str:
+    """Where this doctor's own store probe runs from, as an operator would name it.
+
+    It matters: a Removable Volumes decision is cached per context, so an
+    interactive shell can open the store in microseconds while every new
+    launchd job hangs on the same volume (m3, 2026-11-13).
+    """
+    env = os.environ if env is None else env
+    ppid = os.getppid() if ppid is None else ppid
+    if env.get("SSH_CONNECTION"):
+        return "this doctor (ssh session)"
+    service = str(env.get("XPC_SERVICE_NAME") or "")
+    if ppid == 1 or (service not in ("", "0") and not service.startswith("application.")):
+        return f"this doctor (launchd job{': ' + service if service not in ('', '0') else ''})"
+    return "this doctor (interactive shell)"
+
+
+def watchdog_store_reading(value: dict | None, now: float | None = None) -> dict:
+    """The launchd watchdog's store-health state, summarized with its context and age."""
+    value = value if isinstance(value, dict) else {}
+    state = value.get("state")
+    if not state:
+        return {"state": None, "text": "launchd watchdog: no store-health state on this host"}
+    now = time.time() if now is None else now
+    context = str(value.get("probe_context") or "launchd watchdog (launchd job)")
+    updated = value.get("updated_at")
+    age = (f", {int(now - updated)}s ago" if isinstance(updated, (int, float))
+           and updated <= now else "")
+    last = value.get("last_result") if isinstance(value.get("last_result"), dict) else {}
+    text = f"{context}: {state}{age}"
+    failures = value.get("consecutive_failures")
+    if state != "healthy":
+        text += f", {failures} consecutive failure(s), last: {last.get('reason')}"
+        kind = (value.get("classification") or {}).get("kind")
+        if kind:
+            text += f", classified {kind}"
+    return {"state": state, "text": text, "consecutive_failures": failures,
+            "context": context}
+
+
+def check_store_stall(value: dict | None, watchdog: dict | None = None,
+                      context: str | None = None, now: float | None = None) -> Finding:
+    """Whether the VM store or repository volume answers at all (store_stall.py),
+    next to the launchd watchdog's own reading (store-health.json).
+
+    The two readings come from different contexts and both are shown, named.
+    When this doctor's probe answers but the watchdog reads draining (or
+    suspect), the result is not all-clear: launchd-context opens can hang while
+    the doctor's context holds a cached authorization.
+    """
     import store_stall
 
     value = value or {"state": "unprobed", "detail": "no probe result", "stalled": []}
-    facts = {"store": value}
-    detail = store_stall.describe(value)
+    context = context or reading_context()
+    reading = watchdog_store_reading(watchdog, now=now)
+    facts = {"store": value, "context": context, "watchdog": reading}
+    detail = f"{store_stall.describe(value)} [{context}]; {reading['text']}"
     if value.get("state") == "stalled":
         return Finding("store_stall", PROBLEM, "store_stalled", detail, facts)
+    if reading["state"] == "draining":
+        return Finding("store_stall", PROBLEM, "store_context_disagree",
+                       detail + "; this doctor's context answered, launchd-context opens did not",
+                       facts)
+    if reading["state"] == "suspect":
+        return Finding("store_stall", UNKNOWN, "store_context_suspect", detail, facts)
     if value.get("state") == "ok":
         return Finding("store_stall", OK, "store_ok", detail, facts)
     return Finding("store_stall", UNKNOWN, "store_unprobed", detail, facts)
@@ -1201,14 +1260,16 @@ def check_tcc_wedge(value: dict | None, now: float | None = None) -> Finding:
 
     `value` is the watchdog's store-health state (tcc_wedge.read_state). Only a
     classification fresher than tcc_wedge.FRESH_S counts; an old one says
-    nothing about now.
+    nothing about now. A draining store with no wedge verdict is not "none":
+    the cause is unproven, and the detail says what the classifier saw.
     """
     import tcc_wedge
 
     value = value or {}
     classification = value.get("classification") or {}
     facts = {"classification": classification, "heal": value.get("heal"),
-             "last_heal": value.get("last_heal"), "store_state": value.get("state")}
+             "last_heal": value.get("last_heal"), "store_state": value.get("state"),
+             "context": str(value.get("probe_context") or "launchd watchdog (launchd job)")}
     fresh = False
     try:
         stamp = time.strptime(str(classification.get("classified_at")), "%Y-%m-%dT%H:%M:%SZ")
@@ -1216,6 +1277,14 @@ def check_tcc_wedge(value: dict | None, now: float | None = None) -> Finding:
     except (ValueError, TypeError):
         fresh = False
     if classification.get("kind") != tcc_wedge.KIND or not fresh:
+        if value.get("state") == "draining":
+            kind = classification.get("kind") or "not classified"
+            why = (f"the last verdict ({kind}, {classification.get('classified_at')}) is older "
+                   f"than {tcc_wedge.FRESH_S}s" if kind == tcc_wedge.KIND
+                   else f"{kind}: {classification.get('reason')}")
+            return Finding("tcc_wedge", UNKNOWN, "tcc_wedge_unclassified",
+                           "tcc wedge: the launchd watchdog's store probe is draining and the "
+                           f"cause is unproven ({why})", facts)
         return Finding("tcc_wedge", OK, "tcc_wedge_none",
                        "tcc wedge: no fresh wedged-tccd verdict for the Tart store", facts)
     heal = value.get("heal") or {}
@@ -1890,13 +1959,13 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             store_value = store_stall.status(home)
         except Exception as exc:  # noqa: BLE001 - reported as not probed
             store_value = {"state": "unprobed", "detail": f"probe failed: {exc}", "stalled": []}
-    findings.append(check_store_stall(store_value))
     if tcc_value is None:
         try:
             import tcc_wedge
             tcc_value = tcc_wedge.read_state(str(home))
         except Exception as exc:  # noqa: BLE001 - reported as no verdict
             tcc_value = {"classification": {}, "read_error": str(exc)}
+    findings.append(check_store_stall(store_value, watchdog=tcc_value))
     findings.append(check_tcc_wedge(tcc_value))
     if launchd_timers_value is None:
         try:

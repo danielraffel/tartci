@@ -1882,6 +1882,10 @@ def store_health_pass(
         state["resolution"] = resolution
         state["failure_threshold"] = failure_threshold
         state["updated_at"] = int(time.time())
+        # Which context this reading came from: `tartci doctor fleet` runs its
+        # own probe from wherever it is started (often an interactive shell
+        # with a cached authorization) and shows both, naming each.
+        state["probe_context"] = "launchd watchdog (launchd job)"
         # Past the threshold, name the cause of a hang and, when the readings
         # agree it is a wedged tccd, run the one scoped root heal. The control
         # path is the state directory: internal volume, never the store. A
@@ -1892,7 +1896,9 @@ def store_health_pass(
                 state, previous, control_path=os.path.dirname(state_path),
                 store_timeout_s=timeout_s, dry_run=dry_run or status_only,
                 heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0",
-                context_probe=tcc_wedge.context_probe_from_env())
+                context_probe=tcc_wedge.context_probe_from_env(),
+                launchd_probe=tcc_wedge.launchd_probe_from_env(
+                    tart_home, os.path.dirname(state_path), timeout_s))
         except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive
             state["classification"] = {"kind": "classifier_error", "reason": str(exc)[:300],
                                        "evidence": {}, "classified_at": _iso(time.time())}

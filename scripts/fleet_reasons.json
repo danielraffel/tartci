@@ -548,6 +548,17 @@
       "why": "The launchd watchdog re-measures it every 30 minutes on a managed host; until then the answer is unknown, not current.",
       "remedy": "Run `tartci fleet-macos self-update --plan` (read-only)."
     },
+    "store_context_disagree": {
+      "summary": "This doctor's own store probe answered, but the launchd watchdog's store probe reads draining.",
+      "why": "A Removable Volumes authorization is cached per context. An interactive or ssh shell that already holds one opens the store in microseconds while every new launchd job, the lanes and the watchdog included, hangs on the same volume. On 2026-11-13 m3 admitted no VM for hours while `doctor fleet` from a shell read store_ok. The detail names the context of each reading.",
+      "remedy": "Read the tcc_wedge finding and `python3 scripts/tcc_wedge.py --state` for the watchdog's classification. If it is tcc_attribution_wedge, follow tcc_wedge_unhealed; otherwise drain the host (`tartci pool drain`), let running jobs finish, and reboot it.",
+      "do_not": "Do not read this doctor's ok as the host's answer: the lanes read the watchdog's state, not this probe. Do not clear store-health.json by hand."
+    },
+    "store_context_suspect": {
+      "summary": "This doctor's own store probe answered, but the launchd watchdog's last store probe failed once.",
+      "why": "One failure is below the watchdog's drain threshold and may be transient; a second makes it draining. The two readings come from different contexts, so one answering does not clear the other.",
+      "remedy": "Run `tartci doctor fleet` again after the next watchdog pass (5 minutes); draining becomes store_context_disagree, a recovery becomes store_ok."
+    },
     "store_ok": {
       "summary": "Every store volume the profile names answered its probe in time.",
       "why": "A directory listing, tart list and git rev-parse on the VM store and repository volumes each finished within the probe timeout.",
@@ -686,6 +697,12 @@
       "summary": "The watchdog has no fresh wedged-tccd verdict for the Tart store.",
       "why": "Either the store answers, or it is failing for a reason the three readings (internal control path, sandboxd/tccd log signature, optional probe from a TCC-granted context) do not attribute to tccd.",
       "remedy": "Nothing for this check; a stalled store is reported by store_stall."
+    },
+    "tcc_wedge_unclassified": {
+      "summary": "The launchd watchdog's store probe is draining, and its classifier did not attribute the hang to a wedged tccd.",
+      "why": "A hang with no sandboxd/tccd refusal lines is attributed only when a fresh launchd job hangs on the volume root while its internal open answers AND a context with TCC access (TARTCI_TCC_CONTEXT_PROBE) answers for the same store. A missing or disagreeing reading leaves the cause unproven, and nothing privileged runs. The detail names what the classifier saw.",
+      "remedy": "Read `python3 scripts/tcc_wedge.py --state`. If the launchd probe hung on the root and no context probe is configured, set TARTCI_TCC_CONTEXT_PROBE for the watchdog on this host. Otherwise drain the host (`tartci pool drain`), let jobs finish, and reboot it.",
+      "do_not": "Do not run the heal wrapper by hand to test a guess, and do not read this as tcc_wedge_none."
     },
     "tcc_wedge_unhealed": {
       "summary": "The watchdog classified the store hang as a wedged tccd, but the heal did not run or did not bring the store back.",

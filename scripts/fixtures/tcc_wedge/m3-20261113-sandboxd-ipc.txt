@@ -1,0 +1,19 @@
+Timestamp               Ty Process[PID:TID]
+2026-11-12 22:02:32.565 A  sandboxd[11033:3417775e] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:33.084 A  sandboxd[11033:341e8b9a] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:33.084 Df sandboxd[11033:341e8b9a] [com.apple.xpc:connection] [0x79c2c4d680] activating connection: mach=true listener=false peer=false name=com.apple.tccd.system
+2026-11-12 22:02:33.100 A  sandboxd[11033:341e8b9a] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:33.100 Df sandboxd[11033:341e8b9a] [com.apple.xpc:connection] [0x79c2c4ca00] activating connection: mach=true listener=false peer=false name=com.apple.tccd
+2026-11-12 22:02:33.100 I  tccd[10784:341f7dbe] [com.apple.TCC:access] REQUEST_MSG: msgID=11033.597076, msg={
+	service="kTCCServiceSystemPolicyRemovableVolumes"
+	TCCD_MSG_ID="11033.597076"
+}
+2026-11-12 22:02:35.035 A  sandboxd[11033:341ec78b] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:35.035 Df sandboxd[11033:341ec78b] [com.apple.xpc:connection] [0x79c2c4ca00] activating connection: mach=true listener=false peer=false name=com.apple.tccd.system
+2026-11-12 22:02:35.056 A  sandboxd[11033:341ec78b] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:36.952 A  sandboxd[11033:3420081d] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:36.952 Df sandboxd[11033:3420081d] [com.apple.xpc:connection] [0x79c2c4d680] activating connection: mach=true listener=false peer=false name=com.apple.tccd.system
+2026-11-12 22:02:36.953 I  sandboxd[11033:3420081d] [com.apple.TCC:access] SEND: 0/7 synchronous to com.apple.tccd.system: request: msgID=11033.597078, function=TCCAccessRequest, service=kTCCServiceSystemPolicyRemovableVolumes,
+2026-11-12 22:02:36.956 A  sandboxd[11033:3420081d] (TCC) tcc_send_request_authorization() IPC
+2026-11-12 22:02:36.960 I  tccd[10784:342beaba] [com.apple.TCC:access] REQUEST_MSG: msgID=11033.597078, msg={
+}

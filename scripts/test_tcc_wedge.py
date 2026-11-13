@@ -453,7 +453,9 @@ class LaneAndDoctorTests(unittest.TestCase):
             (self.wedge_state(), fd.OK, "tcc_wedge_healed"),
             (self.wedge_state(reprobe_ok=False), fd.PROBLEM, "tcc_wedge_unhealed"),
             (self.wedge_state("wrapper_missing"), fd.PROBLEM, "tcc_wedge_unhealed"),
-            (self.wedge_state(age_s=tw.FRESH_S + 1), fd.OK, "tcc_wedge_none"),
+            (self.wedge_state(age_s=tw.FRESH_S + 1, store_state="healthy"), fd.OK,
+             "tcc_wedge_none"),
+            (self.wedge_state(age_s=tw.FRESH_S + 1), fd.UNKNOWN, "tcc_wedge_unclassified"),
             ({}, fd.OK, "tcc_wedge_none"),
             (None, fd.OK, "tcc_wedge_none"),
         ]
@@ -521,6 +523,366 @@ class WrapperSourceTests(unittest.TestCase):
         installer = (ROOT / "fleet" / "ops" / "install-tartci-heal-tcc.sh").read_text()
         self.assertIn("WRAPPER_DST=/usr/local/sbin/tartci-heal-tcc", installer)
         self.assertIn("visudo -cf", installer)
+
+
+FIXTURES = ROOT / "scripts" / "fixtures" / "tcc_wedge"
+
+
+def fixture_json(name: str) -> dict:
+    return json.loads((FIXTURES / name).read_text())
+
+
+class NoSignatureWedgeFixtureTests(unittest.TestCase):
+    """The m3 stall of 2026-11-13: the store hangs, sandboxd/tccd log no refusal.
+
+    Fixtures: the watchdog's store-health.json from the issue (paths made
+    placeholders), the fresh-launchd-job probe record measured on m3 that
+    morning (hung on the volume root, internal open answered), and a
+    sandboxd/tccd log excerpt: the issue's unanswered IPC line (thread
+    3417775e) among answered threads captured on m3 the same morning.
+    """
+
+    def readings(self, **overrides):
+        state = fixture_json("m3-20261113-store-health.json")
+        logged = state["classification"]["evidence"]
+        kwargs = dict(
+            consecutive_failures=state["consecutive_failures"],
+            failure_threshold=state["failure_threshold"],
+            last_reason=state["last_result"]["reason"],
+            failing_since=state["failing_since"], control_path="/internal/state",
+            now=state["updated_at"],
+            control=lambda path, timeout_s: dict(logged["control_probe"]),
+            scan=lambda window_s, before=None: dict(logged["log_scan"]),
+            launchd_probe=lambda: fixture_json("m3-20261113-launchd-probe.json"),
+            ipc_scan=lambda start, end: tw.ipc_hits(
+                (FIXTURES / "m3-20261113-sandboxd-ipc.txt").read_text()),
+            # Evidence 2 in the issue: the same probe from an interactive shell.
+            context_probe=lambda: {"ok": True, "latency_ms": 0.052,
+                                   "context": "interactive shell"})
+        kwargs.update(overrides)
+        return tw.classify(**kwargs)
+
+    def test_the_fixture_ipc_log_has_one_unanswered_request(self) -> None:
+        hits = tw.ipc_hits((FIXTURES / "m3-20261113-sandboxd-ipc.txt").read_text())
+        self.assertEqual(hits["state"], "unanswered")
+        self.assertEqual(hits["unanswered"], 1)
+        self.assertEqual(hits["answered"], 3)
+        self.assertEqual(hits["first_unanswered"], "2026-11-12 22:02:32")
+        self.assertEqual(hits["tccd_requests"], 2)
+
+    def test_the_11_13_readings_give_a_wedge_without_error_lines(self) -> None:
+        verdict = self.readings()
+        self.assertEqual(verdict["kind"], tw.KIND)
+        self.assertEqual(verdict["path"], "launchd_root_hang")
+        self.assertIn("/Volumes/Example", verdict["reason"])
+        self.assertIn("1 authorization request(s) tccd never received", verdict["reason"])
+        self.assertEqual(verdict["evidence"]["log_scan"]["total"], 0)
+        self.assertEqual(verdict["evidence"]["launchd_probe"]["outcome"], "hung_on_root")
+
+    def test_the_ipc_signature_is_corroboration_not_a_requirement(self) -> None:
+        # Measured on m3 on 11-13: the next fresh launchd probe hung the same
+        # way and sandboxd logged no IPC line for it at all.
+        for ipc in ({"state": "absent", "unanswered": 0}, {"state": "unavailable"},
+                    {"state": "all_answered", "answered": 4, "unanswered": 0}):
+            with self.subTest(ipc=ipc["state"]):
+                verdict = self.readings(ipc_scan=lambda start, end, ipc=ipc: ipc)
+                self.assertEqual(verdict["kind"], tw.KIND)
+                self.assertIn(f"IPC signature {ipc['state']}", verdict["reason"])
+
+    def test_the_issue_classification_without_the_new_readings_stays_unclassified(self) -> None:
+        # Negative control: the readings the watchdog had on 11-13 (control and
+        # an empty signature scan) and nothing else are what it recorded.
+        verdict = self.readings(launchd_probe=None, context_probe=None)
+        self.assertEqual(verdict["kind"], "stalled_unclassified")
+
+
+class DisagreeingReadingsNeverHealTests(unittest.TestCase):
+    """Every combination where the readings disagree, through the real classify."""
+
+    def run_step(self, *, launchd, context, removable=0):
+        state = {"state": "draining", "consecutive_failures": 3, "drain_required": True,
+                 "failure_threshold": 2, "path": "/Volumes/Example/VMs",
+                 "last_result": {"ok": False, "reason": "timeout after 10s"}}
+        healed: list = []
+
+        def classify_fn(**kw):
+            kw.update(scan=scan_with(removable), control=ok_control,
+                      ipc_scan=lambda start, end: {"state": "unanswered", "unanswered": 1})
+            return tw.classify(**kw)
+        tw.watchdog_step(state, {"failing_since": NOW - 900}, control_path="/internal/state",
+                         store_timeout_s=10.0, dry_run=False, now=NOW,
+                         classify_fn=classify_fn,
+                         heal_fn=lambda **kw: healed.append(kw) or {"outcome": "ran",
+                                                                   "at": tw._iso(NOW)},
+                         reprobe=lambda path, timeout_s: {"ok": True},
+                         context_probe=context,
+                         launchd_probe=None if launchd is None else (lambda: dict(launchd)))
+        return state, healed
+
+    HUNG = {"outcome": "hung_on_root", "volume_root": "/Volumes/Example",
+            "started_epoch": NOW - 12, "waited_s": 10.0}
+    ANSWERED = {"outcome": "answered", "volume_root": "/Volumes/Example", "root_latency_ms": 0.1}
+    FAST_ERROR = {"outcome": "root_error", "volume_root": "/Volumes/Example", "errno": 1,
+                  "error": "[Errno 1] Operation not permitted"}
+
+    def ok(self):
+        return {"ok": True}
+
+    def hung(self):
+        return {"ok": False, "reason": "timeout after 10s"}
+
+    def test_the_agreeing_readings_heal_once(self) -> None:
+        # The positive control every veto below is measured against.
+        state, healed = self.run_step(launchd=self.HUNG, context=self.ok)
+        self.assertEqual(state["classification"]["kind"], tw.KIND)
+        self.assertEqual(len(healed), 1)
+
+    def test_disagreements_never_heal(self) -> None:
+        cases = {
+            "launchd job opened the root": dict(launchd=self.ANSWERED, context=self.ok),
+            "launchd job failed fast on the root": dict(launchd=self.FAST_ERROR,
+                                                        context=self.ok),
+            "authorized context hangs too": dict(launchd=self.HUNG, context=self.hung),
+            "no authorized context configured": dict(launchd=self.HUNG, context=None),
+            "no launchd probe": dict(launchd=None, context=self.ok),
+            "launchd probe recorded nothing": dict(
+                launchd={"outcome": "did_not_start", "volume_root": "/Volumes/Example"},
+                context=self.ok),
+            "launchd probe inconclusive": dict(
+                launchd={"outcome": "inconclusive", "detail": "launchctl submit failed"},
+                context=self.ok),
+            "error lines, but the launchd job opened the root": dict(
+                launchd=self.ANSWERED, context=self.ok, removable=7),
+            "error lines, but the authorized context hangs": dict(
+                launchd=self.HUNG, context=self.hung, removable=7),
+        }
+        for name, kwargs in cases.items():
+            with self.subTest(name):
+                state, healed = self.run_step(**kwargs)
+                self.assertEqual(healed, [], name)
+                self.assertNotEqual(state["classification"]["kind"], tw.KIND, name)
+                self.assertNotIn("heal", state, name)
+
+    def test_the_existing_signature_path_still_heals(self) -> None:
+        for launchd in (None, self.HUNG, {"outcome": "not_external"},
+                        {"outcome": "did_not_start", "volume_root": "/Volumes/Example"}):
+            with self.subTest(launchd=launchd):
+                state, healed = self.run_step(launchd=launchd, context=None, removable=3)
+                self.assertEqual(state["classification"]["kind"], tw.KIND)
+                self.assertEqual(state["classification"]["path"], "error_signature")
+                self.assertEqual(len(healed), 1)
+
+
+class IpcSignatureTests(unittest.TestCase):
+    def line(self, stamp, tid, message="(TCC) tcc_send_request_authorization() IPC"):
+        return f"2026-11-12 {stamp} A  sandboxd[11033:{tid}] {message}"
+
+    def test_a_second_ipc_without_a_follow_up_is_a_later_step_not_a_new_request(self) -> None:
+        text = "\n".join([self.line("22:07:30.035", "aa"),
+                          self.line("22:07:30.035", "aa", "activating connection: name=com.apple.tccd.system"),
+                          self.line("22:07:30.056", "aa")])
+        self.assertEqual(tw.ipc_hits(text)["state"], "all_answered")
+
+    def test_a_lone_ipc_is_unanswered_unless_the_log_ends_too_soon(self) -> None:
+        text = self.line("22:02:32.565", "bb")
+        self.assertEqual(tw.ipc_hits(text)["state"], "unanswered")
+        end = tw._local_epoch("2026-11-12 22:02:34", None)
+        self.assertEqual(tw.ipc_hits(text, end_epoch=end)["state"], "pending")
+        self.assertEqual(tw.ipc_hits("")["state"], "absent")
+
+    def test_a_follow_up_later_than_the_window_does_not_answer(self) -> None:
+        text = "\n".join([self.line("22:02:32.000", "cc"),
+                          self.line("22:02:40.000", "cc", "activating connection")])
+        self.assertEqual(tw.ipc_hits(text)["unanswered"], 1)
+
+    def test_scan_ipc_is_bounded_and_reports_failure_as_unavailable(self) -> None:
+        seen = {}
+
+        def runner(argv, *, timeout, operation):
+            seen.update(argv=argv, timeout=timeout)
+            return subprocess.CompletedProcess(argv, 0, stdout=self.line("22:02:32.565", "dd"),
+                                               stderr="")
+        value = tw.scan_ipc(NOW, NOW + 10, runner=runner)
+        self.assertEqual(seen["timeout"], tw.IPC_SCAN_TIMEOUT_S)
+        self.assertIn("--start", seen["argv"])
+        self.assertIn("--debug", seen["argv"])
+        self.assertIn("tcc_send_request_authorization", value and "tcc_send_request_authorization")
+
+        def hung(argv, *, timeout, operation):
+            return subprocess.CompletedProcess(argv, bounded_subprocess.TIMEOUT_EXIT_CODE,
+                                               stdout="", stderr="killed")
+        self.assertEqual(tw.scan_ipc(NOW, NOW + 10, runner=hung)["state"], "unavailable")
+
+
+class LaunchdProbeTests(unittest.TestCase):
+    """The fresh-launchd-job probe, with launchctl faked: the child phases and
+    the always-remove contract."""
+
+    def setUp(self) -> None:
+        self.td = tempfile.TemporaryDirectory()
+        self.addCleanup(self.td.cleanup)
+        self.calls: list = []
+
+    def runner(self, phase=None, submit_rc=0, remove_rc=0):
+        def run(argv, *, timeout, operation):
+            self.calls.append(list(argv))
+            if argv[1] == "submit":
+                if phase:
+                    result = argv[argv.index("--result") + 1]
+                    Path(result).write_text(json.dumps({"phase": phase, "pid": 1,
+                                                        "internal_latency_ms": 0.02}))
+                return subprocess.CompletedProcess(argv, submit_rc, stdout="",
+                                                   stderr="" if submit_rc == 0 else "denied")
+            return subprocess.CompletedProcess(argv, remove_rc, stdout="", stderr="")
+        return run
+
+    def probe(self, runner, timeout_s=0.3, **kwargs):
+        return tw.launchd_probe("/Volumes/Example/VMs", self.td.name, timeout_s, runner=runner,
+                                python="/usr/bin/python3", **kwargs)
+
+    def verbs(self):
+        return [argv[1] for argv in self.calls]
+
+    def test_outcome_per_phase_and_the_job_is_always_removed(self) -> None:
+        for phase, outcome in (("root_ok", "answered"), ("root_error", "root_error"),
+                               ("internal_ok", "hung_on_root"), (None, "did_not_start")):
+            with self.subTest(phase=phase):
+                self.calls.clear()
+                record = self.probe(self.runner(phase))
+                self.assertEqual(record["outcome"], outcome)
+                self.assertEqual(self.verbs(), ["submit", "remove"])
+                self.assertEqual(self.calls[1][2], record["label"])
+                self.assertTrue(record["job_removed"])
+                self.assertEqual(os.listdir(Path(self.td.name) / tw.LAUNCHD_PROBE_DIR), [])
+
+    def test_submit_argv_opens_the_volume_root_from_the_internal_dir(self) -> None:
+        self.probe(self.runner("root_ok"))
+        argv = self.calls[0]
+        self.assertEqual(argv[:4], [tw.LAUNCHCTL, "submit", "-l", argv[3]])
+        self.assertTrue(argv[3].startswith(tw.LAUNCHD_LABEL_PREFIX + "."))
+        self.assertEqual(argv[argv.index("--root") + 1], "/Volumes/Example")
+        self.assertEqual(argv[argv.index("--internal") + 1],
+                         str(Path(self.td.name) / tw.LAUNCHD_PROBE_DIR))
+        self.assertEqual(argv[argv.index("--") + 2], tw.CHILD)
+
+    def test_removed_even_when_polling_raises(self) -> None:
+        def boom(_seconds):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.probe(self.runner("internal_ok"), timeout_s=5, sleep=boom)
+        self.assertEqual(self.verbs(), ["submit", "remove"])
+
+    def test_a_failed_submit_is_inconclusive_and_still_removed(self) -> None:
+        record = self.probe(self.runner(submit_rc=1))
+        self.assertEqual(record["outcome"], "inconclusive")
+        self.assertIn("denied", record["detail"])
+        self.assertEqual(self.verbs(), ["submit", "remove"])
+
+    def test_a_job_that_could_not_be_removed_is_retried_next_pass(self) -> None:
+        first = self.probe(self.runner("internal_ok", remove_rc=5))
+        self.assertFalse(first["job_removed"])
+        self.calls.clear()
+        second = self.probe(self.runner("root_ok"))
+        self.assertEqual(second["removed_leftover_jobs"], [first["label"]])
+        self.assertEqual(self.verbs(), ["remove", "submit", "remove"])
+        self.assertEqual(self.calls[0][2], first["label"])
+
+    def test_an_internal_store_is_not_probed(self) -> None:
+        record = tw.launchd_probe("/var/tmp/vms", self.td.name, 1, runner=self.runner("root_ok"))
+        self.assertEqual(record["outcome"], "not_external")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(tw.volume_root("/Volumes/Example/VMs"), "/Volumes/Example")
+        self.assertEqual(tw.volume_root("/Volumes/Example"), "/Volumes/Example")
+        self.assertEqual(tw.volume_root("/Users/example/vms"), "/")
+
+    def test_the_probe_is_off_with_its_switch(self) -> None:
+        self.assertIsNone(tw.launchd_probe_from_env("/Volumes/Example/VMs", "/x", 10,
+                                                    env={"TARTCI_TCC_LAUNCHD_PROBE": "0"}))
+        self.assertIsNotNone(tw.launchd_probe_from_env("/Volumes/Example/VMs", "/x", 10, env={}))
+
+    def test_the_child_records_each_phase(self) -> None:
+        result = Path(self.td.name) / "r.json"
+        args = [sys.executable, str(ROOT / "scripts" / "tcc_launchd_probe_child.py"),
+                "--internal", self.td.name, "--result", str(result), "--hold", "0"]
+        out = subprocess.run(args + ["--root", self.td.name], capture_output=True, text=True,
+                             check=False)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(result.read_text())["phase"], "root_ok")
+        result.unlink()
+        subprocess.run(args + ["--root", str(Path(self.td.name) / "absent")], check=False)
+        value = json.loads(result.read_text())
+        self.assertEqual(value["phase"], "root_error")
+        self.assertEqual(value["errno"], 2)
+
+
+class DoctorContextTests(unittest.TestCase):
+    """doctor fleet shows the watchdog's reading next to its own, named by context."""
+
+    OWN_OK = {"state": "ok", "detail": "4 store probe(s) answered within 15s", "stalled": [],
+              "probed_at": NOW}
+
+    def test_draining_from_the_state_file_even_when_the_own_probe_is_ok(self) -> None:
+        watchdog = fixture_json("m3-20261113-store-health.json")
+        finding = fd.check_store_stall(self.OWN_OK, watchdog=watchdog,
+                                       context="this doctor (interactive shell)",
+                                       now=watchdog["updated_at"] + 13)
+        self.assertEqual((finding.state, finding.code), (fd.PROBLEM, "store_context_disagree"))
+        self.assertIn("draining", finding.detail)
+        self.assertIn("3 consecutive failure(s)", finding.detail)
+        self.assertIn("[this doctor (interactive shell)]", finding.detail)
+        self.assertIn("launchd watchdog (launchd job): draining, 13s ago", finding.detail)
+        self.assertIn("classified stalled_unclassified", finding.detail)
+        tcc = fd.check_tcc_wedge(watchdog, now=watchdog["updated_at"])
+        self.assertEqual((tcc.state, tcc.code), (fd.UNKNOWN, "tcc_wedge_unclassified"))
+        self.assertIn("cause is unproven", tcc.detail)
+        for code in ("store_context_disagree", "store_context_suspect", "tcc_wedge_unclassified"):
+            self.assertIn(code, fd.CODES)
+            self.assertIn(code, fd.load_reasons())
+
+    def test_agreeing_readings_keep_their_codes(self) -> None:
+        # Negative controls: a healthy watchdog, no state file, a stalled own probe.
+        healthy = {"state": "healthy", "consecutive_failures": 0, "updated_at": NOW}
+        finding = fd.check_store_stall(self.OWN_OK, watchdog=healthy, context="ctx", now=NOW)
+        self.assertEqual((finding.state, finding.code), (fd.OK, "store_ok"))
+        self.assertIn("launchd watchdog (launchd job): healthy", finding.detail)
+        finding = fd.check_store_stall(self.OWN_OK, watchdog={}, context="ctx", now=NOW)
+        self.assertEqual(finding.code, "store_ok")
+        self.assertIn("no store-health state", finding.detail)
+        stalled = {"state": "stalled", "detail": "x", "stalled": []}
+        finding = fd.check_store_stall(stalled, watchdog={"state": "draining"}, context="ctx")
+        self.assertEqual(finding.code, "store_stalled")
+        self.assertEqual(fd.check_tcc_wedge(healthy, now=NOW).code, "tcc_wedge_none")
+
+    def test_one_watchdog_failure_is_not_all_clear(self) -> None:
+        suspect = {"state": "suspect", "consecutive_failures": 1, "updated_at": NOW,
+                   "last_result": {"reason": "timeout after 10s"}}
+        finding = fd.check_store_stall(self.OWN_OK, watchdog=suspect, context="ctx", now=NOW)
+        self.assertEqual((finding.state, finding.code), (fd.UNKNOWN, "store_context_suspect"))
+
+    def test_reading_context_names_where_the_doctor_ran(self) -> None:
+        self.assertEqual(fd.reading_context({"SSH_CONNECTION": "a b c d"}, ppid=99),
+                         "this doctor (ssh session)")
+        self.assertEqual(fd.reading_context({"XPC_SERVICE_NAME": "com.example.job"}, ppid=99),
+                         "this doctor (launchd job: com.example.job)")
+        self.assertEqual(fd.reading_context({"XPC_SERVICE_NAME": "0"}, ppid=99),
+                         "this doctor (interactive shell)")
+        self.assertEqual(fd.reading_context({}, ppid=1), "this doctor (launchd job)")
+
+    def test_collect_reads_the_watchdog_state_file_beside_its_own_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td) / ".tartci" / "state"
+            state_dir.mkdir(parents=True)
+            (state_dir / "store-health.json").write_text(
+                (FIXTURES / "m3-20261113-store-health.json").read_text())
+            env = {k: v for k, v in os.environ.items() if k != "TARTCI_HOME"}
+            with mock.patch.dict(os.environ, env, clear=True):
+                rows = fd.collect(home=Path(td), skip_census=True,
+                                  probe=lambda root: {"error": "stub"},
+                                  store_value=dict(self.OWN_OK))
+        found = {row.check: row for row in rows}
+        self.assertEqual(found["store_stall"].code, "store_context_disagree")
+        self.assertEqual(found["tcc_wedge"].code, "tcc_wedge_unclassified")
+        self.assertNotEqual(fd.diagnose("m3", rows).worst, fd.OK)
 
 
 if __name__ == "__main__":

@@ -141,6 +141,64 @@ class TccWedgeWatchdogTests(unittest.TestCase):
         self.assertEqual(second["state"], "draining")
         self.assertEqual(saved["last_heal"]["outcome"], "ran")
 
+    def launchd_passes(self, td: str, env: dict) -> tuple:
+        import tcc_wedge
+        state_home = Path(td) / "state-home"
+        wrapper = Path(td) / "tartci-heal-tcc"
+        wrapper.write_text("#!/bin/sh\nexit 0\n")
+        wrapper.chmod(0o755)
+        heal_calls: list = []
+        launchd_calls: list = []
+
+        def fake_launchd_probe(store_path, internal_dir, timeout_s):
+            launchd_calls.append((store_path, internal_dir, timeout_s))
+            return {"outcome": "hung_on_root", "volume_root": "/Volumes/Example",
+                    "started_epoch": 1.0, "waited_s": timeout_s}
+        probes = [{"ok": False, "reason": "timeout after 10s"}] * 2 + [
+            {"ok": True, "device_id": "7", "latency_ms": 8.1, "path": "/Volumes/Example/VMs"}]
+        with mock.patch.dict(os.environ, dict(env, TARTCI_HOME=str(state_home),
+                                              TARTCI_TCC_CONTEXT_PROBE="/usr/bin/true")), \
+                mock.patch.object(watchdog, "resolve_tart_home",
+                                  return_value=("/Volumes/Example/VMs", "test")), \
+                mock.patch.object(watchdog.store_health, "probe", side_effect=probes), \
+                mock.patch.object(tcc_wedge, "WRAPPER", str(wrapper)), \
+                mock.patch.object(tcc_wedge, "launchd_probe", fake_launchd_probe), \
+                mock.patch.object(tcc_wedge, "scan_ipc",
+                                  lambda start, end: {"state": "absent", "unanswered": 0}), \
+                mock.patch.object(tcc_wedge, "scan_log",
+                                  lambda window_s, before=None: {
+                                      "ok": True, "window_s": window_s, "total": 0,
+                                      "by_signature": {"removable_volumes_auth_failed": 0}}), \
+                mock.patch.object(tcc_wedge, "control_probe",
+                                  lambda path, timeout_s: {"ok": True, "path": path}), \
+                mock.patch.object(tcc_wedge, "wrapper_insecurity", lambda path: ""), \
+                mock.patch.object(tcc_wedge, "run_privileged_bounded",
+                                  lambda argv, timeout: (heal_calls.append(argv), 0, "")[1:]):
+            results = [watchdog.store_health_pass(
+                participation_file=str(Path(td) / "participation"), status_only=False,
+                dry_run=False, failure_threshold=2) for _ in range(2)]
+        return results, heal_calls, launchd_calls, state_home
+
+    def test_the_watchdog_runs_the_fresh_launchd_probe_against_the_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            (first, second), heal_calls, launchd_calls, state_home = self.launchd_passes(td, {})
+        self.assertEqual(first["probe_context"], "launchd watchdog (launchd job)")
+        self.assertEqual(launchd_calls, [("/Volumes/Example/VMs",
+                                          str(state_home / "state"), 10.0)])
+        self.assertEqual(second["classification"]["kind"], "tcc_attribution_wedge")
+        self.assertEqual(second["classification"]["path"], "launchd_root_hang")
+        self.assertEqual(len(heal_calls), 1)
+        self.assertEqual(second["state"], "healthy")
+
+    def test_the_launchd_probe_switch_leaves_a_silent_hang_unclassified(self) -> None:
+        # Negative control: identical readings without the launchd probe.
+        with tempfile.TemporaryDirectory() as td:
+            (_, second), heal_calls, launchd_calls, _ = self.launchd_passes(
+                td, {"TARTCI_TCC_LAUNCHD_PROBE": "0"})
+        self.assertEqual(launchd_calls, [])
+        self.assertEqual(heal_calls, [])
+        self.assertEqual(second["classification"]["kind"], "stalled_unclassified")
+
     def test_the_second_wedge_within_the_interval_is_rate_limited(self) -> None:
         import tcc_wedge
         with tempfile.TemporaryDirectory() as td:
