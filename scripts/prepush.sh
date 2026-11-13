@@ -19,6 +19,8 @@
 #                   test, the public-path lint test, and only the unit-test
 #                   modules that changed against origin/main plus those that
 #                   import a changed module (scripts/prepush_select.py)
+#   lint            those changed modules again under a Python 3.11+ found by
+#                   scripts/prepush_unittest.py (a loud SKIP when none exists)
 #
 # --full adds what the fast mode skips: the whole unit-test suite under 3.9, the
 # whole suite and tests/test_*.sh under the default python3 (concurrently).
@@ -111,8 +113,9 @@ print("all test modules import under Python %d.%d" % sys.version_info[:2])
 }
 
 # Run the fast unit-test selection under the CI-like 3.9 (3.9 first on PATH),
-# then the changed modules once more under the default python3 when that is a
-# different interpreter, so tests that need tomllib are not skipped everywhere.
+# then the changed modules once more under a Python 3.11+ (tomllib), so tests
+# that need tomllib are not skipped everywhere. With no 3.11+ installed, that
+# second run is reported as a SKIP, never passed silently.
 fast_unit_tests() {
   local selected m
   selected="$(python3 scripts/prepush_select.py "$BASE")" || {
@@ -133,11 +136,21 @@ SELECTED_END
     seen="$seen$m "; uniq+=("$m")
   done
   echo "unit-test modules: ${uniq[*]}"  # bash32-lint: nonempty one per fixed module
-  mkdir -p "$logdir/bin39" && ln -sf "$PY39" "$logdir/bin39/python3"
-  PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" -m unittest "${uniq[@]}"  # bash32-lint: nonempty one per fixed module
-  if [ "${#chosen[@]}" -gt 0 ] && [ "$(python3 -c 'import sys; print(sys.version_info[:2])')" != "(3, 9)" ]; then
-    echo "changed modules again under the default python3 (tomllib-gated tests run here)"
-    PYTHONPATH=scripts python3 -m unittest "${chosen[@]}"  # bash32-lint: nonempty guarded by the -gt 0 test
+  { mkdir -p "$logdir/bin39" && ln -sf "$PY39" "$logdir/bin39/python3"; } || return 1
+  # prepush_unittest.py loads each module the way CI's discover does, so a module
+  # that skips itself without tomllib reports a skip instead of crashing the run.
+  # `stage` calls this inside `if`, where set -e is off: every failure must
+  # return explicitly, or a red 3.9 run is masked by a green run after it.
+  PATH="$logdir/bin39:$PATH" PYTHONPATH=scripts "$PY39" scripts/prepush_unittest.py run "${uniq[@]}" || return 1  # bash32-lint: nonempty one per fixed module
+  [ "${#chosen[@]}" -gt 0 ] || return 0
+  # The tomllib-gated tests skipped above run again under a Python 3.11+, found
+  # even when the default python3 is the hosts' 3.9.
+  local tomllib_py
+  if tomllib_py="$(python3 scripts/prepush_unittest.py pick-tomllib-python)"; then
+    echo "changed modules again under $tomllib_py (tomllib-gated tests run here)"
+    PYTHONPATH=scripts "$tomllib_py" scripts/prepush_unittest.py run "${chosen[@]}" || return 1  # bash32-lint: nonempty guarded by the -gt 0 test
+  else
+    printf '\033[33mSKIP: no Python 3.11+ with tomllib found (set TARTCI_PREPUSH_TOMLLIB_PY); the tomllib-gated tests in %s did not run locally. CI runs them.\033[0m\n' "${chosen[*]}" >&2  # bash32-lint: nonempty guarded by the -gt 0 test
   fi
 }
 
