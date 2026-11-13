@@ -50,9 +50,16 @@ FAKE_GH = textwrap.dedent(
 FAKE_SSH = textwrap.dedent(
     """\
     #!/usr/bin/env python3
-    import json, os, sys
+    import json, os, sys, time
     fixture = json.load(open(os.environ["FAKE_SSH_FIXTURE"]))
     entry = fixture.get(sys.argv[-2], {"rc": 255, "stderr": "ssh: connect: Connection refused"})
+    if "store-health.json" in sys.argv[-1] and entry.get("rc", 0) == 0:
+        # The watchdog's store reading: healthy and just written unless the
+        # fixture names one ("store": null is a missing file).
+        now = int(time.time())
+        store = entry.get("store", {"state": "healthy", "updated_at": now - 60})
+        sys.stdout.write(f"{now}\\n" + (json.dumps(store) if store else ""))
+        sys.exit(entry.get("store_rc", 0))
     if "status" in entry:
         json.dump(entry["status"], sys.stdout)
     sys.stderr.write(entry.get("stderr", ""))
@@ -502,6 +509,10 @@ class PeerSshDestinationTests(unittest.TestCase):
             ssh = root / "ssh"
             ssh.write_text("#!/bin/bash\n"
                            f"printf '%s\\n' \"$*\" >> {str(calls)!r}\n"
+                           'case "${@: -1}" in *store-health.json*) '
+                           'now=$(date +%s); echo $now; '
+                           'echo "{\\"state\\": \\"healthy\\", \\"updated_at\\": $now}"; '
+                           'exit 0;; esac\n'
                            f"echo {json.dumps(json.dumps(live_status()))}\n",
                            encoding="utf-8")
             ssh.chmod(0o755)
@@ -517,8 +528,9 @@ class PeerSshDestinationTests(unittest.TestCase):
         self.assertFalse(any("ProxyCommand" in line for line in argv), argv)
         # Positive: the plain alias is read, with "--" before it.
         self.assertTrue(evidence["m1"].counted, evidence["m1"].why)
-        self.assertEqual(1, len(argv), argv)
+        self.assertEqual(2, len(argv), argv)
         self.assertIn("-- ssh-m1 " + capacity_floor.PEER_STATUS_COMMAND, argv[0])
+        self.assertIn("-- ssh-m1 " + capacity_floor.PEER_STORE_HEALTH_COMMAND, argv[1])
 
 
 class CliTests(unittest.TestCase):
@@ -592,6 +604,40 @@ class CliTests(unittest.TestCase):
         self.assertEqual(payload["findings"][0]["remaining"], ["m5 (mints on demand)"])
         verdicts = {peer["host"]: peer["counted"] for peer in payload["findings"][0]["peers"]}
         self.assertEqual(verdicts, {"m1": False, "m5": True})
+
+    @testing_support.requires_tomllib
+    def test_a_live_peer_whose_store_cannot_admit_is_not_counted(self) -> None:
+        # m5's drain on 2026-11-13: studio's pool read on and fleet-ready while
+        # its watchdog read the Tart store as draining (a TCC wedge), and the
+        # floor counted it as minting on demand. No VM could start there.
+        wedged = {"state": "draining", "consecutive_failures": 4, "updated_at": 0,
+                  "last_result": {"reason": "timeout after 10s"},
+                  "classification": {"kind": "tcc_attribution_wedge"}}
+        cases = {"draining": ({"store": wedged}, "store health is draining"),
+                 "wedged": ({"store": wedged}, "tcc_attribution_wedge"),
+                 "no state file": ({"store": None}, "no Tart store health reading"),
+                 "unreadable": ({"store_rc": 1}, "Tart store health unreadable")}
+        for name, (store, fragment) in cases.items():
+            with self.subTest(name):
+                proc = self.run_guard({}, supply=published("m5"),
+                                      peers={"ssh-m5": {"status": live_status(), **store}})
+                self.assertEqual(proc.returncode, capacity_floor.EXIT_LAST_SERVING_HOST,
+                                 proc.stderr)
+                payload = json.loads(proc.stdout)
+                self.assertFalse(payload["allowed"])
+                peer = payload["findings"][0]["peers"][0]
+                self.assertFalse(peer["counted"])
+                self.assertIn(fragment, peer["why"])
+
+    @testing_support.requires_tomllib
+    def test_a_live_peer_with_a_healthy_store_is_counted(self) -> None:
+        # The control: the same peer and pool status, its store healthy.
+        proc = self.run_guard({}, supply=published("m5"),
+                              peers={"ssh-m5": {"status": live_status()}})
+        self.assertEqual(proc.returncode, capacity_floor.EXIT_OK, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertTrue(payload["findings"][0]["peers"][0]["counted"])
+        self.assertIn("Tart store healthy", payload["findings"][0]["peers"][0]["why"])
 
     @testing_support.requires_tomllib
     def test_idle_fleet_whose_declaring_peers_are_unproven_exits_three(self) -> None:

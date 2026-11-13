@@ -23,6 +23,7 @@ identical to the full-shell key:
 | `self-update-marker` | `fleet_self_update._PEER_MARKER` (imported, same bytes) |
 | `fleet-source-verified` | the canary read in `fleet_self_update.read_canary_verified` |
 | `job-claim-status` | `cd ~ && ~/.local/bin/tartci job-claim status --publish` (`job_claim.gather_peers`) |
+| `store-health` | `capacity_floor.PEER_STORE_HEALTH_COMMAND`: the peer's clock and its watchdog's `store-health.json` (`capacity_floor`, `fleet_self_update` coverage check) |
 
 Anything else — an empty command, a shell, an allowed string with one byte
 added or removed — exits **77** and writes one audit line (client address,
