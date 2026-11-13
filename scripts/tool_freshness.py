@@ -17,6 +17,10 @@ launchd watchdog, and optionally applies the update itself:
             and `auto_apply`, a behind tool is updated once its newest
             release is `apply_after_minutes` old, at most once per target per
             `apply_retry_hours`, and the result is re-read and verified.
+            Only the canary host applies first; the others wait for its
+            verified, healthy deploy, and a host running the merge steward
+            rolls a Shipyard swap back when the next tick fails its
+            invariants (tool_freshness_canary.py).
             A tool with `release_assets` (Shipyard or pulp) is first checked for readiness:
             every asset listed on the GitHub release and HEAD 200. A release
             that is not ready, or an apply that exits NOT_READY_EXIT (75: a
@@ -99,6 +103,8 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Callable
 
+import tool_freshness_canary as canary
+
 try:
     import tomllib
 except ModuleNotFoundError:  # pragma: no cover - the launchd python is 3.9
@@ -134,6 +140,10 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # A draft's assets answer 404 to an anonymous HEAD, so it reads "not
         # ready yet" until it is published. The fleet is macOS arm64.
         "release_assets": ["shipyard-macos-arm64.dmg", "checksums.sha256"],
+        # Other hosts wait for the canary (tool_freshness_canary.py), and a
+        # host that runs the merge steward judges the swap by its next tick.
+        "canary_gate": True,
+        "steward_check": True,
     },
     "pulp": {
         "repo": "Generous-Corp/pulp",
@@ -153,6 +163,7 @@ DEFAULT_TOOLS: dict[str, dict[str, Any]] = {
         # only when the release archive is not downloadable and only when its
         # sha256 matches the release's own SHA256SUMS.
         "local_archive_dir": None,
+        "canary_gate": True,
     },
     "tart": {
         "repo": "openai/tart",
@@ -294,11 +305,12 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         with path.open("rb") as handle:
             data = tomllib.load(handle)
         for key in ("stale_hours", "apply_after_minutes", "apply_retry_hours",
-                    "not_ready_alert_hours", "hold_max_hours"):
+                    "not_ready_alert_hours", "hold_max_hours", "canary_soak_hours"):
             if key in data:
                 settings[key] = float(data[key])
-        if isinstance(data.get("host_class"), str):
-            settings["host_class"] = data["host_class"]
+        for key in ("host_class", "canary_host", "canary_ssh"):
+            if isinstance(data.get(key), str):
+                settings[key] = data[key]
         for name, override in (data.get("tools") or {}).items():
             settings["tools"].setdefault(name, {"enabled": True, "apply_command": None,
                                                 "auto_apply": False})
@@ -633,6 +645,15 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
     return row
 
 
+def soaked_candidates(row: dict, now: float, soak_minutes: float) -> list[dict]:
+    """Every release this host could move to that has soaked, oldest first."""
+    candidates = row.get("candidates") or [{"version": row.get("latest"),
+                                            "tag": row.get("latest_tag"),
+                                            "published_at": row.get("latest_published_at")}]
+    return [c for c in candidates
+            if now - (_epoch(c.get("published_at")) or now) >= soak_minutes * 60]
+
+
 def soaked_candidate(row: dict, now: float, soak_minutes: float) -> tuple[dict | None, str]:
     """(newest release that has soaked, why none has).
 
@@ -642,13 +663,10 @@ def soaked_candidate(row: dict, now: float, soak_minutes: float) -> tuple[dict |
     minutes old). Applying the newest SOAKED release moves the host forward,
     and the next pass takes the newer one once it has soaked too.
     """
-    candidates = row.get("candidates") or [{"version": row.get("latest"),
-                                            "tag": row.get("latest_tag"),
-                                            "published_at": row.get("latest_published_at")}]
-    soaked = [c for c in candidates
-              if now - (_epoch(c.get("published_at")) or now) >= soak_minutes * 60]
+    soaked = soaked_candidates(row, now, soak_minutes)
     if soaked:
         return soaked[-1], ""
+    candidates = row.get("candidates") or [{"tag": row.get("latest_tag")}]
     return None, f"waiting: {candidates[0]['tag']} is younger than {soak_minutes:g} min"
 
 
@@ -773,13 +791,16 @@ def _wait_not_ready(name: str, tag: str, detail: str, row: dict, now: float, sta
 def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state: Path,
                 settings: dict, attempts: dict,
                 run: Callable[[list[str], float], tuple[int, str]],
-                pending: dict | None = None, probe: dict | None = None) -> dict | None:
+                pending: dict | None = None, probe: dict | None = None,
+                gate: dict | None = None) -> dict | None:
     """Apply a behind tool's update when allowed; return the re-measured version.
 
     `pending` holds releases that are not ready yet (never attempts); `probe`
-    replaces the release check in tests ({"platform", "result"}).
+    replaces the release check in tests ({"platform", "result"}); `gate` is the
+    pass's canary-gate context (the canary read once, the notes to log).
     """
     pending = {} if pending is None else pending
+    gate = {"notes": []} if gate is None else gate
     if not tool.get("apply_command"):
         return None
     # Resolved on every pass, behind or not: a malformed hold is a problem even
@@ -800,8 +821,19 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     if candidate is None:
         row["apply"] = waiting
         return None
+    if tool.get("canary_gate"):
+        soaked = soaked_candidates(row, now, float(settings["apply_after_minutes"]))
+        candidate, note = canary.gate_candidate(name, soaked, home, now, settings, state, run, gate)
+        if candidate is None:
+            row["apply"] = row["canary_wait"] = note
+            gate.setdefault("notes", []).append(f"{name}: {note}")
+            return None
+        row["canary"] = note
     tag, target_version = str(candidate["tag"]), candidate["version"]
     last = attempts.get(name) or {}
+    if last.get("target") == tag and last.get("rejected"):
+        row["apply"] = f"not retrying {tag} here: {last.get('result')}"
+        return None
     if last.get("target") == tag and not _not_ready_before_install(last) and \
             now - (_epoch(last.get("at")) or 0) < float(settings["apply_retry_hours"]) * 3600:
         row["apply"] = f"already attempted {tag} at {last.get('at')}: {last.get('result')}"
@@ -823,12 +855,7 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
         row["apply"] = ("refused: no host class (set host_class in tool-freshness.toml "
                         "or install a fleet profile)")
         return None
-    argv = _expand(tool["apply_command"], home, tag, klass, platform, local or "")
-    rc, out = run(argv, APPLY_TIMEOUT_S)  # type: ignore[arg-type]
-    verdict = None
-    if tool.get("verdict_json"):
-        summaries = [doc for doc in json_documents(out) if doc.get("event") == "fleet_summary"]
-        verdict = summaries[-1].get("verdict") if summaries else "no fleet_summary"
+    rc, out, verdict = _run_apply(tool, home, tag, klass, platform, local or "", run)
     if rc == NOT_READY_EXIT:
         # A download failed before anything was installed (a 404 or a network
         # error): not ready yet, never a spent attempt.
@@ -852,6 +879,32 @@ def maybe_apply(name: str, tool: dict, row: dict, home: Path, now: float, state:
     return {"installed": _vstr(after["installed"])}
 
 
+def _run_apply(tool: dict, home: Path, tag: str, klass: str, platform: str, local: str,
+               run: Callable[[list[str], float], tuple[int, str]]) -> tuple[int, str, Any]:
+    """Run the tool's apply command for `tag`: (exit, output, fleet_summary verdict)."""
+    argv = _expand(tool["apply_command"], home, tag, klass, platform, local)
+    rc, out = run(argv, APPLY_TIMEOUT_S)  # type: ignore[arg-type]
+    verdict = None
+    if tool.get("verdict_json"):
+        summaries = [doc for doc in json_documents(out) if doc.get("event") == "fleet_summary"]
+        verdict = summaries[-1].get("verdict") if summaries else "no fleet_summary"
+    return rc, out, verdict
+
+
+def _rollback(tool: dict, home: Path, settings: dict, tag: str,
+              run: Callable[[list[str], float], tuple[int, str]]) -> tuple[bool, str]:
+    """Move the tool back to `tag` with its governed apply; (landed, detail)."""
+    klass = host_class(home, settings) or ""
+    if "{host_class}" in " ".join(tool["apply_command"]) and not klass:
+        return False, "refused: no host class"
+    rc, out, verdict = _run_apply(tool, home, tag, klass, host_platform(), "", run)
+    after = read_versions(tool, home, run)
+    effective = min(v for v in (after["installed"], after["generation"] or after["installed"]) if v) \
+        if after["installed"] else None
+    landed = rc == 0 and _vstr(effective) == tag.lstrip("v") and verdict in (None, "verified")
+    return landed, f"exit {rc}, verdict {verdict}, installed {_vstr(effective)}: {out[-200:]}"
+
+
 def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
             settings: dict | None = None,
             run: Callable[[list[str], float], tuple[int, str]] = run_command,
@@ -869,6 +922,8 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     previous = cached.get("tools") or {}
     attempts = _read_json(state / "attempts.json") or {}
     pending = _read_json(state / "pending.json") or {}
+    steward = _read_json(state / "steward.json") or {}
+    gate: dict[str, Any] = {"notes": []}
     tools: dict[str, dict] = {}
     for name, tool in settings["tools"].items():
         if not tool.get("enabled", True):
@@ -881,29 +936,56 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
         row = measure(name, tool, home, now, prior, run, feed, float(settings["stale_hours"]),
                       publication_filter)
         before = {key: prior.get(key) for key in ("installed", "generation")} if prior else {}
-        applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run,
-                              pending, probe(name, str(row.get("latest_tag"))) if probe else None)
-        if applied and applied.get("installed"):
+        before_effective = (prior or {}).get("effective")
+        by = "observed"
+        rolled_back = tool.get("steward_check") and tool.get("apply_command") and \
+            canary.steward_pass(name, tool, row, home, now, settings, steward, attempts,
+                                lambda event: _append_event(state, event),
+                                lambda tag: _rollback(tool, home, settings, tag, run))
+        if rolled_back:
+            applied = None
             before = {key: row.get(key) for key in ("installed", "generation")}
-            note = row.get("apply")
+            problem = row.get("steward_problem")
             row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
                           publication_filter)
-            row["apply"] = note
+            row.update(steward_problem=problem, apply=f"rolled back: {problem}")
+            by = "steward_rollback"
+        else:
+            applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run,
+                                  pending, probe(name, str(row.get("latest_tag"))) if probe
+                                  else None, gate)
+        if applied and applied.get("installed"):
+            by = "auto_apply"
+            before = {key: row.get(key) for key in ("installed", "generation")}
+            before_effective = row.get("effective")
+            notes = {key: row[key] for key in ("apply", "canary") if key in row}
+            row = measure(name, tool, home, now, None, run, feed, float(settings["stale_hours"]),
+                          publication_filter)
+            row.update(notes)
         for key, component in (("installed", "cli"), ("generation", "auth_generation")):
             old, new = before.get(key), row.get(key)
             if old and new and old != new:
-                _append_event(state, {
+                downgrade = _version(new) < _version(old)  # type: ignore[operator]
+                event = {
                     "event": "tool_deployed", "tool": name, "component": component,
                     "at": _iso(now), "from": old, "to": new, "latest": row.get("latest"),
-                    "by": "auto_apply" if applied else "observed",
-                    "downgrade": _version(new) < _version(old),  # type: ignore[operator]
+                    "by": by, "downgrade": downgrade,
                     "verify": "current" if row.get("state") == "current"
-                    else str(row.get("state"))})
+                    else str(row.get("state"))}
+                if (component == "cli" and not downgrade and tool.get("steward_check")
+                        and canary.runs_steward(home, tool, now)):
+                    # Readers (the other hosts' canary gate) then wait for a
+                    # clean tick on this release, not for the fixed soak.
+                    event["steward_host"] = True
+                    canary.record_deploy(steward, name, new, before_effective or old, by, now)
+                _append_event(state, event)
         tools[name] = row
     value = {"measured_at": _iso(now), "stale_hours": settings["stale_hours"], "tools": tools}
     _write_json(state / "state.json", value)
     _write_json(state / "attempts.json", attempts)
     _write_json(state / "pending.json", pending)
+    _write_json(state / "steward.json", steward)
+    canary.log_gate(state, now, gate["notes"])
     return value
 
 
@@ -943,7 +1025,9 @@ def summary(home: Path | None = None) -> dict:
     problems = [f"tool freshness {aged}"] if aged else []
     problems += [f"{row['tool']} {row['behind_hours']:g} h behind {row['latest_tag']}"
                  + (f" ({row['held']})" if row.get("held") else "")
+                 + (f" ({row['canary_wait']})" if row.get("canary_wait") else "")
                  for row in rows if row.get("stale")]
+    problems += [row["steward_problem"] for row in rows if row.get("steward_problem")]
     problems += [f"{row['tool']} freshness unknown" for row in rows
                  if row.get("state") == "unknown"]
     problems += [row["release_incomplete"] for row in rows if row.get("release_incomplete")]

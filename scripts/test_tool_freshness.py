@@ -117,6 +117,9 @@ def make_generation(home: Path) -> Path:
 def settings(**overrides) -> dict:
     value = {"stale_hours": 12.0, "apply_after_minutes": 30.0, "apply_retry_hours": 6.0,
              "host_class": "studio",
+             # This fake host is the canary unless a test says otherwise, so
+             # the apply tests below exercise the apply itself.
+             "canary_host": "studio",
              "tools": {name: dict(tool, enabled=True) for name, tool in tf.DEFAULT_TOOLS.items()}}
     value.update(overrides)
     return value
@@ -420,6 +423,12 @@ class ToolFreshnessTests(unittest.TestCase):
         host.apply_installs["shipyard"] = "0.221.1"
         no_class = settings()
         del no_class["host_class"]
+        # With the canary gate on, a host that cannot name itself is never the
+        # canary: it waits (fail closed) and never applies.
+        row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
+        self.assertIn("waiting for canary studio (this host's id is unknown)", row["apply"])
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        no_class["tools"]["shipyard"]["canary_gate"] = False
         row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
         self.assertIn("refused: no host class", row["apply"])
         self.assertFalse(any("fleet-update" in call for call in host.calls))
@@ -565,7 +574,7 @@ class ToolFreshnessTests(unittest.TestCase):
         path.write_text(body)
         os.utime(path, (written, written))
         value = tf.load_settings(self.home, path)
-        value["host_class"] = "studio"
+        value["host_class"] = value["canary_host"] = "studio"
         return value
 
     HOLD = "[tools.shipyard]\n# held: canary failed\nauto_apply = false\n"

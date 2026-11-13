@@ -3001,7 +3001,8 @@ arrive, and a host that did not get it is loud:
   skew read "1 commits behind main" for two days while the watchdog's pass
   never ran.
 - **Automatic apply.** Shipyard updates itself from here by default: once its
-  newest release is 30 minutes old, `shipyard runner fleet-update --to <tag>
+  newest release is 30 minutes old (on the canary host; the others wait for
+  it, below), `shipyard runner fleet-update --to <tag>
   --host-class <this host> --apply --json`, the governed rollout that stages
   CLI, daemon, ghapp, token helper and close guard as one content-addressed
   generation, probes it, swaps atomically and rolls back on failure. Success
@@ -3041,6 +3042,56 @@ arrive, and a host that did not get it is loud:
   off and kept m1, m3 and m5s off every Shipyard release for 16 days, with the
   doctor reporting only "behind".
 
+- **One host goes first (canary gate).** Both automatic applies are gated by
+  one canary host, `canary_host` in `tool-freshness.toml` (default `m5`, the
+  least loaded build host). The canary applies a release at 30 minutes, as
+  above. Every other host applies it only once the canary's `events.jsonl`
+  shows a `tool_deployed` for the tool's CLI with `to` equal to the release and
+  `verify` current or behind, nothing after it that failed it
+  (`tool_apply_failed` for it, `tool_rolled_back` or `tool_steward_failed` for
+  it, or a downgrade away from it), and a health signal: when the canary runs
+  the merge steward (its deploy event carries `steward_host: true`), a
+  `tool_steward_verified` for the release; otherwise `canary_soak_hours` (2)
+  on the canary's clock since the deploy. Of the soaked releases a host
+  applies the newest one the canary cleared. The others read the canary over
+  fleet ssh (`ssh -n -o BatchMode=yes <target> tail events.jsonl`, once per
+  pass); the target is `canary_ssh`, else the canary's published host row in
+  `fleet/advertised-labels.json`, else `tartci-<host_id>`. It fails closed: an
+  unreadable canary, an unsafe target, or a host that cannot name itself
+  (no fleet profile `host.id` and no `host_class`) waits and never applies.
+  The wait reads `waiting for canary m5: ...` on the tool's line, is appended
+  to the stale problem once the tool goes STALE, and every waiting pass writes
+  exactly one line to `~/.tartci/state/tool-freshness/canary-gate.log`. There
+  is no urgent-release bypass (no such marker exists on Shipyard or pulp
+  releases); to move a host now, run its `shipyard runner fleet-update` by
+  hand. A canary that is held, retired or down stalls the fleet's automatic
+  applies until `canary_host` is changed, and says so on every host.
+
+      canary_host = "m5"       # every host must agree; change it in all files
+      # canary_ssh = "m5-lan"  # optional SSH target override
+      # canary_soak_hours = 2
+
+- **The steward judges each Shipyard swap where it runs.** On a host whose
+  `~/Library/Logs/shipyard-steward-tick/summary.log` has a tick line from the
+  last hour, a Shipyard deploy is recorded in
+  `~/.tartci/state/tool-freshness/steward.json`. Each later watchdog pass reads
+  the summary log's ticks that started after the deploy and ran the new release
+  (`ver=`); the steward ticks every 5 minutes, so the check lands within one
+  watchdog interval of the swap. The first such tick with every `invariants=`
+  token ok writes `tool_steward_verified`. The first one with a failing
+  invariant that was not already failing on the last tick before the deploy
+  fails it: an automatic apply is rolled back with `shipyard runner
+  fleet-update --to <previous release>` (the same governed swap), recorded as
+  `tool_apply_failed` (verdict `steward_invariants`) and `tool_rolled_back`,
+  and that release is never retried on the host (`attempts.json` marks it
+  rejected). A rollback that does not land is retried on the next two passes,
+  then left as a `roll back by hand` problem. A failure on a version
+  installed by hand is recorded as `tool_steward_failed` and not rolled back.
+  No judging tick after an hour is a problem (`is the steward tick running?`),
+  never a rollback. An invariant already failing before the swap therefore
+  neither rolls back nor verifies; on a steward canary it keeps the other
+  hosts waiting until a clean tick.
+
 - **A fleet host must carry its maintenance agents.** `tartci doctor fleet`
   reports `host_agents_missing` (a problem) when a host with an installed
   fleet profile has no loaded `com.danielraffel.tartci.launchd-watchdog` or
@@ -3055,8 +3106,12 @@ arrive, and a host that did not get it is loud:
   current; a host with no generation link measures the CLI alone.
 - **Deploy log.** `~/.tartci/state/tool-freshness/events.jsonl` gets one
   `tool_deployed` event (tool, `component` cli or auth_generation, from, to,
-  `by` auto_apply or observed, verify) whenever an installed version changes, whoever changed it, and a
-  `tool_apply_failed` event when an automatic apply does not land.
+  `by` auto_apply, observed or steward_rollback, verify, and `steward_host`
+  when a steward host recorded a check for it) whenever an installed version
+  changes, whoever changed it, and a `tool_apply_failed` event when an
+  automatic apply does not land or the steward fails it. The steward check
+  adds `tool_steward_verified`, `tool_steward_failed` and `tool_rolled_back`.
+  This file is what the canary gate reads.
 - **A pulp release is installed only when it is complete, and waited for
   patiently until then.** The pulp repository's Atom feed lists a tag the
   moment auto-release pushes it, about an hour before the release build uploads
