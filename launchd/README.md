@@ -644,6 +644,28 @@ this, m1, m5 and m5studio carried `--stale-log-seconds 4500` only in
 hand-edited plists, so any re-render from this file restored the 1800 default
 and the heals that #191 diagnosed (#195).
 
+The same table carries the host's TCC context probe, which the silent-wedge
+classifier in `scripts/tcc_wedge.py` needs before it may run the root heal:
+
+```toml
+[launchd_watchdog]
+tcc_context_probe = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5",
+                     "localhost", "/usr/bin/python3 -c '...os.open(...)' /Volumes/Example/VMs"]
+```
+
+It renders as `TARTCI_TCC_CONTEXT_PROBE` (the argv joined with shell quoting,
+which `tcc_wedge` splits back to the same list). The validator refuses a value
+that is not an argv list of non-empty strings, whose program is not an absolute
+path, or none of whose words (shell-split, so the remote command of an `ssh`
+counts) names `host.tart_home` or a path below it: the reading must open the
+store itself, because a probe that only reaches the host, or that cannot fail,
+would approve a root heal for a slow or broken volume. Absent, nothing renders
+and the classifier records the reading as not configured. Validate a new value
+from both contexts before declaring it: a plain shell, and a `launchctl submit`
+job (removed afterwards), which is the context the watchdog runs in. A
+launchd job opening the store directly is refused by TCC, so a probe that
+answers there proves it reached the granted context.
+
 After self-update verifies the lanes it runs `tartci fleet-macos support-agents
 auto`. With `bootstrap = false` that is a plan: it compares each declared
 agent's installed plist with its render (`match_bytes`, `match_plist` for key

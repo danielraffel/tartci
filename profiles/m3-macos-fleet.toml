@@ -316,6 +316,12 @@ runner_group_id = 8
 # only on hand-edited plists until it moved here (#195).
 [launchd_watchdog]
 stale_log_seconds = 4500
+# Opens the Tart store from a context that holds TCC access: sshd has Full
+# Disk Access, so this answers while a tccd wedge blocks every launchd job's
+# open of the volume. It is the reading that lets the watchdog run the root
+# heal for a wedge that logs nothing (scripts/tcc_wedge.py, docs/runbook.md).
+# Same open as the store probe: O_RDONLY|O_DIRECTORY on the store itself.
+tcc_context_probe = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost", "/usr/bin/python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY))' /Volumes/Workshop/VMs"]
 
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]

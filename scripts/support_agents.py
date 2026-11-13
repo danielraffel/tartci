@@ -63,6 +63,7 @@ import hashlib
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import time
@@ -101,18 +102,73 @@ def _tart_home(profile: Dict[str, Any]) -> Dict[str, str]:
     return {"TART_HOME": tart_home} if isinstance(tart_home, str) and tart_home else {}
 
 
-def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
-    """The frozen-lane threshold from `[launchd_watchdog] stale_log_seconds`.
+WATCHDOG_KEYS = {"stale_log_seconds", "tcc_context_probe"}
+CONTEXT_PROBE_ENV = "TARTCI_TCC_CONTEXT_PROBE"
 
-    It used to live only on hand-edited plists (m1, m5 and m5studio carried
-    `--stale-log-seconds 4500`; the template rendered the 1800 default), so a
-    re-render brought back the kills it was set to stop. Absent, the watchdog
-    keeps its own default.
+
+def context_probe_problem(value: Any, tart_home: Any) -> Optional[str]:
+    """Why `[launchd_watchdog] tcc_context_probe` is unusable; None when fine.
+
+    The probe is the reading that lets the watchdog run the root TCC heal
+    (scripts/tcc_wedge.py), so a value that cannot fail must not install: it
+    is an argv list whose program is an absolute path, and one of its words
+    (shell-split, so the remote command of an `ssh localhost "..."` counts)
+    must be this host's Tart store or a path below it. A probe that only
+    reaches the host, or names another path, would answer through a wedge
+    that blocks the store and approve a heal it cannot justify.
+    """
+    if (not isinstance(value, list) or len(value) < 2
+            or not all(isinstance(word, str) and word.strip() for word in value)):
+        return "launchd_watchdog.tcc_context_probe must be a list of two or more non-empty strings"
+    if any(ch in word for word in value for ch in ("\x00", "\n", "\r")):
+        return "launchd_watchdog.tcc_context_probe must not contain NUL or line breaks"
+    if not value[0].startswith("/"):
+        return "launchd_watchdog.tcc_context_probe must start with an absolute program path"
+    if not isinstance(tart_home, str) or not tart_home.startswith("/"):
+        return "launchd_watchdog.tcc_context_probe needs host.tart_home to name the store it probes"
+    store = tart_home.rstrip("/")
+    words: List[str] = []
+    for word in value:
+        try:
+            words.extend(shlex.split(word))
+        except ValueError:
+            return "launchd_watchdog.tcc_context_probe has an unbalanced quote"
+    if not any(w.rstrip("/") == store or w.startswith(store + "/") for w in words):
+        return (f"launchd_watchdog.tcc_context_probe must open the store itself: "
+                f"no word names host.tart_home ({tart_home})")
+    return None
+
+
+def _context_probe_env(profile: Dict[str, Any], table: Dict[str, Any]) -> Dict[str, str]:
+    """TARTCI_TCC_CONTEXT_PROBE, which tcc_wedge shell-splits back to this argv.
+
+    Rendered only from a value the validator accepts, so a malformed key in a
+    profile that skipped validation renders nothing (the heal stays off)
+    rather than a probe that cannot fail.
+    """
+    value = table.get("tcc_context_probe")
+    host = profile.get("host") if isinstance(profile.get("host"), dict) else {}
+    if value is None or context_probe_problem(value, host.get("tart_home")) is not None:
+        return {}
+    return {CONTEXT_PROBE_ENV: shlex.join(value)}
+
+
+def _watchdog_env(profile: Dict[str, Any]) -> Dict[str, str]:
+    """The watchdog's per-host settings from the profile's `[launchd_watchdog]`.
+
+    `stale_log_seconds` is the frozen-lane threshold. It used to live only on
+    hand-edited plists (m1, m5 and m5studio carried `--stale-log-seconds
+    4500`; the template rendered the 1800 default), so a re-render brought back
+    the kills it was set to stop. Absent, the watchdog keeps its own default.
+
+    `tcc_context_probe` is the command that opens the store from a context
+    holding TCC access; without it the silent-wedge classifier never fires.
     """
     table = profile.get("launchd_watchdog") if isinstance(profile.get("launchd_watchdog"), dict) else {}
     stale = table.get("stale_log_seconds")
     environment = ({"TARTCI_WATCHDOG_STALE_LOG_SECONDS": str(stale)}
                    if type(stale) is int else {})
+    environment.update(_context_probe_env(profile, table))
     configured_root = os.environ.get("TARTCI_FLEET_SOURCE_ROOT", "").strip()
     if configured_root:
         source = fleet_source.resolve(ROOT)
