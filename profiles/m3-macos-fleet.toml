@@ -276,6 +276,13 @@ golden = "pulp-build-runner:latest"
 # Vellum is advisory to Pulp's required gate: vm=60, while Pulp
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"
+# 8, not the role's 14: a non-gate lane is clamped to the 12-core non-gate
+# budget, so a 12-core Vellum lease fit only while no agent build held a single
+# non-gate core. On 2026-11-13 one 4-core governed build held the lane at
+# "cores=12 budget=12 used=4" with a Vellum job queued, until the two Pulp gate
+# VMs took both guest slots. 8 + a 4-core build fits the budget. Rollback:
+# delete this line and re-render.
+vm_cores = 8
 supervisors = 1
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
