@@ -636,12 +636,20 @@ def load(path: Path) -> dict:
     if watchdog is not None:
         # The watchdog's frozen-lane threshold, rendered into its plist by the
         # support-agents step; it lived only on hand-edited plists (#195).
-        if not isinstance(watchdog, dict) or set(watchdog) - {"stale_log_seconds"}:
-            fail("launchd_watchdog must be a table with only stale_log_seconds")
+        if not isinstance(watchdog, dict) or set(watchdog) - support_agents.WATCHDOG_KEYS:
+            fail("launchd_watchdog must be a table with only "
+                 f"{sorted(support_agents.WATCHDOG_KEYS)}")
         stale = watchdog.get("stale_log_seconds")
         if stale is not None and (type(stale) is not int or not 600 <= stale <= 14400):
             fail("launchd_watchdog.stale_log_seconds must be an integer from 600 "
                  "through 14400")
+        # The command that opens the store from a TCC-granted context; it is
+        # what lets the watchdog run the root heal (scripts/tcc_wedge.py).
+        if "tcc_context_probe" in watchdog:
+            problem = support_agents.context_probe_problem(
+                watchdog["tcc_context_probe"], host.get("tart_home"))
+            if problem:
+                fail(problem)
     disagreement = data.get("build_disagreement")
     if disagreement is not None:
         if not isinstance(disagreement, dict):

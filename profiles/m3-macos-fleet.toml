@@ -316,12 +316,20 @@ runner_group_id = 8
 # only on hand-edited plists until it moved here (#195).
 [launchd_watchdog]
 stale_log_seconds = 4500
+# Opens the Tart store from a context that holds TCC access: sshd has Full
+# Disk Access, so this answers while a tccd wedge blocks every launchd job's
+# open of the volume. It is the reading that lets the watchdog run the root
+# heal for a wedge that logs nothing (scripts/tcc_wedge.py, docs/runbook.md).
+# Same open as the store probe: O_RDONLY|O_DIRECTORY on the store itself.
+tcc_context_probe = ["/usr/bin/ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "localhost", "/usr/bin/python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY))' /Volumes/Workshop/VMs"]
 
 [support_agents]
 declared = ["reclaim", "artifact-cache-refresh", "keychain-unlock", "schedule-backstop", "reuse-canary", "launchd-watchdog", "reap"]
 # Converge the VM janitor and the disk reclaimer (so reclaim fixes such as the
-# 90%-used pressure trigger reach the host); every other declared agent stays plan-only.
-bootstrap = ["reap", "reclaim"]
+# 90%-used pressure trigger reach the host), and the launchd watchdog, so its
+# TCC context probe (and TART_HOME, which the hand-installed plist lacked)
+# reach it; every other declared agent stays plan-only.
+bootstrap = ["reap", "reclaim", "launchd-watchdog"]
 
 # The reuse canary (scripts/reuse_canary.py): this host's Shipyard runs in
 # shadow_compare mode, so a daily mac run at origin/main keeps a bindable reuse

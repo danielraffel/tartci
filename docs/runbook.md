@@ -460,7 +460,10 @@ authorization failure (lines written after the last heal are ignored, so the
 burst a release writes cannot justify the next heal); and, when
 `TARTCI_TCC_CONTEXT_PROBE` names a command that probes the store from a context
 with TCC access (for example over `ssh localhost`, whose sshd holds Full Disk
-Access), that command must exit 0. Only every configured reading agreeing
+Access), that command must exit 0. Set it per host as `[launchd_watchdog]
+tcc_context_probe` in the fleet profile (launchd/README.md), which the
+support-agents step renders into the watchdog plist; never edit the plist by
+hand. Only every configured reading agreeing
 yields `tcc_attribution_wedge`; otherwise the
 verdict is `stalled_unclassified` (volume stalled, cause unproven) or
 `host_unresponsive`, and nothing privileged runs. The verdict and its evidence
