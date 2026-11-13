@@ -221,7 +221,9 @@ def clearance(events: list[dict], clock: float, tool: str, version: str,
                and e.get("verify") in ("current", "behind") and _epoch(e.get("at")) is not None]
     if not deploys:
         return False, f"has not deployed {version}"
-    deploy = deploys[-1]
+    # A rollback back onto `version` is a downgrade event; its health was proved
+    # by the deploy that first moved up to it, so that one starts the clock.
+    deploy = ([e for e in deploys if not e.get("downgrade")] or deploys)[-1]
     since = _epoch(deploy["at"]) or 0.0
     for event in events:
         at = _epoch(event.get("at"))
@@ -370,6 +372,12 @@ def parse_ticks(text: str) -> list[dict]:
         if not match:
             continue
         stamp, subject, rest = match.groups()
+        # summary.log is shared: fleet-deploy, drain-watch and loss-report
+        # write their own stamped lines. Only the tick's fleet line and its
+        # per-repository lines belong to a tick; anything else would pose as a
+        # later tick and mark an unfinished one complete.
+        if subject != "fleet" and "/" not in subject:
+            continue
         tick = ticks.setdefault(stamp, {"at": _epoch(stamp), "versions": set(),
                                         "invariants": [], "done": set(),
                                         "passes": 0, "errors": 0})
@@ -404,12 +412,17 @@ def _clean(tick: dict) -> bool:
     return bool(tokens) and all(t == "ok" for t in tokens) and not tick["errors"]
 
 
+def is_steward_host(home: Path, settings: dict) -> bool:
+    """Whether this host is a published steward host (tool_rollout.steward_hosts)."""
+    me = self_host_id(home, settings)
+    return bool(me) and me in rollout(settings)["steward_hosts"]
+
+
 def runs_steward(home: Path, tool: dict, now: float) -> bool:
     text = _read_tail(steward_log(home, tool))
     if not text:
         return False
-    return any(t["versions"] and now - t["at"] <= STEWARD_ACTIVE_HOURS * 3600
-               for t in parse_ticks(text))
+    return any(now - t["at"] <= STEWARD_ACTIVE_HOURS * 3600 for t in parse_ticks(text))
 
 
 def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
@@ -441,6 +454,7 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     if in_flight and STEWARD_ERROR in _failures(in_flight[0]):
         preexisting.add(STEWARD_ERROR)
     stamp = lambda t: _iso(t["at"])  # noqa: E731
+    down = 0  # consecutive complete ticks after the swap where the steward could not run
     for i, tick in enumerate(ticks):
         if tick["at"] < deployed_at or not complete[i]:
             continue
@@ -449,6 +463,11 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
         if not (ran_it or could_not_run):
             continue
         failed = _failures(tick) - preexisting
+        down = down + 1 if failed == {STEWARD_ERROR} else 0
+        if failed == {STEWARD_ERROR} and down < 2:
+            # One tick of nothing but errors and skips is often a timeout or a
+            # rate-limit skip; a rejection is permanent, so it takes two in a row.
+            continue
         if failed:
             return "failed", (f"steward tick {stamp(tick)} on {version}: "
                               + ("the steward could not run (only ERROR lines)"
@@ -480,7 +499,7 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
     if not isinstance(entry, dict):
         return False
     if entry.get("gave_up"):
-        if row.get("effective") != entry.get("version"):
+        if row.get("effective") is not None and row["effective"] != entry.get("version"):
             steward.pop(name, None)  # someone moved the host off it
             return False
         row["steward_problem"] = (f"{name} {entry.get('version')}: steward failed and "

@@ -976,6 +976,12 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                           publication_filter)
             row.update(steward_problem=problem, apply=f"rolled back: {problem}")
             by = "steward_rollback"
+        elif isinstance(steward.get(name), dict) and row.get("state") == "behind":
+            # A newer release waits until the steward has judged this one, so a
+            # pending verdict is never overwritten (and its rollback target lost).
+            applied = None
+            row["apply"] = (f"waiting: the steward has not judged "
+                            f"{steward[name].get('version')} yet")
         else:
             applied = maybe_apply(name, tool, row, home, now, state, settings, attempts, run,
                                   pending, probe(name, str(row.get("latest_tag"))) if probe
@@ -1001,7 +1007,11 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                     "verify": "current" if row.get("state") == "current"
                     else str(row.get("state"))}
                 if (component == "cli" and not downgrade and tool.get("steward_check")
-                        and canary.runs_steward(home, tool, now)):
+                        and (canary.is_steward_host(home, settings)
+                             or canary.runs_steward(home, tool, now))):
+                    # A published steward host records it even while its tick
+                    # is down: the check then stays pending and becomes a
+                    # problem after an hour, and the hosts behind it wait.
                     # Readers (the other hosts' canary gate) then wait for a
                     # clean tick on this release, not for the fixed soak.
                     event["steward_host"] = True

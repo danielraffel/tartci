@@ -353,6 +353,28 @@ class CanaryGateTests(_Fleet):
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
         self.assertIn("steward host studio: deployed 0.221.1 and a steward tick", row["canary"])
 
+    def test_a_release_rolled_back_onto_on_the_steward_host_still_clears(self) -> None:
+        # studio verified 0.221.1, took 0.221.2, failed it and rolled back to
+        # 0.221.1. A host still on 0.221.0 may take 0.221.1.
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 12 * HOUR),
+            ("v0.221.2", NOW - 6 * HOUR))
+        def at(h: float) -> str:
+            return iso(NOW - h * HOUR)
+        studio = canary_events(
+            deployed("0.221.1", NOW - 10 * HOUR, steward_host=True),
+            {"event": "tool_steward_verified", "tool": "shipyard", "at": at(9), "version": "0.221.1"},
+            deployed("0.221.2", NOW - 5 * HOUR, steward_host=True, **{"from": "0.221.1"}),
+            {"event": "tool_apply_failed", "tool": "shipyard", "at": at(4.5), "target": "0.221.2"},
+            {"event": "tool_rolled_back", "tool": "shipyard", "at": at(4.5), "from": "0.221.2",
+             "to": "0.221.1"},
+            deployed("0.221.1", NOW - 4.5 * HOUR, downgrade=True, by="steward_rollback",
+                     **{"from": "0.221.2"}))
+        host = self.behind({"m5": canary_events(deployed("0.221.1", NOW - 11 * HOUR)),
+                            "m3": studio})
+        self.refresh(host, "m1", stewards=["studio"])
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
     def test_pulp_does_not_wait_for_the_steward_host(self) -> None:
         self.feeds["Generous-Corp/pulp"] = feed(("v0.877.2", NOW - 30 * HOUR),
                                                ("v0.877.3", NOW - 4 * HOUR))
@@ -565,13 +587,78 @@ class StewardCheckTests(_Fleet):
 
     # ── error lines and error tokens ──
 
-    def test_a_steward_that_cannot_run_rolls_back(self) -> None:
+    def test_a_steward_that_cannot_run_twice_in_a_row_rolls_back(self) -> None:
         host = self.deploy_on_steward_host()
-        at = NOW + 5 * MIN
-        self.log(*(f"{stamp(at)} {repo} ERROR rc=101 thread main panicked" for repo in REPOS))
-        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        self.log(*(f"{stamp(NOW + 5 * MIN)} {repo} ERROR rc=101 thread main panicked"
+                   for repo in REPOS))
+        self.log(f"{stamp(NOW + 10 * MIN)} fleet invariants=ERROR")  # completes the first
+        self.refresh(host, "m5", now=NOW + 11 * MIN)
+        # One tick of errors may be a timeout or a rate-limit skip: not yet.
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.log(f"{stamp(NOW + 10 * MIN)} danielraffel/tartci skipped=rest_exhausted remaining=12",
+                 *(f"{stamp(NOW + 10 * MIN)} {repo} ERROR rc=101 thread main panicked"
+                   for repo in REPOS[1:]))
+        row = self.refresh(host, "m5", now=NOW + 16 * MIN)["tools"]["shipyard"]
         self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
         self.assertIn("the steward could not run", row["steward_problem"])
+
+    def test_could_not_run_ticks_must_be_consecutive(self) -> None:
+        host = self.deploy_on_steward_host()
+        errors = lambda at: [f"{stamp(at)} {repo} ERROR rc=124 " for repo in REPOS]  # noqa: E731
+        self.log(*errors(NOW + 5 * MIN))
+        # Between them, a tick that ran but is inconclusive (one repo errored).
+        at = NOW + 10 * MIN
+        self.log(f"{stamp(at)} fleet invariants=ok",
+                 f"{stamp(at)} danielraffel/tartci ERROR rc=124 ",
+                 f"{stamp(at)} Generous-Corp/pulp rc=0 took=9s ver=0.221.1 invariants=ok",
+                 f"{stamp(at)} danielraffel/Shipyard rc=0 took=9s ver=0.221.1 invariants=ok")
+        self.log(*errors(NOW + 15 * MIN))
+        self.refresh(host, "m5", now=NOW + 18 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
+    def test_one_could_not_run_tick_between_good_ones_is_forgiven(self) -> None:
+        host = self.deploy_on_steward_host()
+        self.log(f"{stamp(NOW + 5 * MIN)} danielraffel/tartci skipped=rest_exhausted remaining=9",
+                 f"{stamp(NOW + 5 * MIN)} Generous-Corp/pulp skipped=rest_exhausted remaining=9",
+                 f"{stamp(NOW + 5 * MIN)} danielraffel/Shipyard ERROR rc=124 ")
+        self.tick(NOW + 10 * MIN, "0.221.1", "ok")
+        self.refresh(host, "m5", now=NOW + 16 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+
+    # ── other writers share summary.log ──
+
+    def test_other_writers_lines_are_not_ticks(self) -> None:
+        host = self.deploy_on_steward_host()
+        at = NOW + 5 * MIN
+        self.log(f"{stamp(at)} fleet invariants=ok",
+                 f"{stamp(at)} danielraffel/tartci rc=0 took=9s ver=0.221.1 invariants=ok",
+                 f"{stamp(at + 60)} drain-watch kind=pass_fault repo=- lane=repair-3 count=1",
+                 f"{stamp(at + 90)} fleet-deploy unit=pass-runner installed rev=0c2515c from=none",
+                 f"{stamp(at + 95)} loss-report lost=0")
+        self.refresh(host, "m5", now=NOW + 8 * MIN)
+        # Not complete: Generous-Corp/pulp and danielraffel/Shipyard are still running.
+        self.assertNotIn("tool_steward_verified", self.kinds())
+        self.log(f"{stamp(at)} Generous-Corp/pulp rc=0 took=9s ver=0.221.1 invariants=ok",
+                 f"{stamp(at)} danielraffel/Shipyard rc=0 took=60s ver=0.221.1 "
+                 "invariants=FAIL:arming")
+        self.refresh(host, "m5", now=NOW + 12 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
+
+    def test_another_writers_line_does_not_make_the_in_flight_tick_the_baseline(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "ok")
+        at = NOW - 6 * MIN  # in flight at the swap; its last repo ran the new binary
+        self.log(f"{stamp(at)} fleet invariants=ok",
+                 f"{stamp(at)} danielraffel/tartci rc=0 took=9s ver=0.221.0 invariants=ok",
+                 f"{stamp(at)} Generous-Corp/pulp rc=0 took=9s ver=0.221.0 invariants=ok",
+                 f"{stamp(NOW - 3 * MIN)} drain-watch kind=pass_fault repo=- lane=x count=1",
+                 f"{stamp(at)} danielraffel/Shipyard rc=0 took=60s ver=0.221.0 "
+                 "invariants=FAIL:arming")
+        host = self.behind()
+        self.refresh(host, "m5")
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:arming")
+        self.refresh(host, "m5", now=NOW + 10 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
 
     def test_a_steward_outage_that_predates_the_swap_is_not_the_releases_fault(self) -> None:
         self.tick(NOW - 20 * MIN, "0.221.0", "ok")
@@ -580,8 +667,10 @@ class StewardCheckTests(_Fleet):
         self.log(*(f"{stamp(NOW - 5 * MIN)} {repo} ERROR rc=1 api.github.com 503" for repo in REPOS))
         host = self.behind()
         self.refresh(host, "m5")
-        self.log(*(f"{stamp(NOW + 5 * MIN)} {repo} ERROR rc=1 api.github.com 503" for repo in REPOS))
-        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        for minute in (5, 10):  # two in a row: enough to fail a release on its own
+            self.log(*(f"{stamp(NOW + minute * MIN)} {repo} ERROR rc=1 api.github.com 503"
+                       for repo in REPOS))
+        row = self.refresh(host, "m5", now=NOW + 13 * MIN)["tools"]["shipyard"]
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
         self.assertIn("no conclusive complete steward tick", row["steward"])
         # A real regression after the outage still fails it.
@@ -705,6 +794,11 @@ class StewardCheckTests(_Fleet):
         self.assertIn("roll back by hand", row["steward_problem"])
         self.assertIn("roll back by hand", tf.summary(self.home)["problem"])
         self.assertEqual(self.kinds().count("tool_apply_failed"), 1)
+        # A pass that cannot read the version keeps the give-up and its alarm.
+        host.versions["shipyard"] = None
+        self.refresh(host, "m5", now=NOW + 30 * MIN)
+        self.assertTrue(json.loads((self.state / "steward.json").read_text())["shipyard"]
+                        ["gave_up"])
 
     def test_a_rollback_is_saved_before_the_next_tool_runs(self) -> None:
         host = self.deploy_on_steward_host()
@@ -718,6 +812,44 @@ class StewardCheckTests(_Fleet):
         attempts = json.loads((self.state / "attempts.json").read_text())
         self.assertTrue(attempts["shipyard"]["rejected"])
         self.assertEqual(json.loads((self.state / "steward.json").read_text()), {})
+
+    def test_a_published_steward_host_records_the_check_while_its_tick_is_down(self) -> None:
+        self.tick(NOW - 3 * HOUR, "0.221.0")  # the steward has been down for hours
+        cleared = canary_events(deployed("0.221.1", NOW - 3 * HOUR))
+        host = self.behind({"m5": cleared})
+        self.refresh(host, "studio", stewards=["studio"])
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.assertTrue(self.events()[-1]["steward_host"])
+        self.assertEqual(json.loads((self.state / "steward.json").read_text())["shipyard"]
+                         ["version"], "0.221.1")
+        row = self.refresh(host, "studio", now=NOW + 2 * HOUR, stewards=["studio"])["tools"]
+        self.assertIn("is the steward tick running?", row["shipyard"]["steward_problem"])
+
+    def test_a_steward_whose_recent_ticks_all_errored_still_counts_as_running(self) -> None:
+        # Not a published steward host, but its tick is running (every line an
+        # ERROR, so none carries ver=): it still records and judges the swap.
+        self.log(*(f"{stamp(NOW - 10 * MIN)} {repo} ERROR rc=1 boom" for repo in REPOS))
+        host = self.behind()
+        self.refresh(host, "m5")
+        self.assertTrue(self.events()[-1].get("steward_host"))
+        self.assertIn("shipyard", json.loads((self.state / "steward.json").read_text()))
+
+    def test_a_newer_release_waits_for_the_pending_verdict(self) -> None:
+        host = self.deploy_on_steward_host()
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 4 * HOUR),
+            ("v0.221.2", NOW - 1 * HOUR))
+        row = self.refresh(host, "m5", now=NOW + 5 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.assertIn("the steward has not judged 0.221.1 yet", row["apply"])
+        self.tick(NOW + 6 * MIN, "0.221.1", "ok")
+        self.refresh(host, "m5", now=NOW + 12 * MIN)
+        # Judged first, then the newer release goes in the same pass.
+        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.2"])
+        kinds = self.kinds()
+        self.assertLess(kinds.index("tool_steward_verified"), len(kinds) - 1)
+        self.assertEqual((self.events()[-1]["event"], self.events()[-1]["to"]),
+                         ("tool_deployed", "0.221.2"))
 
     def test_a_host_without_a_running_steward_records_no_check(self) -> None:
         self.tick(NOW - 3 * HOUR, "0.221.0")  # an old log: the steward no longer runs here

@@ -3089,12 +3089,17 @@ arrive, and a host that did not get it is loud:
       # tool-freshness.toml
       # canary_soak_hours = 2
 
-- **The steward judges each Shipyard swap where it runs.** On a host whose
+- **The steward judges each Shipyard swap where it runs.** On a published
+  steward host, or any host whose
   `~/Library/Logs/shipyard-steward-tick/summary.log` has a tick line from the
   last hour, a Shipyard deploy is recorded in
   `~/.tartci/state/tool-freshness/steward.json` with the time of the swap
   (taken after the apply returns, not at the start of the pass). Each later
-  watchdog pass judges it by **complete** ticks only: a tick writes one line
+  watchdog pass judges it by **complete** ticks only. Only the tick's own
+  lines count (its `fleet` line and one line per `owner/repo`); the other
+  writers that share summary.log (`fleet-deploy`, `drain-watch`,
+  `loss-report`) stamp their own lines and are ignored, since they would
+  otherwise pose as a later tick. A tick writes one line
   per repository over several minutes, so it counts once a later tick has
   started or every repository in
   `~/.local/share/shipyard-steward/fleet-repos.txt` has its final line (`rc=`,
@@ -3110,8 +3115,10 @@ arrive, and a host that did not get it is loud:
   intervals of the swap.
   - The first judging tick with every `invariants=` token ok and no `ERROR`
     line writes `tool_steward_verified`.
-  - The first one with a failing invariant the baseline did not have, or with
-    only `ERROR` lines, fails it: an automatic apply is rolled back with
+  - The first one with a failing invariant the baseline did not have, or the
+    second in a row in which the steward could not run at all (every
+    repository wrote `ERROR` or a skip; one such tick is often a timeout or a
+    rate-limit skip), fails it: an automatic apply is rolled back with
     `shipyard runner fleet-update --to <previous release>` (the same governed
     swap; the previous release is the older of the CLI and its ghapp
     generation, what really ran), recorded as `tool_apply_failed` (verdict
@@ -3139,6 +3146,10 @@ arrive, and a host that did not get it is loud:
     invariant already failing before the swap neither rolls back nor
     verifies; it keeps the hosts behind the steward host waiting until a
     clean tick.
+  - While a deploy waits for its verdict, a newer release waits too, so the
+    verdict and its rollback target are never overwritten. A steward host
+    that rolled back onto a release it had verified earlier still clears that
+    release for the hosts behind it.
 
 - **A fleet host must carry its maintenance agents.** `tartci doctor fleet`
   reports `host_agents_missing` (a problem) when a host with an installed
