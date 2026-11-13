@@ -56,6 +56,15 @@ Only use `/Volumes` for macOS launchd through the opt-in, receipt-bound native
 launcher described below. Do not grant broad access to Bash, Node, Python, or
 `env`: those interpreter identities are shared by unrelated tools and produce
 repeated privacy prompts.
+Never point a LaunchAgent's program at a per-generation path (a generation or
+auth-generations digest, a Homebrew Cellar version, a venv, a `current` link)
+or at an ad-hoc or unsigned binary. TCC records a bare executable by its path
+and an ad-hoc one by its code hash, so each install or rebuild is a new
+identity and a new consent alert; an unanswered alert on an unattended host
+blocks every ungranted launchd open of an external volume (tartci#840).
+`scripts/lint.sh` runs `scripts/launchd_identity_lint.py --templates` over
+every template here; `python3 scripts/launchd_identity_lint.py --installed
+~/Library/LaunchAgents` lists a host's installed agents by identity class.
 Shipyard fleet probes should point `host_class.<name>.tartci_bin` at that same
 wrapper and `host_class.<name>.tart_home` at the same `$HOME/VMs` store; otherwise
 capacity and supervisor health will be read from different Tart homes.

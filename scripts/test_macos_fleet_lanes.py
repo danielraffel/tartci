@@ -322,6 +322,18 @@ class MacosFleetLaneTests(unittest.TestCase):
                 ],
             )
 
+    def test_every_profile_renders_lanes_with_a_stable_privacy_identity(self) -> None:
+        import launchd_identity_lint
+        seen = 0
+        for name, config in HOST_CONFIGS.items():
+            for body in fleet.rendered_plists(fleet.load(config)).values():
+                program = launchd_identity_lint.program_of(plistlib.loads(body))
+                verdict = launchd_identity_lint.classify_static(program)
+                with self.subTest(host=name, program=program):
+                    self.assertIn(verdict["kind"], ("launcher", "platform"), verdict)
+                seen += 1
+        self.assertGreater(seen, len(HOST_CONFIGS), "every host rendered its lanes")
+
     def test_external_volume_profile_fails_closed_without_launch_helper(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "m3.toml"
