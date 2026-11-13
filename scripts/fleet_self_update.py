@@ -27,6 +27,11 @@ no new mechanics; every step is a command that already exists:
   4. Capacity floor: drain passes --allow-last-serving-host ONLY when every
      last-serving label is on the explicit idle-by-design list, and the rule
      is written to the receipt. Capacity unknown refuses.
+     Queue-light: a host that would take its turn drains only while at most
+     QUEUE_LIGHT_MAX_JOBS queued gate jobs it serves wait fleet-wide (an
+     unread queue is not light). Otherwise it steps aside, keeping its place
+     privately so a peer with a lighter queue can go, until the queue is
+     light or it has waited QUEUE_HEAVY_MAX_DEFER_SECONDS.
   5. drain, wait (bounded) for `pool off --plan` to show no mid-job lane,
      pool off, pin the new launcher approval (backed up), install --apply
      (retried while agents unload), relay reconcile, `pool on` through the
@@ -88,6 +93,19 @@ DEFAULT_WAIT_SECONDS = 90 * 60
 # While the drain waits on the same lanes, a receipt step at least this often.
 WAIT_IDLE_NOTE_SECONDS = 5 * 60
 DEFAULT_POLL_SECONDS = 45
+# Queue-light: a host drains for an update only while at most this many queued
+# self-hosted gate jobs it serves are waiting fleet-wide (gate-queue.json, the
+# same read the starvation bound uses). A drain while the queue is heavy idles
+# this host's gate slots exactly when they are wanted: m3 drained ten times
+# for self-updates from 2026-11-10 and once sat idle 25 minutes with a backlog.
+# One job is light: an ephemeral runner leaves the job it is booting for
+# queued for a minute or two, and another host can take a single job.
+QUEUE_LIGHT_MAX_JOBS = 1
+# A host deferred for a heavy queue this long (its place in the update queue,
+# `since`) takes its turn anyway, so a fleet that is never idle cannot keep a
+# host on old code forever. It is below the starvation bounds, so a heavy queue
+# alone never opens a starvation issue.
+QUEUE_HEAVY_MAX_DEFER_SECONDS = 3 * 3600
 INSTALL_ATTEMPTS = 4
 # `shipyard writer-domain-exec` exits this, naming WRITER_DOMAIN_OVERLAP, when a
 # Shipyard Sandbox E2E audit holds the writer domain past its acquire timeout.
@@ -245,8 +263,8 @@ class Deferred(Refused):
 
 
 class SteppedAside(Refused):
-    """The capacity floor refused, so this host could not take a turn if it
-    had one. Its place is kept privately and no ticket is published: peers
+    """The capacity floor refused, or the gate queue this host serves is
+    heavy, so this host could not take a turn if it had one. Its place is kept privately and no ticket is published: peers
     must not yield to a host that cannot go. `quiet` is set when a peer was
     also out of service, the usual cause of a floor refusal that clears by
     itself once that peer is back."""
@@ -491,6 +509,8 @@ class Config:
     stale_hours: float = DEFAULT_STALE_HOURS
     wait_seconds: int = DEFAULT_WAIT_SECONDS
     poll_seconds: int = DEFAULT_POLL_SECONDS
+    queue_light_max_jobs: int = QUEUE_LIGHT_MAX_JOBS
+    queue_heavy_max_defer_seconds: int = QUEUE_HEAVY_MAX_DEFER_SECONDS
     idle_by_design: tuple[str, ...] = DEFAULT_IDLE_BY_DESIGN
     peers: dict[str, str] = dataclasses.field(default_factory=dict)
     fleet_source_repository: str | None = None
@@ -642,8 +662,9 @@ def load_config(home: Path, settings: Path | None = None) -> Config:
     if path.is_file() and tomllib is not None:
         data = tomllib.loads(path.read_text())
         cfg.peers = {str(k): str(v) for k, v in (data.get("peers") or {}).items()}
-        for key in ("soak_seconds", "wait_seconds", "poll_seconds"):
-            if isinstance(data.get(key), int):
+        for key in ("soak_seconds", "wait_seconds", "poll_seconds", "queue_light_max_jobs",
+                    "queue_heavy_max_defer_seconds"):
+            if isinstance(data.get(key), int) and not isinstance(data.get(key), bool):
                 setattr(cfg, key, data[key])
         for key in ("rate_hours", "stale_hours"):
             if isinstance(data.get(key), (int, float)):
@@ -2584,6 +2605,30 @@ def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> 
     return bool(gate_demand(cfg, me, now)[0])
 
 
+def queue_light(cfg: Config, me: str, now: float) -> tuple[bool, str]:
+    """(whether the gate backlog this host serves is light enough to drain, why).
+
+    A host with no published gate registration serves no gate job, so its
+    queue is light. A failed or partial demand read is not light: a blind read
+    is not "no demand" (QUEUE_HEAVY_MAX_DEFER_SECONDS still bounds the wait).
+    """
+    try:
+        snapshot = refresh_gate_demand(cfg, me, now)
+    except Exception as error:  # noqa: BLE001 - an unreadable supply is an unread queue
+        return False, f"gate demand unread ({type(error).__name__}: {str(error)[:160]})"
+    if not snapshot:
+        return True, "this host serves no published gate registration"
+    jobs, errors = gate_demand(cfg, me, now)
+    if errors:
+        return False, "gate demand unread (" + "; ".join(errors)[:200] + ")"
+    if len(jobs) > cfg.queue_light_max_jobs:
+        oldest = min((gate_job_demand.epoch(job.get("created_at")) or now) for job in jobs)
+        return False, (f"{len(jobs)} queued gate jobs this host serves (light is at most "
+                       f"{cfg.queue_light_max_jobs}; oldest queued {(now - oldest) / 60:.0f} min)")
+    return True, (f"{len(jobs)} queued gate jobs this host serves (light is at most "
+                  f"{cfg.queue_light_max_jobs})")
+
+
 def _gate_queue_path_in(state_dir: Path) -> Path:
     return Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(state_dir / "gate-queue.json"))
 
@@ -3732,6 +3777,25 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         else:
             refusals.append(str(floor_refusal))
             receipt.step("capacity-floor", str(floor_refusal), ok=False)
+        # Queue-light: only reached when this host would take its turn. A
+        # heavy queue steps aside (place kept privately, nothing published),
+        # so a peer with a lighter queue can take the turn meanwhile.
+        light, why_light = queue_light(cfg, me, sys_.now())
+        waited = max(0.0, sys_.now() - my_since)
+        if light:
+            receipt.step("queue-light", why_light)
+        elif waited >= cfg.queue_heavy_max_defer_seconds:
+            receipt.step("queue-light", f"{why_light}; deferred {waited / 3600:.1f} h for a heavy "
+                         f"queue, the most allowed ({cfg.queue_heavy_max_defer_seconds // 3600} h), "
+                         "so it drains anyway")
+        else:
+            refusal = (f"gate queue is heavy: {why_light}; draining now would idle this host's "
+                       "gate slots while jobs wait")
+            if apply:
+                raise SteppedAside(f"{refusal}; stepped aside until the queue is light",
+                                   quiet=True)
+            refusals.append(refusal)
+            receipt.step("queue-light", refusal, ok=False)
         if (helper is not None and (not refresh or layout == "v2")
                 and (layout != "v2" or change.changed)):
             # A new launcher must pass its volume probe after the install, and

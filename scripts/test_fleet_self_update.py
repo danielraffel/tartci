@@ -980,6 +980,120 @@ class HappyPathTests(Base):
         self.assertFalse((self.cfg.state_dir / "last.json").exists())
 
 
+class QueueLightTests(Base):
+    """A host drains for an update only while the gate backlog it serves is light."""
+
+    def demand(self, count: int, *, errors: tuple = (), registered: bool = True) -> None:
+        """Make the gate-demand refresh publish `count` queued jobs this host serves."""
+        def refresh(cfg, me, now):
+            if not registered:
+                return {}
+            snapshot = {"observed_at": su._iso(now), "host_id": me, "errors": list(errors),
+                        "jobs": [{"id": i, "hosts": [me], "repo": "Generous-Corp/pulp",
+                                  "workflow": "Build and Test", "name": "macos",
+                                  "created_at": su._iso(now - 600 - i)} for i in range(count)]}
+            su._write_json(cfg.state_dir / "gate-queue.json", snapshot)
+            return snapshot
+        patch = mock.patch.object(su, "refresh_gate_demand", refresh)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def receipt(self) -> dict:
+        newest = max((self.cfg.state_dir / "attempts").glob("*.json"),
+                     key=lambda p: p.stat().st_mtime)
+        return json.loads(newest.read_text())
+
+    def queue_step(self) -> str:
+        return next(s["detail"] for s in self.receipt()["steps"] if s["step"] == "queue-light")
+
+    def assertSteppedAsideForQueue(self, rc: int) -> None:
+        self.assertEqual(rc, su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        # The place is kept privately: peers must not yield to a host that
+        # will not take the turn while its queue is heavy.
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        aside = json.loads((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).read_text())
+        self.assertIn("gate queue is heavy", aside["reason"])
+
+    def test_a_heavy_queue_steps_aside_before_any_mutation(self) -> None:
+        self.demand(2)
+        self.assertSteppedAsideForQueue(self.apply())
+        self.assertIn("2 queued gate jobs", self.receipt()["error"])
+
+    def test_a_light_queue_takes_the_turn(self) -> None:
+        # Control for the heavy case, same instrument: one queued job is light.
+        self.demand(1)
+        self.assertUpdated(self.apply())
+        self.assertIn("1 queued gate jobs", self.queue_step())
+
+    def test_an_empty_queue_takes_the_turn(self) -> None:
+        self.demand(0)
+        self.assertUpdated(self.apply())
+
+    def test_a_host_with_no_gate_registration_is_light(self) -> None:
+        self.demand(5, registered=False)
+        self.assertUpdated(self.apply())
+
+    def test_an_unread_queue_is_not_light(self) -> None:
+        self.demand(0, errors=("repos/Generous-Corp/pulp/actions/runs?status=queued: HTTP 502",))
+        self.assertSteppedAsideForQueue(self.apply())
+        self.assertIn("gate demand unread", self.receipt()["error"])
+
+    def test_a_refresh_that_raises_is_not_light(self) -> None:
+        def boom(cfg, me, now):
+            raise RuntimeError("published supply unreadable")
+        with mock.patch.object(su, "refresh_gate_demand", boom):
+            self.assertSteppedAsideForQueue(self.apply())
+
+    def test_the_threshold_is_configurable(self) -> None:
+        self.cfg.queue_light_max_jobs = 3
+        self.demand(3)
+        self.assertUpdated(self.apply())
+
+    def aside_since(self, since: float) -> None:
+        su._write_json(self.cfg.state_dir / su.STEPPED_ASIDE_NAME, {
+            "host_id": "m1", "target": T_OLD, "ts": NOW - 60, "reason": "gate queue is heavy",
+            "stepped_aside": True, "since": since})
+
+    def test_a_heavy_queue_stops_deferring_after_the_bound(self) -> None:
+        self.demand(4)
+        self.aside_since(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 60)
+        self.assertUpdated(self.apply())
+        self.assertIn("drains anyway", self.queue_step())
+
+    def test_a_heavy_queue_inside_the_bound_still_steps_aside(self) -> None:
+        # Control for the bound, same instrument: ten minutes short of it.
+        self.demand(4)
+        self.aside_since(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_the_bound_is_below_every_starvation_bound(self) -> None:
+        self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_AFTER_SECONDS)
+        self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_FALLBACK_SECONDS)
+
+    def test_a_light_queue_still_waits_for_a_draining_peer(self) -> None:
+        # One host at a time holds whatever the queue says.
+        self.demand(0)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_plan_reports_a_heavy_queue_read_only(self) -> None:
+        self.demand(3)
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertIn("gate queue is heavy", self.receipt()["error"])
+
+    def test_settings_set_the_threshold_and_bound(self) -> None:
+        settings = self.home / "self-update.toml"
+        settings.write_text("queue_light_max_jobs = 4\nqueue_heavy_max_defer_seconds = 7200\n")
+        cfg = su.load_config(self.home, settings)
+        self.assertEqual((cfg.queue_light_max_jobs, cfg.queue_heavy_max_defer_seconds), (4, 7200))
+        settings.write_text("queue_light_max_jobs = true\n")
+        self.assertEqual(su.load_config(self.home, settings).queue_light_max_jobs,
+                         su.QUEUE_LIGHT_MAX_JOBS)
+
+
 class OneAtATimeTests(Base):
     def test_peer_authentication_failure_is_named_separately(self) -> None:
         self.sys.peer_status_errors["m5"] = "Permission denied (publickey)."

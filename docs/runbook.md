@@ -2768,6 +2768,20 @@ fleet`), and check GitHub's job history against it with
   the first attempt the floor admits publishes the kept `since` again. On
   2026-11-04 m5studio, the only host whose fleet was ready while m1, m3 and
   m5 reported `disk_pressure`, kept its ticket and every peer yielded to it.
+- **A host drains only while its gate queue is light.** Once the peers and
+  the capacity floor would let a host take its turn, it reads the queued
+  self-hosted gate jobs it serves fleet-wide (the same `gate-queue.json` read
+  the starvation bound uses, refreshed at that attempt). More than
+  `queue_light_max_jobs` (default 1) queued jobs, or a demand read that failed
+  or was partial, steps the host aside like a floor refusal: nothing is
+  drained, `waiting.json` is withdrawn so a peer with a lighter queue can go,
+  and the receipt's `queue-light` step names the count. A host that serves no
+  published gate registration is always light. After
+  `queue_heavy_max_defer_seconds` (default 3 h, below both starvation bounds)
+  in the update queue the host drains anyway, so a fleet that is never idle
+  cannot hold a host on old code. Both are top-level keys in
+  `~/.config/tartci/self-update.toml`. From 2026-11-10 m3 drained ten times for
+  self-updates and once sat idle 25 minutes while gate jobs waited.
   `pool status` reports the host as `stepped aside, holding no update turn`.
   It exits 0 when a peer was also out of service, otherwise 3.
 - **A peer that stays unreachable stops holding the turn.** An unreadable
