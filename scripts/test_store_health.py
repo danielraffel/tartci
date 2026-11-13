@@ -201,8 +201,13 @@ class TccWedgeWatchdogTests(unittest.TestCase):
 
     def test_a_disabled_launchd_probe_is_named_in_the_classification(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            (_, second), _, _, _ = self.launchd_passes(
+            (_, second), heal_calls, launchd_calls, _ = self.launchd_passes(
                 td, {"TARTCI_TCC_LAUNCHD_PROBE": "0"})
+        self.assertEqual(launchd_calls, [], "a disabled probe submits no launchd job")
+        self.assertEqual(heal_calls, [], "a missing launchd reading never heals")
+        self.assertEqual(second["classification"]["kind"], "stalled_unclassified")
+        self.assertIn("launchd_probe", second["classification"]["evidence"],
+                      "the disabled reading is recorded, not left out")
         evidence = second["classification"]["evidence"]["launchd_probe"]
         self.assertEqual(evidence["outcome"], "disabled")
         self.assertIn("TARTCI_TCC_LAUNCHD_PROBE=0", evidence["detail"])

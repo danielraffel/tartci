@@ -494,6 +494,31 @@ class ProtectedLabelTests(unittest.TestCase):
         self.assertIn(capacity_floor.Protected("o/r", "custom"), protected)
 
 
+NOW_EPOCH = 1_800_000_000.0
+
+
+class PeerStoreTimestampTests(unittest.TestCase):
+    """A peer's healthy store reading counts only with a trustworthy timestamp."""
+
+    def reading(self, updated) -> str:
+        return f"{int(NOW_EPOCH)}\n" + json.dumps({"state": "healthy", "updated_at": updated})
+
+    def test_corrupt_or_far_future_timestamps_do_not_cover(self) -> None:
+        for name, value in {"NaN": float("nan"), "inf": float("inf"),
+                            "-inf": float("-inf"), "negative": -1.0,
+                            "far future": 1e18, "two minutes ahead": NOW_EPOCH + 120}.items():
+            with self.subTest(name):
+                why = capacity_floor.peer_store_admits(self.reading(value))
+                self.assertIsNotNone(why)
+                self.assertIn("stale", why)
+
+    def test_a_current_timestamp_covers(self) -> None:
+        # The control: the same reading, written a minute ago (or with a
+        # few seconds of clock skew ahead).
+        self.assertIsNone(capacity_floor.peer_store_admits(self.reading(NOW_EPOCH - 60)))
+        self.assertIsNone(capacity_floor.peer_store_admits(self.reading(NOW_EPOCH + 5)))
+
+
 class PeerSshDestinationTests(unittest.TestCase):
     """A published supply's `ssh` reaches ssh argv only as a plain destination."""
 

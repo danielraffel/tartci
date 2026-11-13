@@ -16,6 +16,27 @@ from python_child import child_python
 
 
 DEFAULT_TIMEOUT_S = 10.0
+
+
+def finite_epoch(value: Any, now: float | None = None,
+                 future_slack_s: float = 0.0) -> float | None:
+    """`value` as a trustworthy epoch timestamp, or None.
+
+    json.load accepts NaN and Infinity, and every comparison with NaN is
+    false, so a corrupted `updated_at` would otherwise slip past every age
+    check and read as fresh. None for a bool, a non-number, NaN, an infinity,
+    zero or a negative value, and (given `now`) anything more than
+    `future_slack_s` ahead of it. Callers treat None as stale or unknown.
+    """
+    import math
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    if not math.isfinite(value) or value <= 0:
+        return None
+    if now is not None and value > now + future_slack_s:
+        return None
+    return value
 DEFAULT_FAILURE_THRESHOLD = 2
 
 _PROFILE_TART_HOME_CODE = (

@@ -8,6 +8,7 @@ removed must NOT classify, and must NOT invoke the wrapper.
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -66,6 +67,57 @@ def classify(**overrides):
                   scan=scan_with(5), control=ok_control)
     kwargs.update(overrides)
     return tw.classify(**kwargs)
+
+
+BAD_EPOCHS = {"NaN": float("nan"), "inf": float("inf"), "-inf": float("-inf"),
+              "negative": -5.0, "zero": 0, "far future": 1e18, "bool": True}
+
+
+class CorruptTimestampTests(unittest.TestCase):
+    """json.load accepts NaN and Infinity, and every comparison with NaN is
+    false: a corrupted timestamp must never read as fresh or recent."""
+
+    def test_finite_epoch_rejects_every_corrupt_value(self) -> None:
+        import store_health
+        for name, value in BAD_EPOCHS.items():
+            with self.subTest(name):
+                self.assertIsNone(store_health.finite_epoch(value, NOW))
+        self.assertIsNone(store_health.finite_epoch(NOW + 61, NOW, future_slack_s=60))
+        self.assertEqual(store_health.finite_epoch(NOW - 5, NOW), NOW - 5)
+        self.assertEqual(store_health.finite_epoch(NOW + 30, NOW, future_slack_s=60), NOW + 30)
+        self.assertTrue(math.isnan(json.loads('{"u": NaN}')["u"]), "the premise: json reads NaN")
+
+    def test_the_streak_window_and_log_cutoff_ignore_corrupt_stamps(self) -> None:
+        for name, value in BAD_EPOCHS.items():
+            with self.subTest(name):
+                self.assertEqual(tw.window_seconds(value, NOW), tw.MIN_WINDOW_S)
+                seen: list = []
+                verdict = classify(scan=scan_with(5, seen=seen), healed_at=value)
+                self.assertIsNone(seen[0]["before"])
+                self.assertEqual(verdict["kind"], tw.KIND)
+
+    def test_a_corrupt_streak_start_is_reseeded_not_kept(self) -> None:
+        for name, value in BAD_EPOCHS.items():
+            with self.subTest(name):
+                state = {"state": "draining", "consecutive_failures": 3, "drain_required": True,
+                         "failure_threshold": 2,
+                         "last_result": {"ok": False, "reason": "timeout after 10s"}}
+                seen: list = []
+                tw.watchdog_step(state, {"failing_since": value,
+                                         "last_heal": {"at_epoch": value, "outcome": "x"}},
+                                 control_path="/internal/state", store_timeout_s=10.0,
+                                 dry_run=True, now=NOW,
+                                 classify_fn=lambda **kw: seen.append(kw) or {"kind": "x"})
+                self.assertEqual(state["failing_since"], NOW - 2 * tw.WATCHDOG_INTERVAL_S)
+                self.assertIsNone(seen[0]["healed_at"])
+
+    def test_a_corrupt_heal_stamp_is_no_record_and_a_real_one_still_limits(self) -> None:
+        for name, value in BAD_EPOCHS.items():
+            with self.subTest(name):
+                self.assertEqual(tw.heal_allowed({"at_epoch": value}, NOW), (True, ""))
+        allowed, why = tw.heal_allowed({"at_epoch": NOW - 60}, NOW)
+        self.assertFalse(allowed)
+        self.assertIn("under the", why)
 
 
 class SignatureTests(unittest.TestCase):
@@ -1052,12 +1104,30 @@ class DoctorContextTests(unittest.TestCase):
         self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=draining, context="ctx",
                                               now=NOW).code, "store_context_disagree")
 
+    def test_a_non_finite_or_far_future_watchdog_timestamp_is_unknown_not_ok(self) -> None:
+        for name, value in BAD_EPOCHS.items():
+            with self.subTest(name):
+                record = {"state": "healthy", "consecutive_failures": 0, "updated_at": value}
+                finding = fd.check_store_stall(self.OWN_OK, watchdog=record, context="ctx",
+                                               now=NOW)
+                self.assertEqual((finding.state, finding.code),
+                                 (fd.UNKNOWN, "store_watchdog_stale"))
+                self.assertIn("is not a valid time", finding.detail)
+        # Through the real file: json writes and reads NaN.
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "store-health.json"
+            path.write_text('{"state": "healthy", "consecutive_failures": 0, "updated_at": NaN}')
+            import store_health
+            loaded = store_health.load(str(path))
+        self.assertEqual(fd.check_store_stall(self.OWN_OK, watchdog=loaded, context="ctx",
+                                              now=NOW).code, "store_watchdog_stale")
+
     def test_a_future_watchdog_timestamp_is_unknown_not_ok(self) -> None:
         future = {"state": "healthy", "consecutive_failures": 0,
                   "updated_at": NOW + 3600}
         finding = fd.check_store_stall(self.OWN_OK, watchdog=future, context="ctx", now=NOW)
         self.assertEqual((finding.state, finding.code), (fd.UNKNOWN, "store_watchdog_stale"))
-        self.assertIn("timestamp is in the future", finding.detail)
+        self.assertIn("is not a valid time", finding.detail)
 
     def test_one_watchdog_failure_is_not_all_clear(self) -> None:
         suspect = {"state": "suspect", "consecutive_failures": 1, "updated_at": NOW,

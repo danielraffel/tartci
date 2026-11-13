@@ -140,9 +140,10 @@ def signature_hits(text: str, *, before: Optional[str] = None) -> dict[str, Any]
 
 def window_seconds(failing_since: Optional[float], now: float) -> int:
     """How far back to scan: the whole streak plus a margin, within bounds."""
-    if not isinstance(failing_since, (int, float)) or failing_since > now:
+    since = store_health.finite_epoch(failing_since, now)
+    if since is None:
         return MIN_WINDOW_S
-    return int(min(MAX_WINDOW_S, max(MIN_WINDOW_S, now - failing_since + MIN_WINDOW_S)))
+    return int(min(MAX_WINDOW_S, max(MIN_WINDOW_S, now - since + MIN_WINDOW_S)))
 
 
 def scan_log(window_s: int, *, before: Optional[str] = None,
@@ -572,7 +573,8 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
             evidence["ipc_scan"] = ipc_scan(started, started + float(
                 launchd.get("waited_s") or launchd.get("timeout_s") or store_timeout_s))
     window = window_seconds(failing_since, now)
-    before = local_stamp(healed_at) if isinstance(healed_at, (int, float)) else None
+    healed = store_health.finite_epoch(healed_at, now)
+    before = local_stamp(healed) if healed is not None else None
     log = scan(window, before=before)
     evidence["log_scan"] = log
     minutes = max(1, int(math.ceil(window / 60.0)))
@@ -655,8 +657,10 @@ def heal_allowed(last_heal: Optional[dict], now: float) -> tuple[bool, str]:
     """tartci's own rate limit, independent of the wrapper's root-owned stamp."""
     if not isinstance(last_heal, dict):
         return True, ""
-    at = last_heal.get("at_epoch")
-    if not isinstance(at, (int, float)) or at > now:
+    # An unreadable stamp (NaN, an infinity, the future) is no record: the
+    # wrapper's own root-owned stamp still holds the 30-minute bound.
+    at = store_health.finite_epoch(last_heal.get("at_epoch"), now)
+    if at is None:
         return True, ""
     if now - at < HEAL_INTERVAL_S:
         return False, (f"last heal {int(now - at)}s ago, under the "
@@ -800,8 +804,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         if isinstance(previous.get("last_heal"), dict):
             state["last_heal"] = previous["last_heal"]
         return None
-    since = previous.get("failing_since")
-    if isinstance(since, (int, float)) and since <= now:
+    since = store_health.finite_epoch(previous.get("failing_since"), now)
+    if since is not None:
         state["failing_since"] = since
     else:
         # No recorded start (first pass after a rollout mid-wedge): the earlier
@@ -819,7 +823,7 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         failure_threshold=int(state.get("failure_threshold") or 2),
         last_reason=last_result.get("reason"), failing_since=state["failing_since"],
         control_path=control_path, now=now, store_timeout_s=store_timeout_s,
-        healed_at=healed_at if isinstance(healed_at, (int, float)) else None,
+        healed_at=store_health.finite_epoch(healed_at, now),
         context_probe=context_probe, launchd_probe=launchd_probe,
         launchd_probe_disabled=launchd_probe_disabled)
     state["classification"] = classification
