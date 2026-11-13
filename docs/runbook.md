@@ -1903,7 +1903,9 @@ VM runners participate in the host-core lease store by default. Set
 host needs a provider-specific lease size; otherwise the host profile's
 `vm_pool_cores` value is used. A managed macOS fleet lane may declare positive
 integer `vm_cores`, which renders the macOS override only for that lane. Pulp's
-M3 lane uses 12 so two guests fit its 26-core budget; M1 and M5 inherit 3 and 6.
+M3 lane uses 7 so two guests fit its 14-core gate reserve, and M3's Vellum lane
+uses 8 so its non-gate guest fits beside a 4-core agent build; M1 and M5 inherit
+3 and 6.
 The macOS hard cap remains a separate <=2 guest
 semaphore and fails closed: if `tart list` is unavailable or malformed, the
 macOS serve loop treats the cap as already full and waits. Disable the lease
@@ -4064,6 +4066,14 @@ non-gate budget), **not** a redundant safety patch. Do **not** "pin
 acquire with dev-overflow's `reserved_gate_cores=0` and let it eat the gate
 reserve. Keep the override (or remove it for a linux lane sized to the full
 12-core budget); either way the clamp keeps the gate safe.
+
+The clamp also means a non-gate macOS lane sized at or above the budget (the
+role's 14 clamps to all 12 on m3) fits only while **no** non-gate build holds a
+single core: `lease_fit` reports `not_now` (`cores=12 budget=12 used=4`) for as
+long as any agent build runs. Fair share (`fair_share_after_secs`) promotes the
+lane to gate priority after its wait, but by then the gate lanes may hold both
+guest slots. Size such a lane below the budget with `vm_cores` (m3's Vellum lane
+uses 8) so it can coexist with an ordinary agent build.
 ## Host hygiene: disk floor and foreign VMs
 
 The watchdog runs two report-only checks (`scripts/host_hygiene.py`). They
