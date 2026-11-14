@@ -126,9 +126,17 @@ _STABLE_TIME_ENV: dict[str, str | None] = {"LC_ALL": "C", "LANG": "C", "TZ": Non
 
 def pid_start(pid: int) -> str:
     proc = run(["ps", "-p", str(pid), "-o", "lstart="], env_overrides=_STABLE_TIME_ENV)
-    if proc.returncode != 0:
+    if proc.returncode == 0 and proc.stdout.strip():
+        return " ".join(proc.stdout.strip().split())
+    # Minimal Linux images and restricted test sandboxes may deny ps even
+    # though /proc exposes a stable per-boot start tick. Keep the same
+    # fail-closed empty result when neither source is available.
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        fields = stat.rsplit(")", 1)[1].split()
+        return f"proc:{fields[19]}"
+    except (OSError, UnicodeError, IndexError):
         return ""
-    return " ".join(proc.stdout.strip().split())
 
 
 def host_boot_time() -> str:
