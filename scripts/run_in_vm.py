@@ -448,7 +448,7 @@ class Run:
         if self.tmp and (Path(self.tmp) / "src.bundle").exists():
             dirs.append(f"--dir=gitbundle:{self.tmp}:ro")
         root = cache_root()
-        shared = root / "ccache" / "tartci-layers-v1" / "shared"
+        shared = root / "ccache-layers-v1" / "shared"
         if shared.is_dir() and not shared.is_symlink():
             dirs.append(f"--dir=ccache-shared:{shared}:ro")
         fetch = Path(os.environ.get("PULP_SHARED_FETCHCONTENT_SOURCE_DIR")

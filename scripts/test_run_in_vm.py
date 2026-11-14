@@ -175,7 +175,7 @@ class RunInVmTest(unittest.TestCase):
     # ── the happy path ─────────────────────────────────────────────────────
 
     def test_success_streams_patch_and_tears_down(self) -> None:
-        shared = self.cache / "ccache" / "tartci-layers-v1" / "shared"
+        shared = self.cache / "ccache-layers-v1" / "shared"
         shared.mkdir(parents=True)
         (self.cache / "configure-checks").mkdir()
         self.ssh_config({"patch": "diff --git a/a.txt b/a.txt\n"})

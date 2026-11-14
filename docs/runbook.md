@@ -4445,7 +4445,7 @@ A command that itself exits 255 reads as 76: ssh cannot tell the two apart.
 - **Filesystem.** The guest sees exactly these host directories, every one
   read-only: `src` (the source tree), `gitbundle` (a temporary directory with
   the bundle), and when present `ccache-shared` (the gate ccache's shared store,
-  `<cache_root>/ccache/tartci-layers-v1/shared`, read through ccache's
+  `<cache_root>/ccache-layers-v1/shared`, a sibling of the legacy writable `ccache` directory, read through ccache's
   `read-only` remote), `fetchcontent`, `pip-wheelhouse` and `artifact-cache`.
   It never mounts the writable gate ccache directory, the configure-check
   cache, a home directory, `~/.config` or `~/.ssh`, so a run cannot write any
