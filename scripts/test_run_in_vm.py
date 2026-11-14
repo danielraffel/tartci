@@ -40,12 +40,34 @@ if cmd == "list":
     print(json.dumps([{"Name": n, "State": v, "OS": "darwin", "Source": "local"} for n, v in vms.items()]))
 elif cmd == "clone":
     if os.environ.get("FAKE_CLONE_RC", "0") != "0":
+        sys.stderr.write("clone \x1b[31mexploded\x1b[0m\n")
         sys.exit(int(os.environ["FAKE_CLONE_RC"]))
+    if os.environ.get("FAKE_CLONE_ADDS_GATE") == "1":
+        vms["gate-vm-late"] = "running"
     vms[args[1]] = "stopped"; save(vms)
+    if os.environ.get("FAKE_CLONE_SLEEP"):
+        open(os.path.join(state, "clone.pid"), "w").write(str(os.getpid()))
+        time.sleep(float(os.environ["FAKE_CLONE_SLEEP"]))
 elif cmd == "set":
     pass
 elif cmd == "run":
     name = args[-1]
+    if os.environ.get("FAKE_RUN_FAIL") == "1":
+        sys.stdout.write("Error: The number of VMs exceeds the system limit\n")
+        sys.exit(1)
+    for a in args:
+        if a.startswith("--dir=src:"):
+            root = a[len("--dir=src:"):].rsplit(":", 1)[0]
+            listing = {}
+            for dirpath, dirnames, filenames in os.walk(root):
+                for n in dirnames + filenames:
+                    full = os.path.join(dirpath, n)
+                    rel = os.path.relpath(full, root)
+                    if os.path.islink(full):
+                        listing[rel] = "link:" + os.readlink(full)
+                    elif os.path.isfile(full):
+                        listing[rel] = open(full).read()
+            open(os.path.join(state, "src-listing.json"), "w").write(json.dumps(listing))
     vms[name] = "running"; save(vms)
     open(os.path.join(state, "run-argv.json"), "w").write(json.dumps(sys.argv[1:]))
     while load().get(name) == "running":
@@ -79,12 +101,14 @@ if remote == "true":
 if remote == "/bin/bash -s":
     sys.exit(cfg.get("prep_rc", 0))
 if "git diff --cached --binary" in remote:
+    sys.stderr.write("w" * cfg.get("patch_stderr_bytes", 0)); sys.stderr.flush()
     sys.stdout.write(cfg.get("patch", "")); sys.exit(0)
 if "tar -cf -" in remote:
     sys.stdout.write("x" * cfg.get("tar_bytes", 10)); sys.exit(0)
 if "exec " in remote:
     time.sleep(cfg.get("cmd_sleep", 0))
     sys.stdout.write("guest stdout\n")
+    sys.stdout.write("y" * cfg.get("out_bytes", 0))
     sys.exit(cfg.get("cmd_rc", 0))
 sys.exit(99)
 '''
@@ -95,7 +119,7 @@ def make_exe(path: Path, text: str) -> None:
     path.chmod(path.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-class RunInVmTest(unittest.TestCase):
+class Harness(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="rivm-test-"))
         self.addCleanup(subprocess.run, ["rm", "-rf", str(self.tmp)], check=False)
@@ -172,6 +196,8 @@ class RunInVmTest(unittest.TestCase):
         records = self.home / ".tartci" / "state" / "scratch-vms"
         self.assertEqual(list(records.glob("*.json")) if records.exists() else [], [])
 
+
+class RunInVmTest(Harness):
     # ── the happy path ─────────────────────────────────────────────────────
 
     def test_success_streams_patch_and_tears_down(self) -> None:
@@ -190,7 +216,13 @@ class RunInVmTest(unittest.TestCase):
 
         argv = json.loads((self.state / "run-argv.json").read_text())
         dirs = [a for a in argv if a.startswith("--dir=")]
-        self.assertIn(f"--dir=src:{self.src.resolve()}:ro", dirs)
+        src_dirs = [d for d in dirs if d.startswith("--dir=src:")]
+        self.assertEqual(len(src_dirs), 1)
+        # The live work tree is never mounted: only a host-side export of it,
+        # on the cache volume, removed with the run.
+        self.assertNotIn(f"--dir=src:{self.src.resolve()}:ro", dirs)
+        self.assertTrue(src_dirs[0].startswith(f"--dir=src:{self.cache / 'run-in-vm'}/run-"))
+        self.assertEqual(list((self.cache / "run-in-vm").glob("run-*")), [])
         self.assertIn(f"--dir=ccache-shared:{shared}:ro", dirs)
         self.assertTrue(any(d.startswith("--dir=gitbundle:") and d.endswith(":ro") for d in dirs))
         for d in dirs:
@@ -367,6 +399,145 @@ class RunInVmTest(unittest.TestCase):
                 proc = self.run_cli(*args)
                 self.assertEqual(proc.returncode, 2, proc.stderr[-3000:])
         self.assertFalse((self.state / "tart.log").exists())
+
+
+class ReviewFixTest(Harness):
+    """The failure modes the adversarial review named, each driven for real."""
+
+    def records(self) -> list:
+        d = self.home / ".tartci" / "state" / "scratch-vms"
+        return list(d.glob("scratch-rivm-*.json")) if d.exists() else []
+
+    def test_export_hides_git_ignored_and_untracked_secrets(self) -> None:
+        (self.src / ".gitignore").write_text("build/\n.env\n")
+        (self.src / "build").mkdir()
+        (self.src / "build" / "obj.o").write_text("o")
+        (self.src / ".env").write_text("TOKEN=secret")
+        (self.src / "new.txt").write_text("untracked but not ignored\n")
+        (self.src / "a.txt").write_text("modified\n")
+        (self.src / "skip").mkdir()
+        (self.src / "skip" / "x.txt").write_text("x")
+        os.symlink(str(self.home), self.src / "home-link")
+        proc = self.run_cli("--exclude", "/skip", "--", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        listing = json.loads((self.state / "src-listing.json").read_text())
+        self.assertFalse([k for k in listing if k == ".git" or k.startswith(".git/")], listing)
+        for hidden in ("build", "build/obj.o", ".env", "skip", "skip/x.txt"):
+            self.assertNotIn(hidden, listing)
+        self.assertEqual(listing["a.txt"], "modified\n")
+        self.assertEqual(listing["new.txt"], "untracked but not ignored\n")
+        # Copied as a link, never followed into the host home.
+        self.assertEqual(listing["home-link"], f"link:{self.home}")
+        self.assert_clean()
+
+    def test_clone_timeout_kills_the_writer_and_does_not_brick_the_host(self) -> None:
+        start = time.monotonic()
+        proc = self.run_cli("--timeout", "6", "--", "true", FAKE_CLONE_SLEEP="120")
+        self.assertEqual(proc.returncode, 124, proc.stderr[-3000:])
+        self.assertLess(time.monotonic() - start, 60)
+        pid = int((self.state / "clone.pid").read_text())
+        time.sleep(0.5)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+        self.assert_clean()
+        again = self.run_cli("--", "true")
+        self.assertEqual(again.returncode, 0, again.stderr[-3000:])
+
+    def test_clone_timeout_with_unproved_delete_keeps_the_record(self) -> None:
+        proc = self.run_cli("--timeout", "6", "--", "true", FAKE_CLONE_SLEEP="120",
+                            FAKE_DELETE_FAILS="1")
+        self.assertEqual(proc.returncode, 78, proc.stderr[-3000:])
+        self.assertEqual(len(self.records()), 1)
+
+    def test_boot_failure_reason_carries_the_tart_run_log(self) -> None:
+        proc = self.run_cli("--", "true", FAKE_RUN_FAIL="1")
+        self.assertEqual(proc.returncode, 76, proc.stderr[-3000:])
+        self.assertIn("exceeds the system limit", self.result()["reason"])
+        self.assertIn("exceeds the system limit", self.result()["tart_run_log_tail"])
+        self.assert_clean()
+
+    def test_reason_has_no_terminal_escapes(self) -> None:
+        proc = self.run_cli("--", "true", FAKE_CLONE_RC="1")
+        self.assertEqual(proc.returncode, 76, proc.stderr[-3000:])
+        reason = self.result()["reason"]
+        self.assertIn("exploded", reason)
+        self.assertNotIn("\x1b", reason)
+
+    def test_heavy_stderr_on_collect_does_not_stall(self) -> None:
+        self.ssh_config({"patch": "p", "patch_stderr_bytes": 4 * 1024 * 1024})
+        start = time.monotonic()
+        proc = self.run_cli("--timeout", "60", "--patch-out", str(self.tmp / "o.patch"),
+                            "--", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        self.assertLess(time.monotonic() - start, 45)
+        self.assertEqual((self.tmp / "o.patch").read_text(), "p")
+
+    def test_gate_that_starts_during_the_clone_refuses_before_boot(self) -> None:
+        proc = self.run_cli("--", "true", FAKE_CLONE_ADDS_GATE="1")
+        self.assertEqual(proc.returncode, 75, proc.stderr[-3000:])
+        self.assertIn("free for the gates", self.result()["reason"])
+        self.assertFalse((self.state / "run-argv.json").exists(), "tart run must not start")
+        self.assert_clean()
+
+    def test_gate_waiter_preempts_the_run(self) -> None:
+        import leases  # noqa: PLC0415
+
+        lease_dir = self.home / "leases"
+        lease_dir.mkdir(parents=True, exist_ok=True)
+        me = leases.process_identity(os.getpid())
+        (lease_dir / "waiters.json").write_text(json.dumps([{
+            "id": "vm-tart-macos-vm-gate-waiting", "command_kind": "tart-macos-vm",
+            "priority": 100, "priority_class": "gate", "lease_size_cores": 7,
+            "pid": me["pid"], "process_start_time": me["process_start_time"],
+            "host_boot_time": me["host_boot_time"],
+            "seen_at": leases.iso(leases.utcnow()), "waiting_since": leases.iso(leases.utcnow()),
+        }]))
+        self.ssh_config({"cmd_sleep": 60})
+        start = time.monotonic()
+        proc = self.run_cli("--", "sleep", "60", TARTCI_RIVM_HEARTBEAT_SECS="1")
+        self.assertEqual(proc.returncode, 79, proc.stderr[-3000:])
+        self.assertLess(time.monotonic() - start, 45)
+        self.assertIn("gate-waiting", self.result()["reason"])
+        self.assert_clean()
+
+    def test_guest_output_is_capped(self) -> None:
+        self.ssh_config({"out_bytes": 200_000})
+        proc = self.run_cli("--max-log-bytes", "1000", "--", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        self.assertLessEqual(len(proc.stdout.encode()), 1000)
+        self.assertTrue(self.result().get("log_truncated"))
+
+    def test_stale_scratch_dir_of_a_dead_run_is_swept(self) -> None:
+        stale = self.cache / "run-in-vm" / "run-old"
+        (stale / "src").mkdir(parents=True)
+        true_proc = subprocess.Popen(["true"]); true_proc.wait()
+        (stale / "owner.json").write_text(json.dumps({"pid": true_proc.pid, "pid_start": "x"}))
+        proc = self.run_cli("--", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        self.assertFalse(stale.exists())
+
+    def leftover(self, pid: int, start: str) -> None:
+        (self.state / "vms.json").write_text(json.dumps({"scratch-rivm-old-1": "running"}))
+        d = self.home / ".tartci" / "state" / "scratch-vms"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "scratch-rivm-old-1.json").write_text(json.dumps({
+            "name": "scratch-rivm-old-1", "owner": "run-in-vm:old", "store": str(self.store),
+            "from": "golden", "created_at": time.time(), "expires_at": time.time() + 999,
+            "warned_at": None, "pid": pid, "pid_start": start}))
+
+    def test_leftover_with_a_dead_owner_is_reclaimed(self) -> None:
+        dead = subprocess.Popen(["true"]); dead.wait()
+        self.leftover(dead.pid, "gone")
+        proc = self.run_cli("--", "true")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
+        self.assertNotIn("scratch-rivm-old-1", self.vms())
+        self.assert_clean()
+
+    def test_leftover_with_a_live_owner_is_still_refused(self) -> None:
+        self.leftover(os.getpid(), run_in_vm.pid_start(os.getpid()))
+        proc = self.run_cli("--", "true")
+        self.assertEqual(proc.returncode, 75, proc.stderr[-3000:])
+        self.assertIn("scratch-rivm-old-1", self.vms())
 
 
 class PureTest(unittest.TestCase):
