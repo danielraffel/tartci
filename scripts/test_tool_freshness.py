@@ -117,6 +117,9 @@ def make_generation(home: Path) -> Path:
 def settings(**overrides) -> dict:
     value = {"stale_hours": 12.0, "apply_after_minutes": 30.0, "apply_retry_hours": 6.0,
              "host_class": "studio",
+             # This fake host is the canary unless a test says otherwise, so
+             # the apply tests below exercise the apply itself.
+             "tool_rollout": {"canary": "studio", "steward_hosts": ["m5"]},
              "tools": {name: dict(tool, enabled=True) for name, tool in tf.DEFAULT_TOOLS.items()}}
     value.update(overrides)
     return value
@@ -335,6 +338,14 @@ class ToolFreshnessTests(unittest.TestCase):
         # pulp is already current, so it is not installed.
         self.assertFalse(any("pulp-install" in c for c in host.calls))
 
+    def test_auto_apply_records_the_post_apply_swap_time(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        host.apply_installs["shipyard"] = "0.221.1"
+
+        self.refresh(host, clock=lambda: NOW + 5 * 60)
+
+        self.assertEqual(self.events()[0]["at"], iso(NOW + 5 * 60))
+
     def test_a_behind_pulp_cli_is_installed_from_its_pinned_release_installer(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.877.1"})
         host.apply_installs["pulp"] = "0.877.2"
@@ -420,6 +431,12 @@ class ToolFreshnessTests(unittest.TestCase):
         host.apply_installs["shipyard"] = "0.221.1"
         no_class = settings()
         del no_class["host_class"]
+        # With the canary gate on, a host that cannot name itself is never the
+        # canary: it waits (fail closed) and never applies.
+        row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
+        self.assertIn("waiting: this host's id is unknown", row["apply"])
+        self.assertFalse(any("fleet-update" in call for call in host.calls))
+        no_class["tools"]["shipyard"]["canary_gate"] = False
         row = self.refresh(host, settings=no_class)["tools"]["shipyard"]
         self.assertIn("refused: no host class", row["apply"])
         self.assertFalse(any("fleet-update" in call for call in host.calls))
@@ -566,6 +583,7 @@ class ToolFreshnessTests(unittest.TestCase):
         os.utime(path, (written, written))
         value = tf.load_settings(self.home, path)
         value["host_class"] = "studio"
+        value["tool_rollout"] = {"canary": "studio", "steward_hosts": ["m5"]}
         return value
 
     HOLD = "[tools.shipyard]\n# held: canary failed\nauto_apply = false\n"

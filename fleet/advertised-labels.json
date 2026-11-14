@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "542f6b82023f753a6a54543db14f9acd2eb22092b7d6090dcde9f4cfe9a02121"
+    "profiles_sha256": "284e9ca999d7f4dda3395b541f0404b52d17040e557431be109756994478626c"
   },
   "registrations": [
     {
@@ -661,5 +661,11 @@
       "host_id": "m5studio",
       "ssh": "m5s"
     }
-  ]
+  ],
+  "tool_rollout": {
+    "canary": "m5",
+    "steward_hosts": [
+      "studio"
+    ]
+  }
 }

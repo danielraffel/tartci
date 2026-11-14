@@ -306,7 +306,12 @@ class WatchdogIssue(unittest.TestCase):
         env = {"HOME": str(self.home), "TARTCI_HOME": str(self.home),
                "PATH": "/usr/bin:/bin", "XPC_SERVICE_NAME":
                "com.danielraffel.tartci.launchd-watchdog",
-               "TARTCI_FLEET_PROFILE": str(self.home / "profile.toml")}
+               "TARTCI_FLEET_PROFILE": str(self.home / "profile.toml"),
+               # The child's scratch-home guard compares TARTCI_HOME with its own
+               # temp dir. Without the parent's TMPDIR it falls back to /tmp, so a
+               # home under macOS's /var/folders TMPDIR read as a real host and the
+               # alert tried to open a real issue (and failed only for lack of ghapp).
+               "TMPDIR": tempfile.gettempdir()}
         (self.home / "profile.toml").write_text('[host]\nid = "m5studio"\n')
         result = subprocess.run(["/bin/bash", str(ROOT / "tartci"), "launchd", "heal"],
                                 capture_output=True, text=True, env=env, check=False,
