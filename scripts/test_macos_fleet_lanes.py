@@ -1093,10 +1093,13 @@ class MacosFleetLaneTests(unittest.TestCase):
                     lane for lane in data["lane"] if lane["id"] == "spectr-gate"
                 )
                 self.assertEqual(spectr_lane["registration_scope"], "repository")
-                self.assertEqual(
-                    spectr_lane["labels"],
-                    ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"],
-                )
+                expected_spectr_labels = [
+                    "self-hosted", "macOS", "ARM64", "spectr-build",
+                    "spectr-build-vm", "spectr-gate-fast",
+                ]
+                if host_id == "m5studio":
+                    expected_spectr_labels.append("spectr-release")
+                self.assertEqual(spectr_lane["labels"], expected_spectr_labels)
                 expected_spectr_workflows = ["Spectr M5 Product Acceptance"]
                 if host_id == "m5studio":
                     expected_spectr_workflows.append("Spectr Release")

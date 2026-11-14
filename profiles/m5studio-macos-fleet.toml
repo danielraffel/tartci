@@ -241,7 +241,7 @@ golden = "pulp-build-runner:latest"
 ccache_write_isolation = true
 priority = "gate"
 min_queued_age_seconds = 0
-labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
+labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast", "spectr-release"]
 # The trusted m5studio lane also performs signed Spectr releases. Other
 # Spectr lanes remain acceptance-only so a release cannot land on an
 # unqualified host.
