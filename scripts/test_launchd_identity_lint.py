@@ -25,6 +25,8 @@ class StaticClassTests(unittest.TestCase):
         "/usr/bin/python3": "platform",
         "/usr/libexec/PlistBuddy": "platform",
         "/System/Library/Frameworks/Foo.framework/Versions/A/foo": "platform",
+        "/usr/bin/../bin/bash": "platform",
+        "/usr/bin/../../tmp/tool": "user_binary",
         LAUNCHER: "launcher",
         "$HOME/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher": "launcher",
         # per install or upgrade (the 2026-11-13 m3 prompt sources)
@@ -142,6 +144,16 @@ class InstalledScanTests(unittest.TestCase):
             "lane": "launcher", "watchdog": "platform", "reconcile": "per_generation",
             "attestation": "per_generation", "subrouter": "adhoc", "script": "unsigned",
             "daemon": "developer_id", "broken": "missing"})
+
+    def test_resolved_platform_prefix_target_is_reclassified(self) -> None:
+        kinds = self.scan(
+            {"escaped": ["/usr/bin/tool"], "launcher_escape": [LAUNCHER]},
+            signatures={"/tmp/tool": {"signed": False, "error": "not signed"},
+                        "/tmp/launcher": {"signed": False, "error": "not signed"}},
+            links={"/usr/bin/tool": "/usr/bin/../../tmp/tool",
+                   LAUNCHER: "/usr/bin/../../tmp/launcher"})
+        self.assertEqual(kinds, {"escaped": "unsigned", "launcher_escape": "unsigned",
+                                 "broken": "missing"})
 
     def test_strict_exits_nonzero_only_with_a_refusal(self) -> None:
         with tempfile.TemporaryDirectory() as td:

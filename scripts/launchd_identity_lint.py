@@ -108,7 +108,8 @@ def classify_static(program: Optional[str]) -> Dict[str, str]:
     """The identity class of a program path, from the path alone."""
     if not program:
         return {"kind": "missing", "reason": "no Program or ProgramArguments[0]"}
-    normalized = program.replace("$HOME", "/Users/example")
+    # Collapse traversal before checking trusted prefixes.
+    normalized = os.path.normpath(program.replace("$HOME", "/Users/example"))
     if not normalized.startswith("/"):
         return {"kind": "relative", "reason": f"{program} is not an absolute path"}
     if normalized.startswith(PLATFORM_ROOTS):
@@ -145,14 +146,16 @@ def classify_installed(program: Optional[str], *, codesign: Optional[Codesign] =
     static = classify_static(program)
     if static["kind"] in ("missing", "relative", "per_generation"):
         return static
-    resolved = realpath(str(program))
-    if resolved != program:
-        target = classify_static(resolved)
-        if target["kind"] == "per_generation":
-            return {"kind": "per_generation",
-                    "reason": f"{program} resolves to {resolved}: {target['reason']}"}
-        if static["kind"] == "user_binary" and target["kind"] in ("platform", "launcher"):
-            static = target
+    resolved = os.path.normpath(realpath(str(program)))
+    # Reclassify the resolved target too: a trusted-looking symlink can escape
+    # its prefix (for example /usr/bin/tool -> /tmp/tool).
+    target = classify_static(resolved)
+    if target["kind"] == "per_generation":
+        return {"kind": "per_generation",
+                "reason": f"{program} resolves to {resolved}: {target['reason']}"}
+    if target["kind"] in ("platform", "launcher"):
+        return target
+    static = target
     if static["kind"] != "user_binary":
         return static
     info = (codesign or codesign_info)(resolved)
