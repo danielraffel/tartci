@@ -79,6 +79,8 @@ run_lib 1 '
   dirs="$(printf "%s " ${CCACHE_LAYER_TART_DIRS[@]+"${CCACHE_LAYER_TART_DIRS[@]}"})"
   [ "$dirs" = "--dir=ccache-shared:$CCACHE_LAYER_ROOT/shared:ro " ] || exit 4
   CURRENT_ASSIGNMENT_QUARANTINE=none
+  CURRENT_JOB_CAPTURE_STATUS=terminal
+  CURRENT_JOB_RECEIPT='"'"'{"kind":"terminal","conclusion":"success","event":"push","head_branch":"main"}'"'"'
   tartci_ccache_layer_settle vm-green 0 "'"$tmp"'/success.log" 192.0.2.1
 ' || fail "green job run failed"
 [ -f "$layers/shared/${good_result:0:2}/${good_result:2}" ] || fail "green result was not promoted"

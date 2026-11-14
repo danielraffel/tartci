@@ -100,25 +100,55 @@ def runner_log_result(path: Path | None) -> str | None:
     return result
 
 
+TRUSTED_BRANCHES = ("main",)
+
+
+def trusted_ref(receipt: dict) -> str | None:
+    """Why this run's ref may feed the shared store, or None.
+
+    Only a push to a protected branch or a merge-group run is trusted: those
+    run reviewed code. A pull-request job runs code its author controls, so its
+    results never reach the store later trusted builds read.
+    """
+    event, branch = receipt.get("event"), receipt.get("head_branch")
+    if event == "merge_group":
+        return "merge_group"
+    if event == "push" and branch in TRUSTED_BRANCHES:
+        return f"push:{branch}"
+    return None
+
+
 def verdict(runner_rc: int, capture_status: str, receipt: str, quarantine: str,
-            local_result: str | None) -> tuple[str, str]:
-    """(``green``|``red``, reason). Anything short of positive proof is red."""
+            local_result: str | None, run_id: str = "", job_id: str = "") -> tuple[str, str]:
+    """(``green``|``red``, reason). Anything short of positive proof is red.
+
+    The proof is the host's own GitHub observation: a terminal receipt with
+    conclusion=success, bound to this run and job, for a trusted ref. The
+    guest-written runner log is attacker-controlled output, so it can only
+    downgrade a verdict, never establish one.
+    """
     if runner_rc != 0:
         return "red", f"runner_rc={runner_rc}"
     if quarantine not in ("", "none"):
         return "red", f"quarantine={quarantine}"
-    if local_result is None:
-        return "red", "no_completion_line"
-    if local_result not in GREEN_RESULTS:
+    if local_result is not None and local_result not in GREEN_RESULTS:
         return "red", f"result={local_result}"
-    if capture_status == "terminal":
-        try:
-            conclusion = json.loads(receipt or "{}").get("conclusion")
-        except (json.JSONDecodeError, AttributeError):
-            return "red", "receipt_unreadable"
-        if conclusion != "success":
-            return "red", f"conclusion={conclusion}"
-    return "green", f"result={local_result}"
+    if capture_status != "terminal":
+        return "red", f"no_host_receipt={capture_status or 'none'}"
+    try:
+        data = json.loads(receipt or "{}")
+        conclusion = data.get("conclusion")
+    except (json.JSONDecodeError, AttributeError):
+        return "red", "receipt_unreadable"
+    if conclusion != "success":
+        return "red", f"conclusion={conclusion}"
+    if (run_id and str(data.get("run_id")) != str(run_id)) or \
+            (job_id and str(data.get("job_id")) != str(job_id)):
+        return "red", "receipt_unbound"
+    trust = trusted_ref(data)
+    if trust is None:
+        return "red", f"untrusted_ref={data.get('event')}:{data.get('head_branch')}"
+    return "green", f"receipt={trust}"
 
 
 # ── Paths, locks, audit ────────────────────────────────────────────────────
@@ -247,7 +277,7 @@ def settle(layout: Layout, vm: str, runner_rc: int, capture_status: str,
     layout.ensure()
     local_result = runner_log_result(runner_log)
     decision, reason = verdict(runner_rc, capture_status, receipt, quarantine,
-                               local_result)
+                               local_result, run_id, job_id)
     layer = layout.jobs / vm
     if not layer.is_dir() or layer.is_symlink():
         audit(layout, "settle", vm=vm, verdict=decision, reason=reason,
@@ -460,9 +490,16 @@ def receive_stream(layout: Layout, vm: str, owner_pid: int, stream,
     remote = layer / "remote"
     stamp = time.time() if now is None else now
     counts = {"received": 0, "rejected": 0, "bytes": 0}
+    total = 0
     try:
         with tarfile.open(fileobj=stream, mode="r|") as archive:
+            seen_stats = False
             for member in archive:
+                # Every member's declared size counts against the cap before any
+                # of it is read, whether or not the member is then accepted.
+                total += max(member.size, 0) + 512
+                if total > max_bytes:
+                    raise ReceiveError(f"stream exceeds {max_bytes} bytes")
                 name = member.name
                 while name.startswith("./"):
                     name = name[2:]
@@ -470,7 +507,10 @@ def receive_stream(layout: Layout, vm: str, owner_pid: int, stream,
                 if member.isdir() and (name in ("", "remote") or
                                        re.fullmatch(r"remote/[0-9a-z]{2}", name)):
                     continue
-                if name == STATS_MEMBER and member.isfile() and member.size <= STATS_MAX:
+                if name == STATS_MEMBER:
+                    if seen_stats or not member.isfile() or member.size > STATS_MAX:
+                        raise ReceiveError("duplicate or oversized stats member")
+                    seen_stats = True
                     handle = archive.extractfile(member)
                     text = handle.read(STATS_MAX).decode("utf-8", "replace") if handle else ""
                     (layer / "stats.json").write_text(json.dumps(parse_stats(text)))
@@ -479,8 +519,6 @@ def receive_stream(layout: Layout, vm: str, owner_pid: int, stream,
                 if not match or not member.isfile():
                     counts["rejected"] += 1
                     continue
-                if counts["bytes"] + member.size > max_bytes:
-                    raise ReceiveError(f"stream exceeds {max_bytes} bytes")
                 handle = archive.extractfile(member)
                 header = handle.read(ENTRY_HEADER_MIN) if handle else b""
                 if len(header) < ENTRY_HEADER_MIN or header[:2] != ENTRY_MAGIC \
@@ -753,6 +791,8 @@ def main(argv: list[str] | None = None) -> int:
     verdict_cmd.add_argument("--receipt", default="")
     verdict_cmd.add_argument("--quarantine", default="")
     verdict_cmd.add_argument("--runner-log", type=Path)
+    verdict_cmd.add_argument("--run-id", default="")
+    verdict_cmd.add_argument("--job-id", default="")
 
     receive_cmd = sub.add_parser("receive")
     receive_cmd.add_argument("--vm", required=True)
@@ -773,7 +813,8 @@ def main(argv: list[str] | None = None) -> int:
             print(layout.root)
         elif args.command == "verdict":
             decision, reason = verdict(args.runner_rc, args.capture_status, args.receipt,
-                                       args.quarantine, runner_log_result(args.runner_log))
+                                       args.quarantine, runner_log_result(args.runner_log),
+                                       args.run_id, args.job_id)
             print(f"{decision}\t{reason}")
         elif args.command == "receive":
             pull = args.pull[1:] if args.pull[:1] == ["--"] else args.pull

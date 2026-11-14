@@ -28,6 +28,8 @@ import macos_fleet_lanes as fleet  # noqa: E402
 LIB = ROOT / "providers" / "tart-macos" / "ccache-layer.lib.sh"
 RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 PROMOTER = ROOT / "scripts" / "ccache_layer.py"
+TRUSTED_RECEIPT = ('{"kind":"terminal","conclusion":"success","event":"push",'
+                   '"head_branch":"main","run_id":1,"job_id":2}')
 SUCCESS_LOG = "2026-09-27 01:00:00Z: Job macos completed with result: Succeeded\n"
 
 
@@ -62,8 +64,9 @@ class Base(unittest.TestCase):
         return cl.attach(self.layout, vm, os.getpid() if owner is None else owner)
 
     def settle(self, vm: str, rc: int = 0, **kwargs: object) -> tuple[str, str, Path | None]:
-        return cl.settle(self.layout, vm, rc, str(kwargs.get("capture", "")),
-                         str(kwargs.get("receipt", "")), str(kwargs.get("quarantine", "none")),
+        return cl.settle(self.layout, vm, rc, str(kwargs.get("capture", "terminal")),
+                         str(kwargs.get("receipt", TRUSTED_RECEIPT)),
+                         str(kwargs.get("quarantine", "none")),
                          kwargs.get("log", self.log))  # type: ignore[arg-type]
 
     def shared_keys(self) -> set[str]:
@@ -77,21 +80,38 @@ class Base(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    def test_green_needs_clean_exit_and_success(self) -> None:
-        self.assertEqual(cl.verdict(0, "", "", "none", "Succeeded")[0], "green")
-        self.assertEqual(cl.verdict(0, "", "", "none", "SucceededWithIssues")[0], "green")
-        self.assertEqual(
-            cl.verdict(0, "terminal", '{"kind":"terminal","conclusion":"success"}', "none",
-                       "Succeeded")[0], "green")
+    def test_green_needs_a_trusted_host_receipt(self) -> None:
+        for local in ("Succeeded", "SucceededWithIssues", None):
+            self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", local,
+                                        "1", "2"), ("green", "receipt=push:main"))
+        merge_group = '{"conclusion":"success","event":"merge_group","head_branch":"gh-readonly-queue/main/x"}'
+        self.assertEqual(cl.verdict(0, "terminal", merge_group, "none", None)[0], "green")
+
+    def test_a_forged_runner_log_line_is_not_proof(self) -> None:
+        # The guest writes the runner log, so "Succeeded" there proves nothing.
+        for capture in ("", "active", "setup_error", "terminal_unknown"):
+            with self.subTest(capture):
+                self.assertEqual(cl.verdict(0, capture, "", "none", "Succeeded")[0], "red")
+
+    def test_pull_request_and_unbound_receipts_are_red(self) -> None:
+        pr = '{"conclusion":"success","event":"pull_request","head_branch":"main"}'
+        fork_main = '{"conclusion":"success","event":"pull_request_target","head_branch":"main"}'
+        for receipt in (pr, fork_main, '{"conclusion":"success","event":"push","head_branch":"feat/x"}'):
+            self.assertIn("untrusted_ref", cl.verdict(0, "terminal", receipt, "none", None)[1])
+        self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", None, "9", "2"),
+                         ("red", "receipt_unbound"))
+        self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", None, "1", "9"),
+                         ("red", "receipt_unbound"))
 
     def test_everything_short_of_proof_is_red(self) -> None:
+        t = TRUSTED_RECEIPT
         cases = {
-            "timeout": (124, "", "", "none", "Succeeded"),
-            "retarget": (125, "", "", "none", None),
-            "killed": (143, "", "", "none", None),
-            "failed": (0, "", "", "none", "Failed"),
-            "cancelled": (0, "", "", "none", "Canceled"),
-            "no_line": (0, "", "", "none", None),
+            "timeout": (124, "terminal", t, "none", "Succeeded"),
+            "retarget": (125, "terminal", t, "none", None),
+            "killed": (143, "terminal", t, "none", None),
+            "failed": (0, "terminal", t, "none", "Failed"),
+            "cancelled": (0, "terminal", t, "none", "Canceled"),
+            "no_receipt": (0, "", "", "none", None),
             "quarantine": (0, "active", "", "listener_exited_workflow_active", "Succeeded"),
             "api_failure": (0, "terminal", '{"conclusion":"failure"}', "none", "Succeeded"),
             "api_cancel": (0, "terminal", '{"conclusion":"cancelled"}', "none", "Succeeded"),
@@ -253,7 +273,9 @@ class KilledJobRegressionTests(Base):
         scenarios = {
             "vm-timeout": dict(rc=124, log=self.log),
             "vm-signal": dict(rc=0, quarantine="signal_teardown_unknown", log=self.log),
-            "vm-no-line": dict(rc=0, log=self.tmp / "absent.log"),
+            "vm-no-receipt": dict(rc=0, capture=""),
+            "vm-forged-line": dict(rc=0, capture="setup_error"),
+            "vm-pr-job": dict(rc=0, receipt=TRUSTED_RECEIPT.replace('"push"', '"pull_request"')),
         }
         for vm, kwargs in scenarios.items():
             with self.subTest(vm):
@@ -535,6 +557,7 @@ class BootTests(Base):
             tartci_ccache_layer_boot vm-j
             tartci_ccache_layer_attach vm-j
             CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
             tartci_ccache_layer_settle vm-j {runner_rc} "{self.log}" 192.0.2.1
         ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": cmd})
 
@@ -605,6 +628,7 @@ class BootTests(Base):
                     tartci_ccache_layer_boot vm-j
                     tartci_ccache_layer_attach vm-j
                     CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
                     tartci_ccache_layer_settle vm-j 0 "{self.log}" 192.0.2.1
                 ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": cmd or f"cat {tar}", **env})
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -619,6 +643,7 @@ class BootTests(Base):
             tartci_ccache_layer_boot vm-j
             tartci_ccache_layer_attach vm-j
             CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
             tartci_ccache_layer_settle vm-j 0 "{self.log}" 192.0.2.1
         ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": "sleep 60",
                           "TARTCI_CCACHE_LAYER_PULL_SECS": "2"})
@@ -635,6 +660,32 @@ class BootTests(Base):
                        max_bytes=1 << 20, timeout=2)
         self.assertLess(time.monotonic() - started, 30)
         self.assertFalse((self.layout.jobs / "vm-linger").exists())
+
+    def tar_stream(self, members: list[tuple[str, bytes]]) -> io.BytesIO:
+        import tarfile  # noqa: PLC0415
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+        return buf
+
+    def test_receive_cap_counts_rejected_members(self) -> None:
+        # Junk the validator rejects still costs stream bytes; it must hit the cap.
+        self.layout.ensure()
+        stream = self.tar_stream([(f"junk/{i}", b"x" * 4096) for i in range(8)])
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive_stream(self.layout, "vm-junk", os.getpid(), stream, max_bytes=8192)
+        self.assertFalse((self.layout.jobs / "vm-junk").exists())
+
+    def test_receive_rejects_a_repeated_stats_member(self) -> None:
+        self.layout.ensure()
+        stream = self.tar_stream([("stats.txt", b"cache_miss\t1\n")] * 2)
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive_stream(self.layout, "vm-stats", os.getpid(), stream, max_bytes=1 << 20)
+        self.assertFalse((self.layout.jobs / "vm-stats").exists())
 
     def test_isolated_boot_mounts_configure_checks_read_only(self) -> None:
         runner = (Path(__file__).resolve().parents[1] / "providers/tart-macos/runner.sh").read_text()

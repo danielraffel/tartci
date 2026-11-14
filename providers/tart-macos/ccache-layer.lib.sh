@@ -173,6 +173,7 @@ tartci_ccache_layer_settle(){
       --capture-status "${CURRENT_JOB_CAPTURE_STATUS:-}" \
       --receipt "${CURRENT_JOB_RECEIPT:-}" \
       --quarantine "$quarantine" \
+      --run-id "${CURRENT_RUN_ID:-}" --job-id "${CURRENT_JOB_ID:-}" \
       --runner-log "$runner_log" 2>/dev/null | cut -f1)" || decision=""
   if [ "$decision" = green ]; then
     while IFS= read -r line; do pull+=("$line"); done < <(tartci_ccache_layer_pull_argv "$ip")

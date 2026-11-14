@@ -938,13 +938,17 @@ September 2026 torn manifests made every gate build link the wrong objects for
 - write its new entries only to a **guest-local** directory
   (`~/.tartci-ccache/job/remote`, `remote_only`). The guest has no writable
   path, link or inode on the host cache filesystem for its ccache;
-- when, and only when, the job's verdict is green (clean listener exit, the
-  runner's own `completed with result: Succeeded`, no lifecycle quarantine,
-  and a GitHub `success` conclusion whenever the API observed one), the host
+- when, and only when, the job's verdict is green (clean listener exit, no
+  lifecycle quarantine, and the host's own GitHub observation: a `terminal`
+  receipt with conclusion `success`, bound to this run and job, for a trusted
+  ref: a push to `main` or a merge-group run). The guest-written runner log is
+  attacker-controlled output; it can turn a verdict red but never green, and
+  no receipt means red. A pull-request job's results are never promoted. The host
   pulls the guest's entries over ssh as a tar stream while the VM is still up
   (`ccache_layer.py receive`, bounded by `TARTCI_CCACHE_LAYER_PULL_SECS`,
-  default 900, and `TARTCI_CCACHE_LAYER_PULL_MAX`, default 20G). Every member is
-  validated: only regular files named `remote/<k0k1>/<rest>` that start with a
+  default 900, and `TARTCI_CCACHE_LAYER_PULL_MAX`, default 20G; every member's
+  declared size counts against the cap before it is read, accepted or not, and a
+  second `stats.txt` fails the pull). Every member is validated: only regular files named `remote/<k0k1>/<rest>` that start with a
   ccache entry header are written, by the host, `O_EXCL|O_NOFOLLOW`, mode 0644,
   mtime = receive time; links, devices, other paths and non-entries are
   dropped. The layer is promoted into the shared store once `tart list` proves
@@ -983,19 +987,14 @@ to `CCACHE_MAX_SIZE`.
 What it does not close:
 
 - A promoted layer is still the guest's own claim about which object a key
-  names. A **green** job's new results are trusted, and its manifests replace
-  older ones, which can repoint a source at a result that job added. Fork pull
+  names. Only layers from trusted refs (a push to `main`, a merge-group run) are
+  promoted, so a pull-request author cannot repoint a manifest; but a trusted
+  job's new results are trusted, and its manifests replace older ones. Fork pull
   requests never reach these lanes; release-tier boots mount no shared cache.
-- `configure-checks` is still a shared read-write mount on the same host
-  filesystem. Pulp parses it as data and the boot-time tamper check refuses a
-  file outside the writer's format. Whether Virtualization.framework's shared
-  directory honours a guest `link()` from a read-only share into a writable one
-  on the same host filesystem has not been probed; if it does, a writable alias
-  of a read-only file (the shared ccache store, `artifact-cache`,
-  `pip-wheelhouse`) could be made through `configure-checks`. Probe on an idle
-  host (`ln '/Volumes/My Shared Files/ccache-shared/<k>/<f>'
-  '/Volumes/My Shared Files/configure-checks/x'` in a guest) before relying on
-  the read-only mounts against a hostile guest.
+- `configure-checks` is mounted **read-only** under isolation; the guest seeds a
+  local copy with rsync, so no writable share sits beside `ccache-shared` and a
+  cross-share `link()` has no writable target. The cost: configure-check results
+  a job produces are no longer written back to the shared host directory.
 - The operator `providers/tart-macos/run.sh` still mounts the legacy ccache
   read-write, and the Linux provider mounts its own `ccache-linux` read-write;
   neither reaches `<layers>`. Guest network is unchanged (Tart NAT).
