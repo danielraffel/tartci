@@ -160,13 +160,19 @@ class Harness(unittest.TestCase):
             "FAKE_STATE": str(self.state),
             "SSH_AUTH_SOCK": "/tmp/should-never-reach-ssh",
             "TARTCI_HOME_VOLUME_FLOOR": "0",
+            # Keep fake lease admission independent of the CI host profile.
+            # The production command still reads the real host profile.
+            "TARTCI_HOST_CORES": "8",
+            "TARTCI_HOST_MEM_MB": "65536",
+            "TARTCI_ROLE": "light",
         }
         env.update(extra)
         return env
 
     def run_cli(self, *args: str, timeout: float = 120, **extra: str) -> subprocess.CompletedProcess:
         argv = [sys.executable, str(HERE / "run_in_vm.py"), "--src", str(self.src),
-                "--owner", "tester", "--result-json", str(self.tmp / "result.json"), *args]
+                "--owner", "tester", "--result-json", str(self.tmp / "result.json"),
+                "--cores", "1", "--mem-mb", "2048", *args]
         return subprocess.run(argv, env=self.env(**extra), capture_output=True, text=True,
                               timeout=timeout, check=False)
 

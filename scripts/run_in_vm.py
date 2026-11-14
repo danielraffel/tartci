@@ -52,6 +52,8 @@ from typing import Callable, Dict, List, Optional
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from python_child import child_python  # noqa: E402
+
 EXIT_OK = 0
 EXIT_COMMAND_FAILED = 1
 EXIT_USAGE = 2
@@ -312,7 +314,7 @@ def run(argv: List[str], timeout: float, env: Optional[Dict[str, str]] = None,
 
 
 def lease(command: List[str], timeout: float = 60.0) -> subprocess.CompletedProcess:
-    return run([sys.executable, leases_script(), *command], timeout)
+    return run([child_python(), leases_script(), *command], timeout)
 
 
 class Deadline:
@@ -801,7 +803,7 @@ class Run:
         clone_log = Path(self.tmp or ".") / "tart-clone.log"
         with open(clone_log, "wb") as log:
             clone = subprocess.Popen(
-                [sys.executable, leases_script(), "guard-run", "--id", self.lease_id, "--",
+                [child_python(), leases_script(), "guard-run", "--id", self.lease_id, "--",
                  tart_bin(), "clone", self.args.golden, self.name],
                 env={**child_env(), "TART_HOME": self.home}, stdin=subprocess.DEVNULL,
                 stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
@@ -824,7 +826,7 @@ class Run:
             self.admit_again()
         log = open(Path(self.tmp or ".") / "tart-run.log", "wb")  # noqa: SIM115
         self.guardian = subprocess.Popen(
-            [sys.executable, leases_script(), "guard-exec", "--id", self.lease_id, "--",
+            [child_python(), leases_script(), "guard-exec", "--id", self.lease_id, "--",
              tart_bin(), "run", "--no-graphics", *self.mounts(), self.name],
             env={**child_env(), "TART_HOME": self.home}, stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
