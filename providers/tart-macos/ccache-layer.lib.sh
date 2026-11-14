@@ -157,7 +157,7 @@ tartci_ccache_layer_pull_argv(){
     return 0
   fi
   # shellcheck disable=SC2016 # expands in the guest
-  printf '%s\n' ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
+  printf '%s\n' ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     'cd "$HOME/.tartci-ccache/job" && CCACHE_DIR="$HOME/.tartci-ccache/job/local" ccache --print-stats >stats.txt 2>/dev/null; tar -cf - stats.txt remote'
 }
 

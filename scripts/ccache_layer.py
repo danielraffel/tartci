@@ -421,7 +421,7 @@ def layer_stats(layer: Path, ccache: str | None) -> dict[str, int] | None:
             return None
         return {k: v for k, v in data.items() if k in STATS_KEYS and type(v) is int} or None
     local = layer / "local"
-    if not ccache or local.is_symlink() or not local.is_dir():
+    if not ccache or local.is_symlink():
         return None
     # Read no ccache.conf from the layer (ccache_guard.HOST_CCACHE_CONFIG).
     env = dict(os.environ, CCACHE_DIR=str(local), CCACHE_CONFIGPATH=os.devnull)
