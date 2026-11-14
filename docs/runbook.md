@@ -4367,6 +4367,185 @@ tartci scratch-vm delete <name>               # when done, before the TTL
   (`ghcr.io/cirruslabs/ubuntu@sha256:cb46e376...`); pass `--from` for a local
   golden.
 
+## Running untrusted code in a disposable VM (`tartci run-in-vm`)
+
+`tartci run-in-vm` runs one command against a source tree inside a disposable
+macOS VM and returns its output, a patch and named files. It exists so that a
+lane which must execute a pull request's own scripts (gates, pre-push checks,
+builds, tests, regenerators) never runs them as the host user, where they could
+read the host's keys, tokens, SSH agent and every same-user process's
+environment. The host keeps its credentials and its git plumbing; only the
+command runs in the guest.
+
+```sh
+tartci run-in-vm --src <worktree> --owner <lane> [--timeout 2700] \
+  [--patch-out out.patch] [--artifacts-out out.tar --artifact build/report.json] \
+  [--result-json result.json] -- tools/scripts/gates.sh origin/main
+```
+
+The patch is attacker-controlled data. Before the host pushes it:
+
+```sh
+git -C <worktree> apply --check out.patch            # applies cleanly, nothing else
+git apply --numstat out.patch | cut -f3              # review every path it touches;
+# refuse changes under .githooks/, .github/, .shipyard/, tools/ci/ (anything a
+# host push, hook or CI on a privileged runner would execute) unless the repair
+# was meant to change them
+git -C <worktree> apply out.patch
+git -C <worktree> -c core.hooksPath=/dev/null push --no-verify ...
+```
+
+Push with hooks off: the hooks already ran in the VM, and a hook taken from the
+patched tree would run as the credentialed host user, which is exactly what
+this command exists to prevent.
+
+What it does, in order:
+
+1. Takes a host-local lock (`~/.tartci/state/run-in-vm/host.lock`, a `flock`
+   the kernel drops if the process dies): **at most one run-in-vm per host**.
+   Under the lock it removes scratch directories left by a run whose process is
+   gone.
+2. Prepares on the host, before any admission: a scratch directory on the cache
+   volume (`<cache_root>/run-in-vm/run-*`, never the boot disk), a `git bundle`
+   of `HEAD` and `refs/remotes/origin/main` (plus any `--git-ref`), and an
+   **export** of the source tree (below), which is what the guest mounts.
+3. Admission, immediately before the clone: refuses (exit 75) while the pool is
+   not `on` or a transition lock exists, while another `scratch-rivm-*` VM is
+   listed, and when booting one more macOS guest would leave fewer than
+   `--min-free-slots` (default 1) of the host's `--macos-vm-cap` (default 2)
+   slots for the gates. With the defaults it starts only when no macOS guest is
+   running. A leftover `scratch-rivm-*` VM whose recorded run-in-vm owner
+   process is gone (pid and start time) is stopped, deleted and proved absent
+   instead of refusing; one whose owner is alive, or that has no run-in-vm
+   record, is refused.
+4. Records the VM as a scratch VM (`scratch-rivm-<owner>-<UTC stamp>`, owner
+   `run-in-vm:<owner>`, the owner pid and its start time, TTL = `--timeout` +
+   30 min), so the launchd watchdog deletes it even if run-in-vm is killed with
+   SIGKILL.
+5. Takes a `tart-macos-vm` lease at `background` priority (10, the lowest) in
+   the same lease store the lanes use, sized `--cores` (default 4) and
+   `--mem-mb` (default 8192), smaller than a gate VM. A denial is exit 75. The
+   clone runs under `leases.py guard-run` in its own process session (a timeout
+   or signal kills the guard and its `tart clone` writer together), and
+   `tart run` under `guard-exec`, as in the lanes.
+6. Clones the golden (`pulp-build-runner:latest`) and sizes it, then **checks
+   admission again** (a gate may have booted meanwhile; exit 75, the clone is
+   deleted), boots it with the mounts below and a mandatory Softnet default-deny
+   policy, and waits for an IP (120 s) and ssh (180 s). A boot failure's reason
+   carries the tail of `tart run`'s own output (`tart_run_log_tail` in
+   `--result-json`). The host must provide
+   `~/.config/tartci/run-in-vm-network.json` (or
+   `TARTCI_RIVM_NETWORK_POLICY`) with
+   `{"version":1,"mode":"softnet","allow":["<DNS-or-relay-IPv4>/32", ...]}`.
+   Missing, malformed, or unrestricted policy refuses before a VM is created.
+7. Copies `/Volumes/My Shared Files/src` into a guest-writable `~/work`,
+   rebuilds git history there from the bundle, resets the index to the host's
+   commit so uncommitted host changes still read as changes, and commits a
+   baseline. The patch is `git diff --binary` against that baseline.
+8. Runs the command (argv quoted exactly, stdin `/dev/null`). Its stdout and
+   stderr are copied to the caller's up to `--max-log-bytes` (default 64 MiB,
+   then dropped and `log_truncated` set). Then streams the patch and the tar
+   back over ssh, each capped by `--max-output-bytes` (default 512 MiB); their
+   ssh stderr goes to a file, so a noisy guest cannot stall the stream.
+9. While the VM runs, every 30 s it heartbeats the lease and checks for gate
+   demand: if this lease is marked `preempted`, a live VM-lease waiter above
+   background priority is registered in the lease store's `waiters.json` (lanes
+   register there when `rank_vm_waiters` or fair share is on), or either read
+   fails, it **yields**: tears the VM down and exits 79.
+10. Stops and deletes the VM, proves it is gone (`tart list`, else the store
+    directory), releases the lease and removes the scratch record and the
+    scratch directory. Any clone attempt counts: a timed-out or interrupted
+    clone is deleted and proved absent too. If deletion is not proved, the
+    lease and the record stay, and the watchdog deletes the VM at its TTL.
+
+`--timeout` (default 2700, at most 14400) bounds the whole run, export and boot
+included, by wall clock; teardown runs after it.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | the command exited 0, every requested output was collected, the VM is proved deleted |
+| 1 | the command exited non-zero; its own code is `guest_rc` in `--result-json`. Outputs were still collected |
+| 2 | bad arguments; nothing was started |
+| 75 | refused: another run-in-vm holds this host, the pool is not on, no macOS slot would stay free for the gates (before the clone, or again right before boot), a live run-in-vm VM is left over, or the lease store denied the lease. Retry later |
+| 76 | export, bundle, clone, size, boot, IP, ssh, guest preparation, or the ssh connection itself (ssh rc 255) failed |
+| 77 | the command ran but the patch or artifact stream failed or exceeded `--max-output-bytes` |
+| 78 | the VM could not be proved deleted; its scratch record stays for the watchdog. Overrides every code but 2 |
+| 79 | gate work started waiting for this host's capacity; the run yielded and the VM was torn down. Retry later |
+| 124 | the `--timeout` wall clock ran out; the VM was torn down |
+| 130 | SIGINT or SIGTERM; the VM was torn down |
+
+A command that itself exits 255 reads as 76: ssh cannot tell the two apart.
+Reasons in `--result-json` are printable text only (no terminal escapes).
+
+### Isolation guarantees, and what they do not cover
+
+- **Process.** The command runs in a separate macOS guest. It cannot read host
+  process memory or any host process's environment (`KERN_PROCARGS2` does not
+  cross the VM boundary), and the host never executes anything from the source
+  tree. Its only work on it is `git rev-parse`, `git bundle create` and
+  `git ls-files` (with `core.fsmonitor=false`, no system config), which run no
+  hooks or filters from the tree, and copying files.
+- **Filesystem.** The guest sees exactly these host directories, every one
+  read-only:
+  - `src`: a host-side **export**, not the work tree. It holds the files git
+    would ship: tracked files as they are in the work tree (uncommitted edits
+    included) plus untracked files that are not ignored. It never holds
+    `.git`, ignored files (`build/`, `.env`, local configuration), or submodule
+    checkouts (a submodule such as a private `planning/` is left out).
+    Symlinks are copied as links and never followed. `--exclude` patterns
+    (fnmatch on a relative path or any of its parent directories; a leading
+    `/` anchors at the root) are applied on the host, so an excluded file is
+    not readable in the guest at all. Anything a PR commits, or that sits
+    untracked and un-ignored in the work tree, **is** visible to the guest.
+  - `gitbundle`: the run's scratch directory, holding the bundle (only the
+    named refs' history, not the repository config, hooks or other branches)
+    and the export.
+  - When present: `ccache-shared` (the gate ccache's shared store,
+    `<cache_root>/ccache-layers-v1/shared`, a sibling of the legacy writable
+    `ccache` directory, read through ccache's `read-only` remote),
+    `fetchcontent`, `pip-wheelhouse` and `artifact-cache`.
+
+  It never mounts the live work tree, the writable gate ccache directory, the
+  configure-check cache, a home directory, `~/.config` or `~/.ssh`, so a run
+  cannot write any host cache or plant anything a later job reads. The guest's
+  own ccache and configure-check caches are guest-local and discarded with the
+  VM.
+- **Keychain.** No host keychain, certificate or signing material enters the
+  guest.
+- **Credentials.** None enter the guest. ssh runs with `-F /dev/null` (no user
+  or system ssh config, so no `SendEnv`), `IdentitiesOnly=yes`,
+  `IdentityAgent=none`, `ForwardAgent=no`, `ClearAllForwardings=yes`, no
+  control socket, and an environment of `PATH`, `HOME` and `LANG` only;
+  `SSH_AUTH_SOCK` is removed before anything starts. The host's
+  `~/.ssh/id_ed25519` is used as the client key into the guest and never copied
+  into it. GitHub App keys, cached installation tokens, `~/.config/pulp/secrets`
+  and model credentials stay on the host; the caller pushes from the host with
+  code it never executed, hooks off (above).
+- **Network.** The guest is booted with Tart Softnet, a default-deny IPv4
+  policy, and only the DNS or relay CIDRs in the host-owned run-in-vm policy.
+  Tart's unrestricted shared NAT is never used as an isolation fallback. A
+  missing policy refuses before clone, and a policy that allows `0.0.0.0/0` is
+  rejected. The policy must include every destination needed by the command;
+  network access is otherwise unavailable.
+- **Persistence.** Nothing is writable on the host, and the VM, its disk, its
+  build directory and the run's scratch directory are deleted at the end of
+  every run.
+- **Gate capacity.** A repair VM holds one of Apple's two macOS guest slots.
+  With the defaults it boots only when both are free, re-checks right before
+  boot, and yields (exit 79) as soon as gate work registers as waiting. Lanes
+  that do not register waiters (neither `rank_vm_waiters` nor fair share on)
+  give it no signal, so there it holds the slot until `--timeout` (default 45
+  minutes).
+- **Residuals.** What comes back (stdout, stderr, the patch, the tar) is
+  attacker-controlled data: check and review the patch as above, extract the
+  tar only as an unprivileged user into an empty directory, and do not render
+  the logs in a terminal that trusts escape sequences.
+
+Switching the Shipyard pass-runner's repair and operator lanes to this command
+is owned by the m5s Shipyard session; this command does not change any lane.
+
 ## Leaked lane clones
 
 `vm_reap` deletes a stopped clone of a loaded lane, `<runner>-<pid>-<n>`,

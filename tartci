@@ -16,6 +16,8 @@
 #                              # free regenerable caches (old gate ccache, unreferenced OCI images)
 #   tartci scratch-vm create --owner AGENT --ttl HOURS [--from IMAGE]
 #                                        # a test VM the watchdog deletes on its TTL
+#   tartci run-in-vm --src DIR --owner NAME [--timeout S] [--patch-out F] -- CMD...
+#                                        # run CMD in a disposable credential-free VM (one per host)
 #   tartci image-prune [--apply] [--json] # plan (default) or remove unreferenced Tart images
 #   tartci retention [--apply] [--json]   # plan (default) or prune old per-boot state + generations
 #   tartci artifact-cache <add|git-sync|refresh|compact|prune|status> # guest read-only cache
@@ -1647,6 +1649,7 @@ case "${1:-help}" in
   doctor)  shift; cmd_doctor "$@" ;;
   reclaim) shift; cmd_reclaim "$@" ;;
   scratch-vm) shift; tartci_verified_python_run "$HERE/scripts/scratch_vm.py" "$@" ;;
+  run-in-vm) shift; tartci_verified_python_run "$HERE/scripts/run_in_vm.py" "$@" ;;
   disk)    shift; cmd_disk "$@" ;;
   job-claim) shift; tartci_toml_exec_or_python3 "$HERE/scripts/job_claim.py" "$@" ;;
   image-prune) shift; tartci_toml_exec "$HERE/scripts/tart_image_prune.py" "$@" ;;
