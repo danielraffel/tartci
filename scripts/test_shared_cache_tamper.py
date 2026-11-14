@@ -236,6 +236,23 @@ class TamperRefusalTests(unittest.TestCase):
         self.assertIn("rc=0 refusal=\n", unmounted.stdout)
 
 
+    def test_isolated_boot_skips_the_legacy_ccache_guard(self) -> None:
+        # With write isolation the VM never mounts the legacy ccache directory,
+        # so its preparation and the guard's walk would only delay the boot.
+        stubs = ('tartci_prepare_disk_root(){ mkdir -p "$1"; printf "prep %s\\n" "$1"; }\n'
+                 'tartci_ccache_guard(){ printf "guard %s\\n" "$1"; }\n')
+        script = stubs + 'tartci_prepare_lane_cache_mounts "$1" "" "$2" 1 "$3"; echo "rc=$?"'
+        fetch = str(self.root.parent / "fetchcontent")
+        legacy = str(self.root / "ccache")
+        isolated = lib(script, str(self.root), fetch, "1")
+        self.assertIn("rc=0", isolated.stdout)
+        self.assertNotIn(f"guard {legacy}", isolated.stdout)
+        self.assertNotIn(f"prep {legacy}\n", isolated.stdout)
+        self.assertIn(f"prep {self.root}/configure-checks", isolated.stdout)
+        unisolated = lib(script, str(self.root), fetch, "0")
+        self.assertIn(f"guard {legacy}", unisolated.stdout)
+
+
 class ReleaseTierLabelTests(unittest.TestCase):
     def mounts(self, labels: str, **env: str) -> bool:
         result = lib('tartci_labels_mount_shared_cache "$1"', labels, env=env)

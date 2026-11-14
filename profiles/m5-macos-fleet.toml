@@ -102,6 +102,9 @@ checkout_build_outputs = true
 # ok-run median from 89 s to 11 s at the same hit rate, and the trim is now on
 # every macOS fleet host. Rollback: delete this key.
 gate_ccache_trim = true
+# Every lane runs with ccache write isolation, so the legacy gate cache is no
+# longer mounted or hit; age it out in days, not weeks. Rollback: delete.
+gate_ccache_max_age_days = 3
 
 # Canary: rank waiting VM lanes by the lease priority they already carry
 # (scripts/leases.py). Six VM lanes share this host's one free 6-core VM slot

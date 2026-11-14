@@ -130,6 +130,9 @@ worktree_root_checkouts = true
 # 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
 # rate held at 99.49% (99.51% before). Rollback: delete this key.
 gate_ccache_trim = true
+# Every lane runs with ccache write isolation, so the legacy gate cache is no
+# longer mounted or hit; age it out in days, not weeks. Rollback: delete.
+gate_ccache_max_age_days = 3
 
 # Merge-group-first VM slot priority (scripts/slot_priority.py). Pulp's merge
 # queue waited an hour or more for macOS VM slots behind PR-head jobs on

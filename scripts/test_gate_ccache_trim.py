@@ -179,14 +179,15 @@ class Settings(unittest.TestCase):
     def test_every_macos_fleet_profile_opts_in_with_the_default_window(self):
         # The m5 canary held the per-job hit rate (99.49% against 99.51%) while
         # the pre-boot guard's ok-run median fell from 89 s to 11 s, so every
-        # macOS fleet host runs it at the defaults.
+        # macOS fleet host runs it. With ccache write isolation on every lane
+        # the legacy cache is no longer hit, so it ages out at the 3-day floor.
         profiles = sorted((HERE.parent / "profiles").glob("*-macos-fleet.toml"))
         self.assertEqual([p.name.split("-macos")[0] for p in profiles],
                          ["m1", "m3", "m5", "m5studio"])
         for profile in profiles:
             settings, why = trim.load_settings(profile)
             self.assertEqual(why, "enabled", profile.name)
-            self.assertEqual((settings["max_age_days"], settings["interval_hours"]), (14, 24),
+            self.assertEqual((settings["max_age_days"], settings["interval_hours"]), (3, 24),
                              profile.name)
 
 
