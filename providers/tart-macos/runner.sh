@@ -1224,6 +1224,14 @@ tartci_storage_health_check(){
       heartbeat tcc-attribution-wedge
       note "Tart store health is unknown — TCC attribution wedge (sandboxd/tccd not answering Removable Volumes checks; heal: $heal_outcome) — deferring new VM admission"
       ;;
+    "tcc_prompt_pending "*)
+      # Same blocked heartbeat phase as the wedge: admission waits on TCC.
+      heal_outcome="${cause#tcc_prompt_pending }"
+      event tcc_prompt_pending "Tart store opens wait behind an unanswered privacy consent alert" \
+        "state=unknown" "path=$path" "reason=$reason" "heal=$heal_outcome"
+      heartbeat tcc-attribution-wedge
+      note "Tart store health is unknown — a macOS privacy consent alert is waiting on the console (owner paged; heal: $heal_outcome) — deferring new VM admission"
+      ;;
     *)
       event yielded_storage_health "Tart store probe failed" \
         "state=unknown" "path=$path" "reason=$reason"

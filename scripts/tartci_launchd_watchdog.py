@@ -76,6 +76,7 @@ from typing import Any, NamedTuple
 
 import macos_runner_identity
 import store_health
+import tcc_prompt
 import tcc_wedge
 
 try:
@@ -1539,6 +1540,47 @@ def peer_stall_pass(now: float | None = None) -> str | None:
     return None
 
 
+def consent_alert_reading(save: bool = True, observe=None,
+                          timeout_s: float = 10.0) -> dict[str, Any] | None:
+    """This pass's privacy-consent-alert reading (scripts/tcc_prompt.py), or
+    None when it could not be taken. Never raises.
+
+    With an alert on screen it runs the fresh launchd probe of the store
+    itself, so the reading does not depend on this watchdog's own store probe
+    (whose context may hold a grant and answer while ungranted jobs hang).
+    """
+    try:
+        tart_home, _ = resolve_tart_home()
+        state_dir = os.path.join(os.environ.get(
+            "TARTCI_HOME", os.path.expanduser("~/.tartci")), "state")
+        launchd = (tcc_wedge.launchd_probe_from_env(tart_home, state_dir, timeout_s)
+                   if tart_home else None)
+        return (observe or tcc_prompt.observe)(
+            save=save, launchd=launchd,
+            context=tcc_wedge.context_probe_from_env(timeout_s=timeout_s))
+    except Exception:  # noqa: BLE001 - the store pass must go on without it
+        return None
+
+
+def tcc_prompt_pass(reading: dict[str, Any] | None, store_state: dict[str, Any] | None,
+                    now: float | None = None, issue=None, close=None,
+                    heal=None) -> str | None:
+    """Page once per episode while a consent alert holds the store
+    (scripts/tcc_prompt.py). Never raises."""
+    if not reading:
+        return None
+    try:
+        return tcc_prompt.alert_pass(reading, store_state,
+                                     now=utcnow() if now is None else now,
+                                     fresh_s=tcc_wedge.FRESH_S,
+                                     heal_after_s=tcc_wedge.PROMPT_HEAL_AFTER_S,
+                                     issue=issue, close=close, heal=heal,
+                                     heal_enabled=os.environ.get("TARTCI_TCC_HEAL", "1") != "0")
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-prompt check FAILED "
+                f"({type(exc).__name__}: {exc}); a waiting consent alert would not be paged")
+
+
 def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
     """Raise one issue while a tartci LaunchAgent on this host refuses to run
     an unpinned interpreter (scripts/interpreter_alert.py). Never raises."""
@@ -1851,8 +1893,12 @@ def store_health_pass(
     dry_run: bool,
     timeout_s: float = 10.0,
     failure_threshold: int = 2,
+    consent_alert: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Probe the Tart store and fail closed after repeated I/O failures.
+
+    `consent_alert` is this pass's tcc_prompt.observe reading; with an alert on
+    screen a hang can classify as tcc_prompt_pending.
 
     State is kept under TARTCI_HOME (normally the internal boot volume).  A
     store timeout must not strand the watchdog, so the probe itself is always
@@ -1901,7 +1947,9 @@ def store_health_pass(
                 context_probe=tcc_wedge.context_probe_from_env(timeout_s=timeout_s),
                 launchd_probe=launchd_probe,
                 launchd_probe_disabled=(launchd_probe is None and
-                                        os.environ.get("TARTCI_TCC_LAUNCHD_PROBE", "1") == "0"))
+                                        os.environ.get("TARTCI_TCC_LAUNCHD_PROBE", "1") == "0"),
+                consent_alert=(None if consent_alert is None
+                               else (lambda: dict(consent_alert))))
         except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive
             state["classification"] = {"kind": "classifier_error", "reason": str(exc)[:300],
                                        "evidence": {}, "classified_at": _iso(time.time())}
@@ -2014,13 +2062,22 @@ def main(argv: list[str] | None = None) -> int:
 
     agents = discover_agents(args.launch_agents_dir)
     participating = pool_participating(args.participation_file)
+    consent_alert = consent_alert_reading(save=not (args.status or args.dry_run),
+                                          timeout_s=args.store_health_timeout_seconds)
     store_health_result = store_health_pass(
         participation_file=args.participation_file,
         status_only=args.status,
         dry_run=args.dry_run,
         timeout_s=args.store_health_timeout_seconds,
         failure_threshold=args.store_health_failure_threshold,
+        consent_alert=consent_alert,
     )
+    # Page right away, not in the late alert block: an unanswered consent alert
+    # holds every launchd open of the store until someone clicks it.
+    if not (args.status or args.dry_run):
+        prompt_line = tcc_prompt_pass(consent_alert, store_health_result)
+        if prompt_line:
+            print(prompt_line)
     # Compute the VM-running guard ONCE per pass, but only after storage health
     # is proven. A Tart inventory call can itself block on a wedged external
     # volume; never let it outrun the bounded storage gate.
