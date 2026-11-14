@@ -17,12 +17,19 @@ layer after the job:
            whose promoter died is promoted again (promotion is idempotent);
   trim     keep ``shared/`` under a size cap, oldest entries first.
 
-Layout under the layers root (inside the host ccache directory the guest
-mounts, so every move is a same-filesystem rename):
+The guest has NO writable ccache mount on the host. It mounts the shared store
+read-only and writes its new entries to a guest-local directory; when the job
+ends green, the host pulls those entries over ssh as a tar stream (``receive``)
+and validates every member before it lands in a job layer. A guest therefore
+holds no path, link or inode on the host cache filesystem it could write.
 
-  shared/<k0k1>/<rest>      ccache ``file:`` remote-storage layout, read by guests
-  jobs/<vm>/local/          the guest's CCACHE_DIR (stats only: remote_only)
-  jobs/<vm>/remote/         the guest's writable remote storage
+Layout under the layers root ($CACHE_ROOT/ccache-layers-v1, a sibling of the
+legacy ccache directory, so no legacy read-write mount reaches it):
+
+  shared/<k0k1>/<rest>      ccache ``file:`` remote-storage layout; guests mount
+                            it read-only
+  jobs/<vm>/remote/         entries received from a green guest (host-only)
+  jobs/<vm>/stats.json      the guest's own hit/miss counters, as data
   green/<vm>/  discard/<vm>/
 
 Host-only state (never mounted into a guest) lives in a separate state
@@ -50,8 +57,10 @@ import json
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
@@ -91,25 +100,55 @@ def runner_log_result(path: Path | None) -> str | None:
     return result
 
 
+TRUSTED_BRANCHES = ("main",)
+
+
+def trusted_ref(receipt: dict) -> str | None:
+    """Why this run's ref may feed the shared store, or None.
+
+    Only a push to a protected branch or a merge-group run is trusted: those
+    run reviewed code. A pull-request job runs code its author controls, so its
+    results never reach the store later trusted builds read.
+    """
+    event, branch = receipt.get("event"), receipt.get("head_branch")
+    if event == "merge_group":
+        return "merge_group"
+    if event == "push" and branch in TRUSTED_BRANCHES:
+        return f"push:{branch}"
+    return None
+
+
 def verdict(runner_rc: int, capture_status: str, receipt: str, quarantine: str,
-            local_result: str | None) -> tuple[str, str]:
-    """(``green``|``red``, reason). Anything short of positive proof is red."""
+            local_result: str | None, run_id: str = "", job_id: str = "") -> tuple[str, str]:
+    """(``green``|``red``, reason). Anything short of positive proof is red.
+
+    The proof is the host's own GitHub observation: a terminal receipt with
+    conclusion=success, bound to this run and job, for a trusted ref. The
+    guest-written runner log is attacker-controlled output, so it can only
+    downgrade a verdict, never establish one.
+    """
     if runner_rc != 0:
         return "red", f"runner_rc={runner_rc}"
     if quarantine not in ("", "none"):
         return "red", f"quarantine={quarantine}"
-    if local_result is None:
-        return "red", "no_completion_line"
-    if local_result not in GREEN_RESULTS:
+    if local_result is not None and local_result not in GREEN_RESULTS:
         return "red", f"result={local_result}"
-    if capture_status == "terminal":
-        try:
-            conclusion = json.loads(receipt or "{}").get("conclusion")
-        except (json.JSONDecodeError, AttributeError):
-            return "red", "receipt_unreadable"
-        if conclusion != "success":
-            return "red", f"conclusion={conclusion}"
-    return "green", f"result={local_result}"
+    if capture_status != "terminal":
+        return "red", f"no_host_receipt={capture_status or 'none'}"
+    try:
+        data = json.loads(receipt or "{}")
+        conclusion = data.get("conclusion")
+    except (json.JSONDecodeError, AttributeError):
+        return "red", "receipt_unreadable"
+    if conclusion != "success":
+        return "red", f"conclusion={conclusion}"
+    if (run_id and str(data.get("run_id")) != str(run_id)) or \
+            (job_id and str(data.get("job_id")) != str(job_id)):
+        return "red", "receipt_unbound"
+    trust = trusted_ref(data)
+    if trust is None:
+        return "red", f"untrusted_ref={data.get('event')}:{data.get('head_branch')}"
+    return "green", f"receipt={trust}"
 
 
 # ── Paths, locks, audit ────────────────────────────────────────────────────
@@ -129,9 +168,23 @@ class Layout:
         self.audit = state / "audit.jsonl"
 
     def ensure(self) -> None:
+        # Tart mounts shared/ and jobs/<vm> by path, and every move below is a
+        # rename by path: a symlink anywhere on the way would mount, promote
+        # into or delete whatever it points at. mkdir(exist_ok) accepts a link
+        # to a directory, so check before and after creating.
+        self.refuse_links()
         for path in (self.shared, self.jobs, self.green, self.discard,
                      self.owners, self.locks, self.promotions):
             path.mkdir(parents=True, exist_ok=True)
+        self.refuse_links()
+
+    def refuse_links(self) -> None:
+        for path in (self.root, self.shared, self.jobs, self.green, self.discard,
+                     self.state):
+            if path.is_symlink():
+                raise ValueError(f"{path} is a symlink; refusing to use it")
+            if path.exists() and not path.is_dir():
+                raise ValueError(f"{path} is not a directory")
 
 
 def check_vm(vm: str) -> str:
@@ -224,7 +277,7 @@ def settle(layout: Layout, vm: str, runner_rc: int, capture_status: str,
     layout.ensure()
     local_result = runner_log_result(runner_log)
     decision, reason = verdict(runner_rc, capture_status, receipt, quarantine,
-                               local_result)
+                               local_result, run_id, job_id)
     layer = layout.jobs / vm
     if not layer.is_dir() or layer.is_symlink():
         audit(layout, "settle", vm=vm, verdict=decision, reason=reason,
@@ -336,7 +389,13 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
                               "rejected": 0, "bytes": 0}
     keys: list[str] = []
     lock_path = layout.locks / "shared-manifests.lock"
-    for key_dir, name, path in iter_layer_entries(layer / "remote"):
+    remote = layer / "remote"
+    # The guest owns jobs/<vm> read-write, so it can swap remote/ for a link
+    # to any host directory; scandir would follow it. Promote nothing then.
+    if layer.is_symlink() or remote.is_symlink():
+        counts["rejected"] += 1
+        return {**counts, "keys": keys}
+    for key_dir, name, path in iter_layer_entries(remote):
         if not KEY_DIR.fullmatch(key_dir) or not KEY_NAME.fullmatch(name):
             counts["rejected"] += 1
             continue
@@ -366,26 +425,170 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
     return {**counts, "keys": keys}
 
 
+STATS_KEYS = {"direct_cache_hit", "preprocessed_cache_hit", "cache_miss",
+              "remote_storage_hit", "remote_storage_miss", "remote_storage_error"}
+
+
+def parse_stats(text: str) -> dict[str, int]:
+    """Whitelisted integer counters from ``ccache --print-stats`` output."""
+    stats: dict[str, int] = {}
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[0] in STATS_KEYS and parts[1].isdigit() \
+                and len(parts[1]) <= 15:
+            stats[parts[0]] = int(parts[1])
+    return stats
+
+
 def layer_stats(layer: Path, ccache: str | None) -> dict[str, int] | None:
-    """Hit/miss counters from the job's own stats, when a host ccache exists."""
-    if not ccache:
+    """Hit/miss counters for a layer: the guest's own (received as data), or,
+    for a host-side layer with a real ``local/`` directory, the host ccache's."""
+    received = layer / "stats.json"
+    if received.is_file() and not received.is_symlink():
+        try:
+            data = json.loads(received.read_text())
+        except (OSError, ValueError):
+            return None
+        return {k: v for k, v in data.items() if k in STATS_KEYS and type(v) is int} or None
+    local = layer / "local"
+    if not ccache or local.is_symlink():
         return None
-    # The layer sits inside the guest-writable mount, so read no ccache.conf
-    # from it (ccache_guard.HOST_CCACHE_CONFIG).
-    env = dict(os.environ, CCACHE_DIR=str(layer / "local"), CCACHE_CONFIGPATH=os.devnull)
+    # Read no ccache.conf from the layer (ccache_guard.HOST_CCACHE_CONFIG).
+    env = dict(os.environ, CCACHE_DIR=str(local), CCACHE_CONFIGPATH=os.devnull)
     try:
         output = subprocess.run([ccache, "--print-stats"], env=env, text=True,
                                 capture_output=True, timeout=30, check=False)
     except (OSError, subprocess.SubprocessError):
         return None
-    wanted = {"direct_cache_hit", "preprocessed_cache_hit", "cache_miss",
-              "remote_storage_hit", "remote_storage_miss", "remote_storage_error"}
-    stats: dict[str, int] = {}
-    for line in output.stdout.splitlines():
-        parts = line.split("\t")
-        if len(parts) == 2 and parts[0] in wanted and parts[1].isdigit():
-            stats[parts[0]] = int(parts[1])
-    return stats or None
+    return parse_stats(output.stdout) or None
+
+
+# ── Receive (pull a green guest's entries) ─────────────────────────────────
+
+MEMBER = re.compile(r"^remote/([0-9a-z]{2})/([0-9a-z]{8,128})$")
+STATS_MEMBER = "stats.txt"
+STATS_MAX = 64 * 1024
+
+
+class ReceiveError(Exception):
+    pass
+
+
+def receive_stream(layout: Layout, vm: str, owner_pid: int, stream,
+                   max_bytes: int, now: float | None = None) -> dict[str, int]:
+    """Validate a guest's tar stream into a fresh ``jobs/<vm>`` layer.
+
+    Only regular files named ``remote/<k0k1>/<rest>`` that start with a ccache
+    entry header, and an optional small ``stats.txt``, are written. Nothing a
+    guest names is followed or trusted: no links, no devices, no other paths,
+    and every file is created here (O_EXCL|O_NOFOLLOW, 0644, mtime = now), so
+    the guest's mtimes and modes never reach the shared store.
+    """
+    import tarfile  # noqa: PLC0415
+
+    layer = attach(layout, vm, owner_pid)
+    remote = layer / "remote"
+    stamp = time.time() if now is None else now
+    counts = {"received": 0, "rejected": 0, "bytes": 0}
+    total = 0
+    try:
+        with tarfile.open(fileobj=stream, mode="r|") as archive:
+            seen_stats = False
+            for member in archive:
+                # Every member's declared size counts against the cap before any
+                # of it is read, whether or not the member is then accepted.
+                total += max(member.size, 0) + 512
+                if total > max_bytes:
+                    raise ReceiveError(f"stream exceeds {max_bytes} bytes")
+                name = member.name
+                while name.startswith("./"):
+                    name = name[2:]
+                name = name.rstrip("/")
+                if member.isdir() and (name in ("", "remote") or
+                                       re.fullmatch(r"remote/[0-9a-z]{2}", name)):
+                    continue
+                if name == STATS_MEMBER:
+                    if seen_stats or not member.isfile() or member.size > STATS_MAX:
+                        raise ReceiveError("duplicate or oversized stats member")
+                    seen_stats = True
+                    handle = archive.extractfile(member)
+                    text = handle.read(STATS_MAX).decode("utf-8", "replace") if handle else ""
+                    (layer / "stats.json").write_text(json.dumps(parse_stats(text)))
+                    continue
+                match = MEMBER.fullmatch(name)
+                if not match or not member.isfile():
+                    counts["rejected"] += 1
+                    continue
+                handle = archive.extractfile(member)
+                header = handle.read(ENTRY_HEADER_MIN) if handle else b""
+                if len(header) < ENTRY_HEADER_MIN or header[:2] != ENTRY_MAGIC \
+                        or header[3] not in (ENTRY_TYPE_RESULT, ENTRY_TYPE_MANIFEST):
+                    counts["rejected"] += 1
+                    continue
+                key_dir = remote / match.group(1)
+                key_dir.mkdir(exist_ok=True)
+                dest = key_dir / match.group(2)
+                try:
+                    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                                 | getattr(os, "O_NOFOLLOW", 0), 0o644)
+                except FileExistsError:
+                    counts["rejected"] += 1
+                    continue
+                with os.fdopen(fd, "wb") as out:
+                    out.write(header)
+                    shutil.copyfileobj(handle, out, 1 << 20)
+                os.chmod(dest, 0o644)
+                os.utime(dest, (stamp, stamp))
+                counts["received"] += 1
+                counts["bytes"] += member.size
+    except (tarfile.TarError, OSError, ReceiveError) as exc:
+        discard_path = unique_target(layout.discard, vm)
+        os.rename(layer, discard_path)
+        with contextlib.suppress(OSError):
+            (layout.owners / vm).unlink()
+        remove_tree(discard_path)
+        audit(layout, "receive_failed", vm=vm, reason=str(exc)[:200], **counts)
+        raise ReceiveError(str(exc)) from exc
+    audit(layout, "receive", vm=vm, **counts)
+    return counts
+
+
+def receive(layout: Layout, vm: str, owner_pid: int, command: list[str],
+            max_bytes: int, timeout: float) -> dict[str, int]:
+    """Run ``command`` (the ssh that tars the guest's layer) under a wall-clock
+    bound and receive its stdout."""
+    check_vm(vm)
+    proc = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.DEVNULL, start_new_session=True)
+    timer = threading.Timer(timeout, lambda: _kill_group(proc))
+    timer.start()
+    try:
+        counts = receive_stream(layout, vm, owner_pid, proc.stdout, max_bytes)
+        # The bound covers the wait too: a command that closes stdout but stays
+        # alive is killed (and reaped) when the timer fires.
+        rc = proc.wait()
+    except ReceiveError:
+        _kill_group(proc)
+        proc.wait()
+        raise
+    finally:
+        timer.cancel()
+    if rc != 0:
+        settle_path = layout.jobs / vm
+        if settle_path.exists():
+            target = unique_target(layout.discard, vm)
+            os.rename(settle_path, target)
+            remove_tree(target)
+        with contextlib.suppress(OSError):
+            (layout.owners / vm).unlink()
+        audit(layout, "receive_failed", vm=vm, reason=f"rc={rc}", **counts)
+        raise ReceiveError(f"pull command exited {rc}")
+    return counts
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(proc.pid, signal.SIGKILL)
 
 
 def wait_vm_gone(vm: str, is_present: Callable[[str], bool], timeout: float,
@@ -550,7 +753,7 @@ def parse_size(value: str) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ccache_layer")
     parser.add_argument("--root", required=True, type=Path,
-                        help="layers root inside the host ccache directory")
+                        help="layers root ($CACHE_ROOT/ccache-layers-v1)")
     parser.add_argument("--state", required=True, type=Path,
                         help="host-only state directory (never mounted)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -580,6 +783,24 @@ def main(argv: list[str] | None = None) -> int:
         cmd.add_argument("--max-size", type=parse_size)
         cmd.add_argument("--trim-interval", type=float, default=DEFAULT_TRIM_INTERVAL)
 
+    sub.add_parser("prepare")
+
+    verdict_cmd = sub.add_parser("verdict")
+    verdict_cmd.add_argument("--runner-rc", required=True, type=int)
+    verdict_cmd.add_argument("--capture-status", default="")
+    verdict_cmd.add_argument("--receipt", default="")
+    verdict_cmd.add_argument("--quarantine", default="")
+    verdict_cmd.add_argument("--runner-log", type=Path)
+    verdict_cmd.add_argument("--run-id", default="")
+    verdict_cmd.add_argument("--job-id", default="")
+
+    receive_cmd = sub.add_parser("receive")
+    receive_cmd.add_argument("--vm", required=True)
+    receive_cmd.add_argument("--owner-pid", required=True, type=int)
+    receive_cmd.add_argument("--max-bytes", type=parse_size, default=parse_size("20G"))
+    receive_cmd.add_argument("--timeout", type=float, default=900.0)
+    receive_cmd.add_argument("pull", nargs=argparse.REMAINDER)
+
     trim_cmd = sub.add_parser("trim")
     trim_cmd.add_argument("--max-size", required=True, type=parse_size)
     trim_cmd.add_argument("--trim-interval", type=float, default=0.0)
@@ -587,7 +808,21 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     layout = Layout(args.root, args.state)
     try:
-        if args.command == "attach":
+        if args.command == "prepare":
+            layout.ensure()
+            print(layout.root)
+        elif args.command == "verdict":
+            decision, reason = verdict(args.runner_rc, args.capture_status, args.receipt,
+                                       args.quarantine, runner_log_result(args.runner_log),
+                                       args.run_id, args.job_id)
+            print(f"{decision}\t{reason}")
+        elif args.command == "receive":
+            pull = args.pull[1:] if args.pull[:1] == ["--"] else args.pull
+            if not pull:
+                parser.error("receive needs the pull command after --")
+            print(json.dumps(receive(layout, args.vm, args.owner_pid, pull,
+                                     args.max_bytes, args.timeout), sort_keys=True))
+        elif args.command == "attach":
             print(attach(layout, args.vm, args.owner_pid))
         elif args.command == "settle":
             decision, reason, target = settle(
@@ -605,7 +840,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(sweep(layout, presence, **options), sort_keys=True))
         else:
             print(json.dumps(trim(layout, args.max_size, args.trim_interval)))
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, ReceiveError) as exc:
         print(f"ccache_layer: {exc}", file=sys.stderr)
         return 1
     return 0

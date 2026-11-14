@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import testing_support  # noqa: E402
 testing_support.skip_module_without_tomllib()
+import io
 import json
 import os
 import shutil
@@ -27,6 +28,8 @@ import macos_fleet_lanes as fleet  # noqa: E402
 LIB = ROOT / "providers" / "tart-macos" / "ccache-layer.lib.sh"
 RUNNER = ROOT / "providers" / "tart-macos" / "runner.sh"
 PROMOTER = ROOT / "scripts" / "ccache_layer.py"
+TRUSTED_RECEIPT = ('{"kind":"terminal","conclusion":"success","event":"push",'
+                   '"head_branch":"main","run_id":1,"job_id":2}')
 SUCCESS_LOG = "2026-09-27 01:00:00Z: Job macos completed with result: Succeeded\n"
 
 
@@ -61,8 +64,9 @@ class Base(unittest.TestCase):
         return cl.attach(self.layout, vm, os.getpid() if owner is None else owner)
 
     def settle(self, vm: str, rc: int = 0, **kwargs: object) -> tuple[str, str, Path | None]:
-        return cl.settle(self.layout, vm, rc, str(kwargs.get("capture", "")),
-                         str(kwargs.get("receipt", "")), str(kwargs.get("quarantine", "none")),
+        return cl.settle(self.layout, vm, rc, str(kwargs.get("capture", "terminal")),
+                         str(kwargs.get("receipt", TRUSTED_RECEIPT)),
+                         str(kwargs.get("quarantine", "none")),
                          kwargs.get("log", self.log))  # type: ignore[arg-type]
 
     def shared_keys(self) -> set[str]:
@@ -76,21 +80,38 @@ class Base(unittest.TestCase):
 
 
 class VerdictTests(unittest.TestCase):
-    def test_green_needs_clean_exit_and_success(self) -> None:
-        self.assertEqual(cl.verdict(0, "", "", "none", "Succeeded")[0], "green")
-        self.assertEqual(cl.verdict(0, "", "", "none", "SucceededWithIssues")[0], "green")
-        self.assertEqual(
-            cl.verdict(0, "terminal", '{"kind":"terminal","conclusion":"success"}', "none",
-                       "Succeeded")[0], "green")
+    def test_green_needs_a_trusted_host_receipt(self) -> None:
+        for local in ("Succeeded", "SucceededWithIssues", None):
+            self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", local,
+                                        "1", "2"), ("green", "receipt=push:main"))
+        merge_group = '{"conclusion":"success","event":"merge_group","head_branch":"gh-readonly-queue/main/x"}'
+        self.assertEqual(cl.verdict(0, "terminal", merge_group, "none", None)[0], "green")
+
+    def test_a_forged_runner_log_line_is_not_proof(self) -> None:
+        # The guest writes the runner log, so "Succeeded" there proves nothing.
+        for capture in ("", "active", "setup_error", "terminal_unknown"):
+            with self.subTest(capture):
+                self.assertEqual(cl.verdict(0, capture, "", "none", "Succeeded")[0], "red")
+
+    def test_pull_request_and_unbound_receipts_are_red(self) -> None:
+        pr = '{"conclusion":"success","event":"pull_request","head_branch":"main"}'
+        fork_main = '{"conclusion":"success","event":"pull_request_target","head_branch":"main"}'
+        for receipt in (pr, fork_main, '{"conclusion":"success","event":"push","head_branch":"feat/x"}'):
+            self.assertIn("untrusted_ref", cl.verdict(0, "terminal", receipt, "none", None)[1])
+        self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", None, "9", "2"),
+                         ("red", "receipt_unbound"))
+        self.assertEqual(cl.verdict(0, "terminal", TRUSTED_RECEIPT, "none", None, "1", "9"),
+                         ("red", "receipt_unbound"))
 
     def test_everything_short_of_proof_is_red(self) -> None:
+        t = TRUSTED_RECEIPT
         cases = {
-            "timeout": (124, "", "", "none", "Succeeded"),
-            "retarget": (125, "", "", "none", None),
-            "killed": (143, "", "", "none", None),
-            "failed": (0, "", "", "none", "Failed"),
-            "cancelled": (0, "", "", "none", "Canceled"),
-            "no_line": (0, "", "", "none", None),
+            "timeout": (124, "terminal", t, "none", "Succeeded"),
+            "retarget": (125, "terminal", t, "none", None),
+            "killed": (143, "terminal", t, "none", None),
+            "failed": (0, "terminal", t, "none", "Failed"),
+            "cancelled": (0, "terminal", t, "none", "Canceled"),
+            "no_receipt": (0, "", "", "none", None),
             "quarantine": (0, "active", "", "listener_exited_workflow_active", "Succeeded"),
             "api_failure": (0, "terminal", '{"conclusion":"failure"}', "none", "Succeeded"),
             "api_cancel": (0, "terminal", '{"conclusion":"cancelled"}', "none", "Succeeded"),
@@ -252,7 +273,9 @@ class KilledJobRegressionTests(Base):
         scenarios = {
             "vm-timeout": dict(rc=124, log=self.log),
             "vm-signal": dict(rc=0, quarantine="signal_teardown_unknown", log=self.log),
-            "vm-no-line": dict(rc=0, log=self.tmp / "absent.log"),
+            "vm-no-receipt": dict(rc=0, capture=""),
+            "vm-forged-line": dict(rc=0, capture="setup_error"),
+            "vm-pr-job": dict(rc=0, receipt=TRUSTED_RECEIPT.replace('"push"', '"pull_request"')),
         }
         for vm, kwargs in scenarios.items():
             with self.subTest(vm):
@@ -283,6 +306,34 @@ class SweepAndTrimTests(Base):
         counts = cl.sweep(self.layout, never_present)
         self.assertEqual(counts["resumed"], 1)
         self.assertEqual(self.shared_keys(), {"ab" + "a" * 38})
+
+    def test_a_remote_dir_swapped_for_a_link_promotes_nothing(self) -> None:
+        # The guest owns jobs/<vm> read-write and can replace remote/ with a
+        # link to any host directory full of entry-shaped files.
+        outside = self.tmp / "host-dir"
+        write_entry(outside, "ab" + "e" * 38, entry(0))
+        layer = self.attach("vm-link")
+        shutil.rmtree(layer / "remote")
+        (layer / "remote").symlink_to(outside)
+        self.settle("vm-link")
+        self.assertEqual(cl.process(self.layout, "vm-link", never_present), "promoted")
+        self.assertEqual(self.shared_keys(), set())
+        promote = [e for e in self.audit_events() if e["event"] == "promote"]
+        self.assertEqual(promote[-1]["rejected"], 1)
+        self.assertTrue((outside / "ab" / ("e" * 38)).exists(), "the link target is untouched")
+
+    def test_a_symlinked_store_directory_is_refused(self) -> None:
+        for name in ("shared", "jobs", "green", "discard"):
+            with self.subTest(dir=name):
+                tmp = Path(tempfile.mkdtemp(prefix="ccache-layer-link-"))
+                self.addCleanup(shutil.rmtree, tmp, True)
+                layout = cl.Layout(tmp / "layers", tmp / "state")
+                (tmp / "target").mkdir()
+                (tmp / "layers").mkdir()
+                (tmp / "layers" / name).symlink_to(tmp / "target")
+                with self.assertRaises(ValueError):
+                    cl.attach(layout, "vm-x", os.getpid())
+                self.assertEqual(list((tmp / "target").iterdir()), [])
 
     def test_trim_evicts_oldest_until_under_the_cap_and_reaps_stale_tmp(self) -> None:
         for i in range(10):
@@ -361,8 +412,14 @@ class ShellLibTests(unittest.TestCase):
         result = self.fragments("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         out = result.stdout
-        self.assertIn("ROOT</tmp/cache-root/ccache/tartci-layers-v1>", out)
-        self.assertIn("'/Volumes/My Shared Files/ccache/tartci-layers-v1/jobs/vm-x'", out)
+        # A sibling of the legacy ccache directory, never inside it: a legacy
+        # read-write `ccache` mount must not reach the shared store.
+        self.assertIn("ROOT</tmp/cache-root/ccache-layers-v1>", out)
+        self.assertNotIn("/tmp/cache-root/ccache/", out)
+        self.assertIn("'/Volumes/My Shared Files/ccache-shared' ~/.tartci-ccache/shared", out)
+        # The job layer is guest-local: no host share is linked for it.
+        self.assertIn("mkdir -p ~/.tartci-ccache/job/local ~/.tartci-ccache/job/remote", out)
+        self.assertEqual(out.count("/Volumes/My Shared Files/"), 1, out)
         self.assertIn('file:$HOME/.tartci-ccache/shared|read-only file:$HOME/.tartci-ccache/job/remote', out)
         self.assertIn("CCACHE_REMOTE_ONLY=true", out)
         self.assertIn("CCACHE_REMOTE_STORAGE=file:%s|read-only file:%s", out)
@@ -384,19 +441,308 @@ class ShellLibTests(unittest.TestCase):
         self.assertLess(wrapper.index("run_runner_until_done_unlayered"),
                         wrapper.index("tartci_ccache_layer_settle"))
 
+    def test_boot_mounts_the_layer_instead_of_the_legacy_writable_cache(self) -> None:
+        source = RUNNER.read_text()
+        boot = source[source.index("boot_vm_to_ssh(){"):source.index("tartci_vm_ssh_wait(){")]
+        isolated = boot.index('if [ "$CURRENT_SHARED_CACHE" = 1 ] && [ "$CCACHE_LAYER_ENABLED" = 1 ]; then')
+        legacy = boot.index('tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")')
+        # The legacy writable mount is only reached on the branch where
+        # isolation is off; a failed attach drops the shared cache instead.
+        self.assertLess(isolated, legacy)
+        self.assertIn('elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then\n'
+                      '    tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")', boot)
+        branch = boot[isolated:legacy]
+        self.assertIn("tartci_ccache_layer_boot", branch)
+        self.assertIn("CURRENT_SHARED_CACHE=0", branch)
+        # The layer is attached before the configure-checks mount reads the flag
+        # and before `tart run` starts the guest.
+        self.assertLess(isolated, boot.index('--dir="configure-checks:'))
+        self.assertLess(isolated, boot.index("tart run --no-graphics"))
+
+    def test_teardown_abandons_an_unsettled_layer_after_the_guest_stops(self) -> None:
+        source = RUNNER.read_text()
+        discard = source[source.index("discard_current_vm(){"):]
+        discard = discard[:discard.index("\n}\n")]
+        self.assertLess(discard.index("terminate_current_guardian"),
+                        discard.index('tartci_ccache_layer_abandon "$CURRENT_VM"'))
+
+
+class BootTests(Base):
+    """The host-side hooks, driven through the shell library."""
+
+    def run_lib(self, snippet: str, value: str = "1",
+                extra_env: dict | None = None) -> subprocess.CompletedProcess[str]:
+        tart = self.tmp / "bin" / "tart"
+        tart.parent.mkdir(parents=True, exist_ok=True)
+        tart.write_text('#!/bin/sh\nprintf "[]"\n')
+        tart.chmod(0o755)
+        script = textwrap.dedent(f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}; CACHE_ROOT={self.tmp}/cache; CCACHE_MAX_SIZE=1G
+            STATE_DIR={self.tmp}/events; mkdir -p "$STATE_DIR"
+            TARTCI_CCACHE_WRITE_ISOLATION='{value}'
+            event(){{ printf '%s %s\n' "$1" "${{2:-}}" >>"$STATE_DIR/events"; }}
+            source {LIB}
+        """) + textwrap.dedent(snippet) + "\nwait\n"
+        env = dict(os.environ, TARTCI_CCACHE_LAYER_TART=str(tart))
+        env.update(extra_env or {})
+        return subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                              check=False, env=env)
+
+    @property
+    def root(self) -> Path:
+        return self.tmp / "cache" / "ccache-layers-v1"
+
+    def events(self) -> str:
+        path = self.tmp / "events" / "events"
+        return path.read_text() if path.exists() else ""
+
+    def guest_tar(self, members: dict[str, bytes]) -> Path:
+        """A tar the fake pull command streams, as the guest would."""
+        import tarfile
+        path = self.tmp / "guest.tar"
+        with tarfile.open(path, "w") as archive:
+            for name, data in members.items():
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                info.mtime = 4_000_000_000  # a guest-chosen future mtime
+                info.mode = 0o000
+                archive.addfile(info, io.BytesIO(data))
+        return path
+
+    def test_boot_mounts_only_the_shared_store_read_only(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_boot vm-a
+            printf '%s\n' "${CCACHE_LAYER_TART_DIRS[@]}"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(),
+                         [f"--dir=ccache-shared:{self.root}/shared:ro"])
+        self.assertTrue((self.root / "shared").is_dir())
+        self.assertFalse((self.root / "jobs" / "vm-a").exists(),
+                         "no host directory is created for the guest to write")
+        self.assertFalse((self.tmp / "cache" / "ccache").exists(),
+                         "the boot hook must not create or use the legacy directory")
+
+    def test_off_boot_is_a_no_op(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_boot vm-a
+            printf 'n=%s\n' "${#CCACHE_LAYER_TART_DIRS[@]}"
+        ''', value="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("n=0", result.stdout)
+        self.assertFalse(self.root.exists())
+
+    def test_symlinked_shared_store_refuses_the_boot(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        self.root.mkdir(parents=True)
+        (self.root / "shared").symlink_to(elsewhere)
+        result = self.run_lib('''
+            if tartci_ccache_layer_boot vm-a; then echo attached; else echo refused; fi
+            printf 'n=%s\n' "${#CCACHE_LAYER_TART_DIRS[@]}"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused", result.stdout)
+        self.assertIn("n=0", result.stdout)
+        self.assertIn("ccache_layer_attach_failed", self.events())
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def settle_with_pull(self, members: dict[str, bytes], runner_rc: int = 0,
+                         pull_cmd: str | None = None) -> subprocess.CompletedProcess[str]:
+        tar = self.guest_tar(members)
+        marker = self.tmp / "pulled"
+        cmd = pull_cmd or f"touch {marker}; cat {tar}"
+        return self.run_lib(f'''
+            tartci_ccache_layer_boot vm-j
+            tartci_ccache_layer_attach vm-j
+            CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
+            tartci_ccache_layer_settle vm-j {runner_rc} "{self.log}" 192.0.2.1
+        ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": cmd})
+
+    def test_green_job_entries_are_pulled_validated_and_promoted(self) -> None:
+        good = "ab" + "1" * 38
+        manifest = "cd" + "2" * 38
+        result = self.settle_with_pull({
+            "./stats.txt": b"cache_miss\t7\nremote_storage_hit\t3\nbogus\t9\n",
+            f"./remote/{good[:2]}/{good[2:]}": entry(0, b"obj"),
+            f"./remote/{manifest[:2]}/{manifest[2:]}": entry(1, b"man"),
+            "./remote/ef/" + "3" * 38: b"not an entry",
+            "../escape": entry(0),
+            "./remote/ab/../../../escape2": entry(0),
+            "/etc/abs" : entry(0),
+        })
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.shared_keys_at(self.root), {good, manifest})
+        for key in (good, manifest):
+            info = (self.root / "shared" / key[:2] / key[2:]).stat()
+            self.assertEqual(info.st_mode & 0o777, 0o644, "the guest's mode never reaches shared")
+            self.assertLess(info.st_mtime, 4_000_000_000, "the guest's mtime never reaches shared")
+        self.assertFalse((self.tmp / "escape").exists())
+        self.assertFalse((self.tmp / "cache" / "escape2").exists())
+        audit = [json.loads(line) for line in
+                 (self.tmp / "cache" / "ccache-layer-state" / "audit.jsonl").read_text().splitlines()]
+        received = [e for e in audit if e["event"] == "receive"][-1]
+        self.assertEqual(received["received"], 2)
+        self.assertEqual(received["rejected"], 4)
+        promote = [e for e in audit if e["event"] == "promote"][-1]
+        self.assertEqual(promote["stats"], {"cache_miss": 7, "remote_storage_hit": 3})
+
+    def shared_keys_at(self, root: Path) -> set[str]:
+        return {f"{p.parent.name}{p.name}" for p in (root / "shared").glob("*/*")
+                if not p.name.startswith(".")}
+
+    def test_links_and_devices_in_the_stream_are_rejected(self) -> None:
+        import tarfile
+        target = self.tmp / "host-secret"
+        target.write_bytes(entry(0, b"secret"))
+        path = self.tmp / "guest.tar"
+        with tarfile.open(path, "w") as archive:
+            for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE):
+                info = tarfile.TarInfo(f"remote/ab/{'4' * 37}{kind.decode()}"
+                                       if kind == tarfile.SYMTYPE else f"remote/ab/{'5' * 38}")
+                info.type = kind
+                info.linkname = str(target)
+                archive.addfile(info)
+        result = self.settle_with_pull({}, pull_cmd=f"cat {path}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.shared_keys_at(self.root), set())
+        self.assertEqual(target.read_bytes(), entry(0, b"secret"))
+
+    def test_red_job_is_never_pulled(self) -> None:
+        good = "ab" + "1" * 38
+        result = self.settle_with_pull({f"remote/{good[:2]}/{good[2:]}": entry(0)}, runner_rc=1)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.tmp / "pulled").exists(), "a red job must not even be pulled")
+        self.assertEqual(self.shared_keys_at(self.root), set())
+
+    def test_failed_or_oversized_pull_settles_red(self) -> None:
+        good = "ab" + "1" * 38
+        for name, cmd, env in (("pull-fails", "exit 3", {}),
+                               ("oversized", None, {"TARTCI_CCACHE_LAYER_PULL_MAX": "1K"})):
+            with self.subTest(case=name):
+                shutil.rmtree(self.tmp / "cache", ignore_errors=True)
+                tar = self.guest_tar({f"remote/{good[:2]}/{good[2:]}": entry(0, b"x" * 4096)})
+                result = self.run_lib(f'''
+                    tartci_ccache_layer_boot vm-j
+                    tartci_ccache_layer_attach vm-j
+                    CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
+                    tartci_ccache_layer_settle vm-j 0 "{self.log}" 192.0.2.1
+                ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": cmd or f"cat {tar}", **env})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.shared_keys_at(self.root), set())
+                self.assertFalse((self.root / "jobs" / "vm-j").exists())
+                self.assertIn("ccache_layer_pull_failed", self.events())
+                self.assertIn("verdict=red", self.events())
+
+    def test_pull_is_bounded_in_time(self) -> None:
+        started = time.monotonic()
+        result = self.run_lib(f'''
+            tartci_ccache_layer_boot vm-j
+            tartci_ccache_layer_attach vm-j
+            CURRENT_ASSIGNMENT_QUARANTINE=none
+            CURRENT_JOB_CAPTURE_STATUS=terminal; CURRENT_JOB_RECEIPT='{TRUSTED_RECEIPT}'
+            tartci_ccache_layer_settle vm-j 0 "{self.log}" 192.0.2.1
+        ''', extra_env={"TARTCI_CCACHE_LAYER_PULL_CMD": "sleep 60",
+                          "TARTCI_CCACHE_LAYER_PULL_SECS": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertIn("ccache_layer_pull_failed", self.events())
+
+    def test_receive_bound_covers_a_command_that_closes_stdout_and_lingers(self) -> None:
+        self.layout.ensure()
+        started = time.monotonic()
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive(self.layout, "vm-linger", os.getpid(),
+                       ["sh", "-c", "head -c 10240 /dev/zero; exec 1>&-; sleep 60"],
+                       max_bytes=1 << 20, timeout=2)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse((self.layout.jobs / "vm-linger").exists())
+
+    def tar_stream(self, members: list[tuple[str, bytes]]) -> io.BytesIO:
+        import tarfile  # noqa: PLC0415
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+        buf.seek(0)
+        return buf
+
+    def test_receive_cap_counts_rejected_members(self) -> None:
+        # Junk the validator rejects still costs stream bytes; it must hit the cap.
+        self.layout.ensure()
+        stream = self.tar_stream([(f"junk/{i}", b"x" * 4096) for i in range(8)])
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive_stream(self.layout, "vm-junk", os.getpid(), stream, max_bytes=8192)
+        self.assertFalse((self.layout.jobs / "vm-junk").exists())
+
+    def test_receive_rejects_a_repeated_stats_member(self) -> None:
+        self.layout.ensure()
+        stream = self.tar_stream([("stats.txt", b"cache_miss\t1\n")] * 2)
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive_stream(self.layout, "vm-stats", os.getpid(), stream, max_bytes=1 << 20)
+        self.assertFalse((self.layout.jobs / "vm-stats").exists())
+
+    def test_isolated_boot_mounts_configure_checks_read_only(self) -> None:
+        runner = (Path(__file__).resolve().parents[1] / "providers/tart-macos/runner.sh").read_text()
+        self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks:ro"', runner)
+        self.assertIn('rsync -a "/Volumes/My Shared Files/configure-checks/"', runner)
+        # The only writable configure-checks mount is the non-isolated branch.
+        writable = '--dir="configure-checks:$CACHE_ROOT/configure-checks")'
+        before = runner[:runner.index(writable)]
+        self.assertTrue(before.endswith('elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then\n    tart_dirs+=('))
+
+    def test_interrupted_pull_layer_is_deleted_on_teardown(self) -> None:
+        key = "ab" + "c" * 38
+        layout = cl.Layout(self.root, self.tmp / "cache" / "ccache-layer-state")
+        layer = cl.attach(layout, "vm-gone", os.getpid())
+        write_entry(layer / "remote", key, entry(0))
+        result = self.run_lib('''
+            tartci_ccache_layer_attach vm-gone
+            tartci_ccache_layer_abandon vm-gone
+            printf 'vm=<%s>\n' "$CCACHE_LAYER_VM"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vm=<>", result.stdout)
+        self.assertFalse((self.root / "jobs" / "vm-gone").exists())
+        self.assertEqual(self.shared_keys_at(self.root), set())
+        self.assertNotIn('"event": "promote"', layout.audit.read_text())
+
+    def test_abandon_without_a_layer_is_a_no_op(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_abandon vm-never-attached
+            echo done
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("done", result.stdout)
+        self.assertEqual(self.events(), "")
+
 
 class ProfileTests(unittest.TestCase):
-    def test_no_shipped_profile_enables_isolation(self) -> None:
-        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+    def test_every_fleet_lane_enables_isolation(self) -> None:
+        # Every gate lane on every fleet host: the shared store is the one
+        # cross-job channel the gate VMs have, so no lane keeps the legacy
+        # writable mount.
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        for path in profiles:
             with self.subTest(profile=path.name):
                 data = fleet.load(path)
+                self.assertTrue(data["lane"])
                 for lane in data["lane"]:
-                    self.assertNotIn("ccache_write_isolation", lane)
-                for name, body in fleet.rendered_plists(data).items():
-                    self.assertNotIn(b"TARTCI_CCACHE_WRITE_ISOLATION", body, name)
+                    self.assertIs(lane.get("ccache_write_isolation"), True, lane["id"])
+                rendered = fleet.rendered_plists(data)
+                self.assertTrue(rendered)
+                for name, body in rendered.items():
+                    self.assertIn(b"<key>TARTCI_CCACHE_WRITE_ISOLATION</key>", body, name)
 
     def profile_with(self, value: str) -> Path:
         base = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+        base = base.replace("ccache_write_isolation = true\n", "")
         marker = 'id = "pulp-gate"\n'
         text = base.replace(marker, marker + f"ccache_write_isolation = {value}\n", 1)
         tomllib.loads(text)

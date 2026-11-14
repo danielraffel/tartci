@@ -115,6 +115,9 @@ scratch_dirs = true
 # 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
 # rate held at 99.49% (99.51% before). Rollback: delete this key.
 gate_ccache_trim = true
+# Every lane runs with ccache write isolation, so the legacy gate cache is no
+# longer mounted or hit; age it out in days, not weeks. Rollback: delete.
+gate_ccache_max_age_days = 3
 
 # Merge-group-first VM slot priority (scripts/slot_priority.py). Pulp's merge
 # queue waited an hour or more for macOS VM slots behind PR-head jobs on
@@ -153,6 +156,9 @@ runner_group_id = 1
 claim_rank = 0
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 # 8, not 12: two 12-core gate VMs leased 24 of 28 cores and left agent builds the
 # background-QoS floor (6-8 min per file). 2 x 8 = the 16-core gate reserve.
 vm_cores = 8
@@ -230,6 +236,9 @@ repo = "danielraffel/spectr"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
@@ -244,6 +253,9 @@ id = "forge-gate"
 repo = "Generous-Corp/forge"
 runner_group_id = 11
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 chrome_app_dir = "/Applications/Google Chrome.app"
 priority = "gate"
 min_queued_age_seconds = 0
@@ -261,6 +273,9 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 supervisors = 1
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m5studio"]

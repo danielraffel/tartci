@@ -421,8 +421,11 @@ first; list it only when what it asserts really needs tomllib.
   → *Clean:* `tartci ccache quarantine --host-cache` renames suspects into
   `<cache>-quarantine/<stamp>/` (never deletes; `guard.log` keeps both counts;
   consistent verdicts are remembered in `verdicts.json`). It scans the legacy
-  root and `tartci-layers-v1/shared`, never the per-job `jobs/`, `green/` or
-  `discard/` layers.
+  root and the pre-rollout `tartci-layers-v1/shared`, never the per-job
+  `jobs/`, `green/` or `discard/` layers. The write-isolation store at
+  `$CACHE_ROOT/ccache-layers-v1/shared` is outside its reach and is not
+  guarded at boot: it only ever receives whole entries pulled from a green
+  job after the job ended, so the torn-manifest case cannot arise there.
   `tartci ccache reset --reset` moves the whole cache aside; it refuses while
   a VM runs or holds a lease unless `--force`. The macOS runner runs the
   quarantine before every VM boot (fail-open, `TARTCI_CCACHE_GUARD=0` disables;

@@ -922,54 +922,102 @@ are staged beside their destination and renamed into place, and one writer runs
 at a time per cache. Size is bounded by what you add: one mirror per repository
 plus the pinned archives you list.
 
-### Optional per-job ccache write isolation
+### Per-job ccache write isolation (on for every fleet lane)
 
-By default every guest mounts the host ccache read-write, so a job torn down
+Without it every guest mounts the host ccache read-write, so a job torn down
 mid-build (a Tart hang, a timeout, a cancel) can leave half-written direct-mode
-manifests that every later job trusts. On m3 in September 2026 that made every
-gate build link the wrong objects for 17 hours. Setting
-`ccache_write_isolation = true` on a `[[lane]]` (it renders
+manifests that every later job trusts, and any job, red or green, can write or
+overwrite any entry a later job (a merge-group gate included) links. On m3 in
+September 2026 torn manifests made every gate build link the wrong objects for
+17 hours. Setting `ccache_write_isolation = true` on a `[[lane]]` (it renders
 `TARTCI_CCACHE_WRITE_ISOLATION=1`) makes each job:
 
-- read the shared store through ccache remote storage marked `read-only`;
-- write new entries only to its own layer (`remote_only`, so a hit is never
-  copied back into the layer);
-- have that layer promoted into the shared store by the host only when the
-  job's verdict is green (clean listener exit, the runner's own
-  `completed with result: Succeeded`, no lifecycle quarantine, and a GitHub
-  `success` conclusion whenever the API observed one) **and** `tart list`
-  proves the VM is gone. Everything else is deleted without touching the
-  shared store.
+- boot with ONE ccache mount instead of the legacy read-write `ccache`:
+  `ccache-shared` = `<layers>/shared`, **read-only**, read through ccache remote
+  storage that is also marked `read-only`;
+- write its new entries only to a **guest-local** directory
+  (`~/.tartci-ccache/job/remote`, `remote_only`). The guest has no writable
+  path, link or inode on the host cache filesystem for its ccache;
+- when, and only when, the job's verdict is green (clean listener exit, no
+  lifecycle quarantine, and the host's own GitHub observation: a `terminal`
+  receipt with conclusion `success`, bound to this run and job, for a trusted
+  ref: a push to `main` or a merge-group run). The guest-written runner log is
+  attacker-controlled output; it can turn a verdict red but never green, and
+  no receipt means red. A pull-request job's results are never promoted. The host
+  pulls the guest's entries over ssh as a tar stream while the VM is still up
+  (`ccache_layer.py receive`, bounded by `TARTCI_CCACHE_LAYER_PULL_SECS`,
+  default 900, and `TARTCI_CCACHE_LAYER_PULL_MAX`, default 20G; every member's
+  declared size counts against the cap before it is read, accepted or not, and a
+  second `stats.txt` fails the pull). Every member is validated: only regular files named `remote/<k0k1>/<rest>` that start with a
+  ccache entry header are written, by the host, `O_EXCL|O_NOFOLLOW`, mode 0644,
+  mtime = receive time; links, devices, other paths and non-entries are
+  dropped. The layer is promoted into the shared store once `tart list` proves
+  the VM is gone. A red, cancelled or timed-out job is never pulled; a failed,
+  timed-out or oversized pull settles red.
 
-The layer is attached when the job starts in the guest, after the JIT mint, so
-a VM booted before any job exists is covered the same way; the boot-time mount
-is unchanged. Everything lives under `$CACHE_ROOT/ccache/tartci-layers-v1/`
-(`shared/`, `jobs/<vm>/`, `green/`, `discard/`) in ccache's `file:` remote
-layout, which differs from the legacy primary cache beside it; the two never
-read or clean each other. The shared store therefore starts cold on the first
-isolated lane of a host. Host-only state, including the promotion audit log
-(`audit.jsonl`, one JSON line per attach / settle / promote / discard / trim,
-with the job's hit and miss counters when the host has ccache) and the list of
-keys each promotion wrote (`promotions/*.keys`), is in
-`$CACHE_ROOT/ccache-layer-state/`. Promotion hard-links result entries so an
-existing key is never overwritten, replaces a manifest only with a strictly
-newer one, rejects anything that is not a ccache entry in a well-formed key
-path, and runs after the job, off its critical path. A supervisor that dies
-mid-job leaves its layer to the next attach's sweep, which discards it.
+`<layers>` is `$CACHE_ROOT/ccache-layers-v1`, a **sibling** of the legacy
+`$CACHE_ROOT/ccache`, never inside it, so a lane still on the legacy writable
+mount (one not yet switched, or an operator `run.sh`) cannot reach the shared
+store. If the layers root is unusable at boot (a symlink anywhere in it, a
+failed create), the VM boots with **no** shared cache (a cold, private guest
+cache), never the legacy writable mount; the lane logs
+`ccache_layer_attach_failed` in its `events.jsonl`, and a lane that keeps
+logging it is running every job cold. A pull interrupted mid-stream leaves a
+host layer that teardown (`ccache_layer_abandon`) or the next boot's sweep
+deletes unpromoted. With isolation on, the boot neither prepares nor guards the
+legacy ccache directory, which no VM mounts.
 
-Enable on one lane, re-render, reload that lane at an idle boundary; roll back
-by deleting the key. Verify with:
+Promotion hard-links result entries so an existing result is never
+overwritten, replaces an existing manifest with a newer one (newer = received
+later, since the host sets every mtime), rejects anything that is not a ccache
+entry in a well-formed key path, and runs after the job, off its critical
+path. The pull itself does hold the slot: a warm job's layer is small, a cold
+job's can be several GB.
+
+The store uses ccache's `file:` remote layout, which differs from the legacy
+primary cache, and starts **cold** on each host: until the first green job of
+a host promotes, that host's gate builds miss. The shared store is trimmed to
+`CCACHE_MAX_SIZE` by mtime (receive time; a read-only hit does not refresh it),
+so eviction is oldest-promoted, not least-recently-used. The legacy primary
+cache is no longer mounted or hit; the fleet profiles set
+`gate_ccache_max_age_days = 3` so `gate_ccache_trim` empties it within days
+(m3's held 3.8 GB on 2026-11-14). The per-host disk delta is the new store, up
+to `CCACHE_MAX_SIZE`.
+
+What it does not close:
+
+- A promoted layer is still the guest's own claim about which object a key
+  names. Only layers from trusted refs (a push to `main`, a merge-group run) are
+  promoted, so a pull-request author cannot repoint a manifest; but a trusted
+  job's new results are trusted, and its manifests replace older ones. Fork pull
+  requests never reach these lanes; release-tier boots mount no shared cache.
+- `configure-checks` is mounted **read-only** under isolation; the guest seeds a
+  local copy with rsync, so no writable share sits beside `ccache-shared` and a
+  cross-share `link()` has no writable target. The cost: configure-check results
+  a job produces are no longer written back to the shared host directory.
+- The operator `providers/tart-macos/run.sh` still mounts the legacy ccache
+  read-write, and the Linux provider mounts its own `ccache-linux` read-write;
+  neither reaches `<layers>`. Guest network is unchanged (Tart NAT).
+- Only a unit test (`ProfileTests.test_every_fleet_lane_enables_isolation`)
+  enforces that every fleet lane sets the key; the profile validator only
+  type-checks it.
+
+Host-only state, including the audit log (`audit.jsonl`, one JSON line per
+receive / settle / promote / discard / trim, with the job's own hit and miss
+counters, pulled as data, on each promote) and the list of keys each promotion
+wrote (`promotions/*.keys`), is in `$CACHE_ROOT/ccache-layer-state/`.
+
+Rollout: the key is set on every lane of every fleet profile; the normal fleet
+install re-renders the lane plists and reloads each lane at an idle boundary.
+Roll back a lane by deleting its key and re-rendering. Verify with:
 
 ```bash
-state=~/.cache/pulp-ci/ccache-layer-state
+state="$CACHE_ROOT/ccache-layer-state"
 grep -c '"event": "promote"' "$state/audit.jsonl"                   # grows on green jobs
 grep '"event": "settle"' "$state/audit.jsonl" | grep '"verdict": "red"'  # and no promote follows these
+grep -h 'ccache_layer_attach_failed\|ccache_layer_pull_failed' "$STATE_DIR"/events.jsonl  # lane state dir; should stay empty
+grep '"event": "promote"' "$state/audit.jsonl" | tail -5             # per-job hit counters after warm-up
 ```
-
-The guard is ccache's `read-only` flag, not the mount: the mount is fixed at
-boot and shared with non-isolated lanes, so a hostile guest could still write
-the directory. A read-only mount of the shared store is the next step once VM
-boot is restructured.
 
 **Ephemeral runner concept:** an ephemeral per-job GitHub Actions runner clones
 the golden, mounts the host caches, runs **one** job, and self-destructs. The

@@ -58,11 +58,16 @@ tartci_lane_cache_root_refusal() {
 # the reason; a failed preparation leaves it empty. Returns 1 either way.
 # shellcheck disable=SC2034 # TARTCI_LANE_CACHE_REFUSAL is read by runner.sh
 tartci_prepare_lane_cache_mounts() {
-  local root="$1" host="${2:-}" fetchcontent="$3" shared="${4:-1}"
+  local root="$1" host="${2:-}" fetchcontent="$3" shared="${4:-1}" isolated="${5:-0}"
   TARTCI_LANE_CACHE_REFUSAL=""
   TARTCI_LANE_CACHE_REFUSAL="$(tartci_lane_cache_root_refusal "$root" "$host")" || return 1
-  tartci_prepare_disk_root "$root/ccache" || return 1
-  tartci_ccache_guard "$root/ccache"
+  # With ccache write isolation (argument 5 = 1) the VM never mounts the legacy
+  # ccache directory, so there is nothing to prepare or guard there; the
+  # guard's walk of a large legacy cache would only delay the boot.
+  if [ "$isolated" != 1 ]; then
+    tartci_prepare_disk_root "$root/ccache" || return 1
+    tartci_ccache_guard "$root/ccache"
+  fi
   tartci_prepare_disk_root "$fetchcontent" || return 1
   # Pulp's configure-check replay (tools/cmake/PulpConfigureCheckCache.cmake)
   # keys SDL3's ~180 try_compile results on the SDK, compiler and flags and

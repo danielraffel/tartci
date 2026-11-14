@@ -185,7 +185,8 @@ class CurrentJobScanner:
         base = {"run_id": run_id, "job_id": job_id, "workflow_id": workflow_id,
                 "workflow_name": workflow_name, "runner_name": runner,
                 "job_status": status, "run_status": run_status,
-                "run_conclusion": run.get("conclusion")}
+                "run_conclusion": run.get("conclusion"),
+                "event": run.get("event"), "head_branch": run.get("head_branch")}
         if runner != self.args.runner:
             return self._receipt("assignment_changed", **base)
         if status == "completed":
