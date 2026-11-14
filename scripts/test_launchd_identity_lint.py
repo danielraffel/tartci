@@ -96,7 +96,7 @@ class TemplateTests(unittest.TestCase):
         clean = subprocess.run([sys.executable, str(ROOT / "scripts" / "launchd_identity_lint.py"),
                                 "--templates"], capture_output=True, text=True, check=False)
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
-        self.assertNotIn("BAD", clean.stdout)
+        self.assertEqual([], [line for line in clean.stdout.splitlines() if line.startswith("BAD")])
 
     def test_lint_sh_runs_it(self) -> None:
         self.assertIn("scripts/launchd_identity_lint.py --templates",
