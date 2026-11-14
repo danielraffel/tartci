@@ -699,6 +699,12 @@
       "remedy": "Nothing now. If it recurs every few hours, read the heal history in ~/.tartci/state/store-health.json and the launchd watchdog log, and look at what loads tccd on this host.",
       "do_not": "Do not take a healed verdict as proof the volume is fast or that the cause is fixed: the wrapper restarts daemons; it changes no grant and removes no trigger."
     },
+    "tcc_prompt_pending": {
+      "summary": "The Tart store hangs for launchd jobs because a macOS privacy consent alert is waiting, unanswered, on this host's console.",
+      "why": "While a consent alert waits, Removable Volumes authorizations that need a decision queue behind it, so every launchd job with no stored grant blocks in open() on the store volume (m3, 2026-11-07 to 11-13: 25 of 27 store stalls began 0.5 to 7 min after an alert and ended minutes after a click). The watchdog saw a UserNotificationCenter window on screen while a fresh launchd job hung on the volume root. New Shipyard installs (a new binary path each time) were the usual trigger.",
+      "remedy": "At the host's screen, read the alert, note the program it names, and click Allow; the store answers within minutes. The watchdog has opened a GitHub issue for it. If a store open has waited on it for 15 min, the watchdog runs /usr/local/sbin/tartci-heal-tcc once, which drops the alert without granting anything.",
+      "do_not": "Do not click Don't Allow: a refusal is remembered and the job then fails with a permission error instead of hanging. Do not script a click on the alert."
+    },
     "tcc_wedge_none": {
       "summary": "The watchdog has no fresh wedged-tccd verdict for the Tart store.",
       "why": "Either the store answers, or it is failing for a reason the three readings (internal control path, sandboxd/tccd log signature, optional probe from a TCC-granted context) do not attribute to tccd.",

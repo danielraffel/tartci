@@ -534,6 +534,47 @@ are written to `~/.tartci/state/store-health.json` (`classification`), and:
   not rewritten for over two passes gives `store_watchdog_stale` (unknown),
   whatever state it last recorded.
 
+**Most of those hangs are an unanswered privacy consent alert (m3,
+2026-11-07 to 11-13).** While macOS shows a consent alert (a
+CFUserNotification drawn by UserNotificationCenter) on the console, Removable
+Volumes authorizations that need a decision queue behind it, and the alert has
+no timeout. A new Shipyard install was the usual trigger: each one runs from a
+new `~/.local/share/shipyard/auth-generations/<sha>/shipyard` path, a new
+privacy identity. Every watchdog pass reads the window server's window list
+(owner names only, no Screen Recording grant; `scripts/tcc_prompt.py`, bounded
+child) and records whether UserNotificationCenter has a window ordered on
+screen, since when (`~/.tartci/state/tcc-prompt.json`), and whether a Shipyard
+generation was installed within 10 min before it. A listing with no windows at
+all is `unavailable`, never "no alert". Then:
+
+- with the alert on screen, the same pass runs the fresh launchd probe of the
+  store once (it does not depend on the watchdog's own store probe, whose
+  context may hold a grant and answer while ungranted jobs hang). A hang on the
+  volume root while the job's internal open answers, with a configured
+  `TARTCI_TCC_CONTEXT_PROBE` answering if there is one, means a store open
+  waits on the alert. When the watchdog's own store probe is draining too, the
+  classifier reuses that reading and names the verdict `tcc_prompt_pending`
+  (`path: consent_alert`), with or without a context probe; a launchd job that
+  opens the root, or fails fast on it, is not this verdict;
+- the watchdog pages at once, before its other alert passes: one GitHub issue
+  per alert episode, `[tartci] <host> has a macOS privacy prompt waiting: click
+  Allow`, opened when the alert is up and either a store open waits on it or
+  the alert followed a Shipyard install, and closed when the alert is gone
+  (`TARTCI_TCC_PROMPT_ISSUE=0` keeps the WARN line and opens no issue);
+- the consent-alert pass owns the fallback heal: once a store open has waited
+  on the alert for `PROMPT_HEAL_AFTER_S` (15 min) it runs the same scoped heal
+  once per alert episode, sharing the store-health heal record as one budget
+  (`~/.tartci/state/tcc-prompt-heal.json`; `TARTCI_TCC_HEAL=0` pages only).
+  It drops the alert and grants nothing, so Allow at the console is the better
+  ending. The store-health heal record for a `tcc_prompt_pending` verdict
+  reads `paged`;
+- the lane's deferral names it (event `tcc_prompt_pending`, the same blocked
+  heartbeat phase as the wedge), and `tartci doctor fleet` reports
+  `tcc_prompt_pending` as a problem.
+
+`python3 scripts/tcc_prompt.py --check` prints the reading now without saving
+it. Nothing in tartci answers, dismisses or changes a privacy decision.
+
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs
 exactly `/usr/bin/killall tccd sandboxd` (launchd relaunches both on demand),

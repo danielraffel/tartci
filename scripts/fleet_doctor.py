@@ -171,6 +171,7 @@ CODES: tuple[str, ...] = (
     "support_agents_ok",
     "support_agents_pending",
     "support_agents_unreadable",
+    "tcc_prompt_pending",
     "tcc_wedge_healed",
     "tcc_wedge_none",
     "tcc_wedge_unclassified",
@@ -1297,6 +1298,13 @@ def check_tcc_wedge(value: dict | None, now: float | None = None) -> Finding:
         fresh = (time.time() if now is None else now) - calendar.timegm(stamp) <= tcc_wedge.FRESH_S
     except (ValueError, TypeError):
         fresh = False
+    if classification.get("kind") == tcc_wedge.PROMPT_KIND and fresh:
+        heal = value.get("heal") or {}
+        return Finding("tcc_wedge", PROBLEM, "tcc_prompt_pending",
+                       f"tcc wedge: a privacy consent alert is waiting on the console "
+                       f"(classified at {classification.get('classified_at')}: "
+                       f"{classification.get('reason')}); heal "
+                       f"{heal.get('outcome') or 'not_attempted'}", facts)
     if classification.get("kind") != tcc_wedge.KIND or not fresh:
         if value.get("state") == "draining":
             kind = classification.get("kind") or "not classified"

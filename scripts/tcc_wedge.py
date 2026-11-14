@@ -64,6 +64,12 @@ from bounded_subprocess import ObservationError, require_success, run_bounded
 import store_health
 
 KIND = "tcc_attribution_wedge"
+# A store hang behind a privacy consent alert nobody has answered (tcc_prompt.py).
+PROMPT_KIND = "tcc_prompt_pending"
+# How long the page has to be answered before the scoped heal drops the alert
+# (tcc_prompt.alert_pass owns that fallback). Allow is the better ending: a
+# grant persists, a dropped prompt grants nothing.
+PROMPT_HEAL_AFTER_S = 15 * 60
 # The lane's heartbeat phase while it defers admission for this cause.
 PHASE = "tcc-attribution-wedge"
 WRAPPER = "/usr/local/sbin/tartci-heal-tcc"
@@ -93,7 +99,7 @@ SIGNATURES = (
 _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
 OUTCOMES = ("ran", "rate_limited", "wrapper_rate_limited", "wrapper_missing",
             "wrapper_insecure", "not_permitted", "timeout", "failed", "disabled",
-            "escalated")
+            "escalated", "paged")
 # Outcomes that reached sudo and so spend the 30-minute budget. A refused
 # sudo spends it too: retrying it every pass would be a 300 s loop of nothing.
 BUDGET_OUTCOMES = frozenset({"ran", "not_permitted", "timeout", "failed"})
@@ -506,7 +512,8 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
              context_probe: Optional[Callable[[], dict]] = None,
              launchd_probe: Optional[Callable[[], dict]] = None,
              launchd_probe_disabled: bool = False,
-             ipc_scan: Optional[Callable[[float, float], dict]] = None) -> dict[str, Any]:
+             ipc_scan: Optional[Callable[[float, float], dict]] = None,
+             consent_alert: Optional[Callable[[], dict]] = None) -> dict[str, Any]:
     """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}.
 
     Two paths reach `tcc_attribution_wedge`; every other combination is
@@ -526,6 +533,14 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
     left sandboxd) is recorded and named as corroboration, never required and
     never a veto: on 2026-11-13 the same wedge showed an unanswered IPC on one
     probe and no IPC line at all on the next, so its absence proves nothing.
+
+    A third verdict, `tcc_prompt_pending` (path consent_alert), names the cause
+    behind most of those hangs: a privacy consent alert waiting on the console
+    (`consent_alert`, tcc_prompt.observe) while a fresh launchd job hangs on the
+    volume root and the internal control path answers. It does not need a
+    configured TCC-granted context; when one is configured and hangs too, the
+    volume is stalled and the verdict is withheld. An alert with no launchd
+    hang, or a launchd job that opens the root, is not this verdict.
     """
     now = time.time() if now is None else now
     scan = scan_log if scan is None else scan
@@ -555,7 +570,38 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                        f"the internal control path {control_path} also fails "
                        f"({ctl.get('reason')}); not a TCC verdict")
     launchd: dict[str, Any] = {"outcome": "not_run"}
-    if launchd_probe_disabled:
+    alert: dict[str, Any] = {}
+    if consent_alert is not None:
+        alert = dict(consent_alert() or {})
+        evidence["consent_alert"] = alert
+    if alert.get("state") == "present" and not launchd_probe_disabled and (
+            launchd_probe is not None or isinstance(alert.get("launchd_probe"), dict)):
+        # An alert is on screen: the fresh launchd job is the reading that ties
+        # it to the store, whether or not a TCC-granted context is configured.
+        # The alert pass already ran one this pass; reuse it.
+        launchd = (dict(alert["launchd_probe"]) if isinstance(alert.get("launchd_probe"), dict)
+                   else launchd_probe())
+        evidence["launchd_probe"] = launchd
+        if launchd.get("outcome") == "hung_on_root":
+            reading = context_probe() if context_probe is not None else None
+            if reading is not None:
+                evidence["tcc_context_probe"] = reading
+            if reading is not None and not reading.get("ok"):
+                return verdict("stalled_unclassified",
+                               "a privacy consent alert is on screen, but the store did not "
+                               "answer from a context with TCC access either "
+                               f"({reading.get('reason')}); the volume, not the alert, is stalled")
+            install = alert.get("shipyard_install") or {}
+            after = (f", first seen {install.get('seconds_before_alert')} s after Shipyard "
+                     f"installed generation {str(install.get('generation'))[:12]}"
+                     if install else "")
+            return verdict(PROMPT_KIND,
+                           f"a privacy consent alert has been on screen since "
+                           f"{alert.get('since')}{after}, and a fresh launchd job hangs on the "
+                           f"volume root {launchd.get('volume_root')} while its internal open "
+                           "and the internal control path answer: launchd-context opens wait "
+                           "behind the unanswered alert", path="consent_alert")
+    elif launchd_probe_disabled:
         launchd = {"outcome": "disabled",
                    "detail": "TARTCI_TCC_LAUNCHD_PROBE=0; the launchd reading is disabled"}
         evidence["launchd_probe"] = launchd
@@ -788,9 +834,15 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
                   reprobe: Optional[Callable[..., dict]] = None,
                   context_probe: Optional[Callable[[], dict]] = None,
                   launchd_probe: Optional[Callable[[], dict]] = None,
-                  launchd_probe_disabled: bool = False) -> Optional[dict]:
+                  launchd_probe_disabled: bool = False,
+                  consent_alert: Optional[Callable[[], dict]] = None) -> Optional[dict]:
     """Classify, heal once, and reprobe. Mutates `state`; returns a recovered
     probe result when the heal brought the store back, else None.
+
+    A `tcc_prompt_pending` verdict runs nothing here: tcc_prompt.alert_pass
+    pages the owner and owns the fallback heal (after PROMPT_HEAL_AFTER_S,
+    once per alert episode, under the same budget). Its heal record reads
+    `paged`.
 
     `failing_since`, `last_heal` and the latest classification ride along in
     the state file so the rate limit and the lane's cause line survive passes.
@@ -825,9 +877,17 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         control_path=control_path, now=now, store_timeout_s=store_timeout_s,
         healed_at=store_health.finite_epoch(healed_at, now),
         context_probe=context_probe, launchd_probe=launchd_probe,
-        launchd_probe_disabled=launchd_probe_disabled)
+        launchd_probe_disabled=launchd_probe_disabled, consent_alert=consent_alert)
     state["classification"] = classification
-    if classification.get("kind") != KIND:
+    kind = classification.get("kind")
+    if kind == PROMPT_KIND:
+        state["heal"] = {"outcome": "paged", "at": _iso(now),
+                         "detail": "a privacy consent alert is waiting on the console; the "
+                                   "consent-alert pass pages the owner and drops the alert "
+                                   f"with the scoped heal only if it is unanswered after "
+                                   f"{PROMPT_HEAL_AFTER_S // 60} min"}
+        return None
+    if kind != KIND:
         return None
     if (last_heal and last_heal.get("outcome") == "ran"
             and last_heal.get("failing_since") == state["failing_since"]):
@@ -923,11 +983,12 @@ def read_state(home: Optional[str] = None) -> dict:
 
 
 def lane_cause(state: dict, now: Optional[float] = None) -> str:
-    """What a lane prints while it defers: `tcc_attribution_wedge <heal outcome>`,
-    or nothing when the watchdog has no fresh wedge verdict."""
+    """What a lane prints while it defers: `<kind> <heal outcome>` for a fresh
+    `tcc_attribution_wedge` or `tcc_prompt_pending` verdict, else nothing."""
     now = time.time() if now is None else now
     classification = state.get("classification") or {}
-    if classification.get("kind") != KIND or state.get("state") == "healthy":
+    kind = classification.get("kind")
+    if kind not in (KIND, PROMPT_KIND) or state.get("state") == "healthy":
         return ""
     try:
         stamp = time.strptime(str(classification.get("classified_at")), "%Y-%m-%dT%H:%M:%SZ")
@@ -936,7 +997,7 @@ def lane_cause(state: dict, now: Optional[float] = None) -> str:
     if now - calendar.timegm(stamp) > FRESH_S:
         return ""
     outcome = (state.get("heal") or {}).get("outcome") or "not_attempted"
-    return f"{KIND} {outcome}"
+    return f"{kind} {outcome}"
 
 
 def main(argv: Optional[list] = None) -> int:
