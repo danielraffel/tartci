@@ -515,6 +515,34 @@ class ReviewFixTest(Harness):
         self.assertIn("network policy", proc.stderr.lower())
         self.assertFalse((self.state / "tart.log").exists())
 
+    def test_network_policy_rejects_full_ipv4_union(self) -> None:
+        policy = self.tmp / "full-ipv4-policy.json"
+        policy.write_text(json.dumps({"version": 1, "mode": "softnet",
+                                      "allow": ["0.0.0.0/1", "128.0.0.0/1"]}))
+        with mock.patch.dict(os.environ, {"TARTCI_RIVM_NETWORK_POLICY": str(policy)}):
+            with self.assertRaisesRegex(run_in_vm.Refused, "unrestricted IPv4"):
+                run_in_vm.network_policy()
+
+    def test_network_policy_rejects_full_ipv6_union(self) -> None:
+        policy = self.tmp / "full-ipv6-policy.json"
+        policy.write_text(json.dumps({"version": 1, "mode": "softnet",
+                                      "allow": ["::/1", "8000::/1"]}))
+        with mock.patch.dict(os.environ, {"TARTCI_RIVM_NETWORK_POLICY": str(policy)}):
+            with self.assertRaisesRegex(run_in_vm.Refused, "unrestricted IPv6"):
+                run_in_vm.network_policy()
+
+    def test_network_policy_merges_overlapping_ipv4_and_ipv6_ranges(self) -> None:
+        policy = self.tmp / "merged-policy.json"
+        policy.write_text(json.dumps({
+            "version": 1,
+            "mode": "softnet",
+            "allow": ["192.0.2.0/25", "192.0.2.128/25",
+                      "2001:db8::/65", "2001:db8:0:0:8000::/65"],
+        }))
+        with mock.patch.dict(os.environ, {"TARTCI_RIVM_NETWORK_POLICY": str(policy)}):
+            args = run_in_vm.network_policy()
+        self.assertEqual(args[-1], "--net-softnet-allow=192.0.2.0/24,2001:db8::/64")
+
     def test_lease_observation_failure_is_a_preemption_reason(self) -> None:
         lease_file = self.home / "leases" / "leases.json"
         lease_file.parent.mkdir(parents=True, exist_ok=True)

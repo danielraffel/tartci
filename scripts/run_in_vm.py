@@ -312,7 +312,7 @@ def network_policy() -> List[str]:
     allow = payload.get("allow")
     if not isinstance(allow, list) or not allow:
         raise Refused(f"run-in-vm network policy needs non-empty allow list: {path}")
-    normalized: List[str] = []
+    networks_by_version = {4: [], 6: []}
     for value in allow:
         if not isinstance(value, str):
             raise Refused(f"run-in-vm network policy has a non-string allow rule: {path}")
@@ -320,11 +320,16 @@ def network_policy() -> List[str]:
             network = ipaddress.ip_network(value, strict=True)
         except ValueError:
             raise Refused(f"run-in-vm network policy has an invalid CIDR: {value}") from None
-        if network.version != 4 or network.prefixlen == 0:
-            raise Refused(f"run-in-vm network policy must not allow unrestricted traffic: {value}")
-        text = str(network)
-        if text not in normalized:
-            normalized.append(text)
+        networks_by_version[network.version].append(network)
+
+    normalized: List[str] = []
+    for version in (4, 6):
+        merged = list(ipaddress.collapse_addresses(networks_by_version[version]))
+        if any(network.prefixlen == 0 for network in merged):
+            raise Refused(
+                f"run-in-vm network policy must not allow unrestricted IPv{version} traffic"
+            )
+        normalized.extend(str(network) for network in merged)
     return ["--net-softnet", "--net-softnet-block=0.0.0.0/0",
             f"--net-softnet-allow={','.join(normalized)}"]
 
