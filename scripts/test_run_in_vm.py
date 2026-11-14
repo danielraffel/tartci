@@ -648,6 +648,37 @@ class PureTest(unittest.TestCase):
         for bad in ("/etc/passwd", "../x", "a/../../b", ""):
             self.assertFalse(run_in_vm.safe_artifact(bad), bad)
 
+    def test_host_prep_subprocesses_are_bounded_by_the_run_deadline(self) -> None:
+        seen = []
+
+        def fake_run(argv, timeout, **kw):
+            seen.append(timeout)
+            return subprocess.CompletedProcess(argv, 0, stdout="abc\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            job = run_in_vm.Run.__new__(run_in_vm.Run)
+            job.args = mock.Mock(src=tmp, git_ref=None)
+            job.tmp = tmp
+            with mock.patch.object(run_in_vm, "run", fake_run):
+                job.bundle(run_in_vm.Deadline(5))
+            self.assertTrue(seen and all(t <= 5 for t in seen), seen)
+            # A stalled prep step maps to timeout 124, not setup failure 76.
+            job.name = "x"
+            with mock.patch.object(run_in_vm, "runs_dir", lambda: Path(tmp)), \
+                    mock.patch.object(run_in_vm, "pid_start", lambda pid: 0), \
+                    mock.patch.object(run_in_vm, "run",
+                                      side_effect=subprocess.TimeoutExpired("git", 1)):
+                with self.assertRaises(run_in_vm.TimedOut):
+                    job.prepare(run_in_vm.Deadline(5))
+            with mock.patch.object(run_in_vm, "runs_dir", lambda: Path(tmp)), \
+                    mock.patch.object(run_in_vm, "pid_start", lambda pid: 0), \
+                    mock.patch.object(run_in_vm, "run", fake_run), \
+                    mock.patch("subprocess.run",
+                               side_effect=subprocess.TimeoutExpired("git", 1)):
+                job.args.exclude = []
+                with self.assertRaises(run_in_vm.TimedOut):
+                    job.prepare(run_in_vm.Deadline(5))
+
     def test_exit_codes_are_distinct_and_documented(self) -> None:
         self.assertEqual(len(set(run_in_vm.EXIT_CODES)), len(run_in_vm.EXIT_CODES))
         runbook = (ROOT / "docs" / "runbook.md").read_text()

@@ -556,7 +556,8 @@ def atomic_write_text(path: Union[Path, str], text: str) -> None:
     os.replace(temporary, path)
 
 
-def export_tree(src: str, dest: Path, excludes: List[str]) -> int:
+def export_tree(src: str, dest: Path, excludes: List[str],
+                deadline: Optional[Deadline] = None) -> int:
     """Copy the files git would ship (tracked plus untracked-not-ignored) into
     `dest`, so the guest never sees `.git`, ignored files (build trees, local
     secrets) or submodule checkouts. Symlinks are copied as links, never
@@ -570,7 +571,8 @@ def export_tree(src: str, dest: Path, excludes: List[str]) -> int:
     listing = subprocess.run(
         ["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
          "-C", src, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-        capture_output=True, timeout=600, check=False, env=env)
+        capture_output=True, check=False, env=env,
+        timeout=deadline.bound(600) if deadline else 600)
     if listing.returncode != 0:
         raise SetupFailed(f"git ls-files failed: {clean(listing.stderr.decode(errors='replace'))}")
 
@@ -832,11 +834,17 @@ class Run:
         self.tmp = tempfile.mkdtemp(prefix="run-", dir=str(root))
         (Path(self.tmp) / "owner.json").write_text(json.dumps(
             {"pid": os.getpid(), "pid_start": pid_start(os.getpid()), "vm": self.name}))
-        bundled = self.bundle(deadline)
+        try:
+            bundled = self.bundle(deadline)
+        except subprocess.TimeoutExpired:
+            raise TimedOut("host preparation ran past --timeout") from None
         self.export = Path(self.tmp) / "src"
         self.export.mkdir()
-        self.result["exported_entries"] = export_tree(self.args.src, self.export,
-                                                      self.args.exclude or [])
+        try:
+            self.result["exported_entries"] = export_tree(
+                self.args.src, self.export, self.args.exclude or [], deadline)
+        except subprocess.TimeoutExpired:
+            raise TimedOut("host preparation ran past --timeout") from None
         deadline.bound(1)
         return bundled
 
@@ -845,17 +853,17 @@ class Run:
         the guest gets history, not the host's git config, hooks or other refs."""
         src = self.args.src
         env = {**child_env(), "GIT_CONFIG_NOSYSTEM": "1", "GIT_TERMINAL_PROMPT": "0"}
-        head = run(["git", "-C", src, "rev-parse", "--verify", "-q", "HEAD"], 30, env=env)
+        head = run(["git", "-C", src, "rev-parse", "--verify", "-q", "HEAD"], deadline.bound(30), env=env)
         if head.returncode != 0:
             return False, "", "", []
         sha = head.stdout.strip()
-        branch = run(["git", "-C", src, "symbolic-ref", "--short", "-q", "HEAD"], 30, env=env)
+        branch = run(["git", "-C", src, "symbolic-ref", "--short", "-q", "HEAD"], deadline.bound(30), env=env)
         name = branch.stdout.strip() if branch.returncode == 0 else ""
         if not REF_RE.match(name or "") or name.endswith(".lock") or ".." in name:
             name = "work"
         refs = []
         for ref in self.args.git_ref or ["refs/remotes/origin/main"]:
-            probe = run(["git", "-C", src, "rev-parse", "--verify", "-q", ref], 30, env=env)
+            probe = run(["git", "-C", src, "rev-parse", "--verify", "-q", ref], deadline.bound(30), env=env)
             if probe.returncode == 0:
                 refs.append(ref)
         assert self.tmp
