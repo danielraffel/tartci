@@ -50,6 +50,8 @@ import traceback
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
+from python_child import child_python
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from python_child import child_python  # noqa: E402

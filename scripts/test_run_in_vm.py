@@ -274,7 +274,7 @@ class RunInVmTest(Harness):
         self.ssh_config({"cmd_sleep": 3})
         proc = subprocess.Popen(
             [sys.executable, str(HERE / "run_in_vm.py"), "--src", str(self.src), "--owner",
-             "tester", "--", "true"], env=self.env(), stdout=subprocess.PIPE,
+             "tester", "--cores", "1", "--mem-mb", "2048", "--", "true"], env=self.env(), stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         try:
             seen = []
@@ -349,7 +349,7 @@ class RunInVmTest(Harness):
         self.ssh_config({"cmd_sleep": 60})
         proc = subprocess.Popen(
             [sys.executable, str(HERE / "run_in_vm.py"), "--src", str(self.src), "--owner",
-             "tester", "--", "sleep", "60"], env=self.env(), stdout=subprocess.PIPE,
+             "tester", "--cores", "1", "--mem-mb", "2048", "--", "sleep", "60"], env=self.env(), stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True)
         for _ in range(200):
             if any("exec " in c["argv"][-1] for c in self.ssh_calls()):
