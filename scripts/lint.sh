@@ -12,6 +12,8 @@
 #   4. public paths — no real home directory, volume or host name.
 #   5. bash 3.2 arrays — no array expansion that macOS /bin/bash 3.2 aborts on
 #               when the array is empty under `set -u`.
+#   6. launchd identity — no LaunchAgent template runs as a per-install or
+#               ad-hoc privacy identity (scripts/launchd_identity_lint.py).
 #
 # Portable to macOS's stock bash 3.2 (no `mapfile`, no associative arrays) —
 # tartci's primary host is macOS, so `scripts/lint.sh` must run there too.
@@ -109,6 +111,17 @@ if python3 scripts/bash32_array_lint.py; then
   ok "bash 3.2 arrays: every array expansion under set -u is guarded"
 else
   bad "bash 3.2 arrays: unguarded expansions above (scripts/bash32_array_lint.py)"
+fi
+
+# ── 6. launchd privacy identity ─────────────────────────────────────────────
+# macOS keys a privacy grant to a job's program; a per-generation path or an
+# ad-hoc binary is a new identity, and a new unanswered consent alert, at every
+# install (tartci#840).
+if python3 scripts/launchd_identity_lint.py --templates >/dev/null; then
+  ok "launchd identity: every LaunchAgent template runs a stable program"
+else
+  python3 scripts/launchd_identity_lint.py --templates | grep '^BAD' || true
+  bad "launchd identity: per-install or ad-hoc programs above (scripts/launchd_identity_lint.py)"
 fi
 
 echo
