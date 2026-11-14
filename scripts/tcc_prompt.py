@@ -194,9 +194,10 @@ def read_windows(*, runner: Optional[Callable[..., Any]] = None,
                  timeout_s: float = WINDOW_READ_TIMEOUT_S) -> dict[str, Any]:
     """The window-list reading, from a bounded child process."""
     from bounded_subprocess import ObservationError, require_success, run_bounded
+    from python_child import child_python
     runner = run_bounded if runner is None else runner
     if python is None:
-        python = sys.executable or "/usr/bin/python3"
+        python = child_python()
     argv = [python, "-I", "-B", os.path.abspath(__file__), "--windows-json"]
     try:
         completed = runner(argv, timeout=timeout_s, operation="tcc_prompt_windows")

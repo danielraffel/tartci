@@ -121,7 +121,8 @@ class ShipyardInstallTests(unittest.TestCase):
         self.assertEqual([row["generation"] for row in installs], ["b" * 64, "a" * 64])
         self.assertTrue(installs[0]["binary"].endswith("b" * 64 + "/shipyard"))
         # birth time where the filesystem keeps one; utime only moves mtime
-        self.assertLessEqual(installs[0]["installed_epoch"], time.time() + 1)
+        # (NOW is a fixed instant that may lie after the wall clock)
+        self.assertLessEqual(installs[0]["installed_epoch"], max(time.time(), NOW) + 1)
 
     def test_an_alert_is_attributed_only_within_ten_minutes_after_an_install(self) -> None:
         installs = [{"generation": "b" * 64, "installed_epoch": NOW - 240,
