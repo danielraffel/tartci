@@ -4430,9 +4430,14 @@ What it does, in order:
    `tart run` under `guard-exec`, as in the lanes.
 6. Clones the golden (`pulp-build-runner:latest`) and sizes it, then **checks
    admission again** (a gate may have booted meanwhile; exit 75, the clone is
-   deleted), boots it with the mounts below, and waits for an IP (120 s) and
-   ssh (180 s). A boot failure's reason carries the tail of `tart run`'s own
-   output (`tart_run_log_tail` in `--result-json`).
+   deleted), boots it with the mounts below and a mandatory Softnet default-deny
+   policy, and waits for an IP (120 s) and ssh (180 s). A boot failure's reason
+   carries the tail of `tart run`'s own output (`tart_run_log_tail` in
+   `--result-json`). The host must provide
+   `~/.config/tartci/run-in-vm-network.json` (or
+   `TARTCI_RIVM_NETWORK_POLICY`) with
+   `{"version":1,"mode":"softnet","allow":["<DNS-or-relay-IPv4>/32", ...]}`.
+   Missing, malformed, or unrestricted policy refuses before a VM is created.
 7. Copies `/Volumes/My Shared Files/src` into a guest-writable `~/work`,
    rebuilds git history there from the bundle, resets the index to the host's
    commit so uncommitted host changes still read as changes, and commits a
@@ -4443,10 +4448,10 @@ What it does, in order:
    back over ssh, each capped by `--max-output-bytes` (default 512 MiB); their
    ssh stderr goes to a file, so a noisy guest cannot stall the stream.
 9. While the VM runs, every 30 s it heartbeats the lease and checks for gate
-   demand: if this lease is marked `preempted`, or a live VM-lease waiter above
+   demand: if this lease is marked `preempted`, a live VM-lease waiter above
    background priority is registered in the lease store's `waiters.json` (lanes
-   register there when `rank_vm_waiters` or fair share is on), it **yields**:
-   tears the VM down and exits 79.
+   register there when `rank_vm_waiters` or fair share is on), or either read
+   fails, it **yields**: tears the VM down and exits 79.
 10. Stops and deletes the VM, proves it is gone (`tart list`, else the store
     directory), releases the lease and removes the scratch record and the
     scratch directory. Any clone attempt counts: a timed-out or interrupted
@@ -4518,14 +4523,12 @@ Reasons in `--result-json` are printable text only (no terminal escapes).
   into it. GitHub App keys, cached installation tokens, `~/.config/pulp/secrets`
   and model credentials stay on the host; the caller pushes from the host with
   code it never executed, hooks off (above).
-- **Network: not restricted.** The guest is on Tart's default shared NAT
-  (`192.168.64.0/24`). It can reach the host at `192.168.64.1`, every LAN host
-  and the internet, so a hostile command can exfiltrate what is in the guest
-  (the export, the shared ccache contents, FetchContent sources) and can reach
-  any service listening on the host's bridge address. Host sshd refuses
-  password and keyboard-interactive login, and no host key is in the guest. The
-  pf anchor that would limit guests to the relay port and DNS needs sudo and is
-  an open item (fleet-handbook W6).
+- **Network.** The guest is booted with Tart Softnet, a default-deny IPv4
+  policy, and only the DNS or relay CIDRs in the host-owned run-in-vm policy.
+  Tart's unrestricted shared NAT is never used as an isolation fallback. A
+  missing policy refuses before clone, and a policy that allows `0.0.0.0/0` is
+  rejected. The policy must include every destination needed by the command;
+  network access is otherwise unavailable.
 - **Persistence.** Nothing is writable on the host, and the VM, its disk, its
   build directory and the run's scratch directory are deleted at the end of
   every run.

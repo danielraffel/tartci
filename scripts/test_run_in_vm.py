@@ -13,6 +13,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -130,6 +131,10 @@ class Harness(unittest.TestCase):
         self.cache = self.tmp / "cache"
         for d in (self.bin, self.state, self.home, self.store / "vms" / "golden", self.cache):
             d.mkdir(parents=True)
+        policy = self.tmp / "run-in-vm-network.json"
+        policy.parent.mkdir(parents=True, exist_ok=True)
+        policy.write_text(json.dumps({"version": 1, "mode": "softnet",
+                                      "allow": ["8.8.8.8/32"]}))
         make_exe(self.bin / "tart", FAKE_TART)
         make_exe(self.bin / "ssh", FAKE_SSH)
         (self.bin / "state-path").write_text(str(self.state))
@@ -155,6 +160,7 @@ class Harness(unittest.TestCase):
             "TARTCI_CI_CACHE": str(self.cache),
             "TARTCI_TART": str(self.bin / "tart"),
             "TARTCI_TART_BIN": str(self.bin / "tart"),
+            "TARTCI_RIVM_NETWORK_POLICY": str(self.tmp / "run-in-vm-network.json"),
             "TARTCI_SSH": str(self.bin / "ssh"),
             "TARTCI_VM_SSH_KEY": str(self.tmp / "key"),
             "FAKE_STATE": str(self.state),
@@ -230,6 +236,9 @@ class RunInVmTest(Harness):
         self.assertTrue(src_dirs[0].startswith(f"--dir=src:{self.cache / 'run-in-vm'}/run-"))
         self.assertEqual(list((self.cache / "run-in-vm").glob("run-*")), [])
         self.assertIn(f"--dir=ccache-shared:{shared}:ro", dirs)
+        self.assertIn("--net-softnet", argv)
+        self.assertIn("--net-softnet-block=0.0.0.0/0", argv)
+        self.assertIn("--net-softnet-allow=8.8.8.8/32", argv)
         self.assertTrue(any(d.startswith("--dir=gitbundle:") and d.endswith(":ro") for d in dirs))
         for d in dirs:
             self.assertTrue(d.endswith(":ro"), f"writable mount: {d}")
@@ -477,6 +486,65 @@ class ReviewFixTest(Harness):
         self.assertEqual(proc.returncode, 0, proc.stderr[-3000:])
         self.assertLess(time.monotonic() - start, 45)
         self.assertEqual((self.tmp / "o.patch").read_text(), "p")
+
+    def test_partial_output_symlink_is_not_followed(self) -> None:
+        target = self.tmp / "outside.txt"
+        partial = self.tmp / ".o.patch.partial"
+        target.write_text("keep\n")
+        partial.symlink_to(target)
+        with self.assertRaises(run_in_vm.OutputFailed):
+            run_in_vm.open_exclusive(partial, "wb")
+        self.assertEqual(target.read_text(), "keep\n")
+
+    def test_output_symlink_and_source_output_are_rejected(self) -> None:
+        target = self.tmp / "outside.txt"
+        target.write_text("keep\n")
+        link = self.tmp / "link.patch"
+        link.symlink_to(target)
+        proc = self.run_cli("--patch-out", str(link), "--", "true")
+        self.assertEqual(proc.returncode, 2, proc.stderr[-3000:])
+        self.assertEqual(target.read_text(), "keep\n")
+        proc = self.run_cli("--patch-out", str(self.src / "inside.patch"), "--", "true")
+        self.assertEqual(proc.returncode, 2, proc.stderr[-3000:])
+        self.assertFalse((self.state / "tart.log").exists())
+
+    def test_missing_network_policy_refuses_before_clone(self) -> None:
+        proc = self.run_cli("--", "true",
+                            TARTCI_RIVM_NETWORK_POLICY=str(self.tmp / "missing-policy.json"))
+        self.assertEqual(proc.returncode, 75, proc.stderr[-3000:])
+        self.assertIn("network policy", proc.stderr.lower())
+        self.assertFalse((self.state / "tart.log").exists())
+
+    def test_lease_observation_failure_is_a_preemption_reason(self) -> None:
+        lease_file = self.home / "leases" / "leases.json"
+        lease_file.parent.mkdir(parents=True, exist_ok=True)
+        lease_file.write_text("not-json\n")
+        with mock.patch.dict(os.environ, {"TARTCI_LEASE_DIR": str(lease_file.parent)}):
+            reason = run_in_vm.gate_waiting("vm-tart-macos-vm-test")
+        self.assertIn("observation failed", reason)
+
+    def test_heartbeat_failure_requests_preemption(self) -> None:
+        class OneTick:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, _seconds: float) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+            def is_set(self) -> bool:
+                return False
+
+        job = run_in_vm.Run.__new__(run_in_vm.Run)
+        job.heartbeat_stop = OneTick()
+        job.lease_id = "vm-tart-macos-vm-test"
+        job.preempted = ""
+        with mock.patch.object(run_in_vm, "lease", return_value=subprocess.CompletedProcess(
+                [], 1, '{"error":"store unreadable"}', "")), mock.patch.object(
+                    run_in_vm.os, "kill") as kill:
+            job.heartbeat()
+        self.assertIn("heartbeat failed", job.preempted)
+        kill.assert_called_once()
 
     def test_gate_that_starts_during_the_clone_refuses_before_boot(self) -> None:
         proc = self.run_cli("--", "true", FAKE_CLONE_ADDS_GATE="1")

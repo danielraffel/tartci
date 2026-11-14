@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -48,9 +49,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Callable, Dict, List, Optional
-
-from python_child import child_python
+from typing import Callable, Dict, List, Optional, Union
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -291,6 +290,45 @@ def pool_open() -> tuple[bool, str]:
     return True, "on"
 
 
+def network_policy() -> List[str]:
+    """Return a mandatory Softnet default-deny policy for the guest.
+
+    The policy is host-owned configuration.  A missing, malformed, or
+    permissive policy refuses admission before a VM is created; Tart's shared
+    NAT is never an isolation fallback.
+    """
+    path = Path(os.environ.get("TARTCI_RIVM_NETWORK_POLICY") or
+                "~/.config/tartci/run-in-vm-network.json").expanduser()
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("policy is missing or is a symlink")
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise Refused(f"no valid run-in-vm network policy: {path} ({exc})") from None
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise Refused(f"no valid run-in-vm network policy: {path} (version)")
+    if payload.get("mode") != "softnet":
+        raise Refused(f"run-in-vm network policy must use Softnet: {path}")
+    allow = payload.get("allow")
+    if not isinstance(allow, list) or not allow:
+        raise Refused(f"run-in-vm network policy needs non-empty allow list: {path}")
+    normalized: List[str] = []
+    for value in allow:
+        if not isinstance(value, str):
+            raise Refused(f"run-in-vm network policy has a non-string allow rule: {path}")
+        try:
+            network = ipaddress.ip_network(value, strict=True)
+        except ValueError:
+            raise Refused(f"run-in-vm network policy has an invalid CIDR: {value}") from None
+        if network.version != 4 or network.prefixlen == 0:
+            raise Refused(f"run-in-vm network policy must not allow unrestricted traffic: {value}")
+        text = str(network)
+        if text not in normalized:
+            normalized.append(text)
+    return ["--net-softnet", "--net-softnet-block=0.0.0.0/0",
+            f"--net-softnet-allow={','.join(normalized)}"]
+
+
 # ── Small process helpers ──────────────────────────────────────────────────
 
 
@@ -428,26 +466,89 @@ def admit_slots(home: str, cap: int, min_free: int, own: str = "") -> None:
 def gate_waiting(lease_id: str) -> str:
     """Non-empty (a reason) when gate work wants this host's capacity: this
     lease was marked preempted, or a live VM lease waiter above background
-    priority is registered. Fail-open: an unreadable store yields nothing."""
+    priority is registered. Any unreadable observation is itself a reason to
+    yield, because the run cannot prove that a gate is not waiting."""
     try:
         import leases  # noqa: PLC0415
 
         store = leases.default_store_dir()
         records = json.loads(leases.store_file(store).read_text() or "{}")
-        rows = records.get("leases", records) if isinstance(records, dict) else records
-        for row in rows if isinstance(rows, list) else []:
+        if isinstance(records, dict):
+            rows = records.get("leases")
+        else:
+            rows = records
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return "lease-demand observation failed: invalid lease store shape"
+        for row in rows:
             if isinstance(row, dict) and row.get("id") == lease_id and row.get("preempted") is True:
                 return "the lease store preempted this lease"
-        waiters, _ = leases.load_waiters(store)
+        waiters, problems = leases.load_waiters(store)
+        if problems:
+            return f"lease-demand observation failed: {'; '.join(problems)}"
         live, _ = leases.live_waiters(waiters, WAITER_FRESH_SECS)
         for row in live:
             if (int(row.get("priority") or 0) > leases.PRIORITY_CLASSES["background"]
                     and leases.is_vm_kind(row.get("command_kind"))
                     and str(row.get("id")) != lease_id):
                 return f"VM lease waiter {row.get('id')} (priority {row.get('priority')}) is waiting"
-    except Exception:  # noqa: BLE001 - observation only
-        return ""
+    except Exception as exc:  # noqa: BLE001 - observation must fail closed
+        return f"lease-demand observation failed: {clean(str(exc))}"
     return ""
+
+
+def validate_output_path(value: str, source: Path) -> Path:
+    """Validate a caller output without traversing symlinked directories."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    path = Path(os.path.abspath(path))
+    source_real = Path(os.path.realpath(source))
+    path_real = Path(os.path.realpath(path.parent)) / path.name
+    try:
+        if os.path.commonpath((str(path_real), str(source_real))) == str(source_real):
+            raise ValueError("output must be outside --src")
+    except ValueError as exc:
+        raise ValueError(f"unsafe output path {value}: {exc}") from None
+    if path.exists() and path.is_symlink():
+        raise ValueError("output is a symlink")
+    parent = path.parent
+    if not parent.is_dir():
+        raise ValueError("output directory does not exist")
+    # Existing symlink components can redirect the temporary file or result
+    # replacement into an attacker-selected directory.
+    current = parent
+    while current != current.parent:
+        if current.is_symlink():
+            # macOS exposes the system temporary directory as /tmp ->
+            # /private/tmp. It is a fixed system alias; all other symlinked
+            # components are rejected because they can redirect the output.
+            if current == Path("/tmp") and Path(os.path.realpath(current)) == Path("/private/tmp"):
+                current = current.parent
+                continue
+            raise ValueError("output directory contains a symlink")
+        current = current.parent
+    return path
+
+
+def open_exclusive(path: Path, mode: str):
+    """Open a new output file without following a symlink or overwriting it."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError as exc:
+        raise OutputFailed(f"cannot create output temporary {path}: {exc.strerror}") from None
+    return os.fdopen(fd, mode)
+
+
+def atomic_write_text(path: Union[Path, str], text: str) -> None:
+    """Write result JSON through an exclusive temporary and atomic replace."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.partial")
+    with open_exclusive(temporary, "w") as handle:
+        handle.write(text)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def export_tree(src: str, dest: Path, excludes: List[str]) -> int:
@@ -621,6 +722,7 @@ def safe_artifact(path: str) -> bool:
 class Run:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
+        self.network_args = network_policy()
         self.home = args.tart_home or tart_home()
         stamp = time.strftime("%Y%m%d%H%M%S", time.gmtime())
         self.name = f"{VM_PREFIX}{args.owner}-{stamp}"
@@ -676,8 +778,18 @@ class Run:
 
     def heartbeat(self) -> None:
         while not self.heartbeat_stop.wait(HEARTBEAT_SECS):
-            with contextlib.suppress(Exception):
-                lease(["heartbeat", "--id", self.lease_id, "--json"], 30)
+            try:
+                beat = lease(["heartbeat", "--id", self.lease_id, "--json"], 30)
+                payload = json.loads(beat.stdout or "{}")
+                if beat.returncode != 0 or payload.get("heartbeat") != self.lease_id:
+                    raise RuntimeError((payload.get("error") if isinstance(payload, dict)
+                                        else "heartbeat was not acknowledged") or
+                                       f"heartbeat exited {beat.returncode}")
+            except Exception as exc:  # noqa: BLE001 - inability to heartbeat is unsafe
+                if not self.heartbeat_stop.is_set():
+                    self.preempted = f"lease heartbeat failed: {clean(str(exc))}"
+                    os.kill(os.getpid(), signal.SIGUSR1)
+                    return
             why = gate_waiting(self.lease_id)
             if why and not self.heartbeat_stop.is_set():
                 # Yield the slot: the main thread's SIGUSR1 handler raises
@@ -829,7 +941,7 @@ class Run:
         log = open(Path(self.tmp or ".") / "tart-run.log", "wb")  # noqa: SIM115
         self.guardian = subprocess.Popen(
             [child_python(), leases_script(), "guard-exec", "--id", self.lease_id, "--",
-             tart_bin(), "run", "--no-graphics", *self.mounts(), self.name],
+             tart_bin(), "run", "--no-graphics", *self.network_args, *self.mounts(), self.name],
             env={**child_env(), "TART_HOME": self.home}, stdin=subprocess.DEVNULL,
             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
         log.close()
@@ -868,7 +980,7 @@ class Run:
         # stderr goes to a file, never a pipe read after stdout EOF: a guest
         # that writes more stderr than the pipe holds would otherwise stall the
         # stream until the deadline and read as a timeout.
-        with open(tmp_out, "wb") as handle, open(err_path, "wb") as err_handle:
+        with open_exclusive(tmp_out, "wb") as handle, open(err_path, "wb") as err_handle:
             argv = [ssh_bin(), *SSH_OPTIONS, "-i", self.key, f"{self.user}@{self.ip}", remote]
             proc = subprocess.Popen(argv, env=ssh_env(), stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=err_handle)
@@ -1050,9 +1162,14 @@ def parse_args(argv: List[str]) -> argparse.Namespace:
         args.src = str(src.resolve())
         if ":" in args.src:
             problems.append("--src must not contain ':' (Tart's --dir separator)")
-    for out in (args.patch_out, args.artifacts_out, args.result_json):
-        if out and not Path(out).expanduser().resolve().parent.is_dir():
-            problems.append(f"output directory does not exist: {out}")
+    for name in ("patch_out", "artifacts_out", "result_json"):
+        out = getattr(args, name)
+        if not out:
+            continue
+        try:
+            setattr(args, name, str(validate_output_path(out, src)))
+        except ValueError as exc:
+            problems.append(str(exc))
     if problems:
         parser.error("; ".join(problems))
     return args
@@ -1141,7 +1258,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.result_json:
         summary = dict(job.result if job else {})
         summary.update({"exit_code": code, "reason": clean(reason, 2000)})
-        Path(args.result_json).write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        try:
+            atomic_write_text(args.result_json,
+                              json.dumps(summary, indent=2, sort_keys=True) + "\n")
+        except OutputFailed as exc:
+            note(str(exc))
+            if code == EXIT_OK:
+                code = EXIT_OUTPUT_FAILED
     return code
 
 
