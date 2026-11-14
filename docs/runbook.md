@@ -4367,6 +4367,123 @@ tartci scratch-vm delete <name>               # when done, before the TTL
   (`ghcr.io/cirruslabs/ubuntu@sha256:cb46e376...`); pass `--from` for a local
   golden.
 
+## Running untrusted code in a disposable VM (`tartci run-in-vm`)
+
+`tartci run-in-vm` runs one command against a source tree inside a disposable
+macOS VM and returns its output, a patch and named files. It exists so that a
+lane which must execute a pull request's own scripts (gates, pre-push checks,
+builds, tests, regenerators) never runs them as the host user, where they could
+read the host's keys, tokens, SSH agent and every same-user process's
+environment. The host keeps its credentials and its git plumbing; only the
+command runs in the guest.
+
+```sh
+tartci run-in-vm --src <worktree> --owner <lane> [--timeout 3600] \
+  [--patch-out out.patch] [--artifacts-out out.tar --artifact build/report.json] \
+  [--result-json result.json] -- tools/scripts/gates.sh origin/main
+git -C <worktree> apply out.patch    # the patch is data; the host never ran the code
+```
+
+What it does, in order:
+
+1. Takes a host-local lock (`~/.tartci/state/run-in-vm/host.lock`, a `flock`
+   the kernel drops if the process dies): **at most one run-in-vm per host**.
+2. Refuses (exit 75) while the pool is not `on` or a transition lock exists,
+   while any `scratch-rivm-*` VM is still listed, and when booting one more
+   macOS guest would leave fewer than `--min-free-slots` (default 1) of the
+   host's `--macos-vm-cap` (default 2) slots for the gates. With the defaults it
+   starts only when no macOS guest is running, and the gates keep the other slot.
+3. Records the VM as a scratch VM (`scratch-rivm-<owner>-<UTC stamp>`, owner
+   `run-in-vm:<owner>`, TTL = `--timeout` + 30 min), so the launchd watchdog
+   deletes it even if run-in-vm is killed with SIGKILL.
+4. Takes a `tart-macos-vm` lease at `background` priority (10, the lowest) in
+   the same lease store the lanes use, sized `--cores` (default 4) and
+   `--mem-mb` (default 8192), smaller than a gate VM. A denial is exit 75. The
+   clone runs under `leases.py guard-run` and `tart run` under `guard-exec`, as
+   in the lanes, and the lease is heartbeated every 30 s.
+5. Clones the golden (`pulp-build-runner:latest`), sizes it, boots it with the
+   mounts below, waits for an IP (120 s) and ssh (180 s).
+6. Copies `/Volumes/My Shared Files/src` into a guest-writable `~/work`
+   (without `.git`), rebuilds git history there from a bundle of `HEAD` and
+   `refs/remotes/origin/main` (plus any `--git-ref`), resets the index to the
+   host's commit so uncommitted host changes still read as changes, and commits
+   a baseline. The patch is `git diff --binary` against that baseline.
+7. Runs the command (argv quoted exactly, stdin `/dev/null`, stdout and stderr
+   streamed to the caller's), then streams the patch and the tar back over ssh,
+   each capped by `--max-output-bytes` (default 512 MiB).
+8. Stops and deletes the VM, proves it is gone (`tart list`, else the store
+   directory), releases the lease and removes the scratch record. If deletion
+   is not proved, the lease and the record stay, and the watchdog deletes the
+   VM at its TTL.
+
+`--timeout` (default 3600, at most 14400) bounds the whole run, boot included,
+by wall clock; teardown runs after it.
+
+### Exit codes
+
+| Code | Meaning |
+|------|---------|
+| 0 | the command exited 0, every requested output was collected, the VM is proved deleted |
+| 1 | the command exited non-zero; its own code is `guest_rc` in `--result-json`. Outputs were still collected |
+| 2 | bad arguments; nothing was started |
+| 75 | refused before any VM existed: another run-in-vm holds this host, the pool is not on, no macOS slot would stay free for the gates, or the lease store denied the lease |
+| 76 | clone, size, boot, IP, ssh, guest preparation, or the ssh connection itself (ssh rc 255) failed |
+| 77 | the command ran but the patch or artifact stream failed or exceeded `--max-output-bytes` |
+| 78 | the VM could not be proved deleted; its scratch record stays for the watchdog. Overrides every code but 2 |
+| 124 | the `--timeout` wall clock ran out; the VM was torn down |
+| 130 | SIGINT or SIGTERM; the VM was torn down |
+
+A command that itself exits 255 reads as 76: ssh cannot tell the two apart.
+
+### Isolation guarantees, and what they do not cover
+
+- **Process.** The command runs in a separate macOS guest. It cannot read host
+  process memory or any host process's environment (`KERN_PROCARGS2` does not
+  cross the VM boundary), and the host never executes anything from the source
+  tree: its only work on it is `git rev-parse` and `git bundle create`, which
+  run no hooks or filters from the tree.
+- **Filesystem.** The guest sees exactly these host directories, every one
+  read-only: `src` (the source tree), `gitbundle` (a temporary directory with
+  the bundle), and when present `ccache-shared` (the gate ccache's shared store,
+  `<cache_root>/ccache/tartci-layers-v1/shared`, read through ccache's
+  `read-only` remote), `fetchcontent`, `pip-wheelhouse` and `artifact-cache`.
+  It never mounts the writable gate ccache directory, the configure-check
+  cache, a home directory, `~/.config` or `~/.ssh`, so a run cannot write any
+  host cache or plant anything a later job reads. The guest's own ccache and
+  configure-check caches are guest-local and discarded with the VM. The host's
+  `.git` is not mounted: the bundle carries only the named refs' history, not
+  the repository config (which can hold remote URLs), hooks or other branches.
+- **Keychain.** No host keychain, certificate or signing material enters the
+  guest.
+- **Credentials.** None enter the guest. ssh runs with `-F /dev/null` (no user
+  or system ssh config, so no `SendEnv`), `IdentitiesOnly=yes`,
+  `IdentityAgent=none`, `ForwardAgent=no`, `ClearAllForwardings=yes`, no
+  control socket, and an environment of `PATH`, `HOME` and `LANG` only;
+  `SSH_AUTH_SOCK` is removed before anything starts. The host's
+  `~/.ssh/id_ed25519` is used as the client key into the guest and never copied
+  into it. GitHub App keys, cached installation tokens, `~/.config/pulp/secrets`
+  and model credentials stay on the host; the caller pushes from the host with
+  code it never executed.
+- **Network: not restricted.** The guest is on Tart's default shared NAT
+  (`192.168.64.0/24`). It can reach the host at `192.168.64.1`, every LAN host
+  and the internet, so a hostile command can exfiltrate what is in the guest
+  (the source tree, the shared ccache contents, FetchContent sources) and can
+  reach any service listening on the host's bridge address. Host sshd refuses
+  password and keyboard-interactive login, and no host key is in the guest. The
+  pf anchor that would limit guests to the relay port and DNS needs sudo and is
+  an open item (fleet-handbook W6).
+- **Persistence.** Nothing is writable on the host, and the VM, its disk and its
+  build directory are deleted at the end of every run.
+- **Residuals.** What comes back (stdout, stderr, the patch, the tar) is
+  attacker-controlled data: apply the patch with `git apply` and review it like
+  any other PR content, extract the tar only as an unprivileged user into an
+  empty directory, and do not render the logs in a terminal that trusts escape
+  sequences. A repair VM holds one of Apple's two macOS guest slots for up to
+  `--timeout`; with the default it starts only when both are free.
+
+Switching the Shipyard pass-runner's repair and operator lanes to this command
+is owned by the m5s Shipyard session; this command does not change any lane.
+
 ## Leaked lane clones
 
 `vm_reap` deletes a stopped clone of a loaded lane, `<runner>-<pid>-<n>`,
