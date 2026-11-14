@@ -57,6 +57,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER_SUFFIX = "/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher"
+LAUNCHER_RELATIVE = tuple(LAUNCHER_SUFFIX.lstrip("/").split("/"))
 PLATFORM_ROOTS = ("/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/", "/usr/libexec/", "/System/")
 OK_KINDS = frozenset({"launcher", "platform", "developer_id"})
 HEX_SEGMENT = re.compile(r"^[0-9a-f]{40,64}$")
@@ -93,6 +94,16 @@ def program_of(value: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def is_canonical_launcher(path: str) -> bool:
+    """Whether `path` is the launcher in a user's canonical home directory."""
+    parts = Path(os.path.normpath(path)).parts
+    if tuple(parts[-len(LAUNCHER_RELATIVE):]) != LAUNCHER_RELATIVE:
+        return False
+    home = parts[:-len(LAUNCHER_RELATIVE)]
+    return ((len(home) == 3 and home[:2] == (os.sep, "Users") and bool(home[2]))
+            or home == (os.sep, "var", "root"))
+
+
 def classify_static(program: Optional[str]) -> Dict[str, str]:
     """The identity class of a program path, from the path alone."""
     if not program:
@@ -106,7 +117,7 @@ def classify_static(program: Optional[str]) -> Dict[str, str]:
     why = per_generation_reason(normalized)
     if why:
         return {"kind": "per_generation", "reason": why}
-    if normalized.endswith(LAUNCHER_SUFFIX):
+    if is_canonical_launcher(normalized):
         return {"kind": "launcher", "reason": "the stable Developer-ID TartCI launcher"}
     return {"kind": "user_binary",
             "reason": f"{program} is outside the system volume and is not the TartCI launcher"}

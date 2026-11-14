@@ -43,6 +43,7 @@ class StaticClassTests(unittest.TestCase):
         + "/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher": "per_generation",
         "/Users/example/.cache/tool/" + "d" * 40 + "/bin/tool": "per_generation",
         # outside the system volume and not the launcher at its stable path
+        "/tmp/.local/libexec/TartCILauncher.app/Contents/MacOS/tartci-launcher": "user_binary",
         "/Applications/TartCILauncher.app/Contents/MacOS/tartci-launcher": "user_binary",
         "$HOME/.local/bin/tartci": "user_binary",
         "/Users/example/bin/subrouter": "user_binary",
