@@ -17,12 +17,15 @@ layer after the job:
            whose promoter died is promoted again (promotion is idempotent);
   trim     keep ``shared/`` under a size cap, oldest entries first.
 
-Layout under the layers root (inside the host ccache directory the guest
-mounts, so every move is a same-filesystem rename):
+Layout under the layers root ($CACHE_ROOT/ccache-layers-v1, a sibling of the
+legacy ccache directory, so every move is a same-filesystem rename and no
+legacy read-write mount reaches it):
 
-  shared/<k0k1>/<rest>      ccache ``file:`` remote-storage layout, read by guests
+  shared/<k0k1>/<rest>      ccache ``file:`` remote-storage layout; guests mount
+                            it read-only
   jobs/<vm>/local/          the guest's CCACHE_DIR (stats only: remote_only)
-  jobs/<vm>/remote/         the guest's writable remote storage
+  jobs/<vm>/remote/         the guest's writable remote storage; the guest
+                            mounts only its own jobs/<vm>
   green/<vm>/  discard/<vm>/
 
 Host-only state (never mounted into a guest) lives in a separate state
@@ -129,9 +132,23 @@ class Layout:
         self.audit = state / "audit.jsonl"
 
     def ensure(self) -> None:
+        # Tart mounts shared/ and jobs/<vm> by path, and every move below is a
+        # rename by path: a symlink anywhere on the way would mount, promote
+        # into or delete whatever it points at. mkdir(exist_ok) accepts a link
+        # to a directory, so check before and after creating.
+        self.refuse_links()
         for path in (self.shared, self.jobs, self.green, self.discard,
                      self.owners, self.locks, self.promotions):
             path.mkdir(parents=True, exist_ok=True)
+        self.refuse_links()
+
+    def refuse_links(self) -> None:
+        for path in (self.root, self.shared, self.jobs, self.green, self.discard,
+                     self.state):
+            if path.is_symlink():
+                raise ValueError(f"{path} is a symlink; refusing to use it")
+            if path.exists() and not path.is_dir():
+                raise ValueError(f"{path} is not a directory")
 
 
 def check_vm(vm: str) -> str:
@@ -336,7 +353,13 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
                               "rejected": 0, "bytes": 0}
     keys: list[str] = []
     lock_path = layout.locks / "shared-manifests.lock"
-    for key_dir, name, path in iter_layer_entries(layer / "remote"):
+    remote = layer / "remote"
+    # The guest owns jobs/<vm> read-write, so it can swap remote/ for a link
+    # to any host directory; scandir would follow it. Promote nothing then.
+    if layer.is_symlink() or remote.is_symlink():
+        counts["rejected"] += 1
+        return {**counts, "keys": keys}
+    for key_dir, name, path in iter_layer_entries(remote):
         if not KEY_DIR.fullmatch(key_dir) or not KEY_NAME.fullmatch(name):
             counts["rejected"] += 1
             continue

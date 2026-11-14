@@ -159,6 +159,9 @@ runner_group_id = 1
 claim_rank = 2
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 min_queued_age_seconds = 0
 assignment_mode = "event-class-v2"
 # Pre-clone demand check: before cloning, re-ask the pre-mint question live and
@@ -244,6 +247,9 @@ registration_scope = "repository"
 runtime_measure = true
 runtime_tags = "pulp"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 min_queued_age_seconds = 0
 supervisors = 1
 runner_idle_timeout_seconds = 60
@@ -290,6 +296,9 @@ repo = "danielraffel/spectr"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
@@ -304,6 +313,9 @@ id = "forge-gate"
 repo = "Generous-Corp/forge"
 runner_group_id = 11
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 chrome_app_dir = "/Applications/Google Chrome.app"
 priority = "gate"
 min_queued_age_seconds = 0
@@ -321,6 +333,9 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 # Vellum is advisory to Pulp's required gate: vm=60, while Pulp
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"

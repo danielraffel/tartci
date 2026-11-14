@@ -284,6 +284,34 @@ class SweepAndTrimTests(Base):
         self.assertEqual(counts["resumed"], 1)
         self.assertEqual(self.shared_keys(), {"ab" + "a" * 38})
 
+    def test_a_remote_dir_swapped_for_a_link_promotes_nothing(self) -> None:
+        # The guest owns jobs/<vm> read-write and can replace remote/ with a
+        # link to any host directory full of entry-shaped files.
+        outside = self.tmp / "host-dir"
+        write_entry(outside, "ab" + "e" * 38, entry(0))
+        layer = self.attach("vm-link")
+        shutil.rmtree(layer / "remote")
+        (layer / "remote").symlink_to(outside)
+        self.settle("vm-link")
+        self.assertEqual(cl.process(self.layout, "vm-link", never_present), "promoted")
+        self.assertEqual(self.shared_keys(), set())
+        promote = [e for e in self.audit_events() if e["event"] == "promote"]
+        self.assertEqual(promote[-1]["rejected"], 1)
+        self.assertTrue((outside / "ab" / ("e" * 38)).exists(), "the link target is untouched")
+
+    def test_a_symlinked_store_directory_is_refused(self) -> None:
+        for name in ("shared", "jobs", "green", "discard"):
+            with self.subTest(dir=name):
+                tmp = Path(tempfile.mkdtemp(prefix="ccache-layer-link-"))
+                self.addCleanup(shutil.rmtree, tmp, True)
+                layout = cl.Layout(tmp / "layers", tmp / "state")
+                (tmp / "target").mkdir()
+                (tmp / "layers").mkdir()
+                (tmp / "layers" / name).symlink_to(tmp / "target")
+                with self.assertRaises(ValueError):
+                    cl.attach(layout, "vm-x", os.getpid())
+                self.assertEqual(list((tmp / "target").iterdir()), [])
+
     def test_trim_evicts_oldest_until_under_the_cap_and_reaps_stale_tmp(self) -> None:
         for i in range(10):
             write_entry(self.layout.shared, f"{i:02x}" + "b" * 38, entry(0, b"x" * 1000),
@@ -361,8 +389,13 @@ class ShellLibTests(unittest.TestCase):
         result = self.fragments("1")
         self.assertEqual(result.returncode, 0, result.stderr)
         out = result.stdout
-        self.assertIn("ROOT</tmp/cache-root/ccache/tartci-layers-v1>", out)
-        self.assertIn("'/Volumes/My Shared Files/ccache/tartci-layers-v1/jobs/vm-x'", out)
+        # A sibling of the legacy ccache directory, never inside it: a legacy
+        # read-write `ccache` mount must not reach the shared store.
+        self.assertIn("ROOT</tmp/cache-root/ccache-layers-v1>", out)
+        self.assertNotIn("/tmp/cache-root/ccache/", out)
+        self.assertIn("'/Volumes/My Shared Files/ccache-shared' ~/.tartci-ccache/shared", out)
+        self.assertIn("'/Volumes/My Shared Files/ccache-job' ~/.tartci-ccache/job", out)
+        self.assertNotIn("/Volumes/My Shared Files/ccache/", out)
         self.assertIn('file:$HOME/.tartci-ccache/shared|read-only file:$HOME/.tartci-ccache/job/remote', out)
         self.assertIn("CCACHE_REMOTE_ONLY=true", out)
         self.assertIn("CCACHE_REMOTE_STORAGE=file:%s|read-only file:%s", out)
@@ -384,19 +417,151 @@ class ShellLibTests(unittest.TestCase):
         self.assertLess(wrapper.index("run_runner_until_done_unlayered"),
                         wrapper.index("tartci_ccache_layer_settle"))
 
+    def test_boot_mounts_the_layer_instead_of_the_legacy_writable_cache(self) -> None:
+        source = RUNNER.read_text()
+        boot = source[source.index("boot_vm_to_ssh(){"):source.index("tartci_vm_ssh_wait(){")]
+        isolated = boot.index('if [ "$CURRENT_SHARED_CACHE" = 1 ] && [ "$CCACHE_LAYER_ENABLED" = 1 ]; then')
+        legacy = boot.index('tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")')
+        # The legacy writable mount is only reached on the branch where
+        # isolation is off; a failed attach drops the shared cache instead.
+        self.assertLess(isolated, legacy)
+        self.assertIn('elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then\n'
+                      '    tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")', boot)
+        branch = boot[isolated:legacy]
+        self.assertIn("tartci_ccache_layer_boot", branch)
+        self.assertIn("CURRENT_SHARED_CACHE=0", branch)
+        # The layer is attached before the configure-checks mount reads the flag
+        # and before `tart run` starts the guest.
+        self.assertLess(isolated, boot.index('--dir="configure-checks:'))
+        self.assertLess(isolated, boot.index("tart run --no-graphics"))
+
+    def test_teardown_abandons_an_unsettled_layer_after_the_guest_stops(self) -> None:
+        source = RUNNER.read_text()
+        discard = source[source.index("discard_current_vm(){"):]
+        discard = discard[:discard.index("\n}\n")]
+        self.assertLess(discard.index("terminate_current_guardian"),
+                        discard.index('tartci_ccache_layer_abandon "$CURRENT_VM"'))
+
+
+class BootTests(Base):
+    """The host-side boot hook, driven through the shell library."""
+
+    def run_lib(self, snippet: str, value: str = "1") -> subprocess.CompletedProcess[str]:
+        tart = self.tmp / "bin" / "tart"
+        tart.parent.mkdir(parents=True, exist_ok=True)
+        tart.write_text('#!/bin/sh\nprintf "[]"\n')
+        tart.chmod(0o755)
+        script = textwrap.dedent(f"""
+            set -euo pipefail
+            TARTCI_ROOT={ROOT}; CACHE_ROOT={self.tmp}/cache; CCACHE_MAX_SIZE=1G
+            STATE_DIR={self.tmp}/events; mkdir -p "$STATE_DIR"
+            TARTCI_CCACHE_WRITE_ISOLATION='{value}'
+            TARTCI_CCACHE_LAYER_TART={tart}
+            event(){{ printf '%s %s\n' "$1" "${{2:-}}" >>"$STATE_DIR/events"; }}
+            source {LIB}
+        """) + textwrap.dedent(snippet) + "\nwait\n"
+        return subprocess.run(["bash", "-c", script], text=True, capture_output=True,
+                              check=False, env=dict(os.environ, TARTCI_CCACHE_LAYER_TART=str(tart)))
+
+    def test_boot_mounts_shared_read_only_and_only_this_vms_layer(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_boot vm-a
+            printf '%s\n' "${CCACHE_LAYER_TART_DIRS[@]}"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        root = self.tmp / "cache" / "ccache-layers-v1"
+        self.assertEqual(result.stdout.splitlines(), [
+            f"--dir=ccache-shared:{root}/shared:ro",
+            f"--dir=ccache-job:{root}/jobs/vm-a",
+        ])
+        self.assertTrue((root / "jobs" / "vm-a" / "remote").is_dir())
+        self.assertFalse((self.tmp / "cache" / "ccache").exists(),
+                         "the boot hook must not create or use the legacy directory")
+
+    def test_off_boot_is_a_no_op(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_boot vm-a
+            printf 'n=%s\n' "${#CCACHE_LAYER_TART_DIRS[@]}"
+        ''', value="0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("n=0", result.stdout)
+        self.assertFalse((self.tmp / "cache" / "ccache-layers-v1").exists())
+
+    def test_symlinked_shared_store_refuses_the_boot_layer(self) -> None:
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        root = self.tmp / "cache" / "ccache-layers-v1"
+        root.mkdir(parents=True)
+        (root / "shared").symlink_to(elsewhere)
+        result = self.run_lib('''
+            if tartci_ccache_layer_boot vm-a; then echo attached; else echo refused; fi
+            printf 'n=%s\n' "${#CCACHE_LAYER_TART_DIRS[@]}"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused", result.stdout)
+        self.assertIn("n=0", result.stdout)
+        self.assertIn("ccache_layer_attach_failed", (self.tmp / "events" / "events").read_text())
+        self.assertEqual(list(elsewhere.iterdir()), [])
+
+    def test_job_start_requires_the_boot_layer(self) -> None:
+        result = self.run_lib('''
+            if tartci_ccache_layer_attach vm-unbooted; then echo started; else echo refused; fi
+            printf 'PREP<%s>\n' "$CCACHE_LAYER_GUEST_PREP"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("refused", result.stdout)
+        self.assertIn("PREP<>", result.stdout)
+
+    def test_discarded_vm_layer_is_deleted_and_never_promoted(self) -> None:
+        key = "ab" + "c" * 38
+        result = self.run_lib(f'''
+            tartci_ccache_layer_boot vm-gone
+            tartci_ccache_layer_attach vm-gone
+            mkdir -p "$CCACHE_LAYER_ROOT/jobs/vm-gone/remote/ab"
+            printf '\\314\\254\\001\\000%016d' 0 >"$CCACHE_LAYER_ROOT/jobs/vm-gone/remote/ab/{key[2:]}"
+            tartci_ccache_layer_abandon vm-gone
+            printf 'vm=<%s>\n' "$CCACHE_LAYER_VM"
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("vm=<>", result.stdout)
+        root = self.tmp / "cache" / "ccache-layers-v1"
+        self.assertFalse((root / "jobs" / "vm-gone").exists())
+        self.assertFalse((root / "shared" / "ab" / key[2:]).exists())
+        audit = (self.tmp / "cache" / "ccache-layer-state" / "audit.jsonl").read_text()
+        self.assertIn('"verdict": "red"', audit)
+        self.assertNotIn('"event": "promote"', audit)
+
+    def test_abandon_after_settle_is_a_no_op(self) -> None:
+        result = self.run_lib('''
+            tartci_ccache_layer_abandon vm-never-attached
+            echo done
+        ''')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("done", result.stdout)
+        self.assertFalse((self.tmp / "events" / "events").exists())
+
 
 class ProfileTests(unittest.TestCase):
-    def test_no_shipped_profile_enables_isolation(self) -> None:
-        for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
+    def test_every_fleet_lane_enables_isolation(self) -> None:
+        # Every gate lane on every fleet host: the shared store is the one
+        # cross-job channel the gate VMs have, so no lane keeps the legacy
+        # writable mount.
+        profiles = sorted((ROOT / "profiles").glob("*-macos-fleet.toml"))
+        self.assertGreaterEqual(len(profiles), 4)
+        for path in profiles:
             with self.subTest(profile=path.name):
                 data = fleet.load(path)
+                self.assertTrue(data["lane"])
                 for lane in data["lane"]:
-                    self.assertNotIn("ccache_write_isolation", lane)
-                for name, body in fleet.rendered_plists(data).items():
-                    self.assertNotIn(b"TARTCI_CCACHE_WRITE_ISOLATION", body, name)
+                    self.assertIs(lane.get("ccache_write_isolation"), True, lane["id"])
+                rendered = fleet.rendered_plists(data)
+                self.assertTrue(rendered)
+                for name, body in rendered.items():
+                    self.assertIn(b"<key>TARTCI_CCACHE_WRITE_ISOLATION</key>", body, name)
 
     def profile_with(self, value: str) -> Path:
         base = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()
+        base = base.replace("ccache_write_isolation = true\n", "")
         marker = 'id = "pulp-gate"\n'
         text = base.replace(marker, marker + f"ccache_write_isolation = {value}\n", 1)
         tomllib.loads(text)

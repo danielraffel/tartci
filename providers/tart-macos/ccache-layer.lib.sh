@@ -15,17 +15,33 @@
 #     (scripts/ccache_layer.py). Red, cancelled, timed-out and orphaned layers
 #     are deleted without ever touching the shared store.
 #
-# The layer attaches when the job starts in the guest (after the JIT mint), not
-# at VM boot, so a VM booted ahead of any job is covered the same way. The
-# boot-time mount itself is unchanged. Both the shared store and the layers
-# therefore live INSIDE the mounted host ccache directory, under
-# tartci-layers-v1/. They use ccache's `file:` remote-storage layout
-# (`<k0k1>/<rest>`), which differs from a primary cache (`<k0>/<k1>/<rest>`),
-# so the legacy primary cache beside them is neither read nor cleaned by them,
-# and ccache's own cleanup of that primary cache never walks into them.
+# The guest never sees the directory that holds the shared store. The layer is
+# attached on the host before the VM boots, and the boot mounts exactly two
+# ccache directories instead of the legacy read-write `ccache` mount:
 #
-# Unset (the default) changes nothing: every variable the guest command uses
-# below is empty, and the attach/settle hooks return immediately.
+#   ccache-shared  <layers>/shared      read-only (enforced by the mount, not
+#                                       only by ccache's `read-only` flag)
+#   ccache-job     <layers>/jobs/<vm>   read-write, this VM's own layer
+#
+# so a hostile guest can neither write the shared store nor reach another
+# job's layer. The layers root is $CACHE_ROOT/ccache-layers-v1, a SIBLING of
+# the legacy $CACHE_ROOT/ccache directory, not inside it: a lane that still
+# mounts the legacy directory read-write (a lane not yet switched, an operator
+# run of run.sh) therefore cannot reach the shared store either. The store
+# uses ccache's `file:` remote-storage layout (`<k0k1>/<rest>`), so it starts
+# cold on each host; the first green job per host warms it.
+#
+# A promoted layer is still the guest's own claim about which object a key
+# names: write isolation keeps red, cancelled, timed-out and torn jobs out of
+# the shared store and stops any guest overwriting an existing key, but a GREEN
+# job's new keys are trusted. Fork pull requests never reach these lanes.
+#
+# A VM discarded before its job settles (a boot failure, a parked VM that
+# expired, a supervisor signal) has its layer settled red and deleted.
+#
+# Unset (the default) changes nothing: the boot mounts the legacy `ccache`
+# directory, every variable the guest command uses below is empty, and the
+# attach/settle hooks return immediately.
 
 CCACHE_LAYER_ENABLED=0
 case "${TARTCI_CCACHE_WRITE_ISOLATION:-}" in
@@ -33,11 +49,12 @@ case "${TARTCI_CCACHE_WRITE_ISOLATION:-}" in
   1) CCACHE_LAYER_ENABLED=1 ;;
   *) printf 'invalid TARTCI_CCACHE_WRITE_ISOLATION: expected 0 or 1\n' >&2; exit 1 ;;
 esac
-# Must stay inside the directory Tart mounts as `ccache` ($CACHE_ROOT/ccache):
-# the guest reaches it at $CCACHE_LAYER_GUEST_ROOT.
-CCACHE_LAYER_ROOT="${CACHE_ROOT:-$HOME/.cache/pulp-ci}/ccache/tartci-layers-v1"
+# Must stay OUTSIDE the directory legacy boots mount as `ccache`
+# ($CACHE_ROOT/ccache), so no legacy read-write mount can reach it.
+CCACHE_LAYER_ROOT="${CACHE_ROOT:-$HOME/.cache/pulp-ci}/ccache-layers-v1"
 CCACHE_LAYER_STATE="${TARTCI_CCACHE_LAYER_STATE_DIR:-${CACHE_ROOT:-$HOME/.cache/pulp-ci}/ccache-layer-state}"
-CCACHE_LAYER_GUEST_ROOT="/Volumes/My Shared Files/ccache/tartci-layers-v1"
+CCACHE_LAYER_GUEST_SHARED="/Volumes/My Shared Files/ccache-shared"
+CCACHE_LAYER_GUEST_JOB="/Volumes/My Shared Files/ccache-job"
 CCACHE_LAYER_PY="${TARTCI_CCACHE_LAYER_PY:-python3}"
 CCACHE_LAYER_PROMOTER="${TARTCI_ROOT:-.}/scripts/ccache_layer.py"
 # Shell fragments spliced into the guest command. Empty = legacy behaviour.
@@ -46,6 +63,8 @@ CCACHE_LAYER_GUEST_PREP=""
 # shellcheck disable=SC2034 # consumed by runner.sh's guest command
 CCACHE_LAYER_GUEST_ENV=""
 CCACHE_LAYER_VM=""
+# The `tart run --dir` arguments for an attached VM (tartci_ccache_layer_boot).
+CCACHE_LAYER_TART_DIRS=()
 
 tartci_ccache_layer_py(){
   "$CCACHE_LAYER_PY" "$CCACHE_LAYER_PROMOTER" \
@@ -71,8 +90,8 @@ tartci_ccache_layer_guest_fragments(){
   # so the guest reaches both stores through space-free symlinks.
   # shellcheck disable=SC2016,SC2034 # $HOME expands in the guest; runner.sh consumes it
   CCACHE_LAYER_GUEST_PREP="mkdir -p ~/.tartci-ccache && \
-ln -sfn '$CCACHE_LAYER_GUEST_ROOT/shared' ~/.tartci-ccache/shared && \
-ln -sfn '$CCACHE_LAYER_GUEST_ROOT/jobs/$vm' ~/.tartci-ccache/job && \
+ln -sfn '$CCACHE_LAYER_GUEST_SHARED' ~/.tartci-ccache/shared && \
+ln -sfn '$CCACHE_LAYER_GUEST_JOB' ~/.tartci-ccache/job && \
 ln -sfn ~/.tartci-ccache/job/local ~/Library/Caches/ccache && \
 export CCACHE_DIR=\"\$HOME/.tartci-ccache/job/local\" CCACHE_REMOTE_ONLY=true \
 CCACHE_REMOTE_STORAGE=\"file:\$HOME/.tartci-ccache/shared|read-only file:\$HOME/.tartci-ccache/job/remote\" && \
@@ -84,24 +103,61 @@ printf 'CCACHE_DIR=%s\nCCACHE_REMOTE_ONLY=true\nCCACHE_REMOTE_STORAGE=file:%s|re
 \"\$HOME/.tartci-ccache/job/local\" \"\$HOME/.tartci-ccache/shared\" \"\$HOME/.tartci-ccache/job/remote\" >> .env.tartci && "
 }
 
-# Host side of the job start: create the empty layer, record its owner, and
-# reclaim anything an earlier supervisor left. Off: a no-op.
+# Host side of the boot: create this VM's empty layer, record its owner, and
+# fill CCACHE_LAYER_TART_DIRS with the two mounts. Returns 1 when the layer
+# could not be attached; the caller then boots without any shared cache (a
+# cold, private guest cache) rather than falling back to the legacy writable
+# mount. Off: a no-op that leaves CCACHE_LAYER_TART_DIRS empty.
+tartci_ccache_layer_boot(){
+  local vm="$1"
+  CCACHE_LAYER_TART_DIRS=()
+  [ "$CCACHE_LAYER_ENABLED" = 1 ] || return 0
+  if ! tartci_ccache_layer_py attach --vm "$vm" --owner-pid "$$" >/dev/null; then
+    event ccache_layer_attach_failed "vm=$vm root=$CCACHE_LAYER_ROOT"
+    return 1
+  fi
+  # shellcheck disable=SC2034 # consumed by runner.sh's tart run
+  CCACHE_LAYER_TART_DIRS=(--dir="ccache-shared:$CCACHE_LAYER_ROOT/shared:ro"
+    --dir="ccache-job:$CCACHE_LAYER_ROOT/jobs/$vm")
+  event ccache_layer_attach "vm=$vm"
+  # Off the boot's critical path: resumes interrupted promotions and deletes
+  # orphaned layers. Never promotes a layer that has no green verdict.
+  tartci_ccache_layer_py sweep --max-size "$CCACHE_MAX_SIZE" \
+    >>"$CCACHE_LAYER_STATE/sweep.log" 2>&1 </dev/null &
+  return 0
+}
+
+# Guest side of the job start: build the guest fragments for a VM whose layer
+# was attached at boot. A VM booted with isolation on but no layer (removed
+# under it) must not run the job: its guest has no ccache-job mount to write.
 tartci_ccache_layer_attach(){
   local vm="$1"
   CCACHE_LAYER_VM=""
   tartci_ccache_layer_guest_fragments "$vm"
   [ "$CCACHE_LAYER_ENABLED" = 1 ] || return 0
-  if ! tartci_ccache_layer_py attach --vm "$vm" --owner-pid "$$" >/dev/null; then
+  if [ -L "$CCACHE_LAYER_ROOT/jobs/$vm" ] || [ ! -d "$CCACHE_LAYER_ROOT/jobs/$vm" ]; then
     tartci_ccache_layer_guest_fragments_clear
-    event ccache_layer_attach_failed "vm=$vm root=$CCACHE_LAYER_ROOT"
+    event ccache_layer_attach_failed "vm=$vm root=$CCACHE_LAYER_ROOT reason=no_boot_layer"
     return 1
   fi
   CCACHE_LAYER_VM="$vm"
-  event ccache_layer_attach "vm=$vm"
-  # Off the job's critical path: resumes interrupted promotions and deletes
-  # orphaned layers. Never promotes a layer that has no green verdict.
-  tartci_ccache_layer_py sweep --max-size "$CCACHE_MAX_SIZE" \
-    >>"$CCACHE_LAYER_STATE/sweep.log" 2>&1 </dev/null &
+  return 0
+}
+
+# A VM torn down before its job settled: settle its layer red (deleted, never
+# promoted). Called once the guest is no longer running. Off: a no-op.
+tartci_ccache_layer_abandon(){
+  local vm="$1" settled layer
+  [ "$CCACHE_LAYER_ENABLED" = 1 ] && [ -n "$vm" ] || return 0
+  [ "$CCACHE_LAYER_VM" != "$vm" ] || CCACHE_LAYER_VM=""
+  [ -d "$CCACHE_LAYER_ROOT/jobs/$vm" ] || return 0
+  settled="$(tartci_ccache_layer_py settle --vm "$vm" --runner-rc 1 \
+    --quarantine vm_discarded 2>/dev/null)" || return 0
+  layer="$(printf '%s' "$settled" | cut -f3)"
+  event ccache_layer_abandon "vm=$vm"
+  [ -n "$layer" ] || return 0
+  tartci_ccache_layer_py process --layer "$layer" --max-size "$CCACHE_MAX_SIZE" \
+    >>"$CCACHE_LAYER_STATE/process.log" 2>&1 </dev/null &
   return 0
 }
 

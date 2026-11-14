@@ -47,7 +47,7 @@ run_lib(){
   '
 }
 
-layers="$tmp/cache/ccache/tartci-layers-v1"
+layers="$tmp/cache/ccache-layers-v1"
 audit="$tmp/cache/ccache-layer-state/audit.jsonl"
 good_result="ab$(printf '1%.0s' $(seq 38))"
 good_manifest="cd$(printf '2%.0s' $(seq 38))"
@@ -57,7 +57,7 @@ printf 'x: Job macos completed with result: Succeeded\n' >"$tmp/success.log"
 
 # ── Off: nothing is created and the guest command is unchanged ─────────────
 run_lib 0 '
-  tartci_ccache_layer_attach vm-off
+  tartci_ccache_layer_boot vm-off && tartci_ccache_layer_attach vm-off
   [ -z "$CCACHE_LAYER_GUEST_PREP" ] || exit 3
   [ -z "$CCACHE_LAYER_GUEST_ENV" ] || exit 3
   tartci_ccache_layer_settle vm-off 0 "'"$tmp"'/success.log"
@@ -67,8 +67,10 @@ run_lib 0 '
 
 # ── Green: the job's entries reach the shared store ────────────────────────
 run_lib 1 '
-  tartci_ccache_layer_attach vm-green
-  case "$CCACHE_LAYER_GUEST_PREP" in *"jobs/vm-green"*) ;; *) exit 3 ;; esac
+  tartci_ccache_layer_boot vm-green && tartci_ccache_layer_attach vm-green
+  case "$CCACHE_LAYER_GUEST_PREP" in *"My Shared Files/ccache-job"*) ;; *) exit 3 ;; esac
+  dirs="$(printf "%s " ${CCACHE_LAYER_TART_DIRS[@]+"${CCACHE_LAYER_TART_DIRS[@]}"})"
+  case "$dirs" in *"ccache-shared:$CCACHE_LAYER_ROOT/shared:ro"*"ccache-job:$CCACHE_LAYER_ROOT/jobs/vm-green "*) ;; *) exit 4 ;; esac
   '"$(declare -f write_entry)"'
   write_entry "$CCACHE_LAYER_ROOT/jobs/vm-green/remote" '"$good_result"' 0 result
   write_entry "$CCACHE_LAYER_ROOT/jobs/vm-green/remote" '"$good_manifest"' 1 manifest
@@ -84,7 +86,7 @@ grep -q 'ccache_layer_settle vm=vm-green verdict=green' "$tmp/state/events" || f
 
 # ── Killed mid-build: the zero-include manifest never reaches shared ───────
 run_lib 1 '
-  tartci_ccache_layer_attach vm-killed
+  tartci_ccache_layer_boot vm-killed && tartci_ccache_layer_attach vm-killed
   '"$(declare -f write_zero_include_manifest)"'
   write_zero_include_manifest "$CCACHE_LAYER_ROOT/jobs/vm-killed/remote" '"$poison"'
   CURRENT_ASSIGNMENT_QUARANTINE=signal_teardown_unknown
@@ -96,15 +98,15 @@ run_lib 1 '
 grep -q 'ccache_layer_settle vm=vm-killed verdict=red reason=runner_rc=124' "$tmp/state/events" \
   || fail "no red settle event for the killed job"
 
-# ── Supervisor died before settling: the next attach's sweep discards it ───
+# ── Supervisor died before settling: the next boot's sweep discards it ───
 run_lib 1 '
-  tartci_ccache_layer_attach vm-orphan
+  tartci_ccache_layer_boot vm-orphan && tartci_ccache_layer_attach vm-orphan
   '"$(declare -f write_zero_include_manifest)"'
   write_zero_include_manifest "$CCACHE_LAYER_ROOT/jobs/vm-orphan/remote" '"$orphan_poison"'
 ' || fail "orphan setup failed"
 true & dead_pid=$!; wait "$dead_pid"
 printf '%s\n' "$dead_pid" >"$tmp/cache/ccache-layer-state/owners/vm-orphan"
-run_lib 1 'tartci_ccache_layer_attach vm-next' || fail "next attach failed"
+run_lib 1 'tartci_ccache_layer_boot vm-next' || fail "next attach failed"
 [ ! -e "$layers/jobs/vm-orphan" ] || fail "orphaned layer survived the sweep"
 [ ! -e "$layers/shared/${orphan_poison:0:2}/${orphan_poison:2}" ] || fail "an orphaned layer was promoted"
 [ -d "$layers/jobs/vm-next" ] || fail "the live job's own layer was swept"
