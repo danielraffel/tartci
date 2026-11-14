@@ -196,8 +196,17 @@ class FastModeCoversTodaysFailureClassesTest(unittest.TestCase):
             self.assertTrue(os.path.exists(os.path.join(ROOT, "scripts", module + ".py")), module)
 
     def test_fast_unit_tests_run_under_the_39_interpreter(self):
-        self.assertIn('"$PY39" -m unittest "${uniq[@]}"', self.text)
+        # `stage` runs it inside `if` (set -e off), so the 3.9 run must return on
+        # failure itself; otherwise the later tomllib run decides the verdict.
+        self.assertIn('"$PY39" scripts/prepush_unittest.py run "${uniq[@]}" || return 1', self.text)
         self.assertIn("fast_unit_tests", self.fast)
+
+    def test_tomllib_gated_tests_run_under_a_found_311_or_report_skip(self):
+        # Hosts' default python3 is the 3.9: the second run must not depend on it.
+        self.assertIn("prepush_unittest.py pick-tomllib-python", self.text)
+        self.assertIn('"$tomllib_py" scripts/prepush_unittest.py run "${chosen[@]}" || return 1', self.text)
+        self.assertIn("SKIP: no Python 3.11+ with tomllib found", self.text)
+        self.assertNotIn("python3 -m unittest \"${chosen[@]}\"", self.text)
 
     def test_serial_gates_cover_lint_interpreter_and_compile(self):
         self.assertIn('stage lint "repo lint" ./scripts/lint.sh', self.serial)

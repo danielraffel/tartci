@@ -465,6 +465,96 @@ def next_observer_state(record: dict, ok: bool, reason: str, *, marker_epoch: in
              "marker_ack": ack}, reason)
 
 
+def commit_observer(path: Path, state_path: Path, args: argparse.Namespace, observer: str,
+                    document: dict, ok: bool, reason: str, elapsed: float,
+                    quarantine_marker: Path) -> dict:
+    """Advance `observer`'s record in the shared state and persist it.
+
+    The caller holds the state lock and has already read `document`. Raises
+    OSError when the state cannot be written; the caller then fails closed.
+    """
+    record = _observer_record(document, observer)
+    # The legacy single observer raises the host marker whenever it
+    # quarantines, as before (below). A named observer raises it only
+    # on evidence about the store itself, at once.
+    raise_marker = (not ok) and observer != "" and reason in STORE_WIDE_FAILURES
+    if raise_marker:
+        quarantine_marker.touch(exist_ok=True)
+    record, reason = next_observer_state(
+        record, ok, reason, marker_epoch=_marker_epoch(quarantine_marker),
+        failure_threshold=args.failure_threshold,
+        recovery_threshold=args.recovery_threshold)
+    if raise_marker:
+        record["status"] = "quarantined"
+    status = record["status"]
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    result = {"schema": 1, "status": status, "reason": reason, "path": str(path), "state": str(state_path), "failure_streak": record["failure_streak"], "healthy_streak": record["healthy_streak"], "elapsed_seconds": round(elapsed, 3), "checked_at": checked_at}
+    if observer:
+        result["observer"] = observer
+    observers = document.get("observers") if isinstance(document.get("observers"), dict) else {}
+    observers = _prune_observers(observers, time.time())
+    observers[observer] = dict(record, reason=reason, checked_at=checked_at)
+    saved = dict(result, observers=observers, marker_ack=record["marker_ack"])
+    host_status, host_reason, host_checked = host_verdict(
+        {"observers": observers}, marker_present=quarantine_marker.exists())
+    saved.update(status=host_status, reason=host_reason, checked_at=host_checked)
+    save_state(state_path, saved)
+    if status == "quarantined" and observer == "":
+        quarantine_marker.touch(exist_ok=True)
+        observers[observer]["marker_ack"] = _marker_epoch(quarantine_marker)
+        save_state(state_path, dict(saved, observers=observers,
+                                    marker_ack=observers[observer]["marker_ack"]))
+    elif (status == "healthy" and record["marker_ack"] is not None
+          and _marker_epoch(quarantine_marker) == record["marker_ack"]):
+        # This observer completed a full recovery window after the
+        # marker it acknowledged; nobody has raised a newer one.
+        quarantine_marker.unlink()
+    return result
+
+
+# How long the supervisor waits for the state lock after killing a worker
+# that overran its deadline. Every holder releases it within milliseconds.
+SUPERVISOR_LOCK_WAIT_SECONDS = 1.0
+
+
+def record_supervisor_timeout(path: Path, state_path: Path,
+                              args: argparse.Namespace, observer: str) -> dict | None:
+    """Charge a reaped, overrunning worker to its own lane, not to the host.
+
+    A worker the supervisor killed and reaped was not stuck in the kernel on
+    the store: it was slow (a CPU- or I/O-starved host) and the store answers
+    the other lanes. Raising the host marker for it held every lane on m1 in
+    `recovery_check_pending` for three healthy probes each, about once an hour,
+    while the watchdog read the store in under a millisecond. So it counts as
+    one failed probe for this observer: the lane still refuses this poll and
+    quarantines after `failure_threshold` in a row. Returns None when the
+    state cannot be read or written within a bounded wait; the caller then
+    fails closed host-wide exactly as before.
+    """
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    quarantine_marker = Path(str(state_path) + ".quarantine")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with lock_path.open("a+") as lock:
+            deadline = time.monotonic() + SUPERVISOR_LOCK_WAIT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        return None
+                    time.sleep(0.02)
+            document = load_state(state_path, path)
+            if document.get("state_unreadable"):
+                return None
+            return commit_observer(path, state_path, args, observer, document, False,
+                                   "health_supervisor_timeout", float(args.timeout),
+                                   quarantine_marker)
+    except OSError:
+        return None
+
+
 def run_worker(args: argparse.Namespace) -> int:
     path = Path(args.path)
     state_path = Path(args.state) if args.state else default_state(path)
@@ -496,47 +586,14 @@ def run_worker(args: argparse.Namespace) -> int:
                 result = {"schema": 1, "status": "quarantined", "reason": "health_state_unreadable", "path": str(path), "state": str(state_path), "failure_streak": args.failure_threshold, "healthy_streak": 0}
                 print(json.dumps(result, sort_keys=True))
                 return QUARANTINED
-            record = _observer_record(document, observer)
-            # The legacy single observer raises the host marker whenever it
-            # quarantines, as before (below). A named observer raises it only
-            # on evidence about the store itself, at once.
-            raise_marker = (not ok) and observer != "" and reason in STORE_WIDE_FAILURES
-            if raise_marker:
-                quarantine_marker.touch(exist_ok=True)
-            record, reason = next_observer_state(
-                record, ok, reason, marker_epoch=_marker_epoch(quarantine_marker),
-                failure_threshold=args.failure_threshold,
-                recovery_threshold=args.recovery_threshold)
-            if raise_marker:
-                record["status"] = "quarantined"
-            status = record["status"]
-            checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            result = {"schema": 1, "status": status, "reason": reason, "path": str(path), "state": str(state_path), "failure_streak": record["failure_streak"], "healthy_streak": record["healthy_streak"], "elapsed_seconds": round(elapsed, 3), "checked_at": checked_at}
-            if observer:
-                result["observer"] = observer
-            observers = document.get("observers") if isinstance(document.get("observers"), dict) else {}
-            observers = _prune_observers(observers, time.time())
-            observers[observer] = dict(record, reason=reason, checked_at=checked_at)
-            saved = dict(result, observers=observers, marker_ack=record["marker_ack"])
-            host_status, host_reason, host_checked = host_verdict(
-                {"observers": observers}, marker_present=quarantine_marker.exists())
-            saved.update(status=host_status, reason=host_reason, checked_at=host_checked)
             try:
-                save_state(state_path, saved)
-                if status == "quarantined" and observer == "":
-                    quarantine_marker.touch(exist_ok=True)
-                    observers[observer]["marker_ack"] = _marker_epoch(quarantine_marker)
-                    save_state(state_path, dict(saved, observers=observers,
-                                                marker_ack=observers[observer]["marker_ack"]))
-                elif (status == "healthy" and record["marker_ack"] is not None
-                      and _marker_epoch(quarantine_marker) == record["marker_ack"]):
-                    # This observer completed a full recovery window after the
-                    # marker it acknowledged; nobody has raised a newer one.
-                    quarantine_marker.unlink()
+                result = commit_observer(path, state_path, args, observer, document,
+                                         ok, reason, elapsed, quarantine_marker)
             except OSError:
                 result = durable_quarantine(path, state_path, args, "health_state_write_failed")
                 print(json.dumps(result, sort_keys=True))
                 return QUARANTINED
+            status = result["status"]
             print(json.dumps(result, sort_keys=True))
             return HEALTHY if status == "healthy" else DEGRADED if status == "degraded" else QUARANTINED
     except OSError:
@@ -551,7 +608,7 @@ def run(args: argparse.Namespace) -> int:
     try:
         stdout, stderr = child.communicate(timeout=args.timeout + 2.0)
     except subprocess.TimeoutExpired:
-        reap_after_kill(child)
+        reaped = reap_after_kill(child)
         if child.stdout is not None:
             child.stdout.close()
         if child.stderr is not None:
@@ -570,6 +627,12 @@ def run(args: argparse.Namespace) -> int:
                                        "health_state_path_unsafe")
             print(json.dumps(result, sort_keys=True))
             return QUARANTINED
+        observer = str(getattr(args, "observer", "") or "")
+        if observer and reaped:
+            recorded = record_supervisor_timeout(path, state_path, args, observer)
+            if recorded is not None:
+                print(json.dumps(recorded, sort_keys=True))
+                return DEGRADED if recorded["status"] == "degraded" else QUARANTINED
         result = durable_quarantine(path, state_path, args, "health_supervisor_timeout")
         print(json.dumps(result, sort_keys=True))
         return QUARANTINED
