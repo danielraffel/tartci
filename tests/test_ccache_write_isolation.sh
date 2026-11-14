@@ -47,7 +47,7 @@ run_lib(){
   '
 }
 
-layers="$tmp/cache/ccache/tartci-layers-v1"
+layers="$tmp/cache/ccache-layers-v1"
 audit="$tmp/cache/ccache-layer-state/audit.jsonl"
 good_result="ab$(printf '1%.0s' $(seq 38))"
 good_manifest="cd$(printf '2%.0s' $(seq 38))"
@@ -57,7 +57,7 @@ printf 'x: Job macos completed with result: Succeeded\n' >"$tmp/success.log"
 
 # ── Off: nothing is created and the guest command is unchanged ─────────────
 run_lib 0 '
-  tartci_ccache_layer_attach vm-off
+  tartci_ccache_layer_boot vm-off && tartci_ccache_layer_attach vm-off
   [ -z "$CCACHE_LAYER_GUEST_PREP" ] || exit 3
   [ -z "$CCACHE_LAYER_GUEST_ENV" ] || exit 3
   tartci_ccache_layer_settle vm-off 0 "'"$tmp"'/success.log"
@@ -65,15 +65,21 @@ run_lib 0 '
 [ ! -e "$layers" ] || fail "isolation off created $layers"
 [ ! -e "$tmp/state/events" ] || fail "isolation off emitted events"
 
-# ── Green: the job's entries reach the shared store ────────────────────────
+# The guest's job directory lives in the guest; the fake pull tars this one.
+guest="$tmp/guest-job"
+mkdir -p "$guest/remote"
+export TARTCI_CCACHE_LAYER_PULL_CMD="cd '$guest' && tar -cf - remote"
+
+# ── Green: the job's entries are pulled and reach the shared store ────────
+write_entry "$guest/remote" "$good_result" 0 result
+write_entry "$guest/remote" "$good_manifest" 1 manifest
 run_lib 1 '
-  tartci_ccache_layer_attach vm-green
-  case "$CCACHE_LAYER_GUEST_PREP" in *"jobs/vm-green"*) ;; *) exit 3 ;; esac
-  '"$(declare -f write_entry)"'
-  write_entry "$CCACHE_LAYER_ROOT/jobs/vm-green/remote" '"$good_result"' 0 result
-  write_entry "$CCACHE_LAYER_ROOT/jobs/vm-green/remote" '"$good_manifest"' 1 manifest
+  tartci_ccache_layer_boot vm-green && tartci_ccache_layer_attach vm-green
+  case "$CCACHE_LAYER_GUEST_PREP" in *"My Shared Files/ccache-shared"*) ;; *) exit 3 ;; esac
+  dirs="$(printf "%s " ${CCACHE_LAYER_TART_DIRS[@]+"${CCACHE_LAYER_TART_DIRS[@]}"})"
+  [ "$dirs" = "--dir=ccache-shared:$CCACHE_LAYER_ROOT/shared:ro " ] || exit 4
   CURRENT_ASSIGNMENT_QUARANTINE=none
-  tartci_ccache_layer_settle vm-green 0 "'"$tmp"'/success.log"
+  tartci_ccache_layer_settle vm-green 0 "'"$tmp"'/success.log" 192.0.2.1
 ' || fail "green job run failed"
 [ -f "$layers/shared/${good_result:0:2}/${good_result:2}" ] || fail "green result was not promoted"
 [ -f "$layers/shared/${good_manifest:0:2}/${good_manifest:2}" ] || fail "green manifest was not promoted"
@@ -82,34 +88,29 @@ run_lib 1 '
 grep -q '"event": "promote"' "$audit" || fail "no promotion in the audit log"
 grep -q 'ccache_layer_settle vm=vm-green verdict=green' "$tmp/state/events" || fail "no green settle event"
 
-# ── Killed mid-build: the zero-include manifest never reaches shared ───────
+# ── Killed mid-build: nothing is pulled, the manifest never reaches shared ─
+rm -rf "$guest/remote"; mkdir -p "$guest/remote"
+write_zero_include_manifest "$guest/remote" "$poison"
 run_lib 1 '
-  tartci_ccache_layer_attach vm-killed
-  '"$(declare -f write_zero_include_manifest)"'
-  write_zero_include_manifest "$CCACHE_LAYER_ROOT/jobs/vm-killed/remote" '"$poison"'
+  tartci_ccache_layer_boot vm-killed && tartci_ccache_layer_attach vm-killed
   CURRENT_ASSIGNMENT_QUARANTINE=signal_teardown_unknown
-  tartci_ccache_layer_settle vm-killed 124 "'"$tmp"'/success.log"
+  tartci_ccache_layer_settle vm-killed 124 "'"$tmp"'/success.log" 192.0.2.1
 ' || fail "killed job run failed"
 [ ! -e "$layers/shared/${poison:0:2}/${poison:2}" ] || fail "a killed job's manifest reached the shared store"
-[ ! -e "$layers/discard/vm-killed" ] || fail "killed layer was not deleted"
-[ ! -e "$layers/jobs/vm-killed" ] || fail "killed layer was left under jobs/"
+[ ! -e "$layers/jobs/vm-killed" ] || fail "killed job left a layer under jobs/"
 grep -q 'ccache_layer_settle vm=vm-killed verdict=red reason=runner_rc=124' "$tmp/state/events" \
   || fail "no red settle event for the killed job"
 
-# ── Supervisor died before settling: the next attach's sweep discards it ───
-run_lib 1 '
-  tartci_ccache_layer_attach vm-orphan
-  '"$(declare -f write_zero_include_manifest)"'
-  write_zero_include_manifest "$CCACHE_LAYER_ROOT/jobs/vm-orphan/remote" '"$orphan_poison"'
-' || fail "orphan setup failed"
+# ── Supervisor died mid-pull: the next boot's sweep discards the layer ─────
+mkdir -p "$layers/jobs/vm-orphan/remote/${orphan_poison:0:2}"
+write_zero_include_manifest "$layers/jobs/vm-orphan/remote" "$orphan_poison"
 true & dead_pid=$!; wait "$dead_pid"
 printf '%s\n' "$dead_pid" >"$tmp/cache/ccache-layer-state/owners/vm-orphan"
-run_lib 1 'tartci_ccache_layer_attach vm-next' || fail "next attach failed"
+run_lib 1 'tartci_ccache_layer_boot vm-next' || fail "next boot failed"
 [ ! -e "$layers/jobs/vm-orphan" ] || fail "orphaned layer survived the sweep"
 [ ! -e "$layers/shared/${orphan_poison:0:2}/${orphan_poison:2}" ] || fail "an orphaned layer was promoted"
-[ -d "$layers/jobs/vm-next" ] || fail "the live job's own layer was swept"
 grep -q '"reason": "orphaned_active_layer"' "$audit" || fail "orphan discard not audited"
 
 promotions="$(grep -c '"event": "promote"' "$audit")"
 [ "$promotions" = 1 ] || fail "expected exactly one promotion, saw $promotions"
-echo "ok: ccache write isolation (off no-op, green promotes, killed/orphaned never promote)"
+echo "ok: ccache write isolation (off no-op, green pulled and promoted, killed/orphaned never promote)"

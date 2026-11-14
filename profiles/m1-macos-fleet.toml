@@ -117,6 +117,9 @@ checkout_build_outputs = true
 # 11 s and its budget-exhausted share from 57% to 0%, with the per-job hit
 # rate held at 99.49% (99.51% before). Rollback: delete this key.
 gate_ccache_trim = true
+# Every lane runs with ccache write isolation, so the legacy gate cache is no
+# longer mounted or hit; age it out in days, not weeks. Rollback: delete.
+gate_ccache_max_age_days = 3
 
 # Merge-group-first VM slot priority (scripts/slot_priority.py). Pulp's merge
 # queue waited an hour or more for macOS VM slots behind PR-head jobs on
@@ -145,6 +148,9 @@ runner_group_id = 1
 claim_rank = 3
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 min_queued_age_seconds = 600
 # Overflow only (2026-10-16): m1 takes a PR-head job only once it has queued
 # for 600 s. The young-work fallback (fallback_preferred_hosts) is removed:
@@ -239,6 +245,9 @@ repo = "danielraffel/spectr"
 runner_group_id = 1
 registration_scope = "repository"
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 priority = "vm"
 min_queued_age_seconds = 600
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
@@ -253,6 +262,9 @@ id = "forge-gate"
 repo = "Generous-Corp/forge"
 runner_group_id = 11
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 chrome_app_dir = "/Applications/Google Chrome.app"
 priority = "gate"
 min_queued_age_seconds = 0
@@ -272,6 +284,9 @@ id = "vellum-gate"
 repo = "Generous-Corp/vellum"
 runner_group_id = 8
 golden = "pulp-build-runner:latest"
+# Per-job ccache write layer: shared store mounted read-only, promoted only
+# on green (docs/runbook.md, "ccache write isolation"). Rollback: delete.
+ccache_write_isolation = true
 # Vellum is advisory to Pulp's required gate: vm=60, while Pulp
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"

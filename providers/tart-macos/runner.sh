@@ -1723,6 +1723,8 @@ discard_current_vm(){
     event teardown_incomplete "vm=$CURRENT_VM reason=guardian_live pid=$CURRENT_RPID"
     return 1
   fi
+  # The guest no longer runs: a layer it never settled is deleted, unpromoted.
+  tartci_ccache_layer_abandon "$CURRENT_VM"
   CURRENT_RPID=""
   bounded_teardown_command tart-stop tart stop "$CURRENT_VM" >/dev/null 2>&1 || true
   if ! tartci_tart_delete "$CURRENT_VM" \
@@ -2301,19 +2303,20 @@ GUEST
 }
 
 # The per-job ccache write layer (ccache-layer.lib.sh) brackets the listener:
-# attached as the job starts in the guest, settled as soon as it ends. Both
-# hooks are no-ops unless TARTCI_CCACHE_WRITE_ISOLATION=1.
+# wired into the guest as the job starts, and when the job ends its verdict is
+# decided and a green guest's entries are pulled over ssh (the VM is still up)
+# and settled. Every hook is a no-op unless TARTCI_CCACHE_WRITE_ISOLATION=1.
 run_runner_until_done(){
   local layer_rc=0
-  # The layer lives inside the shared ccache mount; a VM booted without that
-  # mount (a release tier) has none to attach.
+  # A VM booted without the shared store (a release tier, or a layers root
+  # the boot could not use) has no layer.
   if [ "${CURRENT_SHARED_CACHE:-1}" = 1 ]; then
     tartci_ccache_layer_attach "$1" || return 1
   else
     tartci_ccache_layer_guest_fragments_clear
   fi
   run_runner_until_done_unlayered "$@" || layer_rc=$?
-  tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log"
+  tartci_ccache_layer_settle "$1" "$layer_rc" "$STATE_DIR/$1.actions-runner.log" "$2"
   return "$layer_rc"
 }
 
@@ -2583,7 +2586,7 @@ boot_vm_to_ssh(){
   # stops the boot.
   CURRENT_SHARED_CACHE=1
   tartci_labels_mount_shared_cache "$labels" || CURRENT_SHARED_CACHE=0
-  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT" "$CURRENT_SHARED_CACHE"; then
+  if ! tartci_prepare_lane_cache_mounts "$CACHE_ROOT" "$HOST_CACHE_ROOT" "$FETCHCONTENT_SOURCE_ROOT" "$CURRENT_SHARED_CACHE" "$CCACHE_LAYER_ENABLED"; then
     [ -z "$TARTCI_LANE_CACHE_REFUSAL" ] || note "[$i] $TARTCI_LANE_CACHE_REFUSAL; refusing to boot"
     discard_current_vm
     tartci_release_vm_lease
@@ -2605,7 +2608,21 @@ boot_vm_to_ssh(){
   CURRENT_GUEST_MEM_MB="$lease_mem"
   boot_log="$(mktemp -t "tart-run-$vm")"
   local tart_dirs=()
-  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")
+  # Write isolation (ccache-layer.lib.sh) replaces the legacy read-write
+  # ccache mount with the shared store, read-only; the guest's new entries stay
+  # in the guest until a green job's are pulled. A layers root the boot cannot
+  # use boots the VM with no shared cache at all, never the legacy writable
+  # mount.
+  if [ "$CURRENT_SHARED_CACHE" = 1 ] && [ "$CCACHE_LAYER_ENABLED" = 1 ]; then
+    if tartci_ccache_layer_boot "$vm"; then
+      tart_dirs+=(${CCACHE_LAYER_TART_DIRS[@]+"${CCACHE_LAYER_TART_DIRS[@]}"})
+    else
+      note "[$i] ccache layer could not be attached — booting $vm without the shared cache"
+      CURRENT_SHARED_CACHE=0
+    fi
+  elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then
+    tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")
+  fi
   tart_dirs+=(--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro")
   [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks")
   [ "$CURRENT_SHARED_CACHE" = 1 ] || event shared_cache_skipped "labels=$labels"
