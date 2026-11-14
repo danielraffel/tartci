@@ -56,7 +56,7 @@ class CacheRoutingTests(unittest.TestCase):
         self.assertIn('tartci_prepare_lane_cache_mounts "$CACHE_ROOT"', body)
         self.assertIn('tartci_prepare_disk_root "$root/configure-checks"', lib)
         self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks"', body)
-        self.assertIn("ln -sfn '/Volumes/My Shared Files/configure-checks'", body)
+        self.assertIn('ln -sfn "/Volumes/My Shared Files/configure-checks"', body)
         self.assertIn("PULP_CONFIGURE_CHECK_CACHE_DIR=%s", body)
         # The re-rendered .env must drop a stale value of the key.
         self.assertRegex(body, r"awk -F= .*PULP_CONFIGURE_CHECK_CACHE_DIR.*\.env > \.env\.tartci")

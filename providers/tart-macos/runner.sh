@@ -2343,11 +2343,21 @@ run_runner_until_done_unlayered(){
   # shellcheck disable=SC2016 # $HOME expands in the guest
   [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] \
     || guest_cache_prep='rm -f ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && mkdir -p ~/Library/Caches/ccache "$HOME/Library/Caches/Pulp/configure-checks" && printf "TARTCI_DIAG shared-cache=off\n" && '
+  # Writable share: link it. Read-only share (write isolation): seed a local
+  # directory from it, so nothing the guest writes reaches the host.
+  local guest_configure_checks_prep
+  # shellcheck disable=SC2016 # $HOME expands in the guest
+  if [ "${CURRENT_SHARED_CACHE:-1}" = 1 ] && [ "${CCACHE_LAYER_ENABLED:-0}" = 1 ]; then
+    guest_configure_checks_prep='rm -rf "$HOME/Library/Caches/Pulp/configure-checks" && mkdir -p "$HOME/Library/Caches/Pulp/configure-checks" && { rsync -a "/Volumes/My Shared Files/configure-checks/" "$HOME/Library/Caches/Pulp/configure-checks/" || true; } &&'
+  else
+    # shellcheck disable=SC2016
+    guest_configure_checks_prep='ln -sfn "/Volumes/My Shared Files/configure-checks" "$HOME/Library/Caches/Pulp/configure-checks" &&'
+  fi
   # ccache reads its config from CCACHE_CONFIGPATH instead of the shared
   # cache directory any guest can write (see lane-cache-root.lib.sh).
   ssh ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY_PRIV" "$VM_USER@$ip" \
     "mkdir -p ~/.ccache-tmp && \
-     mkdir -p \"\$HOME/Library/Caches/Pulp\" && ln -sfn '/Volumes/My Shared Files/configure-checks' \"\$HOME/Library/Caches/Pulp/configure-checks\" && \
+     mkdir -p \"\$HOME/Library/Caches/Pulp\" && ${guest_configure_checks_prep} \
      ln -sfn '/Volumes/My Shared Files/ccache' ~/Library/Caches/ccache && \
      ${CCACHE_LAYER_GUEST_PREP}export CCACHE_NODEPEND=true CCACHE_COMPILERCHECK=content CCACHE_MAXSIZE='$CCACHE_MAX_SIZE' && unset CCACHE_DEPEND && \
      ${guest_cache_prep}mkdir -p ~/.config/ccache && touch ~/.config/ccache/tartci.conf && \
@@ -2624,7 +2634,14 @@ boot_vm_to_ssh(){
     tart_dirs+=(--dir="ccache:$CACHE_ROOT/ccache")
   fi
   tart_dirs+=(--dir="fetchcontent:$FETCHCONTENT_SOURCE_ROOT:ro")
-  [ "$CURRENT_SHARED_CACHE" != 1 ] || tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks")
+  # Under write isolation configure-checks is read-only too: a writable share
+  # beside the read-only ccache store could be used to hard-link a shared
+  # entry and write through it. The guest seeds a local copy instead.
+  if [ "$CURRENT_SHARED_CACHE" = 1 ] && [ "$CCACHE_LAYER_ENABLED" = 1 ]; then
+    tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks:ro")
+  elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then
+    tart_dirs+=(--dir="configure-checks:$CACHE_ROOT/configure-checks")
+  fi
   [ "$CURRENT_SHARED_CACHE" = 1 ] || event shared_cache_skipped "labels=$labels"
   [ -z "$CHROME_MOUNT_ARG" ] || tart_dirs+=(--dir="$CHROME_MOUNT_ARG")
   [ -z "$CFT_MOUNT_ARG" ] || tart_dirs+=(--dir="$CFT_MOUNT_ARG")

@@ -526,13 +526,15 @@ def receive(layout: Layout, vm: str, owner_pid: int, command: list[str],
     timer.start()
     try:
         counts = receive_stream(layout, vm, owner_pid, proc.stdout, max_bytes)
+        # The bound covers the wait too: a command that closes stdout but stays
+        # alive is killed (and reaped) when the timer fires.
+        rc = proc.wait()
     except ReceiveError:
         _kill_group(proc)
         proc.wait()
         raise
     finally:
         timer.cancel()
-    rc = proc.wait()
     if rc != 0:
         settle_path = layout.jobs / vm
         if settle_path.exists():

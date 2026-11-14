@@ -626,6 +626,25 @@ class BootTests(Base):
         self.assertLess(time.monotonic() - started, 30)
         self.assertIn("ccache_layer_pull_failed", self.events())
 
+    def test_receive_bound_covers_a_command_that_closes_stdout_and_lingers(self) -> None:
+        self.layout.ensure()
+        started = time.monotonic()
+        with self.assertRaises(cl.ReceiveError):
+            cl.receive(self.layout, "vm-linger", os.getpid(),
+                       ["sh", "-c", "head -c 10240 /dev/zero; exec 1>&-; sleep 60"],
+                       max_bytes=1 << 20, timeout=2)
+        self.assertLess(time.monotonic() - started, 30)
+        self.assertFalse((self.layout.jobs / "vm-linger").exists())
+
+    def test_isolated_boot_mounts_configure_checks_read_only(self) -> None:
+        runner = (Path(__file__).resolve().parents[1] / "providers/tart-macos/runner.sh").read_text()
+        self.assertIn('--dir="configure-checks:$CACHE_ROOT/configure-checks:ro"', runner)
+        self.assertIn('rsync -a "/Volumes/My Shared Files/configure-checks/"', runner)
+        # The only writable configure-checks mount is the non-isolated branch.
+        writable = '--dir="configure-checks:$CACHE_ROOT/configure-checks")'
+        before = runner[:runner.index(writable)]
+        self.assertTrue(before.endswith('elif [ "$CURRENT_SHARED_CACHE" = 1 ]; then\n    tart_dirs+=('))
+
     def test_interrupted_pull_layer_is_deleted_on_teardown(self) -> None:
         key = "ab" + "c" * 38
         layout = cl.Layout(self.root, self.tmp / "cache" / "ccache-layer-state")
