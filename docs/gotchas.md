@@ -1151,7 +1151,7 @@ not permission to force-remove a worktree.
   tier-0 scan then counts 0 and the lane boots tier 1. → *Fix:* the newest
   `--merge-group-quota` (default 2, env `TARTCI_QUEUE_MERGE_GROUP_QUOTA`)
   `merge_group` runs are read on every refresh from the same fetch cap, so the
-  API-call budget is unchanged; `0` restores the old selection. The slot reserved for the oldest backlog run
+  API-call budget is unchanged, and at least one slot always rotates (the quota is clamped to leave one, plus one more when the oldest-run reservation fires; the reservation yields when only one slot remains); `0` restores the old selection. The slot reserved for the oldest backlog run
   now skips runs older than `--oldest-reserve-max-age` (default 2 days, env
   `TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS`, 0 disables), so a ghost run from
   a closed PR stops spending it on every refresh; it stays in the rotation.

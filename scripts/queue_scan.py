@@ -448,6 +448,34 @@ class QueueScanner:
         # keep the historical selection.
         return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
 
+    def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
+        now = int(getattr(self, "now", 0) or 0)
+        max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
+        if now and max_age:
+            backlog = [
+                run for run in backlog
+                if _age_seconds(_created_key(run), now) <= max_age
+            ]
+        return min(backlog, key=_created_key) if backlog else None
+
+    def _reservation_fires(
+        self, newest: list[dict[str, Any]], state: dict[str, Any]
+    ) -> bool:
+        """Whether the oldest-backlog slot will be spent this sweep, judged
+        before the merge-group runs are set aside (the oldest backlog run is
+        the same unless it is itself a merge-group run, which needs no slot)."""
+        oldest = self._oldest_reservable(newest[self.args.newest_quota:])
+        if oldest is None:
+            return False
+        now = int(getattr(self, "now", 0) or 0)
+        interval = int(getattr(self.args, "negative_ttl", 0) or 0)
+        reserved_raw = state.get("oldest_reserved_at")
+        if isinstance(reserved_raw, dict):
+            at = reserved_raw.get(str(int(oldest["id"])))
+            if isinstance(at, int) and now - at < interval:
+                return False
+        return True
+
     def _candidate_runs(
         self, runs: list[dict[str, Any]], state: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], list[int]]:
@@ -458,9 +486,13 @@ class QueueScanner:
         # the newest merge_group runs on every refresh, outside the rotation.
         # They are paid for from the same job-fetch cap (the API-call budget is
         # unchanged) and always leave one slot for the rotation.
+        # Every refresh keeps at least one rotating slot, so a busy merge queue
+        # (Pulp builds up to five groups) cannot starve the PR backlog. When the
+        # oldest-run reservation will fire this sweep it costs a slot too.
+        reservation = 1 if self._reservation_fires(newest, state) else 0
         merge_quota = min(
             self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - 1),
+            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
         )
         priority = [
             run for run in newest if run.get("event") == "merge_group"
@@ -483,16 +515,7 @@ class QueueScanner:
         # A run older than --oldest-reserve-max-age (a closed PR's run GitHub
         # never retired, a phantom) cannot be live demand worth a guaranteed
         # slot on every refresh; it stays in the rotation but is not reserved.
-        now = int(getattr(self, "now", 0) or 0)
-        max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
-        if now and max_age:
-            reservable = [
-                run for run in backlog
-                if _age_seconds(_created_key(run), now) <= max_age
-            ]
-        else:
-            reservable = backlog
-        oldest = min(reservable, key=_created_key) if reservable else None
+        oldest = self._oldest_reservable(backlog)
         oldest_id = int(oldest["id"]) if oldest is not None else -1
 
         groups: dict[str, list[dict[str, Any]]] = {}
@@ -536,8 +559,9 @@ class QueueScanner:
             )
             if isinstance(at, int) and now - at < interval
         }
+        # The reservation yields to the rotation: at least one slot rotates.
         reserved_oldest = (
-            oldest is not None and capacity > 0 and str(oldest_id) not in reserved_at
+            oldest is not None and capacity > 1 and str(oldest_id) not in reserved_at
         )
         if reserved_oldest:
             selected.append(oldest)

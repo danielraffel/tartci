@@ -29,7 +29,11 @@ def event_run(run_id: int, created: str, page: str, event: str) -> dict:
 def scanner() -> queue_scan.QueueScanner:
     value = object.__new__(queue_scan.QueueScanner)
     value.args = argparse.Namespace(
-        newest_quota=2, max_job_fetches=5, page_offset_cap=64, merge_group_quota=2
+        newest_quota=2,
+        max_job_fetches=5,
+        page_offset_cap=64,
+        merge_group_quota=2,
+        negative_ttl=30,
     )
     return value
 
@@ -72,6 +76,46 @@ class QueueScanFairnessTests(unittest.TestCase):
             for _ in range(3)
         ]
         self.assertFalse(all(seen), seen)
+
+    def test_pr_backlog_is_still_visited_while_merge_groups_are_in_flight(self) -> None:
+        """Pulp builds up to five groups at once: three merge_group runs in
+        flight must not starve the PR runs behind the newest two."""
+        for reservation_fires_every_refresh in (False, True):
+            with self.subTest(reservation_every_refresh=reservation_fires_every_refresh):
+                value = scanner()
+                runs = [
+                    event_run(200 + i, f"2026-11-15T12:{i:02d}:00Z", "queued:1", "merge_group")
+                    for i in range(3)
+                ]
+                runs += [
+                    event_run(300 + i, f"2026-11-15T11:{10 + i}:00Z", "queued:1", "pull_request")
+                    for i in range(2)
+                ]
+                backlog = [
+                    event_run(400 + i, f"2026-11-14T{10 + i:02d}:00:00Z", "queued:1", "pull_request")
+                    for i in range(6)
+                ]
+                runs += backlog
+                state: dict = {}
+                visited: set[int] = set()
+                refreshes = 14
+                for refresh in range(refreshes):
+                    # Live: a refresh every 160s, so the 30s reservation
+                    # interval has always lapsed and the oldest-run slot fires.
+                    value.now = 1_800_000_000 + (160 * refresh if reservation_fires_every_refresh else 0)
+                    selected, _ = value._candidate_runs(runs, state)
+                    ids = [int(item["id"]) for item in selected]
+                    self.assertLessEqual(len(ids), 5, ids)
+                    rotating = [i for i in ids if i not in {200, 201, 202, 400}]
+                    # The reserved slot is the oldest backlog run (400); every
+                    # refresh must still rotate at least one other backlog run.
+                    self.assertTrue(rotating or not reservation_fires_every_refresh, ids)
+                    visited |= set(ids)
+                self.assertEqual(
+                    visited & ({300, 301} | {int(r["id"]) for r in backlog}),
+                    {300, 301} | {int(r["id"]) for r in backlog},
+                    visited,
+                )
 
     def test_merge_group_quota_never_takes_the_last_rotation_slot(self) -> None:
         value = scanner()
