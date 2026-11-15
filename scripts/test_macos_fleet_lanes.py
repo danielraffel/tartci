@@ -270,7 +270,7 @@ class MacosFleetLaneTests(unittest.TestCase):
                     fleet.load(path)
 
     def test_m3_vellum_gate_runs_two_supervisors(self) -> None:
-        vellum = next(lane for lane in fleet.load(HOST_CONFIGS["m3"])["lane"]
+        vellum = next(lane for lane in fleet.load(HOST_CONFIGS["studio"])["lane"]
                       if lane["id"] == "vellum-gate")
         self.assertEqual(vellum["supervisors"], 2)
 
