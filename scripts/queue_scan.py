@@ -67,6 +67,16 @@ def _fresh(timestamp: str, max_age_seconds: int) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - created).total_seconds() <= max_age_seconds
 
 
+def _age_seconds(timestamp: str, now: int) -> float:
+    """Seconds since an ISO-8601 timestamp; 0 when it cannot be read, so an
+    unreadable date never demotes a run."""
+    try:
+        created = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return 0.0
+    return now - created.timestamp()
+
+
 def _old_enough(timestamp: str, min_age_seconds: int, now: int) -> bool:
     if min_age_seconds <= 0:
         return True
@@ -433,11 +443,64 @@ class QueueScanner:
             return runs
         raise RuntimeError("workflow ID recovery exhausted")
 
+    def _merge_group_quota(self) -> int:
+        # Namespaces built without the option (in-process callers, older tests)
+        # keep the historical selection.
+        return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
+
+    def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
+        now = int(getattr(self, "now", 0) or 0)
+        max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
+        if now and max_age:
+            backlog = [
+                run for run in backlog
+                if _age_seconds(_created_key(run), now) <= max_age
+            ]
+        return min(backlog, key=_created_key) if backlog else None
+
+    def _reservation_fires(
+        self, newest: list[dict[str, Any]], state: dict[str, Any]
+    ) -> bool:
+        """Whether the oldest-backlog slot will be spent this sweep, judged
+        before the merge-group runs are set aside (the oldest backlog run is
+        the same unless it is itself a merge-group run, which needs no slot)."""
+        oldest = self._oldest_reservable(newest[self.args.newest_quota:])
+        if oldest is None:
+            return False
+        now = int(getattr(self, "now", 0) or 0)
+        interval = int(getattr(self.args, "negative_ttl", 0) or 0)
+        reserved_raw = state.get("oldest_reserved_at")
+        if isinstance(reserved_raw, dict):
+            at = reserved_raw.get(str(int(oldest["id"])))
+            if isinstance(at, int) and now - at < interval:
+                return False
+        return True
+
     def _candidate_runs(
         self, runs: list[dict[str, Any]], state: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], list[int]]:
         newest = sorted(runs, key=_created_key, reverse=True)
-        latency = newest[: self.args.newest_quota]
+        # A merge-queue run is the work the whole queue waits on, and its second
+        # job (a dependent job queued when the first ends) appears long after the
+        # run was created, when newer PR runs already outrank it by age. Fetch
+        # the newest merge_group runs on every refresh, outside the rotation.
+        # They are paid for from the same job-fetch cap (the API-call budget is
+        # unchanged) and always leave one slot for the rotation.
+        # Every refresh keeps at least one rotating slot, so a busy merge queue
+        # (Pulp builds up to five groups) cannot starve the PR backlog. When the
+        # oldest-run reservation will fire this sweep it costs a slot too.
+        reservation = 1 if self._reservation_fires(newest, state) else 0
+        merge_quota = min(
+            self._merge_group_quota(),
+            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
+        )
+        priority = [
+            run for run in newest if run.get("event") == "merge_group"
+        ][:merge_quota]
+        priority_ids = {int(run["id"]) for run in priority}
+        latency = priority + [
+            run for run in newest if int(run["id"]) not in priority_ids
+        ][: self.args.newest_quota]
         latency_ids = {int(run["id"]) for run in latency}
         backlog = [
             run for run in runs if int(run["id"]) not in latency_ids
@@ -449,8 +512,11 @@ class QueueScanner:
         # bounded sweep. The rotating page/group cursor still provides
         # breadth, while this reservation prevents an old run from remaining
         # invisible when the backlog grows faster than the cursor reaches it.
-        oldest = min(backlog, key=_created_key)
-        oldest_id = int(oldest["id"])
+        # A run older than --oldest-reserve-max-age (a closed PR's run GitHub
+        # never retired, a phantom) cannot be live demand worth a guaranteed
+        # slot on every refresh; it stays in the rotation but is not reserved.
+        oldest = self._oldest_reservable(backlog)
+        oldest_id = int(oldest["id"]) if oldest is not None else -1
 
         groups: dict[str, list[dict[str, Any]]] = {}
         for run in backlog:
@@ -493,7 +559,10 @@ class QueueScanner:
             )
             if isinstance(at, int) and now - at < interval
         }
-        reserved_oldest = capacity > 0 and str(oldest_id) not in reserved_at
+        # The reservation yields to the rotation: at least one slot rotates.
+        reserved_oldest = (
+            oldest is not None and capacity > 1 and str(oldest_id) not in reserved_at
+        )
         if reserved_oldest:
             selected.append(oldest)
             reserved_at[str(oldest_id)] = now
@@ -789,6 +858,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--max-run-pages", type=int, default=int(os.environ.get("TARTCI_QUEUE_RUN_PAGES", "2")))
     parser.add_argument("--max-job-fetches", type=int, default=int(os.environ.get("TARTCI_QUEUE_JOB_FETCHES", "5")))
+    parser.add_argument(
+        "--merge-group-quota",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "0")),
+        help="newest merge_group runs whose jobs are read on every refresh, taken "
+        "from --max-job-fetches (0, the default, keeps the newest-then-rotation order)",
+    )
+    parser.add_argument(
+        "--oldest-reserve-max-age",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS", "172800")),
+        help="the reserved oldest-backlog slot skips runs older than this many seconds "
+        "(0 disables)",
+    )
     parser.add_argument("--newest-quota", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEWEST_QUOTA", "2")))
     parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "14")))
     parser.add_argument("--workflow-cache-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_WORKFLOW_CACHE_TTL_SECS", "86400")))
