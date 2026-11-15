@@ -1140,3 +1140,17 @@ Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
 
 - **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.
+
+- **A merge group's second job waits 30+ minutes while PR jobs keep booting
+  VMs.** → *Cause:* `queue_scan.py` reads the jobs of only `--max-job-fetches`
+  (5) runs per refresh: the newest 2, one slot reserved for the globally oldest
+  backlog run (a ghost PR run from days ago), and a rotating window over the
+  rest. A merge-group run's second job (for Vellum, `sterile-consumer`, which
+  `needs:` the GPU job) appears only when the first ends, so by then newer PR
+  runs outrank its run by creation time and it is visited once per rotation. The
+  tier-0 scan then counts 0 and the lane boots tier 1. → *Fix:* the newest
+  `--merge-group-quota` (default 2, env `TARTCI_QUEUE_MERGE_GROUP_QUOTA`)
+  `merge_group` runs are read on every refresh from the same fetch cap, so the
+  API-call budget is unchanged; `0` restores the old selection. → *Diagnose:*
+  the lane's `queue-scan.<hash>.json` `negative` map lists only runs that scan
+  evaluated; the merge-group run's id is absent while its job sits `queued`.

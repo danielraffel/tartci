@@ -433,11 +433,32 @@ class QueueScanner:
             return runs
         raise RuntimeError("workflow ID recovery exhausted")
 
+    def _merge_group_quota(self) -> int:
+        # Namespaces built without the option (in-process callers, older tests)
+        # keep the historical selection.
+        return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
+
     def _candidate_runs(
         self, runs: list[dict[str, Any]], state: dict[str, Any]
     ) -> tuple[list[dict[str, Any]], list[int]]:
         newest = sorted(runs, key=_created_key, reverse=True)
-        latency = newest[: self.args.newest_quota]
+        # A merge-queue run is the work the whole queue waits on, and its second
+        # job (a dependent job queued when the first ends) appears long after the
+        # run was created, when newer PR runs already outrank it by age. Fetch
+        # the newest merge_group runs on every refresh, outside the rotation.
+        # They are paid for from the same job-fetch cap (the API-call budget is
+        # unchanged) and always leave one slot for the rotation.
+        merge_quota = min(
+            self._merge_group_quota(),
+            max(0, self.args.max_job_fetches - self.args.newest_quota - 1),
+        )
+        priority = [
+            run for run in newest if run.get("event") == "merge_group"
+        ][:merge_quota]
+        priority_ids = {int(run["id"]) for run in priority}
+        latency = priority + [
+            run for run in newest if int(run["id"]) not in priority_ids
+        ][: self.args.newest_quota]
         latency_ids = {int(run["id"]) for run in latency}
         backlog = [
             run for run in runs if int(run["id"]) not in latency_ids
@@ -789,6 +810,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gh-timeout", type=int, default=int(os.environ.get("TARTCI_GH_TIMEOUT_SECS", "15")))
     parser.add_argument("--max-run-pages", type=int, default=int(os.environ.get("TARTCI_QUEUE_RUN_PAGES", "2")))
     parser.add_argument("--max-job-fetches", type=int, default=int(os.environ.get("TARTCI_QUEUE_JOB_FETCHES", "5")))
+    parser.add_argument(
+        "--merge-group-quota",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "2")),
+        help="newest merge_group runs whose jobs are read on every refresh, taken "
+        "from --max-job-fetches (0 disables)",
+    )
     parser.add_argument("--newest-quota", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEWEST_QUOTA", "2")))
     parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "14")))
     parser.add_argument("--workflow-cache-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_WORKFLOW_CACHE_TTL_SECS", "86400")))
