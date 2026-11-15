@@ -1666,6 +1666,13 @@ reclaim_runner_name(){
   local max_busy="${TARTCI_STUCK_REGISTRATION_MAX_DELETES:-3}"
   local retry_secs="${TARTCI_STUCK_REGISTRATION_RETRY_SECS:-600}"
   local sf count=0 last=0 now first jobinfo del_out
+  # Env knobs must be positive integers; anything else falls back to the default
+  # (a bad value must not abort the set -e supervisor in arithmetic). The delete
+  # threshold is also capped at max_attempts so it is always reachable.
+  case "$max_attempts" in ''|*[!0-9]*|0) max_attempts=18;; esac
+  case "$max_busy" in ''|*[!0-9]*|0) max_busy=3;; esac
+  case "$retry_secs" in ''|*[!0-9]*) retry_secs=600;; esac
+  [ "$max_busy" -le "$max_attempts" ] || max_busy="$max_attempts"
   for attempt in $(seq 1 "$max_attempts"); do
     id="$("$GH_CLI" api "$runner_api_root" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"

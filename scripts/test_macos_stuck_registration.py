@@ -75,6 +75,26 @@ class StuckRegistrationTests(unittest.TestCase):
                 env="TARTCI_STUCK_REGISTRATION_MAX_DELETES=2")
         self.assertEqual(n, 2)
 
+    def test_invalid_knobs_fall_back_to_defaults(self) -> None:
+        for env in ("TARTCI_STUCK_REGISTRATION_MAX_DELETES=abc",
+                    "TARTCI_STUCK_REGISTRATION_MAX_DELETES=0",
+                    "TARTCI_STUCK_REGISTRATION_MAX_DELETES=",
+                    "TARTCI_STUCK_REGISTRATION_RETRY_SECS=x1"):
+            with tempfile.TemporaryDirectory() as t:
+                n, out, err = self.run_reclaim(Path(t), calls=2, delete_ok=False, env=env)
+            self.assertEqual(n, 3, env)
+            self.assertIn(f"STUCK={NAME}", out, env)
+            self.assertNotIn("syntax error", err, env)
+
+    def test_threshold_above_attempt_limit_is_still_reachable(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            n, out, _ = self.run_reclaim(
+                Path(t), calls=1, delete_ok=False,
+                env="TARTCI_STUCK_REGISTRATION_MAX_DELETES=99")
+        self.assertEqual(n, 18)
+        self.assertIn(f"STUCK={NAME}", out)
+        self.assertEqual(out.count("FINDING"), 1)
+
     def test_stuck_registration_is_not_retried_every_cycle(self) -> None:
         with tempfile.TemporaryDirectory() as t:
             n, out, _ = self.run_reclaim(Path(t), calls=5, delete_ok=False)
