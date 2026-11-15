@@ -67,6 +67,16 @@ def _fresh(timestamp: str, max_age_seconds: int) -> bool:
     return (dt.datetime.now(dt.timezone.utc) - created).total_seconds() <= max_age_seconds
 
 
+def _age_seconds(timestamp: str, now: int) -> float:
+    """Seconds since an ISO-8601 timestamp; 0 when it cannot be read, so an
+    unreadable date never demotes a run."""
+    try:
+        created = dt.datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    except (AttributeError, ValueError):
+        return 0.0
+    return now - created.timestamp()
+
+
 def _old_enough(timestamp: str, min_age_seconds: int, now: int) -> bool:
     if min_age_seconds <= 0:
         return True
@@ -470,8 +480,20 @@ class QueueScanner:
         # bounded sweep. The rotating page/group cursor still provides
         # breadth, while this reservation prevents an old run from remaining
         # invisible when the backlog grows faster than the cursor reaches it.
-        oldest = min(backlog, key=_created_key)
-        oldest_id = int(oldest["id"])
+        # A run older than --oldest-reserve-max-age (a closed PR's run GitHub
+        # never retired, a phantom) cannot be live demand worth a guaranteed
+        # slot on every refresh; it stays in the rotation but is not reserved.
+        now = int(getattr(self, "now", 0) or 0)
+        max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
+        if now and max_age:
+            reservable = [
+                run for run in backlog
+                if _age_seconds(_created_key(run), now) <= max_age
+            ]
+        else:
+            reservable = backlog
+        oldest = min(reservable, key=_created_key) if reservable else None
+        oldest_id = int(oldest["id"]) if oldest is not None else -1
 
         groups: dict[str, list[dict[str, Any]]] = {}
         for run in backlog:
@@ -514,7 +536,9 @@ class QueueScanner:
             )
             if isinstance(at, int) and now - at < interval
         }
-        reserved_oldest = capacity > 0 and str(oldest_id) not in reserved_at
+        reserved_oldest = (
+            oldest is not None and capacity > 0 and str(oldest_id) not in reserved_at
+        )
         if reserved_oldest:
             selected.append(oldest)
             reserved_at[str(oldest_id)] = now
@@ -816,6 +840,13 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "2")),
         help="newest merge_group runs whose jobs are read on every refresh, taken "
         "from --max-job-fetches (0 disables)",
+    )
+    parser.add_argument(
+        "--oldest-reserve-max-age",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS", "172800")),
+        help="the reserved oldest-backlog slot skips runs older than this many seconds "
+        "(0 disables)",
     )
     parser.add_argument("--newest-quota", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEWEST_QUOTA", "2")))
     parser.add_argument("--max-api-calls", type=int, default=int(os.environ.get("TARTCI_QUEUE_MAX_API_CALLS", "14")))
