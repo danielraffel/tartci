@@ -1638,14 +1638,72 @@ yield_bound_reached(){
   printf '%s\n' "$count"
 }
 
+# A registration GitHub will not delete because it is busy (the VM idled out at
+# the instant GitHub assigned it a job) never stops being busy. Retrying it
+# forever wedges the lane, so failed deletes of the SAME id are counted in
+# STATE_DIR; at TARTCI_STUCK_REGISTRATION_MAX_DELETES the id is declared stuck,
+# reported once with the orphaned run and job, and retried only every
+# TARTCI_STUCK_REGISTRATION_RETRY_SECS. Callers read STUCK_REGISTRATION_NAME to
+# boot under a different name.
+STUCK_REGISTRATION_NAME=""
+stuck_registration_file(){ printf '%s/stuck-registration-%s' "$STATE_DIR" "$1"; }
+
+# Best effort and bounded: find the unfinished job assigned to runner $1.
+stuck_registration_job(){
+  local name="$1" rid out
+  for rid in $("$GH_CLI" api "repos/$REPO/actions/runs?status=in_progress&per_page=20" \
+        --jq '.workflow_runs[].id' 2>/dev/null | head -n 20); do
+    out="$("$GH_CLI" api "repos/$REPO/actions/runs/$rid/jobs?filter=latest" \
+      --jq ".jobs[] | select(.runner_name==\"$name\" and .status!=\"completed\") | \"run_id=$rid job_id=\\(.id)\"" \
+      2>/dev/null | head -n1 || true)"
+    [ -z "$out" ] || { printf '%s' "$out"; return 0; }
+  done
+  printf '%s' "run_id=unknown job_id=unknown"
+}
+
 reclaim_runner_name(){
   local name="$1" runner_api_root="${2:-$RUNNER_API_ROOT}" max_attempts="${3:-18}" id attempt
+  local max_busy="${TARTCI_STUCK_REGISTRATION_MAX_DELETES:-3}"
+  local retry_secs="${TARTCI_STUCK_REGISTRATION_RETRY_SECS:-600}"
+  local sf count=0 last=0 now first jobinfo
   for attempt in $(seq 1 "$max_attempts"); do
     id="$("$GH_CLI" api "$runner_api_root" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
     [ -n "$id" ] || break
+    sf="$(stuck_registration_file "$id")"
+    count=0; last=0; first=0
+    [ ! -f "$sf" ] || read -r count first last <"$sf" 2>/dev/null || true
+    case "$count$first$last" in *[!0-9]*) count=0; first=0; last=0;; esac
+    now="$(date +%s)"
+    if [ "$count" -ge "$max_busy" ]; then
+      STUCK_REGISTRATION_NAME="$name"
+      if [ $((now - last)) -lt "$retry_secs" ]; then
+        note "runner registration '$name' (id=$id) is stuck busy; not retrying for $((retry_secs - (now - last)))s"
+        break
+      fi
+      note "retrying stuck runner registration '$name' (id=$id)"
+      if "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1; then
+        rm -f "$sf"; STUCK_REGISTRATION_NAME=""; id=""
+      else
+        printf '%s %s %s\n' "$count" "$first" "$now" >"$sf" 2>/dev/null || true
+      fi
+      break
+    fi
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1 && { id=""; break; }
+    if "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1; then
+      rm -f "$sf"; id=""; break
+    fi
+    count=$((count + 1))
+    [ "$first" -gt 0 ] || first="$now"
+    printf '%s %s %s\n' "$count" "$first" "$now" >"$sf" 2>/dev/null || true
+    if [ "$count" -ge "$max_busy" ]; then
+      STUCK_REGISTRATION_NAME="$name"
+      jobinfo="$(stuck_registration_job "$name")"
+      note "FINDING stuck_runner_registration: '$name' id=$id cannot be deleted after $count tries ($jobinfo); the job is orphaned and needs a force-cancel. Booting a new runner under a fresh name."
+      event stuck_registration "name=$name id=$id tries=$count $jobinfo" \
+        "name=$name" "registration_id=$id" "tries=$count"
+      break
+    fi
     sleep 10
   done
   # A registration we found but could not delete becomes a ghost: it stays
@@ -3047,7 +3105,15 @@ run_one(){
       note "[$i] selected class demand is gone or a preferred class is waiting (${ASSIGNMENT_V2_PRE_MINT_BLOCKER}) — not cloning"
       return 75
     fi
+    STUCK_REGISTRATION_NAME=""
     reclaim_runner_name "$vm" "$selected_runner_api_root"
+    if [ "$STUCK_REGISTRATION_NAME" = "$vm" ]; then
+      # The old name is held by an undeletable busy registration; boot under a
+      # fresh one so the lane serves jobs again.
+      vm="$(ephemeral_boot_name "$i")-$(date +%s)"
+      STUCK_REGISTRATION_NAME=""
+      note "booting under fresh runner name $vm"
+    fi
     sweep_lane_ghost_runners "$selected_runner_api_root" "$vm"
     lease_rc=0
     boot_vm_to_ssh "$i" "$vm" "$selected_labels" "$lease_priority" "$logdir" booting \
