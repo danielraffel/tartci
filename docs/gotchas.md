@@ -1149,7 +1149,10 @@ not permission to force-remove a worktree.
   `needs:` the GPU job) appears only when the first ends, so by then newer PR
   runs outrank its run by creation time and it is visited once per rotation. The
   tier-0 scan then counts 0 and the lane boots tier 1. → *Fix:* the newest
-  `--merge-group-quota` (default 2, env `TARTCI_QUEUE_MERGE_GROUP_QUOTA`)
+  `--merge-group-quota` (default 0, so Pulp, whose queue shows 100+ queued runs and
+  depends on the newest slots, keeps today's order; the Vellum lanes set it to 2
+  through the `queue_merge_group_quota` lane key, rendered as env
+  `TARTCI_QUEUE_MERGE_GROUP_QUOTA`)
   `merge_group` runs are read on every refresh from the same fetch cap, so the
   API-call budget is unchanged, and at least one slot always rotates (the quota is clamped to leave one, plus one more when the oldest-run reservation fires; the reservation yields when only one slot remains); `0` restores the old selection. The slot reserved for the oldest backlog run
   now skips runs older than `--oldest-reserve-max-age` (default 2 days, env

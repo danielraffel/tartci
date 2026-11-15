@@ -861,9 +861,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--merge-group-quota",
         type=int,
-        default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "2")),
+        default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "0")),
         help="newest merge_group runs whose jobs are read on every refresh, taken "
-        "from --max-job-fetches (0 disables)",
+        "from --max-job-fetches (0, the default, keeps the newest-then-rotation order)",
     )
     parser.add_argument(
         "--oldest-reserve-max-age",

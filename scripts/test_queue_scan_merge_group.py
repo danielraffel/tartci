@@ -175,5 +175,54 @@ class OldestReservationTests(unittest.TestCase):
         self.assertLessEqual(len(selected), 5)
 
 
+class ScopeTests(unittest.TestCase):
+    """The merge-group quota is a Vellum-lane setting; every other lane (Pulp,
+    whose queue shows 100+ queued runs, so it depends on the newest slots) keeps
+    the plain newest-then-rotation order."""
+
+    ROOT = Path(__file__).resolve().parents[1]
+
+    def test_the_default_is_zero(self) -> None:
+        import os
+        import subprocess
+        import sys
+
+        env = {k: v for k, v in os.environ.items() if k != "TARTCI_QUEUE_MERGE_GROUP_QUOTA"}
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.argv=['x','--repo','o/r','--workflow','w','--labels','l','--state-file','s','--provider','p'];"
+             "import queue_scan; print(queue_scan.parse_args().merge_group_quota)"],
+            cwd=self.ROOT / "scripts", env=env, capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(out.stdout.strip(), "0")
+
+    def test_only_the_vellum_lanes_set_it_and_every_host_renders_it(self) -> None:
+        import plistlib
+        import sys
+
+        sys.path.insert(0, str(self.ROOT / "scripts"))
+        import testing_support
+
+        testing_support.skip_module_without_tomllib()
+        import macos_fleet_lanes as fleet
+
+        for host in ("m1", "m3", "m5", "m5studio"):
+            with self.subTest(host=host):
+                rendered = fleet.rendered_plists(
+                    fleet.load(self.ROOT / "profiles" / f"{host}-macos-fleet.toml")
+                )
+                quotas = {}
+                for name, body in rendered.items():
+                    if "tart-runner-macos-fleet" not in name:
+                        continue
+                    env = plistlib.loads(body)["EnvironmentVariables"]
+                    quotas[name] = env.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA")
+                vellum = {n: q for n, q in quotas.items() if ".vellum-gate" in n}
+                other = {n: q for n, q in quotas.items() if ".vellum-gate" not in n}
+                self.assertTrue(vellum, quotas)
+                self.assertEqual(set(vellum.values()), {"2"}, vellum)
+                self.assertEqual(set(other.values()), {None}, other)
+
+
 if __name__ == "__main__":
     unittest.main()
