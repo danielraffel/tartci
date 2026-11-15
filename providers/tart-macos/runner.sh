@@ -1665,7 +1665,7 @@ reclaim_runner_name(){
   local name="$1" runner_api_root="${2:-$RUNNER_API_ROOT}" max_attempts="${3:-18}" id attempt
   local max_busy="${TARTCI_STUCK_REGISTRATION_MAX_DELETES:-3}"
   local retry_secs="${TARTCI_STUCK_REGISTRATION_RETRY_SECS:-600}"
-  local sf count=0 last=0 now first jobinfo
+  local sf count=0 last=0 now first jobinfo del_out
   for attempt in $(seq 1 "$max_attempts"); do
     id="$("$GH_CLI" api "$runner_api_root" --paginate \
           --jq ".runners[] | select(.name==\"$name\") | .id" 2>/dev/null | head -n1 || true)"
@@ -1690,8 +1690,14 @@ reclaim_runner_name(){
       break
     fi
     note "reclaiming static name '$name': deleting stale runner registration (id=$id attempt=$attempt)"
-    if "$GH_CLI" api -X DELETE "$runner_api_root/$id" >/dev/null 2>&1; then
+    if del_out="$("$GH_CLI" api -X DELETE "$runner_api_root/$id" 2>&1)"; then
       rm -f "$sf"; id=""; break
+    fi
+    # Only "the runner is busy running a job" marks a registration stuck. A
+    # network, 5xx or rate-limit failure is transient: retry, never count.
+    if ! printf '%s' "$del_out" | grep -qi 'busy'; then
+      sleep 10
+      continue
     fi
     count=$((count + 1))
     [ "$first" -gt 0 ] || first="$now"
@@ -1724,7 +1730,7 @@ reclaim_runner_name(){
 sweep_lane_ghost_runners(){
   local runner_api_root="$1" keep="$2" id name
   "$GH_CLI" api "$runner_api_root" --paginate \
-    --jq ".runners[] | select(.status == \"offline\") | select(.name | test(\"^${RUNNER_NAME}-[0-9]+-[0-9]+$\")) | \"\\(.id)\\t\\(.name)\"" 2>/dev/null \
+    --jq ".runners[] | select(.status == \"offline\") | select(.name | test(\"^${RUNNER_NAME}-[0-9]+-[0-9]+(-[0-9]+)?$\")) | \"\\(.id)\\t\\(.name)\"" 2>/dev/null \
   | while IFS="$(printf '\t')" read -r id name; do
       [ -n "$id" ] && [ -n "$name" ] || continue
       [ "$name" = "$keep" ] && continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import unittest
@@ -20,13 +21,15 @@ def extract(name: str) -> str:
 
 
 class StuckRegistrationTests(unittest.TestCase):
-    def run_reclaim(self, td: Path, calls: int, delete_ok: bool, env: str = ""):
+    def run_reclaim(self, td: Path, calls: int, delete_ok: bool, env: str = "",
+                    err: str = "HTTP 422: Runner is busy"):
         deletes = td / "deletes.txt"
         gh = td / "fake-gh"
         gh.write_text(
             "#!/bin/bash\n"
             'if [ "$1" = "api" ] && [ "$2" = "-X" ] && [ "$3" = "DELETE" ]; then\n'
             f'  echo x >> "{deletes}"\n'
+            f"  [ {0 if delete_ok else 1} = 1 ] && echo '{err}' >&2\n"
             f"  exit {0 if delete_ok else 1}\n"
             "fi\n"
             'case "$2" in\n'
@@ -86,6 +89,20 @@ class StuckRegistrationTests(unittest.TestCase):
                 env="TARTCI_STUCK_REGISTRATION_RETRY_SECS=0")
         self.assertEqual(n, 3 + 2, "every later cycle retries once when the window is 0")
         self.assertIn("retrying stuck runner registration", out)
+
+    def test_transient_failures_never_count_as_stuck(self) -> None:
+        for err in ("HTTP 502 Bad Gateway", "dial tcp: i/o timeout", "HTTP 403: rate limit exceeded"):
+            with tempfile.TemporaryDirectory() as t:
+                n, out, _ = self.run_reclaim(Path(t), calls=1, delete_ok=False, err=err)
+                self.assertEqual(n, 18, err)
+                self.assertNotIn("FINDING", out)
+                self.assertIn("STUCK=\n", out)
+                self.assertEqual(list(Path(t).glob("stuck-registration-*")), [])
+
+    def test_sweep_matches_the_fresh_name(self) -> None:
+        sweep = extract("sweep_lane_ghost_runners")
+        self.assertIn("(-[0-9]+)?$", sweep)
+        self.assertTrue(re.search(r"^m1-vellum-gate-01-[0-9]+-[0-9]+(-[0-9]+)?$", NAME + "-1789000000"))
 
     def test_successful_delete_is_unchanged(self) -> None:
         with tempfile.TemporaryDirectory() as t:
