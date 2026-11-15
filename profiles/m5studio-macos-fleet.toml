@@ -243,7 +243,8 @@ priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast", "spectr-release"]
 # The trusted m5studio lane also performs signed Spectr releases. Other
-# Spectr lanes remain acceptance-only so a release cannot land on an
+# Spectr lanes also poll Spectr Release so it is never starved, but only this
+# lane carries the spectr-release label, so a release cannot land on an
 # unqualified host.
 workflows = ["Spectr M5 Product Acceptance", "Spectr Release"]
 replaces_launchd_labels = []

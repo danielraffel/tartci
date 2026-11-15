@@ -254,7 +254,7 @@ ccache_write_isolation = true
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
-workflows = ["Spectr M5 Product Acceptance"]
+workflows = ["Spectr M5 Product Acceptance", "Spectr Release"]
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.
@@ -298,7 +298,10 @@ priority = "vm"
 # VMs took both guest slots. 8 + a 4-core build fits the budget. Rollback:
 # delete this line and re-render.
 vm_cores = 8
-supervisors = 1
+# Two supervisors: the lease budget (26 cores) holds a second 8-core Vellum guest
+# beside a Spectr guest while Pulp gate lanes idle; 6 merge-queue GPU proofs queued
+# 2-4h behind one slot on 2026-11-15. Rollback: set back to 1 and re-render.
+supervisors = 2
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
