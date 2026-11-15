@@ -90,6 +90,44 @@ def serving_hosts(job: dict, repo: str, workflow: str, regs: Iterable[dict]) -> 
     return sorted(hosts)
 
 
+MAX_RUN_PAGES = 10
+
+
+def list_runs(fetch: Fetch, base: str) -> Tuple[Optional[List[dict]], List[str]]:
+    """(every run the listing returns, read errors); runs is None when the first page failed.
+
+    Pages forward while a page is full. A short last page is the whole listing
+    even when `total_count` says a run or two more: a run that changed status
+    between GitHub's count and its list is never on a later page, so asking
+    for one cannot find it, and failing closed on that left a host unable to
+    judge its queue (m1 read 39 of 40 Vellum runs). Only a listing still full
+    after MAX_RUN_PAGES pages is unread.
+    """
+    runs: List[dict] = []
+    seen: set = set()
+    errors: List[str] = []
+    for page in range(1, MAX_RUN_PAGES + 1):
+        path = base if page == 1 else f"{base}&page={page}"
+        try:
+            listing = fetch(path)
+        except Exception as error:  # noqa: BLE001 - any failed read is reported
+            errors.append(f"{path}: {error}"[:300])
+            return (runs if page > 1 else None), errors
+        batch = listing.get("workflow_runs") if isinstance(listing, dict) else None
+        if not isinstance(batch, list):
+            errors.append(f"{path}: no workflow_runs in the answer")
+            return (runs if page > 1 else None), errors
+        for run in batch:
+            ident = run.get("id") if isinstance(run, dict) else None
+            if ident is None or ident not in seen:
+                seen.add(ident)
+                runs.append(run)
+        if len(batch) < PAGE:
+            return runs, errors
+    errors.append(f"{base}: still full after {MAX_RUN_PAGES} pages; read {len(runs)} runs")
+    return runs, errors
+
+
 def queued_jobs(fetch: Fetch, regs: List[dict], now: float,
                 max_age: float = MAX_JOB_AGE_SECONDS) -> Tuple[List[dict], List[str]]:
     """(queued jobs some host in `regs` serves, read errors)."""
@@ -103,19 +141,10 @@ def queued_jobs(fetch: Fetch, regs: List[dict], now: float,
     seen_runs: set = set()
     for repo in sorted(workflows):
         for status in RUN_STATUSES:
-            path = f"repos/{repo}/actions/runs?status={status}&per_page={PAGE}"
-            try:
-                listing = fetch(path)
-            except Exception as error:  # noqa: BLE001 - any failed read is reported
-                errors.append(f"{path}: {error}"[:300])
+            runs, read_errors = list_runs(fetch, f"repos/{repo}/actions/runs?status={status}&per_page={PAGE}")
+            errors.extend(read_errors)
+            if runs is None:
                 continue
-            runs = listing.get("workflow_runs") if isinstance(listing, dict) else None
-            if not isinstance(runs, list):
-                errors.append(f"{path}: no workflow_runs in the answer")
-                continue
-            total = listing.get("total_count")
-            if isinstance(total, int) and total > len(runs):
-                errors.append(f"{path}: read {len(runs)} of {total} runs")
             for run in runs:
                 if not isinstance(run, dict):
                     continue
