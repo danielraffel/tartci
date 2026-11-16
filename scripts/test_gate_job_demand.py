@@ -145,6 +145,41 @@ class GateJobDemandTests(unittest.TestCase):
         _, errors = demand.queued_jobs(Recorder(), demand.registrations(ADVERTISED), NOW)
         self.assertTrue(any("not captured" in error for error in errors))
 
+    def _runs(self, count: int, start: int = 1) -> list[dict]:
+        return [{"id": start + i, "name": "nope", "created_at": "2026-10-13T16:00:00Z"}
+                for i in range(count)]
+
+    def test_a_short_page_is_complete_even_when_the_count_says_more(self) -> None:
+        base = f"repos/{PULP}/actions/runs?status=queued&per_page=100"
+        fetch = Recorder({base: {"total_count": 40, "workflow_runs": self._runs(39)}})
+        runs, errors = demand.list_runs(fetch, base)
+        self.assertEqual((len(runs), errors), (39, []))
+        self.assertEqual(fetch.paths, [base])  # no second page asked for
+
+    def test_a_full_page_is_followed_to_the_next(self) -> None:
+        base = f"repos/{PULP}/actions/runs?status=queued&per_page=100"
+        fetch = Recorder({
+            base: {"total_count": 130, "workflow_runs": self._runs(100)},
+            base + "&page=2": {"total_count": 130, "workflow_runs": self._runs(30, 101)},
+        })
+        runs, errors = demand.list_runs(fetch, base)
+        self.assertEqual((len(runs), errors), (130, []))
+
+    def test_a_listing_full_to_the_page_cap_is_unread(self) -> None:
+        base = f"repos/{PULP}/actions/runs?status=queued&per_page=100"
+        overrides = {base: {"workflow_runs": self._runs(100)}}
+        for page in range(2, demand.MAX_RUN_PAGES + 1):
+            overrides[f"{base}&page={page}"] = {"workflow_runs": self._runs(100, page * 1000)}
+        runs, errors = demand.list_runs(Recorder(overrides), base)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("still full", errors[0])
+
+    def test_a_failed_second_page_is_an_error(self) -> None:
+        base = f"repos/{PULP}/actions/runs?status=queued&per_page=100"
+        fetch = Recorder({base: {"workflow_runs": self._runs(100)}}, fail="page=2")
+        _, errors = demand.list_runs(fetch, base)
+        self.assertTrue(errors and "HTTP 502" in errors[0], errors)
+
 
 if __name__ == "__main__":
     unittest.main()

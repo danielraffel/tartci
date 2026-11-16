@@ -303,6 +303,11 @@ vm_cores = 8
 # 2-4h behind one slot on 2026-11-15. Rollback: set back to 1 and re-render.
 supervisors = 2
 min_queued_age_seconds = 0
+# Vellum's merge-group sterile job appears only when its GPU job ends, long
+# after the run was created, so the scan reads the newest 2 merge_group runs'
+# jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
+# default 0. Rollback: delete this line and re-render.
+queue_merge_group_quota = 2
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
 # every host (31 of 65 Vellum boots got no job, 2026-11-01..04).

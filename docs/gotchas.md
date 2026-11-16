@@ -1140,3 +1140,24 @@ Incomplete `lsof`, Git, branch, or main-fetch evidence is a stop,
 not permission to force-remove a worktree.
 
 - **A fleet pin is an install contract, not a PATH preference.** The installer probes api.github.com before writing LaunchAgents. It records TARTCI_PYTHON, carries the same path into sealed lanes.json and ghapp, and uses TARTCI_RENDER_PYTHON while rendering. A blocked or vanished interpreter names the path and requires reinstalling the current TartCI generation; do not relink python3 underneath a live generation.
+
+- **A merge group's second job waits 30+ minutes while PR jobs keep booting
+  VMs.** → *Cause:* `queue_scan.py` reads the jobs of only `--max-job-fetches`
+  (5) runs per refresh: the newest 2, one slot reserved for the globally oldest
+  backlog run (a ghost PR run from days ago), and a rotating window over the
+  rest. A merge-group run's second job (for Vellum, `sterile-consumer`, which
+  `needs:` the GPU job) appears only when the first ends, so by then newer PR
+  runs outrank its run by creation time and it is visited once per rotation. The
+  tier-0 scan then counts 0 and the lane boots tier 1. → *Fix:* the newest
+  `--merge-group-quota` (default 0, so Pulp, whose queue shows 100+ queued runs and
+  depends on the newest slots, keeps today's order; the Vellum lanes set it to 2
+  through the `queue_merge_group_quota` lane key, rendered as env
+  `TARTCI_QUEUE_MERGE_GROUP_QUOTA`)
+  `merge_group` runs are read on every refresh from the same fetch cap, so the
+  API-call budget is unchanged, and at least one slot always rotates (the quota is clamped to leave one, plus one more when the oldest-run reservation fires; the reservation yields when only one slot remains); `0` restores the old selection. The slot reserved for the oldest backlog run
+  now skips runs older than `--oldest-reserve-max-age` (default 2 days, env
+  `TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS`, 0 disables), so a ghost run from
+  a closed PR stops spending it on every refresh; it stays in the rotation.
+  → *Diagnose:*
+  the lane's `queue-scan.<hash>.json` `negative` map lists only runs that scan
+  evaluated; the merge-group run's id is absent while its job sits `queued`.

@@ -130,7 +130,7 @@ LANE_KEYS = {
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
-    "v2_gate_classes",
+    "v2_gate_classes", "queue_merge_group_quota",
 }
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
@@ -851,6 +851,9 @@ def load(path: Path) -> dict:
         age = lane.get("min_queued_age_seconds", 0)
         if type(age) is not int or age < 0:
             fail(f"lane {lane_id}: min_queued_age_seconds must be a nonnegative integer")
+        quota = lane.get("queue_merge_group_quota")
+        if quota is not None and (type(quota) is not int or quota < 0):
+            fail(f"lane {lane_id}: queue_merge_group_quota must be a nonnegative integer")
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
@@ -3150,6 +3153,10 @@ def lane_plist(
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
+    if "queue_merge_group_quota" in lane:
+        # queue_scan.py reads the newest N merge_group runs' jobs on every
+        # refresh; absent, the lane keeps the plain newest-then-rotation order.
+        env["TARTCI_QUEUE_MERGE_GROUP_QUOTA"] = str(lane["queue_merge_group_quota"])
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if "vm_cores_from" in lane:
