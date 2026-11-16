@@ -226,6 +226,37 @@ class Gate(unittest.TestCase):
         # The job_assigned fell out of the tail window; nothing in the tail opens a job.
         self.assertIsNone(wd.open_job_assignment(str(self.events), now))
 
+    def test_boundary_aligned_assignment_is_kept(self) -> None:
+        now = time.time()
+        first = json.dumps(self.row(now - 100, "job_assigned")) + "\n"
+        filler = json.dumps(self.row(now - 10, "storage_health"))
+        # Pad with non-event lines so the tail window starts exactly at the
+        # job_assigned record (the byte before it is a newline).
+        rest = wd.EVENTS_TAIL_BYTES - len(first.encode())
+        pad_lines = []
+        while rest > 0:
+            line = "x" * min(rest - 1, 200) + "\n" if rest > 1 else "\n"
+            pad_lines.append(line)
+            rest -= len(line)
+        self.events.write_text("garbage-before\n" + first + "".join(pad_lines))
+        size = self.events.stat().st_size
+        self.assertEqual(size - wd.EVENTS_TAIL_BYTES, len("garbage-before\n"))
+        self.assertIn("job_assigned", wd.open_job_assignment(str(self.events), now) or "")
+
+    def test_unreadable_log_raises_so_heal_defers(self) -> None:
+        # A parent directory without search permission makes stat() fail with
+        # EACCES, which os.path.exists() reports as "absent".
+        sub = self.root / "locked"
+        sub.mkdir()
+        log = sub / "events.jsonl"
+        log.write_text(json.dumps(self.row(time.time() - 100, "job_assigned")) + "\n")
+        sub.chmod(0)
+        self.addCleanup(sub.chmod, 0o700)
+        if os.access(str(log), os.R_OK):
+            self.skipTest("permissions not enforced (running as root)")
+        with self.assertRaises(PermissionError):
+            wd.open_job_assignment(str(log))
+
     def test_missing_log_is_no_evidence(self) -> None:
         self.assertIsNone(wd.open_job_assignment(str(self.root / "absent.jsonl")))
 

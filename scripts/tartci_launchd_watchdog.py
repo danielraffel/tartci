@@ -1058,16 +1058,25 @@ def open_job_assignment(events_path: str, now: float | None = None) -> str | Non
     log also carries plain diagnostic lines). Raises OSError when the log
     exists but cannot be read, so the caller defers rather than heals.
     """
-    if not os.path.exists(events_path):
-        return None
-    with open(events_path, "rb") as fh:
+    try:
+        fh = open(events_path, "rb")
+    except FileNotFoundError:
+        return None  # only a genuinely absent log is "no evidence"
+    with fh:
         fh.seek(0, os.SEEK_END)
         size = fh.tell()
-        fh.seek(max(0, size - EVENTS_TAIL_BYTES))
+        start = max(0, size - EVENTS_TAIL_BYTES)
+        # Drop the first line only when the window starts mid-record: the
+        # byte before the window is not a newline.
+        cut = False
+        if start > 0:
+            fh.seek(start - 1)
+            cut = fh.read(1) != b"\n"
+        fh.seek(start)
         tail = fh.read().decode("utf-8", errors="replace")
     lines = tail.splitlines()
-    if size > EVENTS_TAIL_BYTES and lines:
-        lines = lines[1:]  # the first line is probably cut
+    if cut and lines:
+        lines = lines[1:]  # the first line is cut
     assigned: tuple[float, dict[str, Any]] | None = None
     for line in lines:
         if not line.startswith("{"):
