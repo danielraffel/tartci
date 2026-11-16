@@ -2646,8 +2646,13 @@ override that accepts killing the job is `--force` (`--allow-mid-job` still work
 the plan (`would bootout …`, `would bootstrap …`, `would kickstart -k …`) or
 `REFUSE: <reason>`. Exit codes for `--reload`: `0` reloaded / would proceed,
 `1` a mutation ran and failed its postcondition, `3` refused before changing
-anything. The unattended `tartci launchd heal` path is unchanged: it keeps its
-host-wide "no VM running" gate.
+anything. The unattended `tartci launchd heal` path keeps its host-wide "no VM
+running" gate, and before any bootout it runs the same per-lane mid-job probe
+plus a read of the lane's `events.jsonl` for an open `job_assigned`. Busy or
+unknown defers the heal with `heal-deferred: mid-job (<evidence>)`; there is no
+override, because nobody is there to accept killing the job. A stale-boot heal
+skips the probe (its verdict already proves no run or job identity) but still
+reads the event log.
 
 ### Runners the janitor must never delete (`keep_not_minted_here`)
 
