@@ -3804,9 +3804,8 @@ if [ "$LOOP" = 1 ]; then
       VM_DHCP_PROBE_BLOCKED_BY=""
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
       # A boot that a short-job-first event stood for and that ran no job.
-      if declare -F tartci_slot_priority_short_outcome >/dev/null; then
-        tartci_slot_priority_short_outcome "" "" no_job
-      fi
+      ! declare -F tartci_slot_priority_short_outcome >/dev/null \
+        || tartci_slot_priority_short_outcome "" "" no_job
       # Release per-turn ownership proofs immediately after run_one, before
       # the serving accounting grows. This keeps every early-return proof
       # within the loop's bounded post-run window.
