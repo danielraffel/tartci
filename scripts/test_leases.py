@@ -1878,5 +1878,194 @@ class LeaseMinimalPathTests(unittest.TestCase):
         self.assertEqual(proc.stdout, "")
 
 
+class AcquireOutcomeJournalTests(LeaseCliTestCase):
+    def events(self) -> list[dict]:
+        path = self.store / "events.jsonl"
+        if not path.exists():
+            return []
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        return [row for row in rows if row.get("event") == "acquire_outcome"]
+
+    def test_grant_row_shape(self) -> None:
+        self.acquire("g1", 2, extra_args=("--class", "interactive",
+                                          "--interactive-share-cores", "8", "--label", "lbl",
+                                          "--repo", "o/r"))
+        (row,) = self.events()
+        self.assertEqual(row["outcome"], "granted")
+        self.assertEqual(row["lease_id"], "g1")
+        self.assertEqual(row["class"], "interactive")
+        self.assertEqual(row["kind"], "test")
+        self.assertEqual(row["owner"], "unittest")
+        self.assertEqual(row["label"], "lbl")
+        self.assertEqual(row["repo"], "o/r")
+        self.assertEqual((row["cores_requested"], row["cores_granted"]), (2, 2))
+        self.assertFalse(row["floor"])
+        for key in ("ts", "host", "priority", "wait_secs", "attempts"):
+            self.assertIn(key, row)
+
+    def test_denial_is_one_event_and_a_wait_timeout_is_one_event(self) -> None:
+        self.acquire("hog", 8)
+        denied = self.acquire("d1", 2, check=False)
+        self.assertEqual(denied.returncode, 75)
+        timed = self.acquire("d2", 2, check=False, extra_args=("--wait-secs", "3"))
+        self.assertEqual(timed.returncode, 75)
+        rows = [r for r in self.events() if r["lease_id"] != "hog"]
+        self.assertEqual([r["outcome"] for r in rows], ["denied", "timeout"])
+        self.assertEqual(rows[1]["attempts"], 2)
+        self.assertEqual(rows[1]["cores_granted"], 0)
+        self.assertEqual(rows[1]["reason"], "capacity_exceeded")
+
+    def test_waiter_loop_denials_are_not_outcomes_but_the_grant_is(self) -> None:
+        self.acquire("hog", 8)
+        self.acquire("w1", 2, check=False, extra_args=("--waiter-id", "lane"))
+        self.assertEqual([r["lease_id"] for r in self.events()], ["hog"])
+        self.run_cli("release", "--id", "hog", "--capacity", "8")
+        since = str(int(time.time()) - 90)
+        self.acquire("w1", 2, extra_args=("--waiter-id", "lane", "--demand-since", since))
+        row = self.events()[-1]
+        self.assertEqual(row["outcome"], "granted")
+        self.assertGreaterEqual(row["wait_secs"], 90)
+
+    def test_floor_grant_is_marked(self) -> None:
+        self.acquire("hog", 8)
+        self.acquire("f1", 4, extra_args=("--allow-floor", "--agent-floor-cores", "1",
+                                          "--agent-floor-pool-cores", "2"), check=False)
+        rows = [r for r in self.events() if r["lease_id"] == "f1"]
+        if rows and rows[0]["outcome"] == "granted":
+            self.assertTrue(rows[0]["floor"])
+
+    def test_results_identical_with_and_without_journaling(self) -> None:
+        def run(journal: bool) -> list[tuple[dict, int]]:
+            store = Path(self.tmp.name) / ("with" if journal else "without")
+            out = []
+            argv = [
+                ("a", "5"), ("b", "5"), ("c", "2"),
+            ]
+            for lease_id, cores in argv:
+                args = leases.parse_args([
+                    "acquire", "--id", lease_id, "--cores", cores, "--capacity", "8",
+                    "--capacity-mem-mb", "0", "--reserved-gate-cores", "0", "--kind", "test",
+                    "--pid", str(self.pid), "--store-dir", str(store)])
+                patch = (contextlib.nullcontext() if journal else
+                         mock.patch.object(leases, "journal_acquire_outcome"))
+                with patch:
+                    result, rc = leases.acquire_with_wait(args)
+                result.pop("reaped", None)
+                lease = result.get("lease") or {}
+                for key in ("created_at", "heartbeat_at", "process_start_time", "host_boot_time"):
+                    lease.pop(key, None)
+                out.append((result, rc))
+            return out
+
+        self.assertEqual(run(True), run(False))
+        self.assertTrue((Path(self.tmp.name) / "with" / "events.jsonl").exists())
+        self.assertFalse((Path(self.tmp.name) / "without" / "events.jsonl").exists())
+
+    def test_journal_failure_does_not_change_the_result(self) -> None:
+        with mock.patch.object(leases, "journal_lease_events", side_effect=RuntimeError("x")):
+            proc = self.acquire("ok", 1)
+        self.assertTrue(json.loads(proc.stdout)["ok"])
+
+    def test_concurrent_writers_at_the_rotation_boundary_lose_nothing(self) -> None:
+        import threading
+        self.store.mkdir(parents=True, exist_ok=True)
+        path = self.store / "events.jsonl"
+        path.write_text("x" * 2100 + "\n")
+        rotated = path.with_name("events.jsonl.1")
+        n = 6
+        with mock.patch.object(leases, "LEASE_EVENTS_MAX_BYTES", 2000):
+            threads = [threading.Thread(target=leases.journal_lease_events,
+                                        args=(self.store, [{"event": "w", "n": i}]))
+                       for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        lines = []
+        for f in (rotated, path):
+            if f.exists():
+                lines += f.read_text().splitlines()
+        seen = {json.loads(l)["n"] for l in lines if l.startswith("{")}
+        self.assertEqual(seen, set(range(n)))
+        # The pre-existing generation is retained, not replaced by a fresh file.
+        self.assertTrue(any(l.startswith("xxx") for l in rotated.read_text().splitlines()))
+
+    def test_rotation_and_append_wait_for_the_journal_lock(self) -> None:
+        import threading
+        self.store.mkdir(parents=True, exist_ok=True)
+        path = self.store / "events.jsonl"
+        writer = threading.Thread(target=leases.journal_lease_events,
+                                  args=(self.store, [{"event": "w", "n": 1}]))
+        with leases.journal_lock(self.store):
+            writer.start()
+            writer.join(0.5)
+            self.assertTrue(writer.is_alive(), "writer must block on the journal lock")
+            self.assertFalse(path.exists())
+        writer.join(5)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+
+
+class LeaseStatsTests(LeaseCliTestCase):
+    def write(self, rows: list[dict]) -> None:
+        self.store.mkdir(parents=True, exist_ok=True)
+        with (self.store / "events.jsonl").open("w") as handle:
+            for row in rows:
+                handle.write(json.dumps(row) + "\n")
+
+    def row(self, age_secs: int, **fields) -> dict:
+        ts = leases.iso(leases.utcnow() - __import__("datetime").timedelta(seconds=age_secs))
+        base = {"ts": ts, "event": "acquire_outcome", "class": "interactive", "kind": "build",
+                "outcome": "granted", "floor": False, "wait_secs": 0}
+        return {**base, **fields}
+
+    def test_aggregation(self) -> None:
+        self.write([
+            self.row(10, wait_secs=1),
+            self.row(10, wait_secs=3, floor=True),
+            self.row(10, wait_secs=5),
+            self.row(10, wait_secs=100, outcome="timeout"),
+            self.row(10, **{"class": "background"}, wait_secs=9),
+            self.row(7200, wait_secs=999),          # outside --since 1h
+            {"ts": "bad", "event": "acquire_outcome"},
+            {"ts": leases.iso(leases.utcnow()), "event": "reap"},
+        ])
+        body = json.loads(self.run_cli("stats", "--since", "1h", "--capacity", "8").stdout)
+        self.assertEqual(body["events"], 5)
+        groups = {(g["class"], g["kind"]): g for g in body["groups"]}
+        inter = groups[("interactive", "build")]
+        self.assertEqual((inter["count"], inter["granted"], inter["timeouts"]), (4, 3, 1))
+        self.assertAlmostEqual(inter["floor_share"], 1 / 3, places=2)
+        self.assertEqual(inter["wait_p50_secs"], 3)
+        self.assertEqual(inter["wait_p90_secs"], 100)
+        self.assertEqual(body["capacity"]["total_cores"], 8)
+
+    def test_dead_owner_lease_is_not_capacity_in_use(self) -> None:
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.acquire("live", 2)
+        records = json.loads((self.store / "leases.json").read_text())
+        rows = records["leases"] if isinstance(records, dict) else records
+        old = "2000-01-01T00:00:00Z"
+        rows.append({"id": "dead", "lease_size_cores": 5, "priority": 50,
+                     "priority_class": "build", "command_kind": "test", "owner": "x",
+                     "pid": dead.pid, "process_start_time": identity["process_start_time"],
+                     "host_boot_time": identity["host_boot_time"],
+                     "created_at": old, "heartbeat_at": old})
+        (self.store / "leases.json").write_text(
+            json.dumps({"leases": rows} if isinstance(records, dict) else rows))
+        body = json.loads(self.run_cli("stats", "--capacity", "8").stdout)
+        self.assertEqual(body["capacity"]["used_cores"], 2)
+
+    def test_text_output_and_since_parsing(self) -> None:
+        self.write([self.row(5, wait_secs=2)])
+        text = self.run_cli("stats", "--capacity", "8").stdout
+        self.assertIn("interactive", text)
+        self.assertEqual(leases.parse_since("90m"), 5400)
+        self.assertEqual(leases.parse_since("7d"), 604800)
+        with self.assertRaises(ValueError):
+            leases.parse_since("soon")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

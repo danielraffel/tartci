@@ -109,6 +109,12 @@ def parse_args(
     status = sub.add_parser("status", aliases=["list"], help="show active leases")
     add_common(status)
 
+    stats_parser = sub.add_parser(
+        "stats", help="acquire waits and grants from the journal, per class and kind"
+    )
+    add_common(stats_parser)
+    stats_parser.add_argument("--since", default="24h", help="window: 30m, 24h, 7d")
+
     reap_parser = sub.add_parser("reap", help="reclaim dead-owner leases and show status")
     add_common(reap_parser)
 

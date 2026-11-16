@@ -9,6 +9,7 @@ import datetime as dt
 import json
 import os
 import pathlib
+import socket
 import subprocess
 import sys
 import time
@@ -383,17 +384,37 @@ def journal_lease_events(store_dir: pathlib.Path, rows: list[dict[str, Any]]) ->
     caller = {"pid": os.getpid(), "ppid": os.getppid(), "argv": sys.argv[:6]}
     path = lease_events_file(store_dir)
     try:
-        if path.stat().st_size >= LEASE_EVENTS_MAX_BYTES:
-            path.replace(path.with_name(path.name + ".1"))
+        store_dir.mkdir(parents=True, exist_ok=True)
+        with journal_lock(store_dir):
+            try:
+                if path.stat().st_size >= LEASE_EVENTS_MAX_BYTES:
+                    path.replace(path.with_name(path.name + ".1"))
+            except OSError:
+                pass
+            with path.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps({"ts": iso(utcnow()), **row, "caller": caller},
+                                            sort_keys=True) + "\n")
     except OSError:
         pass
-    try:
-        with path.open("a", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps({"ts": iso(utcnow()), **row, "caller": caller},
-                                        sort_keys=True) + "\n")
-    except OSError:
-        pass
+
+
+@contextlib.contextmanager
+def journal_lock(store_dir: pathlib.Path) -> Iterator[None]:
+    """Serialize journal rotation and append across processes. Separate from
+    the store lock because acquire outcomes are journaled after it is released,
+    while reap rows are written under it; the order is always store, then
+    journal, so the two cannot deadlock. Without flock the journal stays
+    best effort."""
+    if fcntl is None:
+        yield
+        return
+    with (store_dir / "events.lock").open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def default_store_dir() -> pathlib.Path:
@@ -2510,23 +2531,174 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 WAIT_POLL_SECS = 2.0
 
 
+def acquire_outcome_row(
+    args: argparse.Namespace, result: dict[str, Any], rc: int, *, wait_secs: int, attempts: int
+) -> dict[str, Any]:
+    """One journal row for the final outcome of an acquire."""
+    lease = result.get("lease") if isinstance(result.get("lease"), dict) else {}
+    granted = rc == 0
+    if granted:
+        outcome = "granted"
+    elif int(getattr(args, "wait_secs", 0) or 0) > 0:
+        outcome = "timeout"
+    else:
+        outcome = "denied"
+    _, priority_class = parse_priority(args.priority)
+    return {
+        "event": "acquire_outcome",
+        "host": socket.gethostname(),
+        "lease_id": str(lease.get("id") or args.id or ""),
+        "kind": args.kind,
+        "class": getattr(args, "build_class", None) or "unclassified",
+        "priority": priority_class,
+        "owner": args.owner,
+        "label": args.label,
+        "repo": str(getattr(args, "repo", "") or ""),
+        "cores_requested": int(args.cores_requested),
+        "cores_granted": record_int(lease, "lease_size_cores") if granted else 0,
+        "floor": bool(result.get("floor")) if granted else False,
+        "outcome": outcome,
+        "reason": "" if granted else str(result.get("reason") or ""),
+        "wait_secs": wait_secs,
+        "attempts": attempts,
+    }
+
+
+def journal_acquire_outcome(
+    args: argparse.Namespace,
+    result: dict[str, Any],
+    rc: int,
+    *,
+    started: float,
+    attempts: int,
+) -> None:
+    """Record the outcome of an acquire, never a retry. Best effort: a journal
+    failure must not change the result the caller gets.
+
+    A denial with a --waiter-id and no --wait-secs is one pass of the caller's
+    own retry loop (the VM lanes); its outcome is the grant that ends the loop,
+    so only the grant is recorded. wait_secs starts at --demand-since when the
+    caller passed one, else at the first attempt."""
+    try:
+        if rc not in (0, 75):
+            return
+        wait_budget = int(getattr(args, "wait_secs", 0) or 0)
+        if rc == 75 and wait_budget == 0 and getattr(args, "waiter_id", ""):
+            return
+        now = time.time()
+        demand = int(getattr(args, "demand_since", 0) or 0)
+        began = float(demand) if 0 < demand <= now else started
+        wait_secs = max(0, int(now - began))
+        row = acquire_outcome_row(args, result, rc, wait_secs=wait_secs, attempts=attempts)
+        journal_lease_events(pathlib.Path(args.store_dir).expanduser(), [row])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def acquire_with_wait(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
     """`acquire`, retried locally until it is granted or --wait-secs elapses.
 
     Only a capacity-style denial (rc 75) is retried; the lock is released
     between attempts, so a waiting build never blocks a gate's acquire. No
-    remote call is made: the store is local.
+    remote call is made: the store is local. One outcome row is journaled per
+    call, whatever the number of retries.
     """
+    started = time.time()
     deadline = time.monotonic() + max(0, int(getattr(args, "wait_secs", 0) or 0))
     attempts = 0
     while True:
         attempts += 1
         result, rc = acquire(args)
         if rc != 75 or time.monotonic() + WAIT_POLL_SECS > deadline:
+            journal_acquire_outcome(args, result, rc, started=started, attempts=attempts)
             if attempts > 1:
                 result["wait_attempts"] = attempts
             return result, rc
         time.sleep(WAIT_POLL_SECS)
+
+
+STATS_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def parse_since(text: str) -> int:
+    """'30m', '24h', '7d' (or bare seconds) to seconds."""
+    raw = str(text).strip().lower()
+    unit = STATS_UNITS.get(raw[-1:] or "")
+    number = raw[:-1] if unit else raw
+    if not number.isdigit():
+        raise ValueError(f"--since takes 30m, 24h, 7d or seconds, not {text!r}")
+    return int(number) * (unit or 1)
+
+
+def percentile(values: list[int], pct: int) -> int:
+    """Nearest-rank percentile of a non-empty list."""
+    ordered = sorted(values)
+    rank = max(1, -(-len(ordered) * pct // 100))
+    return ordered[rank - 1]
+
+
+def read_acquire_outcomes(store_dir: pathlib.Path, since_epoch: float) -> list[dict[str, Any]]:
+    path = lease_events_file(store_dir)
+    rows: list[dict[str, Any]] = []
+    for source in (path.with_name(path.name + ".1"), path):
+        try:
+            lines = source.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                row = json.loads(line)
+                stamp = dt.datetime.fromisoformat(str(row["ts"]).replace("Z", "+00:00"))
+            except (ValueError, KeyError, TypeError):
+                continue
+            if row.get("event") == "acquire_outcome" and stamp.timestamp() >= since_epoch:
+                rows.append(row)
+    return rows
+
+
+def lease_stats(args: argparse.Namespace) -> dict[str, Any]:
+    store_dir = pathlib.Path(args.store_dir).expanduser()
+    since_secs = parse_since(getattr(args, "since", "24h"))
+    rows = read_acquire_outcomes(store_dir, time.time() - since_secs)
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault((str(row.get("class")), str(row.get("kind"))), []).append(row)
+    table = []
+    for (klass, kind), group in sorted(groups.items()):
+        waits = [int(row.get("wait_secs") or 0) for row in group]
+        granted = [row for row in group if row.get("outcome") == "granted"]
+        table.append({
+            "class": klass,
+            "kind": kind,
+            "count": len(group),
+            "granted": len(granted),
+            "floor_share": round(sum(1 for row in granted if row.get("floor")) / len(granted), 3)
+            if granted else 0.0,
+            "timeouts": sum(1 for row in group if row.get("outcome") == "timeout"),
+            "wait_p50_secs": percentile(waits, 50),
+            "wait_p90_secs": percentile(waits, 90),
+        })
+    # Same live-record view as status: a provably dead owner's lease is not
+    # capacity in use. Read only: nothing is written or journaled here.
+    cfg = capacity_config(args)
+    with locked_store(store_dir):
+        active, _, _ = reclaim(load_records(store_dir), int(args.stale_secs))
+    capacity = usage(active, cfg)
+    return {"since_secs": since_secs, "events": len(rows), "groups": table, "capacity": capacity}
+
+
+def print_stats(result: dict[str, Any]) -> None:
+    cap = result["capacity"]
+    print(
+        f"capacity used={cap.get('used_cores')}/{cap.get('total_cores')} "
+        f"since={result['since_secs']}s events={result['events']}"
+    )
+    print(f"{'class':<13}{'kind':<18}{'count':>6}{'granted':>8}{'floor%':>8}"
+          f"{'timeout':>8}{'p50s':>7}{'p90s':>7}")
+    for row in result["groups"]:
+        print(f"{row['class']:<13}{row['kind']:<18}{row['count']:>6}{row['granted']:>8}"
+              f"{row['floor_share'] * 100:>7.0f}%{row['timeouts']:>8}"
+              f"{row['wait_p50_secs']:>7}{row['wait_p90_secs']:>7}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2537,6 +2709,11 @@ def main(argv: list[str] | None = None) -> int:
             rc = 0 if not result["problems"] else 1
         elif args.command == "acquire":
             result, rc = acquire_with_wait(args)
+        elif args.command == "stats":
+            result, rc = lease_stats(args), 0
+            if not getattr(args, "json", False):
+                print_stats(result)
+                return 0
         elif args.command == "release":
             result, rc = release(args)
         elif args.command == "resize":

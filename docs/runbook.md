@@ -4977,3 +4977,17 @@ without it rustup checks for, and by default installs, a newer rustup on every
 naming the recorded value and the fix. A profile without `[rustup]` leaves the
 host's rustup as it is; undo the setting with `rustup set auto-self-update
 enable`.
+
+## Reading lease waits
+
+`tartci leases acquire` journals one `acquire_outcome` row per call to
+`<store>/events.jsonl` (granted, denied or timeout, with `wait_secs` from the
+first attempt, or from `--demand-since` when the caller passes it), not one
+row per 2-second retry. A VM lane that retries from its own loop with
+`--waiter-id` records only the grant that ends the loop. `tartci leases stats
+[--since 24h] [--json]` aggregates the rows per class and kind: count,
+granted, floor share, timeouts and p50/p90 wait, next to current capacity. A
+high floor share or a p90 that climbs while capacity sits full means the caps
+are too tight for the demand; a p90 near zero with idle capacity means agents
+get cores at once. The journal keeps one previous generation (about 8 MB), so
+`--since` beyond a few days may be truncated on a busy host.
