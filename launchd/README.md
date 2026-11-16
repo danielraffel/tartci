@@ -244,7 +244,18 @@ watchdog refuses both alive-but-frozen and crash-loop recovery when inventory is
 unavailable, so this diagnostic distinction does not weaken the long-build
 guard. That refusal is only as good as the rendered `TART_HOME`: a LaunchAgent
 inherits no login shell, so an agent installed without it reads Tart's default
-store, reports an empty inventory, and reads every long build as an idle host. Do not put relay hostnames,
+store, reports an empty inventory, and reads every long build as an idle host.
+An empty inventory therefore reads as unavailable, not idle: a real Tart store
+always lists its base images. When it is empty while live `tart-macos-vm`
+leases exist, the pass logs one `inventory-mismatch: TART_HOME=<path>` line.
+Independently of the inventory, every unattended heal first asks the lane
+itself (`lane_busy`: a `tart run` or `tart clone` descendant, a held VM lease,
+or a busy heartbeat) and reads the lane's `events.jsonl` for a `job_assigned`
+with no later teardown, signal, terminal receipt or new cycle. A busy or
+unknown answer logs `heal-deferred: mid-job (<evidence>)` and does not count
+toward the heal rate limit. A stale-boot heal skips the `lane_busy` question,
+because that verdict already proves the lane has no run or job identity.
+Do not put relay hostnames,
 GitHub tokens, or proxy variables in shell startup files; the profile records
 only non-secret per-host intent, and `ghapp` supplies short-lived App auth.
 While pool participation is off, reconciliation loads and proves only the
