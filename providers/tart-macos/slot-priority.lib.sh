@@ -159,6 +159,28 @@ tartci_slot_priority_lease_wait(){
   tartci_slot_priority_withdraw
 }
 
+# Short-job-first (`[[lane]] short_jobs`): a claim the rule gave this lane logs
+# `short_job_first_granted`; in shadow, a slot the rule would have given it logs
+# `short_job_first_shadow` ("would-boot-short-first"). Only the short lane logs,
+# once per decision, so the monitor counts each boot once. The fields name the
+# short job, so a later read can check whether the VM it booted ran that job:
+# GitHub, not tartci, picks which matching job a new runner gets.
+tartci_slot_priority_short_event(){
+  local line="$1" labels="$2" sp_fields=()
+  read -r -a sp_fields <<< "${line#* }"
+  case " $line " in
+    *" short_first=boosted "*)
+      event short_job_first_granted "short job $(tartci_slot_priority_token short_job "$line") takes the free slot ahead of $(tartci_slot_priority_token short_passed "$line"): ${line#* }" \
+        ${sp_fields[@]+"${sp_fields[@]}"} labels="$labels"
+      ;;
+    *" short_first=would_boot "*)
+      event short_job_first_shadow "would-boot-short-first: short job $(tartci_slot_priority_token short_job "$line") would take the free slot ahead of $(tartci_slot_priority_token short_passed "$line"): ${line#* }" \
+        ${sp_fields[@]+"${sp_fields[@]}"} labels="$labels"
+      ;;
+  esac
+  return 0
+}
+
 # tartci_slot_priority_gate <cap> <running> <selected_labels> <selected_tier>
 # Returns 0 to claim (first-come, ranked first, shadow, or any failure) and 75
 # when, in mode `on`, a lane ranked ahead can take the free slot. With every
@@ -186,6 +208,7 @@ tartci_slot_priority_gate(){
   read -r -a sp_fields <<< "${line#* }"
   case "$verdict" in
     defer)
+      tartci_slot_priority_short_event "$line" "$labels"
       now="$(date +%s)"
       [ "$SLOT_PRIORITY_DEFER_SINCE" -gt 0 ] || SLOT_PRIORITY_DEFER_SINCE="$now"
       if [ $((now - SLOT_PRIORITY_DEFER_SINCE)) -ge "$TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS" ]; then
@@ -207,6 +230,7 @@ tartci_slot_priority_gate(){
             ${sp_fields[@]+"${sp_fields[@]}"} labels="$labels"
           ;;
       esac
+      tartci_slot_priority_short_event "$line" "$labels"
       return 0
       ;;
     *)

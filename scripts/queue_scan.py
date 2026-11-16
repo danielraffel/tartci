@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from bounded_subprocess import run_bounded
-from slot_demand import DemandDetail
+from slot_demand import DemandDetail, parse_short_jobs
 from observation_lock import FairObservationLock, ObservationBackoff, ObservationTimeout, timed_out
 from gh_identity import (
     NO_VALID_CREDENTIALS,
@@ -726,7 +726,7 @@ class QueueScanner:
 
         last_backlog_id: int | None = None
         matches = 0
-        detail = DemandDetail()
+        detail = DemandDetail(short_jobs=parse_short_jobs(getattr(self.args, "short_jobs", "")))
         matched_job_ids: set[int] = set()
         backlog_id_set = set(backlog_ids)
         for run in candidates:
@@ -895,6 +895,12 @@ def parse_args() -> argparse.Namespace:
         "--detail-file",
         help="also write the matched jobs' event classes and oldest created_at here "
         "(scripts/slot_demand.py); makes no extra API call",
+    )
+    parser.add_argument(
+        "--short-jobs",
+        default=os.environ.get("TARTCI_SHORT_JOBS", ""),
+        help="`workflow|job` lines naming the lane's short jobs; the detail file "
+        "then counts them per class (slot priority's short-job-first rule)",
     )
     parser.add_argument("--min-age-seconds", type=int, default=0)
     parser.add_argument("--match-labels", type=int, choices=(0, 1), default=1)
