@@ -188,6 +188,10 @@ class AgentHealth(NamedTuple):
     # reported, and --status exits non-zero on it.
     verdict: str               # "healthy" | "attention" | "wedged" | "broken" | "unknown"
     reason: str
+    # Which wedge signature fired. "stale-boot" proves the lane has no run or
+    # job identity yet, so the heal gate does not ask lane_busy (whose lease
+    # and boot-phase evidence would defer that recovery forever).
+    signature: str = ""
 
 
 class TartVMProbe(NamedTuple):
@@ -195,6 +199,9 @@ class TartVMProbe(NamedTuple):
     reason: str
     executable: str | None
     tart_home: str | None
+    # The inventory read cleanly and listed nothing. A real Tart store always
+    # lists its base images, so this reads as unknown, never as idle.
+    empty: bool = False
 
 
 class StaleBootProbe(NamedTuple):
@@ -703,6 +710,20 @@ def probe_tart_vm_running() -> TartVMProbe:
                 tart_cli,
                 tart_home,
             )
+        if not inventory:
+            # A Tart store holds the base images every lane clones from, so a
+            # clean but empty list means this process is looking at the wrong
+            # store (a stale TART_HOME in the watchdog plist did exactly this on
+            # m5s), not that the host is idle. Idle would authorize a heal.
+            return TartVMProbe(
+                None,
+                f"Tart VM inventory is empty in {tart_home}; a Tart store always "
+                "lists its base images, so this is the wrong store (check "
+                "TART_HOME), not an idle host",
+                tart_cli,
+                tart_home,
+                True,
+            )
         running = any(
             str(vm.get("State", vm.get("state", ""))).lower().startswith("run")
             for vm in inventory
@@ -843,7 +864,7 @@ def gather_health(label: str, plist_path: str, stale_log_s: int,
         if boot_probe.stale:
             return AgentHealth(
                 label, plist_path, log_path, state, last_exit, log_age, "wedged",
-                f"{boot_probe.reason}; no Tart VM is running",
+                f"{boot_probe.reason}; no Tart VM is running", "stale-boot",
             )
         if boot_probe.stale is None:
             return AgentHealth(
@@ -1006,6 +1027,133 @@ def mid_job_refusal(label: str, launch_agents_dir: str | None = None) -> str | N
         return (f"lane {label} busy state is unknown ({row.detail}); refusing "
                 "rather than risk killing a running job")
     return None
+
+
+# A job_assigned event this old with no closing event is not trusted as a job in
+# flight: GitHub's default job timeout is 6 hours, and a lane that lost its
+# closing event must still be recoverable eventually. lane_busy still sees a
+# live `tart run` or VM lease past this age.
+JOB_ASSIGNMENT_MAX_AGE_S = 6 * 3600
+# Events that end the lane's current job: its teardown, the supervisor being
+# signalled, a terminal receipt, or the next cycle starting.
+JOB_CLOSING_EVENTS = frozenset({
+    "teardown", "supervisor_signal", "job_terminal_receipt", "lease_acquired",
+    "clone_start",
+})
+EVENTS_TAIL_BYTES = 512 * 1024
+
+
+def _event_ts(value: Any) -> float | None:
+    try:
+        return dt.datetime.strptime(str(value), "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
+def open_job_assignment(events_path: str, now: float | None = None) -> str | None:
+    """Evidence that the lane's event log shows a job still assigned, or None.
+
+    Reads only the tail of events.jsonl and skips lines that are not JSON (the
+    log also carries plain diagnostic lines). Raises OSError when the log
+    exists but cannot be read, so the caller defers rather than heals.
+    """
+    try:
+        fh = open(events_path, "rb")
+    except FileNotFoundError:
+        return None  # only a genuinely absent log is "no evidence"
+    with fh:
+        fh.seek(0, os.SEEK_END)
+        size = fh.tell()
+        start = max(0, size - EVENTS_TAIL_BYTES)
+        # Drop the first line only when the window starts mid-record: the
+        # byte before the window is not a newline.
+        cut = False
+        if start > 0:
+            fh.seek(start - 1)
+            cut = fh.read(1) != b"\n"
+        fh.seek(start)
+        tail = fh.read().decode("utf-8", errors="replace")
+    lines = tail.splitlines()
+    if cut and lines:
+        lines = lines[1:]  # the first line is cut
+    assigned: tuple[float, dict[str, Any]] | None = None
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        event = row.get("event")
+        if event == "job_assigned":
+            ts = _event_ts(row.get("ts"))
+            if ts is not None:
+                assigned = (ts, row)
+        elif event in JOB_CLOSING_EVENTS:
+            assigned = None
+    if assigned is None:
+        return None
+    ts, row = assigned
+    age = (utcnow() if now is None else now) - ts
+    if age > JOB_ASSIGNMENT_MAX_AGE_S:
+        return None
+    return (f"job_assigned {int(max(0.0, age))}s ago with no teardown "
+            f"(vm {row.get('vm') or '-'}: {str(row.get('detail') or '')[:120]})")
+
+
+def heal_deferral(health: AgentHealth, launch_agents_dir: str | None = None) -> str | None:
+    """Why an unattended heal of this wedged lane must wait, or None to heal.
+
+    A heal is a bootout, which kills any job the lane is running. The verdict
+    alone cannot prove the lane idle: a long job writes nothing to the lane log,
+    and a wrong TART_HOME makes the VM inventory read idle. So ask the lane
+    itself, and defer on busy, on unknown, and on any error.
+    """
+    try:
+        declared = _runner_state_from_plist(health.plist)
+        if declared is not None:
+            evidence = open_job_assignment(os.path.join(declared[0], "events.jsonl"))
+            if evidence is not None:
+                return evidence
+        if health.signature == "stale-boot":
+            return None
+        return mid_job_refusal(health.label, launch_agents_dir)
+    except Exception as exc:  # noqa: BLE001 - an unreadable lane is not an idle lane
+        return f"busy check failed: {exc}"
+
+
+def inventory_mismatch(vm_probe: TartVMProbe,
+                       leases: list[dict[str, Any]] | None = None) -> str | None:
+    """One line naming the store when Tart lists nothing but live macOS VM
+    leases exist, so a wrong TART_HOME is visible in the watchdog log."""
+    if not vm_probe.empty:
+        return None
+    try:
+        if leases is None:
+            import lane_busy  # noqa: PLC0415 - sibling module
+            leases = lane_busy.lease_records()
+        live = []
+        for row in leases or []:
+            pid = row.get("pid")
+            if row.get("command_kind") != "tart-macos-vm" or not isinstance(pid, int):
+                continue
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except PermissionError:
+                pass
+            live.append(row)
+    except Exception:  # noqa: BLE001 - a report line must never stop the pass
+        return None
+    if not live:
+        return None
+    names = ", ".join(str(r.get("vm_name") or r.get("id") or "-") for r in live[:4])
+    return (f"inventory-mismatch: TART_HOME={vm_probe.tart_home} lists no VMs but "
+            f"{len(live)} live tart-macos-vm lease(s) exist ({names})")
 
 
 def reload_command(label: str, launch_agents_dir: str, *, dry_run: bool,
@@ -2082,6 +2230,9 @@ def main(argv: list[str] | None = None) -> int:
     # is proven. A Tart inventory call can itself block on a wedged external
     # volume; never let it outrun the bounded storage gate.
     vm_probe = probe_tart_vm_running_after_storage(store_health_result)
+    mismatch_line = inventory_mismatch(vm_probe)
+    if mismatch_line and not args.json:
+        print(f"{_iso(utcnow())} launchd-watchdog: {mismatch_line}")
     disabled = disabled_services()
     health = [
         gather_health(lbl, p, args.stale_log_seconds, vm_probe.running, participating,
@@ -2105,7 +2256,12 @@ def main(argv: list[str] | None = None) -> int:
         }
         if h.verdict == "wedged" and not args.status:
             stamps = heal_log.get(h.label, [])
-            if should_heal(stamps, now, args.heal_window_seconds, args.max_heals):
+            deferral = heal_deferral(h, args.launch_agents_dir)
+            if deferral is not None:
+                # Not a heal: no stamp, so it never counts toward the rate limit.
+                entry["action"] = "heal-deferred"
+                entry["reason"] += f"; heal-deferred: mid-job ({deferral})"
+            elif should_heal(stamps, now, args.heal_window_seconds, args.max_heals):
                 ok = reload_agent(h.label, h.plist, dry_run=args.dry_run)
                 entry["action"] = "would-heal" if args.dry_run else (
                     "healed" if ok else "heal-failed")
@@ -2231,6 +2387,7 @@ def main(argv: list[str] | None = None) -> int:
                 "reason": vm_probe.reason,
                 "executable": vm_probe.executable,
                 "tart_home": vm_probe.tart_home,
+                "inventory_mismatch": mismatch_line,
             },
             "store_health": store_health_result,
             "agents": results,

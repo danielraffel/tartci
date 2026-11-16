@@ -250,7 +250,8 @@ with tempfile.TemporaryDirectory() as td:
     tart_home = Path(td) / "VMs"
     tart_home.mkdir()
     fake_tart = Path(td) / "tart"
-    fake_tart.write_text("#!/bin/sh\nprintf '[]\\n'\n")
+    fake_tart.write_text(
+        "#!/bin/sh\nprintf '[{\"Name\": \"base:latest\", \"State\": \"stopped\"}]\\n'\n")
     fake_tart.chmod(0o755)
     with mock.patch.dict(
         os.environ,
@@ -262,10 +263,32 @@ with tempfile.TemporaryDirectory() as td:
     ):
         probe = wd.probe_tart_vm_running()
     check(probe.running is False, f"explicit Tart under minimal PATH must prove idle: {probe}")
+    check(not probe.empty, f"a store listing its base image is not empty: {probe}")
     check(probe.executable == str(fake_tart),
           f"probe must report the explicit executable it ran: {probe}")
     check(probe.tart_home == str(tart_home),
           f"probe must report the exact Tart store it inspected: {probe}")
+
+# An empty inventory is a wrong store, not an idle host. A stale TART_HOME in
+# the watchdog plist read `[]` on m5s and authorized heals that killed jobs.
+with tempfile.TemporaryDirectory() as td:
+    tart_home = Path(td) / "VMs"
+    tart_home.mkdir()
+    fake_tart = Path(td) / "tart"
+    fake_tart.write_text("#!/bin/sh\nprintf '[]\\n'\n")
+    fake_tart.chmod(0o755)
+    with mock.patch.dict(
+        os.environ,
+        {"PATH": "/usr/bin:/bin", "TARTCI_TART_CLI": str(fake_tart),
+         "TART_HOME": str(tart_home)},
+    ):
+        probe = wd.probe_tart_vm_running()
+    check(probe.running is None, f"an empty Tart inventory must be unknown, not idle: {probe}")
+    check(probe.empty, f"an empty Tart inventory must say so: {probe}")
+    check("TART_HOME" in probe.reason, f"empty inventory must name TART_HOME: {probe.reason}")
+    v, _ = wd.classify("running", 0, log_age_s=STALE + 100, stale_log_s=STALE,
+                       vm_running=probe.running, vm_probe_reason=probe.reason)
+    check(v == "unknown", f"stale log + empty inventory must never be wedged, got {v}")
 
 # A wedged Tart store must become an unavailable probe, not hang the watchdog.
 with tempfile.TemporaryDirectory() as td:

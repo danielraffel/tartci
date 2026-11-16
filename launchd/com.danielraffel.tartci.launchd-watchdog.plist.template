@@ -15,8 +15,9 @@
   mid-build supervisor (a VM is running), and a deliberately-stopped agent (not
   loaded) are all left alone. Both signatures are gated on the Tart inventory
   because healing is a bootout, which SIGTERMs a supervisor under a live job and
-  takes its guest with it; an inventory that cannot be read refuses to heal
-  rather than guessing.
+  takes its guest with it; an inventory that cannot be read, or that reads
+  empty, refuses to heal rather than guessing. Every heal also asks the lane
+  itself (lane_busy and its events.jsonl) and defers while a job is in flight.
   It also reconciles durable pool intent: missing runner jobs are reloaded when
   participation is ON and remain stopped when participation is OFF. A loaded,
   pool-enabled supervisor that exits EX_TEMPFAIL for its documented App-auth
