@@ -37,6 +37,10 @@ SLOT_PRIORITY_DEFER_SINCE=0
 SLOT_PRIORITY_HAS_INTENT=0
 SLOT_PRIORITY_LAST_LABELS=""
 SLOT_PRIORITY_LAST_TIER=0
+# The short job behind this lane's latest short-job-first event, as
+# `<epoch> <short_first> <job_id> <run_id> <name>`, until the next VM this lane
+# boots is handed a job (tartci_slot_priority_short_outcome).
+SLOT_PRIORITY_SHORT_PENDING=""
 _tartci_slot_priority_mode=""
 case "${TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS:-300}" in
   ''|*[!0-9]*) TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS=300 ;;
@@ -169,6 +173,11 @@ tartci_slot_priority_short_event(){
   local line="$1" labels="$2" sp_fields=()
   read -r -a sp_fields <<< "${line#* }"
   case " $line " in
+    *" short_first=boosted "*|*" short_first=would_boot "*)
+      SLOT_PRIORITY_SHORT_PENDING="$(date +%s) $(tartci_slot_priority_token short_first "$line") $(tartci_slot_priority_token short_job_id "$line") $(tartci_slot_priority_token short_run_id "$line") $(tartci_slot_priority_token short_job "$line")"
+      ;;
+  esac
+  case " $line " in
     *" short_first=boosted "*)
       event short_job_first_granted "short job $(tartci_slot_priority_token short_job "$line") takes the free slot ahead of $(tartci_slot_priority_token short_passed "$line"): ${line#* }" \
         ${sp_fields[@]+"${sp_fields[@]}"} labels="$labels"
@@ -178,6 +187,31 @@ tartci_slot_priority_short_event(){
         ${sp_fields[@]+"${sp_fields[@]}"} labels="$labels"
       ;;
   esac
+  return 0
+}
+
+# tartci_slot_priority_short_outcome <run_id> <job_id> [no_job]
+# Once the next VM this lane boots after a short-job-first event is handed a
+# job, log `short_job_first_outcome`: the short job that was the reason, the job
+# the VM actually ran, and whether they are the same (served_short=yes|no, or
+# unknown when the assignment was not captured, no_job when the boot ran none:
+# the loop calls it after every run_one, a no-op once logged). In shadow this measures how
+# often a boost would have served a long job that shares the short job's label.
+tartci_slot_priority_short_outcome(){
+  local ran_run="${1:-}" ran_job="${2:-}" at mode job run name served=unknown
+  [ -n "$SLOT_PRIORITY_SHORT_PENDING" ] || return 0
+  read -r at mode job run name <<< "$SLOT_PRIORITY_SHORT_PENDING"
+  SLOT_PRIORITY_SHORT_PENDING=""
+  if [ "${3:-}" = no_job ]; then
+    served=no_job
+  elif [ -n "$ran_job" ] && [ "$job" != unknown ]; then
+    if [ "$ran_job" = "$job" ]; then served=yes; else served=no; fi
+  fi
+  event short_job_first_outcome \
+    "after $mode for short job ${name:-unknown} ($job), the VM ran job ${ran_job:-unknown}: served_short=$served" \
+    short_first="$mode" short_job="${name:-unknown}" short_job_id="$job" short_run_id="$run" \
+    ran_job_id="${ran_job:-unknown}" ran_run_id="${ran_run:-unknown}" served_short="$served" \
+    since_event_secs="$(( $(date +%s) - ${at:-0} ))"
   return 0
 }
 

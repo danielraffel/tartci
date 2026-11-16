@@ -2495,6 +2495,10 @@ run_runner_until_done_unlayered(){
       done
       CURRENT_SERVED=1
       event job_assigned "$(grep 'Running job:' "$runner_log" | tail -1)"
+      # Slot priority's short-job-first: did this VM run the short job it was for?
+      if declare -F tartci_slot_priority_short_outcome >/dev/null; then
+        tartci_slot_priority_short_outcome "${CURRENT_RUN_ID:-}" "${CURRENT_JOB_ID:-}"
+      fi
       # The queued job this claim stood for is gone from the queue now.
       tartci_job_claim_release
       heartbeat job-running
@@ -3799,6 +3803,10 @@ if [ "$LOOP" = 1 ]; then
       # shellcheck disable=SC2034 # read by tartci_vm_dhcp_cancel (vm-dhcp.lib.sh)
       VM_DHCP_PROBE_BLOCKED_BY=""
       run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?
+      # A boot that a short-job-first event stood for and that ran no job.
+      if declare -F tartci_slot_priority_short_outcome >/dev/null; then
+        tartci_slot_priority_short_outcome "" "" no_job
+      fi
       # Release per-turn ownership proofs immediately after run_one, before
       # the serving accounting grows. This keeps every early-return proof
       # within the loop's bounded post-run window.

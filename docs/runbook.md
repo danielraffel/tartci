@@ -3624,8 +3624,11 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   ("would-boot-short-first") when the rule would have given it a slot; `on`
   logs `short_job_first_granted`. Both name the short job's id and run id.
   GitHub, not tartci, picks which matching job the booted runner takes, so a
-  boost can serve a long job that shares the short job's label; join the
-  event to what the VM ran before reading a wait change as the rule's.
+  boost can serve a long job that shares the short job's label: the lane's
+  next boot after either event logs `short_job_first_outcome` with the job the
+  VM ran and `served_short=yes|no|no_job|unknown`. Keep the vellum-gate lanes
+  in shadow until sterile-consumer runs on a runner label of its own that
+  only boosted runners carry; until then `on` can hand a long GPU job the slot.
   Rollback: set `short_job_first = "off"` (or delete the line to return to
   shadow), re-render, restart the lanes at an idle boundary.
 - **Fair share between repositories (opt-in, default off)**: `[leases]

@@ -290,6 +290,51 @@ class ShadowTests(ShortFirstBase):
         self.assertTrue(rows[1].startswith("short_job_first_granted|"), rows[1])
 
 
+    def test_the_outcome_names_the_job_the_vm_ran(self) -> None:
+        line = ("defer mode=on reason=outranked class=merge_group rank=0 free=1 ahead=1 "
+                "short_first=would_boot short_job=sterile-consumer short_job_id=7 "
+                "short_run_id=9 short_queued_at=x short_passed=pulp-gate")
+        script = (
+            "set -euo pipefail\n"
+            f"source {LIB}\n"
+            'event(){ [ "$1" = short_job_first_outcome ] && printf "%s\\n" "$*"; return 0; }\n'
+            # The boot after the event ran the short job.
+            'tartci_slot_priority_short_event "$1" labels\n'
+            'tartci_slot_priority_short_outcome 9 7\n'
+            # Logged once: the loop's call after run_one is then a no-op.
+            'tartci_slot_priority_short_outcome "" "" no_job\n'
+            # The boot ran a long job that shares the label.
+            'tartci_slot_priority_short_event "$1" labels\n'
+            'tartci_slot_priority_short_outcome 8 3\n'
+            # The boot ran no job at all.
+            'tartci_slot_priority_short_event "$1" labels\n'
+            'tartci_slot_priority_short_outcome "" "" no_job\n'
+            # With no short-job event pending nothing is logged.
+            'tartci_slot_priority_short_outcome 8 3\n'
+        )
+        proc = subprocess.run([BASH32, "-c", script, "x", line], text=True,
+                              capture_output=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        rows = proc.stdout.splitlines()
+        self.assertEqual(len(rows), 3, rows)
+        self.assertIn("served_short=yes", rows[0])
+        self.assertIn("ran_job_id=7", rows[0])
+        self.assertIn("short_first=would_boot", rows[0])
+        self.assertIn("served_short=no ", rows[1] + " ")
+        self.assertIn("ran_job_id=3", rows[1])
+        self.assertIn("ran_run_id=8", rows[1])
+        self.assertIn("served_short=no_job", rows[2])
+
+    def test_the_runner_reports_the_outcome_after_assignment_and_after_each_boot(self) -> None:
+        body = (ROOT / "providers/tart-macos/runner.sh").read_text()
+        assigned = body.index('event job_assigned "$(grep')
+        self.assertIn('tartci_slot_priority_short_outcome "${CURRENT_RUN_ID:-}" '
+                      '"${CURRENT_JOB_ID:-}"', body[assigned:assigned + 400])
+        boot = body.index('run_one "$i" "$selected_labels" "$selected_tier" || run_rc=$?')
+        self.assertIn('tartci_slot_priority_short_outcome "" "" no_job',
+                      body[boot:boot + 300])
+
+
 class DetailTests(unittest.TestCase):
     def test_parse_short_jobs(self) -> None:
         self.assertEqual(slot_demand.parse_short_jobs(STERILE + "\n|lint\n\nbare\n|\n"),
