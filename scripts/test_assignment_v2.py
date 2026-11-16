@@ -2332,6 +2332,16 @@ class StaleDemandTests(RunnerFixture, unittest.TestCase):
         self.assertEqual(entry["reason"], "queue_branch_absent_and_no_queued_job")
         self.assertIn("assignment_stale_demand", self._events())
 
+    def test_ghost_is_logged_once_across_repeated_passes(self) -> None:
+        self._state(ghost=True, ghost_ref="absent")
+        for _ in range(3):
+            result = self._runner("--print-selection")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip().split("\t")[0], "0", result.stdout)
+        self.assertIn("103", self._quarantine())
+        self.assertEqual(self._events().count("assignment_stale_demand"), 1,
+                         self._events())
+
     def test_live_merge_group_run_is_counted_and_never_quarantined(self) -> None:
         # THE CONTROL for every exclusion above. A classifier that quarantined
         # everything would satisfy the ghost tests perfectly and silently
@@ -3488,6 +3498,40 @@ class StaleDemandConjunctionTests(unittest.TestCase):
             )
             run = dict(self._ghost(), event="pull_request")
             self.assertFalse(classifier.classify(run, 0))
+
+
+class StaleDemandReportOnceTests(StaleDemandConjunctionTests):
+    """A quarantined phantom is excluded every pass but reported once."""
+
+    def _evidence_kinds(self, classifier):
+        return [record["evidence"] for record in classifier.evidence]
+
+    def test_phantom_is_excluded_then_not_reported_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            quarantine = Path(directory) / "stale-demand-quarantine.json"
+            first = self._classifier(False, quarantine)
+            self.assertTrue(first.classify(self._ghost(), 0))
+            first.persist()
+            self.assertEqual(self._evidence_kinds(first), ["excluded"])
+            for _ in range(3):
+                later = self._classifier(False, quarantine)
+                self.assertTrue(later.remembered(self._ghost()))
+                self.assertEqual(self._evidence_kinds(later), [])
+
+    def test_unreported_record_is_reported_once_then_silent(self) -> None:
+        # A record written before this behaviour has no reported_at.
+        with tempfile.TemporaryDirectory() as directory:
+            quarantine = Path(directory) / "stale-demand-quarantine.json"
+            quarantine.write_text(json.dumps({"runs": {"103": {
+                "quarantined_at": __import__("time").time(),
+                "reason": "queue_branch_absent_and_no_queued_job"}}}))
+            first = self._classifier(False, quarantine)
+            self.assertTrue(first.remembered(self._ghost()))
+            self.assertEqual(self._evidence_kinds(first), ["quarantine_hit"])
+            first.persist()
+            second = self._classifier(False, quarantine)
+            self.assertTrue(second.remembered(self._ghost()))
+            self.assertEqual(self._evidence_kinds(second), [])
 
 
 # Every test class must be defined before the runner starts, so this stays the
