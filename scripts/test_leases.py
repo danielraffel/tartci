@@ -1887,7 +1887,8 @@ class AcquireOutcomeJournalTests(LeaseCliTestCase):
         return [row for row in rows if row.get("event") == "acquire_outcome"]
 
     def test_grant_row_shape(self) -> None:
-        self.acquire("g1", 2, extra_args=("--class", "interactive", "--label", "lbl",
+        self.acquire("g1", 2, extra_args=("--class", "interactive",
+                                          "--interactive-share-cores", "8", "--label", "lbl",
                                           "--repo", "o/r"))
         (row,) = self.events()
         self.assertEqual(row["outcome"], "granted")
@@ -1965,6 +1966,44 @@ class AcquireOutcomeJournalTests(LeaseCliTestCase):
             proc = self.acquire("ok", 1)
         self.assertTrue(json.loads(proc.stdout)["ok"])
 
+    def test_concurrent_writers_at_the_rotation_boundary_lose_nothing(self) -> None:
+        import threading
+        self.store.mkdir(parents=True, exist_ok=True)
+        path = self.store / "events.jsonl"
+        path.write_text("x" * 2100 + "\n")
+        rotated = path.with_name("events.jsonl.1")
+        n = 6
+        with mock.patch.object(leases, "LEASE_EVENTS_MAX_BYTES", 2000):
+            threads = [threading.Thread(target=leases.journal_lease_events,
+                                        args=(self.store, [{"event": "w", "n": i}]))
+                       for i in range(n)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        lines = []
+        for f in (rotated, path):
+            if f.exists():
+                lines += f.read_text().splitlines()
+        seen = {json.loads(l)["n"] for l in lines if l.startswith("{")}
+        self.assertEqual(seen, set(range(n)))
+        # The pre-existing generation is retained, not replaced by a fresh file.
+        self.assertTrue(any(l.startswith("xxx") for l in rotated.read_text().splitlines()))
+
+    def test_rotation_and_append_wait_for_the_journal_lock(self) -> None:
+        import threading
+        self.store.mkdir(parents=True, exist_ok=True)
+        path = self.store / "events.jsonl"
+        writer = threading.Thread(target=leases.journal_lease_events,
+                                  args=(self.store, [{"event": "w", "n": 1}]))
+        with leases.journal_lock(self.store):
+            writer.start()
+            writer.join(0.5)
+            self.assertTrue(writer.is_alive(), "writer must block on the journal lock")
+            self.assertFalse(path.exists())
+        writer.join(5)
+        self.assertEqual(len(path.read_text().splitlines()), 1)
+
 
 class LeaseStatsTests(LeaseCliTestCase):
     def write(self, rows: list[dict]) -> None:
@@ -1999,6 +2038,24 @@ class LeaseStatsTests(LeaseCliTestCase):
         self.assertEqual(inter["wait_p50_secs"], 3)
         self.assertEqual(inter["wait_p90_secs"], 100)
         self.assertEqual(body["capacity"]["total_cores"], 8)
+
+    def test_dead_owner_lease_is_not_capacity_in_use(self) -> None:
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait(timeout=5)
+        identity = leases.process_identity(self.pid)
+        self.acquire("live", 2)
+        records = json.loads((self.store / "leases.json").read_text())
+        rows = records["leases"] if isinstance(records, dict) else records
+        old = "2000-01-01T00:00:00Z"
+        rows.append({"id": "dead", "lease_size_cores": 5, "priority": 50,
+                     "priority_class": "build", "command_kind": "test", "owner": "x",
+                     "pid": dead.pid, "process_start_time": identity["process_start_time"],
+                     "host_boot_time": identity["host_boot_time"],
+                     "created_at": old, "heartbeat_at": old})
+        (self.store / "leases.json").write_text(
+            json.dumps({"leases": rows} if isinstance(records, dict) else rows))
+        body = json.loads(self.run_cli("stats", "--capacity", "8").stdout)
+        self.assertEqual(body["capacity"]["used_cores"], 2)
 
     def test_text_output_and_since_parsing(self) -> None:
         self.write([self.row(5, wait_secs=2)])

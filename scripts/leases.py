@@ -384,17 +384,37 @@ def journal_lease_events(store_dir: pathlib.Path, rows: list[dict[str, Any]]) ->
     caller = {"pid": os.getpid(), "ppid": os.getppid(), "argv": sys.argv[:6]}
     path = lease_events_file(store_dir)
     try:
-        if path.stat().st_size >= LEASE_EVENTS_MAX_BYTES:
-            path.replace(path.with_name(path.name + ".1"))
+        store_dir.mkdir(parents=True, exist_ok=True)
+        with journal_lock(store_dir):
+            try:
+                if path.stat().st_size >= LEASE_EVENTS_MAX_BYTES:
+                    path.replace(path.with_name(path.name + ".1"))
+            except OSError:
+                pass
+            with path.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps({"ts": iso(utcnow()), **row, "caller": caller},
+                                            sort_keys=True) + "\n")
     except OSError:
         pass
-    try:
-        with path.open("a", encoding="utf-8") as handle:
-            for row in rows:
-                handle.write(json.dumps({"ts": iso(utcnow()), **row, "caller": caller},
-                                        sort_keys=True) + "\n")
-    except OSError:
-        pass
+
+
+@contextlib.contextmanager
+def journal_lock(store_dir: pathlib.Path) -> Iterator[None]:
+    """Serialize journal rotation and append across processes. Separate from
+    the store lock because acquire outcomes are journaled after it is released,
+    while reap rows are written under it; the order is always store, then
+    journal, so the two cannot deadlock. Without flock the journal stays
+    best effort."""
+    if fcntl is None:
+        yield
+        return
+    with (store_dir / "events.lock").open("a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def default_store_dir() -> pathlib.Path:
@@ -2658,7 +2678,12 @@ def lease_stats(args: argparse.Namespace) -> dict[str, Any]:
             "wait_p50_secs": percentile(waits, 50),
             "wait_p90_secs": percentile(waits, 90),
         })
-    capacity = usage(load_records(store_dir), capacity_config(args))
+    # Same live-record view as status: a provably dead owner's lease is not
+    # capacity in use. Read only: nothing is written or journaled here.
+    cfg = capacity_config(args)
+    with locked_store(store_dir):
+        active, _, _ = reclaim(load_records(store_dir), int(args.stale_secs))
+    capacity = usage(active, cfg)
     return {"since_secs": since_secs, "events": len(rows), "groups": table, "capacity": capacity}
 
 
