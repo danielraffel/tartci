@@ -364,6 +364,14 @@ def pending_verdict(store_state: Optional[dict], now: float, fresh_s: float) -> 
     return classification if 0 <= now - stamp <= fresh_s else None
 
 
+def hung_job(reading: dict) -> str:
+    """The launchd job whose store probe hung on the volume root, if known."""
+    probe = reading.get("launchd_probe") or {}
+    if probe.get("outcome") == "hung_on_root" and probe.get("label"):
+        return str(probe["label"])
+    return ""
+
+
 def render(host: str, reading: dict, verdict: Optional[dict], heal_after_s: int,
            detected: str) -> tuple[str, str]:
     import tartci_incident
@@ -376,12 +384,18 @@ def render(host: str, reading: dict, verdict: Optional[dict], heal_after_s: int,
     if verdict:
         evidence.append(f"- the launchd watchdog classified the store hang as `{KIND}` at "
                         f"{verdict.get('classified_at')}: {verdict.get('reason')}")
+    job = hung_job(reading)
+    if job:
+        evidence.append(f"- the launchd store probe job `{job}` hung opening the volume root")
     if install:
-        evidence.append(f"- Shipyard installed generation `{install['generation']}` at "
-                        f"{install['installed_at']}, {install['seconds_before_alert']} s before "
-                        f"the alert: a new binary path, so a new privacy identity")
-    cause = ("A new Shipyard binary (`" + install["binary"] + "`) asked for access and "
-             "macOS is waiting for an answer." if install else
+        evidence.append(f"- near Shipyard install: generation `{install['generation']}` was "
+                        f"installed at {install['installed_at']}, "
+                        f"{install['seconds_before_alert']} s before the alert (timing only: "
+                        f"nothing here identifies which program the alert names)")
+    cause = ("Unconfirmed. A Shipyard install landed near the alert (`" + install["binary"] +
+             "` is a new binary path, which would need a new privacy decision), but that is "
+             "timing only; read the alert to see which program is asking. macOS is waiting "
+             "for an answer." if install else
              "A launchd job with no stored privacy decision asked for access to a removable "
              "volume and macOS is waiting for an answer.")
     body = "\n".join([
@@ -462,10 +476,13 @@ def alert_pass(reading: dict, store_state: Optional[dict], now: Optional[float] 
         record = fallback_heal(reading, store_state, now, state_dir=state_dir,
                                heal_after_s=heal_after_s, heal=heal, enabled=heal_enabled)
         heal_text = f"; heal {record.get('outcome')}"
-    why = (f"after Shipyard install {install['generation'][:12]} "
-           f"({install['seconds_before_alert']} s before)" if install else "")
+    why = (f"near Shipyard install {install['generation'][:12]} "
+           f"({install['seconds_before_alert']} s; timing only)" if install else "")
     if waiting:
         why = (why + "; " if why else "") + "launchd store opens hang behind it"
+        job = hung_job(reading)
+        if job:
+            why += f" (probe job {job})"
     return (f"{detected} launchd-watchdog: WARN tcc-prompt: a privacy consent alert has waited "
             f"on the console since {reading.get('since')} ({why}{heal_text})"
             + (f" (issue #{out.get('issue')})" if out.get("issue") else " (issue not opened)"))
