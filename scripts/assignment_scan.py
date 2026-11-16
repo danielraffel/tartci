@@ -257,7 +257,14 @@ class StaleDemandClassifier:
         record = self.quarantined.get(str(run.get("id")))
         if record is None:
             return False
-        self.note("quarantine_hit", run, reason=record.get("reason"))
+        # Say so once per quarantine, not once per scan pass: a phantom that
+        # stays queued for months produced one identical event per lane per
+        # pass (31k lines in one lane's log on m1). The exclusion itself is
+        # unchanged; only the repeated evidence is dropped.
+        if not record.get("reported_at"):
+            self.note("quarantine_hit", run, reason=record.get("reason"))
+            record["reported_at"] = time.time()
+            self.dirty = True
         return True
 
     def classify(self, run: dict[str, Any], queued_jobs: int) -> bool:
@@ -284,6 +291,7 @@ class StaleDemandClassifier:
         with self.lock:
             self.quarantined[str(run.get("id"))] = {
                 "quarantined_at": time.time(),
+                "reported_at": time.time(),
                 "reason": reason,
                 "head_branch": run.get("head_branch"),
             }
