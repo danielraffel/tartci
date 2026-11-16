@@ -117,7 +117,7 @@ class HealPass(unittest.TestCase):
         heal_log = wd.load_heal_log(str(self.root / "home" / "state" / "launchd-watchdog.json"))
         return buf.getvalue(), reload, heal_log
 
-    IDLE = wd.TartVMProbe(False, "Tart VM inventory is idle", "/bin/tart", "/Volumes/Atelier/VMs")
+    IDLE = wd.TartVMProbe(False, "Tart VM inventory is idle", "/bin/tart", "/Volumes/Example/VMs")
     EMPTY = wd.TartVMProbe(None, "Tart VM inventory is empty in /Users/x/VMs; check TART_HOME",
                            "/bin/tart", "/Users/x/VMs", True)
 
