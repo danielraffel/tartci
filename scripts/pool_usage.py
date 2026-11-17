@@ -165,9 +165,20 @@ def read_lines_since(path: str, cutoff: str, chunk: int = 1 << 20) -> List[bytes
     return lines
 
 
+def lane_log_lines(path: str, cutoff: str) -> List[bytes]:
+    """The lane log's lines since cutoff, oldest first. The lane renames a full
+    events.jsonl to events.jsonl.1 (runner.sh tartci_event_log_rotate), so a
+    window reaching past the rename reads .1 first."""
+    lines: List[bytes] = []
+    for part in (path + ".1", path):
+        if os.path.isfile(part):
+            lines.extend(read_lines_since(part, cutoff))
+    return lines
+
+
 def load_events(path: str, cutoff: str) -> List[Dict[str, Any]]:
     out = []
-    for i, line in enumerate(read_lines_since(path, cutoff)):
+    for i, line in enumerate(lane_log_lines(path, cutoff)):
         try:
             d = json.loads(line.decode("utf-8", "replace"))
             t = parse_ts(d["ts"])

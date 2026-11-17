@@ -2677,6 +2677,15 @@ override, because nobody is there to accept killing the job. A stale-boot heal
 skips the probe (its verdict already proves no run or job identity) but still
 reads the event log.
 
+A lane's `events.jsonl` is bounded: once it reaches 16 MiB the supervisor
+renames it to `events.jsonl.1` (replacing the previous one) at the top of its
+loop with no VM, never mid-job, so the open `job_assigned` above is always in
+the current file. `tartci pool status --usage`, `pre_mint_outcomes`, the
+serving-truth alarm and the DHCP breaker's boot times read `events.jsonl.1`
+first. Tail readers (lease-fit transitions over 24 h, the watchdog) read only
+the current file, so for the first hours after a rename their window is
+shorter. A `grep` by hand should include `events.jsonl.1`.
+
 ### Runners the janitor must never delete (`keep_not_minted_here`)
 
 Every host's janitor (`scripts/vm_reap.py`, run by the `reap` LaunchAgent) reads
