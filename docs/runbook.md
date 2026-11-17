@@ -425,7 +425,9 @@ finish. The watchdog never reboots or kills a process for this condition.
 `--store-health-timeout-seconds` and
 `--store-health-failure-threshold` tune the bounds for fixture testing.
 The macOS runner performs the same probe before a new job claim/clone and on
-each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
+each idle poll. A healthy result emits `storage_health` only when the state
+turns healthy and then at most hourly; the heartbeat's `storage_health` field
+is the current verdict. An unknown or timed-out result emits `yielded_storage_health`,
 sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
 the lane as blocked/unknown; active guests continue to finish.
 
