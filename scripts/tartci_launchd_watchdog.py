@@ -1356,8 +1356,39 @@ def attestation_python(timeout_s: float = 60.0) -> str | None:
     return lines[-1]
 
 
-def host_attestation_pass(home: str | None = None, run=subprocess.run,
-                          loaded=None, pinned_python=None) -> str | None:
+def _bounded_run(argv: list[str], *, timeout: float, env: dict | None = None,
+                 **_ignored) -> subprocess.CompletedProcess:
+    """`run_bounded` for this pass: a child stuck in an uninterruptible wait
+    cannot hold the watchdog."""
+    import bounded_subprocess  # noqa: PLC0415 - sibling module
+    return bounded_subprocess.run_bounded(argv, timeout=timeout, env=env,
+                                          operation="host-attestation")
+
+
+def _attestation_loaded(label: str) -> bool:
+    try:
+        return _bounded_run(["/bin/launchctl", "print", f"{_domain()}/{label}"],
+                            timeout=15).returncode == 0
+    except Exception:  # noqa: BLE001 - unknown reads as not loaded: change nothing
+        return False
+
+
+def _unstable_interpreter(path: str) -> bool:
+    """Whether scripts/tcc_risk_lint.py flags `path` as a privacy identity
+    that changes (a Homebrew Cellar, ad-hoc or unsigned binary, or /Volumes)."""
+    import tcc_risk_lint  # noqa: PLC0415 - sibling module
+    verdict = tcc_risk_lint.judge_binary(path, tcc_risk_lint.CodesignCache(budget=1))
+    return verdict.get("verdict") == "flag"
+
+
+def _framework_python(path: str | None) -> bool:
+    root = os.environ.get("TARTCI_PYTHON_FRAMEWORK_ROOT") or "/Library/Frameworks/Python.framework"
+    return bool(path) and str(path).startswith(root.rstrip("/") + "/Versions/")
+
+
+def host_attestation_pass(home: str | None = None, run=_bounded_run,
+                          loaded=None, pinned_python=None,
+                          unstable=None) -> str | None:
     """Redeploy a loaded host-attestation writer that is not this tartci's,
     or that runs a different interpreter than the installer now pins.
 
@@ -1374,15 +1405,19 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
     /opt/homebrew/bin/python3, an ad-hoc Cellar binary that becomes a new
     identity on every `brew upgrade` (scripts/tcc_risk_lint.py). It is
     re-rendered once; a plist that already runs the pinned interpreter is left
-    alone, so this never loops.
+    alone, so this never loops. The re-pin runs only when the current
+    interpreter is one the tcc-risk lint flags AND the installer would pin the
+    python.org framework binary: an operator's TARTCI_ATTESTATION_PYTHON choice
+    that the lint accepts is never touched, nothing is ever re-pinned toward
+    Homebrew, and a framework python whose probe fails once does not flap.
+    A writer redeploy keeps an accepted interpreter the same way.
     Returns the line to log, or None when there is nothing to say. Never raises.
     """
     home = home or os.path.expanduser("~")
     plist_path = os.path.join(home, "Library", "LaunchAgents", f"{ATTESTATION_LABEL}.plist")
     if not os.path.isfile(plist_path):
         return None
-    is_loaded = loaded if loaded is not None else (
-        lambda label: _run(["launchctl", "print", f"{_domain()}/{label}"])[0] == 0)
+    is_loaded = loaded if loaded is not None else _attestation_loaded
     if not is_loaded(ATTESTATION_LABEL):
         return None
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1400,12 +1435,24 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
             return None
         return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation writer is stale "
                 f"but its plist is unreadable ({exc}); not redeployed")
+    current = argv[0] if argv else ""
+    try:
+        flagged = bool(current) and (unstable or _unstable_interpreter)(current)
+    except Exception:  # noqa: BLE001 - an unreadable verdict changes nothing
+        flagged = False
+    wanted = (pinned_python or attestation_python)() if flagged else None
+    move = flagged and _framework_python(wanted) and wanted != current
     repin = None
     if source == installed:
-        wanted = (pinned_python or attestation_python)()
-        if not wanted or (argv and argv[0] == wanted):
+        if not move:
             return None
-        repin = (argv[0] if argv else "no program", wanted)
+        repin = (current, wanted)
+    env = dict(os.environ)
+    env.pop("TARTCI_ATTESTATION_PYTHON", None)
+    if current and not move:
+        # Keep the interpreter the plist runs: an operator's choice, or the
+        # unstable one when no framework python is available to move to.
+        env["TARTCI_ATTESTATION_PYTHON"] = current
     try:
         args: list[str] = []
         generation = (plist.get("EnvironmentVariables") or {}).get("PULP_ATTESTATION_GENERATION")
@@ -1421,8 +1468,8 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
                 f"but its plist is unreadable ({exc}); not redeployed")
     try:
         proc = run(["/bin/bash", os.path.join(root, "scripts", "install_host_attestation.sh"),
-                    *args], capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
+                    *args], timeout=120, env=env)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy FAILED ({exc})"
     was = (installed or "absent")[:12]
     if repin is not None:

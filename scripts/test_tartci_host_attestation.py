@@ -513,14 +513,24 @@ class WatchdogRedeployTests(unittest.TestCase):
         with open(os.path.join(self.current, "tartci_host_attestation.py"), "wb") as fh:
             fh.write(content)
 
-    def run_pass(self, loaded: bool = True, rc: int = 0, pinned: str | None = "/opt/homebrew/bin/python3"):
+    def run_pass(self, loaded: bool = True, rc: int = 0, pinned: str | None = "/opt/homebrew/bin/python3",
+                 unstable=lambda path: path.startswith("/opt/homebrew/")):
         # `pinned` is what the installer would pin now; by default the plist's
-        # own interpreter, so only the writer is judged.
+        # own interpreter, so only the writer is judged. `unstable` stands in
+        # for the tcc-risk lint's verdict on the plist's interpreter.
+        self.envs = []
+        self.pinned_asked = 0
+
         def fake_run(argv, **kw):
             self.calls.append(list(argv))
+            self.envs.append(kw.get("env") or {})
             return __import__("subprocess").CompletedProcess(argv, rc, "", "boom" if rc else "")
+
+        def pinned_python():
+            self.pinned_asked += 1
+            return pinned
         return self.wd.host_attestation_pass(self.home, fake_run, loaded=lambda label: loaded,
-                                             pinned_python=lambda: pinned)
+                                             pinned_python=pinned_python, unstable=unstable)
 
     def test_a_stale_writer_is_redeployed_with_the_plists_own_arguments(self) -> None:
         # m3 and m5 on 2026-10-02 ran a 2026-09-12 writer nothing redeployed.
@@ -578,11 +588,85 @@ class WatchdogRedeployTests(unittest.TestCase):
         self.assertIsNone(self.run_pass(pinned=None))  # installer refused: judge the writer only
         self.assertEqual(self.calls, [])
 
+    def test_an_operator_override_the_lint_accepts_is_never_repinned(self) -> None:
+        # TARTCI_ATTESTATION_PYTHON is not in the plist; its result is.
+        override = "/usr/local/opt/custom/bin/python3"
+        self.plist(ProgramArguments=[override, f"{self.current}/tartci_host_attestation.py",
+                                     "--write", "--self-check"])
+        self.installed(self.source)
+        self.assertIsNone(self.run_pass(pinned=FRAMEWORK_PYTHON))
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.pinned_asked, 0)  # an accepted interpreter is not even re-judged
+        # A writer redeploy keeps it too.
+        self.installed(b"# an older writer\n")
+        self.assertIn("redeployed", self.run_pass(pinned=FRAMEWORK_PYTHON))
+        self.assertEqual(self.envs[-1].get("TARTCI_ATTESTATION_PYTHON"), override)
+
+    def test_a_failed_framework_probe_never_repins_toward_homebrew(self) -> None:
+        # The installer falls back to Homebrew (or refuses) when the framework
+        # python's tomllib probe fails once: nothing moves, nothing flaps.
+        self.plist()
+        self.installed(self.source)
+        for fallback in ("/opt/homebrew/bin/python3", "/usr/local/bin/python3", None):
+            self.assertIsNone(self.run_pass(pinned=fallback))
+        self.assertEqual(self.calls, [])
+        # Even a stable non-framework choice is not a reason to move.
+        self.plist(ProgramArguments=["/opt/homebrew/opt/python@3.13/bin/python3.13",
+                                     f"{self.current}/tartci_host_attestation.py"])
+        self.assertIsNone(self.run_pass(pinned="/usr/local/bin/python3"))
+        self.assertEqual(self.calls, [])
+
+    def test_a_cellar_interpreter_is_repinned_only_to_the_framework_binary(self) -> None:
+        self.plist()
+        self.installed(self.source)
+        line = self.run_pass(pinned=FRAMEWORK_PYTHON)
+        self.assertIn("repinned /opt/homebrew/bin/python3 -> " + FRAMEWORK_PYTHON, line)
+        # The installer chooses again, with no override pinning the old binary.
+        self.assertNotIn("TARTCI_ATTESTATION_PYTHON", self.envs[-1])
+
+    def test_children_are_bounded_by_default(self) -> None:
+        import inspect
+        params = inspect.signature(self.wd.host_attestation_pass).parameters
+        self.assertIs(params["run"].default, self.wd._bounded_run)
+        source = inspect.getsource(self.wd._attestation_loaded)
+        self.assertIn("_bounded_run", source)
+
+    def test_the_default_verdict_is_the_tcc_risk_lint(self) -> None:
+        cellar = "/opt/homebrew/Cellar/python@3.12/3.12.13_2/bin/python3.12"
+        self.assertTrue(self.wd._unstable_interpreter(cellar))
+        self.assertFalse(self.wd._unstable_interpreter("/usr/bin/python3"))
+
     def test_the_heal_pass_runs_it(self) -> None:
         here = os.path.dirname(os.path.abspath(__file__))
         with open(os.path.join(here, "tartci_launchd_watchdog.py")) as fh:
             source = fh.read()
         self.assertIn("attestation_line = host_attestation_pass()", source[source.index("def main("):])
+
+class ExternalVolumeTests(unittest.TestCase):
+    """The writer never stats a path under /Volumes (a consent alert there
+    holds every launchd open of the volume)."""
+
+    def test_volumes_paths_are_never_stated(self) -> None:
+        from unittest import mock
+        touched: list[str] = []
+        real = {name: getattr(os.path, name) for name in ("isfile", "isdir", "exists", "getmtime")}
+
+        def guard(name):
+            def call(path, *a, **kw):
+                if str(path).startswith("/Volumes"):
+                    touched.append(f"{name} {path}")
+                return real[name](path, *a, **kw)
+            return call
+        with mock.patch.multiple(os.path, **{n: guard(n) for n in real}):
+            registered, _, _, detail = att.read_runner_registration("/Volumes/Example/runner")
+            ages = att.heartbeat_ages("/Volumes/Example/state", time.time())
+        self.assertFalse(registered)
+        self.assertIn("external volume", detail)
+        self.assertEqual(ages, [])
+        self.assertEqual(touched, [])
+        self.assertTrue(att.on_external_volume("/Volumes/Example/x/../y"))
+        self.assertFalse(att.on_external_volume("/Users/example/Volumes/Example"))
+
 
 FRAMEWORK_PYTHON = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
 INSTALLER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "install_host_attestation.sh")
