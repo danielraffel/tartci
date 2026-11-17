@@ -88,6 +88,26 @@ class CurrentJobScanTests(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["kind"], "active")
         self.assertEqual(json.loads(result.stdout)["job_id"], 444)
 
+    def test_stderr_is_one_summary_line_per_scan(self) -> None:
+        # runner.sh appends the scanner's stderr to the lane's events.jsonl; a
+        # line per API call was about 100 lines per scan there.
+        result = self._scan()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertRegex(lines[0], r"^current-job-api mode=discover result=active calls=\d+ "
+                                   r"elapsed_s=[0-9.]+ slowest_s=[0-9.]+ slowest=repos/\S+$")
+        calls = int(lines[0].split("calls=", 1)[1].split()[0])
+        self.assertGreater(calls, 100)
+
+    def test_a_failed_scan_still_writes_its_summary(self) -> None:
+        result = self._scan("unexpected", "--max-api-calls", "3")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(json.loads(result.stdout)["kind"], "observation_error")
+        lines = result.stderr.splitlines()
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("result=observation_error calls=3 ", lines[0])
+
     def test_unexpected_workflow_assignment_is_typed_not_idle(self) -> None:
         receipt = json.loads(self._scan("unexpected").stdout)
         self.assertEqual(receipt["kind"], "unexpected_assignment")
