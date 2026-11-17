@@ -27,6 +27,33 @@ tartci_pinned_python() {
   printf '%s\n' "$candidate"
 }
 
+# The python.org framework interpreter at its real versioned path
+# (/Library/Frameworks/Python.framework/Versions/3.N/bin/python3.N), or
+# nothing. It is Developer ID signed, so its macOS privacy identity survives
+# patch updates; a Homebrew Cellar binary is ad-hoc signed and becomes a new
+# identity (and can raise a new consent alert) on every `brew upgrade`.
+# Versions/Current wins, then the newest 3.N with tomllib.
+# scripts/install_host_attestation.sh carries the same rule.
+tartci_framework_python() {
+  local root="${TARTCI_PYTHON_FRAMEWORK_ROOT:-/Library/Frameworks/Python.framework}"
+  local current version dir listed=""
+  current="$(readlink "$root/Versions/Current" 2>/dev/null || true)"
+  for dir in "$root"/Versions/3.*; do
+    [ -d "$dir" ] && listed="$listed ${dir##*/}"
+  done
+  # shellcheck disable=SC2086 # version names are 3.N, split on purpose
+  for version in "$current" $(printf '%s\n' $listed | sort -t. -k2,2nr); do
+    case "$version" in 3.[0-9]|3.[0-9][0-9]) ;; *) continue ;; esac
+    dir="$root/Versions/$version/bin"
+    [ -f "$dir/python$version" ] && [ ! -L "$dir/python$version" ] || continue
+    if [ -x "$dir/python$version" ] && "$dir/python$version" -c 'import tomllib' >/dev/null 2>&1; then
+      printf '%s\n' "$dir/python$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # host.python from a fleet profile: one absolute path on a `python = "..."`
 # line of the [host] table. Read without a TOML parser, which this is choosing.
 tartci_profile_python() {

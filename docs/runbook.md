@@ -606,6 +606,46 @@ the install step; `TARTCI_TCC_HEAL=0` in the watchdog's environment keeps it
 classify-only. Operator reads: `python3 scripts/tcc_wedge.py --state`,
 `python3 scripts/tcc_wedge.py --scan-log --last-minutes 60`.
 
+**Jobs a wedge leaves blocked are paged; prompt-prone agents are reported.**
+Restarting tccd and sandboxd does not release a job already held in `open()`
+on the store: on m3 (2026-11-16) com.pulp.fleet.prewall and three fleet-pass
+`must-review.py` children stayed blocked for hours after the alert went away,
+and a periodic job whose run never ends never starts again.
+
+- *Stuck jobs* (`scripts/tcc_stuck_jobs.py`, every watchdog pass right after
+  store health, report only). While store health names a wedge
+  (`tcc_attribution_wedge`, `tcc_prompt_pending`, or a store probe that timed
+  out past the failure threshold), it finds this user's loaded launchd jobs
+  running longer than max(3 x StartInterval, 30 min) whose process tree has an
+  argument or cwd under /Volumes (one `ps` read, one `lsof -b -w -d cwd`;
+  /Volumes itself is never stat'ed). Each is logged as
+  `WARN tcc-wedge stuck <label>: ...`; the episode raises one page (issue
+  class `tcc_wedge_stuck_jobs`, closed when the store recovers) naming the
+  labels, the pids and the one line that clears them
+  (`launchctl kickstart -k gui/<uid>/<label>; kill -KILL <pids>`). It never
+  restarts or signals anything, since a fleet-pass run can be legitimately busy;
+  runner lanes, `actions.runner.*`, the watchdog itself and KeepAlive
+  services without a StartInterval are never reported.
+  `python3 scripts/tcc_stuck_jobs.py` prints the current reading.
+- *Lint* (`scripts/tcc_risk_lint.py`, at most every 15 min, report only). A
+  loaded LaunchAgent whose program, or the interpreter it resolves to, is under
+  a Homebrew Cellar or is ad-hoc or unsigned, or whose script argument or
+  WorkingDirectory is under /Volumes, and that does not run through
+  TartCILauncher.app or ShipyardLauncher.app, is logged as
+  `WARN tcc-risk <label>: <reason>`; each newly flagged label is a `tcc_risk`
+  event, and the host carries one `tcc_risk` issue while anything is flagged.
+  It never unloads anything. `python3 scripts/tcc_risk_lint.py` prints the same
+  findings now. The lint judges the program launchd starts: a `/bin/bash` agent
+  passes even if the script then execs a Cellar python (most tartci agents run
+  the `python.pin` interpreter that way).
+- *Host attestation* runs the python.org framework binary at its versioned path
+  (`/Library/Frameworks/Python.framework/Versions/3.x/bin/python3.x`, Developer
+  ID signed) instead of `/opt/homebrew/bin/python3`.
+  `scripts/install_host_attestation.sh --print-python` shows the choice
+  (`TARTCI_ATTESTATION_PYTHON` overrides it); with no framework python it falls
+  back to Homebrew with a `WARN tcc-risk` line. The watchdog re-renders a loaded
+  attestation plist that runs any other interpreter, once.
+
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
 token — the `[github.auth]` `source = "command"` block (the

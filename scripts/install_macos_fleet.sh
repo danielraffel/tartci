@@ -187,6 +187,26 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# A Homebrew Cellar interpreter is ad-hoc signed and becomes a new macOS
+# privacy identity on every `brew upgrade`; while its consent alert waits,
+# every launchd open of the store on /Volumes blocks (m3, 2026-11-16). The
+# interpreter is not switched here: on a sealed-launcher host the launcher's
+# lanes.json is built with the interpreter self-update chose, and the two must
+# agree. The profile's host.python is the one switch both sides honour, and
+# the preflight below proves it from launchd before any lane runs it.
+if [ -z "${TARTCI_ROLLBACK_PYTHON:-}" ] && [ -z "${PROFILE_PYTHON:-}" ]; then
+  case "$PYTHON_BIN" in
+    */Cellar/*)
+      if framework_python="$(tartci_framework_python)"; then
+        echo "WARN tcc-risk: the pinned interpreter $PYTHON_BIN is a Homebrew Cellar binary whose privacy" \
+             "identity changes on every brew upgrade; add  python = \"$framework_python\"  to [host]" \
+             "in this host's fleet profile and reinstall" >&2
+      else
+        echo "WARN tcc-risk: the pinned interpreter $PYTHON_BIN is a Homebrew Cellar binary whose privacy" \
+             "identity changes on every brew upgrade; install python.org Python 3.11+ and set host.python" >&2
+      fi ;;
+  esac
+fi
 # Switching the lane interpreter: macOS grants (Full Disk Access, Removable
 # Volumes, Local Network) belong to the binary, so prove the NEW one can use the
 # VM store from launchd before any lane runs it. If it cannot, keep the

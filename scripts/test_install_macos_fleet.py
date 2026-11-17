@@ -372,6 +372,38 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def _fake_framework(self) -> Path:
+        bindir = self.root / "Python.framework" / "Versions" / "3.13" / "bin"
+        bindir.mkdir(parents=True)
+        binary = bindir / "python3.13"
+        shutil.copy2(sys.executable, binary)
+        binary.chmod(0o755)
+        (self.root / "Python.framework" / "Versions" / "Current").symlink_to("3.13")
+        return binary
+
+    def test_a_cellar_pin_warns_with_the_host_python_line_to_add(self) -> None:
+        # m3, 2026-11-16: python.pin named an ad-hoc Cellar binary.
+        framework = self._fake_framework()
+        cellar = self.root / "homebrew" / "Cellar" / "python@3.12" / "3.12.13" / "bin"
+        cellar.mkdir(parents=True)
+        interpreter = cellar / "python3.12"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(interpreter),
+                                    TARTCI_PYTHON_FRAMEWORK_ROOT=str(self.root / "Python.framework"))
+        self.assertIn("WARN tcc-risk", result.stderr)
+        self.assertIn(f'python = "{framework}"', result.stderr)
+
+    def test_a_non_cellar_pin_does_not_warn(self) -> None:
+        # Control, same instrument: only the interpreter's path changed.
+        self._fake_framework()
+        interpreter = self.root / "pinned-python3"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(interpreter),
+                                    TARTCI_PYTHON_FRAMEWORK_ROOT=str(self.root / "Python.framework"))
+        self.assertNotIn("WARN tcc-risk", result.stderr)
+
     def test_python_symlink_cycle_is_bounded(self) -> None:
         first = self.root / "python-cycle-0"
         first.symlink_to(sys.executable)

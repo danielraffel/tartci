@@ -162,6 +162,19 @@ def parse_launchctl_print(out: str) -> dict:
     return found
 
 
+def on_external_volume(path: str | None) -> bool:
+    """Lexical only: a path under /Volumes is never stat'ed or read.
+
+    The writer runs under launchd as its own privacy identity; a stat on an
+    external volume it holds no grant for raises a consent alert, and while
+    that alert waits every launchd open of the volume blocks (m3, 2026-11-16).
+    """
+    if not path:
+        return False
+    normal = os.path.normpath(str(path))
+    return normal == "/Volumes" or normal.startswith("/Volumes/")
+
+
 def read_runner_registration(runner_dir: str) -> tuple[bool, str | None, list[str], str]:
     """Read ``<runner_dir>/.runner``.
 
@@ -171,6 +184,8 @@ def read_runner_registration(runner_dir: str) -> tuple[bool, str | None, list[st
     that is the single most load-bearing character in this function.
     """
     path = os.path.join(runner_dir, ".runner")
+    if on_external_volume(path):
+        return False, None, [], f".runner not read: {path} is on an external volume"
     if not os.path.isfile(path):
         return False, None, [], f".runner absent at {path}"
     try:
@@ -402,7 +417,7 @@ def assess_persistent_runner(label: str, plist_path: str | None, lane_repo: str 
 def heartbeat_ages(state_dir: str, now: float) -> list[float]:
     """Ages in seconds of every supervisor heartbeat in ``state_dir``."""
     ages: list[float] = []
-    if not os.path.isdir(state_dir):
+    if on_external_volume(state_dir) or not os.path.isdir(state_dir):
         return ages
     for name in os.listdir(state_dir):
         if not name.endswith(".state.json"):
@@ -476,7 +491,7 @@ def sensor_census(agents: list[tuple[str, str]], now: float,
                 data = plistlib.load(handle)
             interval = data.get("StartInterval")
             log_path = data.get("StandardOutPath") or data.get("StandardErrorPath")
-            if log_path and os.path.exists(log_path):
+            if log_path and not on_external_volume(log_path) and os.path.exists(log_path):
                 log_age = int(max(0.0, now - os.path.getmtime(log_path)))
         except Exception:  # noqa: BLE001
             pass
