@@ -227,6 +227,56 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(verdict["kind"], "stalled_unclassified")
         self.assertIn("log show unavailable", verdict["reason"])
 
+    def test_a_heal_from_an_earlier_streak_does_not_cut_this_one(self) -> None:
+        # m3 2026-11-17: the last heal was 3 days old, so cutting at it hid
+        # every signature line of the current streak (ignored_after_heal 14862).
+        seen: list = []
+        verdict = classify(scan=scan_with(5, seen=seen), healed_at=NOW - 3 * 86400)
+        self.assertIsNone(seen[0]["before"])
+        self.assertEqual(verdict["kind"], tw.KIND)
+        # A heal inside the scanned window still cuts: its release burst is
+        # not evidence for the next heal.
+        seen.clear()
+        classify(scan=scan_with(5, seen=seen), failing_since=NOW - 1800, healed_at=NOW - 1500)
+        self.assertEqual(seen[0]["before"], tw.local_stamp(NOW - 1500))
+
+    def test_a_saturated_tccd_hangs_the_context_probe_but_not_statfs(self) -> None:
+        # m3 2026-11-17: the ssh context probe hung on the same tccd while
+        # `df` of the volume answered and sandboxd logged Removable Volumes
+        # refusals: tccd, not the volume.
+        hung = lambda: {"ok": False, "reason": "timeout: timed out after 10s"}  # noqa: E731
+        verdict = classify(context_probe=hung,
+                           volume_meta=lambda: {"ok": True, "volume_root": "/Volumes/Example"})
+        self.assertEqual(verdict["kind"], tw.KIND)
+        self.assertEqual(verdict["path"], "error_signature_saturated")
+        self.assertTrue(verdict["evidence"]["volume_meta"]["ok"])
+        # Negative controls: statfs failing too, or not read, keeps the veto.
+        for meta in (lambda: {"ok": False, "reason": "timeout"}, None):
+            with self.subTest(meta=meta):
+                vetoed = classify(context_probe=hung, volume_meta=meta)
+                self.assertEqual(vetoed["kind"], "stalled_unclassified")
+                self.assertIn("the volume, not tccd", vetoed["reason"])
+        # Without the Removable Volumes signature statfs alone proves nothing.
+        silent = classify(scan=scan_with(0), context_probe=hung,
+                          volume_meta=lambda: {"ok": True, "volume_root": "/Volumes/Example"})
+        self.assertEqual(silent["kind"], "stalled_unclassified")
+
+    def test_volume_meta_probe_reads_df_for_the_mount_point(self) -> None:
+        def runner_with(stdout, rc=0):
+            def runner(argv, timeout, operation):
+                runner.argv = argv
+                return subprocess.CompletedProcess(argv, rc, stdout, "")
+            return runner
+        listed = runner_with("Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                             "/dev/disk7s1 100 50 50 50% /Volumes/Example\n")
+        reading = tw.volume_meta_probe("/Volumes/Example/VMs", 10.0, runner=listed)
+        self.assertTrue(reading["ok"])
+        self.assertEqual(listed.argv, [tw.DF, "-P", "/Volumes/Example"])
+        other = runner_with("Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                            "/dev/disk3s1 100 50 50 50% /\n")
+        self.assertFalse(tw.volume_meta_probe("/Volumes/Example/VMs", 10.0, runner=other)["ok"])
+        self.assertFalse(tw.volume_meta_probe("/Users/example/vms", 10.0, runner=listed)["ok"])
+
     def test_tcc_context_probe_that_hangs_names_the_volume_not_tccd(self) -> None:
         verdict = classify(context_probe=lambda: {"ok": False, "reason": "timeout after 10s"})
         self.assertEqual(verdict["kind"], "stalled_unclassified")
