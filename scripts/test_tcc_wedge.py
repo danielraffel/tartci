@@ -580,6 +580,40 @@ class LaneAndDoctorTests(unittest.TestCase):
         self.assertIn("wrapper_missing",
                       fd.check_tcc_wedge(self.wedge_state("wrapper_missing"), now=NOW).detail)
 
+    def test_doctor_names_a_stale_installed_heal_wrapper(self) -> None:
+        # The live wrapper is a root-owned copy installed by hand: a merged
+        # change reaches a host only when the installer is re-run there.
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo-wrapper"
+            repo.write_text("#!/bin/bash\n" + tw.SIGKILL_VECTOR + "\n")
+            installed = Path(td) / "installed-wrapper"
+            cases = [
+                (None, fd.NOT_APPLICABLE, "heal_wrapper_not_installed"),
+                (repo.read_text(), fd.OK, "heal_wrapper_current"),
+                ('#!/bin/bash\n"$KILLALL" tccd sandboxd\n', fd.PROBLEM, "heal_wrapper_stale"),
+            ]
+            for text, state, code in cases:
+                with self.subTest(code=code):
+                    if text is None:
+                        installed.unlink(missing_ok=True)
+                    else:
+                        installed.write_text(text)
+                    finding = fd.check_heal_wrapper(installed=installed, repo_copy=repo)
+                    self.assertEqual((finding.state, finding.code), (state, code))
+                    self.assertIn(code, fd.CODES)
+                    self.assertIn(code, fd.load_reasons())
+            self.assertIn("install-tartci-heal-tcc.sh --apply", finding.detail)
+            self.assertIn("SIGTERM", finding.detail)
+            unreadable = fd.check_heal_wrapper(installed=installed, repo_copy=Path(td) / "gone")
+            self.assertEqual((unreadable.state, unreadable.code),
+                             (fd.UNKNOWN, "heal_wrapper_unreadable"))
+            self.assertIn("heal_wrapper_unreadable", fd.CODES)
+            self.assertIn("heal_wrapper_unreadable", fd.load_reasons())
+
+    def test_doctor_runs_the_heal_wrapper_check(self) -> None:
+        source = (ROOT / "scripts" / "fleet_doctor.py").read_text()
+        self.assertIn("findings.append(check_heal_wrapper())", source)
+
     def test_runner_names_the_cause_and_keeps_the_plain_deferral(self) -> None:
         runner = (ROOT / "providers" / "tart-macos" / "runner.sh").read_text()
         gate = runner[runner.index("tartci_storage_health_check(){"):]
@@ -606,7 +640,8 @@ class WrapperSourceTests(unittest.TestCase):
         text = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_text()
         self.assertIn('[[ $# -eq 0 ]] || die "takes no arguments"', text)
         self.assertIn(tw.SIGKILL_VECTOR, text)
-        self.assertEqual(text.count('"$KILLALL"'), 1, "one fixed command vector")
+        self.assertIn('"$KILLALL" -KILL sandboxd', text)
+        self.assertEqual(text.count('"$KILLALL"'), 2, "two fixed command vectors")
         self.assertIn("MIN_INTERVAL=1800", text)
         self.assertIn("STAMP=$STAMP_DIR/last-heal", text)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin", text)

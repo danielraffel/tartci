@@ -110,7 +110,7 @@ HEALED_PROCESSES = ("tccd", "sandboxd")
 HEAL_SETTLE_S = 5.0
 PGREP = "/usr/bin/pgrep"
 # The wrapper's one command vector since it sends SIGKILL (fleet/ops/tartci-heal-tcc).
-SIGKILL_VECTOR = '"$KILLALL" -KILL tccd sandboxd'
+SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
 
 
 def _iso(epoch: float) -> str:

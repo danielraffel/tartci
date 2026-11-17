@@ -8,9 +8,9 @@
 # granting NOPASSWD for this path with an EMPTY argument spec, so sudo itself
 # refuses any argument.
 #
-# WHAT IT DOES, EXACTLY: /usr/bin/killall -KILL tccd sandboxd. launchd relaunches
-# both on demand. No path, label, signal or argument is accepted; nothing else
-# runs.
+# WHAT IT DOES, EXACTLY: /usr/bin/killall -KILL tccd, then /usr/bin/killall
+# -KILL sandboxd if sandboxd is running. launchd relaunches both on demand. No
+# path, label, signal or argument is accepted; nothing else runs.
 #
 # WHY SIGKILL: both daemons catch SIGTERM and exit only once they are idle, and
 # a wedged tccd is never idle. On m3 the system tccd (pid 10970, started
@@ -81,16 +81,26 @@ fi
 before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
 before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
 rc=0
-output=$("$KILLALL" -KILL tccd sandboxd 2>&1) || rc=$?
+output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?
+# sandboxd is launched on demand and may not be running; killall exits 1 on a
+# name with no match, which must not fail a heal that restarted tccd. It is
+# killed only when it was seen, and a miss (it exited in between) is logged.
+sandboxd_rc=absent
+sandboxd_output=""
+if [[ -n "$before_sandboxd" ]]; then
+  sandboxd_rc=0
+  sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?
+fi
 {
-  printf '%s heal uid=%s sudo_user=%s rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" \
+  printf '%s heal uid=%s sudo_user=%s rc=%s sandboxd_rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" "$sandboxd_rc" \
     "${before_tccd% }" "${before_sandboxd% }"
-  [[ -z "$output" ]] || printf '  killall: %s\n' "$(tr '\n' '|' <<<"$output")"
+  [[ -z "$output" ]] || printf '  killall tccd: %s\n' "$(tr '\n' '|' <<<"$output")"
+  [[ -z "$sandboxd_output" ]] || printf '  killall sandboxd: %s\n' "$(tr '\n' '|' <<<"$sandboxd_output")"
 } >>"$LOG" 2>/dev/null || true
 
 if (( rc != 0 )); then
-  die "killall -KILL tccd sandboxd exited $rc: $output" "$rc"
+  die "killall -KILL tccd exited $rc: $output" "$rc"
 fi
-printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
-  "${before_tccd% }" "${before_sandboxd% }"
+printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s], sandboxd kill %s); launchd relaunches them on demand\n' \
+  "${before_tccd% }" "${before_sandboxd% }" "$sandboxd_rc"

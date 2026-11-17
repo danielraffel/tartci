@@ -72,6 +72,10 @@ CODES: tuple[str, ...] = (
     "gate_reserve_overcommitted",
     "gate_reserve_unknown",
     "generation_path_exec",
+    "heal_wrapper_current",
+    "heal_wrapper_not_installed",
+    "heal_wrapper_stale",
+    "heal_wrapper_unreadable",
     "hold_receipt_malformed",
     "hold_receipt_present",
     "home_volume_floor_not_judged",
@@ -1333,6 +1337,39 @@ def check_tcc_wedge(value: dict | None, now: float | None = None) -> Finding:
     return Finding("tcc_wedge", PROBLEM, "tcc_wedge_unhealed", detail, facts)
 
 
+def check_heal_wrapper(installed: Path | None = None, repo_copy: Path | None = None) -> Finding:
+    """Is the root-owned heal wrapper this host runs the one in this checkout?
+
+    /usr/local/sbin/tartci-heal-tcc is a copy installed by hand with sudo, so a
+    merged wrapper change reaches a host only when the installer is re-run
+    there. The installed copy is 0755, so reading it needs no privilege.
+    """
+    import tcc_wedge
+
+    installed = Path(tcc_wedge.WRAPPER) if installed is None else installed
+    repo_copy = ROOT / "fleet" / "ops" / "tartci-heal-tcc" if repo_copy is None else repo_copy
+    install = "sudo fleet/ops/install-tartci-heal-tcc.sh --apply"
+    facts = {"installed": str(installed), "repo_copy": str(repo_copy), "install": install}
+    if not installed.exists():
+        return Finding("heal_wrapper", NOT_APPLICABLE, "heal_wrapper_not_installed",
+                       f"heal wrapper: {installed} is not installed on this host", facts)
+    try:
+        live = installed.read_bytes()
+        wanted = repo_copy.read_bytes()
+    except OSError as exc:
+        return Finding("heal_wrapper", UNKNOWN, "heal_wrapper_unreadable",
+                       f"heal wrapper: cannot compare {installed} with {repo_copy}: {exc}", facts)
+    if live == wanted:
+        return Finding("heal_wrapper", OK, "heal_wrapper_current",
+                       f"heal wrapper: {installed} matches this checkout", facts)
+    facts["sends_sigkill"] = tcc_wedge.wrapper_sends_sigkill(str(installed))
+    return Finding("heal_wrapper", PROBLEM, "heal_wrapper_stale",
+                   f"heal wrapper: {installed} differs from {repo_copy}"
+                   + ("" if facts["sends_sigkill"] else
+                      " and still sends SIGTERM, which tccd defers, so a heal cannot restart it")
+                   + f"; reinstall from this checkout: {install}", facts)
+
+
 def check_reclaim(value: dict | None) -> Finding:
     """The disk reclaimer's last pass, from its receipt (scripts/reclaim_status.py)."""
     import reclaim_status
@@ -1996,6 +2033,7 @@ def collect(*, home: Path, agents_dir: Path | None = None,
             tcc_value = {"classification": {}, "read_error": str(exc)}
     findings.append(check_store_stall(store_value, watchdog=tcc_value))
     findings.append(check_tcc_wedge(tcc_value))
+    findings.append(check_heal_wrapper())
     if launchd_timers_value is None:
         try:
             import launchd_interval_guard

@@ -579,8 +579,10 @@ it. Nothing in tartci answers, dismisses or changes a privacy decision.
 
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs
-exactly `/usr/bin/killall -KILL tccd sandboxd` (launchd relaunches both on demand;
-SIGKILL because both daemons defer SIGTERM until idle, and a wedged tccd never is),
+exactly `/usr/bin/killall -KILL tccd`, then `/usr/bin/killall -KILL sandboxd` when
+sandboxd is running (launchd relaunches both on demand; SIGKILL because both
+daemons defer SIGTERM until idle, and a wedged tccd never is; an absent sandboxd
+does not fail the heal),
 takes no arguments (its sudoers grant has an empty argument spec, so sudo
 refuses any), runs at most once per 30 minutes (stamp in the root-only
 `/var/db/tartci-heal-tcc`, plus tartci's own `last_heal` record) and at most
@@ -597,7 +599,10 @@ tried. A wider root helper is the owner's decision. An `ineffective` heal
 whose installed wrapper does not send SIGKILL also records `stale_wrapper`:
 the live copy in `/usr/local/sbin` predates the SIGKILL change, and a repo
 change reaches a host only when the installer below is re-run there.
-It is installed by hand, once per host, and again after each wrapper change:
+Merging a wrapper change changes nothing on a host until
+`sudo fleet/ops/install-tartci-heal-tcc.sh --apply` runs there; `tartci doctor
+fleet` reports `heal_wrapper_stale` until it does. It is installed by hand, once
+per host, and again after each wrapper change:
 
 ```sh
 fleet/ops/install-tartci-heal-tcc.sh             # plan

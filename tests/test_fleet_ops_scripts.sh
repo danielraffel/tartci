@@ -282,9 +282,21 @@ heal_bin="$tmp/heal-bin"; mkdir -p "$heal_bin"
 cat >"$heal_bin/killall" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
+# A real killall exits 1 on a name with no match.
+[ "${2:-}" != sandboxd ] || exit "${STUB_KILLALL_SANDBOXD_RC:-${STUB_KILLALL_RC:-0}}"
 exit "${STUB_KILLALL_RC:-0}"
 EOF
 chmod +x "$heal_bin/killall"
+# pgrep -x NAME: tccd always runs; sandboxd unless STUB_SANDBOXD_ABSENT=1.
+cat >"$heal_bin/pgrep" <<'EOF'
+#!/usr/bin/env bash
+case "${2:-}" in
+  tccd) echo 101 ;;
+  sandboxd) [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ] && exit 1; echo 202 ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$heal_bin/pgrep"
 heal_env=(env TARTCI_HEAL_TCC_TEST=1 TARTCI_HEAL_TCC_STAMP="$tmp/heal.stamp"
           TARTCI_HEAL_TCC_LOG="$tmp/heal.log" TARTCI_HEAL_TCC_PATH="$heal_bin:$PATH"
           STUB_STATE="$STUB_STATE")
@@ -299,19 +311,30 @@ if [ "$(uname -s)" = Darwin ]; then
   expect_rc 0 "heal: first run" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has out "restarted tccd and sandboxd"
   # SIGKILL: tccd and sandboxd defer SIGTERM until idle, and a wedged tccd never is.
-  [ "$(cat "$STUB_STATE/killall.log")" = "-KILL tccd sandboxd" ] || fail "heal: killall must receive exactly '-KILL tccd sandboxd', got: $(cat "$STUB_STATE/killall.log")"
+  [ "$(cat "$STUB_STATE/killall.log")" = "$(printf -- '-KILL tccd\n-KILL sandboxd')" ] || fail "heal: killall must receive exactly '-KILL tccd' then '-KILL sandboxd', got: $(cat "$STUB_STATE/killall.log")"
   [ -e "$tmp/heal.stamp" ] || fail "heal: no stamp written"
   grep -q "heal uid=" "$tmp/heal.log" || fail "heal: no audit line"
   expect_rc 75 "heal: second run within the interval is rate limited" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has err "rate limited"
-  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 1 ] || fail "heal: rate limit must run nothing"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: rate limit must run nothing"
   grep -q "rate-limited" "$tmp/heal.log" || fail "heal: rate limit not logged"
   # An old stamp (older than 30 min) allows a run again; a failing killall is reported and still stamps.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
   expect_rc 3 "heal: killall failure is passed through" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_RC=3 bash "$HEAL"
-  has err "killall -KILL tccd sandboxd exited 3"
-  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: an old stamp must allow one run"
+  has err "killall -KILL tccd exited 3"
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 4 ] || fail "heal: an old stamp must allow one run"
   expect_rc 75 "heal: a failed attempt still spends the budget" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # sandboxd is launched on demand: when it is not running, tccd alone is
+  # killed and the heal succeeds (killall would exit 1 on the missing name).
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 0 "heal: an absent sandboxd does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_SANDBOXD_ABSENT=1 STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
+  [ "$(cat "$STUB_STATE/killall.log")" = "-KILL tccd" ] || fail "heal: an absent sandboxd must not be signalled, got: $(cat "$STUB_STATE/killall.log")"
+  has out "sandboxd kill absent"
+  # sandboxd exiting between pgrep and killall is logged, not a failed heal.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  expect_rc 0 "heal: sandboxd gone before its kill does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
+  has out "sandboxd kill 1"
+  grep -q "sandboxd_rc=1" "$tmp/heal.log" || fail "heal: the sandboxd miss is not logged"
 else
   expect_rc 78 "heal: refuses off macOS" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has err "macOS only"
