@@ -989,6 +989,40 @@ cache is no longer mounted or hit; the fleet profiles set
 (m3's held 3.8 GB on 2026-11-14). The per-host disk delta is the new store, up
 to `CCACHE_MAX_SIZE`.
 
+**Seeding a cold host from a peer.** `ccache_layer.py seed` warms an empty or
+cold store from a trusted peer's `shared/`. A peer's store holds only layers
+already promoted under the trusted-ref rule, so seeding admits no
+pull-request-authored content. The peer stream goes through `receive`
+unchanged (every member validated, capped by `--max-bytes`, created fresh with
+the host's mtime) into a `jobs/seed-<peer>-*` layer, then through
+`promote_layer` with manifest replacement off, so a key the host already has,
+result or manifest, always wins. Each run writes one `ccache_seed` audit event
+(`verdict` `seeded` or `refused`, `peer`, `bytes_received`, and the counts).
+
+Both lanes must run the same golden and compiler, or the seed only costs disk
+(`CCACHE_COMPILERCHECK=content` keys each entry on the compiler, so a mismatch
+misses rather than links the wrong object). The seed refuses, before pulling
+anything, unless the two identity files match exactly. On each host, write the
+identity with the gate golden and the guest compiler's version line (from a gate
+job log, or `xcrun clang --version | head -1` in a booted clone):
+
+    python3 scripts/ccache_layer.py --root "$CACHE_ROOT/ccache-layers-v1" \
+      --state "$CACHE_ROOT/ccache-layer-state" identity \
+      --golden pulp-build-runner:latest --compiler "Apple clang version ..." \
+      > /tmp/lane.identity.json
+
+Copy the peer's file to the cold host, then run on the cold host:
+
+    python3 scripts/ccache_layer.py --root "$CACHE_ROOT/ccache-layers-v1" \
+      --state "$CACHE_ROOT/ccache-layer-state" seed --from m5studio \
+      --local-identity /tmp/lane.identity.json \
+      --peer-identity /tmp/m5studio.identity.json --max-bytes 20G -- \
+      ssh m5studio "tar -cf - -C ~/.cache/pulp-ci/ccache-layers-v1 \
+        --exclude '.*' -s '#^shared#remote#' shared"
+
+Judge it by the next trusted gate job on that host: its `ccache per-job json`
+hit rate and its `Build` step minutes.
+
 What it does not close:
 
 - A promoted layer is still the guest's own claim about which object a key

@@ -722,6 +722,131 @@ class BootTests(Base):
         self.assertEqual(self.events(), "")
 
 
+class SeedTests(Base):
+    """Warming an empty host store from a trusted peer's store."""
+
+    IDENTITY = {"schema": 1, "golden": "pulp-build-runner:latest",
+                "golden_config_sha256": "a" * 64, "compiler": "Apple clang version 17.0.0"}
+
+    def identity_file(self, name: str, **changes: object) -> Path:
+        path = self.tmp / f"{name}.identity.json"
+        path.write_text(json.dumps({**self.IDENTITY, **changes}))
+        return path
+
+    def peer_tar(self, members: list[tuple[str, bytes]], links: tuple[str, ...] = ()) -> Path:
+        import tarfile  # noqa: PLC0415
+        path = self.tmp / "peer.tar"
+        with tarfile.open(path, "w") as archive:
+            for name, data in members:
+                info = tarfile.TarInfo(name)
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+            for name in links:
+                info = tarfile.TarInfo(name)
+                info.type = tarfile.SYMTYPE
+                info.linkname = str(self.tmp / "host-secret")
+                archive.addfile(info)
+        return path
+
+    def run_seed(self, tar: Path, peer_identity: Path | None = None,
+                 max_bytes: int = 1 << 20, command: list[str] | None = None) -> dict:
+        return cl.seed(self.layout, "m5studio", self.identity_file("local"),
+                       peer_identity or self.identity_file("peer"),
+                       command or ["cat", str(tar)], max_bytes, timeout=30)
+
+    def seed_events(self) -> list[dict]:
+        return [e for e in self.audit_events() if e["event"] == "ccache_seed"]
+
+    def test_a_matching_peer_store_lands_and_the_audit_names_source_and_bytes(self) -> None:
+        result_key, manifest_key = "ab" + "1" * 38, "cd" + "2" * 38
+        tar = self.peer_tar([(f"remote/ab/{'1' * 38}", entry(0)),
+                             (f"remote/cd/{'2' * 38}", entry(1))])
+        counts = self.run_seed(tar)
+        self.assertEqual(counts["promoted"], 2)
+        self.assertEqual(self.shared_keys(), {result_key, manifest_key})
+        [event] = self.seed_events()
+        self.assertEqual(event["verdict"], "seeded")
+        self.assertEqual(event["peer"], "m5studio")
+        self.assertEqual(event["bytes_received"], 2 * len(entry(0)))
+        self.assertEqual(event["identity"]["golden"], "pulp-build-runner:latest")
+        self.assertEqual(list(self.layout.jobs.iterdir()), [], "the seed layer is removed")
+
+    def test_a_mismatched_image_or_compiler_is_refused_before_any_pull(self) -> None:
+        marker = self.tmp / "pulled"
+        for field, value in (("golden_config_sha256", "b" * 64),
+                             ("compiler", "Apple clang version 16.0.0"),
+                             ("golden", "pulp-build-runner:old")):
+            with self.subTest(field):
+                with self.assertRaises(cl.SeedError):
+                    self.run_seed(self.tmp / "unused.tar",
+                                  peer_identity=self.identity_file("peer", **{field: value}),
+                                  command=["sh", "-c", f"touch {marker}"])
+                self.assertFalse(marker.exists(), "a refused seed must not run the pull")
+                self.assertEqual(self.seed_events()[-1]["verdict"], "refused")
+                self.assertEqual(self.seed_events()[-1]["fields"], [field])
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_a_malformed_identity_is_refused(self) -> None:
+        bad = self.tmp / "bad.identity.json"
+        for text in ("{not json", json.dumps({**self.IDENTITY, "extra": 1}),
+                     json.dumps({**self.IDENTITY, "golden_config_sha256": "XYZ"}),
+                     json.dumps({**self.IDENTITY, "compiler": " "})):
+            with self.subTest(text=text[:30]):
+                bad.write_text(text)
+                with self.assertRaises(cl.SeedError):
+                    self.run_seed(self.tmp / "unused.tar", peer_identity=bad)
+        self.assertEqual(self.shared_keys(), set())
+
+    def test_links_and_bad_headers_are_rejected_as_in_receive(self) -> None:
+        (self.tmp / "host-secret").write_bytes(entry(0, b"secret"))
+        good = "ab" + "1" * 38
+        tar = self.peer_tar([(f"remote/ab/{'1' * 38}", entry(0)),
+                             (f"remote/ab/{'2' * 38}", b"not a ccache entry at all"),
+                             (f"remote/ab/{'3' * 38}", b"\xcc\xac\x01\x07" + b"\x00" * 16),
+                             ("shared/ab/" + "4" * 38, entry(0)),
+                             (".trim-stamp", b"")],
+                            links=(f"remote/ab/{'5' * 38}",))
+        self.run_seed(tar)
+        self.assertEqual(self.shared_keys(), {good})
+        [event] = self.seed_events()
+        self.assertEqual(event["received_rejected"], 5)
+        self.assertEqual((self.tmp / "host-secret").read_bytes(), entry(0, b"secret"))
+
+    def test_max_bytes_is_honoured(self) -> None:
+        tar = self.peer_tar([(f"remote/ab/{i:038d}", entry(0, b"x" * 4096)) for i in range(4)])
+        with self.assertRaises(cl.SeedError):
+            self.run_seed(tar, max_bytes=8192)
+        self.assertEqual(self.shared_keys(), set())
+        self.assertEqual(list(self.layout.jobs.iterdir()), [])
+        self.assertEqual(self.seed_events()[-1]["verdict"], "refused")
+        self.assertIn("exceeds", self.seed_events()[-1]["reason"])
+
+    def test_a_seed_never_replaces_a_local_manifest_or_result(self) -> None:
+        manifest, result = "cd" + "2" * 38, "ab" + "1" * 38
+        self.layout.ensure()
+        local_manifest = write_entry(self.layout.shared, manifest, entry(1, b"local"), mtime=1.0)
+        local_result = write_entry(self.layout.shared, result, entry(0, b"local"), mtime=1.0)
+        tar = self.peer_tar([(f"remote/cd/{'2' * 38}", entry(1, b"peer")),
+                             (f"remote/ab/{'1' * 38}", entry(0, b"peer"))])
+        counts = self.run_seed(tar)
+        self.assertEqual(counts["existing"], 2)
+        self.assertEqual(counts["replaced"], 0)
+        self.assertEqual(local_manifest.read_bytes(), entry(1, b"local"))
+        self.assertEqual(local_result.read_bytes(), entry(0, b"local"))
+
+    def test_identity_hashes_the_golden_configuration(self) -> None:
+        fake = self.tmp / "tart"
+        fake.write_text('#!/bin/sh\nprintf \'{"cpuCount":8,"os":"darwin"}\'\n')
+        fake.chmod(0o755)
+        value = cl.identity("pulp-build-runner:latest", "Apple clang version 17.0.0\n", str(fake))
+        path = self.tmp / "id.json"
+        path.write_text(json.dumps(value))
+        self.assertEqual(cl.load_identity(path)["compiler"], "Apple clang version 17.0.0")
+        import hashlib  # noqa: PLC0415
+        self.assertEqual(value["golden_config_sha256"],
+                         hashlib.sha256(b'{"cpuCount":8,"os":"darwin"}').hexdigest())
+
+
 class ProfileTests(unittest.TestCase):
     def test_every_fleet_lane_enables_isolation(self) -> None:
         # Every gate lane on every fleet host: the shared store is the one

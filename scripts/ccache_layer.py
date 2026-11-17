@@ -15,7 +15,9 @@ layer after the job:
   sweep    reclaim what an interrupted supervisor left behind: an active layer
            whose owner is dead is discarded (never promoted), a green layer
            whose promoter died is promoted again (promotion is idempotent);
-  trim     keep ``shared/`` under a size cap, oldest entries first.
+  trim     keep ``shared/`` under a size cap, oldest entries first;
+  seed     warm an empty host store from a trusted peer's ``shared/`` through
+           the same receive validation, never replacing a local key.
 
 The guest has NO writable ccache mount on the host. It mounts the shared store
 read-only and writes its new entries to a guest-local directory; when the job
@@ -383,8 +385,13 @@ def publish_manifest(src: Path, dest: Path, lock_path: Path) -> str:
         return "replaced" if existing is not None else "promoted"
 
 
-def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
-    """Publish every valid entry of a green layer into ``shared/``."""
+def promote_layer(layout: Layout, layer: Path,
+                  replace_manifests: bool = True) -> dict[str, int | list[str]]:
+    """Publish every valid entry of a green layer into ``shared/``.
+
+    ``replace_manifests=False`` publishes a manifest only where the key is
+    absent, exactly like a result entry: a seed never repoints a local key.
+    """
     counts: dict[str, int] = {"promoted": 0, "replaced": 0, "existing": 0,
                               "rejected": 0, "bytes": 0}
     keys: list[str] = []
@@ -414,7 +421,7 @@ def promote_layer(layout: Layout, layer: Path) -> dict[str, int | list[str]]:
         dest_dir = layout.shared / key_dir
         dest_dir.mkdir(parents=True, exist_ok=True)
         dest = dest_dir / name
-        if kind == ENTRY_TYPE_MANIFEST:
+        if kind == ENTRY_TYPE_MANIFEST and replace_manifests:
             outcome = publish_manifest(path, dest, lock_path)
         else:
             outcome = publish_result(path, dest)
@@ -661,6 +668,98 @@ def process(layout: Layout, name: str, is_present: Callable[[str], bool],
     return "promoted"
 
 
+# ── Seed (warm an empty host store from a trusted peer's store) ────────────
+
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+PEER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
+IDENTITY_FIELDS = ("golden", "golden_config_sha256", "compiler")
+
+
+class SeedError(Exception):
+    pass
+
+
+def load_identity(path: Path) -> dict[str, str]:
+    """A lane identity: the gate golden's name, the sha256 of its ``tart get``
+    configuration, and the guest compiler's version line. Strict schema."""
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise SeedError(f"unreadable identity {path}: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != {"schema", *IDENTITY_FIELDS} \
+            or value.get("schema") != 1:
+        raise SeedError(f"identity {path} must be schema 1 with exactly {IDENTITY_FIELDS}")
+    for key in IDENTITY_FIELDS:
+        if not isinstance(value[key], str) or not value[key].strip():
+            raise SeedError(f"identity {path} field {key} must be a non-empty string")
+    if not HEX64.fullmatch(value["golden_config_sha256"]):
+        raise SeedError(f"identity {path} golden_config_sha256 must be lowercase SHA-256")
+    return {key: value[key] for key in IDENTITY_FIELDS}
+
+
+def identity(golden: str, compiler: str, tart: str = "tart") -> dict[str, object]:
+    """This host's lane identity, from ``tart get <golden> --format json``."""
+    import hashlib  # noqa: PLC0415
+
+    out = subprocess.run([tart, "get", golden, "--format", "json"], capture_output=True,
+                         timeout=60, check=False)
+    if out.returncode != 0 or not out.stdout.strip():
+        raise SeedError(f"tart get {golden} failed (rc={out.returncode})")
+    return {"schema": 1, "golden": golden,
+            "golden_config_sha256": hashlib.sha256(out.stdout).hexdigest(),
+            "compiler": compiler.strip()}
+
+
+def seed(layout: Layout, peer: str, local_identity: Path, peer_identity: Path,
+         command: list[str], max_bytes: int, timeout: float) -> dict[str, int]:
+    """Warm this host's ``shared/`` from a trusted peer's ``shared/``.
+
+    ``command`` streams the peer store as a tar whose members are named
+    ``remote/<k0k1>/<rest>`` (the receive layout). The stream goes through
+    ``receive`` unchanged (every member validated, capped, re-stamped) into a
+    ``jobs/seed-<peer>-*`` layer, then through ``promote_layer`` with manifest
+    replacement off, so an existing local key always wins. Refused before
+    anything is pulled unless both identities parse and match exactly.
+    """
+    if not PEER_NAME.fullmatch(peer):
+        raise SeedError(f"invalid peer name: {peer!r}")
+    layout.ensure()
+    try:
+        local, remote = load_identity(local_identity), load_identity(peer_identity)
+    except SeedError as exc:
+        audit(layout, "ccache_seed", peer=peer, verdict="refused", reason=str(exc)[:200])
+        raise
+    mismatched = [key for key in IDENTITY_FIELDS if local[key] != remote[key]]
+    if mismatched:
+        audit(layout, "ccache_seed", peer=peer, verdict="refused",
+              reason="identity_mismatch", fields=mismatched)
+        raise SeedError(f"peer identity differs from this lane's in {mismatched}")
+    name = f"seed-{peer}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:6]}"
+    with flock(layout.locks / "seed.lock", blocking=False) as held:
+        if not held:
+            raise SeedError("another seed is running")
+        try:
+            received = receive(layout, name, os.getpid(), command, max_bytes, timeout)
+        except ReceiveError as exc:
+            audit(layout, "ccache_seed", peer=peer, verdict="refused",
+                  reason=f"receive_failed: {exc}"[:200], layer=name)
+            raise SeedError(str(exc)) from exc
+        layer = layout.jobs / name
+        try:
+            result = promote_layer(layout, layer, replace_manifests=False)
+        finally:
+            remove_tree(layer)
+            with contextlib.suppress(OSError):
+                (layout.owners / name).unlink()
+        keys = result.pop("keys")
+        if keys:
+            (layout.promotions / f"{name}.keys").write_text("\n".join(keys) + "\n")
+        audit(layout, "ccache_seed", peer=peer, verdict="seeded", layer=name,
+              received=received["received"], received_rejected=received["rejected"],
+              bytes_received=received["bytes"], identity=local, **result)
+    return {"received": received["received"], **result}
+
+
 # ── Sweep and trim ─────────────────────────────────────────────────────────
 
 
@@ -801,6 +900,21 @@ def main(argv: list[str] | None = None) -> int:
     receive_cmd.add_argument("--timeout", type=float, default=900.0)
     receive_cmd.add_argument("pull", nargs=argparse.REMAINDER)
 
+    seed_cmd = sub.add_parser("seed")
+    seed_cmd.add_argument("--from", dest="peer", required=True,
+                          help="peer host name, recorded in the audit")
+    seed_cmd.add_argument("--local-identity", required=True, type=Path)
+    seed_cmd.add_argument("--peer-identity", required=True, type=Path)
+    seed_cmd.add_argument("--max-bytes", type=parse_size, default=parse_size("20G"))
+    seed_cmd.add_argument("--timeout", type=float, default=3600.0)
+    seed_cmd.add_argument("pull", nargs=argparse.REMAINDER)
+
+    identity_cmd = sub.add_parser("identity")
+    identity_cmd.add_argument("--golden", required=True)
+    identity_cmd.add_argument("--compiler", required=True,
+                              help="the guest compiler's version line")
+    identity_cmd.add_argument("--tart", default=os.environ.get("TARTCI_CCACHE_LAYER_TART", "tart"))
+
     trim_cmd = sub.add_parser("trim")
     trim_cmd.add_argument("--max-size", required=True, type=parse_size)
     trim_cmd.add_argument("--trim-interval", type=float, default=0.0)
@@ -822,6 +936,14 @@ def main(argv: list[str] | None = None) -> int:
                 parser.error("receive needs the pull command after --")
             print(json.dumps(receive(layout, args.vm, args.owner_pid, pull,
                                      args.max_bytes, args.timeout), sort_keys=True))
+        elif args.command == "seed":
+            pull = args.pull[1:] if args.pull[:1] == ["--"] else args.pull
+            if not pull:
+                parser.error("seed needs the peer pull command after --")
+            print(json.dumps(seed(layout, args.peer, args.local_identity, args.peer_identity,
+                                  pull, args.max_bytes, args.timeout), sort_keys=True))
+        elif args.command == "identity":
+            print(json.dumps(identity(args.golden, args.compiler, args.tart), sort_keys=True))
         elif args.command == "attach":
             print(attach(layout, args.vm, args.owner_pid))
         elif args.command == "settle":
@@ -840,7 +962,7 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps(sweep(layout, presence, **options), sort_keys=True))
         else:
             print(json.dumps(trim(layout, args.max_size, args.trim_interval)))
-    except (OSError, ValueError, ReceiveError) as exc:
+    except (OSError, ValueError, ReceiveError, SeedError) as exc:
         print(f"ccache_layer: {exc}", file=sys.stderr)
         return 1
     return 0
