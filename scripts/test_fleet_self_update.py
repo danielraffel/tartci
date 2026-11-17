@@ -538,15 +538,12 @@ class FakeSystem(su.System):
                 return ok(json.dumps({"state": "on", "participating": True,
                                       "fleet": {"managed": True, "fleet_ready": False,
                                                 "problems": self.status_problems}}))
-            # Both describe the host after the update's pool on, never the
-            # pre-update baseline read.
             if (self.broken_target and self.running() != INSTALLED) or \
-                    (self.broken_previous and self.running() == INSTALLED
-                     and self.on_at is not None):
+                    (self.broken_previous and self.running() == INSTALLED):
                 return ok(json.dumps({"state": "on", "participating": True,
                                       "fleet": {"managed": True, "fleet_ready": False,
                                                 "problems": ["broken"]}}))
-            if self.settling_reads > 0 and self.on_at is not None:
+            if self.settling_reads > 0:
                 self.settling_reads -= 1
                 return ok(json.dumps({"state": "on", "participating": True,
                                       "fleet": {"managed": True, "fleet_ready": False,
@@ -964,14 +961,8 @@ class HappyPathTests(Base):
             "capacity_floor.py", "pool drain", "pool off --plan")]
         order.append(first(lambda c: c.startswith("./tartci pool off") and "--plan" not in c))
         order += [first(lambda c, n=n: n in c) for n in ("--apply", "pool on")]
-        # Verification reads pool status after pool on.
-        order.append(next(i for i, c in enumerate(joined) if i > order[-1]
-                          and "pool status" in c and not c.startswith("ssh")))
+        order.append(first(lambda c: "pool status" in c and not c.startswith("ssh")))
         self.assertEqual(order, sorted(order))
-        # The readiness baseline is read before the drain.
-        baseline = next(i for i, c in enumerate(joined)
-                        if "pool status" in c and not c.startswith("ssh"))
-        self.assertLess(baseline, first(lambda c: "pool drain" in c))
         self.assertEqual(self.last()["status"], "succeeded")
         self.assertFalse((self.cfg.state_dir / "active.json").exists())
         # No launch helper, no launcher change: the store is never written.
@@ -2356,87 +2347,12 @@ class HostConditionVerifyTests(Base):
         self.assertUpdated(self.apply())
 
     def test_a_real_problem_beside_a_host_condition_still_fails(self) -> None:
-        # Control: only the host conditions are set aside. The real problem
-        # appears with the update (one already there is a baseline problem,
-        # StandingProblemVerifyTests).
-        self.sys.status_problems = [self.SLEEPS]
-        original = self.sys._shim
-
-        def shim(args):
-            if args[:2] == ["pool", "status"] and self.sys.on_at is not None:
-                self.sys.status_problems = [self.SLEEPS, {"code": "loaded_receipt_mismatch",
-                                                          "label": "lane"}]
-            return original(args)
-        self.sys._shim = shim
+        # Control: only the host conditions are set aside.
+        self.sys.status_problems = [self.SLEEPS, {"code": "loaded_receipt_mismatch",
+                                                  "label": "lane"}]
         self.assertNotEqual(self.apply(), su.EXIT_OK)
         self.assertNotEqual(self.last()["status"], "succeeded")
         self.assertIn("loaded_receipt_mismatch", self.last()["error"])
-
-
-class StandingProblemVerifyTests(Base):
-    """A readiness problem the host already had never fails the update.
-
-    One lane broken before an update failed verification of the new
-    generation and of the rollback alike, and three failures halted
-    self-update on that host.
-    """
-
-    BROKEN_LANE = {"code": "loaded_receipt_mismatch", "label": "pulp-gate.slot2",
-                   "detail": "receipt sha differs (age 41 min)"}
-
-    def test_a_problem_present_before_the_update_does_not_fail_it(self) -> None:
-        self.sys.status_problems = [self.BROKEN_LANE]
-        self.assertUpdated(self.apply())
-        attempt = max((self.cfg.state_dir / "attempts").glob("*.json"),
-                      key=lambda path: path.stat().st_mtime_ns)
-        steps = [s for s in json.loads(attempt.read_text())["steps"] if s["step"] == "baseline"]
-        self.assertIn("loaded_receipt_mismatch", steps[0]["detail"])
-
-    def test_its_detail_may_change_and_it_is_still_the_same_problem(self) -> None:
-        self.sys.status_problems = [self.BROKEN_LANE]
-        original = self.sys._shim
-
-        def shim(args):
-            if args[:2] == ["pool", "status"] and self.sys.on_at is not None:
-                self.sys.status_problems = [{**self.BROKEN_LANE, "detail": "age 44 min"}]
-            return original(args)
-        self.sys._shim = shim
-        self.assertUpdated(self.apply())
-
-    def test_a_new_problem_beside_a_standing_one_still_fails(self) -> None:
-        # Control: only what was there before is set aside.
-        self.sys.status_problems = [self.BROKEN_LANE]
-        original = self.sys._shim
-
-        def shim(args):
-            if args[:2] == ["pool", "status"] and self.sys.on_at is not None:
-                self.sys.status_problems = [self.BROKEN_LANE,
-                                            {"code": "heartbeat_stale", "label": "vellum-gate"}]
-            return original(args)
-        self.sys._shim = shim
-        self.assertNotEqual(self.apply(), su.EXIT_OK)
-        self.assertIn("heartbeat_stale", self.last()["error"])
-        self.assertNotIn("pulp-gate.slot2", self.last()["error"].split("fleet not ready")[1]
-                         if "fleet not ready" in self.last()["error"] else "")
-
-    def test_the_rollback_is_verified_against_the_same_baseline(self) -> None:
-        # The new generation breaks something; the previous one is back to
-        # just the standing problem, so the rollback verifies.
-        self.sys.status_problems = [self.BROKEN_LANE]
-        original = self.sys._shim
-
-        def shim(args):
-            if args[:2] == ["pool", "status"]:
-                self.sys.status_problems = [self.BROKEN_LANE] + (
-                    [{"code": "loaded_receipt_mismatch", "label": "forge-gate"}]
-                    if self.sys.running() != INSTALLED else [])
-            return original(args)
-        self.sys._shim = shim
-        self.assertEqual(self.apply(), su.EXIT_FAILED)
-        last = self.last()
-        self.assertEqual(last["status"], "rolled_back", last["error"])
-        self.assertIn("forge-gate", last["error"])
-        self.assertEqual(self.sys.running(), INSTALLED)
 
 
 class RelayTests(Base):

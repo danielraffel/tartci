@@ -2779,14 +2779,6 @@ fleet`), and check GitHub's job history against it with
   hang an unattended run; the refusal says to run `pulp ship doctor`), then the
   launcher is built under the reseal runbook's immutability preconditions and
   verified.
-- **Verify against what was already wrong.** Just before the drain the run
-  reads this host's readiness problems (`pool status`) and records them as
-  receipt step `baseline`. Verification of the new generation, and of the
-  previous one after a rollback, fails only on a readiness problem that is
-  not in that baseline (matched by code and the lane, label or path it
-  names, never its detail). One lane broken before an update used to fail
-  the update and its rollback alike, and three such failures halted
-  self-update on the host. A problem the update introduces still fails it.
 - **Skew after a verified apply.** The run re-measures skew for the generation
   it just installed and verified, and rewrites `skew.json` (`recorded_by:
   verified_apply`) before finishing, so status reads current at once instead

@@ -59,7 +59,7 @@ import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -4345,9 +4345,6 @@ class Run:
 
     def _update(self) -> None:
         cfg, sys_ = self.cfg, self.sys
-        self.baseline_problems = fleet_problem_keys(cfg, sys_)
-        self.receipt.step("baseline", f"{len(self.baseline_problems)} readiness problem(s) "
-                          "before the update: " + "; ".join(self.baseline_problems)[:300])
         self.phase = "drain"
         drain = tartci(cfg, sys_, "pool", "drain", *self.flag)
         if drain.rc not in (0, 3):  # 3 = drain pending on a persistent runner
@@ -4399,7 +4396,7 @@ class Run:
                 raise LauncherConsent(self.pool_on_text)
             raise Failed("pool on failed after install")
         self.phase = "verify"
-        verify(cfg, sys_, self.target, self.receipt, self.baseline_problems)
+        verify(cfg, sys_, self.target, self.receipt)
         self._publish_tart()
         self.phase = "support-agents"
         self._support_agents()
@@ -5023,8 +5020,7 @@ class Run:
             if not self._pool_on(restore_receipt=True):
                 raise Failed("pool on after rollback failed")
             rollback_pool_on_ok = True
-            verify(cfg, sys_, self.previous, self.receipt,
-                   getattr(self, "baseline_problems", ()))
+            verify(cfg, sys_, self.previous, self.receipt)
         except BaseException as exc:  # noqa: BLE001 - incl. a second SIGTERM
             # Whatever the rollback's own failure, capacity comes back: a
             # failed verification is never a reason to leave the host out.
@@ -5105,38 +5101,10 @@ def _announce(cfg: Config, sys_: System, me: str, target: str,
             raise Deferred(f"peer announced first (or won the tie): {info['evidence']}")
 
 
-def problem_key(problem: object) -> str:
-    """A readiness problem's identity across reads: its code and what it names,
-    never its detail (which carries ages and counts)."""
-    if isinstance(problem, dict):
-        return json.dumps({key: problem[key] for key in ("code", "label", "lane", "name", "path")
-                           if key in problem}, sort_keys=True)
-    return json.dumps(problem, sort_keys=True, default=str)
-
-
-def fleet_problem_keys(cfg: Config, sys_: System) -> list[str]:
-    """This host's readiness problems before the update touches anything. A
-    problem already here is not the update's doing; verifying the new and the
-    rolled-back generation against it failed every update and every rollback
-    while one lane stayed broken, until three failures halted self-update.
-    An unreadable status is an empty baseline: every problem then counts."""
-    status = installed_tartci(cfg, sys_, "pool", "status", "--json")
-    try:
-        value = json.loads(status.out)
-    except json.JSONDecodeError:
-        return []
-    fleet = value.get("fleet") if isinstance(value, dict) else None
-    problems = (fleet or {}).get("problems") if isinstance(fleet, dict) else None
-    return sorted({problem_key(p) for p in problems or []})
-
-
-def _verify_once(cfg: Config, sys_: System, target: str,
-                 baseline: Iterable[str] = ()) -> tuple[list[str], bool, list[str]]:
+def _verify_once(cfg: Config, sys_: System, target: str) -> tuple[list[str], bool, list[str]]:
     """(problems, settling). settling: every problem is a lane that has not yet
     written its first heartbeat, which a freshly loaded supervisor needs a few
-    seconds to do. A readiness problem in `baseline` (present before the
-    update began) does not count."""
-    excused = set(baseline)
+    seconds to do."""
     problems = []
     settling = False
     heartbeat_labels: list[str] = []
@@ -5152,8 +5120,7 @@ def _verify_once(cfg: Config, sys_: System, target: str,
             problems.append(f"pool is {value.get('state')} after pool on")
         if fleet.get("managed") and fleet.get("fleet_ready") is not True:
             found = [p for p in fleet.get("problems") or []
-                     if not (isinstance(p, dict) and p.get("code") in HOST_CONDITION_CODES)
-                     and problem_key(p) not in excused]
+                     if not (isinstance(p, dict) and p.get("code") in HOST_CONDITION_CODES)]
             if found or not fleet.get("problems"):
                 problems.append(f"fleet not ready: {found}")
             heartbeat_labels = [str(p.get("label")) for p in found
@@ -5217,8 +5184,7 @@ def _rollback_terminal_message(reason: str, previous: str) -> str:
     return f"{reason}; rolled back to {previous[:12]} and verified"
 
 
-def verify(cfg: Config, sys_: System, target: str, receipt: Receipt,
-           baseline: Iterable[str] = ()) -> None:
+def verify(cfg: Config, sys_: System, target: str, receipt: Receipt) -> None:
     """Pool on, fleet ready, executing `target`, guard present.
 
     Verification runs seconds after `pool on`, before a just-loaded supervisor
@@ -5227,7 +5193,7 @@ def verify(cfg: Config, sys_: System, target: str, receipt: Receipt,
     """
     deadline = sys_.now() + VERIFY_SETTLE_SECONDS
     while True:
-        problems, settling, heartbeat_labels = _verify_once(cfg, sys_, target, baseline)
+        problems, settling, heartbeat_labels = _verify_once(cfg, sys_, target)
         if not problems:
             break
         if not settling or sys_.now() >= deadline:
