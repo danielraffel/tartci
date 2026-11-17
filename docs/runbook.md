@@ -1008,7 +1008,9 @@ host already has, result or manifest, always wins. The store is then trimmed to
 `--max-size`. A seed refuses:
 - unless both identity files parse and match exactly (before anything is pulled);
 - while `green/` holds a layer waiting to promote, because its manifests would
-  lose to the seeded ones;
+  lose to the seeded ones. This is checked only when the seed starts: a job that
+  settles green during a long seed can still lose a manifest to a seeded one,
+  which costs that key a miss, never a wrong object;
 - when the local store already has entries, unless `--force-warm` is given;
 - while another seed holds `seed.lock`.
 
@@ -1021,7 +1023,8 @@ its promotion, controls every key the cold host does not already have, for every
 later trusted and untrusted build on that host, until the entries are trimmed or
 removed. Seed only from a fleet host whose own audit shows trusted promotions.
 
-Rollback: each seed lists the keys it added in
+Rollback: each seed lists the keys it added (written even when promotion fails
+partway) in
 `ccache-layer-state/promotions/seed-<peer>-<ts>-<id>.keys`. Deleting those
 entries returns the store to its state before the seed (a later job may have
 used them; removing an entry only causes a miss):

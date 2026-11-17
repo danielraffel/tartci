@@ -730,7 +730,11 @@ class SeedTests(Base):
 
     def setUp(self) -> None:
         super().setUp()
-        self.peer_root = self.tmp / "peer-root"
+        # Outside Base's "ccache-layer-*" temp dir: the guard refuses any root
+        # with a component starting "ccache".
+        peer_tmp = Path(tempfile.mkdtemp(prefix="seed-peer-"))
+        self.addCleanup(shutil.rmtree, peer_tmp, True)
+        self.peer_root = peer_tmp / "peer-root"
         self.peer_shared = self.peer_root / "ccache-layers-v1" / "shared"
         self.peer_promotions = self.peer_root / "ccache-layer-state" / "promotions"
         self.peer_shared.mkdir(parents=True)
@@ -802,7 +806,11 @@ class SeedTests(Base):
         marker = self.tmp / "pulled"
         self.ssh.write_text(f"#!/bin/sh\ntouch {marker}\n")
         for root in (str(self.tmp / "legacy-root" / "ccache"), str(legacy),
-                     "~/.cache/pulp-ci/ccache", "~/x/ccache-layers-v1", "~/a/../b", "rel/path"):
+                     "~/.cache/pulp-ci/ccache", "~/x/ccache-layers-v1", "~/a/../b", "rel/path",
+                     # The Linux guests' read-write mount, and the legacy mount
+                     # spelled in another case (APFS is case-insensitive).
+                     "~/.cache/pulp-ci/ccache-linux", "~/.cache/pulp-ci/CCache",
+                     "~/x/TARTCI-LAYERS-V1"):
             with self.subTest(root=root):
                 self.assert_refused("peer cache root", peer_cache_root=root)
                 self.assertFalse(marker.exists(), "a refused source is never pulled")
@@ -903,6 +911,45 @@ class SeedTests(Base):
                 self.assert_refused("No space left")
             self.assertEqual(list(self.layout.jobs.iterdir()), [])
         self.assertEqual(self.shared_keys(), set())
+
+    def test_a_partial_promotion_still_records_every_linked_key(self) -> None:
+        import errno as errno_mod  # noqa: PLC0415
+        from unittest import mock  # noqa: PLC0415
+        first, second = "ab" + "1" * 38, "ab" + "2" * 38
+        self.peer_entry(first, entry(0))
+        self.peer_entry(second, entry(0))
+        real = cl.publish_result
+        calls = {"n": 0}
+
+        def publish_then_fill_disk(src: Path, dest: Path) -> str:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise OSError(errno_mod.ENOSPC, "No space left on device")
+            return real(src, dest)
+
+        with mock.patch.object(cl, "publish_result", side_effect=publish_then_fill_disk):
+            self.assert_refused("No space left")
+        self.assertEqual(self.shared_keys(), {first})
+        [keys_file] = self.layout.promotions.glob("seed-m5studio-*.keys")
+        self.assertEqual(keys_file.read_text().split(), [first])
+
+    def test_the_remote_key_filter_drops_anything_but_a_lowercase_key(self) -> None:
+        import tarfile  # noqa: PLC0415
+        good = "ab" + "1" * 38
+        self.peer_entry(good, entry(0))
+        for key in ("AB" + "1" * 38, "ab" + "1" * 37 + "Z"):
+            write_entry(self.peer_shared, key, entry(0))
+        (self.peer_shared / "x").mkdir()
+        (self.peer_shared / "x" / "y").write_bytes(entry(0))
+        (self.peer_promotions / "odd.keys").write_text("\n".join([
+            "AB" + "1" * 38, "ab" + "1" * 37 + "Z", "../../etc/passwd", "ab/" + "1" * 37,
+            "a", "", "xy", "ab*", "ab " + "1" * 36, "$(touch pwned)"]) + "\n")
+        out = subprocess.run(cl.seed_pull_command("m5studio", str(self.peer_root), str(self.ssh)),
+                             capture_output=True, check=True, cwd=self.tmp)
+        with tarfile.open(fileobj=io.BytesIO(out.stdout)) as archive:
+            names = [member.name for member in archive]
+        self.assertEqual(names, [f"remote/ab/{'1' * 38}"])
+        self.assertFalse((self.tmp / "pwned").exists())
 
     def test_identity_hashes_the_golden_configuration(self) -> None:
         fake = self.tmp / "tart"

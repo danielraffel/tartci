@@ -385,16 +385,18 @@ def publish_manifest(src: Path, dest: Path, lock_path: Path) -> str:
         return "replaced" if existing is not None else "promoted"
 
 
-def promote_layer(layout: Layout, layer: Path,
-                  replace_manifests: bool = True) -> dict[str, int | list[str]]:
+def promote_layer(layout: Layout, layer: Path, replace_manifests: bool = True,
+                  keys: list[str] | None = None) -> dict[str, int | list[str]]:
     """Publish every valid entry of a green layer into ``shared/``.
 
     ``replace_manifests=False`` publishes a manifest only where the key is
     absent, exactly like a result entry: a seed never repoints a local key.
+    ``keys``, when given, is filled as each key is published, so a caller still
+    knows what landed when promotion fails partway.
     """
     counts: dict[str, int] = {"promoted": 0, "replaced": 0, "existing": 0,
                               "rejected": 0, "bytes": 0}
-    keys: list[str] = []
+    keys = [] if keys is None else keys
     lock_path = layout.locks / "shared-manifests.lock"
     remote = layer / "remote"
     # The guest owns jobs/<vm> read-write, so it can swap remote/ for a link
@@ -679,7 +681,11 @@ CACHE_ROOT_SHAPE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]*$")
 # $CACHE_ROOT/ccache/tartci-layers-v1/shared, inside the legacy guest-writable
 # mount. Its entries pass header validation, so a source under it would import
 # objects a pull-request guest could have written.
-FORBIDDEN_ROOT_PARTS = ("ccache", "tartci-layers-v1", "ccache-layers-v1")
+# Compared casefolded (APFS is case-insensitive: CCache/ is ccache/), so any
+# component starting "ccache" (ccache/, ccache-linux/, the Linux guests'
+# read-write mount) or ending "layers-v1" is refused.
+FORBIDDEN_ROOT_PREFIX = "ccache"
+FORBIDDEN_ROOT_SUFFIX = "layers-v1"
 
 
 class SeedError(Exception):
@@ -722,7 +728,9 @@ def check_peer_cache_root(root: str) -> str:
     parts = [part for part in root.split("/") if part not in ("", "~")]
     if not CACHE_ROOT_SHAPE.fullmatch(root) or ".." in parts or "." in parts:
         raise SeedError(f"invalid peer cache root: {root!r}")
-    bad = [part for part in parts if part in FORBIDDEN_ROOT_PARTS]
+    bad = [part for part in parts
+           if part.casefold().startswith(FORBIDDEN_ROOT_PREFIX)
+           or part.casefold().endswith(FORBIDDEN_ROOT_SUFFIX)]
     if bad:
         raise SeedError(f"peer cache root {root!r} names {bad}: the source must be "
                         "<CACHE_ROOT>/ccache-layers-v1/shared, never under a ccache/ mount")
@@ -747,11 +755,13 @@ def seed_pull_command(peer: str, peer_cache_root: str, ssh: str = "ssh") -> list
     shared = _remote_path(root, "ccache-layers-v1", "shared")
     promotions = _remote_path(root, "ccache-layer-state", "promotions")
     script = (
-        "set -eu; "
+        "set -eu; export LC_ALL=C; "
         f"cd {shared}; "
-        f"cat {promotions}/*.keys 2>/dev/null | LC_ALL=C sort -u | "
+        f"cat {promotions}/*.keys 2>/dev/null | sort -u | "
         "while IFS= read -r k; do "
-        "case $k in *[!0-9a-z]*|?|'') continue;; esac; "
+        # Spelled out, not a range: a locale may let [a-z] match uppercase,
+        # and APFS would then resolve AB/... to the ab/... file.
+        "case $k in *[!0123456789abcdefghijklmnopqrstuvwxyz]*|?|'') continue;; esac; "
         'f="${k%\"${k#??}\"}/${k#??}"; '
         '[ -f "$f" ] && [ ! -L "$f" ] && printf \'%s\\n\' "$f"; '
         # No AppleDouble ._ members for extended attributes.
@@ -805,15 +815,18 @@ def seed(layout: Layout, peer: str, local_identity: Path, peer_identity: Path,
                     f"-{uuid.uuid4().hex[:6]}")
             received = receive(layout, name, os.getpid(), command, max_bytes, timeout)
             layer = layout.jobs / name
+            added: list[str] = []
             try:
-                result = promote_layer(layout, layer, replace_manifests=False)
+                result = promote_layer(layout, layer, replace_manifests=False, keys=added)
             finally:
+                # Written even when promotion fails partway, so the rollback
+                # list always names every key this seed linked.
+                if added:
+                    (layout.promotions / f"{name}.keys").write_text("\n".join(added) + "\n")
                 remove_tree(layer)
                 with contextlib.suppress(OSError):
                     (layout.owners / name).unlink()
-            keys = result.pop("keys")
-            if keys:
-                (layout.promotions / f"{name}.keys").write_text("\n".join(keys) + "\n")
+            result.pop("keys")
             trimmed = trim(layout, max_size, 0.0)
     except (SeedError, ReceiveError, OSError, ValueError, subprocess.SubprocessError) as exc:
         audit(layout, "ccache_seed", peer=peer[:80], verdict="refused",
