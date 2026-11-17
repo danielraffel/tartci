@@ -2555,6 +2555,29 @@ class SealedTests(Base):
         receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
         self.assertTrue(all(json.loads(p.read_text())["status"] != "running" for p in receipts))
 
+    def test_a_live_launcher_that_does_not_verify_refuses_before_the_queue_wait_and_build(self) -> None:
+        # m3, 2026-11-15..17: 11 attempts waited out a heavy queue, built and signed a
+        # launcher, then refused at the snapshot on the same standing digest mismatch.
+        self.sys.snapshot_verify_rc = 1
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
+                             for a, _ in self.sys.calls))
+        self.assertEqual(self.sys.mutations(), [])
+        latest = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        steps = json.loads(latest.read_text())["steps"]
+        names = [step["step"] for step in steps]
+        self.assertIn("live launcher does not verify", steps[-1]["detail"] if "detail" in steps[-1]
+                      else json.dumps(steps[-1]))
+        self.assertNotIn("queue-light", names)
+        self.assertNotIn("announce", names)
+
+    def test_a_verified_live_launcher_is_reported_in_the_plan(self) -> None:
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        latest = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        steps = json.loads(latest.read_text())["steps"]
+        self.assertTrue(any(s["step"] == "live-launcher-verify" and s["ok"] for s in steps))
+
     def test_snapshot_that_does_not_verify_refuses_before_drain(self) -> None:
         self.sys.snapshot_verify_rc = 1
         self.assertEqual(self.apply(), su.EXIT_REFUSED)
