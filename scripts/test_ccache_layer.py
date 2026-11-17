@@ -87,6 +87,51 @@ class VerdictTests(unittest.TestCase):
         merge_group = '{"conclusion":"success","event":"merge_group","head_branch":"gh-readonly-queue/main/x"}'
         self.assertEqual(cl.verdict(0, "terminal", merge_group, "none", None)[0], "green")
 
+    PENDING_RUN = ('{"kind":"terminal_pending_run","job_status":"completed",'
+                   '"run_status":"in_progress","conclusion":"success","event":"push",'
+                   '"head_branch":"main","run_id":1,"job_id":2}')
+
+    def test_a_completed_job_whose_run_is_still_going_is_green(self) -> None:
+        # A trusted job followed by another job in the same run: the job is
+        # completed and successful, only the run is not, and the lifecycle
+        # quarantines the observation for reclamation.
+        q = "listener_exited_workflow_active"
+        self.assertEqual(cl.verdict(0, "terminal_pending_run", self.PENDING_RUN, q,
+                                    "Succeeded", "1", "2"), ("green", "receipt=push:main"))
+        merge_group = self.PENDING_RUN.replace('"push"', '"merge_group"').replace(
+            '"main"', '"gh-readonly-queue/main/pr-1-abc"')
+        self.assertEqual(cl.verdict(0, "terminal_pending_run", merge_group, q, None, "1", "2"),
+                         ("green", "receipt=merge_group"))
+        self.assertEqual(cl.verdict(0, "terminal_pending_run", self.PENDING_RUN, "none",
+                                    None, "1", "2")[0], "green")
+
+    def test_a_pending_run_receipt_short_of_proof_stays_red(self) -> None:
+        q = "listener_exited_workflow_active"
+        p = self.PENDING_RUN
+        cases = {
+            "untrusted_ref": (0, "terminal_pending_run", p.replace('"push"', '"pull_request"'),
+                              q, None, "1", "2"),
+            "job_failed": (0, "terminal_pending_run", p.replace('"success"', '"failure"'),
+                           q, None, "1", "2"),
+            "local_failed": (0, "terminal_pending_run", p, q, "Failed", "1", "2"),
+            "runner_rc": (124, "terminal_pending_run", p, q, None, "1", "2"),
+            "run_unbound": (0, "terminal_pending_run", p, q, None, "9", "2"),
+            "job_unbound": (0, "terminal_pending_run", p, q, None, "1", "9"),
+            "ids_missing": (0, "terminal_pending_run", p, q, None, "", ""),
+            "job_not_completed": (0, "terminal_pending_run",
+                                  p.replace('"completed"', '"in_progress"'), q, None, "1", "2"),
+            "receipt_kind_mismatch": (0, "terminal_pending_run",
+                                      p.replace('"terminal_pending_run"', '"active"'),
+                                      q, None, "1", "2"),
+            "other_quarantine": (0, "terminal_pending_run", p, "signal_teardown_unknown",
+                                 None, "1", "2"),
+            "active_capture": (0, "active", p.replace('"terminal_pending_run"', '"active"'),
+                               q, "Succeeded", "1", "2"),
+        }
+        for name, args in cases.items():
+            with self.subTest(name):
+                self.assertEqual(cl.verdict(*args)[0], "red")
+
     def test_a_forged_runner_log_line_is_not_proof(self) -> None:
         # The guest writes the runner log, so "Succeeded" there proves nothing.
         for capture in ("", "active", "setup_error", "terminal_unknown"):

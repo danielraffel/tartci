@@ -946,7 +946,11 @@ September 2026 torn manifests made every gate build link the wrong objects for
 - when, and only when, the job's verdict is green (clean listener exit, no
   lifecycle quarantine, and the host's own GitHub observation: a `terminal`
   receipt with conclusion `success`, bound to this run and job, for a trusted
-  ref: a push to `main` or a merge-group run). The guest-written runner log is
+  ref: a push to `main` or a merge-group run). A job that completed while later
+  jobs of its run were still going is observed as `terminal_pending_run` and
+  carries the `listener_exited_workflow_active` lifecycle quarantine; that
+  pairing is accepted when the receipt says the job completed with `success`
+  and is bound to both the run and the job. The guest-written runner log is
   attacker-controlled output; it can turn a verdict red but never green, and
   no receipt means red. A pull-request job's results are never promoted. The host
   pulls the guest's entries over ssh as a tar stream while the VM is still up
