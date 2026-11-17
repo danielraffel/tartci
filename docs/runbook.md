@@ -2507,6 +2507,20 @@ alert, so its peers raise it.
   and `events.jsonl` (`peer_launchd_stalled`, once per episode).
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.
+- **Shipyard drift.** The same read prints the peer's
+  `~/.tartci/state/tool-freshness/state.json`. A peer more than one Shipyard
+  release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 6 h
+  (`TARTCI_SHIPYARD_DRIFT_HOURS`, 6, counted on the peer's clock from the
+  first release newer than what it runs) behind the latest release opens
+  `[tartci] <peer> Shipyard behind the latest release since <that time>`. So
+  does a peer whose freshness was last measured more than 6 h ago, since a
+  host whose watchdog stopped cannot report itself. The body quotes the
+  peer's own apply line (`waiting for steward host studio: ...`), so it names
+  the gate that holds it. It closes when a fresh reading says `current`, and
+  a peer with no measurement decides nothing. The primary-reader rule above
+  applies, and the episode is `<peer>.shipyard-drift.json`. This exists because
+  m1 and m5s sat on 0.439.2 for 12 h behind 0.440.0 on 2026-11-17 while
+  every per-host view called them only "behind".
 - **Host-vitals timer stall.** The same peer tick reads
   `~/.local/state/pulp/host_vitals.json` using the peer's clock. A sample older
   than `TARTCI_HOST_VITALS_ALERT_SECS` (default 300 seconds) opens one issue
