@@ -2460,6 +2460,35 @@ run_runner_until_done(){
   return "$layer_rc"
 }
 
+# Delete this boot's JIT runner registration before an idle teardown, to close
+# the race where GitHub assigns it a job just as the idle timeout fires (a job
+# that then fails with 0 steps after ~10 min: 10 Vellum GPU jobs in 4.4 days).
+# GitHub refuses to delete a runner that is running a job (HTTP 422), so:
+#   deleted <name>   the runner is gone and can no longer be assigned: kill the VM
+#   absent <name>    GitHub has no such runner: nothing can be assigned to it
+#   busy <name>      422, the runner was assigned a job: keep the VM
+#   error <detail>   any other failure: today's behaviour (kill), logged
+# Uses the same App identity and repo as the JIT mint.
+tartci_idle_delete_runner(){
+  local name="$1" root="${CURRENT_RUNNER_API_ROOT:-}" err id out rc
+  [ -n "$name" ] && [ -n "$root" ] || { echo "error no runner name or api root"; return 0; }
+  err="$(mktemp "${TMPDIR:-/tmp}/tartci-idle-del.XXXXXX")" || { echo "error mktemp failed"; return 0; }
+  id="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" "$JIT_GH_CLI" api "$root" --paginate \
+        --jq ".runners[] | select(.name==\"$name\") | .id" 2>"$err")" || {
+    echo "error list failed: $(tr '\n' ' ' <"$err" | cut -c1-160)"; rm -f "$err"; return 0
+  }
+  id="$(printf '%s\n' "$id" | head -n1)"
+  if [ -z "$id" ]; then rm -f "$err"; echo "absent $name"; return 0; fi
+  out="$(SHIPYARD_GH_APP_REPO="$REPO" GH_REPO="$REPO" "$JIT_GH_CLI" api -X DELETE "$root/$id" 2>&1)"; rc=$?
+  rm -f "$err"
+  if [ "$rc" -eq 0 ]; then echo "deleted $name id=$id"
+  elif printf '%s' "$out" | grep -qE 'HTTP 422|still running a job|is currently running'; then echo "busy $name id=$id"
+  elif printf '%s' "$out" | grep -q 'HTTP 404'; then echo "absent $name id=$id"
+  else echo "error delete failed: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-160)"
+  fi
+  return 0
+}
+
 run_runner_until_done_unlayered(){
   local vm="$1" ip="$2" jit="$3" selected_tier="${4:-0}"
   local runner_log="$STATE_DIR/$vm.actions-runner.log"
@@ -2530,7 +2559,7 @@ run_runner_until_done_unlayered(){
   start="$(date +%s)"
   [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \
     || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))
-  local guest_beat_seen=0 guest_silent listening_at=0
+  local guest_beat_seen=0 guest_silent listening_at=0 idle_gate idle_busy=0
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
@@ -2582,6 +2611,24 @@ run_runner_until_done_unlayered(){
     fi
     if [ "$assigned" = 0 ] && [ "$listening_at" != 0 ] \
        && [ $((now - listening_at)) -ge "$IDLE_TIMEOUT" ]; then
+      # A job can land between the check above and now: look once more, then
+      # delete the registration, which GitHub refuses (422) while it is busy.
+      if grep -q 'Running job:' "$runner_log" 2>/dev/null; then
+        continue
+      fi
+      idle_gate="$(tartci_idle_delete_runner "${CURRENT_REGISTERED_RUNNER:-$vm}")"
+      case "$idle_gate" in
+        busy*)
+          idle_busy=$((idle_busy + 1))
+          event idle_timeout_overtaken "runner was assigned a job at the idle deadline; keeping the VM ($idle_gate) try=$idle_busy"
+          if [ "$idle_busy" -le 24 ]; then
+            sleep 2
+            continue
+          fi
+          ;;
+        deleted*|absent*) event idle_runner_deleted "$idle_gate" ;;
+        *) event idle_delete_failed "$idle_gate; tearing down as before" ;;
+      esac
       event idle_timeout "elapsed=$((now - listening_at))s since=listening listen_after=$((listening_at - start))s rerun_eligible=false"
       kill "$ssh_pid" 2>/dev/null || true
       wait "$ssh_pid" 2>/dev/null || true
@@ -2597,10 +2644,22 @@ run_runner_until_done_unlayered(){
         if grep -q 'Running job:' "$runner_log" 2>/dev/null; then
           event assignment_v2_idle_retarget_overtaken "elapsed=${idle_elapsed}s"
         else
-          kill "$ssh_pid" 2>/dev/null || true
-          wait "$ssh_pid" 2>/dev/null || true
-          sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
-          return "$IDLE_RETARGET_RC"
+          # Same race as the idle timeout: delete the registration first.
+          # GitHub refuses (422) while a job is assigned, and that runner stays.
+          idle_gate="$(tartci_idle_delete_runner "${CURRENT_REGISTERED_RUNNER:-$vm}")"
+          case "$idle_gate" in
+            busy*) event assignment_v2_idle_retarget_overtaken "elapsed=${idle_elapsed}s runner was assigned a job ($idle_gate)" ;;
+            *)
+              case "$idle_gate" in
+                error*) event idle_delete_failed "$idle_gate; retargeting as before" ;;
+                *) event idle_runner_deleted "$idle_gate" ;;
+              esac
+              kill "$ssh_pid" 2>/dev/null || true
+              wait "$ssh_pid" 2>/dev/null || true
+              sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
+              return "$IDLE_RETARGET_RC"
+              ;;
+          esac
         fi
       fi
       # Rearmed from after the scan, never from before it, so a slow
