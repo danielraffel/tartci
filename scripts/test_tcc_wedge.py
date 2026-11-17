@@ -274,6 +274,20 @@ class HealTests(unittest.TestCase):
         self.assertIn("same processes", record["detail"])
         self.assertEqual(record["pids_after"], same)
         self.assertIn("ineffective", tw.BUDGET_OUTCOMES)
+        # The fixture wrapper is not the SIGKILL version, so the record names it.
+        self.assertTrue(record.get("stale_wrapper"))
+        self.assertIn("install-tartci-heal-tcc.sh --apply", record["detail"])
+
+    def test_ineffective_heal_through_the_sigkill_wrapper_is_not_called_stale(self) -> None:
+        self.wrapper.write_text("#!/bin/bash\n" + tw.SIGKILL_VECTOR + "\n")
+        same = {"tccd": [10970], "sandboxd": [35552]}
+        record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
+        self.assertEqual(record["outcome"], "ineffective")
+        self.assertNotIn("stale_wrapper", record)
+        self.assertNotIn("--apply", record["detail"])
+
+    def test_the_repo_wrapper_is_the_sigkill_version(self) -> None:
+        self.assertTrue(tw.wrapper_sends_sigkill(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")))
 
     def test_changed_pids_after_a_zero_exit_are_ran(self) -> None:
         record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([
@@ -591,7 +605,7 @@ class WrapperSourceTests(unittest.TestCase):
     def test_wrapper_is_fixed_argument_less_and_rate_limited(self) -> None:
         text = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_text()
         self.assertIn('[[ $# -eq 0 ]] || die "takes no arguments"', text)
-        self.assertIn('"$KILLALL" -KILL tccd sandboxd', text)
+        self.assertIn(tw.SIGKILL_VECTOR, text)
         self.assertEqual(text.count('"$KILLALL"'), 1, "one fixed command vector")
         self.assertIn("MIN_INTERVAL=1800", text)
         self.assertIn("STAMP=$STAMP_DIR/last-heal", text)

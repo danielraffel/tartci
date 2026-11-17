@@ -109,6 +109,8 @@ BUDGET_OUTCOMES = frozenset({"ran", "ineffective", "not_permitted", "timeout", "
 HEALED_PROCESSES = ("tccd", "sandboxd")
 HEAL_SETTLE_S = 5.0
 PGREP = "/usr/bin/pgrep"
+# The wrapper's one command vector since it sends SIGKILL (fleet/ops/tartci-heal-tcc).
+SIGKILL_VECTOR = '"$KILLALL" -KILL tccd sandboxd'
 
 
 def _iso(epoch: float) -> str:
@@ -805,6 +807,20 @@ def unchanged_pids(before: dict[str, list[int]], after: dict[str, list[int]]) ->
     return all(before.get(name, []) == after.get(name, []) for name in HEALED_PROCESSES)
 
 
+def wrapper_sends_sigkill(wrapper: str) -> bool:
+    """Whether the installed wrapper is the SIGKILL version (read only; it is 0755).
+
+    The live wrapper is a root-owned copy installed by hand, so a repo change
+    reaches a host only when the installer is re-run. Unreadable reads as True:
+    nothing is claimed about a file this cannot see.
+    """
+    try:
+        with open(wrapper, encoding="utf-8", errors="replace") as handle:
+            return SIGKILL_VECTOR in handle.read()
+    except OSError:
+        return True
+
+
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
          runner: Optional[Callable[[list, float], tuple]] = None,
          wrapper: Optional[str] = None, sudo: Optional[str] = None,
@@ -815,9 +831,11 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
     """Run the scoped root wrapper once. Never anything broader.
 
     `ran` means the wrapper exited 0 AND the daemons it restarts are different
-    processes a few seconds later. If every PID is unchanged the signal was
-    delivered and ignored (m3, 2026-11-16: tccd 10784 and 10970 and sandboxd
-    35552 survived a heal that returned 0), so the outcome is `ineffective`.
+    processes a few seconds later. If every PID is unchanged the outcome is
+    `ineffective`. A wrapper installed before it sent SIGKILL sent SIGTERM,
+    which both daemons defer until idle (m3, 2026-11-16 and 11-17: tccd 10784
+    and 10970 and sandboxd 35552 survived heals that returned 0); the record
+    names that stale wrapper and the reinstall step.
     """
     now = time.time() if now is None else now
     runner = run_privileged_bounded if runner is None else runner
@@ -864,6 +882,12 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
             record["detail"] = ("killall returned 0 but tccd/sandboxd are the same processes "
                                 f"{settle_s:g}s later (pids {before_pids}); the heal did not "
                                 "restart them")
+            if not wrapper_sends_sigkill(wrapper):
+                record["stale_wrapper"] = True
+                record["detail"] += (f"; {wrapper} does not send SIGKILL (an install from before "
+                                     "the SIGKILL change, whose SIGTERM the daemons defer): "
+                                     "reinstall it with sudo fleet/ops/install-tartci-heal-tcc.sh "
+                                     "--apply")
         else:
             record["outcome"] = "ran"
     elif rc == 75:

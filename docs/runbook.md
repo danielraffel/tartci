@@ -593,8 +593,11 @@ and records the result; a store that answers again is `action: tcc-healed`.
 re-reads the PIDs of tccd and sandboxd about 5 s later: if they are all the same
 processes the outcome is `heal ineffective` (event `tcc_heal_ineffective` and a
 `WARN tcc-heal ineffective` line), the page continues, and nothing stronger is
-tried. A wider root helper is the owner's decision.
-It is installed by hand, once per host:
+tried. A wider root helper is the owner's decision. An `ineffective` heal
+whose installed wrapper does not send SIGKILL also records `stale_wrapper`:
+the live copy in `/usr/local/sbin` predates the SIGKILL change, and a repo
+change reaches a host only when the installer below is re-run there.
+It is installed by hand, once per host, and again after each wrapper change:
 
 ```sh
 fleet/ops/install-tartci-heal-tcc.sh             # plan
