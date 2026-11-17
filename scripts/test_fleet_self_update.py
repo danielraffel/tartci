@@ -1095,12 +1095,12 @@ class QueueLightTests(Base):
         self.assertSteppedAsideForQueue(self.apply())
 
     def took_turn_at(self, started: float, status: str = "refused") -> None:
-        """An earlier apply that announced its turn, then ended `status`."""
+        """An earlier apply that drained for its turn, then ended `status`."""
         attempts = self.cfg.state_dir / "attempts"
         attempts.mkdir(parents=True, exist_ok=True)
         su._write_json(attempts / "19990101T000000Z-turn.json", {
             "mode": "apply", "target": T_OLD, "status": status, "started_at": su._iso(started),
-            "steps": [{"step": "announce", "ok": True}]})
+            "steps": [{"step": "announce", "ok": True}, {"step": "drain", "ok": True}]})
 
     def test_a_turn_restarts_the_behind_main_clock(self) -> None:
         # A post-drain refusal is neither rate limited nor counted toward the
@@ -1125,7 +1125,12 @@ class QueueLightTests(Base):
             "steps": [{"step": "store-volume", "ok": False}]})
         su._write_json(attempts / "19990101T000001Z-y.json", {
             "mode": "plan", "status": "planned", "started_at": su._iso(NOW - 30),
-            "steps": [{"step": "announce", "ok": True}]})
+            "steps": [{"step": "drain", "ok": True}]})
+        # Announced, then the snapshot refused before any drain: still serving.
+        su._write_json(attempts / "19990101T000002Z-z.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 20),
+            "steps": [{"step": "announce", "ok": True},
+                      {"step": "snapshot-verify", "ok": False}]})
         self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
         self.took_turn_at(NOW - 900)
         self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 900)
