@@ -1067,6 +1067,35 @@ class QueueLightTests(Base):
         self.aside_since(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 600)
         self.assertSteppedAsideForQueue(self.apply())
 
+    def behind_main_for(self, seconds: float) -> None:
+        """The oldest undeployed commit finished its soak `seconds` ago."""
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def test_a_heavy_queue_drains_once_behind_main_past_the_bound(self) -> None:
+        # m3, 2026-11-17: a slow-store host fault released its queue place,
+        # so the next heavy queue started a fresh 3 h wait while m3 sat ten
+        # hours behind main. No ticket here, as after that release.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.assertUpdated(self.apply())
+        self.assertIn("behind main", self.queue_step())
+        self.assertIn("drains anyway", self.queue_step())
+
+    def test_a_heavy_queue_steps_aside_while_behind_main_inside_the_bound(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 600)}, 1800, NOW),
+                         0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW),
+                         3600.0)
+
     def test_the_bound_is_below_every_starvation_bound(self) -> None:
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_AFTER_SECONDS)
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_FALLBACK_SECONDS)
@@ -3102,6 +3131,30 @@ class StoreHealthRecordTests(unittest.TestCase):
         self.state.parent.mkdir(parents=True, exist_ok=True)
         self.state.write_text("{not json")
         self.assertEqual("unknown", su.System().store_health(str(self.store))[0])
+
+
+class HeavyQueueAfterHostFaultTests(Base):
+    """m3, 2026-11-17: a slow-store host fault releases the queue place, and
+    the heavy-queue bound must not restart from zero after it."""
+    sealed = True
+    demand = QueueLightTests.demand
+    receipt = QueueLightTests.receipt
+    queue_step = QueueLightTests.queue_step
+    behind_main_for = QueueLightTests.behind_main_for
+
+    def test_a_host_fault_does_not_restart_the_heavy_queue_bound(self) -> None:
+        self.demand(1)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("Tart store volume slow", self.receipt()["error"])
+        self.assertIsNone(su.waiting_ticket(self.cfg), "the place was released")
+        self.assertEqual([], self.sys.mutations())
+        # Next attempt: the store is fast again but the queue is heavy.
+        self.sys.store_result = {"ms": 4.0}
+        self.demand(4)
+        self.assertUpdated(self.apply())
+        self.assertIn("drains anyway", self.queue_step())
 
 
 class LauncherProbeStopTests(Base):

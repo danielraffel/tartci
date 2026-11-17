@@ -2962,8 +2962,10 @@ fleet`), and check GitHub's job history against it with
   and the receipt's `queue-light` step names the count. A host that serves no
   published gate registration is always light. After
   `queue_heavy_max_defer_seconds` (default 3 h, below both starvation bounds)
-  in the update queue the host drains anyway, so a fleet that is never idle
-  cannot hold a host on old code. Both are top-level keys in
+  in the update queue, or that long behind main (the oldest undeployed commit's
+  age past the soak), the host drains anyway, so a fleet that is never idle
+  cannot hold a host on old code. The behind-main clock matters because a
+  pre-drain host fault such as a slow store volume releases the queue place. Both are top-level keys in
   `~/.config/tartci/self-update.toml`. From 2026-11-10 m3 drained ten times for
   self-updates and once sat idle 25 minutes while gate jobs waited.
   `pool status` reports the host as `stepped aside, holding no update turn`.
