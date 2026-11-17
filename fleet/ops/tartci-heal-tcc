@@ -59,9 +59,17 @@ if [[ $EUID -ne 0 ]]; then
   export PATH="${TARTCI_HEAL_TCC_PATH:-$PATH}"
 fi
 
+# Resolve this after the unprivileged test overrides above.
+LOCK=$STAMP_DIR/heal.lock
 umask 077
 [[ -d "$STAMP_DIR" ]] || mkdir -m 0700 "$STAMP_DIR"
 [[ ! -L "$STAMP_DIR" && ! -L "$STAMP" ]] || die "refusing a symlinked stamp path: $STAMP" 70
+# mkdir is the atomic admission/reservation operation. Keep the lock until
+# after signaling so concurrent authorized callers cannot both spend the
+# budget. A stale lock fails closed; only the owner of the host can remove it.
+[[ ! -L "$LOCK" ]] || die "refusing a symlinked lock path: $LOCK" 70
+mkdir "$LOCK" 2>/dev/null || die "another heal is already in progress" 75
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
 now=$(date +%s)
 stamp_age=""

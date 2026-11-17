@@ -282,6 +282,9 @@ heal_bin="$tmp/heal-bin"; mkdir -p "$heal_bin"
 cat >"$heal_bin/killall" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
+if [ -n "${STUB_BLOCK_FILE:-}" ] && ( set -C; : >"$STUB_BLOCK_FILE" ) 2>/dev/null; then
+  while [ ! -e "${STUB_RELEASE_FILE:?}" ]; do sleep 0.02; done
+fi
 # A real killall exits 1 on a name with no match.
 [ "${2:-}" != sandboxd ] || exit "${STUB_KILLALL_SANDBOXD_RC:-${STUB_KILLALL_RC:-0}}"
 exit "${STUB_KILLALL_RC:-0}"
@@ -335,6 +338,19 @@ if [ "$(uname -s)" = Darwin ]; then
   expect_rc 0 "heal: sandboxd gone before its kill does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
   has out "sandboxd kill exited 1"
   grep -q "sandboxd_rc=1" "$tmp/heal.log" || fail "heal: the sandboxd miss is not logged"
+  # The lock covers both the budget reservation and the kill vectors: a
+  # concurrent caller must be rejected before it reaches killall.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  : >"$STUB_STATE/killall.log"
+  block="$tmp/heal.block"; release="$tmp/heal.release"
+  ( env STUB_BLOCK_FILE="$block" STUB_RELEASE_FILE="$release" "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL" >"$tmp/concurrent.out" 2>"$tmp/concurrent.err" ) &
+  first_pid=$!
+  for _ in $(seq 1 100); do [ -e "$block" ] && break; sleep 0.02; done
+  [ -e "$block" ] || fail "heal: first concurrent caller did not reach killall"
+  expect_rc 75 "heal: concurrent caller is rejected before signaling" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  touch "$release"
+  wait "$first_pid" || { cat "$tmp/concurrent.out" "$tmp/concurrent.err" >&2; fail "heal: first concurrent caller failed"; }
+  [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: concurrent caller reached killall"
 else
   expect_rc 78 "heal: refuses off macOS" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has err "macOS only"
