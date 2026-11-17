@@ -299,6 +299,13 @@ PENDING_DELETE_LAST_SEEN=""
 CURRENT_TEARDOWN_PENDING=""
 JOB_WARN="${TARTCI_JOB_WARN_SECS:-5400}"
 IDLE_TIMEOUT="${TARTCI_RUNNER_IDLE_TIMEOUT_SECS:-900}"
+# The idle clock above starts when the guest runner prints "Listening for
+# Jobs", not when it is launched: GitHub's listener needs 40-68 s to get there
+# (m1 p50 60 s) and a clock that included that start-up killed 8-13% of boots
+# before they could be offered a job. A listener that never reaches listening
+# is killed at this cap instead.
+LISTENER_STARTUP_CAP="${TARTCI_RUNNER_STARTUP_CAP_SECS:-180}"
+case "$LISTENER_STARTUP_CAP" in ''|*[!0-9]*|0) LISTENER_STARTUP_CAP=180 ;; esac
 # A listener whose guest stops writing TARTCI_GUEST_HEARTBEAT lines for this
 # long is a frozen VM, torn down in minutes rather than at JOB_TIMEOUT.
 GUEST_HEARTBEAT_STALE="${TARTCI_GUEST_HEARTBEAT_STALE_SECS:-600}"
@@ -2461,7 +2468,7 @@ run_runner_until_done_unlayered(){
   start="$(date +%s)"
   [ "$ASSIGNMENT_V2_IDLE_RETARGET_SECS" -le 0 ] \
     || retarget_next=$((start + ASSIGNMENT_V2_IDLE_RETARGET_SECS))
-  local guest_beat_seen=0 guest_silent
+  local guest_beat_seen=0 guest_silent listening_at=0
   while kill -0 "$ssh_pid" 2>/dev/null; do
     now="$(date +%s)"
     idle_elapsed=$((now - start))
@@ -2479,8 +2486,8 @@ run_runner_until_done_unlayered(){
       sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
       return 124
     fi
-    if tartci_lifecycle_unmarked listening \
-      && grep -q 'Listening for Jobs' "$runner_log" 2>/dev/null; then
+    if [ "$listening_at" = 0 ] && grep -q 'Listening for Jobs' "$runner_log" 2>/dev/null; then
+      listening_at="$now"
       tartci_lifecycle_mark listening "$now"
     fi
     if [ "$assigned" = 0 ] && grep -q 'Running job:' "$runner_log" 2>/dev/null; then
@@ -2503,8 +2510,17 @@ run_runner_until_done_unlayered(){
       tartci_job_claim_release
       heartbeat job-running
     fi
-    if [ "$assigned" = 0 ] && [ "$idle_elapsed" -ge "$IDLE_TIMEOUT" ]; then
-      event idle_timeout "elapsed=${idle_elapsed}s rerun_eligible=false"
+    if [ "$assigned" = 0 ] && [ "$listening_at" = 0 ] \
+       && [ "$idle_elapsed" -ge "${LISTENER_STARTUP_CAP:-180}" ]; then
+      event listener_startup_timeout "elapsed=${idle_elapsed}s cap=${LISTENER_STARTUP_CAP:-180}s never_listening=1 rerun_eligible=false"
+      kill "$ssh_pid" 2>/dev/null || true
+      wait "$ssh_pid" 2>/dev/null || true
+      sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true
+      return 124
+    fi
+    if [ "$assigned" = 0 ] && [ "$listening_at" != 0 ] \
+       && [ $((now - listening_at)) -ge "$IDLE_TIMEOUT" ]; then
+      event idle_timeout "elapsed=$((now - listening_at))s since=listening listen_after=$((listening_at - start))s rerun_eligible=false"
       kill "$ssh_pid" 2>/dev/null || true
       wait "$ssh_pid" 2>/dev/null || true
       sed '/^TARTCI_GUEST_HEARTBEAT /d; s/^/[actions-runner] /' "$runner_log" >&2 || true

@@ -51,7 +51,7 @@ class Listener:
         ssh.chmod(0o755)
 
     def run(self, stale: int | None, timeout: float = 60,
-            env_stale: str | None = None) -> tuple[subprocess.CompletedProcess, float]:
+            env_stale: str | None = None, idle: int = 600, cap: int | None = None) -> tuple[subprocess.CompletedProcess, float]:
         """`stale` sets the listener's threshold directly; None takes it from
         runner.sh's own top-level assignment and TARTCI_GUEST_HEARTBEAT_STALE_SECS."""
         source = RUNNER.read_text()
@@ -65,7 +65,8 @@ class Listener:
             "set -uo pipefail\n"
             f"STATE_DIR={str(self.tmp)!r}\n"
             "SSH_OPTS=(-o BatchMode=yes); SSH_KEY_PRIV=/dev/null; VM_USER=admin\n"
-            "ASSIGNMENT_V2_IDLE_RETARGET_SECS=0; IDLE_TIMEOUT=600; JOB_WARN=600; JOB_TIMEOUT=7200\n"
+            f"ASSIGNMENT_V2_IDLE_RETARGET_SECS=0; IDLE_TIMEOUT={idle}; JOB_WARN=600; JOB_TIMEOUT=7200\n"
+            + (f"LISTENER_STARTUP_CAP={cap}\n" if cap is not None else "")
             + threshold +
             "CCACHE_MAX_SIZE=1G; CCACHE_LAYER_GUEST_PREP=''; CCACHE_LAYER_GUEST_ENV=''\n"
             "GUEST_HTTP_PROXY=''; CURRENT_GUEST_CORES=''; CURRENT_GUEST_MEM_MB=''\n"

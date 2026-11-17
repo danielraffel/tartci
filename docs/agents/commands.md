@@ -21,6 +21,7 @@ would do; **write** changes host state.
 | `tartci host-profile --delivery [--json]` | read | how code reaches each lane, and staleness |
 | `tartci governor show\|explain\|fleet\|keys` | read | the per-host governor config |
 | `tartci leases status` | read | host lease store |
+| `tartci leases stats` | read | host lease store (`events.jsonl`) |
 | `tartci pool status [--json] [--require-ready] [--require-serving]` | read | admission state and participation |
 | `tartci pool status --usage [--range 24h] [--json]` | read | slot occupancy, idle-with-demand, discards, per-phase VM time |
 | `tartci fleet capacity --repo OWNER/REPO --target LABEL [--profile ABS] [--json]` | read | embedded-evidence, profile-bound observation receipt (`auth_method=untrusted_local`); unknown state fails closed |

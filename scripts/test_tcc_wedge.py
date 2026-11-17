@@ -254,7 +254,36 @@ class HealTests(unittest.TestCase):
     def heal(self, **kwargs):
         kwargs.setdefault("wrapper", str(self.wrapper))
         kwargs.setdefault("insecurity", lambda path: "")
+        # The daemons are replaced unless a test says otherwise.
+        kwargs.setdefault("pids", self.pid_reader([{"tccd": [10], "sandboxd": [20]},
+                                                   {"tccd": [11], "sandboxd": [21]}]))
+        kwargs.setdefault("settle", lambda seconds: None)
         return tw.heal(now=NOW, **kwargs)
+
+    @staticmethod
+    def pid_reader(readings):
+        queue = list(readings)
+        return lambda: queue.pop(0) if len(queue) > 1 else queue[0]
+
+    def test_unchanged_pids_after_a_zero_exit_are_ineffective(self) -> None:
+        # m3 2026-11-16: killall returned 0, tccd 10784 and 10970 and
+        # sandboxd 35552 all survived.
+        same = {"tccd": [10784, 10970], "sandboxd": [35552]}
+        record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
+        self.assertEqual(record["outcome"], "ineffective")
+        self.assertIn("same processes", record["detail"])
+        self.assertEqual(record["pids_after"], same)
+        self.assertIn("ineffective", tw.BUDGET_OUTCOMES)
+
+    def test_changed_pids_after_a_zero_exit_are_ran(self) -> None:
+        record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([
+            {"tccd": [10784], "sandboxd": [35552]}, {"tccd": [99001], "sandboxd": [99002]}]))
+        self.assertEqual(record["outcome"], "ran")
+
+    def test_no_daemon_seen_before_cannot_show_the_heal_failed(self) -> None:
+        empty = {"tccd": [], "sandboxd": []}
+        record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([empty, empty]))
+        self.assertEqual(record["outcome"], "ran")
 
     def test_runs_exactly_sudo_n_wrapper_with_no_arguments(self) -> None:
         record = self.heal(runner=self.runner_rc(0, "restarted"), sudo="/usr/bin/sudo")
@@ -366,6 +395,19 @@ class WatchdogStepTests(unittest.TestCase):
         self.assertIsNotNone(self.step(fresh, previous={
             "last_heal": {"outcome": "ran", "at_epoch": NOW - 3600, "failing_since": NOW - 9000}}))
         self.assertEqual(fresh["heal"]["outcome"], "ran")
+
+    def test_ineffective_heal_is_spent_for_the_streak(self) -> None:
+        # An ineffective heal (PIDs unchanged) is budget-counted, so the next
+        # pass 30 min later in the same streak must escalate, not heal again.
+        state = self.draining()
+        previous = {"failing_since": NOW - 7200,
+                    "last_heal": {"outcome": "ineffective", "at": tw._iso(NOW - 1800),
+                                  "at_epoch": NOW - 1800, "failing_since": NOW - 7200}}
+        healed = []
+        self.assertIsNone(self.step(state, previous=previous,
+                                    heal_fn=lambda **kw: healed.append(kw)))
+        self.assertEqual(healed, [])
+        self.assertEqual(state["heal"]["outcome"], "escalated")
 
     def test_log_cutoff_is_the_last_heal(self) -> None:
         seen = []

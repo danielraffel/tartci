@@ -305,7 +305,7 @@ ccache_write_isolation = true
 priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast"]
-workflows = ["Spectr M5 Product Acceptance"]
+workflows = ["Spectr M5 Product Acceptance", "Spectr Release"]
 replaces_launchd_labels = []
 # Tear a VM down once its guest stops heartbeating for this long; a
 # frozen guest otherwise holds the slot until the 2 h job timeout.

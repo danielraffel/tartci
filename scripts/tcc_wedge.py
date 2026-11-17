@@ -97,12 +97,18 @@ SIGNATURES = (
         r"tcc_server_message_request_authorization\(kTCCServiceSystemPolicyRemovableVolumes\) failed")),
 )
 _TIMESTAMP = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
-OUTCOMES = ("ran", "rate_limited", "wrapper_rate_limited", "wrapper_missing",
+OUTCOMES = ("ran", "ineffective", "rate_limited", "wrapper_rate_limited", "wrapper_missing",
             "wrapper_insecure", "not_permitted", "timeout", "failed", "disabled",
             "escalated", "paged")
 # Outcomes that reached sudo and so spend the 30-minute budget. A refused
 # sudo spends it too: retrying it every pass would be a 300 s loop of nothing.
-BUDGET_OUTCOMES = frozenset({"ran", "not_permitted", "timeout", "failed"})
+BUDGET_OUTCOMES = frozenset({"ran", "ineffective", "not_permitted", "timeout", "failed"})
+# The daemons the wrapper restarts, and how long to let launchd replace them
+# before reading their PIDs again. killall exits 0 when the signal was
+# DELIVERED, which proves nothing about the process having exited.
+HEALED_PROCESSES = ("tccd", "sandboxd")
+HEAL_SETTLE_S = 5.0
+PGREP = "/usr/bin/pgrep"
 
 
 def _iso(epoch: float) -> str:
@@ -592,8 +598,8 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                                "answer from a context with TCC access either "
                                f"({reading.get('reason')}); the volume, not the alert, is stalled")
             install = alert.get("shipyard_install") or {}
-            after = (f", first seen {install.get('seconds_before_alert')} s after Shipyard "
-                     f"installed generation {str(install.get('generation'))[:12]}"
+            after = (f", near Shipyard install {str(install.get('generation'))[:12]} "
+                     f"({install.get('seconds_before_alert')} s; timing only)"
                      if install else "")
             return verdict(PROMPT_KIND,
                            f"a privacy consent alert has been on screen since "
@@ -777,11 +783,42 @@ def run_privileged_bounded(argv: list, timeout: float) -> tuple[Optional[int], s
     return proc.returncode, output or ""
 
 
+def read_pids() -> dict[str, list[int]]:
+    """The live PIDs of each daemon the heal restarts (read-only, no root)."""
+    found: dict[str, list[int]] = {}
+    for name in HEALED_PROCESSES:
+        try:
+            proc = subprocess.run([PGREP, "-x", name], capture_output=True, text=True,
+                                  timeout=5, check=False)
+            found[name] = sorted(int(t) for t in proc.stdout.split() if t.isdigit())
+        except (OSError, subprocess.SubprocessError):
+            found[name] = []
+    return found
+
+
+def unchanged_pids(before: dict[str, list[int]], after: dict[str, list[int]]) -> bool:
+    """True when the heal replaced nothing: some daemon was running before and
+    every daemon's PID set is the same after. An empty `before` (no daemon
+    seen) cannot show a heal failed, so it is not 'unchanged'."""
+    if not any(before.get(name) for name in HEALED_PROCESSES):
+        return False
+    return all(before.get(name, []) == after.get(name, []) for name in HEALED_PROCESSES)
+
+
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
          runner: Optional[Callable[[list, float], tuple]] = None,
          wrapper: Optional[str] = None, sudo: Optional[str] = None,
-         insecurity: Optional[Callable[[str], str]] = None) -> dict[str, Any]:
-    """Run the scoped root wrapper once. Never anything broader."""
+         insecurity: Optional[Callable[[str], str]] = None,
+         pids: Optional[Callable[[], dict]] = None,
+         settle: Optional[Callable[[float], None]] = None,
+         settle_s: float = HEAL_SETTLE_S) -> dict[str, Any]:
+    """Run the scoped root wrapper once. Never anything broader.
+
+    `ran` means the wrapper exited 0 AND the daemons it restarts are different
+    processes a few seconds later. If every PID is unchanged the signal was
+    delivered and ignored (m3, 2026-11-16: tccd 10784 and 10970 and sandboxd
+    35552 survived a heal that returned 0), so the outcome is `ineffective`.
+    """
     now = time.time() if now is None else now
     runner = run_privileged_bounded if runner is None else runner
     wrapper = WRAPPER if wrapper is None else wrapper
@@ -803,6 +840,9 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
                       detail=f"refusing NOPASSWD root through a path that is not root-owned alone: "
                              f"{unsafe}")
         return record
+    read = read_pids if pids is None else pids
+    nap = time.sleep if settle is None else settle
+    before_pids = read()
     try:
         rc, output = runner([sudo, "-n", wrapper], HEAL_TIMEOUT_S)
     except OSError as exc:
@@ -816,7 +856,16 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
     record["rc"] = rc
     record["detail"] = output
     if rc == 0:
-        record["outcome"] = "ran"
+        nap(settle_s)
+        after_pids = read()
+        record["pids_before"], record["pids_after"] = before_pids, after_pids
+        if unchanged_pids(before_pids, after_pids):
+            record["outcome"] = "ineffective"
+            record["detail"] = ("killall returned 0 but tccd/sandboxd are the same processes "
+                                f"{settle_s:g}s later (pids {before_pids}); the heal did not "
+                                "restart them")
+        else:
+            record["outcome"] = "ran"
     elif rc == 75:
         record["outcome"] = "wrapper_rate_limited"
     elif rc == 1 and "password" in output.lower():
@@ -889,7 +938,7 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         return None
     if kind != KIND:
         return None
-    if (last_heal and last_heal.get("outcome") == "ran"
+    if (last_heal and last_heal.get("outcome") in ("ran", "ineffective")
             and last_heal.get("failing_since") == state["failing_since"]):
         # One heal per streak. The restart did not bring the store back, so a
         # second one would only spend the budget on a cause this is not.
