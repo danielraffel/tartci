@@ -882,7 +882,9 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 ```
 
 Then install the LaunchAgent once the report is clean. Logs land in
-`~/Library/Logs/tartci/tartci-reap.log`.
+`~/Library/Logs/tartci/tartci-reap.log`. A pass whose stdout is that file
+renames it aside once it reaches 8 MiB and keeps 3 generations
+(`tartci-reap.log.1` is the newest), as the reclaim log does.
 
 ### Disk reclaimer
 
