@@ -16,7 +16,9 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import testing_support  # noqa: E402,F401
+import testing_support  # noqa: E402
+
+testing_support.skip_module_without_tomllib()  # macos_fleet_lanes imports tomllib
 import macos_fleet_lanes as fleet  # noqa: E402
 
 GIB = 1024 ** 3
