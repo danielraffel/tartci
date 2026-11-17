@@ -13,6 +13,16 @@ schedule_backstop = "live"
 id = "studio"
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m3"
+# The one interpreter every tartci LaunchAgent here runs (runbook: Pinned
+# interpreter): the python.org framework build, Developer ID signed (team
+# BMM5U3QVKW), so its macOS privacy identity survives patch updates. The
+# Homebrew Cellar 3.12.13_2 it replaces is ad-hoc signed and becomes a new
+# identity on every upgrade; on 2026-11-16 a consent alert held every launchd
+# open of /Volumes/Workshop for hours. This binary already reads and writes
+# /Volumes/Workshop from launchd (com.pulp.fleet.prewall runs it every 5 min),
+# and the installer's launchd preflight proves it against tart_home before any
+# lane switches. Rollback: delete this line and reinstall.
+python = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Workshop/VMs"
 # The CI cache (gate ccache, artifact cache, pip wheelhouse) lives on Workshop

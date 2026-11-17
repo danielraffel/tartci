@@ -2464,6 +2464,12 @@ class SealedTests(Base):
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
 
     def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        # The handoff applies only to a profile without host.python (which
+        # always wins); m3's real profile declares one, so drop it here.
+        for profile in (self.home / ".config/tartci/macos-fleet-profile.toml",
+                        self.home / ".local/share/tartci/update-checkout/profiles/m3-macos-fleet.toml"):
+            profile.write_text("".join(line for line in profile.read_text().splitlines(True)
+                                       if not line.startswith("python = ")))
         pinned = self.home / "pinned-python"
         pinned.symlink_to(sys.executable)
         with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
