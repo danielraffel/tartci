@@ -73,6 +73,8 @@ LEASES_KEYS = {
     "fair_share_after_secs",
     # A non-gate guest taking the last slot may use the gate reserve (leases.py).
     "vm_slot_lending",
+    # Starvation bound of slot priority's short-job-first rule.
+    "short_job_first_max_passes", "short_job_first_max_pass_secs",
 }
 # Opt-in guest resolvers the runner configures inside each VM before it
 # registers (host_profile.guest_network_settings, providers/tart-macos/runner.sh).
@@ -131,7 +133,14 @@ LANE_KEYS = {
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
     "v2_gate_classes", "queue_merge_group_quota",
+    # Slot priority's short-job-first rule (scripts/slot_priority.py).
+    "short_jobs", "short_job_first",
 }
+# A short job is named, never guessed: `job` is the job's name, `workflow` (when
+# given) its workflow's. Neither may hold the `|` or newline of the rendered
+# TARTCI_SHORT_JOBS lines.
+SHORT_JOB_KEYS = {"workflow", "job"}
+SHORT_JOB_FIRST_MODES = ("off", "shadow", "on")
 TIER_KEYS = {"label", "workflow", "runner_group_id"}
 # An event-class-v2 lane always serves the two Pulp gate classes, in this order,
 # as its first tiers. It may then declare extra event classes from this closed
@@ -396,6 +405,47 @@ def _symlinked_component(path: PurePosixPath) -> str | None:
         if stat.S_ISLNK(mode):
             return current.as_posix()
     return None
+
+
+def validate_short_jobs(lane_id: str, lane: dict, data: dict) -> None:
+    """`short_jobs` / `short_job_first`: explicit names, a known switch, a ranker to act.
+
+    The rule lives in slot priority and reads the queue_scan detail file, so a
+    lane that declares short jobs needs `[leases] slot_priority` on and a
+    queue_scan lane (event-class-v2 lanes scan with assignment_scan, which
+    does not count short jobs).
+    """
+    short_jobs = lane.get("short_jobs")
+    mode = lane.get("short_job_first")
+    if short_jobs is None:
+        if mode is not None:
+            fail(f"lane {lane_id}: short_job_first needs short_jobs")
+        return
+    if not isinstance(short_jobs, list) or not short_jobs:
+        fail(f"lane {lane_id}: short_jobs must be a nonempty list of tables")
+    seen = set()
+    for entry in short_jobs:
+        if not isinstance(entry, dict) or set(entry) - SHORT_JOB_KEYS or "job" not in entry:
+            fail(f"lane {lane_id}: each short_jobs entry is a table with job and "
+                 "an optional workflow")
+        for key in ("workflow", "job"):
+            value = entry.get(key, "" if key == "workflow" else None)
+            if (not isinstance(value, str) or (key == "job" and not value.strip())
+                    or "|" in value or "\n" in value or "\r" in value
+                    or value != value.strip()):
+                fail(f"lane {lane_id}: short_jobs {key} must be a trimmed string "
+                     "without | or a newline")
+        pair = (entry.get("workflow", ""), entry["job"])
+        if pair in seen:
+            fail(f"lane {lane_id}: short_jobs lists {pair[1]!r} twice")
+        seen.add(pair)
+    if mode is not None and mode not in SHORT_JOB_FIRST_MODES:
+        fail(f'lane {lane_id}: short_job_first must be "off", "shadow" or "on"')
+    if lane.get("assignment_mode") == "event-class-v2":
+        fail(f"lane {lane_id}: short_jobs needs a queue_scan lane, not event-class-v2")
+    leases_table = data.get("leases") if isinstance(data.get("leases"), dict) else {}
+    if leases_table.get("slot_priority", "off") == "off":
+        fail(f"lane {lane_id}: short_jobs needs [leases] slot_priority shadow or on")
 
 
 def validate_lane_cache_roots(host: dict, lanes: list) -> None:
@@ -715,6 +765,12 @@ def load(path: Path) -> dict:
         fair = lease_policy.get("fair_share_after_secs", 0)
         if type(fair) is not int or not (fair == 0 or 300 <= fair <= 14400):
             fail("leases.fair_share_after_secs must be 0 or an integer from 300 to 14400")
+        passes = lease_policy.get("short_job_first_max_passes", 1)
+        if type(passes) is not int or not 1 <= passes <= 10:
+            fail("leases.short_job_first_max_passes must be an integer from 1 to 10")
+        pass_secs = lease_policy.get("short_job_first_max_pass_secs", 600)
+        if type(pass_secs) is not int or not 60 <= pass_secs <= 3600:
+            fail("leases.short_job_first_max_pass_secs must be an integer from 60 to 3600")
     guest_network = data.get("guest_network")
     if guest_network is not None:
         if not isinstance(guest_network, dict):
@@ -854,6 +910,7 @@ def load(path: Path) -> dict:
         quota = lane.get("queue_merge_group_quota")
         if quota is not None and (type(quota) is not int or quota < 0):
             fail(f"lane {lane_id}: queue_merge_group_quota must be a nonnegative integer")
+        validate_short_jobs(lane_id, lane, data)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
             fail(f"lane {lane_id}: vm_cores must be a positive integer")
@@ -2398,6 +2455,35 @@ DISK_PROBLEM_PERCENT = 92
 HOME_DISK_PROBLEM_PERCENT = 97
 
 
+# Raw statfs free space below this is pressure whatever macOS says it could
+# purge: purgeable space is reclaimed on demand and with lag, and a build that
+# needs the room now gets ENOSPC first.
+DISK_RAW_FLOOR_BYTES = 20 * 1024 ** 3
+IMPORTANT_CAPACITY_SCRIPT = Path(__file__).with_name("disk_important_capacity.swift")
+IMPORTANT_CAPACITY_TIMEOUT_S = 20
+
+
+def important_free_bytes(path: Path) -> int | None:
+    """Bytes macOS says are available for important usage on `path`'s volume
+    (free plus purgeable), or None when it cannot be read.
+
+    statfs counts only the free blocks: on m5studio it read 49 GB free
+    (98% used) while the same volume reported 560 GB for important usage.
+    Any failure (no swift, a non-APFS volume, a timeout) is None, and the
+    caller falls back to the raw number.
+    """
+    from bounded_subprocess import ObservationError, run_bounded  # noqa: PLC0415
+    try:
+        proc = run_bounded(["/usr/bin/swift", str(IMPORTANT_CAPACITY_SCRIPT), str(path)],
+                           timeout=IMPORTANT_CAPACITY_TIMEOUT_S, operation="important_capacity")
+    except (OSError, ObservationError, ValueError):
+        return None
+    text = proc.stdout.strip()
+    if proc.returncode != 0 or not text.isdigit():
+        return None
+    return int(text)
+
+
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     """Used % of the VM store volume (host.tart_home) and the home volume.
 
@@ -2432,13 +2518,24 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
             rows.append({"role": role, "path": str(path), "state": "unknown",
                          "detail": str(exc)})
             continue
-        percent = 100.0 * (usage.total - usage.free) / usage.total if usage.total else 0.0
+        important = important_free_bytes(path)
+        # Purgeable space counts toward "available", but never past the volume.
+        available = usage.free if important is None else min(max(usage.free, important),
+                                                              usage.total)
+        percent = 100.0 * (usage.total - available) / usage.total if usage.total else 0.0
         limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
-        state = ("problem" if percent >= limit
+        below_floor = usage.free < DISK_RAW_FLOOR_BYTES
+        state = ("problem" if percent >= limit or below_floor
                  else "warn" if percent >= DISK_WARN_PERCENT else "ok")
         rows.append({"role": role, "path": str(path), "state": state,
                      "used_percent": round(percent, 1),
-                     "free_gib": round(usage.free / 1024 ** 3, 1)})
+                     "raw_used_percent": round(100.0 * (usage.total - usage.free)
+                                               / usage.total, 1) if usage.total else 0.0,
+                     "free_gib": round(available / 1024 ** 3, 1),
+                     "raw_free_gib": round(usage.free / 1024 ** 3, 1),
+                     "important_free_gib": (None if important is None
+                                            else round(important / 1024 ** 3, 1)),
+                     "below_raw_floor": below_floor})
     return rows
 
 
@@ -2562,8 +2659,12 @@ def fleet_readiness(
         if disk["state"] == "problem":
             problems.append({
                 "code": "disk_pressure", "label": disk["path"],
-                "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB free "
-                           + (f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
+                "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB available "
+                           f"({disk['raw_free_gib']} GiB raw free, "
+                           f"{disk['important_free_gib']} GiB available for important usage) "
+                           + (f"(raw free under {DISK_RAW_FLOOR_BYTES // 1024 ** 3} GiB)"
+                              if disk.get("below_raw_floor") else
+                              f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
                               if disk["role"] == "vm_store" else
                               f"(>= {HOME_DISK_PROBLEM_PERCENT}% fails builds with ENOSPC)")),
             })
@@ -3153,6 +3254,13 @@ def lane_plist(
     # Checked-in non-V2 lanes declare their fixed class; Pulp V2 must derive it.
     if "priority" in lane:
         env["TARTCI_VM_LEASE_PRIORITY"] = lane["priority"]
+    if lane.get("short_jobs"):
+        # queue_scan.py counts these jobs in its detail file and slot_priority.py
+        # ranks a lane that saw one queued; shadow unless the lane says otherwise.
+        env["TARTCI_SHORT_JOBS"] = "\n".join(
+            f"{row.get('workflow', '')}|{row['job']}" for row in lane["short_jobs"]
+        )
+        env["TARTCI_SHORT_JOB_FIRST"] = lane.get("short_job_first", "shadow")
     if "queue_merge_group_quota" in lane:
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.

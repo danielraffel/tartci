@@ -607,6 +607,12 @@ SLOT_PRIORITY_DEFAULT_PROMOTE_AFTER_SECS = 2700
 # `fair_share_after_secs` (scripts/fair_share.py): a VM lane that has had work
 # it could not place for this long is ranked ahead of other repositories on the
 # host. 0 (the default) is off. TARTCI_FAIR_SHARE_AFTER_SECS overrides the file.
+# `short_job_first_max_passes` (default 1) and `short_job_first_max_pass_secs`
+# (default 600): the starvation bound of slot priority's short-job-first rule
+# (scripts/slot_priority.py). A waiting lane is passed over by a short job at
+# most that many times, and never once it was first passed that long ago.
+SHORT_JOB_FIRST_DEFAULT_MAX_PASSES = 1
+SHORT_JOB_FIRST_DEFAULT_MAX_PASS_SECS = 600
 
 
 def _parse_leases_table(text: str) -> dict[str, Any]:
@@ -686,6 +692,12 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
     raw = os.environ.get("TARTCI_FAIR_SHARE_AFTER_SECS")
     if raw is not None and raw.strip().isdigit():
         fair = int(raw.strip())
+    max_passes = table.get("short_job_first_max_passes")
+    if type(max_passes) is not int or max_passes < 0:
+        max_passes = SHORT_JOB_FIRST_DEFAULT_MAX_PASSES
+    max_pass_secs = table.get("short_job_first_max_pass_secs")
+    if type(max_pass_secs) is not int or max_pass_secs < 0:
+        max_pass_secs = SHORT_JOB_FIRST_DEFAULT_MAX_PASS_SECS
     return {
         "rank_vm_waiters": enabled,
         "vm_waiter_fresh_secs": fresh,
@@ -695,6 +707,8 @@ def lease_policy_settings(fleet_profile: str | None = None) -> dict[str, Any]:
         "slot_priority_promote_after_secs": promote,
         "slot_priority_release_first": release_first,
         "fair_share_after_secs": fair,
+        "short_job_first_max_passes": max_passes,
+        "short_job_first_max_pass_secs": max_pass_secs,
     }
 
 

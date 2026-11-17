@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "ba0e884f64d9681d236c121c9b3dadea4e35b0bebe63fff593a2efa4ef082291"
+    "profiles_sha256": "70e959b702567e41351def39e7c749b6185f0210db16953dbe30c508a068108a"
   },
   "registrations": [
     {
@@ -86,7 +86,8 @@
         "spectr-gate-fast"
       ],
       "workflows": [
-        "Spectr M5 Product Acceptance"
+        "Spectr M5 Product Acceptance",
+        "Spectr Release"
       ]
     },
     {
@@ -238,7 +239,8 @@
         "spectr-gate-fast"
       ],
       "workflows": [
-        "Spectr M5 Product Acceptance"
+        "Spectr M5 Product Acceptance",
+        "Spectr Release"
       ]
     },
     {
@@ -427,7 +429,8 @@
         "spectr-gate-fast"
       ],
       "workflows": [
-        "Spectr M5 Product Acceptance"
+        "Spectr M5 Product Acceptance",
+        "Spectr Release"
       ]
     },
     {

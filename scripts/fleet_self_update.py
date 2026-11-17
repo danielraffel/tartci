@@ -3466,6 +3466,32 @@ def recover_left_off(cfg: Config, sys_: System) -> dict:
     return outcome
 
 
+def rollback_target_error(cfg: Config, sys_: System, helper: dict, app: Path, profile: Path,
+                          pin: str) -> str | None:
+    """Why `app` (the live launcher, or its rollback snapshot) does not verify against `pin`
+    and `profile`, or None when it does. A rollback reinstalls exactly this bundle."""
+    policy = sys_.run(["python3", "-c",
+                       "import sys; sys.path.insert(0, 'scripts'); "
+                       "import macos_launcher_identity as m; "
+                       "print(m.profile_policy_digest(sys.argv[1]))",
+                       str(profile)], cwd=str(cfg.checkout))
+    if installed_layout(cfg) == "v2":
+        check = sys_.run(["python3", "scripts/macos_launcher_identity.py", "verify-v2", str(app),
+                          "--identifier", str(helper.get("identifier", "")),
+                          "--team-id", str(helper.get("team_id", "")),
+                          "--sha256", pin, "--profile", str(profile)],
+                         cwd=str(cfg.checkout))
+    else:
+        check = sys_.run(["python3", "scripts/macos_launcher_identity.py", "verify", str(app),
+                          "--identifier", str(helper.get("identifier", "")),
+                          "--team-id", str(helper.get("team_id", "")),
+                          "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
+                         cwd=str(cfg.checkout))
+    if policy.rc != 0 or check.rc != 0:
+        return (check.text or policy.text)[:300]
+    return None
+
+
 def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   explicit: bool = False, scheduled: bool = False,
                   reinstall: bool = False) -> int:
@@ -3777,6 +3803,27 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         else:
             refusals.append(str(floor_refusal))
             receipt.step("capacity-floor", str(floor_refusal), ok=False)
+        # Rollback target: every apply snapshots the live launcher and refuses
+        # unless that copy verifies against the current pin and profile. A
+        # standing mismatch (m3, 2026-11-15..17: "launcher profile policy digest
+        # does not match the installed profile", 11 attempts) is known now, so
+        # refuse here, before the heavy-queue wait and the signing build.
+        if helper is not None and helper.get("path") and helper.get("approval_sha256_path") \
+                and Path(helper["approval_sha256_path"]).is_file():
+            error = rollback_target_error(cfg, sys_, helper, Path(helper["path"]),
+                                          cfg.installed_profile,
+                                          Path(helper["approval_sha256_path"]).read_text().strip())
+            if error:
+                refusal = ("the live launcher does not verify against the current approval pin "
+                           "and installed profile, so an update could not roll back to it; "
+                           f"refused before drain and before any build: {error}")
+                if apply:
+                    raise HostFault(refusal)
+                refusals.append(refusal)
+                receipt.step("live-launcher-verify", refusal, ok=False)
+            else:
+                receipt.step("live-launcher-verify", "the live launcher verifies against the current "
+                             "pin and installed profile")
         # Queue-light: only reached when this host would take its turn. A
         # heavy queue steps aside (place kept privately, nothing published),
         # so a peer with a lighter queue can take the turn meanwhile.
@@ -4317,30 +4364,12 @@ class Run:
 
     def _verify_snapshot_bundle(self, snap: Path) -> None:
         """The copy rollback would reinstall must verify against the current pin NOW."""
-        policy = self.sys.run(["python3", "-c",
-                               "import sys; sys.path.insert(0, 'scripts'); "
-                               "import macos_launcher_identity as m; "
-                               "print(m.profile_policy_digest(sys.argv[1]))",
-                               str(snap / "profile.toml")], cwd=str(self.cfg.checkout))
-        pin = (snap / "approved.sha256").read_text().strip()
-        if installed_layout(self.cfg) == "v2":
-            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify-v2",
-                                  str(snap / "TartCILauncher.app"),
-                                  "--identifier", str(self.helper.get("identifier", "")),
-                                  "--team-id", str(self.helper.get("team_id", "")),
-                                  "--sha256", pin, "--profile", str(snap / "profile.toml")],
-                                 cwd=str(self.cfg.checkout))
-        else:
-            check = self.sys.run(["python3", "scripts/macos_launcher_identity.py", "verify",
-                                  str(snap / "TartCILauncher.app"),
-                                  "--identifier", str(self.helper.get("identifier", "")),
-                                  "--team-id", str(self.helper.get("team_id", "")),
-                                  "--sha256", pin, "--profile-policy-sha256", policy.out.strip()],
-                                 cwd=str(self.cfg.checkout))
-        if policy.rc != 0 or check.rc != 0:
+        error = rollback_target_error(self.cfg, self.sys, self.helper, snap / "TartCILauncher.app",
+                                      snap / "profile.toml",
+                                      (snap / "approved.sha256").read_text().strip())
+        if error:
             raise Refused("the snapshot of the live launcher does not verify against the current "
-                          f"approval pin, so it could not be rolled back to: "
-                          f"{(check.text or policy.text)[:300]}")
+                          f"approval pin, so it could not be rolled back to: {error}")
         self.receipt.step("snapshot-verify", "snapshot launcher verifies against the current pin")
 
     def _update(self) -> None:

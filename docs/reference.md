@@ -725,6 +725,17 @@ overrides the ssh client (tests). It never changes the host VM cap. Preview with
 `serve macos --print-claim-delay`. Set it on the gate lanes of slower hosts
 only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
 
+After a lane serves a job whose class label ends in `-merge-group`, its next
+selection bypasses the scan caches once (`scan_refresh_after_merge_group`
+event): a tier lane passes `--force-refresh` to `queue_scan.py`, and an
+event-class-v2 lane skips its selection cache. A merge-group run can queue a
+dependent job when the served job ends (Vellum's `sterile-consumer` waits on
+its GPU proof), seconds before the VM tears down, while the shared discovery
+snapshot can be up to `TARTCI_QUEUE_DISCOVERY_TTL_SECS` (160 s) old. Without
+the refresh the freed lane saw only PR-class work and booted it, so the
+dependent job waited for another lane. It costs one uncached scan per served
+merge-group job and changes no priority.
+
 To order a lane across hosts by speed, give the same lane id a `claim_rank` on
 every host instead (0 = fastest, integers 0-9; not combined with
 `claim_delay_peers`). At render time a lane with rank N > 0 gets
