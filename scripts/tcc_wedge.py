@@ -938,7 +938,7 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         return None
     if kind != KIND:
         return None
-    if (last_heal and last_heal.get("outcome") == "ran"
+    if (last_heal and last_heal.get("outcome") in ("ran", "ineffective")
             and last_heal.get("failing_since") == state["failing_since"]):
         # One heal per streak. The restart did not bring the store back, so a
         # second one would only spend the budget on a cause this is not.

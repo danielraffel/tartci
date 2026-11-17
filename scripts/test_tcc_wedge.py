@@ -396,6 +396,19 @@ class WatchdogStepTests(unittest.TestCase):
             "last_heal": {"outcome": "ran", "at_epoch": NOW - 3600, "failing_since": NOW - 9000}}))
         self.assertEqual(fresh["heal"]["outcome"], "ran")
 
+    def test_ineffective_heal_is_spent_for_the_streak(self) -> None:
+        # An ineffective heal (PIDs unchanged) is budget-counted, so the next
+        # pass 30 min later in the same streak must escalate, not heal again.
+        state = self.draining()
+        previous = {"failing_since": NOW - 7200,
+                    "last_heal": {"outcome": "ineffective", "at": tw._iso(NOW - 1800),
+                                  "at_epoch": NOW - 1800, "failing_since": NOW - 7200}}
+        healed = []
+        self.assertIsNone(self.step(state, previous=previous,
+                                    heal_fn=lambda **kw: healed.append(kw)))
+        self.assertEqual(healed, [])
+        self.assertEqual(state["heal"]["outcome"], "escalated")
+
     def test_log_cutoff_is_the_last_heal(self) -> None:
         seen = []
         state = self.draining()
