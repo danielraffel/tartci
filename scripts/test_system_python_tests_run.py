@@ -45,7 +45,7 @@ SELF_DECLARED = "3.9-safe"
 # dropping the declaration is a visible edit here rather than a silent change
 # to which tests must run on 3.9.
 EXPECTED_SELF_DECLARED = frozenset({
-    "denial_reclaim", "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
+    "denial_reclaim", "disk_available", "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
     "pool_log", "state_age", "vm_dhcp_breaker",
 })
 
