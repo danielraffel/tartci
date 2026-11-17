@@ -119,7 +119,10 @@ SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
 KILL_VECTORS = ('"$KILLALL" -KILL tccd', '"$KILLALL" -KILL sandboxd')
 SIGKILL_WRAPPER_LINES = ('output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?\n'
                          'sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?\n')
-_KILL_CALL = re.compile(r'"\$KILLALL"[^)|;&\n]*')
+# A call runs to the end of its command substitution or line; its trailing
+# redirections (`2>&1`, `9>&-`) are then dropped whole.
+_KILL_CALL = re.compile(r'"\$KILLALL"[^)\n]*')
+_REDIRECTIONS = re.compile(r"(\s+\d*>&?[-\w/]*)+\s*$")
 
 
 def _iso(epoch: float) -> str:
@@ -839,7 +842,7 @@ def kill_vectors(text: str) -> list[str]:
         if line.lstrip().startswith("#"):
             continue
         for call in _KILL_CALL.findall(line):
-            calls.append(re.sub(r"(\s+\d?>&?\S*)+\s*$", "", call).strip())
+            calls.append(_REDIRECTIONS.sub("", call).strip())
     return calls
 
 
