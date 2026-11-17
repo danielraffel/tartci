@@ -165,6 +165,37 @@ class ReclaimTests(Purgeable):
         self.assertGreater(percent, 97)
 
 
+class WedgedVolumeTests(Purgeable):
+    """disk_available.measure stats the path and reads a cache: a wedged
+    volume must cost reclaim a bounded wait, never an indefinite one."""
+
+    def test_a_blocked_measurement_reads_as_unreadable_within_the_deadline(self) -> None:
+        import threading
+        import time
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = dr.bounded_fs_call
+
+        def quick(operation, **kwargs):
+            return real(operation, **dict(kwargs, timeout=0.3))
+
+        def wedged(path, raw_free, total, **kwargs):
+            release.wait(10)
+            return {"available_bytes": 560 * GIB}
+
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(dr.shutil, "disk_usage", return_value=usage(49)), \
+                mock.patch.object(dr, "bounded_fs_call", quick), \
+                mock.patch.object(da, "measure", wedged):
+            started = time.monotonic()
+            free = dr.free_bytes(Path(directory))
+            percent = dr.used_percent(Path(directory))
+            elapsed = time.monotonic() - started
+        self.assertIsNone(free)
+        self.assertIsNone(percent)
+        self.assertLess(elapsed, 3, "free_bytes/used_percent waited on the wedged measurement")
+
+
 class VmDiskFloorTests(unittest.TestCase):
     """tartci_check_disk_floor: helper number first, df when the helper fails."""
 

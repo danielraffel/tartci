@@ -2457,7 +2457,8 @@ HOME_DISK_PROBLEM_PERCENT = 97
 
 # Raw statfs free space below the floor is pressure whatever macOS says it
 # could purge; see disk_available.py.
-from disk_available import DISK_RAW_FLOOR_BYTES, effective_available, important_free_bytes  # noqa: E402,F401
+import disk_available  # noqa: E402
+from disk_available import DISK_RAW_FLOOR_BYTES, important_free_bytes  # noqa: E402,F401
 
 
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
@@ -2494,9 +2495,11 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
             rows.append({"role": role, "path": str(path), "state": "unknown",
                          "detail": str(exc)})
             continue
-        important = important_free_bytes(path)
-        # Purgeable space counts toward "available", but never past the volume.
-        available, below_floor = effective_available(usage.free, usage.total, important)
+        # Purgeable space counts toward "available", never past the volume; the
+        # reading is cached and honours TARTCI_DISK_PURGEABLE=0 (disk_available).
+        measured = disk_available.measure(path, usage.free, usage.total)
+        important = measured["important_free_bytes"]
+        available, below_floor = measured["available_bytes"], measured["below_raw_floor"]
         percent = 100.0 * (usage.total - available) / usage.total if usage.total else 0.0
         limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
         state = ("problem" if percent >= limit or below_floor

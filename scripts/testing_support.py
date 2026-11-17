@@ -16,6 +16,7 @@ Python 3.9-safe.
 from __future__ import annotations
 
 import os
+import tempfile
 import unittest
 
 try:
@@ -34,7 +35,9 @@ def skip_module_without_tomllib() -> None:
         raise unittest.SkipTest(REASON)
 
 
-# Tests mock raw disk numbers; the real macOS purgeable reading (a swift call
-# against the host's actual volume) would swamp them. A test of the purgeable
-# path sets TARTCI_DISK_PURGEABLE=1 and mocks disk_available.important_free_bytes.
-os.environ.setdefault("TARTCI_DISK_PURGEABLE", "0")
+# disk_available caches its macOS reading in a state file: keep tests off the
+# real ~/.tartci state. (TARTCI_DISK_PURGEABLE=0 turns the reading off for a
+# test that wants raw numbers only.)
+os.environ.setdefault("TARTCI_DISK_CACHE_FILE",
+                      os.path.join(tempfile.mkdtemp(prefix="tartci-test-disk-"),
+                                   "disk-important-cache.json"))

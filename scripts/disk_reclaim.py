@@ -563,6 +563,20 @@ def dir_size_bytes(path: pathlib.Path) -> int:
     return total
 
 
+def measured_usage(path: pathlib.Path) -> tuple[Any, dict[str, Any]]:
+    """statfs plus disk_available's reading, all inside one bounded call.
+
+    disk_available.measure stats the path and reads its cache file, so on a
+    wedged volume it blocks like statfs does; it gets the same deadline, and a
+    timeout reads as unreadable (OSError) rather than hanging the pass.
+    """
+    def probe() -> tuple[Any, dict[str, Any]]:
+        usage = shutil.disk_usage(path)
+        return usage, disk_available.measure(path, usage.free, usage.total,
+                                             timeout=ROOT_PROBE_TIMEOUT_S / 2)
+    return bounded_fs_call(probe, description=f"disk usage {path}", pass_deadline=False)
+
+
 def free_bytes(path: pathlib.Path) -> int | None:
     """Free bytes on `path`'s volume, or None when it cannot be read.
 
@@ -584,26 +598,23 @@ def free_bytes(path: pathlib.Path) -> int | None:
     at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
-        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
-                                description=f"disk usage {path}", pass_deadline=False)
+        usage, measured = measured_usage(path)
     except OSError:
         return None
     # Free plus macOS-purgeable (disk_available.py), so reclaim does not read a
     # volume with room to spare as tight and fall back to its 7-day age gate.
-    return disk_available.measure(path, usage.free, usage.total)["available_bytes"]
+    return measured["available_bytes"]
 
 
 def used_percent(path: pathlib.Path) -> float | None:
     """Percent of `path`'s volume in use, or None when it cannot be read."""
     try:
-        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
-                                description=f"disk usage {path}", pass_deadline=False)
+        usage, measured = measured_usage(path)
     except OSError:
         return None
     if not usage.total:
         return None
-    available = disk_available.measure(path, usage.free, usage.total)["available_bytes"]
-    return 100.0 * (usage.total - available) / usage.total
+    return 100.0 * (usage.total - measured["available_bytes"]) / usage.total
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:
