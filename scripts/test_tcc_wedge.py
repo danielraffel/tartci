@@ -280,12 +280,29 @@ class HealTests(unittest.TestCase):
         self.assertTrue(os.path.isabs(tw.INSTALLER))
 
     def test_ineffective_heal_through_the_sigkill_wrapper_is_not_called_stale(self) -> None:
-        self.wrapper.write_text("#!/bin/bash\n" + tw.SIGKILL_VECTOR + "\n")
+        self.wrapper.write_text("#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES)
         same = {"tccd": [10970], "sandboxd": [35552]}
         record = self.heal(runner=self.runner_rc(0, ""), pids=self.pid_reader([same, same]))
         self.assertEqual(record["outcome"], "ineffective")
         self.assertNotIn("stale_wrapper", record)
         self.assertNotIn("--apply", record["detail"])
+
+    def test_only_both_exact_kill_vectors_on_code_lines_count_as_sigkill(self) -> None:
+        good = "#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES
+        incomplete = {
+            "sandboxd still SIGTERMed": good.replace('-KILL sandboxd', 'sandboxd'),
+            "sandboxd kill missing": good.splitlines()[0] + "\n" + good.splitlines()[1] + "\n",
+            "only in a comment": '#!/bin/bash\n# "$KILLALL" -KILL tccd\n# "$KILLALL" -KILL sandboxd\n'
+                                 '"$KILLALL" tccd sandboxd\n',
+            "an extra kill": good + '"$KILLALL" -KILL launchd\n',
+            "the old one-line SIGTERM": '#!/bin/bash\n"$KILLALL" tccd sandboxd\n',
+        }
+        for name, text in incomplete.items():
+            with self.subTest(name):
+                self.wrapper.write_text(text)
+                self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
+        self.wrapper.write_text(good + "# a comment naming \"$KILLALL\" -KILL tccd\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
 
     def test_the_repo_wrapper_is_the_sigkill_version(self) -> None:
         self.assertTrue(tw.wrapper_sends_sigkill(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")))
@@ -586,7 +603,7 @@ class LaneAndDoctorTests(unittest.TestCase):
         # change reaches a host only when the installer is re-run there.
         with tempfile.TemporaryDirectory() as td:
             repo = Path(td) / "repo-wrapper"
-            repo.write_text("#!/bin/bash\n" + tw.SIGKILL_VECTOR + "\n")
+            repo.write_text("#!/bin/bash\n" + tw.SIGKILL_WRAPPER_LINES)
             installed = Path(td) / "installed-wrapper"
             cases = [
                 (None, fd.NOT_APPLICABLE, "heal_wrapper_not_installed"),

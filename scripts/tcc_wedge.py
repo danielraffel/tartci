@@ -113,6 +113,13 @@ PGREP = "/usr/bin/pgrep"
 INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                          "fleet", "ops", "install-tartci-heal-tcc.sh")
 SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
+# Every command the SIGKILL wrapper runs, in order. wrapper_sends_sigkill
+# requires exactly these on code lines: a SIGTERM for either daemon, a missing
+# or extra kill, or a vector that only appears in a comment is not the fix.
+KILL_VECTORS = ('"$KILLALL" -KILL tccd', '"$KILLALL" -KILL sandboxd')
+SIGKILL_WRAPPER_LINES = ('output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?\n'
+                         'sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?\n')
+_KILL_CALL = re.compile(r'"\$KILLALL"[^)|;&\n]*')
 
 
 def _iso(epoch: float) -> str:
@@ -818,9 +825,22 @@ def wrapper_sends_sigkill(wrapper: str) -> bool:
     """
     try:
         with open(wrapper, encoding="utf-8", errors="replace") as handle:
-            return SIGKILL_VECTOR in handle.read()
+            text = handle.read()
     except OSError:
         return True
+    return tuple(kill_vectors(text)) == KILL_VECTORS
+
+
+def kill_vectors(text: str) -> list[str]:
+    """Each `"$KILLALL" ...` call on a code line (comments skipped), in order,
+    with its redirection dropped."""
+    calls: list[str] = []
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        for call in _KILL_CALL.findall(line):
+            calls.append(re.sub(r"\s*\d?>&?\S*\s*$", "", call).strip())
+    return calls
 
 
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,

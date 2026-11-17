@@ -285,8 +285,12 @@ printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
 if [ -n "${STUB_BLOCK_FILE:-}" ] && ( set -C; : >"$STUB_BLOCK_FILE" ) 2>/dev/null; then
   while [ ! -e "${STUB_RELEASE_FILE:?}" ]; do sleep 0.02; done
 fi
-# A real killall exits 1 on a name with no match.
-[ "${2:-}" != sandboxd ] || exit "${STUB_KILLALL_SANDBOXD_RC:-${STUB_KILLALL_RC:-0}}"
+# A real killall prints "No matching processes ..." and exits 1 on a name
+# with no match.
+if [ "${2:-}" = sandboxd ]; then
+  if [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ]; then echo "No matching processes were found" >&2; exit 1; fi
+  exit "${STUB_KILLALL_SANDBOXD_RC:-${STUB_KILLALL_RC:-0}}"
+fi
 exit "${STUB_KILLALL_RC:-0}"
 EOF
 chmod +x "$heal_bin/killall"
@@ -295,7 +299,7 @@ cat >"$heal_bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
 case "${2:-}" in
   tccd) echo 101 ;;
-  sandboxd) [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ] && exit 1; echo 202 ;;
+  sandboxd) [ "${STUB_SANDBOXD_ABSENT:-0}" = 1 ] || [ "${STUB_PGREP_NO_SANDBOXD:-0}" = 1 ] && exit 1; echo 202 ;;
   *) exit 1 ;;
 esac
 EOF
@@ -327,17 +331,34 @@ if [ "$(uname -s)" = Darwin ]; then
   has err "killall -KILL tccd exited 3"
   [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 4 ] || fail "heal: an old stamp must allow one run"
   expect_rc 75 "heal: a failed attempt still spends the budget" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
-  # sandboxd is launched on demand: when it is not running, tccd alone is
-  # killed and the heal succeeds (killall would exit 1 on the missing name).
+  # sandboxd is launched on demand: its kill is always issued, and killall's
+  # no-match exit is not a failure.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
-  expect_rc 0 "heal: an absent sandboxd does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_SANDBOXD_ABSENT=1 STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
-  [ "$(cat "$STUB_STATE/killall.log")" = "-KILL tccd" ] || fail "heal: an absent sandboxd must not be signalled, got: $(cat "$STUB_STATE/killall.log")"
+  expect_rc 0 "heal: an absent sandboxd does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_SANDBOXD_ABSENT=1 bash "$HEAL"
+  [ "$(cat "$STUB_STATE/killall.log")" = "$(printf -- '-KILL tccd\n-KILL sandboxd')" ] || fail "heal: the sandboxd kill must always be issued, got: $(cat "$STUB_STATE/killall.log")"
   has out "restarted tccd (sandboxd was not running)"
-  # sandboxd exiting between pgrep and killall is logged, not a failed heal.
+  grep -q "sandboxd_rc=absent" "$tmp/heal.log" || fail "heal: the absent sandboxd is not logged"
+  # A sandboxd that the pgrep snapshot missed (it started after) is killed.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 0 "heal: a sandboxd missing from the snapshot is still killed" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_PGREP_NO_SANDBOXD=1 bash "$HEAL"
+  grep -qx -- "-KILL sandboxd" "$STUB_STATE/killall.log" || fail "heal: the sandboxd kill was skipped"
+  # Any other sandboxd kill failure fails the heal (after tccd was killed).
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
-  expect_rc 0 "heal: sandboxd gone before its kill does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
-  has out "sandboxd kill exited 1"
-  grep -q "sandboxd_rc=1" "$tmp/heal.log" || fail "heal: the sandboxd miss is not logged"
+  expect_rc 3 "heal: a real sandboxd kill failure is propagated" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=3 bash "$HEAL"
+  has err "killall -KILL sandboxd exited 3"
+  # A lock left by a heal that died (no live holder) never blocks a later one:
+  # flock is released by the kernel when its holder exits.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$tmp/heal.flock"
+  expect_rc 0 "heal: a leftover lock file without a holder does not block" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # A holder killed with SIGKILL releases the lock too.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  /usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; sleep 30' "$tmp/heal.flock" &
+  holder=$!
+  sleep 0.3
+  expect_rc 75 "heal: a live lock holder blocks a second heal" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "already in progress"
+  kill -KILL "$holder"; wait "$holder" 2>/dev/null || true
+  expect_rc 0 "heal: a SIGKILLed holder's lock is released" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   # The lock covers both the budget reservation and the kill vectors: a
   # concurrent caller must be rejected before it reaches killall.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"

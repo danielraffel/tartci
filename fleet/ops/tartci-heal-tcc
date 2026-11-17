@@ -9,8 +9,9 @@
 # refuses any argument.
 #
 # WHAT IT DOES, EXACTLY: /usr/bin/killall -KILL tccd, then /usr/bin/killall
-# -KILL sandboxd if sandboxd is running. launchd relaunches both on demand. No
-# path, label, signal or argument is accepted; nothing else runs.
+# -KILL sandboxd (a sandboxd that is not running is not a failure). launchd
+# relaunches both on demand. No path, label, signal or argument is accepted;
+# nothing else runs.
 #
 # WHY SIGKILL: both daemons catch SIGTERM and exit only once they are idle, and
 # a wedged tccd is never idle. On m3 the system tccd (pid 10970, started
@@ -60,16 +61,20 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # Resolve this after the unprivileged test overrides above.
-LOCK=$STAMP_DIR/heal.lock
+LOCK=$STAMP_DIR/heal.flock
 umask 077
 [[ -d "$STAMP_DIR" ]] || mkdir -m 0700 "$STAMP_DIR"
 [[ ! -L "$STAMP_DIR" && ! -L "$STAMP" ]] || die "refusing a symlinked stamp path: $STAMP" 70
-# mkdir is the atomic admission/reservation operation. Keep the lock until
-# after signaling so concurrent authorized callers cannot both spend the
-# budget. A stale lock fails closed; only the owner of the host can remove it.
+# One heal at a time: an exclusive flock(2) on fd 9, taken before the stamp is
+# read and held until this process exits, so concurrent authorized callers
+# cannot both spend the budget. The kernel drops the lock when the process
+# ends however it ends (timeout, SIGKILL, crash), so no stale lock can block
+# a later heal. perl takes the lock on the open file description fd 9 shares
+# with this shell; the shell keeps holding it after perl exits.
 [[ ! -L "$LOCK" ]] || die "refusing a symlinked lock path: $LOCK" 70
-mkdir "$LOCK" 2>/dev/null || die "another heal is already in progress" 75
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+exec 9>>"$LOCK" || die "cannot open the lock file: $LOCK" 70
+/usr/bin/perl -MFcntl=:flock -e 'open(my $fd, ">&=", 9) or exit 70; flock($fd, LOCK_EX | LOCK_NB) or exit 75' \
+  || die "another heal is already in progress" 75
 
 now=$(date +%s)
 stamp_age=""
@@ -90,14 +95,14 @@ before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
 before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
 rc=0
 output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?
-# sandboxd is launched on demand and may not be running; killall exits 1 on a
-# name with no match, which must not fail a heal that restarted tccd. It is
-# killed only when it was seen, and a miss (it exited in between) is logged.
-sandboxd_rc=absent
-sandboxd_output=""
-if [[ -n "$before_sandboxd" ]]; then
-  sandboxd_rc=0
-  sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?
+# sandboxd is launched on demand and may not be running. Its kill is always
+# issued (a daemon that started after the snapshot above is killed too); the
+# one tolerated failure is killall's no-match exit (1, "No matching
+# processes"), recorded as `absent`. Any other failure fails the heal.
+sandboxd_rc=0
+sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?
+if [[ "$sandboxd_rc" == 1 && "$sandboxd_output" == *"No matching processes"* ]]; then
+  sandboxd_rc=absent
 fi
 {
   printf '%s heal uid=%s sudo_user=%s rc=%s sandboxd_rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
@@ -110,10 +115,13 @@ fi
 if (( rc != 0 )); then
   die "killall -KILL tccd exited $rc: $output" "$rc"
 fi
-case "$sandboxd_rc" in
-  0) restarted="tccd and sandboxd" ;;
-  absent) restarted="tccd (sandboxd was not running)" ;;
-  *) restarted="tccd (sandboxd kill exited $sandboxd_rc: it was gone)" ;;
-esac
+if [[ "$sandboxd_rc" != 0 && "$sandboxd_rc" != absent ]]; then
+  die "killall -KILL sandboxd exited $sandboxd_rc: $sandboxd_output" "$sandboxd_rc"
+fi
+if [[ "$sandboxd_rc" == absent ]]; then
+  restarted="tccd (sandboxd was not running)"
+else
+  restarted="tccd and sandboxd"
+fi
 printf 'tartci-heal-tcc: restarted %s (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
   "$restarted" "${before_tccd% }" "${before_sandboxd% }"
