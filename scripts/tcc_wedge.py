@@ -839,7 +839,7 @@ def kill_vectors(text: str) -> list[str]:
         if line.lstrip().startswith("#"):
             continue
         for call in _KILL_CALL.findall(line):
-            calls.append(re.sub(r"\s*\d?>&?\S*\s*$", "", call).strip())
+            calls.append(re.sub(r"(\s+\d?>&?\S*)+\s*$", "", call).strip())
     return calls
 
 

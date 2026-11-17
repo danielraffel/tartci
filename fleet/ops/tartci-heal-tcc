@@ -75,11 +75,13 @@ umask 077
 exec 9>>"$LOCK" || die "cannot open the lock file: $LOCK" 70
 /usr/bin/perl -MFcntl=:flock -e 'open(my $fd, ">&=", 9) or exit 70; flock($fd, LOCK_EX | LOCK_NB) or exit 75' \
   || die "another heal is already in progress" 75
+# Every child below runs with fd 9 closed (`9>&-`), so a child that hangs
+# (pgrep, killall) cannot keep the lock alive after this shell is gone.
 
 now=$(date +%s)
 stamp_age=""
 if [[ -e "$STAMP" ]]; then
-  last=$(stat -f %m "$STAMP" 2>/dev/null || echo 0)
+  last=$(stat -f %m "$STAMP" 2>/dev/null 9>&- || echo 0)
   stamp_age=$(( now - last ))
   if (( stamp_age >= 0 && stamp_age < MIN_INTERVAL )); then
     printf '%s rate-limited uid=%s sudo_user=%s last_heal=%ss_ago\n' \
@@ -91,16 +93,16 @@ fi
 # Stamp BEFORE acting, so a failed attempt still spends the budget.
 : >"$STAMP"
 
-before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
-before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
+before_tccd=$(pgrep -x tccd 2>/dev/null 9>&- | tr '\n' ' ' 9>&- || true)
+before_sandboxd=$(pgrep -x sandboxd 2>/dev/null 9>&- | tr '\n' ' ' 9>&- || true)
 rc=0
-output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?
+output=$("$KILLALL" -KILL tccd 2>&1 9>&-) || rc=$?
 # sandboxd is launched on demand and may not be running. Its kill is always
 # issued (a daemon that started after the snapshot above is killed too); the
 # one tolerated failure is killall's no-match exit (1, "No matching
 # processes"), recorded as `absent`. Any other failure fails the heal.
 sandboxd_rc=0
-sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?
+sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1 9>&-) || sandboxd_rc=$?
 if [[ "$sandboxd_rc" == 1 && "$sandboxd_output" == *"No matching processes"* ]]; then
   sandboxd_rc=absent
 fi

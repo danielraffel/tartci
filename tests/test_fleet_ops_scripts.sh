@@ -282,6 +282,8 @@ heal_bin="$tmp/heal-bin"; mkdir -p "$heal_bin"
 cat >"$heal_bin/killall" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$STUB_STATE/killall.log"
+# Records whether the wrapper's lock descriptor leaked into this child.
+if [ -e /dev/fd/9 ]; then echo inherited >>"$STUB_STATE/fd9.log"; fi
 if [ -n "${STUB_BLOCK_FILE:-}" ] && ( set -C; : >"$STUB_BLOCK_FILE" ) 2>/dev/null; then
   while [ ! -e "${STUB_RELEASE_FILE:?}" ]; do sleep 0.02; done
 fi
@@ -359,6 +361,12 @@ if [ "$(uname -s)" = Darwin ]; then
   has err "already in progress"
   kill -KILL "$holder"; wait "$holder" 2>/dev/null || true
   expect_rc 0 "heal: a SIGKILLed holder's lock is released" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # The kill vectors never inherit the lock: a killall that outlives the
+  # wrapper must not keep the lock held.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  : >"$STUB_STATE/fd9.log"
+  expect_rc 0 "heal: fd 9 closed for killall" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  [ ! -s "$STUB_STATE/fd9.log" ] || fail "heal: killall inherited the lock descriptor"
   # The lock covers both the budget reservation and the kill vectors: a
   # concurrent caller must be rejected before it reaches killall.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
