@@ -472,15 +472,24 @@ times in a row (default 2), `scripts/tcc_wedge.py` classifies the hang from
 independent readings: the same bounded probe on an internal control path (the
 state directory) must answer; a bounded `log show` over the whole failing
 streak (10 min to 3 h) must contain a sandboxd/tccd Removable Volumes
-authorization failure (lines written after the last heal are ignored, so the
-burst a release writes cannot justify the next heal); and, when
+authorization failure (lines written after a heal inside that window are
+ignored, so the burst a release writes cannot justify the next heal; a heal
+before the minutes the scan reads cuts nothing); and, when
 `TARTCI_TCC_CONTEXT_PROBE` names a command that probes the store from a context
 with TCC access (for example over `ssh localhost`, whose sshd holds Full Disk
 Access), that command must exit 0. Set it per host as `[launchd_watchdog]
 tcc_context_probe` in the fleet profile (launchd/README.md), which the
 support-agents step renders into the watchdog plist; never edit the plist by
 hand. Only every configured reading agreeing
-yields `tcc_attribution_wedge` (`path: error_signature`).
+yields `tcc_attribution_wedge` (`path: error_signature`). The one exception is a
+saturated tccd (m3, 2026-11-17: tccd at 90% CPU, a storm of refusals): the
+context probe waits on the same tccd and times out too, while `df -P` of the
+volume root (statfs, which needs no privacy decision) answers. With the
+refusal lines present that is `path: error_signature_saturated`, still
+`tcc_attribution_wedge`; a volume that does not answer `df` either, or a
+context probe that failed fast instead of timing out, keeps the "the volume,
+not tccd, is stalled" veto. `df` answering proves the volume is mounted, not
+that its I/O is healthy, so this path leans on the refusal lines.
 
 A wedge can also log nothing at all (m3, 2026-11-13: no refusal line for
 hours). For that shape the classifier takes positive readings instead of error
