@@ -102,8 +102,6 @@ class VerdictTests(unittest.TestCase):
             '"main"', '"gh-readonly-queue/main/pr-1-abc"')
         self.assertEqual(cl.verdict(0, "terminal_pending_run", merge_group, q, None, "1", "2"),
                          ("green", "receipt=merge_group"))
-        self.assertEqual(cl.verdict(0, "terminal_pending_run", self.PENDING_RUN, "none",
-                                    None, "1", "2")[0], "green")
 
     def test_a_pending_run_receipt_short_of_proof_stays_red(self) -> None:
         q = "listener_exited_workflow_active"
@@ -125,6 +123,15 @@ class VerdictTests(unittest.TestCase):
                                       q, None, "1", "2"),
             "other_quarantine": (0, "terminal_pending_run", p, "signal_teardown_unknown",
                                  None, "1", "2"),
+            "pending_run_without_its_quarantine": (0, "terminal_pending_run", p, "none",
+                                                   None, "1", "2"),
+            "pending_run_empty_quarantine": (0, "terminal_pending_run", p, "", None, "1", "2"),
+            "push_to_non_main_branch": (0, "terminal_pending_run",
+                                        p.replace('"head_branch":"main"', '"head_branch":"feat/x"'),
+                                        q, None, "1", "2"),
+            "pull_request_target_on_main": (0, "terminal_pending_run",
+                                            p.replace('"push"', '"pull_request_target"'),
+                                            q, None, "1", "2"),
             "active_capture": (0, "active", p.replace('"terminal_pending_run"', '"active"'),
                                q, "Succeeded", "1", "2"),
         }

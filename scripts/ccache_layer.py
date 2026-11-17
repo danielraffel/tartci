@@ -140,8 +140,10 @@ def verdict(runner_rc: int, capture_status: str, receipt: str, quarantine: str,
     """
     if runner_rc != 0:
         return "red", f"runner_rc={runner_rc}"
+    # runner.sh always records this quarantine for terminal_pending_run, so a
+    # pending-run capture without it is not the observation described above.
     pending_run = (capture_status == "terminal_pending_run"
-                   and quarantine in ("", "none", PENDING_RUN_QUARANTINE))
+                   and quarantine == PENDING_RUN_QUARANTINE)
     if quarantine not in ("", "none") and not pending_run:
         return "red", f"quarantine={quarantine}"
     if local_result is not None and local_result not in GREEN_RESULTS:
