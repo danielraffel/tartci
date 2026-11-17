@@ -1015,6 +1015,13 @@ class QueueLightTests(Base):
         aside = json.loads((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).read_text())
         self.assertIn("gate queue is heavy", aside["reason"])
 
+    def assertDrainedAnyway(self, rc: int) -> None:
+        """Passed a heavy queue. EXIT_DEFERRED is also 0, so a step-aside is
+        ruled out first: a revert then FAILs here rather than erroring later."""
+        self.assertFalse(self.receipt().get("stepped_aside"), self.receipt().get("error"))
+        self.assertIn("drains anyway", self.queue_step())
+        self.assertUpdated(rc)
+
     def test_a_heavy_queue_steps_aside_before_any_mutation(self) -> None:
         self.demand(2)
         self.assertSteppedAsideForQueue(self.apply())
@@ -1066,6 +1073,98 @@ class QueueLightTests(Base):
         self.demand(4)
         self.aside_since(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 600)
         self.assertSteppedAsideForQueue(self.apply())
+
+    def behind_main_for(self, seconds: float) -> None:
+        """The oldest undeployed commit finished its soak `seconds` ago."""
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def test_a_heavy_queue_drains_once_behind_main_past_the_bound(self) -> None:
+        # m3, 2026-11-17: a slow-store host fault released its queue place,
+        # so the next heavy queue started a fresh 3 h wait while m3 sat ten
+        # hours behind main. No ticket here, as after that release.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.assertDrainedAnyway(self.apply())
+        self.assertIn("behind main", self.queue_step())
+
+    def test_a_heavy_queue_steps_aside_while_behind_main_inside_the_bound(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def took_turn_at(self, started: float, status: str = "refused",
+                     finished: float | None = None) -> None:
+        """An earlier apply that drained for its turn, then ended `status`."""
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-turn.json", {
+            "mode": "apply", "target": T_OLD, "status": status, "started_at": su._iso(started),
+            "finished_at": su._iso(started + 60 if finished is None else finished),
+            "steps": [{"step": "announce", "ok": True}, {"step": "drain", "ok": True}]})
+
+    def test_a_turn_restarts_the_behind_main_clock(self) -> None:
+        # A post-drain refusal is neither rate limited nor counted toward the
+        # halt; without this a host far behind would drain at every attempt.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_a_turn_older_than_the_bound_does_not_hold_the_host(self) -> None:
+        # Control, same instrument: the last turn was past the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 60)
+        self.assertDrainedAnyway(self.apply())
+
+    def test_a_refusal_before_the_turn_is_not_a_turn(self) -> None:
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-x.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 60),
+            "steps": [{"step": "store-volume", "ok": False}]})
+        su._write_json(attempts / "19990101T000001Z-y.json", {
+            "mode": "plan", "status": "planned", "started_at": su._iso(NOW - 30),
+            "steps": [{"step": "drain", "ok": True}]})
+        # Announced, then the snapshot refused before any drain: still serving.
+        su._write_json(attempts / "19990101T000002Z-z.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 20),
+            "steps": [{"step": "announce", "ok": True},
+                      {"step": "snapshot-verify", "ok": False}]})
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
+        self.took_turn_at(NOW - 900, finished=NOW - 840)
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 840)
+
+    def test_a_same_generation_refresh_keeps_queue_courtesy(self) -> None:
+        # A fleet-source move reinstalls the running generation; it does not
+        # move the host along main, so time behind main must not drain every
+        # host into a heavy queue for it.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        with mock.patch.object(su, "checks_green", return_value=(False, "not green: red")), \
+                mock.patch.object(su, "refresh_reason",
+                                  return_value="fleet source moved to cccccccccccc"):
+            self.assertSteppedAsideForQueue(self.apply())
+        self.assertEqual(self.receipt()["target"], INSTALLED)
+
+    def test_a_long_turn_counts_from_when_it_ended(self) -> None:
+        # Began past the bound, ended ten minutes ago: still a recent turn.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 7200)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 3600, finished=NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 600)}, 1800, NOW),
+                         0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW),
+                         3600.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW,
+                                           last_turn=NOW - 600), 600.0)
 
     def test_the_bound_is_below_every_starvation_bound(self) -> None:
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_AFTER_SECONDS)
@@ -3102,6 +3201,32 @@ class StoreHealthRecordTests(unittest.TestCase):
         self.state.parent.mkdir(parents=True, exist_ok=True)
         self.state.write_text("{not json")
         self.assertEqual("unknown", su.System().store_health(str(self.store))[0])
+
+
+class HeavyQueueAfterHostFaultTests(Base):
+    """m3, 2026-11-17: a slow-store host fault releases the queue place, and
+    the heavy-queue bound must not restart from zero after it."""
+    sealed = True
+    demand = QueueLightTests.demand
+    receipt = QueueLightTests.receipt
+    queue_step = QueueLightTests.queue_step
+    behind_main_for = QueueLightTests.behind_main_for
+    aside_since = QueueLightTests.aside_since
+    assertDrainedAnyway = QueueLightTests.assertDrainedAnyway
+
+    def test_a_host_fault_does_not_restart_the_heavy_queue_bound(self) -> None:
+        self.demand(1)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.aside_since(NOW - 2 * 3600)
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("Tart store volume slow", self.receipt()["error"])
+        self.assertIsNone(su.waiting_ticket(self.cfg), "the place was released")
+        self.assertEqual([], self.sys.mutations())
+        # Next attempt: the store is fast again but the queue is heavy.
+        self.sys.store_result = {"ms": 4.0}
+        self.demand(4)
+        self.assertDrainedAnyway(self.apply())
 
 
 class LauncherProbeStopTests(Base):
