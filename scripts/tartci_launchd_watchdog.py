@@ -1449,9 +1449,11 @@ def host_attestation_pass(home: str | None = None, run=_bounded_run,
         repin = (current, wanted)
     env = dict(os.environ)
     env.pop("TARTCI_ATTESTATION_PYTHON", None)
-    if current and not move:
+    if current and not move and os.access(current, os.X_OK):
         # Keep the interpreter the plist runs: an operator's choice, or the
-        # unstable one when no framework python is available to move to.
+        # unstable one when no framework python is available to move to. A
+        # vanished one is left to the installer to choose, so it never refuses
+        # every pass.
         env["TARTCI_ATTESTATION_PYTHON"] = current
     try:
         args: list[str] = []

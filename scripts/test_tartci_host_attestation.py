@@ -590,7 +590,11 @@ class WatchdogRedeployTests(unittest.TestCase):
 
     def test_an_operator_override_the_lint_accepts_is_never_repinned(self) -> None:
         # TARTCI_ATTESTATION_PYTHON is not in the plist; its result is.
-        override = "/usr/local/opt/custom/bin/python3"
+        override = os.path.join(self.home, "custom", "bin", "python3")
+        os.makedirs(os.path.dirname(override))
+        with open(override, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(override, 0o755)
         self.plist(ProgramArguments=[override, f"{self.current}/tartci_host_attestation.py",
                                      "--write", "--self-check"])
         self.installed(self.source)
@@ -601,6 +605,23 @@ class WatchdogRedeployTests(unittest.TestCase):
         self.installed(b"# an older writer\n")
         self.assertIn("redeployed", self.run_pass(pinned=FRAMEWORK_PYTHON))
         self.assertEqual(self.envs[-1].get("TARTCI_ATTESTATION_PYTHON"), override)
+
+    def test_a_vanished_interpreter_is_not_passed_back_on_a_writer_redeploy(self) -> None:
+        # With no framework python to move to, pinning a binary that no longer
+        # exists would make the installer refuse on every pass.
+        gone = os.path.join(self.home, "gone", "python3")
+        self.plist(ProgramArguments=[gone, f"{self.current}/tartci_host_attestation.py"])
+        self.installed(b"# an older writer\n")
+        self.assertIn("redeployed", self.run_pass(pinned=None, unstable=lambda path: False))
+        self.assertNotIn("TARTCI_ATTESTATION_PYTHON", self.envs[-1])
+        # Control: an interpreter that exists is kept.
+        live = os.path.join(self.home, "live-python3")
+        with open(live, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(live, 0o755)
+        self.plist(ProgramArguments=[live, f"{self.current}/tartci_host_attestation.py"])
+        self.run_pass(pinned=None, unstable=lambda path: False)
+        self.assertEqual(self.envs[-1].get("TARTCI_ATTESTATION_PYTHON"), live)
 
     def test_a_failed_framework_probe_never_repins_toward_homebrew(self) -> None:
         # The installer falls back to Homebrew (or refuses) when the framework
