@@ -45,7 +45,7 @@ SELF_DECLARED = "3.9-safe"
 # dropping the declaration is a visible edit here rather than a silent change
 # to which tests must run on 3.9.
 EXPECTED_SELF_DECLARED = frozenset({
-    "denial_reclaim", "disk_available", "disk_watchdog", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
+    "denial_reclaim", "disk_available", "disk_watchdog", "external_only_policy", "gate_reserve_fit", "home_volume_floor", "launchd_interval_guard",
     "pool_log", "state_age", "vm_dhcp_breaker",
 })
 
@@ -190,6 +190,9 @@ ALLOWED = {
     ("test_gate_reserve_fit.py",
      "ValidateCliTests"):
         LANES,
+    ("test_external_only_policy.py",
+     "ShippedProfileTests"):
+        SHIPPED,
     ("test_home_volume_floor.py",
      "ProfileModeTests"):
         "3.11-only: parses the shipped profiles/*.toml and renders them through "

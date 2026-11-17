@@ -16,6 +16,7 @@ import time
 import uuid
 from typing import Any, Iterator
 
+import external_only_policy
 import fair_share
 import host_profile
 import lease_cli
@@ -737,6 +738,8 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "total_mem_mb": total_mem,
         "reserved_gate_mem_mb": reserved_mem,
         "per_job_mem_mb": per_job_mem,
+        "external_root": profile.get("external_root"),
+        "external_only_mode": profile.get("external_only_mode", "report"),
     }
 
 
@@ -1692,6 +1695,14 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "id": lease_id,
             "kind": args.kind,
         }, 75
+
+    # External-only hosts keep builds and caches off the internal disk. Refused
+    # before the store lock: nothing here depends on lease accounting.
+    refusal = external_only_policy.check_acquire(
+        args, cfg.get("external_root"), mode=cfg.get("external_only_mode", "report"))
+    if refusal is not None:
+        refusal["id"] = lease_id
+        return refusal, external_only_policy.EXIT_REFUSED
 
     disk: dict[str, Any] | None = None
     requested_disk_bytes = 0
@@ -2733,6 +2744,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         result = {"ok": False, "error": str(exc)}
         rc = 2
+    if result.get("reason") == external_only_policy.REASON:
+        print(result["message"], file=sys.stderr)
     emit(result, bool(getattr(args, "json", False)))
     return rc
 

@@ -128,6 +128,15 @@ def parse_args(
     )
     acquire_parser.add_argument("--priority", default="build")
     acquire_parser.add_argument(
+        "--build-dir", action="append", default=[],
+        help="a build directory this build writes; on an external-only host a path on "
+             "the internal data volume refuses the build (external_only_policy.py)",
+    )
+    acquire_parser.add_argument(
+        "--cache-dir", action="append", default=[],
+        help="a cache directory this build writes; judged like --build-dir",
+    )
+    acquire_parser.add_argument(
         "--allow-floor",
         action="store_true",
         help=(

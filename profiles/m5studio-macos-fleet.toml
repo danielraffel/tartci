@@ -20,6 +20,14 @@ ssh = "m5s"
 python = "/opt/homebrew/Cellar/python@3.12/3.12.15/Frameworks/Python.framework/Versions/3.12/bin/python3.12"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Atelier/VMs"
+# External-only host: a host build whose build dir or cache dir resolves to the
+# internal data volume is reported (and, in "refuse" mode, refused) at
+# `tartci leases acquire` (scripts/external_only_policy.py). m5studio's internal volume reached 98% on
+# 2026-11-17. Rollback: delete this line and re-render.
+external_root = "/Volumes/Atelier"
+# "report" warns and admits; flip to "refuse" once `external_only_policy.py check`
+# is clean on this host (runbook: Keeping builds and caches on the external volume).
+external_only_mode = "report"
 cache_root = "/Users/danielraffel/.cache/pulp-ci"
 log_root = "/Users/danielraffel/Library/Logs/tartci"
 # Measured 2026-09-21: of 209 assignment-scan failures on this host in 24h,
