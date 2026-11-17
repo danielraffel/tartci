@@ -2398,6 +2398,35 @@ DISK_PROBLEM_PERCENT = 92
 HOME_DISK_PROBLEM_PERCENT = 97
 
 
+# Raw statfs free space below this is pressure whatever macOS says it could
+# purge: purgeable space is reclaimed on demand and with lag, and a build that
+# needs the room now gets ENOSPC first.
+DISK_RAW_FLOOR_BYTES = 20 * 1024 ** 3
+IMPORTANT_CAPACITY_SCRIPT = Path(__file__).with_name("disk_important_capacity.swift")
+IMPORTANT_CAPACITY_TIMEOUT_S = 20
+
+
+def important_free_bytes(path: Path) -> int | None:
+    """Bytes macOS says are available for important usage on `path`'s volume
+    (free plus purgeable), or None when it cannot be read.
+
+    statfs counts only the free blocks: on m5studio it read 49 GB free
+    (98% used) while the same volume reported 560 GB for important usage.
+    Any failure (no swift, a non-APFS volume, a timeout) is None, and the
+    caller falls back to the raw number.
+    """
+    from bounded_subprocess import ObservationError, run_bounded  # noqa: PLC0415
+    try:
+        proc = run_bounded(["/usr/bin/swift", str(IMPORTANT_CAPACITY_SCRIPT), str(path)],
+                           timeout=IMPORTANT_CAPACITY_TIMEOUT_S, operation="important_capacity")
+    except (OSError, ObservationError, ValueError):
+        return None
+    text = proc.stdout.strip()
+    if proc.returncode != 0 or not text.isdigit():
+        return None
+    return int(text)
+
+
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
     """Used % of the VM store volume (host.tart_home) and the home volume.
 
@@ -2432,13 +2461,24 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
             rows.append({"role": role, "path": str(path), "state": "unknown",
                          "detail": str(exc)})
             continue
-        percent = 100.0 * (usage.total - usage.free) / usage.total if usage.total else 0.0
+        important = important_free_bytes(path)
+        # Purgeable space counts toward "available", but never past the volume.
+        available = usage.free if important is None else min(max(usage.free, important),
+                                                              usage.total)
+        percent = 100.0 * (usage.total - available) / usage.total if usage.total else 0.0
         limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
-        state = ("problem" if percent >= limit
+        below_floor = usage.free < DISK_RAW_FLOOR_BYTES
+        state = ("problem" if percent >= limit or below_floor
                  else "warn" if percent >= DISK_WARN_PERCENT else "ok")
         rows.append({"role": role, "path": str(path), "state": state,
                      "used_percent": round(percent, 1),
-                     "free_gib": round(usage.free / 1024 ** 3, 1)})
+                     "raw_used_percent": round(100.0 * (usage.total - usage.free)
+                                               / usage.total, 1) if usage.total else 0.0,
+                     "free_gib": round(available / 1024 ** 3, 1),
+                     "raw_free_gib": round(usage.free / 1024 ** 3, 1),
+                     "important_free_gib": (None if important is None
+                                            else round(important / 1024 ** 3, 1)),
+                     "below_raw_floor": below_floor})
     return rows
 
 
@@ -2562,8 +2602,12 @@ def fleet_readiness(
         if disk["state"] == "problem":
             problems.append({
                 "code": "disk_pressure", "label": disk["path"],
-                "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB free "
-                           + (f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
+                "detail": (f"{disk['used_percent']}% used, {disk['free_gib']} GiB available "
+                           f"({disk['raw_free_gib']} GiB raw free, "
+                           f"{disk['important_free_gib']} GiB available for important usage) "
+                           + (f"(raw free under {DISK_RAW_FLOOR_BYTES // 1024 ** 3} GiB)"
+                              if disk.get("below_raw_floor") else
+                              f"(>= {DISK_PROBLEM_PERCENT}% stalls I/O on this volume)"
                               if disk["role"] == "vm_store" else
                               f"(>= {HOME_DISK_PROBLEM_PERCENT}% fails builds with ENOSPC)")),
             })
