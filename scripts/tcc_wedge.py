@@ -110,6 +110,8 @@ HEALED_PROCESSES = ("tccd", "sandboxd")
 HEAL_SETTLE_S = 5.0
 PGREP = "/usr/bin/pgrep"
 # The wrapper's one command vector since it sends SIGKILL (fleet/ops/tartci-heal-tcc).
+INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "fleet", "ops", "install-tartci-heal-tcc.sh")
 SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
 
 
@@ -886,8 +888,8 @@ def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
                 record["stale_wrapper"] = True
                 record["detail"] += (f"; {wrapper} does not send SIGKILL (an install from before "
                                      "the SIGKILL change, whose SIGTERM the daemons defer): "
-                                     "reinstall it with sudo fleet/ops/install-tartci-heal-tcc.sh "
-                                     "--apply")
+                                     "reinstall it with sudo "
+                                     f"{INSTALLER} --apply")
         else:
             record["outcome"] = "ran"
     elif rc == 75:

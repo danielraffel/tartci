@@ -276,7 +276,8 @@ class HealTests(unittest.TestCase):
         self.assertIn("ineffective", tw.BUDGET_OUTCOMES)
         # The fixture wrapper is not the SIGKILL version, so the record names it.
         self.assertTrue(record.get("stale_wrapper"))
-        self.assertIn("install-tartci-heal-tcc.sh --apply", record["detail"])
+        self.assertIn(tw.INSTALLER + " --apply", record["detail"])
+        self.assertTrue(os.path.isabs(tw.INSTALLER))
 
     def test_ineffective_heal_through_the_sigkill_wrapper_is_not_called_stale(self) -> None:
         self.wrapper.write_text("#!/bin/bash\n" + tw.SIGKILL_VECTOR + "\n")
@@ -590,6 +591,8 @@ class LaneAndDoctorTests(unittest.TestCase):
             cases = [
                 (None, fd.NOT_APPLICABLE, "heal_wrapper_not_installed"),
                 (repo.read_text(), fd.OK, "heal_wrapper_current"),
+                # A comment-only difference in a SIGKILL wrapper is a notice.
+                (repo.read_text() + "# a newer comment\n", fd.OK, "heal_wrapper_drift"),
                 ('#!/bin/bash\n"$KILLALL" tccd sandboxd\n', fd.PROBLEM, "heal_wrapper_stale"),
             ]
             for text, state, code in cases:
@@ -602,7 +605,8 @@ class LaneAndDoctorTests(unittest.TestCase):
                     self.assertEqual((finding.state, finding.code), (state, code))
                     self.assertIn(code, fd.CODES)
                     self.assertIn(code, fd.load_reasons())
-            self.assertIn("install-tartci-heal-tcc.sh --apply", finding.detail)
+            self.assertIn(str(fd.ROOT / "fleet" / "ops" / "install-tartci-heal-tcc.sh") + " --apply",
+                          finding.detail)
             self.assertIn("SIGTERM", finding.detail)
             unreadable = fd.check_heal_wrapper(installed=installed, repo_copy=Path(td) / "gone")
             self.assertEqual((unreadable.state, unreadable.code),

@@ -102,5 +102,10 @@ fi
 if (( rc != 0 )); then
   die "killall -KILL tccd exited $rc: $output" "$rc"
 fi
-printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s], sandboxd kill %s); launchd relaunches them on demand\n' \
-  "${before_tccd% }" "${before_sandboxd% }" "$sandboxd_rc"
+case "$sandboxd_rc" in
+  0) restarted="tccd and sandboxd" ;;
+  absent) restarted="tccd (sandboxd was not running)" ;;
+  *) restarted="tccd (sandboxd kill exited $sandboxd_rc: it was gone)" ;;
+esac
+printf 'tartci-heal-tcc: restarted %s (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
+  "$restarted" "${before_tccd% }" "${before_sandboxd% }"

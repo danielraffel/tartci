@@ -112,6 +112,12 @@
       "summary": "The installed tartci-heal-tcc wrapper matches this checkout.",
       "why": "The root-owned copy in /usr/local/sbin is byte-identical to fleet/ops/tartci-heal-tcc."
     },
+    "heal_wrapper_drift": {
+      "summary": "The installed tartci-heal-tcc wrapper differs from this checkout but sends SIGKILL.",
+      "why": "A difference that keeps the SIGKILL command (a comment or log line) leaves the heal working, so it is a notice, not a problem.",
+      "remedy": "Reinstall when convenient: sudo fleet/ops/install-tartci-heal-tcc.sh --apply (an owner step).",
+      "do_not": "Do not treat this as a broken heal or page the owner for it."
+    },
     "heal_wrapper_not_installed": {
       "summary": "This host has no tartci-heal-tcc wrapper.",
       "why": "/usr/local/sbin/tartci-heal-tcc does not exist, so the watchdog's TCC heal reports wrapper_missing.",
@@ -119,7 +125,7 @@
       "do_not": "Do not add a broader sudo grant instead."
     },
     "heal_wrapper_stale": {
-      "summary": "The installed tartci-heal-tcc wrapper differs from this checkout.",
+      "summary": "The installed tartci-heal-tcc wrapper still sends SIGTERM, so a heal cannot restart tccd.",
       "why": "The wrapper is a root-owned copy installed by hand, so a merged change reaches a host only when the installer is re-run there. A copy from before the SIGKILL change sends SIGTERM, which tccd defers while wedged, so every heal is ineffective.",
       "remedy": "On this host, from a checkout at the deployed commit: sudo fleet/ops/install-tartci-heal-tcc.sh --apply (an owner step: it needs the owner's sudo password).",
       "do_not": "Do not copy the file into /usr/local/sbin by hand or loosen its ownership: the installer checks the root-owned chain and validates the sudoers grant."

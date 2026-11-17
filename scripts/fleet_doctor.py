@@ -73,6 +73,7 @@ CODES: tuple[str, ...] = (
     "gate_reserve_unknown",
     "generation_path_exec",
     "heal_wrapper_current",
+    "heal_wrapper_drift",
     "heal_wrapper_not_installed",
     "heal_wrapper_stale",
     "heal_wrapper_unreadable",
@@ -1348,7 +1349,7 @@ def check_heal_wrapper(installed: Path | None = None, repo_copy: Path | None = N
 
     installed = Path(tcc_wedge.WRAPPER) if installed is None else installed
     repo_copy = ROOT / "fleet" / "ops" / "tartci-heal-tcc" if repo_copy is None else repo_copy
-    install = "sudo fleet/ops/install-tartci-heal-tcc.sh --apply"
+    install = f"sudo {ROOT / 'fleet' / 'ops' / 'install-tartci-heal-tcc.sh'} --apply"
     facts = {"installed": str(installed), "repo_copy": str(repo_copy), "install": install}
     if not installed.exists():
         return Finding("heal_wrapper", NOT_APPLICABLE, "heal_wrapper_not_installed",
@@ -1363,11 +1364,15 @@ def check_heal_wrapper(installed: Path | None = None, repo_copy: Path | None = N
         return Finding("heal_wrapper", OK, "heal_wrapper_current",
                        f"heal wrapper: {installed} matches this checkout", facts)
     facts["sends_sigkill"] = tcc_wedge.wrapper_sends_sigkill(str(installed))
+    if facts["sends_sigkill"]:
+        # Any other difference (a comment, a log line) leaves the heal working:
+        # a notice, never a reason to spend an owner sudo step.
+        return Finding("heal_wrapper", OK, "heal_wrapper_drift",
+                       f"heal wrapper: {installed} differs from {repo_copy} but sends SIGKILL, "
+                       f"so the heal works; reinstall when convenient: {install}", facts)
     return Finding("heal_wrapper", PROBLEM, "heal_wrapper_stale",
-                   f"heal wrapper: {installed} differs from {repo_copy}"
-                   + ("" if facts["sends_sigkill"] else
-                      " and still sends SIGTERM, which tccd defers, so a heal cannot restart it")
-                   + f"; reinstall from this checkout: {install}", facts)
+                   f"heal wrapper: {installed} still sends SIGTERM, which tccd defers, so a heal "
+                   f"cannot restart it; reinstall: {install}", facts)
 
 
 def check_reclaim(value: dict | None) -> Finding:

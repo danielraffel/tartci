@@ -329,11 +329,11 @@ if [ "$(uname -s)" = Darwin ]; then
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
   expect_rc 0 "heal: an absent sandboxd does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_SANDBOXD_ABSENT=1 STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
   [ "$(cat "$STUB_STATE/killall.log")" = "-KILL tccd" ] || fail "heal: an absent sandboxd must not be signalled, got: $(cat "$STUB_STATE/killall.log")"
-  has out "sandboxd kill absent"
+  has out "restarted tccd (sandboxd was not running)"
   # sandboxd exiting between pgrep and killall is logged, not a failed heal.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
   expect_rc 0 "heal: sandboxd gone before its kill does not fail the heal" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_SANDBOXD_RC=1 bash "$HEAL"
-  has out "sandboxd kill 1"
+  has out "sandboxd kill exited 1"
   grep -q "sandboxd_rc=1" "$tmp/heal.log" || fail "heal: the sandboxd miss is not logged"
 else
   expect_rc 78 "heal: refuses off macOS" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
