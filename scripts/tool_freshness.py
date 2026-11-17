@@ -1024,7 +1024,7 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
                     # clean tick on this release, not for the fixed soak.
                     event["steward_host"] = True
                     canary.record_deploy(steward, name, new, before_effective or old, by,
-                                         swapped_at)
+                                         swapped_at, home, tool)
                 _append_event(state, event)
                 if component == "cli":
                     unverified.pop(name, None)

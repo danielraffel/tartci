@@ -3309,7 +3309,13 @@ arrive, and a host that did not get it is loud:
     v8-builder joined with `required_never_ran` and m3 sat on 0.439.3, with
     m1 and m5s on 0.439.2, for nine hours. The comparison is per repository,
     so a standing failure in one repository does not excuse the same
-    invariant newly failing in another.
+    invariant newly failing in another. The baseline (the last tick finished
+    before the swap, and whether the tick in flight could not run the steward)
+    is stored with the deploy in `steward.json` at the swap. summary.log is
+    read from a 512 KiB tail, and a verdict judged after the pre-swap ticks
+    scrolled out would otherwise blame a standing failure on the release and
+    roll it back. A record without one (written by an older checkout) still
+    reads the baseline from the log.
   - The first one with a failing invariant the baseline did not have, or the
     second in a row in which the steward could not run at all (every
     repository wrote `ERROR` or a skip; one such tick is often a timeout or a
