@@ -760,7 +760,12 @@ def volume_meta_probe(path: str, timeout_s: float, *,
         out["reason"] = str(exc)[:300]
         return out
     lines = (completed.stdout or "").splitlines()[1:]
-    out["ok"] = any(line.split()[-1:] == [root] for line in lines if line.strip())
+    # `Mounted on` is the sixth field in `df -P`.  Split only the fixed
+    # columns before it so a valid mount point such as `/Volumes/External
+    # SSD` remains intact; taking the final whitespace token would reduce it
+    # to `SSD` and disable the saturated-tccd recovery path.
+    out["ok"] = any((fields := line.split(maxsplit=5)) and len(fields) == 6
+                    and fields[5] == root for line in lines if line.strip())
     if not out["ok"]:
         out["reason"] = f"df did not list {root} as a mount point"
     return out

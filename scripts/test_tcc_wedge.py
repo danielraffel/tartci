@@ -286,6 +286,26 @@ class ClassifyTests(unittest.TestCase):
         self.assertFalse(tw.volume_meta_probe("/Users/example/vms", 10.0,
                                               runner=root_listed)["ok"])
 
+    def test_volume_meta_probe_and_classifier_accept_spaced_mount_point(self) -> None:
+        def runner(argv, timeout, operation):
+            return subprocess.CompletedProcess(
+                argv, 0,
+                "Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                "/dev/disk7s1 100 50 50 50% /Volumes/External SSD\n",
+                "",
+            )
+
+        meta = lambda: tw.volume_meta_probe(  # noqa: E731
+            "/Volumes/External SSD/VMs", 10.0, runner=runner)
+        verdict = classify(
+            context_probe=lambda: {"ok": False, "reason": "timeout after 10s"},
+            volume_meta=meta,
+        )
+        self.assertEqual(verdict["kind"], tw.KIND)
+        self.assertEqual(verdict["path"], "error_signature_saturated")
+        self.assertEqual(verdict["evidence"]["volume_meta"]["volume_root"],
+                         "/Volumes/External SSD")
+
     def test_tcc_context_probe_that_hangs_names_the_volume_not_tccd(self) -> None:
         verdict = classify(context_probe=lambda: {"ok": False, "reason": "timeout after 10s"})
         self.assertEqual(verdict["kind"], "stalled_unclassified")
