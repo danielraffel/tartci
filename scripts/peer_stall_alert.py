@@ -60,6 +60,11 @@ SEPARATOR = "--- guard ---"
 RESOLVER_SEPARATOR = "--- resolver ---"
 LAST_SEPARATOR = "--- peer-stall ---"
 VITALS_SEPARATOR = "--- host-vitals ---"
+FRESHNESS_SEPARATOR = "--- tool-freshness ---"
+# A host more than this many Shipyard releases, or this many hours, behind the
+# newest release is reported (tool-freshness state.json, read on the peer).
+SHIPYARD_DRIFT_RELEASES = 1
+SHIPYARD_DRIFT_HOURS = 6
 HOST_VITALS_STALE_SECS = 5 * 60
 # Printed by the peer: its clock, its guard receipt, then its own last
 # peer-stall pass (each empty when absent).
@@ -71,6 +76,8 @@ PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_PEER_STALL_DIR:-${TARTCI_HOME:-$HOME/.tartci}/state/peer-stall}'
              '/last-read.json" 2>/dev/null || true; echo "' + VITALS_SEPARATOR + '"; '
              'cat "${TARTCI_HOST_VITALS_STATE:-$HOME/.local/state/pulp/host_vitals.json}" '
+             '2>/dev/null || true; echo; echo "' + FRESHNESS_SEPARATOR + '"; '
+             'cat "${TARTCI_HOME:-$HOME/.tartci}/state/tool-freshness/state.json" '
              '2>/dev/null || true')
 
 Runner = Callable[[List[str]], Tuple[int, str, str]]
@@ -126,6 +133,7 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     _, _, body = rest.partition(SEPARATOR)
     body, _, last_text = body.partition(LAST_SEPARATOR)
     last_text, _, vitals_text = last_text.partition(VITALS_SEPARATOR)
+    vitals_text, _, freshness_text = vitals_text.partition(FRESHNESS_SEPARATOR)
     guard_text, _, resolver_text = body.partition(RESOLVER_SEPARATOR)
     try:
         last = json.loads(last_text) if last_text.strip() else None
@@ -149,9 +157,14 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
         vitals = json.loads(vitals_text) if vitals_text.strip() else None
     except ValueError:
         vitals = None
+    try:
+        freshness = json.loads(freshness_text) if freshness_text.strip() else None
+    except ValueError:
+        freshness = None
     return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
             "resolver": resolver if isinstance(resolver, dict) else None,
             "vitals": vitals if isinstance(vitals, dict) else None,
+            "freshness": freshness if isinstance(freshness, dict) else None,
             "guard": launchd_interval_guard.classify(
                 receipt, float(clock),
                 receipt_path=f"{target}:launchd-interval-guard/status.json"),
@@ -282,6 +295,72 @@ def vitals_alert_text(peer: str, target: str, me: str,
         f"Read by {me} over SSH at {iso(now)}.",
     ])
     return title, body
+
+
+SHIPYARD_DRIFT_TITLE = "[tartci] {peer} Shipyard behind the latest release since {since}"
+
+
+def shipyard_drift_judge(info: Dict[str, Any], max_releases: int,
+                         max_hours: float) -> Dict[str, Any]:
+    """Judge the peer's Shipyard against the newest release, on the peer's clock.
+
+    Active when it is more than `max_releases` releases or more than
+    `max_hours` hours behind (dated from the first release newer than what it
+    runs), or when its freshness has not been measured for `max_hours`: a host
+    whose watchdog stopped cannot say it is behind. Resolved once a fresh
+    measurement reads current. A peer with no measurement decides nothing."""
+    value = info.get("freshness") or {}
+    row = (value.get("tools") or {}).get("shipyard") if isinstance(value.get("tools"), dict) \
+        else None
+    clock = info.get("clock")
+    measured = _epoch(value.get("measured_at"))
+    if not isinstance(row, dict) or measured is None or not isinstance(clock, (int, float)):
+        return {"active": False, "resolved": False, "since": None, "state": "unknown"}
+    state = str(row.get("state") or "unknown")
+    behind_since = _epoch(row.get("behind_since"))
+    hours = max(0.0, (float(clock) - behind_since) / 3600) if behind_since else 0.0
+    try:
+        releases = int(row.get("releases_behind") or 0)
+    except (TypeError, ValueError):
+        releases = 0
+    unmeasured = (float(clock) - measured) / 3600 > max_hours
+    drifted = state == "behind" and (releases > max_releases or hours > max_hours)
+    verdict = {"state": "unmeasured" if unmeasured else state,
+               "installed": row.get("effective") or row.get("installed"),
+               "latest": row.get("latest"), "releases_behind": releases,
+               "behind_hours": round(hours, 1), "apply": row.get("apply"),
+               "measured_at": value.get("measured_at")}
+    if drifted:
+        since = row.get("behind_since")
+    elif unmeasured:
+        since = value.get("measured_at")
+    else:
+        since = None
+    return {**verdict, "active": drifted or unmeasured,
+            "resolved": state == "current" and not unmeasured, "since": since}
+
+
+def shipyard_drift_alert_text(peer: str, target: str, me: str,
+                              verdict: Dict[str, Any], now: float) -> Tuple[str, str]:
+    title = SHIPYARD_DRIFT_TITLE.format(peer=peer, since=verdict["since"])
+    if verdict["state"] == "unmeasured":
+        first = (f"{peer} has not measured its Shipyard freshness since "
+                 f"{verdict['measured_at']}, so it cannot apply or report a release.")
+    else:
+        first = (f"{peer} runs Shipyard {verdict['installed']}, {verdict['releases_behind']} "
+                 f"release(s) and {verdict['behind_hours']} h behind {verdict['latest']} "
+                 f"(limits: {setting('TARTCI_SHIPYARD_DRIFT_RELEASES', SHIPYARD_DRIFT_RELEASES)} "
+                 f"release(s), {setting('TARTCI_SHIPYARD_DRIFT_HOURS', SHIPYARD_DRIFT_HOURS)} h).")
+    return title, "\n".join([
+        first,
+        f"Its automatic apply says: {verdict.get('apply') or 'nothing'}",
+        f"Run: ssh {target} 'tartci fleet-macos tool-freshness --refresh; "
+        "tail -5 ~/.tartci/state/tool-freshness/canary-gate.log'",
+        "Fix: clear what the apply line names (a canary or steward host that has not "
+        "cleared the release, a hold, a busy host); to move the host now, run its "
+        "`shipyard runner fleet-update --to <tag> --host-class <host> --apply --json`.",
+        f"Read by {me} over SSH at {iso(now)}.",
+    ])
 
 
 def _scratch(directory: pathlib.Path) -> bool:
@@ -486,6 +565,25 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         result[peer]["host_vitals"] = {**vitals_verdict, "acting": acting,
                                         "issue": vitals_out.get("issue"),
                                         "closed": bool(vitals_out.get("closed"))}
+        drift_verdict = shipyard_drift_judge(
+            info, setting("TARTCI_SHIPYARD_DRIFT_RELEASES", SHIPYARD_DRIFT_RELEASES),
+            setting("TARTCI_SHIPYARD_DRIFT_HOURS", SHIPYARD_DRIFT_HOURS))
+        drift_path = directory / f"{peer}.shipyard-drift.json"
+        drift_out: Dict[str, Any] = {}
+        if acting or host_off._read_json(drift_path):
+            drift_out = host_off.episode_alert(
+                drift_path, active=drift_verdict["active"] and acting,
+                resolved=drift_verdict["resolved"], since=drift_verdict["since"],
+                raise_event=lambda peer=peer, verdict=drift_verdict: host_off.event(
+                    directory, "peer_shipyard_drift",
+                    f"{peer}: Shipyard {verdict['installed']} behind {verdict['latest']} "
+                    f"since {verdict['since']}", {"peer": peer, "reader": me}, now),
+                render=lambda peer=peer, target=target, verdict=drift_verdict:
+                    shipyard_drift_alert_text(peer, target, me or "a peer", verdict, now),
+                issue=issue or _open_or_adopt, close=close, issues_enabled=enabled)
+        result[peer]["shipyard_drift"] = {**drift_verdict, "acting": acting,
+                                           "issue": drift_out.get("issue"),
+                                           "closed": bool(drift_out.get("closed"))}
     host_off._write_json(last_path, {"ts": now, "peers": result,
                                      "primary_misses": next_misses})
     return {"skipped": False, "peers": result}

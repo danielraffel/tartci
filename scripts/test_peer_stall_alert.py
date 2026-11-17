@@ -47,13 +47,17 @@ class Fleet:
         self.calls: list[str] = []
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
-              last: dict | None = None, vitals: dict | None = None) -> None:
+              last: dict | None = None, vitals: dict | None = None,
+              freshness: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
                                    f"{psa.LAST_SEPARATOR}\n{tail}\n"
                                    f"{psa.VITALS_SEPARATOR}\n"
-                                   f"{json.dumps(vitals) if vitals is not None else ''}\n", "")
+                                   f"{json.dumps(vitals) if vitals is not None else ''}\n"
+                                   f"{psa.FRESHNESS_SEPARATOR}\n"
+                                   f"{json.dumps(freshness) if freshness is not None else ''}\n",
+                                "")
 
     def healthy(self, target: str) -> None:
         self.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
@@ -483,3 +487,99 @@ class PeerSshDestinationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# m1 and m5s on 2026-11-17: Shipyard 0.439.2 while 0.439.3, 0.439.4 and
+# 0.440.0 were out, waiting on a steward verdict that never came.
+DRIFT_CLOCK = psa._epoch("2026-11-17T06:53:24Z")
+
+
+def freshness(state: str = "behind", releases: int = 3, behind_since: str = "2026-11-16T18:59:17Z",
+              measured_at: str = "2026-11-17T06:53:24Z", latest: str = "0.440.0") -> dict:
+    return {"measured_at": measured_at, "tools": {"shipyard": {
+        "state": state, "installed": "0.439.2", "effective": "0.439.2", "latest": latest,
+        "releases_behind": releases, "behind_since": behind_since,
+        "apply": "waiting for steward host studio: v0.440.0 has not deployed 0.440.0"}}}
+
+
+class ShipyardDrift(unittest.TestCase):
+    """A host more than one release or 6 h behind the latest Shipyard is reported."""
+
+    setUp = PeerStall.setUp
+    issue = PeerStall.issue
+    close = PeerStall.close
+    run_pass = PeerStall.run_pass
+
+    def answer(self, value: dict | None, clock: float = DRIFT_CLOCK) -> None:
+        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                "paused": []}, clock=clock, freshness=value)
+
+    def drift(self, value: dict | None, clock: float = DRIFT_CLOCK, host: str = "m5") -> dict:
+        self.answer(value, clock)
+        return self.run_pass(clock + 60, host=host)["peers"]["m1"]["shipyard_drift"]
+
+    def titles(self) -> list[str]:
+        return [title for title, _ in self.opened if "Shipyard" in title]
+
+    def test_the_incident_pages_once_naming_the_wait(self):
+        verdict = self.drift(freshness())
+        self.assertTrue(verdict["active"])
+        self.assertEqual(self.titles(), [
+            "[tartci] m1 Shipyard behind the latest release since 2026-11-16T18:59:17Z"])
+        body = [b for t, b in self.opened if "Shipyard" in t][0]
+        self.assertIn("0.439.2, 3 release(s) and 11.9 h behind 0.440.0", body)
+        self.assertIn("waiting for steward host studio", body)
+        self.assertIn("Run: ssh m1 'tartci fleet-macos tool-freshness --refresh;", body)
+
+    # The threshold: more than one release, or more than six hours.
+
+    def test_one_release_behind_for_under_six_hours_is_quiet(self):
+        since = psa.iso(DRIFT_CLOCK - 5.9 * 3600)
+        verdict = self.drift(freshness(releases=1, behind_since=since))
+        self.assertFalse(verdict["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_two_releases_behind_pages_at_once(self):
+        since = psa.iso(DRIFT_CLOCK - 0.5 * 3600)
+        self.assertTrue(self.drift(freshness(releases=2, behind_since=since))["active"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_one_release_behind_for_over_six_hours_pages(self):
+        since = psa.iso(DRIFT_CLOCK - 6.1 * 3600)
+        self.assertTrue(self.drift(freshness(releases=1, behind_since=since))["active"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_the_limits_come_from_the_environment(self):
+        since = psa.iso(DRIFT_CLOCK - 6.1 * 3600)
+        with mock.patch.dict(os.environ, {"TARTCI_SHIPYARD_DRIFT_HOURS": "8"}):
+            self.assertFalse(self.drift(freshness(releases=1, behind_since=since))["active"])
+
+    def test_a_host_that_stopped_measuring_pages(self):
+        # Its watchdog stopped: the last reading says current, 7 h ago.
+        old = psa.iso(DRIFT_CLOCK - 7 * 3600)
+        verdict = self.drift(freshness(state="current", releases=0, measured_at=old))
+        self.assertTrue(verdict["active"])
+        self.assertEqual(verdict["state"], "unmeasured")
+        self.assertIn("has not measured its Shipyard freshness", self.opened[-1][1])
+
+    def test_no_measurement_decides_nothing(self):
+        self.assertFalse(self.drift(None)["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_a_current_reading_closes_the_issue(self):
+        self.drift(freshness())
+        later = DRIFT_CLOCK + psa.READ_SECS + 60
+        verdict = self.drift(freshness(state="current", releases=0, measured_at=psa.iso(later)),
+                             clock=later)
+        self.assertTrue(verdict["closed"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_only_the_primary_reader_pages(self):
+        self.answer(freshness())
+        for target in ("m5", "m3"):
+            self.fleet.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                      "paused": []}, clock=DRIFT_CLOCK,
+                             last={"ts": DRIFT_CLOCK, "peers": {"m1": {}}})
+        out = self.run_pass(DRIFT_CLOCK + 60, host="studio")
+        self.assertFalse(out["peers"]["m1"]["shipyard_drift"]["acting"])
+        self.assertEqual(self.titles(), [])
