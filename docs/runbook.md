@@ -3621,6 +3621,30 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
+- **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
+  [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only
+  Vellum's `sterile-consumer`, about 1.5 min); the lane's queue scan counts
+  them per event class in its slot-demand detail file, with no extra GitHub
+  call. With `short_job_first = "on"` a lane whose scan saw one queued ranks
+  ahead of the other lanes of its own effective class for the next free slot;
+  the class order (release, merge group, other, pull request) is unchanged.
+  Starvation bound: a waiting lane is passed over at most `[leases]
+  short_job_first_max_passes` times (default 1), and not at all once it was
+  first passed `short_job_first_max_pass_secs` ago (default 600); after that
+  its class ranks by age alone until that lane stops waiting.
+  `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (300) still caps any one defer streak.
+  The switch defaults to `"shadow"` for a lane that names short jobs: order is
+  unchanged and the short lane logs `short_job_first_shadow`
+  ("would-boot-short-first") when the rule would have given it a slot; `on`
+  logs `short_job_first_granted`. Both name the short job's id and run id.
+  GitHub, not tartci, picks which matching job the booted runner takes, so a
+  boost can serve a long job that shares the short job's label: the lane's
+  next boot after either event logs `short_job_first_outcome` with the job the
+  VM ran and `served_short=yes|no|no_job|unknown`. Keep the vellum-gate lanes
+  in shadow until sterile-consumer runs on a runner label of its own that
+  only boosted runners carry; until then `on` can hand a long GPU job the slot.
+  Rollback: set `short_job_first = "off"` (or delete the line to return to
+  shadow), re-render, restart the lanes at an idle boundary.
 - **Fair share between repositories (opt-in, default off)**: `[leases]
   fair_share_after_secs = N` (300-14400). A VM lane with work it could not
   place for N seconds is admitted at gate priority while another repository

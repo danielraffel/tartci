@@ -308,6 +308,13 @@ min_queued_age_seconds = 0
 # jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
 # default 0. Rollback: delete this line and re-render.
 queue_merge_group_quota = 2
+# sterile-consumer runs about 1.5 min after the GPU proof, on the same runner
+# class, and waited a median 5.3 min (mean 16.7) for a VM slot behind 30-minute
+# GPU jobs. Named here, slot priority lets it take the next free slot ahead of
+# longer jobs of its class, at most once per waiting lane (short_job_first,
+# scripts/slot_priority.py). Unset, the switch is "shadow": logs only.
+# Rollback: delete these lines and re-render.
+short_jobs = [{ workflow = "Locked macOS GPU proof", job = "sterile-consumer" }]
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
 # every host (31 of 65 Vellum boots got no job, 2026-11-01..04).
