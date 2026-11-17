@@ -16,8 +16,8 @@ layer after the job:
            whose owner is dead is discarded (never promoted), a green layer
            whose promoter died is promoted again (promotion is idempotent);
   trim     keep ``shared/`` under a size cap, oldest entries first;
-  seed     warm an empty host store from a trusted peer's ``shared/`` through
-           the same receive validation, never replacing a local key.
+  seed     warm an empty host store from the keys a trusted peer promoted,
+           through the same receive validation, never replacing a local key.
 
 The guest has NO writable ccache mount on the host. It mounts the shared store
 read-only and writes its new entries to a guest-local directory; when the job
@@ -673,6 +673,13 @@ def process(layout: Layout, name: str, is_present: Callable[[str], bool],
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 PEER_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]{0,62}$")
 IDENTITY_FIELDS = ("golden", "golden_config_sha256", "compiler")
+DEFAULT_PEER_CACHE_ROOT = "~/.cache/pulp-ci"
+CACHE_ROOT_SHAPE = re.compile(r"^(~/|/)[A-Za-z0-9._/-]*$")
+# The September write-isolation opt-in kept its store at
+# $CACHE_ROOT/ccache/tartci-layers-v1/shared, inside the legacy guest-writable
+# mount. Its entries pass header validation, so a source under it would import
+# objects a pull-request guest could have written.
+FORBIDDEN_ROOT_PARTS = ("ccache", "tartci-layers-v1", "ccache-layers-v1")
 
 
 class SeedError(Exception):
@@ -710,53 +717,114 @@ def identity(golden: str, compiler: str, tart: str = "tart") -> dict[str, object
             "compiler": compiler.strip()}
 
 
-def seed(layout: Layout, peer: str, local_identity: Path, peer_identity: Path,
-         command: list[str], max_bytes: int, timeout: float) -> dict[str, int]:
-    """Warm this host's ``shared/`` from a trusted peer's ``shared/``.
+def check_peer_cache_root(root: str) -> str:
+    """The peer's CACHE_ROOT; the source is always <root>/ccache-layers-v1/shared."""
+    parts = [part for part in root.split("/") if part not in ("", "~")]
+    if not CACHE_ROOT_SHAPE.fullmatch(root) or ".." in parts or "." in parts:
+        raise SeedError(f"invalid peer cache root: {root!r}")
+    bad = [part for part in parts if part in FORBIDDEN_ROOT_PARTS]
+    if bad:
+        raise SeedError(f"peer cache root {root!r} names {bad}: the source must be "
+                        "<CACHE_ROOT>/ccache-layers-v1/shared, never under a ccache/ mount")
+    return root.rstrip("/") or "/"
 
-    ``command`` streams the peer store as a tar whose members are named
-    ``remote/<k0k1>/<rest>`` (the receive layout). The stream goes through
-    ``receive`` unchanged (every member validated, capped, re-stamped) into a
-    ``jobs/seed-<peer>-*`` layer, then through ``promote_layer`` with manifest
-    replacement off, so an existing local key always wins. Refused before
-    anything is pulled unless both identities parse and match exactly.
+
+def _remote_path(root: str, *rest: str) -> str:
+    import shlex  # noqa: PLC0415
+
+    tail = "/".join(rest)
+    if root == "~" or root.startswith("~/"):
+        inner = root[2:].strip("/")
+        return '"$HOME"/' + shlex.quote(f"{inner}/{tail}" if inner else tail)
+    return shlex.quote(f"{root}/{tail}")
+
+
+def seed_pull_command(peer: str, peer_cache_root: str, ssh: str = "ssh") -> list[str]:
+    """The fixed pull: only keys the peer's own promoter recorded in
+    ``ccache-layer-state/promotions/*.keys``, read from
+    ``<CACHE_ROOT>/ccache-layers-v1/shared``, renamed to the receive layout."""
+    root = check_peer_cache_root(peer_cache_root)
+    shared = _remote_path(root, "ccache-layers-v1", "shared")
+    promotions = _remote_path(root, "ccache-layer-state", "promotions")
+    script = (
+        "set -eu; "
+        f"cd {shared}; "
+        f"cat {promotions}/*.keys 2>/dev/null | LC_ALL=C sort -u | "
+        "while IFS= read -r k; do "
+        "case $k in *[!0-9a-z]*|?|'') continue;; esac; "
+        'f="${k%\"${k#??}\"}/${k#??}"; '
+        '[ -f "$f" ] && [ ! -L "$f" ] && printf \'%s\\n\' "$f"; '
+        # No AppleDouble ._ members for extended attributes.
+        "done | COPYFILE_DISABLE=1 tar --no-mac-metadata -cf - -T - -s '#^#remote/#'"
+    )
+    return [ssh, "-n", "-o", "BatchMode=yes", peer, script]
+
+
+def _store_has_entries(shared: Path) -> bool:
+    if not shared.is_dir():
+        return False
+    for sub in os.scandir(shared):
+        if sub.is_dir(follow_symlinks=False) and KEY_DIR.fullmatch(sub.name):
+            if any(not item.name.startswith(".") for item in os.scandir(sub.path)):
+                return True
+    return False
+
+
+def seed(layout: Layout, peer: str, local_identity: Path, peer_identity: Path,
+         max_bytes: int, timeout: float, max_size: int,
+         peer_cache_root: str = DEFAULT_PEER_CACHE_ROOT, force_warm: bool = False,
+         ssh: str = "ssh") -> dict[str, int]:
+    """Warm this host's ``shared/`` from a trusted peer's promoted keys.
+
+    Every run writes exactly one ``ccache_seed`` audit event: ``seeded``, or
+    ``refused`` with the reason. The pull is built here (ssh to ``peer``, fixed
+    source path, promoted keys only) and its stream goes through ``receive``
+    unchanged into a ``jobs/seed-<peer>-*`` layer, then ``promote_layer`` with
+    manifest replacement off, so an existing local key always wins.
     """
-    if not PEER_NAME.fullmatch(peer):
-        raise SeedError(f"invalid peer name: {peer!r}")
-    layout.ensure()
+    name = ""
     try:
+        if not PEER_NAME.fullmatch(peer):
+            raise SeedError(f"invalid peer name: {peer!r}")
+        layout.ensure()
+        command = seed_pull_command(peer, peer_cache_root, ssh)
         local, remote = load_identity(local_identity), load_identity(peer_identity)
-    except SeedError as exc:
-        audit(layout, "ccache_seed", peer=peer, verdict="refused", reason=str(exc)[:200])
-        raise
-    mismatched = [key for key in IDENTITY_FIELDS if local[key] != remote[key]]
-    if mismatched:
-        audit(layout, "ccache_seed", peer=peer, verdict="refused",
-              reason="identity_mismatch", fields=mismatched)
-        raise SeedError(f"peer identity differs from this lane's in {mismatched}")
-    name = f"seed-{peer}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:6]}"
-    with flock(layout.locks / "seed.lock", blocking=False) as held:
-        if not held:
-            raise SeedError("another seed is running")
-        try:
+        mismatched = [key for key in IDENTITY_FIELDS if local[key] != remote[key]]
+        if mismatched:
+            raise SeedError(f"identity_mismatch: {mismatched}")
+        with flock(layout.locks / "seed.lock", blocking=False) as held:
+            if not held:
+                raise SeedError("busy: another seed is running")
+            if any(layout.green.iterdir()):
+                # A pending trusted layer would lose its manifests to the
+                # seeded ones, which are stamped later.
+                raise SeedError("green_pending: a trusted layer is waiting to promote")
+            if _store_has_entries(layout.shared) and not force_warm:
+                raise SeedError("store_not_empty: pass --force-warm to seed a warm store")
+            name = (f"seed-{peer}-{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}"
+                    f"-{uuid.uuid4().hex[:6]}")
             received = receive(layout, name, os.getpid(), command, max_bytes, timeout)
-        except ReceiveError as exc:
-            audit(layout, "ccache_seed", peer=peer, verdict="refused",
-                  reason=f"receive_failed: {exc}"[:200], layer=name)
-            raise SeedError(str(exc)) from exc
-        layer = layout.jobs / name
-        try:
-            result = promote_layer(layout, layer, replace_manifests=False)
-        finally:
-            remove_tree(layer)
-            with contextlib.suppress(OSError):
-                (layout.owners / name).unlink()
-        keys = result.pop("keys")
-        if keys:
-            (layout.promotions / f"{name}.keys").write_text("\n".join(keys) + "\n")
-        audit(layout, "ccache_seed", peer=peer, verdict="seeded", layer=name,
-              received=received["received"], received_rejected=received["rejected"],
-              bytes_received=received["bytes"], identity=local, **result)
+            layer = layout.jobs / name
+            try:
+                result = promote_layer(layout, layer, replace_manifests=False)
+            finally:
+                remove_tree(layer)
+                with contextlib.suppress(OSError):
+                    (layout.owners / name).unlink()
+            keys = result.pop("keys")
+            if keys:
+                (layout.promotions / f"{name}.keys").write_text("\n".join(keys) + "\n")
+            trimmed = trim(layout, max_size, 0.0)
+    except (SeedError, ReceiveError, OSError, ValueError, subprocess.SubprocessError) as exc:
+        audit(layout, "ccache_seed", peer=peer[:80], verdict="refused",
+              reason=f"{type(exc).__name__}: {exc}"[:300], layer=name)
+        if isinstance(exc, SeedError):
+            raise
+        raise SeedError(str(exc)) from exc
+    audit(layout, "ccache_seed", peer=peer, verdict="seeded", layer=name,
+          received=received["received"], received_rejected=received["rejected"],
+          bytes_received=received["bytes"], identity=local, force_warm=force_warm,
+          trimmed=trimmed, **result)
     return {"received": received["received"], **result}
 
 
@@ -902,12 +970,18 @@ def main(argv: list[str] | None = None) -> int:
 
     seed_cmd = sub.add_parser("seed")
     seed_cmd.add_argument("--from", dest="peer", required=True,
-                          help="peer host name, recorded in the audit")
+                          help="peer host (ssh name); the source is fixed")
+    seed_cmd.add_argument("--peer-cache-root", default=DEFAULT_PEER_CACHE_ROOT,
+                          help="the peer's CACHE_ROOT; never a path under ccache/")
     seed_cmd.add_argument("--local-identity", required=True, type=Path)
     seed_cmd.add_argument("--peer-identity", required=True, type=Path)
     seed_cmd.add_argument("--max-bytes", type=parse_size, default=parse_size("20G"))
+    seed_cmd.add_argument("--max-size", required=True, type=parse_size,
+                          help="trim the store to this size after seeding (CCACHE_MAX_SIZE)")
     seed_cmd.add_argument("--timeout", type=float, default=3600.0)
-    seed_cmd.add_argument("pull", nargs=argparse.REMAINDER)
+    seed_cmd.add_argument("--force-warm", action="store_true",
+                          help="seed even though the local store already has entries")
+    seed_cmd.add_argument("--ssh", default=os.environ.get("TARTCI_CCACHE_SEED_SSH", "ssh"))
 
     identity_cmd = sub.add_parser("identity")
     identity_cmd.add_argument("--golden", required=True)
@@ -937,11 +1011,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(receive(layout, args.vm, args.owner_pid, pull,
                                      args.max_bytes, args.timeout), sort_keys=True))
         elif args.command == "seed":
-            pull = args.pull[1:] if args.pull[:1] == ["--"] else args.pull
-            if not pull:
-                parser.error("seed needs the peer pull command after --")
             print(json.dumps(seed(layout, args.peer, args.local_identity, args.peer_identity,
-                                  pull, args.max_bytes, args.timeout), sort_keys=True))
+                                  args.max_bytes, args.timeout, args.max_size,
+                                  args.peer_cache_root, args.force_warm, args.ssh),
+                             sort_keys=True))
         elif args.command == "identity":
             print(json.dumps(identity(args.golden, args.compiler, args.tart), sort_keys=True))
         elif args.command == "attach":
