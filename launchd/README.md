@@ -882,7 +882,9 @@ TART_HOME="$HOME/VMs" "$HOME/.local/bin/tartci" doctor --reap --json
 ```
 
 Then install the LaunchAgent once the report is clean. Logs land in
-`~/Library/Logs/tartci/tartci-reap.log`.
+`~/Library/Logs/tartci/tartci-reap.log`. A pass whose stdout is that file
+renames it aside once it reaches 8 MiB and keeps 3 generations
+(`tartci-reap.log.1` is the newest), as the reclaim log does.
 
 ### Disk reclaimer
 
@@ -1146,6 +1148,19 @@ the record (`shipyard ship-state discard`) when the pull request is merged or
 closed, or after three consecutive explicit not-found reads. It keeps OPEN
 records and never merges, enqueues or arms a pull request: landing is the
 GitHub merge queue's job.
+
+On a host that activated `ShipyardLauncher.app` (Shipyard's
+`tools/shipyard-launcher`), every Shipyard call the tick makes runs through the
+launcher, so macOS privacy consent judges the launcher's stable bundle identity
+rather than the release's per-install `auth-generations/<id>/shipyard` path.
+That path is a new identity after each release, and its first run from the
+Removable Volumes repo root raised an unanswered consent alert (tartci#920). The
+launcher's own `--launcher-active` verdict decides, bounded by
+`SHIPYARD_QUEUE_LAUNCHER_TIMEOUT_S` (default 45 s). A host without an
+activation record runs Shipyard directly as before. An activated launcher that
+does not answer active also runs directly, and logs a
+`launcher-fallback ... FINDING` line. `SHIPYARD_QUEUE_LAUNCHER=off` turns
+routing off. Each tick logs `launcher=app` or `launcher=direct`.
 
 It never edits state files, fails closed on any GitHub read error, skips
 live/fresh workers, and logs the first stderr line of every failed GitHub or

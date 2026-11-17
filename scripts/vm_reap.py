@@ -1465,8 +1465,49 @@ def ensure_tart_home() -> dict[str, Any]:
     return store
 
 
+# The janitor runs every 5 minutes under launchd and prints its whole digest to
+# its StandardOutPath, which nothing bounded: 87 MB on m5studio after 37 days.
+REAP_LOG_MAX_BYTES = 8 * 1024 * 1024
+REAP_LOG_GENERATIONS = 3
+
+
+def reap_log_path() -> pathlib.Path:
+    return pathlib.Path(os.environ.get("TARTCI_REAP_LOG")
+                        or pathlib.Path.home() / "Library/Logs/tartci/tartci-reap.log")
+
+
+def rotate_own_log(stream: Any = None) -> bool:
+    """Rotate the reap log at startup once it reaches REAP_LOG_MAX_BYTES.
+
+    Only when STREAM (stdout) is that file: a run from a terminal, or with
+    output sent anywhere else, never renames a log it is not writing. The
+    rename is disk_reclaim.rotate_log's, the same one the reclaim log uses, so
+    this pass's output lands in generation 1 and launchd's next spawn opens a
+    new file.
+    """
+    stream = sys.stdout if stream is None else stream
+    path = reap_log_path()
+    try:
+        ours = os.fstat(stream.fileno())
+        disk = os.lstat(path)
+    except (OSError, ValueError, AttributeError):
+        return False
+    if (ours.st_dev, ours.st_ino) != (disk.st_dev, disk.st_ino):
+        return False
+    if disk.st_size < REAP_LOG_MAX_BYTES:
+        return False
+    # A log that cannot be rotated must never stop the janitor from reaping.
+    try:
+        from disk_reclaim import rotate_log  # noqa: PLC0415 - sibling module; owns the rename
+        return rotate_log(path, REAP_LOG_MAX_BYTES, REAP_LOG_GENERATIONS, stream=sys.stderr)
+    except Exception as error:  # noqa: BLE001 - any failure here is a skipped rotation
+        print(f"vm_reap: could not rotate {path}: {error}", file=sys.stderr)
+        return False
+
+
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    rotate_own_log()
     if args.dry_run:
         args.fix = False
     digest, rc = build_digest(args)

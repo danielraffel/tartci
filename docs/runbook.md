@@ -425,7 +425,9 @@ finish. The watchdog never reboots or kills a process for this condition.
 `--store-health-timeout-seconds` and
 `--store-health-failure-threshold` tune the bounds for fixture testing.
 The macOS runner performs the same probe before a new job claim/clone and on
-each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
+each idle poll. A healthy result emits `storage_health` only when the state
+turns healthy and then at most hourly; the heartbeat's `storage_health` field
+is the current verdict. An unknown or timed-out result emits `yielded_storage_health`,
 sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
 the lane as blocked/unknown; active guests continue to finish.
 
@@ -603,6 +605,46 @@ With the wrapper absent the watchdog still classifies, records
 the install step; `TARTCI_TCC_HEAL=0` in the watchdog's environment keeps it
 classify-only. Operator reads: `python3 scripts/tcc_wedge.py --state`,
 `python3 scripts/tcc_wedge.py --scan-log --last-minutes 60`.
+
+**Jobs a wedge leaves blocked are paged; prompt-prone agents are reported.**
+Restarting tccd and sandboxd does not release a job already held in `open()`
+on the store: on m3 (2026-11-16) com.pulp.fleet.prewall and three fleet-pass
+`must-review.py` children stayed blocked for hours after the alert went away,
+and a periodic job whose run never ends never starts again.
+
+- *Stuck jobs* (`scripts/tcc_stuck_jobs.py`, every watchdog pass right after
+  store health, report only). While store health names a wedge
+  (`tcc_attribution_wedge`, `tcc_prompt_pending`, or a store probe that timed
+  out past the failure threshold), it finds this user's loaded launchd jobs
+  running longer than max(3 x StartInterval, 30 min) whose process tree has an
+  argument or cwd under /Volumes (one `ps` read, one `lsof -b -w -d cwd`;
+  /Volumes itself is never stat'ed). Each is logged as
+  `WARN tcc-wedge stuck <label>: ...`; the episode raises one page (issue
+  class `tcc_wedge_stuck_jobs`, closed when the store recovers) naming the
+  labels, the pids and the one line that clears them
+  (`launchctl kickstart -k gui/<uid>/<label>; kill -KILL <pids>`). It never
+  restarts or signals anything, since a fleet-pass run can be legitimately busy;
+  runner lanes, `actions.runner.*`, the watchdog itself and KeepAlive
+  services without a StartInterval are never reported.
+  `python3 scripts/tcc_stuck_jobs.py` prints the current reading.
+- *Lint* (`scripts/tcc_risk_lint.py`, at most every 15 min, report only). A
+  loaded LaunchAgent whose program, or the interpreter it resolves to, is under
+  a Homebrew Cellar or is ad-hoc or unsigned, or whose script argument or
+  WorkingDirectory is under /Volumes, and that does not run through
+  TartCILauncher.app or ShipyardLauncher.app, is logged as
+  `WARN tcc-risk <label>: <reason>`; each newly flagged label is a `tcc_risk`
+  event, and the host carries one `tcc_risk` issue while anything is flagged.
+  It never unloads anything. `python3 scripts/tcc_risk_lint.py` prints the same
+  findings now. The lint judges the program launchd starts: a `/bin/bash` agent
+  passes even if the script then execs a Cellar python (most tartci agents run
+  the `python.pin` interpreter that way).
+- *Host attestation* runs the python.org framework binary at its versioned path
+  (`/Library/Frameworks/Python.framework/Versions/3.x/bin/python3.x`, Developer
+  ID signed) instead of `/opt/homebrew/bin/python3`.
+  `scripts/install_host_attestation.sh --print-python` shows the choice
+  (`TARTCI_ATTESTATION_PYTHON` overrides it); with no framework python it falls
+  back to Homebrew with a `WARN tcc-risk` line. The watchdog re-renders a loaded
+  attestation plist that runs any other interpreter, once.
 
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
@@ -946,7 +988,11 @@ September 2026 torn manifests made every gate build link the wrong objects for
 - when, and only when, the job's verdict is green (clean listener exit, no
   lifecycle quarantine, and the host's own GitHub observation: a `terminal`
   receipt with conclusion `success`, bound to this run and job, for a trusted
-  ref: a push to `main` or a merge-group run). The guest-written runner log is
+  ref: a push to `main` or a merge-group run). A job that completed while later
+  jobs of its run were still going is observed as `terminal_pending_run` and
+  carries the `listener_exited_workflow_active` lifecycle quarantine; that
+  pairing is accepted when the receipt says the job completed with `success`
+  and is bound to both the run and the job. The guest-written runner log is
   attacker-controlled output; it can turn a verdict red but never green, and
   no receipt means red. A pull-request job's results are never promoted. The host
   pulls the guest's entries over ssh as a tar stream while the VM is still up
@@ -2507,6 +2553,20 @@ alert, so its peers raise it.
   and `events.jsonl` (`peer_launchd_stalled`, once per episode).
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.
+- **Shipyard drift.** The same read prints the peer's
+  `~/.tartci/state/tool-freshness/state.json`. A peer more than one Shipyard
+  release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 6 h
+  (`TARTCI_SHIPYARD_DRIFT_HOURS`, 6, counted on the peer's clock from the
+  first release newer than what it runs) behind the latest release opens
+  `[tartci] <peer> Shipyard behind the latest release since <that time>`. So
+  does a peer whose freshness was last measured more than 6 h ago, since a
+  host whose watchdog stopped cannot report itself. The body quotes the
+  peer's own apply line (`waiting for steward host studio: ...`), so it names
+  the gate that holds it. It closes when a fresh reading says `current`, and
+  a peer with no measurement decides nothing. The primary-reader rule above
+  applies, and the episode is `<peer>.shipyard-drift.json`. This exists because
+  m1 and m5s sat on 0.439.2 for 12 h behind 0.440.0 on 2026-11-17 while
+  every per-host view called them only "behind".
 - **Host-vitals timer stall.** The same peer tick reads
   `~/.local/state/pulp/host_vitals.json` using the peer's clock. A sample older
   than `TARTCI_HOST_VITALS_ALERT_SECS` (default 300 seconds) opens one issue
@@ -2658,6 +2718,15 @@ unknown defers the heal with `heal-deferred: mid-job (<evidence>)`; there is no
 override, because nobody is there to accept killing the job. A stale-boot heal
 skips the probe (its verdict already proves no run or job identity) but still
 reads the event log.
+
+A lane's `events.jsonl` is bounded: once it reaches 16 MiB the supervisor
+renames it to `events.jsonl.1` (replacing the previous one) at the top of its
+loop with no VM, never mid-job, so the open `job_assigned` above is always in
+the current file. `tartci pool status --usage`, `pre_mint_outcomes`, the
+serving-truth alarm and the DHCP breaker's boot times read `events.jsonl.1`
+first. Tail readers (lease-fit transitions over 24 h, the watchdog) read only
+the current file, so for the first hours after a rename their window is
+shorter. A `grep` by hand should include `events.jsonl.1`.
 
 ### Runners the janitor must never delete (`keep_not_minted_here`)
 
@@ -3283,8 +3352,21 @@ arrive, and a host that did not get it is loud:
   repositories may have run the new binary under the old `ver=`. The steward
   ticks every 5 minutes, so the check lands within one or two watchdog
   intervals of the swap.
-  - The first judging tick with every `invariants=` token ok and no `ERROR`
-    line writes `tool_steward_verified`.
+  - The first judging tick with no `ERROR` line whose every `invariants=`
+    token is ok, or a `FAIL` the baseline tick already had in the same
+    repository, writes `tool_steward_verified`. A repository added to the
+    fleet with a standing failure therefore no longer holds every release on
+    the steward host and the hosts behind it: on 2026-11-16 skia-builder and
+    v8-builder joined with `required_never_ran` and m3 sat on 0.439.3, with
+    m1 and m5s on 0.439.2, for nine hours. The comparison is per repository,
+    so a standing failure in one repository does not excuse the same
+    invariant newly failing in another. The baseline (the last tick finished
+    before the swap, and whether the tick in flight could not run the steward)
+    is stored with the deploy in `steward.json` at the swap. summary.log is
+    read from a 512 KiB tail, and a verdict judged after the pre-swap ticks
+    scrolled out would otherwise blame a standing failure on the release and
+    roll it back. A record without one (written by an older checkout) still
+    reads the baseline from the log.
   - The first one with a failing invariant the baseline did not have, or the
     second in a row in which the steward could not run at all (every
     repository wrote `ERROR` or a skip; one such tick is often a timeout or a
@@ -3311,11 +3393,13 @@ arrive, and a host that did not get it is loud:
     tick where only some repositories wrote `ERROR` are inconclusive: they
     neither verify nor fail, and the next complete tick decides.
   - A failure on a version installed by hand is recorded as
-    `tool_steward_failed` and not rolled back. No judging tick after an hour
-    is a problem (`is the steward tick running?`), never a rollback. An
-    invariant already failing before the swap neither rolls back nor
-    verifies; it keeps the hosts behind the steward host waiting until a
-    clean tick.
+    `tool_steward_failed` and not rolled back. No conclusive tick after an
+    hour is a problem, never a rollback: `is the steward tick running?` when
+    no complete tick ran the release, `N complete steward ticks ... none
+    conclusive` when ticks ran it but an `ERROR` token, a repository `ERROR`
+    line, or an invariant newly failing in another repository kept each one
+    from deciding. An invariant already failing before the swap never rolls
+    back.
   - While a deploy waits for its verdict, a newer release waits too, so the
     verdict and its rollback target are never overwritten. A steward host
     that rolled back onto a release it had verified earlier still clears that
@@ -3612,6 +3696,30 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
+- **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
+  [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only
+  Vellum's `sterile-consumer`, about 1.5 min); the lane's queue scan counts
+  them per event class in its slot-demand detail file, with no extra GitHub
+  call. With `short_job_first = "on"` a lane whose scan saw one queued ranks
+  ahead of the other lanes of its own effective class for the next free slot;
+  the class order (release, merge group, other, pull request) is unchanged.
+  Starvation bound: a waiting lane is passed over at most `[leases]
+  short_job_first_max_passes` times (default 1), and not at all once it was
+  first passed `short_job_first_max_pass_secs` ago (default 600); after that
+  its class ranks by age alone until that lane stops waiting.
+  `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (300) still caps any one defer streak.
+  The switch defaults to `"shadow"` for a lane that names short jobs: order is
+  unchanged and the short lane logs `short_job_first_shadow`
+  ("would-boot-short-first") when the rule would have given it a slot; `on`
+  logs `short_job_first_granted`. Both name the short job's id and run id.
+  GitHub, not tartci, picks which matching job the booted runner takes, so a
+  boost can serve a long job that shares the short job's label: the lane's
+  next boot after either event logs `short_job_first_outcome` with the job the
+  VM ran and `served_short=yes|no|no_job|unknown`. Keep the vellum-gate lanes
+  in shadow until sterile-consumer runs on a runner label of its own that
+  only boosted runners carry; until then `on` can hand a long GPU job the slot.
+  Rollback: set `short_job_first = "off"` (or delete the line to return to
+  shadow), re-render, restart the lanes at an idle boundary.
 - **Fair share between repositories (opt-in, default off)**: `[leases]
   fair_share_after_secs = N` (300-14400). A VM lane with work it could not
   place for N seconds is admitted at gate priority while another repository
@@ -4022,8 +4130,11 @@ read, nothing is deleted. While a self-update marker
 for that pass, since an install may be staging one. Generations are installed
 read-only; `--apply` makes a doomed one writable before removing it.
 
-No agent runs this yet. Run the plan on a host, read it, then `--apply`.
-Scheduling it (for example from the reclaim agent) is a separate decision.
+The hourly reclaim agent runs it at these defaults on every pass: it plans on
+a dry run and deletes under `--fix`, and the result is the receipt's
+`state_retention` section. It deletes nothing when `TARTCI_HOME` names a
+tree other than `~/.tartci`, and `TARTCI_RECLAIM_RETENTION=0` turns it off
+for a pass. `tartci retention` still runs it by hand with other bounds.
 
 ## Fleet scheduling boundary
 

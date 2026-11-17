@@ -1337,9 +1337,76 @@ def _sha256(path: str) -> str | None:
         return None
 
 
-def host_attestation_pass(home: str | None = None, run=subprocess.run,
-                          loaded=None) -> str | None:
-    """Redeploy a loaded host-attestation writer that is not this tartci's.
+def attestation_python(timeout_s: float = 60.0) -> str | None:
+    """The interpreter install_host_attestation.sh would pin now, or None.
+
+    `--print-python` makes no change. None when the installer refuses or
+    cannot be run: the pass then judges the writer alone, as before."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import bounded_subprocess  # noqa: PLC0415 - sibling module
+        proc = bounded_subprocess.run_bounded(
+            ["/bin/bash", os.path.join(root, "scripts", "install_host_attestation.sh"),
+             "--print-python"], timeout=timeout_s, operation="attestation-python")
+    except Exception:  # noqa: BLE001 - the heal pass must go on
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0 or not lines or not lines[-1].startswith("/"):
+        return None
+    return lines[-1]
+
+
+def _bounded_run(argv: list[str], *, timeout: float, env: dict | None = None,
+                 **_ignored) -> subprocess.CompletedProcess:
+    """`run_bounded` for this pass: a child stuck in an uninterruptible wait
+    cannot hold the watchdog."""
+    import bounded_subprocess  # noqa: PLC0415 - sibling module
+    return bounded_subprocess.run_bounded(argv, timeout=timeout, env=env,
+                                          operation="host-attestation")
+
+
+def _attestation_loaded(label: str) -> bool:
+    try:
+        return _bounded_run(["/bin/launchctl", "print", f"{_domain()}/{label}"],
+                            timeout=15).returncode == 0
+    except Exception:  # noqa: BLE001 - unknown reads as not loaded: change nothing
+        return False
+
+
+def _unstable_interpreter(path: str) -> bool:
+    """Whether scripts/tcc_risk_lint.py flags `path` as a privacy identity
+    that changes (a Homebrew Cellar, ad-hoc or unsigned binary, or /Volumes)."""
+    import tcc_risk_lint  # noqa: PLC0415 - sibling module
+    verdict = tcc_risk_lint.judge_binary(path, tcc_risk_lint.CodesignCache(budget=1))
+    return verdict.get("verdict") == "flag"
+
+
+def _interpreter_available(path: str) -> bool:
+    """Whether `path` is an executable file, without touching /Volumes.
+
+    Lexical and symlink-resolving checks run first (readlink only, never a
+    stat of the target), so a path on, or symlinked onto, a wedged external
+    volume is reported unavailable instead of hanging this process."""
+    try:
+        import tcc_risk_lint  # noqa: PLC0415 - sibling module
+        resolved, stopped = tcc_risk_lint.safe_realpath(path)
+        if stopped or tcc_risk_lint.on_volumes(path) or tcc_risk_lint.on_volumes(resolved):
+            return False
+        return os.access(path, os.X_OK)
+    except Exception:  # noqa: BLE001 - unknown reads as unavailable
+        return False
+
+
+def _framework_python(path: str | None) -> bool:
+    root = os.environ.get("TARTCI_PYTHON_FRAMEWORK_ROOT") or "/Library/Frameworks/Python.framework"
+    return bool(path) and str(path).startswith(root.rstrip("/") + "/Versions/")
+
+
+def host_attestation_pass(home: str | None = None, run=_bounded_run,
+                          loaded=None, pinned_python=None,
+                          unstable=None) -> str | None:
+    """Redeploy a loaded host-attestation writer that is not this tartci's,
+    or that runs a different interpreter than the installer now pins.
 
     install_host_attestation.sh copies the writer out of the generation into
     ~/.local/share/pulp-landing, so a self-update never reached it: on
@@ -1349,26 +1416,62 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
     (every --advertise, the generation and the interval), so a host keeps
     attesting exactly what it attested. A host without the agent, or with it
     unloaded, is left alone: installing or re-enabling it is an operator's call.
+    The interpreter is the agent's macOS privacy identity: a plist rendered
+    before the installer pinned the python.org framework binary still runs
+    /opt/homebrew/bin/python3, an ad-hoc Cellar binary that becomes a new
+    identity on every `brew upgrade` (scripts/tcc_risk_lint.py). It is
+    re-rendered once; a plist that already runs the pinned interpreter is left
+    alone, so this never loops. The re-pin runs only when the current
+    interpreter is one the tcc-risk lint flags AND the installer would pin the
+    python.org framework binary: an operator's TARTCI_ATTESTATION_PYTHON choice
+    that the lint accepts is never touched, nothing is ever re-pinned toward
+    Homebrew, and a framework python whose probe fails once does not flap.
+    A writer redeploy keeps an accepted interpreter the same way.
     Returns the line to log, or None when there is nothing to say. Never raises.
     """
     home = home or os.path.expanduser("~")
     plist_path = os.path.join(home, "Library", "LaunchAgents", f"{ATTESTATION_LABEL}.plist")
     if not os.path.isfile(plist_path):
         return None
-    is_loaded = loaded if loaded is not None else (
-        lambda label: _run(["launchctl", "print", f"{_domain()}/{label}"])[0] == 0)
+    is_loaded = loaded if loaded is not None else _attestation_loaded
     if not is_loaded(ATTESTATION_LABEL):
         return None
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     source = _sha256(os.path.join(root, "scripts", "tartci_host_attestation.py"))
     installed = _sha256(os.path.join(home, ".local", "share", "pulp-landing", "current",
                                      "tartci_host_attestation.py"))
-    if source is None or source == installed:
+    if source is None:
         return None
     try:
         with open(plist_path, "rb") as fh:
             plist = plistlib.load(fh)
         argv = [str(a) for a in plist.get("ProgramArguments") or []]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        if source == installed:
+            return None
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation writer is stale "
+                f"but its plist is unreadable ({exc}); not redeployed")
+    current = argv[0] if argv else ""
+    try:
+        flagged = bool(current) and (unstable or _unstable_interpreter)(current)
+    except Exception:  # noqa: BLE001 - an unreadable verdict changes nothing
+        flagged = False
+    wanted = (pinned_python or attestation_python)() if flagged else None
+    move = flagged and _framework_python(wanted) and wanted != current
+    repin = None
+    if source == installed:
+        if not move:
+            return None
+        repin = (current, wanted)
+    env = dict(os.environ)
+    env.pop("TARTCI_ATTESTATION_PYTHON", None)
+    if current and not move and _interpreter_available(current):
+        # Keep the interpreter the plist runs: an operator's choice, or the
+        # unstable one when no framework python is available to move to. A
+        # vanished one is left to the installer to choose, so it never refuses
+        # every pass.
+        env["TARTCI_ATTESTATION_PYTHON"] = current
+    try:
         args: list[str] = []
         generation = (plist.get("EnvironmentVariables") or {}).get("PULP_ATTESTATION_GENERATION")
         if generation:
@@ -1383,10 +1486,18 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
                 f"but its plist is unreadable ({exc}); not redeployed")
     try:
         proc = run(["/bin/bash", os.path.join(root, "scripts", "install_host_attestation.sh"),
-                    *args], capture_output=True, text=True, timeout=120)
-    except (OSError, subprocess.SubprocessError) as exc:
+                    *args], timeout=120, env=env)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy FAILED ({exc})"
     was = (installed or "absent")[:12]
+    if repin is not None:
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation repin "
+                    f"{repin[0]} -> {repin[1]} FAILED (exit {proc.returncode}: "
+                    f"{detail[-1] if detail else 'no output'})")
+        return (f"{_iso(utcnow())} launchd-watchdog: host-attestation interpreter repinned "
+                f"{repin[0]} -> {repin[1]}")
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy {was} -> "
@@ -1727,6 +1838,32 @@ def tcc_prompt_pass(reading: dict[str, Any] | None, store_state: dict[str, Any] 
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-prompt check FAILED "
                 f"({type(exc).__name__}: {exc}); a waiting consent alert would not be paged")
+
+
+def tcc_stuck_jobs_pass(store_state: dict[str, Any], *, dry_run: bool,
+                        **kwargs) -> str | None:
+    """During a TCC wedge, page once per episode the launchd jobs held in
+    open() on /Volumes, with the command that clears them
+    (scripts/tcc_stuck_jobs.py). Report only. Never raises."""
+    try:
+        import tcc_stuck_jobs  # noqa: PLC0415 - sibling module
+        lines = tcc_stuck_jobs.report_pass(store_state, dry_run=dry_run, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-wedge stuck-job check FAILED "
+                f"({type(exc).__name__}: {exc}); jobs stuck on the store would not be paged")
+    return "\n".join(lines) or None
+
+
+def tcc_risk_pass(now: float | None = None, **kwargs) -> str | None:
+    """At most every 15 min, report loaded LaunchAgents that can raise a
+    privacy prompt (scripts/tcc_risk_lint.py). Report only. Never raises."""
+    try:
+        import tcc_risk_lint  # noqa: PLC0415 - sibling module
+        lines = tcc_risk_lint.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-risk check FAILED "
+                f"({type(exc).__name__}: {exc}); prompt-prone agents would not be reported")
+    return "\n".join(lines) or None
 
 
 def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
@@ -2235,6 +2372,12 @@ def main(argv: list[str] | None = None) -> int:
         prompt_line = tcc_prompt_pass(consent_alert, store_health_result)
         if prompt_line:
             print(prompt_line)
+    # Then name the jobs the wedge left blocked in open(): they stay blocked
+    # after the alert goes away, and a run that never ends never starts again.
+    stuck_line = tcc_stuck_jobs_pass(store_health_result,
+                                     dry_run=args.status or args.dry_run)
+    if stuck_line and not args.json:
+        print(stuck_line)
     # Compute the VM-running guard ONCE per pass, but only after storage health
     # is proven. A Tart inventory call can itself block on a wedged external
     # volume; never let it outrun the bounded storage gate.
@@ -2335,6 +2478,9 @@ def main(argv: list[str] | None = None) -> int:
         grant_line = interpreter_grant_pass()
         if grant_line:
             print(grant_line)
+        tcc_risk_line = tcc_risk_pass()
+        if tcc_risk_line:
+            print(tcc_risk_line)
         scratch_line = scratch_vm_pass()
         if scratch_line:
             print(scratch_line)

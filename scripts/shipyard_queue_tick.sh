@@ -156,6 +156,71 @@ if { [ "$APPLY" = "1" ] && [ "$LEGACY_REAP_ONLY" = "0" ]; } || [ "$LEGACY_AUTHOR
   LEGACY_NOTE="legacy_full_live_ignored"
 fi
 validate_invalid_ledger || unhealthy "invalid-ledger integrity/writability check failed"
+
+# Run Shipyard under ShipyardLauncher.app once this host has activated it.
+# macOS privacy consent (TCC) belongs to a process's responsible process. This
+# tick's LaunchAgent program is /bin/bash, a platform binary, and a
+# non-platform program it starts becomes its own responsible process (measured
+# on m3 with responsibility_get_pid_responsible_for_pid). So each Shipyard call
+# here is judged by the release's real path,
+# ~/.local/share/shipyard/auth-generations/<id>/shipyard, which changes with
+# every release. Its first run from the Removable Volumes repo root raises a
+# new consent alert that nobody answers on an unattended host (tartci#920).
+# The launcher is a signed app bundle with one stable identity that already
+# holds the grant. Started by this script, it is its own responsible process,
+# and it runs the current release as its child, which inherits that identity.
+# Only the launcher's own `--launcher-active` verdict routes. A host that never
+# activated it runs Shipyard directly, as before. An activated host whose
+# launcher does not answer active also runs directly, and says so with a
+# `launcher-fallback ... FINDING` line, because that is the path that prompts.
+# SHIPYARD_QUEUE_LAUNCHER=off turns routing off.
+LAUNCHER_EXE="$HOME/.local/libexec/ShipyardLauncher.app/Contents/MacOS/shipyard-launcher"
+LAUNCHER_RECORD="$HOME/.local/share/shipyard/launcher/activation.json"
+LAUNCHER_TIMEOUT="${SHIPYARD_QUEUE_LAUNCHER_TIMEOUT_S:-45}"
+launcher_fallback() {
+  log "$HOST: launcher-fallback reason=$(printf '%s' "$1" | head -c 60 | tr -c 'A-Za-z0-9_-' '_') FINDING detail=$(printf '%s' "$2" | head -c 160 | tr '\n ' '__')"
+}
+# Prints "active" or the launcher's reason. Bounded: a hung launcher is killed
+# and counts as not active, so it can never stall the tick.
+launcher_verdict() {
+  python3 -c '
+import json, subprocess, sys
+try:
+    run = subprocess.run(sys.argv[2:], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                         stdin=subprocess.DEVNULL, timeout=float(sys.argv[1]))
+except subprocess.TimeoutExpired:
+    print("timeout: no answer within %ss" % sys.argv[1]); sys.exit(0)
+except (OSError, ValueError) as error:
+    print("unrunnable: %s" % error); sys.exit(0)
+try:
+    report = json.loads(run.stdout.decode("utf-8", "replace").strip() or "null")
+except ValueError:
+    report = None
+if run.returncode == 0 and isinstance(report, dict) and report.get("active") is True:
+    print("active")
+else:
+    reason = report.get("reason") if isinstance(report, dict) else None
+    print("exit %d: %s" % (run.returncode, reason or "no report"))
+' "$LAUNCHER_TIMEOUT" "$LAUNCHER_EXE" --launcher-active 2>/dev/null || echo "unrunnable: python3 failed"
+}
+LAUNCHER_PATH="direct"
+if [ -n "${SHIPYARD_LAUNCHER_APP:-}" ]; then
+  LAUNCHER_PATH="app"   # already a child of the launcher; never route twice
+elif [ "${SHIPYARD_QUEUE_LAUNCHER:-on}" != "off" ] && [ -f "$LAUNCHER_RECORD" ]; then
+  if [ ! -x "$LAUNCHER_EXE" ] || [ -L "$LAUNCHER_EXE" ]; then
+    launcher_fallback launcher_missing "$LAUNCHER_EXE is not an executable file"
+  else
+    verdict="$(launcher_verdict)"
+    if [ "$verdict" = "active" ]; then
+      SY="$LAUNCHER_EXE"
+      LAUNCHER_PATH="app"
+    else
+      launcher_fallback "${verdict%%:*}" "$verdict"
+    fi
+  fi
+fi
+log "$HOST: launcher=$LAUNCHER_PATH"
+
 installed="$("$SY" --version 2>/dev/null | awk '{print $2}')"
 compatible="$(python3 "$SUPPORT" version-compatible "$installed" "$MIN_VERSION")"
 if [ "$compatible" != "1" ]; then

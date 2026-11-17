@@ -20,6 +20,17 @@ records an intent in the host's lease store and asks who should have it:
     repositories, so one repository cannot starve another;
   * a job of a lower class that has waited `slot_priority_promote_after_secs`
     (default 2700) ranks as merge-group, so no class starves for good either;
+  * with short-job-first on for a lane (`[[lane]] short_jobs` names the jobs,
+    `short_job_first = "on"` turns it on), a lane whose scan saw one of its
+    short jobs queued ranks ahead of the other lanes of its own effective
+    class, so a job of a minute or two is not queued behind a half-hour one.
+    The class order above is unchanged. Starvation is bounded: a lane passed
+    over this way `short_job_first_max_passes` times (default 1), or first
+    passed `short_job_first_max_pass_secs` ago (default 600), ranks with the
+    short lanes again, by age, so it is never passed over again in that wait.
+    In `shadow` (the default for a lane that names short jobs) the order is
+    unchanged and the short lane reports `would-boot-short-first` whenever the
+    rule would have given it a slot it was not given;
   * ties fall to whoever started waiting first, then the lane id.
 
 A lane defers only while at least as many intents ranked strictly ahead of it
@@ -82,6 +93,12 @@ DEFAULT_DETAIL_MAX_AGE_SECS = 300
 # wanting a slot, and a dead owner never counts.
 DEFAULT_INTENT_FRESH_SECS = 240
 DEFAULT_LOCK_TIMEOUT_SECS = 10.0
+# Views of the short-job-first rule: `plain` ranks as if no lane had it, `on`
+# boosts lanes whose switch is on (what is acted on), `shadow` also boosts
+# lanes in shadow (what would happen if they were on).
+PLAIN_VIEW = "plain"
+ON_VIEW = "on"
+SHADOW_VIEW = "shadow"
 
 
 def intents_file(store_dir: pathlib.Path) -> pathlib.Path:
@@ -173,6 +190,77 @@ def release_first_setting(override: Optional[bool] = None) -> bool:
     return host_profile.lease_policy_settings().get("slot_priority_release_first") is True
 
 
+def short_mode_setting(override: Optional[str] = None) -> str:
+    """This lane's short-job-first switch: the flag, then TARTCI_SHORT_JOB_FIRST.
+
+    The renderer sets the variable only for a lane that declares short_jobs,
+    so a lane without them is `off`.
+    """
+    if override in MODES:
+        return str(override)
+    raw = os.environ.get("TARTCI_SHORT_JOB_FIRST")
+    if raw is not None and raw.strip() in MODES:
+        return raw.strip()
+    return "off"
+
+
+def short_bound_settings(max_passes: Optional[int] = None,
+                         max_pass_secs: Optional[int] = None) -> Tuple[int, int]:
+    """(max passes, max seconds since first passed) of the starvation bound."""
+    settings = host_profile.lease_policy_settings()
+    if max_passes is None or max_passes < 0:
+        max_passes = int(settings.get("short_job_first_max_passes", 1))
+    if max_pass_secs is None or max_pass_secs < 0:
+        max_pass_secs = int(settings.get("short_job_first_max_pass_secs", 600))
+    return int(max_passes), int(max_pass_secs)
+
+
+def short_from_detail(detail: Optional[Dict[str, Any]], cls: str) -> Optional[Dict[str, Any]]:
+    """The oldest queued short job a detail file counted in class `cls`, or None."""
+    if not detail:
+        return None
+    row = (detail.get("classes") or {}).get(cls)
+    short = row.get("short") if isinstance(row, dict) else None
+    if not isinstance(short, dict) or int(short.get("count") or 0) <= 0:
+        return None
+    if _epoch(short.get("oldest_created_at")) is None:
+        return None
+    return short
+
+
+def short_boosted(intent: Dict[str, Any], view: str) -> bool:
+    """The intent saw a short job queued and its switch is on (or shadow, in the shadow view)."""
+    if view == PLAIN_VIEW or not intent.get("short_queued_at"):
+        return False
+    mode = str(intent.get("short_job_first") or "off")
+    return mode == "on" or (view == SHADOW_VIEW and mode == "shadow")
+
+
+def short_exempt(intent: Dict[str, Any], bound: Tuple[int, int], now: float) -> bool:
+    """A lane already passed over by short jobs as often or as long as the bound allows."""
+    max_passes, max_pass_secs = bound
+    passes = leases.record_int(intent, "short_passes")
+    first = _epoch(intent.get("short_passed_since"))
+    if passes <= 0 and first is None:
+        return False
+    return passes >= max_passes or (first is not None and now - first >= max_pass_secs)
+
+
+def suspended_ranks(rows: List[Dict[str, Any]], promote_after: int, now: float,
+                    bound: Tuple[int, int]) -> frozenset:
+    """Effective classes in which short-job-first is suspended.
+
+    A lane that has reached the starvation bound may not be passed again, and
+    the only order that keeps that and stays total is the plain one: while such
+    a lane waits, its class ranks by age alone. Its count resets with its wait.
+    """
+    ranks = set()
+    for row in rows:
+        if short_exempt(row, bound, now):
+            ranks.add(rank_key(row, promote_after, now)[0])
+    return frozenset(ranks)
+
+
 def carries_release_label(labels: Any) -> bool:
     """True when a registration's labels name a tagged-release class."""
     names = {part.strip() for part in str(labels or "").split(",")}
@@ -244,8 +332,16 @@ def effective_rank(cls: str, queued_epoch: Optional[float], promote_after: int,
     return rank
 
 
-def rank_key(intent: Dict[str, Any], promote_after: int, now: float) -> Tuple[Any, ...]:
-    """Smaller is better: class, then the longest wait, then when the lane began waiting.
+def rank_key(intent: Dict[str, Any], promote_after: int, now: float,
+             view: str = PLAIN_VIEW, bound: Tuple[int, int] = (1, 600),
+             suspended: frozenset = frozenset()) -> Tuple[Any, ...]:
+    """Smaller is better: class, short first, the longest wait, when the lane began waiting.
+
+    The short flag is 0 for every intent in the plain view, so that view is
+    the order without short-job-first. In the other views a boosted intent is
+    0 and every other is 1, except in a class `suspended` by the starvation
+    bound (suspended_ranks), where all are 0. The flag only reorders intents
+    of the same effective class.
 
     The wait is the older of the job's queued_at and the lane's waiting_since
     (when it began wanting a slot without a break). A scan that stopped at its
@@ -260,7 +356,12 @@ def rank_key(intent: Dict[str, Any], promote_after: int, now: float) -> Tuple[An
         queued = since if since is not None else (queued if queued is not None else now)
     rank = effective_rank(str(intent.get("event_class") or UNKNOWN_CLASS), queued,
                           promote_after, now)
-    return (rank, queued, since if since is not None else now, str(intent.get("lane") or ""))
+    short = 0
+    if view != PLAIN_VIEW and bound[0] > 0 and rank not in suspended \
+            and not short_boosted(intent, view):
+        short = 1
+    return (rank, short, queued, since if since is not None else now,
+            str(intent.get("lane") or ""))
 
 
 def intent_summary(intent: Dict[str, Any], promote_after: int, now: float) -> Dict[str, Any]:
@@ -274,6 +375,10 @@ def intent_summary(intent: Dict[str, Any], promote_after: int, now: float) -> Di
         "waiting_since": intent.get("waiting_since"),
         "priority": leases.record_int(intent, "priority"),
         "cores": leases.record_int(intent, "lease_size_cores"),
+        "short_job_first": intent.get("short_job_first") or "off",
+        "short_queued_at": intent.get("short_queued_at"),
+        "short_job": intent.get("short_job"),
+        "short_passes": leases.record_int(intent, "short_passes"),
     }
 
 
@@ -285,6 +390,8 @@ def ranked_ahead(
     promote_after: int,
     now: float,
     waiters: Optional[List[Dict[str, Any]]] = None,
+    view: str = PLAIN_VIEW,
+    bound: Tuple[int, int] = (1, 600),
 ) -> List[Dict[str, Any]]:
     """Intents ranked strictly ahead of `me` that could take a slot now.
 
@@ -296,12 +403,18 @@ def ranked_ahead(
     holds nothing back. This lane's own waiter is left out: a lane that defers
     here withdraws it (slot-priority.lib.sh).
     """
-    my_key = rank_key(me, promote_after, now)
+    suspended = suspended_ranks(live, promote_after, now, bound) \
+        if view != PLAIN_VIEW else frozenset()
+
+    def key(row: Dict[str, Any]) -> Tuple[Any, ...]:
+        return rank_key(row, promote_after, now, view, bound, suspended)
+
+    my_key = key(me)
     simulated = list(records)
     ahead: List[Dict[str, Any]] = []
     others = [row for row in live if str(row.get("lane")) != str(me.get("lane"))]
-    for row in sorted(others, key=lambda r: rank_key(r, promote_after, now)):
-        if rank_key(row, promote_after, now) >= my_key:
+    for row in sorted(others, key=key):
+        if key(row) >= my_key:
             break
         priority = leases.record_int(row, "priority")
         cores = leases.record_int(row, "lease_size_cores")
@@ -336,13 +449,21 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     nowdt = slot_demand._utcnow()
     now = nowdt.timestamp()
     witness_only = False
+    short_mode = short_mode_setting(args.short_job_first)
+    bound = short_bound_settings(args.short_max_passes, args.short_max_pass_secs)
+    short: Optional[Dict[str, Any]] = None
     if args.event_class:
         event_class = args.event_class
         queued_at = args.queued_at or None
+        if args.short_queued_at:
+            short = {"oldest_created_at": args.short_queued_at, "count": 1}
     else:
         detail = slot_demand.read_detail(args.demand_file or "", args.detail_max_age_secs)
         event_class, queued_at = demand_from_detail(detail, promote_after, now)
         witness_only = bool(detail and detail.get("witness_only"))
+        short = short_from_detail(detail, event_class)
+    if short_mode == "off":
+        short = None
     release_first = release_first_setting(
         None if args.release_first is None else args.release_first == "1")
     event_class = ranked_class(event_class, args.labels, release_first)
@@ -381,7 +502,17 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
             "host_boot_time": identity["host_boot_time"],
             "waiting_since": previous.get("waiting_since") if same_owner and previous else stamp,
             "seen_at": stamp,
+            "short_job_first": short_mode,
+            "short_queued_at": short.get("oldest_created_at") if short else None,
+            "short_job": {key: short.get(key) for key in ("name", "job_id", "run_id")}
+            if short else None,
         }
+        # The starvation bound's count belongs to this wait: kept while the same
+        # owner keeps waiting, gone with a new owner or a new wait.
+        if same_owner and previous:
+            for key in ("short_passes", "short_passed_since"):
+                if previous.get(key) is not None:
+                    me[key] = previous[key]
         kept = [row for row in live if str(row.get("lane")) != args.lane]
         kept.append(me)
         write_intents(store_dir, kept)
@@ -400,7 +531,31 @@ def decide(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
         if cfg.get("rank_vm_waiters"):
             loaded, _ = leases.load_waiters(store_dir)
             waiters, _ = leases.live_waiters(loaded, int(cfg["waiter_fresh_secs"]))
-        ahead = ranked_ahead(cfg, records, kept, me, promote_after, now, waiters)
+        ahead = ranked_ahead(cfg, records, kept, me, promote_after, now, waiters,
+                             ON_VIEW, bound)
+        free = int(args.free_slots)
+        if short_boosted(me, ON_VIEW) and len(ahead) < free:
+            # Count a pass on every lane the plain order would have served first.
+            plain = ranked_ahead(cfg, records, kept, me, promote_after, now, waiters)
+            if len(plain) >= free:
+                passed = {str(row.get("lane")) for row in plain} \
+                    - {str(row.get("lane")) for row in ahead}
+                for row in kept:
+                    if str(row.get("lane")) in passed:
+                        row["short_passes"] = leases.record_int(row, "short_passes") + 1
+                        row.setdefault("short_passed_since", stamp)
+                write_intents(store_dir, kept)
+                result["short_first"] = "boosted"
+                result["short_passed"] = sorted(passed)
+        elif short_boosted(me, SHADOW_VIEW) and not short_boosted(me, ON_VIEW) \
+                and len(ahead) >= free:
+            would = ranked_ahead(cfg, records, kept, me, promote_after, now, waiters,
+                                 SHADOW_VIEW, bound)
+            if len(would) < free:
+                result["short_first"] = "would_boot"
+                result["short_passed"] = sorted(
+                    {str(row.get("lane")) for row in ahead}
+                    - {str(row.get("lane")) for row in would})
     result["ahead"] = [intent_summary(row, promote_after, now) for row in ahead]
     if len(ahead) < int(args.free_slots):
         result.update(decision="claim", reason="ranked_first")
@@ -439,7 +594,10 @@ def status(args: argparse.Namespace) -> Tuple[Dict[str, Any], int]:
     now = slot_demand._utcnow().timestamp()
     intents, problems = load_intents(store_dir)
     live, _ = live_intents(intents, fresh)
-    ordered = sorted(live, key=lambda r: rank_key(r, promote_after, now))
+    bound = short_bound_settings(args.short_max_passes, args.short_max_pass_secs)
+    suspended = suspended_ranks(live, promote_after, now, bound)
+    ordered = sorted(live, key=lambda r: rank_key(r, promote_after, now, ON_VIEW, bound,
+                                                  suspended))
     return {"ok": True, "mode": mode_setting(args.mode),
             "intents": [intent_summary(row, promote_after, now) for row in ordered],
             "problems": sorted(set(problems))}, 0
@@ -457,6 +615,13 @@ def line(result: Dict[str, Any]) -> str:
     parts += [f"class={v(me.get('event_class'))}", f"rank={v(me.get('effective_rank'))}",
               f"queued_at={v(me.get('queued_at'))}", f"free={v(result.get('free_slots'))}",
               f"ahead={len(result.get('ahead') or [])}"]
+    if result.get("short_first"):
+        job = me.get("short_job") or {}
+        parts += [f"short_first={v(result.get('short_first'))}",
+                  f"short_job={v(job.get('name'))}", f"short_job_id={v(job.get('job_id'))}",
+                  f"short_run_id={v(job.get('run_id'))}",
+                  f"short_queued_at={v(me.get('short_queued_at'))}",
+                  f"short_passed={v(','.join(result.get('short_passed') or []))}"]
     winner = result.get("winner") or {}
     if winner:
         parts += [f"winner_lane={v(winner.get('lane'))}", f"winner_repo={v(winner.get('repo'))}",
@@ -480,6 +645,9 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
         p.add_argument("--capacity-mem-mb", type=int)
         p.add_argument("--reserved-gate-cores", type=int)
         p.add_argument("--lock-timeout-secs", type=float, default=DEFAULT_LOCK_TIMEOUT_SECS)
+        # Override [leases] short_job_first_max_passes / _max_pass_secs.
+        p.add_argument("--short-max-passes", type=int)
+        p.add_argument("--short-max-pass-secs", type=int)
         p.add_argument("--json", action="store_true")
 
     d = sub.add_parser("decide", help="record this lane's intent and say whether it may claim")
@@ -498,6 +666,10 @@ def parse_args(argv: Optional[List[str]]) -> argparse.Namespace:
     d.add_argument("--queued-at", default="")
     # Overrides [leases] slot_priority_release_first (tests and dry runs).
     d.add_argument("--release-first", choices=("0", "1"))
+    # This lane's short-job-first switch (else TARTCI_SHORT_JOB_FIRST, else off)
+    # and, with --event-class, the oldest queued short job's created_at.
+    d.add_argument("--short-job-first", choices=MODES)
+    d.add_argument("--short-queued-at", default="")
 
     w = sub.add_parser("withdraw", help="remove this lane's intent")
     common(w)

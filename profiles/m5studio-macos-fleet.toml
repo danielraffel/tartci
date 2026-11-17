@@ -243,7 +243,8 @@ priority = "gate"
 min_queued_age_seconds = 0
 labels = ["self-hosted", "macOS", "ARM64", "spectr-build", "spectr-build-vm", "spectr-gate-fast", "spectr-release"]
 # The trusted m5studio lane also performs signed Spectr releases. Other
-# Spectr lanes remain acceptance-only so a release cannot land on an
+# Spectr lanes also poll Spectr Release so it is never starved, but only this
+# lane carries the spectr-release label, so a release cannot land on an
 # unqualified host.
 workflows = ["Spectr M5 Product Acceptance", "Spectr Release"]
 replaces_launchd_labels = []
@@ -286,6 +287,13 @@ min_queued_age_seconds = 0
 # jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
 # default 0. Rollback: delete this line and re-render.
 queue_merge_group_quota = 2
+# sterile-consumer runs about 1.5 min after the GPU proof, on the same runner
+# class, and waited a median 5.3 min (mean 16.7) for a VM slot behind 30-minute
+# GPU jobs. Named here, slot priority lets it take the next free slot ahead of
+# longer jobs of its class, at most once per waiting lane (short_job_first,
+# scripts/slot_priority.py). Unset, the switch is "shadow": logs only.
+# Rollback: delete these lines and re-render.
+short_jobs = [{ workflow = "Locked macOS GPU proof", job = "sterile-consumer" }]
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m5studio"]
 priority = "vm"
 # Count peers' in-flight boots, so one queued job no longer boots a VM on

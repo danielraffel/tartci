@@ -51,7 +51,8 @@ class Listener:
         ssh.chmod(0o755)
 
     def run(self, stale: int | None, timeout: float = 60,
-            env_stale: str | None = None, idle: int = 600, cap: int | None = None) -> tuple[subprocess.CompletedProcess, float]:
+            env_stale: str | None = None, idle: int = 600, cap: int | None = None,
+            prelude: str = "") -> tuple[subprocess.CompletedProcess, float]:
         """`stale` sets the listener's threshold directly; None takes it from
         runner.sh's own top-level assignment and TARTCI_GUEST_HEARTBEAT_STALE_SECS."""
         source = RUNNER.read_text()
@@ -78,6 +79,7 @@ class Listener:
             "capture_current_job(){ return 1; }; tartci_job_claim_release(){ :; }\n"
             f"cancel_current_run(){{ echo cancel >>{str(self.events)!r}; }}\n"
             "finalize_listener_receipt(){ :; }\n"
+            + prelude
             + function(source, "tartci_guest_silent_secs") + "\n"
             + function(source, "run_runner_until_done_unlayered") + "\n"
             "run_runner_until_done_unlayered vm1 192.0.2.1 jit 0; echo \"rc=$?\"\n"

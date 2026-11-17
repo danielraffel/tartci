@@ -82,6 +82,7 @@ import checkout_outputs
 import pulp_reapers
 import gate_ccache_trim
 import scratch_dirs
+import state_retention
 import tmp_checkouts
 
 try:
@@ -1601,6 +1602,14 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
                                            profile=pulp_reapers.default_profile_path(),
                                            state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
+    # Per-boot lane files older than 30 days and support generations outside
+    # the newest 10 (state_retention.py). Nothing else ran it, so m1, m3, m5
+    # and m5studio held 111-202 generations (440-818 MB) each. It keeps every
+    # generation a wrapper, plist, receipt, launcher pointer, rollback
+    # snapshot or running process names, and skips generations entirely
+    # while a self-update is in progress.
+    progress.emit("state retention: per-boot files and old generations", force=True)
+    receipt["state_retention"] = state_retention.run(fix=args.fix)
     # Which CI and agent paths hold the boot volume, sampled once a day after
     # the reapers above (boot_usage.py). Read-only.
     progress.emit("boot usage: sampling CI and agent paths on the boot volume", force=True)
