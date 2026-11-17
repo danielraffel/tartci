@@ -586,6 +586,11 @@ once per failing streak (a restart after which the store still hangs is
 by root alone (`wrapper_insecure`), and logs to
 `/var/log/tartci-heal-tcc.log`. After a run the watchdog reprobes the store
 and records the result; a store that answers again is `action: tcc-healed`.
+`killall` exiting 0 only means the signal was delivered, so the watchdog also
+re-reads the PIDs of tccd and sandboxd about 5 s later: if they are all the same
+processes the outcome is `heal ineffective` (event `tcc_heal_ineffective` and a
+`WARN tcc-heal ineffective` line), the page continues, and nothing stronger is
+tried. A stronger signal or a wider root helper is the owner's decision.
 It is installed by hand, once per host:
 
 ```sh

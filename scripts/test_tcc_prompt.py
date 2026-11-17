@@ -250,7 +250,7 @@ class ClassifyPromptTests(unittest.TestCase):
                                                 "seconds_before_alert": 42})
         verdict, _ = classify(alert, HUNG)
         self.assertEqual(verdict["kind"], tw.PROMPT_KIND)
-        self.assertIn("42 s after Shipyard installed generation eeeeeeeeeeee", verdict["reason"])
+        self.assertIn("near Shipyard install eeeeeeeeeeee (42 s; timing only)", verdict["reason"])
 
     def test_a_granted_context_that_answers_still_allows_the_verdict(self) -> None:
         verdict, _ = classify(PRESENT, HUNG, context=lambda: {"ok": True})
@@ -408,13 +408,24 @@ class AlertPassTests(unittest.TestCase):
                                         now=NOW + 600))
         self.assertEqual(self.closed, ["101"])
 
+    def test_the_hung_launchd_probe_job_is_named(self) -> None:
+        reading = dict(PRESENT, hang=True, pending_since_epoch=NOW, pending_since="t",
+                       launchd_probe={"outcome": "hung_on_root",
+                                      "label": "com.tartci.store-probe.123.456"})
+        line = self.run_pass(reading, self.verdict())
+        self.assertIn("com.tartci.store-probe.123.456", line)
+        self.assertIn("com.tartci.store-probe.123.456", self.opened[0][1])
+
     def test_an_alert_right_after_a_shipyard_install_pages_before_any_hang(self) -> None:
         reading = dict(PRESENT, shipyard_install={
             "generation": "f" * 64, "installed_epoch": NOW - 400, "installed_at": "t",
             "binary": "/home/.local/share/shipyard/auth-generations/" + "f" * 64 + "/shipyard",
             "seconds_before_alert": 100})
         line = self.run_pass(reading, None)
-        self.assertIn("after Shipyard install ffffffffffff", line)
+        self.assertIn("near Shipyard install ffffffffffff (100 s; timing only)", line)
+        self.assertNotIn("after Shipyard install", line)
+        self.assertIn("timing only", self.opened[0][1])
+        self.assertNotIn("a new privacy identity", self.opened[0][1])
         self.assertEqual(len(self.opened), 1)
         self.assertIn("auth-generations/" + "f" * 64 + "/shipyard", self.opened[0][1])
 

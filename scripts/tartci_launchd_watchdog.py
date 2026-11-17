@@ -2101,6 +2101,15 @@ def store_health_pass(
         except Exception as exc:  # noqa: BLE001 - the drain path and the save must survive
             state["classification"] = {"kind": "classifier_error", "reason": str(exc)[:300],
                                        "evidence": {}, "classified_at": _iso(time.time())}
+        heal_record = state.get("heal") if isinstance(state.get("heal"), dict) else {}
+        if heal_record.get("outcome") == "ineffective" and not (dry_run or status_only):
+            import host_off  # noqa: PLC0415 - sibling module
+            host_off.event(Path(os.path.dirname(state_path)), "tcc_heal_ineffective",
+                           str(heal_record.get("detail"))[:300],
+                           {"pids_before": heal_record.get("pids_before"),
+                            "pids_after": heal_record.get("pids_after")})
+            print(f"{_iso(utcnow())} launchd-watchdog: WARN tcc-heal ineffective: "
+                  f"{heal_record.get('detail')} (still paging; a stronger heal is the owner's call)")
         if recovered is not None:
             healed = store_health.next_state(state, recovered, failure_threshold)
             for key in ("state", "consecutive_failures", "last_result", "drain_required"):

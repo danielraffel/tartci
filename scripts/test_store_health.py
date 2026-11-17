@@ -58,7 +58,10 @@ class TccWedgeWatchdogTests(unittest.TestCase):
                                   lambda path, timeout_s: {"ok": True, "path": path,
                                                            "latency_ms": 0.05}), \
                 mock.patch.object(tcc_wedge, "wrapper_insecurity", lambda path: ""), \
-                mock.patch.object(tcc_wedge, "run_privileged_bounded", heal_runner):
+                mock.patch.object(tcc_wedge, "run_privileged_bounded", heal_runner), \
+                mock.patch.object(tcc_wedge, "read_pids", mock.Mock(side_effect=[
+                    {"tccd": [1], "sandboxd": [2]}, {"tccd": [3], "sandboxd": [4]}] * 3)), \
+                mock.patch.object(tcc_wedge.time, "sleep", lambda seconds: None):
             first = watchdog.store_health_pass(
                 participation_file=str(Path(td) / "participation"), status_only=False,
                 dry_run=False, failure_threshold=2)
@@ -173,7 +176,10 @@ class TccWedgeWatchdogTests(unittest.TestCase):
                                   lambda path, timeout_s: {"ok": True, "path": path}), \
                 mock.patch.object(tcc_wedge, "wrapper_insecurity", lambda path: ""), \
                 mock.patch.object(tcc_wedge, "run_privileged_bounded",
-                                  lambda argv, timeout: (heal_calls.append(argv), 0, "")[1:]):
+                                  lambda argv, timeout: (heal_calls.append(argv), 0, "")[1:]), \
+                mock.patch.object(tcc_wedge, "read_pids", mock.Mock(side_effect=[
+                    {"tccd": [1], "sandboxd": [2]}, {"tccd": [3], "sandboxd": [4]}] * 3)), \
+                mock.patch.object(tcc_wedge.time, "sleep", lambda seconds: None):
             results = [watchdog.store_health_pass(
                 participation_file=str(Path(td) / "participation"), status_only=False,
                 dry_run=False, failure_threshold=2) for _ in range(2)]
