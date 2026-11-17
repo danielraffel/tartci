@@ -534,7 +534,8 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
              launchd_probe: Optional[Callable[[], dict]] = None,
              launchd_probe_disabled: bool = False,
              ipc_scan: Optional[Callable[[float, float], dict]] = None,
-             consent_alert: Optional[Callable[[], dict]] = None) -> dict[str, Any]:
+             consent_alert: Optional[Callable[[], dict]] = None,
+             volume_meta: Optional[Callable[[], dict]] = None) -> dict[str, Any]:
     """Classify a failing store probe. Returns {kind, reason, evidence, classified_at}.
 
     Two paths reach `tcc_attribution_wedge`; every other combination is
@@ -550,7 +551,10 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
 
     Disagreement fails closed: a fresh launchd job that opens the root, or
     fails fast on it, and an authorized context that hangs too, each veto both
-    paths. The sandboxd IPC signature (an authorization request that never
+    paths. One exception, `error_signature_saturated`: with Removable
+    Volumes refusals in the log, an authorized context that TIMES OUT while
+    the volume answers statfs (`volume_meta`, a bounded `df`) is a saturated
+    tccd every context waits on (m3, 2026-11-17), not a stalled volume. The sandboxd IPC signature (an authorization request that never
     left sandboxd) is recorded and named as corroboration, never required and
     never a veto: on 2026-11-13 the same wedge showed an unanswered IPC on one
     probe and no IPC line at all on the next, so its absence proves nothing.
@@ -641,6 +645,12 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                 launchd.get("waited_s") or launchd.get("timeout_s") or store_timeout_s))
     window = window_seconds(failing_since, now)
     healed = store_health.finite_epoch(healed_at, now)
+    # The cutoff keeps a heal's own release burst from being the evidence for
+    # the next heal. A heal before the scanned window (the minutes `log show`
+    # reads) wrote no line in it, and cutting at it would ignore the streak: on m3 a 2026-11-14 heal hid
+    # every signature line for three days (ignored_after_heal 14862).
+    if healed is not None and healed < now - max(1, int(math.ceil(window / 60.0))) * 60:
+        healed = None
     before = local_stamp(healed) if healed is not None else None
     log = scan(window, before=before)
     evidence["log_scan"] = log
@@ -671,9 +681,28 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
         # only the Removable Volumes request line ties the failure to the store.
         reading = authorized_context()
         if reading is not None and not reading.get("ok"):
-            return verdict("stalled_unclassified",
-                           "the store did not answer from a context with TCC access either "
-                           f"({reading.get('reason')}); the volume, not tccd, is stalled")
+            # The context probe opens the store too, so it waits on the same
+            # system tccd: when tccd itself is saturated (m3, 2026-11-17: 90%
+            # CPU, a storm of Removable Volumes refusals) it hangs as well and
+            # says nothing about the volume. statfs of the volume needs no
+            # privacy authorization; a volume that answers it while sandboxd
+            # logs Removable Volumes refusals is waiting on tccd, not stalled.
+            # Only a context probe that timed out waits on tccd; one that
+            # failed fast (ssh refused, a spawn error) says nothing and vetoes.
+            meta = (volume_meta() if volume_meta is not None and is_timeout(reading.get("reason"))
+                    else None)
+            if meta is not None:
+                evidence["volume_meta"] = meta
+            if not (meta or {}).get("ok"):
+                return verdict("stalled_unclassified",
+                               "the store did not answer from a context with TCC access either "
+                               f"({reading.get('reason')}); the volume, not tccd, is stalled")
+            return verdict(KIND,
+                           f"{removable} sandboxd/tccd Removable Volumes authorization "
+                           f"failure(s) in the last {minutes} min; the context with TCC access "
+                           f"hangs too ({reading.get('reason')}) but the volume answers statfs "
+                           f"({meta.get('volume_root')}): every open waits on a saturated tccd",
+                           path="error_signature_saturated")
         return verdict(KIND,
                        f"{removable} sandboxd/tccd Removable Volumes authorization "
                        f"failure(s) in the last {minutes} min while the internal control path "
@@ -718,6 +747,43 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
                    "open and the internal control path answer, and the store answers from a "
                    f"context with TCC access{corroboration}: launchd-context opens wait on a "
                    "Removable Volumes authorization", path="launchd_root_hang")
+
+
+DF = "/bin/df"
+
+
+def volume_meta_probe(path: str, timeout_s: float, *,
+                      runner: Callable[..., Any] = run_bounded) -> dict[str, Any]:
+    """Bounded `df -P` of the store's volume root: statfs, no privacy check.
+
+    It answers while every open of the volume waits on tccd (m3, 2026-11-17),
+    so it separates a saturated tccd from a stalled volume. Only an external
+    volume whose own mount point is listed counts as answering.
+    """
+    root = volume_root(path)
+    out: dict[str, Any] = {"volume_root": root, "ok": False}
+    if root == "/":
+        out["reason"] = "the store is not on an external volume"
+        return out
+    try:
+        completed = runner([DF, "-P", root], timeout=timeout_s, operation="tcc_volume_meta")
+        require_success(completed, operation="tcc_volume_meta")
+    except ObservationError as exc:
+        out["reason"] = f"{exc.kind}: {exc.detail}"[:300]
+        return out
+    except (OSError, ValueError) as exc:
+        out["reason"] = str(exc)[:300]
+        return out
+    lines = (completed.stdout or "").splitlines()[1:]
+    # `Mounted on` is the sixth field in `df -P`.  Split only the fixed
+    # columns before it so a valid mount point such as `/Volumes/External
+    # SSD` remains intact; taking the final whitespace token would reduce it
+    # to `SSD` and disable the saturated-tccd recovery path.
+    out["ok"] = any((fields := line.split(maxsplit=5)) and len(fields) == 6
+                    and fields[5] == root for line in lines if line.strip())
+    if not out["ok"]:
+        out["reason"] = f"df did not list {root} as a mount point"
+    return out
 
 
 def heal_allowed(last_heal: Optional[dict], now: float) -> tuple[bool, str]:
@@ -934,7 +1000,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
                   context_probe: Optional[Callable[[], dict]] = None,
                   launchd_probe: Optional[Callable[[], dict]] = None,
                   launchd_probe_disabled: bool = False,
-                  consent_alert: Optional[Callable[[], dict]] = None) -> Optional[dict]:
+                  consent_alert: Optional[Callable[[], dict]] = None,
+                  volume_meta: Optional[Callable[[], dict]] = None) -> Optional[dict]:
     """Classify, heal once, and reprobe. Mutates `state`; returns a recovered
     probe result when the heal brought the store back, else None.
 
@@ -969,6 +1036,9 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
     if not state.get("drain_required"):
         return None
     healed_at = last_heal.get("at_epoch") if last_heal else None
+    if volume_meta is None and state.get("path"):
+        store_path = str(state["path"])
+        volume_meta = lambda: volume_meta_probe(store_path, store_timeout_s)  # noqa: E731
     classification = classify_fn(
         consecutive_failures=int(state.get("consecutive_failures") or 0),
         failure_threshold=int(state.get("failure_threshold") or 2),
@@ -976,7 +1046,8 @@ def watchdog_step(state: dict, previous: dict, *, control_path: str, store_timeo
         control_path=control_path, now=now, store_timeout_s=store_timeout_s,
         healed_at=store_health.finite_epoch(healed_at, now),
         context_probe=context_probe, launchd_probe=launchd_probe,
-        launchd_probe_disabled=launchd_probe_disabled, consent_alert=consent_alert)
+        launchd_probe_disabled=launchd_probe_disabled, consent_alert=consent_alert,
+        volume_meta=volume_meta)
     state["classification"] = classification
     kind = classification.get("kind")
     if kind == PROMPT_KIND:
