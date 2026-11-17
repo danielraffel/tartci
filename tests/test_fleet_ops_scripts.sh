@@ -354,7 +354,7 @@ if [ "$(uname -s)" = Darwin ]; then
   expect_rc 0 "heal: a leftover lock file without a holder does not block" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   # A holder killed with SIGKILL releases the lock too.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
-  /usr/bin/perl -MFcntl=:flock -e 'open(my $f, ">>", $ARGV[0]) or die; flock($f, LOCK_EX) or die; sleep 30' "$tmp/heal.flock" &
+  /usr/bin/lockf -k "$tmp/heal.flock" /bin/sleep 30 &
   holder=$!
   sleep 0.3
   expect_rc 75 "heal: a live lock holder blocks a second heal" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"

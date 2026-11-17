@@ -663,6 +663,10 @@ class WrapperSourceTests(unittest.TestCase):
         self.assertIn(tw.SIGKILL_VECTOR, text)
         self.assertIn('"$KILLALL" -KILL sandboxd', text)
         self.assertEqual(text.count('"$KILLALL"'), 2, "two fixed command vectors")
+        # The lock is lockf's fd form: a fixed binary, no interpreter, no
+        # caller-controlled argument.
+        self.assertIn("/usr/bin/lockf -s -t 0 9 ||", text)
+        self.assertNotIn("perl", text)
         self.assertIn("MIN_INTERVAL=1800", text)
         self.assertIn("STAMP=$STAMP_DIR/last-heal", text)
         self.assertIn("export PATH=/usr/bin:/bin:/usr/sbin:/sbin", text)

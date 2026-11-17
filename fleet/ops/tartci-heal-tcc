@@ -69,12 +69,13 @@ umask 077
 # read and held until this process exits, so concurrent authorized callers
 # cannot both spend the budget. The kernel drops the lock when the process
 # ends however it ends (timeout, SIGKILL, crash), so no stale lock can block
-# a later heal. perl takes the lock on the open file description fd 9 shares
-# with this shell; the shell keeps holding it after perl exits.
+# a later heal. /usr/bin/lockf in its file-descriptor form (no command, no
+# interpreter, fixed arguments) takes the lock on the open file description fd
+# 9 shares with this shell; the shell keeps holding it after lockf exits. The
+# directory is root-only (0700), so nobody else can plant a link in it.
 [[ ! -L "$LOCK" ]] || die "refusing a symlinked lock path: $LOCK" 70
 exec 9>>"$LOCK" || die "cannot open the lock file: $LOCK" 70
-/usr/bin/perl -MFcntl=:flock -e 'open(my $fd, ">&=", 9) or exit 70; flock($fd, LOCK_EX | LOCK_NB) or exit 75' \
-  || die "another heal is already in progress" 75
+/usr/bin/lockf -s -t 0 9 || die "another heal is already in progress" 75
 # Every child below runs with fd 9 closed (`9>&-`), so a child that hangs
 # (pgrep, killall) cannot keep the lock alive after this shell is gone.
 
