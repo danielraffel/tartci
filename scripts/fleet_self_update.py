@@ -4396,6 +4396,8 @@ class Run:
             skew["recorded_by"] = "verified_apply"
             _write_json(self.cfg.state_dir / "skew.json", skew)
             self.receipt.step("skew", render_skew(skew))
+            # Caught up: close a STARVED issue now, not at the next attempt.
+            behind_alert(self.cfg, skew, self.sys.now())
         except Exception as exc:  # noqa: BLE001 - never turn a success into a failure
             self.receipt.step("skew", f"not recorded: {type(exc).__name__}: {exc}", ok=False)
 

@@ -1009,6 +1009,11 @@ class BehindMainAlertTests(Base):
         events = (self.cfg.state_dir / "events.jsonl").read_text()
         self.assertEqual(1, events.count("self_update_behind"))
 
+    def test_an_update_that_catches_up_closes_its_issue(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.assertUpdated(self.apply())
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+
     def test_a_host_inside_the_bound_is_quiet(self) -> None:
         # Control, same instrument: ten minutes short of the bound.
         self.behind_main_for(su.BEHIND_STARVED_SECONDS - 600)
