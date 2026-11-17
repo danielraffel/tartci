@@ -3283,8 +3283,15 @@ arrive, and a host that did not get it is loud:
   repositories may have run the new binary under the old `ver=`. The steward
   ticks every 5 minutes, so the check lands within one or two watchdog
   intervals of the swap.
-  - The first judging tick with every `invariants=` token ok and no `ERROR`
-    line writes `tool_steward_verified`.
+  - The first judging tick with no `ERROR` line whose every `invariants=`
+    token is ok, or a `FAIL` the baseline tick already had in the same
+    repository, writes `tool_steward_verified`. A repository added to the
+    fleet with a standing failure therefore no longer holds every release on
+    the steward host and the hosts behind it: on 2026-11-16 skia-builder and
+    v8-builder joined with `required_never_ran` and m3 sat on 0.439.3, with
+    m1 and m5s on 0.439.2, for nine hours. The comparison is per repository,
+    so a standing failure in one repository does not excuse the same
+    invariant newly failing in another.
   - The first one with a failing invariant the baseline did not have, or the
     second in a row in which the steward could not run at all (every
     repository wrote `ERROR` or a skip; one such tick is often a timeout or a
@@ -3311,11 +3318,13 @@ arrive, and a host that did not get it is loud:
     tick where only some repositories wrote `ERROR` are inconclusive: they
     neither verify nor fail, and the next complete tick decides.
   - A failure on a version installed by hand is recorded as
-    `tool_steward_failed` and not rolled back. No judging tick after an hour
-    is a problem (`is the steward tick running?`), never a rollback. An
-    invariant already failing before the swap neither rolls back nor
-    verifies; it keeps the hosts behind the steward host waiting until a
-    clean tick.
+    `tool_steward_failed` and not rolled back. No conclusive tick after an
+    hour is a problem, never a rollback: `is the steward tick running?` when
+    no complete tick ran the release, `N complete steward ticks ... none
+    conclusive` when ticks ran it but an `ERROR` token, a repository `ERROR`
+    line, or an invariant newly failing in another repository kept each one
+    from deciding. An invariant already failing before the swap never rolls
+    back.
   - While a deploy waits for its verdict, a newer release waits too, so the
     verdict and its rollback target are never overwritten. A steward host
     that rolled back onto a release it had verified earlier still clears that

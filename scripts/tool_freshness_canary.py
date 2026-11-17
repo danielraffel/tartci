@@ -395,13 +395,16 @@ def parse_ticks(text: str) -> list[dict]:
         if subject != "fleet" and "/" not in subject:
             continue
         tick = ticks.setdefault(stamp, {"at": _epoch(stamp), "versions": set(),
-                                        "invariants": [], "done": set(),
+                                        "invariants": [], "failing": set(), "done": set(),
                                         "passes": 0, "errors": 0})
         tokens = dict(TOKEN_RE.findall(" " + rest))
         if tokens.get("ver"):
             tick["versions"].add(tokens["ver"])
         if "invariants" in tokens:
             tick["invariants"].append(tokens["invariants"])
+            if tokens["invariants"].startswith("FAIL:"):
+                tick["failing"].update((subject, part) for part in
+                                       tokens["invariants"][5:].split(",") if part)
         if "/" in subject and FINAL_RE.match(rest):
             tick["done"].add(subject)
             if rest.startswith("rc="):
@@ -422,10 +425,18 @@ def _failures(tick: dict) -> set[str]:
     return failed
 
 
-def _clean(tick: dict) -> bool:
-    """Every token ok (off ignored), at least one ok, and no repository errored."""
+def _clean(tick: dict, excused: frozenset = frozenset()) -> bool:
+    """No repository errored, at least one token, every token ok (off ignored)
+    or a FAIL whose every (repository, invariant) pair is in `excused`: the
+    failures the baseline tick already had. Comparing per repository keeps a
+    standing failure in one repository from excusing the same invariant newly
+    failing in another."""
     tokens = [t for t in tick["invariants"] if t != "off"]
-    return bool(tokens) and all(t == "ok" for t in tokens) and not tick["errors"]
+    if not tokens or tick["errors"]:
+        return False
+    if not all(t == "ok" or t.startswith("FAIL:") for t in tokens):
+        return False  # an ERROR token: the tick could not read its own pass
+    return tick["failing"] <= excused
 
 
 def is_steward_host(home: Path, settings: dict) -> bool:
@@ -462,6 +473,7 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     baseline = [ticks[i] for i in range(len(ticks) - 1)
                 if ticks[i + 1]["at"] <= deployed_at]
     preexisting = _failures(baseline[-1]) if baseline else set()
+    excused = frozenset(baseline[-1]["failing"]) if baseline else frozenset()
     # The tick in flight at the swap is not a baseline for invariants (its later
     # repositories may have run the new binary), but if every repository in it
     # errored, the ones that ran before the swap errored too: the steward was
@@ -471,6 +483,7 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
         preexisting.add(STEWARD_ERROR)
     stamp = lambda t: _iso(t["at"])  # noqa: E731
     down = 0  # consecutive complete ticks after the swap where the steward could not run
+    judged = 0  # complete ticks that ran it but were inconclusive
     for i, tick in enumerate(ticks):
         if tick["at"] < deployed_at or not complete[i]:
             continue
@@ -491,6 +504,15 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
                                  f"invariants FAIL {','.join(sorted(failed))}"))
         if _clean(tick):
             return "ok", f"steward tick {stamp(tick)} on {version}: invariants=ok"
+        if _clean(tick, excused):
+            standing = ",".join(sorted(f"{repo}:{inv}" for repo, inv in tick["failing"]))
+            return "ok", (f"steward tick {stamp(tick)} on {version}: no new failure "
+                          f"(already failing before the swap: {standing})")
+        judged += ran_it
+    if judged:
+        return "pending", (f"{judged} complete steward ticks on {version} since "
+                           f"{_iso(deployed_at)}, none conclusive (see their invariants= "
+                           "tokens and ERROR lines)")
     return "pending", f"no conclusive complete steward tick on {version} since {_iso(deployed_at)}"
 
 
@@ -540,8 +562,9 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
         hours = (now - deployed_at) / 3600
         row["steward"] = detail
         if hours > STEWARD_WAIT_HOURS:
-            row["steward_problem"] = (f"{name} {version}: {detail} after {hours:.1f} h "
-                                      "(is the steward tick running?)")
+            row["steward_problem"] = (f"{name} {version}: {detail} after {hours:.1f} h"
+                                      + ("" if "none conclusive" in detail else
+                                         " (is the steward tick running?)"))
         return False
     if entry.get("by") != "auto_apply" or not entry.get("from"):
         append({"event": "tool_steward_failed", "tool": name, "at": _iso(now),
