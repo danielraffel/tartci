@@ -63,7 +63,10 @@ def setUpModule():
                        ("TARTCI_RECLAIM_BOOT_FLOOR_GB", "0"),
                        # Likewise the boot-usage sensor would measure the real
                        # home; test_boot_usage covers it hermetically.
-                       ("TARTCI_BOOT_USAGE", "0")):
+                       ("TARTCI_BOOT_USAGE", "0"),
+                       # Retention would plan against the real home's
+                       # generations; test_state_retention covers it.
+                       ("TARTCI_RECLAIM_RETENTION", "0")):
         _SAVED_ENV[key] = os.environ.get(key)
         os.environ[key] = value
 
@@ -183,6 +186,18 @@ class ScanDepthTests(unittest.TestCase):
             with redirect_stdout(buffer), redirect_stderr(io.StringIO()):
                 code = dr.main(["--roots", str(self.root), "--json", *argv])
         return code, json.loads(buffer.getvalue())
+
+    def test_every_pass_runs_state_retention_with_its_own_fix_flag(self):
+        # Nothing else scheduled state_retention.py: 111-202 generations a host.
+        for argv, fix in (((), False), (("--fix",), True)):
+            receipts = []
+            with unittest.mock.patch.object(dr.state_retention, "run",
+                                            return_value={"enabled": True, "probe": 1}) as run, \
+                    unittest.mock.patch.object(
+                        dr, "record_pass", side_effect=lambda a, r, c: receipts.append(r)):
+                self.run_json(*argv)
+            run.assert_called_once_with(fix=fix)
+            self.assertEqual(receipts[0]["state_retention"], {"enabled": True, "probe": 1})
 
     def test_default_maxdepth_is_five(self):
         with unittest.mock.patch.dict(os.environ, self.env_without_depth(),
