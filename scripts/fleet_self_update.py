@@ -2622,10 +2622,11 @@ def behind_seconds(skew: dict, soak_seconds: int, now: float, last_turn: float =
 
 def last_turn_at(state_dir: Path) -> float:
     """When this host last took an update turn: the newest apply receipt that
-    drained. A refusal after the announcement but before the drain (a snapshot
-    that does not verify) left the host serving, so it is not a turn.
-    0.0 when it never has."""
-    return max((_ts(value.get("started_at")) for _, value in _attempts(state_dir)
+    drained, as of when that turn ended (a turn can run for hours). A refusal
+    after the announcement but before the drain (a snapshot that does not
+    verify) left the host serving, so it is not a turn. 0.0 when it never has."""
+    return max((_ts(value.get("finished_at") or value.get("started_at"))
+                for _, value in _attempts(state_dir)
                 if value.get("mode") == "apply"
                 and any(step.get("step") == "drain" for step in value.get("steps") or ())),
                default=0.0)

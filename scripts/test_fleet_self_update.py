@@ -1094,12 +1094,14 @@ class QueueLightTests(Base):
         self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 600)
         self.assertSteppedAsideForQueue(self.apply())
 
-    def took_turn_at(self, started: float, status: str = "refused") -> None:
+    def took_turn_at(self, started: float, status: str = "refused",
+                     finished: float | None = None) -> None:
         """An earlier apply that drained for its turn, then ended `status`."""
         attempts = self.cfg.state_dir / "attempts"
         attempts.mkdir(parents=True, exist_ok=True)
         su._write_json(attempts / "19990101T000000Z-turn.json", {
             "mode": "apply", "target": T_OLD, "status": status, "started_at": su._iso(started),
+            "finished_at": su._iso(started + 60 if finished is None else finished),
             "steps": [{"step": "announce", "ok": True}, {"step": "drain", "ok": True}]})
 
     def test_a_turn_restarts_the_behind_main_clock(self) -> None:
@@ -1132,8 +1134,8 @@ class QueueLightTests(Base):
             "steps": [{"step": "announce", "ok": True},
                       {"step": "snapshot-verify", "ok": False}]})
         self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
-        self.took_turn_at(NOW - 900)
-        self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 900)
+        self.took_turn_at(NOW - 900, finished=NOW - 840)
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 840)
 
     def test_a_same_generation_refresh_keeps_queue_courtesy(self) -> None:
         # A fleet-source move reinstalls the running generation; it does not
@@ -1146,6 +1148,13 @@ class QueueLightTests(Base):
                                   return_value="fleet source moved to cccccccccccc"):
             self.assertSteppedAsideForQueue(self.apply())
         self.assertEqual(self.receipt()["target"], INSTALLED)
+
+    def test_a_long_turn_counts_from_when_it_ended(self) -> None:
+        # Began past the bound, ended ten minutes ago: still a recent turn.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 7200)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 3600, finished=NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
 
     def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
         self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
