@@ -117,8 +117,9 @@ SIGKILL_VECTOR = '"$KILLALL" -KILL tccd'
 # requires exactly these on code lines: a SIGTERM for either daemon, a missing
 # or extra kill, or a vector that only appears in a comment is not the fix.
 KILL_VECTORS = ('"$KILLALL" -KILL tccd', '"$KILLALL" -KILL sandboxd')
-SIGKILL_WRAPPER_LINES = ('output=$("$KILLALL" -KILL tccd 2>&1) || rc=$?\n'
-                         'sandboxd_output=$("$KILLALL" -KILL sandboxd 2>&1) || sandboxd_rc=$?\n')
+SIGKILL_WRAPPER_LINES = ('output=$(exec 9>&-; exec "$KILLALL" -KILL tccd 2>&1) || rc=$?\n'
+                         'sandboxd_output=$(exec 9>&-; exec "$KILLALL" -KILL sandboxd 2>&1)'
+                         ' || sandboxd_rc=$?\n')
 # A call runs to the end of its command substitution or line; its trailing
 # redirections (`2>&1`, `9>&-`) are then dropped whole.
 _KILL_CALL = re.compile(r'"\$KILLALL"[^)\n]*')

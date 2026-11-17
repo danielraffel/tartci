@@ -296,6 +296,13 @@ fi
 exit "${STUB_KILLALL_RC:-0}"
 EOF
 chmod +x "$heal_bin/killall"
+# lockf: the real one unless a test forces its exit status.
+cat >"$heal_bin/lockf" <<'EOF'
+#!/usr/bin/env bash
+[ -z "${STUB_LOCKF_RC:-}" ] || exit "$STUB_LOCKF_RC"
+exec /usr/bin/lockf "$@"
+EOF
+chmod +x "$heal_bin/lockf"
 # pgrep -x NAME: tccd always runs; sandboxd unless STUB_SANDBOXD_ABSENT=1.
 cat >"$heal_bin/pgrep" <<'EOF'
 #!/usr/bin/env bash
@@ -361,6 +368,23 @@ if [ "$(uname -s)" = Darwin ]; then
   has err "already in progress"
   kill -KILL "$holder"; wait "$holder" 2>/dev/null || true
   expect_rc 0 "heal: a SIGKILLed holder's lock is released" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  # A wrapper SIGKILLed while its killall hangs leaves no lock behind: neither
+  # the orphaned command substitution nor killall holds fd 9.
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  oblock="$tmp/orphan.block"; orelease="$tmp/orphan.release"; rm -f "$oblock" "$orelease"
+  env STUB_BLOCK_FILE="$oblock" STUB_RELEASE_FILE="$orelease" "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL" >/dev/null 2>&1 &
+  orphan_pid=$!
+  for _ in $(seq 1 100); do [ -e "$oblock" ] && break; sleep 0.02; done
+  [ -e "$oblock" ] || fail "heal: the orphan test's wrapper did not reach killall"
+  kill -KILL "$orphan_pid"; wait "$orphan_pid" 2>/dev/null || true
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
+  expect_rc 0 "heal: a hung child of a killed wrapper does not hold the lock" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_BLOCK_FILE="$oblock" STUB_RELEASE_FILE="$orelease" bash "$HEAL"
+  touch "$orelease"
+  # A lockf failure other than contention is a failure, not a benign "busy".
+  touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"; : >"$STUB_STATE/killall.log"
+  expect_rc 70 "heal: a lockf usage error is not reported as busy" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_LOCKF_RC=64 bash "$HEAL"
+  has err "lockf exited 64"
+  [ ! -s "$STUB_STATE/killall.log" ] || fail "heal: a failed lock must run nothing"
   # The kill vectors never inherit the lock: a killall that outlives the
   # wrapper must not keep the lock held.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
@@ -377,6 +401,7 @@ if [ "$(uname -s)" = Darwin ]; then
   for _ in $(seq 1 100); do [ -e "$block" ] && break; sleep 0.02; done
   [ -e "$block" ] || fail "heal: first concurrent caller did not reach killall"
   expect_rc 75 "heal: concurrent caller is rejected before signaling" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
+  has err "already in progress"
   touch "$release"
   wait "$first_pid" || { cat "$tmp/concurrent.out" "$tmp/concurrent.err" >&2; fail "heal: first concurrent caller failed"; }
   [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: concurrent caller reached killall"
