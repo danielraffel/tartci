@@ -1381,6 +1381,22 @@ def _unstable_interpreter(path: str) -> bool:
     return verdict.get("verdict") == "flag"
 
 
+def _interpreter_available(path: str) -> bool:
+    """Whether `path` is an executable file, without touching /Volumes.
+
+    Lexical and symlink-resolving checks run first (readlink only, never a
+    stat of the target), so a path on, or symlinked onto, a wedged external
+    volume is reported unavailable instead of hanging this process."""
+    try:
+        import tcc_risk_lint  # noqa: PLC0415 - sibling module
+        resolved, stopped = tcc_risk_lint.safe_realpath(path)
+        if stopped or tcc_risk_lint.on_volumes(path) or tcc_risk_lint.on_volumes(resolved):
+            return False
+        return os.access(path, os.X_OK)
+    except Exception:  # noqa: BLE001 - unknown reads as unavailable
+        return False
+
+
 def _framework_python(path: str | None) -> bool:
     root = os.environ.get("TARTCI_PYTHON_FRAMEWORK_ROOT") or "/Library/Frameworks/Python.framework"
     return bool(path) and str(path).startswith(root.rstrip("/") + "/Versions/")
@@ -1449,7 +1465,7 @@ def host_attestation_pass(home: str | None = None, run=_bounded_run,
         repin = (current, wanted)
     env = dict(os.environ)
     env.pop("TARTCI_ATTESTATION_PYTHON", None)
-    if current and not move and os.access(current, os.X_OK):
+    if current and not move and _interpreter_available(current):
         # Keep the interpreter the plist runs: an operator's choice, or the
         # unstable one when no framework python is available to move to. A
         # vanished one is left to the installer to choose, so it never refuses

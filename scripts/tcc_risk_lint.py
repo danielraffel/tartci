@@ -106,11 +106,16 @@ def safe_realpath(path: str, readlink: Callable[[str], str] = os.readlink) -> Tu
     return resolved or "/", False
 
 
-def venv_base(program: str, read_text: Callable[[str], str]) -> Optional[str]:
+def venv_base(program: str, read_text: Callable[[str], str],
+              readlink: Callable[[str], str] = os.readlink) -> Optional[str]:
     """The base interpreter of a venv's bin/python, from its pyvenv.cfg."""
     if on_volumes(program):
         return None
     cfg = os.path.join(os.path.dirname(os.path.dirname(program)), "pyvenv.cfg")
+    # pyvenv.cfg may itself be a symlink onto /Volumes: open() would follow it.
+    resolved, stopped = safe_realpath(cfg, readlink)
+    if stopped or on_volumes(resolved):
+        return None
     try:
         text = read_text(cfg)
     except OSError:
@@ -189,10 +194,28 @@ def _is_launcher(path: str) -> bool:
     return any(f"/{bundle}/Contents/MacOS/" in path for bundle in LAUNCHER_BUNDLES)
 
 
-def _which(name: str, path_value: str) -> Optional[str]:
-    # A PATH entry on /Volumes is never searched: that stat could hang.
-    safe = ":".join(p for p in path_value.split(":") if p and not on_volumes(p))
-    return shutil.which(name, path=safe)
+def _which(name: str, path_value: str,
+           readlink: Callable[[str], str] = os.readlink) -> Optional[str]:
+    """The program `name` names on `path_value`. Nothing on /Volumes, and no
+    symlink that resolves there, is ever stat'ed: such a hit is returned
+    unchecked so judge_binary flags it without touching the volume."""
+    if "/" in name:
+        # An absolute target is not searched for; guard it as is.
+        resolved, stopped = safe_realpath(name, readlink)
+        if name.startswith("/") and (stopped or on_volumes(name) or on_volumes(resolved)):
+            return name
+        return shutil.which(name, path="")
+    for entry in path_value.split(":"):
+        if not entry or on_volumes(entry):
+            continue
+        candidate = os.path.join(entry, name)
+        resolved, stopped = safe_realpath(candidate, readlink)
+        if stopped or on_volumes(resolved):
+            return candidate
+        found = shutil.which(name, path=entry)
+        if found:
+            return found
+    return None
 
 
 def judge_binary(program: str, cache: CodesignCache, *,
@@ -210,7 +233,7 @@ def judge_binary(program: str, cache: CodesignCache, *,
     if _is_launcher(resolved):
         return {"verdict": "launcher", "kind": "launcher", "reason": "a signed launcher bundle"}
     shown = program if resolved == program else f"{program} -> {resolved}"
-    base = venv_base(program, read_text)
+    base = venv_base(program, read_text, readlink)
     if base and depth < 2:
         verdict = judge_binary(base, cache, readlink=readlink, read_text=read_text,
                                read_head=read_head, path_value=path_value, depth=depth + 1)
@@ -228,7 +251,7 @@ def judge_binary(program: str, cache: CodesignCache, *,
         # A script's privacy identity is its interpreter's.
         target = interpreter[0]
         if os.path.basename(target) == "env" and len(interpreter) > 1:
-            found = _which(interpreter[1], path_value)
+            found = _which(interpreter[1], path_value, readlink)
             if not found:
                 return {"verdict": "ok", "kind": "unresolved",
                         "reason": f"{shown} runs `{interpreter[1]}`, not on the job's PATH"}

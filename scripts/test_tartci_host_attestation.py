@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -615,6 +616,29 @@ class WatchdogRedeployTests(unittest.TestCase):
         self.assertIn("redeployed", self.run_pass(pinned=None, unstable=lambda path: False))
         self.assertNotIn("TARTCI_ATTESTATION_PYTHON", self.envs[-1])
         # Control: an interpreter that exists is kept.
+        live = os.path.join(self.home, "live-python3")
+        with open(live, "w") as fh:
+            fh.write("#!/bin/sh\n")
+        os.chmod(live, 0o755)
+        self.plist(ProgramArguments=[live, f"{self.current}/tartci_host_attestation.py"])
+        self.run_pass(pinned=None, unstable=lambda path: False)
+        self.assertEqual(self.envs[-1].get("TARTCI_ATTESTATION_PYTHON"), live)
+
+    def test_an_external_volume_interpreter_is_never_probed_on_a_redeploy(self) -> None:
+        # No framework python to move to, so the watchdog decides whether to keep
+        # the current interpreter: os.access on /Volumes (or a link onto it) in
+        # this process would hang the watchdog on a wedged volume.
+        link = os.path.join(self.home, "linked-python3")
+        os.symlink("/Volumes/Example/bin/python3", link)
+        for current in ("/Volumes/Example/bin/python3", link):
+            self.plist(ProgramArguments=[current, f"{self.current}/tartci_host_attestation.py"])
+            self.installed(b"# an older writer\n")
+            with mock.patch.object(self.wd.os, "access",
+                                   side_effect=AssertionError("probed")) as access:
+                self.assertIn("redeployed", self.run_pass(pinned=None, unstable=lambda path: False))
+            access.assert_not_called()
+            self.assertNotIn("TARTCI_ATTESTATION_PYTHON", self.envs[-1])
+        # Control: an internal interpreter is probed and kept.
         live = os.path.join(self.home, "live-python3")
         with open(live, "w") as fh:
             fh.write("#!/bin/sh\n")

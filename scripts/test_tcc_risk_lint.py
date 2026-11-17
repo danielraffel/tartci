@@ -16,6 +16,7 @@ import plistlib
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -146,6 +147,64 @@ class FlagTests(LintTestCase):
         self.assertEqual(self.kinds(flagged, "com.example.link"), ["volumes"])
         self.assertFalse([p for p in fakes.readlinks if p.startswith("/Volumes")])
         self.assertEqual(fakes.codesigns, [])
+
+
+class ExternalVolumeProbeTests(unittest.TestCase):
+    """Nothing the lint reads or stats may sit on, or link onto, /Volumes."""
+
+    def judge(self, fakes, program):
+        cache = lint.CodesignCache(codesign=fakes.codesign, mtime=lambda p: 1.0)
+        calls: list[str] = []
+        real = lint.shutil.which
+
+        def spy(name, path=None, **kw):
+            calls.append(f"{name}@{path}")
+            return real(name, path=path, **kw)
+        with mock.patch.object(lint.shutil, "which", spy):
+            verdict = lint.judge_binary(program, cache, **fakes.kwargs())
+        return verdict, calls
+
+    def test_an_env_shebang_naming_a_volumes_program_is_flagged_unprobed(self) -> None:
+        fakes = Fakes(files={"/Users/example/run.sh": "#!/usr/bin/env /Volumes/Example/bin/python3\n"})
+        verdict, calls = self.judge(fakes, "/Users/example/run.sh")
+        self.assertEqual(verdict["kind"], "volumes")
+        self.assertFalse([c for c in calls if "/Volumes" in c], calls)
+        self.assertFalse([p for p in fakes.reads + fakes.codesigns if p.startswith("/Volumes")])
+        # Control: an internal absolute env target is still looked up normally.
+        fakes = Fakes(files={"/Users/example/run.sh": "#!/usr/bin/env /usr/bin/python3\n"})
+        verdict, _ = self.judge(fakes, "/Users/example/run.sh")
+        self.assertNotEqual(verdict.get("kind"), "volumes")
+
+    def test_a_path_candidate_symlinked_onto_volumes_is_flagged_unprobed(self) -> None:
+        fakes = Fakes(links={"/Users/example/bin/python3": "/Volumes/Example/bin/python3"},
+                      files={"/Users/example/run.sh": "#!/usr/bin/env python3\n"})
+        cache = lint.CodesignCache(codesign=fakes.codesign, mtime=lambda p: 1.0)
+        calls: list[str] = []
+        with mock.patch.object(lint.shutil, "which", lambda *a, **k: calls.append(str(k)) or None):
+            verdict = lint.judge_binary("/Users/example/run.sh", cache,
+                                        path_value="/Users/example/bin:/usr/bin", **fakes.kwargs())
+        self.assertEqual(verdict["kind"], "volumes")
+        self.assertEqual(calls, [])
+        # Control: the same PATH without the link falls through to a normal search.
+        fakes = Fakes(files={"/Users/example/run.sh": "#!/usr/bin/env python3\n"})
+        cache = lint.CodesignCache(codesign=fakes.codesign, mtime=lambda p: 1.0)
+        calls.clear()
+        with mock.patch.object(lint.shutil, "which", lambda *a, **k: calls.append(str(k)) or None):
+            lint.judge_binary("/Users/example/run.sh", cache,
+                              path_value="/Users/example/bin:/usr/bin", **fakes.kwargs())
+        self.assertEqual(len(calls), 2)
+
+    def test_a_pyvenv_cfg_symlinked_onto_volumes_is_never_opened(self) -> None:
+        fakes = Fakes(links={"/Users/example/venv/pyvenv.cfg": "/Volumes/Example/pyvenv.cfg"},
+                      files={"/Users/example/venv/pyvenv.cfg": "home = /usr/bin\n"})
+        self.assertIsNone(lint.venv_base("/Users/example/venv/bin/python", fakes.read_text,
+                                         fakes.readlink))
+        self.assertEqual(fakes.reads, [])
+        # Control: an ordinary internal pyvenv.cfg is read.
+        fakes = Fakes(files={"/Users/example/venv/pyvenv.cfg": "home = /usr/bin\n"})
+        self.assertEqual(lint.venv_base("/Users/example/venv/bin/python", fakes.read_text,
+                                        fakes.readlink), "/usr/bin/python")
+        self.assertEqual(fakes.reads, ["/Users/example/venv/pyvenv.cfg"])
 
 
 class PassTests(LintTestCase):
