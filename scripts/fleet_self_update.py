@@ -3581,9 +3581,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   reinstall: bool = False) -> int:
     now = sys_.now()
     prune_refusals(cfg.state_dir, now)
+    # The last measured skew, for the behind-main alert on the paths that
+    # return before measuring it (blocked, interrupted, checkout refused).
+    last_skew = _read_json(cfg.state_dir / "skew.json") or {}
+
+    def early_alert() -> None:
+        if apply:
+            behind_alert(cfg, last_skew, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
     if blocked:
         print(f"self-update: REFUSED: {blocked}")
+        early_alert()
         return EXIT_REFUSED
     if interrupted:
         if not apply:
@@ -3591,6 +3599,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                   + ", ".join(p.name for p in interrupted))
         else:
             recover_interrupted(cfg, sys_, interrupted)
+            early_alert()
             return EXIT_FAILED
     if apply:
         recover_left_off(cfg, sys_)
@@ -3608,6 +3617,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             receipt.finish("refused", reason)
         else:
             print(f"self-update: REFUSED {reason}")
+        early_alert()
         return EXIT_REFUSED
     try:
         installed, source = installed_commit(cfg)
@@ -3627,6 +3637,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         print(f"self-update: UNKNOWN: {exc}")
         _write_json(cfg.state_dir / "skew.json", {"state": "unknown", "reason": str(exc),
                                                   "measured_at": _iso(now)})
+        early_alert()
         return EXIT_UNKNOWN
     try:
         skew = measure_skew(cfg, sys_, installed, now, target_ref, explicit=explicit)
@@ -3644,6 +3655,7 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         receipt.step("refused", reason, ok=False)
         receipt.finish("refused", reason)
         print(f"self-update: REFUSED {reason}")
+        early_alert()
         return EXIT_REFUSED
     _write_json(cfg.state_dir / "skew.json", skew)
     print(f"self-update: installed {installed[:12]} ({source})")

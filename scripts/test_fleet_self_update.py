@@ -1035,6 +1035,16 @@ class BehindMainAlertTests(Base):
         su.behind_alert(self.cfg, self.skew(bound - 3600 + (later - NOW)), later)
         self.assertEqual(2, len(self.opened()))
 
+    def test_a_refusal_before_measuring_uses_the_last_skew(self) -> None:
+        # A checkout that will not refresh returns before measure_skew; the
+        # last measured skew still says how far behind the host is.
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual(1, len(self.opened()), self.issues)
+
     def test_an_unknown_skew_says_nothing(self) -> None:
         su.behind_alert(self.cfg, {"state": "unknown", "oldest_undeployed": None}, NOW)
         self.assertEqual([], self.issues)
