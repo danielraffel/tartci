@@ -62,7 +62,10 @@ fi
 [[ $EUID -eq 0 ]] || { echo "run with sudo: sudo $0 $1" >&2; exit 77; }
 
 if [[ $mode == rollback ]]; then
-  rm -f "$SUDOERS_DST" "$WRAPPER_DST" "$NEWSYSLOG_DST" /var/db/tartci-heal-tcc/last-heal
+  rm -f "$SUDOERS_DST" "$WRAPPER_DST" "$NEWSYSLOG_DST" /var/db/tartci-heal-tcc/last-heal \
+    /var/db/tartci-heal-tcc/heal.flock
+  # An earlier wrapper's mkdir lock, if one was ever left behind.
+  rmdir /var/db/tartci-heal-tcc/heal.lock 2>/dev/null || true
   rmdir /var/db/tartci-heal-tcc 2>/dev/null || true
   visudo -c >/dev/null || { echo "WARNING: sudoers failed validation after rollback; inspect /etc/sudoers.d" >&2; exit 1; }
   echo "removed $WRAPPER_DST, $SUDOERS_DST and $NEWSYSLOG_DST (the log $LOG is kept)"

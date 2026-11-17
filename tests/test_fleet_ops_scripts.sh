@@ -392,6 +392,9 @@ has out "nothing changed"
 expect_rc 77 "heal installer: apply refuses without root" -- env -u SUDO_USER bash "$HEAL_INSTALL" --apply
 has err "run with sudo"
 expect_rc 64 "heal installer: unknown flag" -- bash "$HEAL_INSTALL" --bogus
+# Rollback removes every file the wrapper leaves in its state directory, so
+# the directory itself can go.
+grep -q '/var/db/tartci-heal-tcc/heal.flock' "$HEAL_INSTALL" || fail "heal installer: rollback leaves heal.flock"
 
 # The chain check's mode predicate (stat prints octal; bash must read base 8).
 # Owner is root only in real use, so only the mode is tested here.
