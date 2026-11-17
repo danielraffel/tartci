@@ -36,24 +36,32 @@ def lane_logs(state_root: Path) -> dict[str, Path]:
             for child in sorted(fleet.iterdir()) if (child / "events.jsonl").is_file()}
 
 
+def _count(lane: str, path: Path, since: dt.date | None,
+           counts: dict[tuple[str, str], dict[str, int]]) -> None:
+    with path.open(encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            if DENIED not in line and RETARGET not in line and KEPT not in line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            day = str(record.get("ts", ""))[:10]
+            if not day or (since and day < since.isoformat()):
+                continue
+            if record.get("event") == DENIED:
+                counts[(lane, day)]["denied"] += 1
+            elif record.get("event") in (RETARGET, KEPT):
+                counts[(lane, day)]["retargets"] += 1
+
+
 def outcomes(logs: dict[str, Path], since: dt.date | None = None) -> list[dict[str, Any]]:
     counts: dict[tuple[str, str], dict[str, int]] = defaultdict(lambda: {"denied": 0, "retargets": 0})
-    for lane, path in logs.items():
-        with path.open(encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                if DENIED not in line and RETARGET not in line and KEPT not in line:
-                    continue
-                try:
-                    record = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                day = str(record.get("ts", ""))[:10]
-                if not day or (since and day < since.isoformat()):
-                    continue
-                if record.get("event") == DENIED:
-                    counts[(lane, day)]["denied"] += 1
-                elif record.get("event") in (RETARGET, KEPT):
-                    counts[(lane, day)]["retargets"] += 1
+    for lane, current in logs.items():
+        # The lane renames a full log to events.jsonl.1 (runner.sh); read both.
+        for path in (current.with_name(current.name + ".1"), current):
+            if path.is_file():
+                _count(lane, path, since, counts)
     rows = []
     for (lane, day), value in sorted(counts.items(), key=lambda item: (item[0][1], item[0][0])):
         retargets = min(value["retargets"], value["denied"])

@@ -405,6 +405,11 @@ PRE_CLONE_DEMAND_GONE=0
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
 STORAGE_HEALTH_STATE="unknown"
+# The lane's events.jsonl is renamed to events.jsonl.1 (replacing the previous
+# one) once it reaches this size; nothing bounded it before (19-48 MB per lane
+# after 49 days). Readers that need older rows read events.jsonl.1 first.
+EVENT_LOG_MAX_BYTES=$((16 * 1024 * 1024))
+
 # A healthy store probe is written to the event log when the state changes and
 # then at most once per STORAGE_HEALTH_OK_EVENT_SECS. The probe runs on every
 # idle poll (about 3,700 times a day per lane), the heartbeat already carries
@@ -1190,6 +1195,20 @@ tartci_lane_claim(){
   fi
   printf '%s\n' "$me" >"$claim" 2>/dev/null || true
   rm -f "$handoff" 2>/dev/null || true
+}
+
+# Rotate the event log between jobs only. Mid-job, the watchdog's mid-job
+# guard (open_job_assignment) must still find the job_assigned row; at the
+# loop top with no VM the last job is closed. A failed rename is retried on
+# the next pass and never stops the lane.
+tartci_event_log_rotate(){
+  local size
+  size="$(wc -c <"$EVENT_LOG" 2>/dev/null | tr -d ' ')"
+  case "$size" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$size" -ge "$EVENT_LOG_MAX_BYTES" ] || return 0
+  mv -f "$EVENT_LOG" "$EVENT_LOG.1" 2>/dev/null || return 0
+  event event_log_rotated "events.jsonl reached $size bytes; the previous rows are in events.jsonl.1" \
+    "bytes=$size"
 }
 
 # The lane's claim names another live supervisor: this one is not the lane's.
@@ -3650,6 +3669,7 @@ if [ "$LOOP" = 1 ]; then
         note "stepping aside ($step_aside) so the lane has one supervisor"
         exit 0
       fi
+      tartci_event_log_rotate
     fi
     # Prove the Tart store is usable before reconciling a parked warm VM. Warm
     # expiry/teardown can mutate the store, so it must not run while the

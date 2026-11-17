@@ -166,6 +166,11 @@ def read_events_since(path: Path, since: float, chunk: int = 1 << 16) -> List[di
 def read_event_paths(paths: Iterable[Path], since: float) -> List[dict]:
     rows: List[dict] = []
     for path in paths:
+        # The lane renames a full log to events.jsonl.1 (runner.sh); a window
+        # reaching past the rename reads it too.
+        previous = path.with_name(path.name + ".1")
+        if previous.is_file():
+            rows.extend(read_events_since(previous, since))
         rows.extend(read_events_since(path, since))
     return sorted(rows, key=lambda row: _time(row) or 0)
 

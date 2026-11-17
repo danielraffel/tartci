@@ -879,8 +879,14 @@ def alert_due(value: dict[str, Any], now: float,
 
 def lane_logs(root: pathlib.Path) -> list[pathlib.Path]:
     """Every lane's events.jsonl under root, at any depth: m5studio keeps its
-    lanes at state/macos-fleet/<lane>/, and a one-level search reads none."""
-    return sorted(root.glob("**/events.jsonl"))
+    lanes at state/macos-fleet/<lane>/, and a one-level search reads none.
+    A lane's previous file (events.jsonl.1, renamed by runner.sh once full)
+    comes first, so its rows are read in order."""
+    logs = []
+    for current in sorted(root.glob("**/events.jsonl")):
+        previous = current.with_name(current.name + ".1")
+        logs.extend(p for p in (previous, current) if p.is_file())
+    return logs
 
 
 def _quantiles(values: list[float]) -> dict[str, Any]:
