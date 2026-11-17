@@ -1775,17 +1775,17 @@ def tcc_prompt_pass(reading: dict[str, Any] | None, store_state: dict[str, Any] 
                 f"({type(exc).__name__}: {exc}); a waiting consent alert would not be paged")
 
 
-def tcc_stuck_recovery_pass(store_state: dict[str, Any], *, dry_run: bool,
-                            **kwargs) -> str | None:
-    """During a TCC wedge, restart this user's launchd jobs held in open() on
-    /Volumes and page when one stays stuck (scripts/tcc_stuck_recovery.py).
-    TARTCI_TCC_STUCK_RECOVERY=0 turns it off. Never raises."""
+def tcc_stuck_jobs_pass(store_state: dict[str, Any], *, dry_run: bool,
+                        **kwargs) -> str | None:
+    """During a TCC wedge, page once per episode the launchd jobs held in
+    open() on /Volumes, with the command that clears them
+    (scripts/tcc_stuck_jobs.py). Report only. Never raises."""
     try:
-        import tcc_stuck_recovery  # noqa: PLC0415 - sibling module
-        lines = tcc_stuck_recovery.recovery_pass(store_state, dry_run=dry_run, **kwargs)
+        import tcc_stuck_jobs  # noqa: PLC0415 - sibling module
+        lines = tcc_stuck_jobs.report_pass(store_state, dry_run=dry_run, **kwargs)
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
-        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-stuck-recovery FAILED "
-                f"({type(exc).__name__}: {exc}); jobs stuck on the store were not restarted")
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-wedge stuck-job check FAILED "
+                f"({type(exc).__name__}: {exc}); jobs stuck on the store would not be paged")
     return "\n".join(lines) or None
 
 
@@ -2307,10 +2307,10 @@ def main(argv: list[str] | None = None) -> int:
         prompt_line = tcc_prompt_pass(consent_alert, store_health_result)
         if prompt_line:
             print(prompt_line)
-    # Then release the jobs the wedge left blocked in open(): they stay blocked
+    # Then name the jobs the wedge left blocked in open(): they stay blocked
     # after the alert goes away, and a run that never ends never starts again.
-    stuck_line = tcc_stuck_recovery_pass(store_health_result,
-                                         dry_run=args.status or args.dry_run)
+    stuck_line = tcc_stuck_jobs_pass(store_health_result,
+                                     dry_run=args.status or args.dry_run)
     if stuck_line and not args.json:
         print(stuck_line)
     # Compute the VM-running guard ONCE per pass, but only after storage health

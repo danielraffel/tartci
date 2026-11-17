@@ -1,37 +1,29 @@
 #!/usr/bin/env python3
-"""Restart user launchd jobs left blocked on the store by a TCC wedge.
+"""Page, once per episode, the launchd jobs a TCC wedge left blocked on the store.
 
 While a privacy consent alert waits, or tccd is wedged, every launchd open()
 of an external volume without a stored grant blocks, and the blocked jobs stay
 blocked after the cause clears (m3, 2026-11-16: com.pulp.fleet.prewall in
 open() from 22:18Z, three fleet-pass must-review.py children from about
-22:16Z). Restarting tccd and sandboxd does not release them; a run that never
-ends also never starts again, so a periodic job is silently gone.
+22:16Z). Restarting tccd and sandboxd does not release them, and a periodic
+job whose run never ends never starts again.
 
 When the watchdog's store-health reading names a wedge (``tcc_attribution_wedge``
 or ``tcc_prompt_pending``, or a store probe that timed out past the failure
-threshold), each pass:
+threshold), each pass finds this user's loaded launchd jobs whose process has
+run longer than max(3 x StartInterval, STUCK_FLOOR_S) and whose process tree
+(the job and its descendants, from one ``ps`` read) has a command argument or
+cwd (``lsof -b -w -d cwd``, which never stats the path) under /Volumes.
 
-  1. finds this user's loaded launchd jobs (``launchctl list``) whose process
-     has run longer than about 3x its StartInterval, and never less than
-     STUCK_FLOOR_S, and whose process tree (the job and its descendants, from
-     one ``ps`` read) has a command argument or cwd (``lsof -b -w -d cwd``,
-     which never stats the path) under /Volumes;
-  2. ``launchctl kickstart -k gui/<uid>/<label>`` each, once per episode per
-     label;
-  3. after SETTLE_S, ``kill -KILL`` the job's own pid if it is still the same
-     process (same start time, same uid);
-  4. logs every action and outcome, and when a job or a /Volumes descendant
-     still survives, logs ``WARN tcc-wedge needs reboot`` and pages through
-     the host incident path (a GitHub issue with the tartci-incident marker).
-
-It never touches another user's or root's process, never runs sudo, and
-leaves alone the runner lanes (``.tart-runner``, ``.qemu-runner``,
-``actions.runner.``: the drain path owns them), the watchdog itself, and
-KeepAlive services with no StartInterval, which always look long-running.
-
-Rollback: ``TARTCI_TCC_STUCK_RECOVERY=0`` in the watchdog's environment turns it
-off (the pass then logs what it would have done). Default on.
+It reports only. Each stuck job is a ``WARN tcc-wedge stuck`` line, a newly
+seen one is an event, and the episode raises one page (a GitHub issue with
+the tartci-incident marker, class ``tcc_wedge_stuck_jobs``) naming the
+labels, the pids and the one command that clears them. The page closes when
+the store recovers. It never restarts or signals anything: a fleet-pass run
+can be legitimately busy for 40 minutes, and the root fixes (stable
+interpreters, scripts off /Volumes; scripts/tcc_risk_lint.py) are what keep
+wedges from forming. Runner lanes, ``actions.runner.*``, the watchdog itself
+and KeepAlive services without a StartInterval are never reported.
 """
 
 from __future__ import annotations
@@ -39,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import plistlib
-import signal
 import sys
 import time
 from pathlib import Path
@@ -50,14 +41,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host_off  # noqa: E402 - sibling module
 import tartci_incident  # noqa: E402 - sibling module
 
-ENV_SWITCH = "TARTCI_TCC_STUCK_RECOVERY"
-CLASS = "tcc_wedge_needs_reboot"
-TITLE = "[tartci] {host}: jobs stay stuck on the store after a TCC wedge; reboot needed"
+CLASS = "tcc_wedge_stuck_jobs"
+TITLE = "[tartci] {host}: launchd jobs stuck on the store during a TCC wedge"
 WEDGE_KINDS = frozenset({"tcc_attribution_wedge", "tcc_prompt_pending"})
 STUCK_FLOOR_S = 30 * 60
 INTERVAL_FACTOR = 3
-SETTLE_S = 10.0
-KILL_SETTLE_S = 2.0
 COMMAND_TIMEOUT_S = 15.0
 EXCLUDED_MARKERS = (".tart-runner", ".qemu-runner")
 EXCLUDED_PREFIXES = ("actions.runner.",)
@@ -271,26 +259,36 @@ def find_stuck(specs: Dict[str, Dict[str, Any]], pids: Dict[str, int],
     return out, notes
 
 
-def same_process(pid: int, lstart: str, uid: int, rows: Optional[Dict[int, Dict[str, Any]]]) -> bool:
-    if rows is None:
-        return True  # cannot tell: assume it survived, so a reboot is named
-    row = rows.get(pid)
-    return bool(row and row["lstart"] == lstart and row["uid"] == uid)
+def clear_command(stuck: List[Dict[str, Any]], uid: int) -> str:
+    """One line that restarts each stuck job and kills what launchd leaves."""
+    steps = []
+    for item in stuck:
+        steps.append(f"launchctl kickstart -k gui/{uid}/{item['label']}")
+        pids = sorted({item["pid"], *(e["pid"] for e in item["evidence"])})
+        steps.append("kill -KILL " + " ".join(map(str, pids)) + " 2>/dev/null")
+    return "; ".join(steps)
 
 
-def render(host: str, stuck: List[Dict[str, Any]], episode: str, detected: str) -> Tuple[str, str]:
-    rows = [f"- `{item['label']}`: " + ", ".join(
-        f"pid {e['pid']} ({e['why']})" for e in item["survivors"]) for item in stuck]
+def render(host: str, stuck: List[Dict[str, Any]], episode: str, detected: str,
+           uid: int) -> Tuple[str, str]:
+    rows = [f"- `{item['label']}`: pid {item['pid']}, up {item['etime']}s (limit "
+            f"{item['limit']}s); " + ", ".join(f"pid {e['pid']} ({e['why']})"
+                                              for e in item["evidence"]) for item in stuck]
     body = "\n".join([
         "## What happened",
-        f"During a TCC wedge on `{host}` (store failing since {episode}), the watchdog "
-        "kickstarted launchd jobs held in open() on /Volumes and sent SIGKILL to the job's own "
-        "pid. These processes survived:", "", *rows, "",
-        "## Fix", "Drain the host, let running jobs finish, and reboot it.", "",
+        f"During a TCC wedge on `{host}` (store failing since {episode}), these launchd jobs "
+        "have run past their limit with work on /Volumes. A job blocked in open() stays "
+        "blocked after the alert clears, and a periodic job then never runs again.", "",
+        "## Evidence", *rows, "",
+        "## Fix",
+        "Once the consent alert is answered (or tccd is healthy), run at the host:",
+        "```sh", clear_command(stuck, uid), "```",
+        "If a process survives `kill -KILL`, drain the host and reboot it.", "",
         "## Safe to auto-apply",
-        "No. A reboot is the owner's call; the watchdog never runs sudo.", "",
+        "No. A long run may be legitimately busy; the watchdog reports only.", "",
         "## How to verify",
-        "After the reboot the store probe is healthy; this issue then closes itself.",
+        "`launchctl list` shows new pids for the labels above and the store probe is healthy; "
+        "this issue closes itself when the store recovers.",
     ])
     marker = tartci_incident.marker(host, CLASS, episode, detected)
     return TITLE.format(host=host), tartci_incident.with_marker(body, marker)
@@ -319,130 +317,63 @@ def _host() -> str:
     return vm_boot_alert._alert_host()[0]
 
 
-def recovery_pass(store_state: Dict[str, Any], *, now: Optional[float] = None,
-                  dry_run: bool = False, enabled: Optional[bool] = None,
-                  home: Optional[str] = None, state_dir: Optional[Path] = None,
-                  uid: Optional[int] = None, run: Runner = _run,
-                  kill: Callable[[int, int], None] = os.kill,
-                  sleep: Callable[[float], None] = time.sleep,
-                  host: Optional[str] = None, issue: Optional[Callable[..., Any]] = None,
-                  close: Optional[Callable[..., Any]] = None) -> List[str]:
-    """One pass. Returns the lines to log. Never raises on a probe failure."""
+def report_pass(store_state: Dict[str, Any], *, now: Optional[float] = None,
+                dry_run: bool = False, home: Optional[str] = None,
+                state_dir: Optional[Path] = None, uid: Optional[int] = None,
+                run: Runner = _run, host: Optional[str] = None,
+                issue: Optional[Callable[..., Any]] = None,
+                close: Optional[Callable[..., Any]] = None) -> List[str]:
+    """One pass. Returns the lines to log. Changes no process, ever."""
     now = time.time() if now is None else now
     home = home or os.path.expanduser("~")
     uid = os.getuid() if uid is None else uid
-    enabled = (os.environ.get(ENV_SWITCH, "1") != "0") if enabled is None else enabled
     sdir = state_dir or Path(os.environ.get("TARTCI_HOME") or os.path.join(home, ".tartci")) / "state"
-    state_path = sdir / "tcc-stuck-recovery.json"
-    alert_path = sdir / "tcc-wedge-reboot-alert.json"
+    state_path = sdir / "tcc-stuck-jobs.json"
+    alert_path = sdir / "tcc-stuck-jobs-alert.json"
     stamp = _iso(now)
-    prefix = f"{stamp} launchd-watchdog: tcc-stuck-recovery:"
     active, episode = wedge(store_state)
-    host_name = host or ""
 
     def page(stuck: List[Dict[str, Any]]) -> Dict[str, Any]:
-        name = host_name or _host()
+        name = host or _host()
         return host_off.episode_alert(
             alert_path, active=bool(stuck), resolved=not active, since=episode or None,
-            raise_event=lambda: host_off.event(sdir, CLASS, "; ".join(s["label"] for s in stuck),
-                                               {"labels": [s["label"] for s in stuck]}, now),
-            render=lambda: render(name, stuck, episode, stamp), issue=issue, close=close)
+            raise_event=lambda: None,
+            render=lambda: render(name, stuck, episode, stamp, uid), issue=issue, close=close)
 
     if not active:
         if not dry_run:
-            if state_path.exists():
-                state_path.unlink(missing_ok=True)
+            state_path.unlink(missing_ok=True)
             if alert_path.exists():
                 page([])
         return []
-    if uid == 0:
-        return [f"{prefix} refused: running as root; only a user's own jobs are restarted"]
-    state = _load(state_path)
-    if state.get("episode") != episode:
-        state = {"episode": episode, "kicked": {}}
-    kicked: Dict[str, Any] = state.setdefault("kicked", {})
     specs = job_specs(Path(home) / "Library" / "LaunchAgents")
     pids = launchd_pids(run)
     rows = ps_snapshot(run)
     if pids is None or rows is None:
-        return [f"{prefix} WARN could not read launchctl list or ps; no job was restarted"]
-    candidates, _notes = find_stuck(specs, pids, rows, uid, run)
-    lines: List[str] = []
-    todo = []
-    for item in candidates:
-        evidence = item["evidence"][0]
-        what = (f"{item['label']} (pid {item['pid']}, up {item['etime']}s > {item['limit']}s; "
-                f"pid {evidence['pid']} {evidence['why']})")
-        if item["label"] in kicked:
-            continue
-        if not enabled:
-            lines.append(f"{prefix} would kickstart {what} ({ENV_SWITCH}=0: report only)")
-            continue
-        if dry_run:
-            lines.append(f"{prefix} would kickstart {what} (dry run)")
-            continue
-        todo.append((item, what))
-    if not todo:
-        if not dry_run and enabled:
-            _save(state_path, state)
+        return [f"{stamp} launchd-watchdog: WARN tcc-wedge stuck-job check could not read "
+                "launchctl list or ps"]
+    stuck, _notes = find_stuck(specs, pids, rows, uid, run)
+    lines = [f"{stamp} launchd-watchdog: WARN tcc-wedge stuck {item['label']}: pid {item['pid']} "
+             f"up {item['etime']}s > {item['limit']}s; pid {item['evidence'][0]['pid']} "
+             f"{item['evidence'][0]['why']}" for item in stuck]
+    if dry_run or not stuck:
         return lines
-    for item, what in todo:
-        target = f"gui/{uid}/{item['label']}"
-        try:
-            proc = run(["/bin/launchctl", "kickstart", "-k", target])
-            ok, detail = proc.returncode == 0, (proc.stderr or proc.stdout or "").strip()[:200]
-        except Exception as exc:  # noqa: BLE001 - recorded, then the kill decides
-            ok, detail = False, str(exc)[:200]
-        kicked[item["label"]] = {"at": stamp, "pid": item["pid"], "lstart": item["lstart"],
-                                 "kickstart": "ok" if ok else f"failed: {detail}"}
-        host_off.event(sdir, "tcc_stuck_kickstart", what,
-                       {"label": item["label"], "pid": item["pid"], "ok": ok}, now)
-        lines.append(f"{prefix} kickstarted {what}" + ("" if ok else f" FAILED ({detail})"))
+    state = _load(state_path)
+    if state.get("episode") != episode:
+        state = {"episode": episode, "seen": []}
+    seen = set(state.get("seen") or [])
+    for item in stuck:
+        if item["label"] not in seen:
+            host_off.event(sdir, CLASS, f"{item['label']}: pid {item['pid']}",
+                           {"label": item["label"], "pid": item["pid"]}, now)
+            seen.add(item["label"])
+    state["seen"] = sorted(seen)
     _save(state_path, state)
-    sleep(SETTLE_S)
-    after = ps_snapshot(run)
-    killed = []
-    for item, _what in todo:
-        if after is None:
-            # Without a fresh snapshot the pid may already be someone else's:
-            # never signal it. Name it as stuck so a person looks.
-            kicked[item["label"]]["outcome"] = "unverified"
-            lines.append(f"{prefix} {item['label']}: WARN ps unreadable after the kickstart; "
-                         f"pid {item['pid']} not signalled")
-            continue
-        if not same_process(item["pid"], item["lstart"], uid, after):
-            kicked[item["label"]]["outcome"] = "restarted"
-            lines.append(f"{prefix} {item['label']}: pid {item['pid']} exited after the kickstart")
-            continue
-        try:
-            kill(item["pid"], signal.SIGKILL)
-            kicked[item["label"]]["outcome"] = "killed"
-            killed.append(item)
-            lines.append(f"{prefix} {item['label']}: pid {item['pid']} survived the kickstart; sent SIGKILL")
-        except ProcessLookupError:
-            kicked[item["label"]]["outcome"] = "restarted"
-        except OSError as exc:
-            kicked[item["label"]]["outcome"] = f"kill failed: {exc}"
-            lines.append(f"{prefix} {item['label']}: kill -KILL {item['pid']} FAILED ({exc})")
-    if killed:
-        sleep(KILL_SETTLE_S)
-        after = ps_snapshot(run)
-    stuck = []
-    for item, _what in todo:
-        survivors = [e for e in item["evidence"]
-                     if same_process(e["pid"], e["lstart"], uid, after)]
-        if survivors:
-            kicked[item["label"]]["outcome"] = "stuck"
-            stuck.append(dict(item, survivors=survivors))
-    _save(state_path, state)
-    if stuck:
-        names = ", ".join(f"{s['label']} (pid " + ",".join(str(e["pid"]) for e in s["survivors"]) + ")"
-                          for s in stuck)
-        out = page(stuck)
-        lines.append(f"{stamp} launchd-watchdog: WARN tcc-wedge needs reboot: still stuck on "
-                     f"/Volumes after kickstart and SIGKILL: {names}"
-                     + (f" (issue #{out.get('issue')})" if out.get("issue")
-                        else f" (issue not opened: {out.get('issue_error') or 'pending'})"))
+    out = page(stuck)
+    lines.append(f"{stamp} launchd-watchdog: tcc-wedge stuck jobs paged"
+                 + (f" (issue #{out.get('issue')})" if out.get("issue")
+                    else f" (issue not opened: {out.get('issue_error') or 'pending'})")
+                 + f"; clear with: {clear_command(stuck, uid)}")
     return lines
 
 
@@ -451,9 +382,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     import tcc_wedge  # noqa: PLC0415
 
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--dry-run", action="store_true", help="say what would be restarted")
-    args = parser.parse_args(argv)
-    for line in recovery_pass(tcc_wedge.read_state(), dry_run=args.dry_run):
+    parser.parse_args(argv)
+    for line in report_pass(tcc_wedge.read_state(), dry_run=True):
         print(line)
     return 0
 
