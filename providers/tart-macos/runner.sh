@@ -405,6 +405,13 @@ PRE_CLONE_DEMAND_GONE=0
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
 STORAGE_HEALTH_STATE="unknown"
+# A healthy store probe is written to the event log when the state changes and
+# then at most once per STORAGE_HEALTH_OK_EVENT_SECS. The probe runs on every
+# idle poll (about 3,700 times a day per lane), the heartbeat already carries
+# the current verdict, and nothing reads the repeated rows: they were 20-90% of
+# every idle lane's events.jsonl. Failures are still written on every probe.
+STORAGE_HEALTH_OK_EVENT_SECS=3600
+STORAGE_HEALTH_OK_EVENT_AT=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -1210,9 +1217,15 @@ tartci_storage_health_check(){
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
   if [ "$rc" -eq 0 ]; then
+    local now
+    now="$(date +%s)"
+    if [ "$STORAGE_HEALTH_STATE" != ok ] \
+        || [ $((now - STORAGE_HEALTH_OK_EVENT_AT)) -ge "$STORAGE_HEALTH_OK_EVENT_SECS" ]; then
+      event storage_health "Tart store probe succeeded" \
+        "state=ok" "path=$path"
+      STORAGE_HEALTH_OK_EVENT_AT="$now"
+    fi
     STORAGE_HEALTH_STATE=ok
-    event storage_health "Tart store probe succeeded" \
-      "state=ok" "path=$path"
     return 0
   fi
   reason="$(printf '%s\n' "$result" | tail -1)"
@@ -1435,6 +1448,36 @@ select_work(){
     tier=$((tier + 1))
   done <<< "$TIER_LABELS_CONFIG"
   printf '0|%s|%s\n' "$LABELS" "$tier"
+}
+
+# refresh_after_serve <served> <labels>: prints 1 when the lane's next
+# selection must bypass the scan caches, else 0. A merge-group run can queue a
+# dependent job the moment the job this lane served ends (Vellum's
+# sterile-consumer waits on its GPU proof and is created seconds before the VM
+# tears down). The shared discovery snapshot is up to TARTCI_QUEUE_DISCOVERY_TTL_SECS
+# (160 s) old, so the freed lane's first scan does not see that job, finds
+# PR-class work instead and boots it: on 2026-11-15..17, 16 of 42 Vellum
+# merge-group sterile jobs waited behind a ~35 min PR proof that way. Only a
+# served job of a class whose label ends in -merge-group triggers it, and it
+# costs one uncached scan per such job.
+refresh_after_serve(){
+  if [ "${1:-0}" = 1 ]; then
+    case ",${2:-}," in *-merge-group,*) printf '%s\n' 1; return 0 ;; esac
+  fi
+  printf '%s\n' 0
+}
+
+# next_selection <force>: the loop's selection. With force=1 it bypasses the
+# shared discovery cache (legacy tiers: queue_scan.py --force-refresh) or the
+# event-class-v2 selection cache, exactly as claim_delay_gate's live recheck.
+next_selection(){
+  if [ "${1:-0}" != 1 ]; then
+    select_work
+  elif [ "$ASSIGNMENT_MODE" = event-class-v2 ]; then
+    tartci_assignment_v2_select 1
+  else
+    SCAN_FORCE_REFRESH=1 select_work
+  fi
 }
 
 # claim_delay_gate <labels> <tier> <queued> — prints `claim` or `backoff`. Off
@@ -3451,6 +3494,8 @@ run_one(){
 }
 
 i=0
+# One-shot: set after this lane serves a merge-group job (refresh_after_serve).
+SCAN_REFRESH_NEXT=0
 [ "$PRINT_QUEUE" = 1 ] && { print_queued_work; exit 0; }
 [ "$PRINT_SELECTION" = 1 ] && { select_work | tr '|' '\t'; exit 0; }
 [ "$PRINT_ASSIGNMENT_PARITY" = 1 ] && {
@@ -3650,7 +3695,13 @@ if [ "$LOOP" = 1 ]; then
     # The scan can outlast the heartbeat staleness window; keep this lane's
     # current phase fresh until the next heartbeat (heartbeat-keepalive.lib.sh).
     tartci_heartbeat_keepalive_start
-    selection="$(select_work)"
+    if [ "$SCAN_REFRESH_NEXT" = 1 ]; then
+      SCAN_REFRESH_NEXT=0
+      selection="$(next_selection 1)"
+      event scan_refresh_after_merge_group "selection=$selection"
+    else
+      selection="$(next_selection 0)"
+    fi
     IFS='|' read -r q selected_labels selected_tier <<< "$selection"
     if printf '%s' "$q" | grep -qxE '[1-9][0-9]*'; then
       selected_group_id="$(runner_group_id_for_tier "$selected_tier")" || selected_group_id=""
@@ -3868,6 +3919,9 @@ if [ "$LOOP" = 1 ]; then
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
+      # A served merge-group job may have just queued its dependent job: the
+      # next selection skips the scan caches once so this freed slot sees it.
+      SCAN_REFRESH_NEXT="$(refresh_after_serve "$CURRENT_SERVED" "$selected_labels")"
       if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
         tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone
       fi
