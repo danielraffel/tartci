@@ -256,6 +256,12 @@ class ClassifyTests(unittest.TestCase):
                 vetoed = classify(context_probe=hung, volume_meta=meta)
                 self.assertEqual(vetoed["kind"], "stalled_unclassified")
                 self.assertIn("the volume, not tccd", vetoed["reason"])
+        # A context probe that failed fast (not a timeout) never reaches df.
+        called = []
+        fast = classify(context_probe=lambda: {"ok": False, "reason": "failed: exit 255"},
+                        volume_meta=lambda: called.append(1) or {"ok": True})
+        self.assertEqual(fast["kind"], "stalled_unclassified")
+        self.assertEqual(called, [])
         # Without the Removable Volumes signature statfs alone proves nothing.
         silent = classify(scan=scan_with(0), context_probe=hung,
                           volume_meta=lambda: {"ok": True, "volume_root": "/Volumes/Example"})
@@ -275,7 +281,10 @@ class ClassifyTests(unittest.TestCase):
         other = runner_with("Filesystem 512-blocks Used Available Capacity Mounted on\n"
                             "/dev/disk3s1 100 50 50 50% /\n")
         self.assertFalse(tw.volume_meta_probe("/Volumes/Example/VMs", 10.0, runner=other)["ok"])
-        self.assertFalse(tw.volume_meta_probe("/Users/example/vms", 10.0, runner=listed)["ok"])
+        root_listed = runner_with("Filesystem 512-blocks Used Available Capacity Mounted on\n"
+                                  "/dev/disk3s1 100 50 50 50% /\n")
+        self.assertFalse(tw.volume_meta_probe("/Users/example/vms", 10.0,
+                                              runner=root_listed)["ok"])
 
     def test_tcc_context_probe_that_hangs_names_the_volume_not_tccd(self) -> None:
         verdict = classify(context_probe=lambda: {"ok": False, "reason": "timeout after 10s"})
@@ -416,6 +425,22 @@ class WatchdogStepTests(unittest.TestCase):
                                                        "device_id": "1"})
         kwargs.update(overrides)
         return tw.watchdog_step(state, previous or {}, **kwargs)
+
+    def test_the_watchdog_hands_classify_a_df_reading_of_the_store_volume(self) -> None:
+        seen: list = []
+        state = self.draining()
+        state["path"] = "/Volumes/Example/VMs"
+        self.step(state, classify_fn=lambda **kw: seen.append(kw) or {"kind": "x"})
+        meta = seen[0].get("volume_meta")
+        self.assertTrue(callable(meta))
+        calls: list = []
+        original = tw.volume_meta_probe
+        tw.volume_meta_probe = lambda path, timeout_s: calls.append((path, timeout_s)) or {}
+        try:
+            meta()
+        finally:
+            tw.volume_meta_probe = original
+        self.assertEqual(calls, [("/Volumes/Example/VMs", 10.0)])
 
     def test_classified_wedge_heals_reprobes_and_reports_recovery(self) -> None:
         state = self.draining()

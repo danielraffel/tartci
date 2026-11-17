@@ -536,10 +536,10 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
 
     Disagreement fails closed: a fresh launchd job that opens the root, or
     fails fast on it, and an authorized context that hangs too, each veto both
-    paths. One exception, `error_signature_saturated`: with Removable Volumes
-    refusals in the log, an authorized context that hangs while the volume
-    answers statfs (`volume_meta`, a bounded `df`) is a saturated tccd that
-    every context waits on (m3, 2026-11-17), not a stalled volume. The sandboxd IPC signature (an authorization request that never
+    paths. One exception, `error_signature_saturated`: with Removable
+    Volumes refusals in the log, an authorized context that TIMES OUT while
+    the volume answers statfs (`volume_meta`, a bounded `df`) is a saturated
+    tccd every context waits on (m3, 2026-11-17), not a stalled volume. The sandboxd IPC signature (an authorization request that never
     left sandboxd) is recorded and named as corroboration, never required and
     never a veto: on 2026-11-13 the same wedge showed an unanswered IPC on one
     probe and no IPC line at all on the next, so its absence proves nothing.
@@ -631,10 +631,10 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
     window = window_seconds(failing_since, now)
     healed = store_health.finite_epoch(healed_at, now)
     # The cutoff keeps a heal's own release burst from being the evidence for
-    # the next heal. A heal before the scanned window wrote no line in it, and
-    # cutting at it would ignore the whole streak: on m3 a 2026-11-14 heal hid
+    # the next heal. A heal before the scanned window (the minutes `log show`
+    # reads) wrote no line in it, and cutting at it would ignore the streak: on m3 a 2026-11-14 heal hid
     # every signature line for three days (ignored_after_heal 14862).
-    if healed is not None and healed < now - window:
+    if healed is not None and healed < now - max(1, int(math.ceil(window / 60.0))) * 60:
         healed = None
     before = local_stamp(healed) if healed is not None else None
     log = scan(window, before=before)
@@ -672,7 +672,10 @@ def classify(*, consecutive_failures: int, failure_threshold: int, last_reason: 
             # says nothing about the volume. statfs of the volume needs no
             # privacy authorization; a volume that answers it while sandboxd
             # logs Removable Volumes refusals is waiting on tccd, not stalled.
-            meta = volume_meta() if volume_meta is not None else None
+            # Only a context probe that timed out waits on tccd; one that
+            # failed fast (ssh refused, a spawn error) says nothing and vetoes.
+            meta = (volume_meta() if volume_meta is not None and is_timeout(reading.get("reason"))
+                    else None)
             if meta is not None:
                 evidence["volume_meta"] = meta
             if not (meta or {}).get("ok"):
