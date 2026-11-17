@@ -682,6 +682,34 @@ class StewardCheckTests(_Fleet):
         self.refresh(other, "studio", now=NOW + 10 * MIN)
         self.assertEqual(other.fleet_updates(), ["v0.221.1"])
 
+    def test_the_baseline_kept_at_the_swap_survives_the_log_scrolling(self) -> None:
+        # summary.log is read from a 512 KiB tail (about a day of ticks on m3).
+        # A verdict judged after the pre-swap ticks scrolled out must not
+        # blame a standing failure on the release and roll it back.
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        entry = json.loads((self.state / "steward.json").read_text())["shipyard"]
+        self.assertEqual(entry["baseline"]["failing"],
+                         [["danielraffel/tartci", "clones"], ["fleet", "clones"]])
+        log = self.home / canary.STEWARD_LOG
+        log.write_text("")  # rotated: nothing from before the swap is left
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones")
+        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"], "not rolled back")
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+        self.assertIn("already failing before the swap", row["steward"])
+
+    def test_a_record_without_a_stored_baseline_reads_the_log_as_before(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        path = self.state / "steward.json"
+        value = json.loads(path.read_text())
+        value["shipyard"].pop("baseline")
+        path.write_text(json.dumps(value))
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones")
+        self.refresh(host, "m5", now=NOW + 10 * MIN)
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+
     def test_a_new_invariant_beside_a_standing_failure_still_rolls_back(self) -> None:
         self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
         host = self.deploy_on_steward_host(before="FAIL:clones")

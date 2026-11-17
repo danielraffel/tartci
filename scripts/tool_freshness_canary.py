@@ -452,9 +452,42 @@ def runs_steward(home: Path, tool: dict, now: float) -> bool:
     return any(now - t["at"] <= STEWARD_ACTIVE_HOURS * 3600 for t in parse_ticks(text))
 
 
-def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
-                    ) -> tuple[str, str]:
-    """("ok" | "failed" | "pending", detail) from the first conclusive complete tick."""
+def _baseline(ticks: list[dict], deployed_at: float) -> dict:
+    """What was already failing when the binary changed: the last tick known to
+    have finished before the swap, and whether the tick in flight at the swap
+    could not run the steward at all."""
+    # The baseline must have finished before the swap: the tick after it
+    # started at or before the swap. The last tick stamped before the swap may
+    # still have been running when the binary changed, so it never qualifies.
+    finished = [ticks[i] for i in range(len(ticks) - 1) if ticks[i + 1]["at"] <= deployed_at]
+    # The tick in flight at the swap is not a baseline for invariants (its later
+    # repositories may have run the new binary), but if every repository in it
+    # errored, the ones that ran before the swap errored too: the steward was
+    # already down (a GitHub outage), and that is not the release's fault.
+    in_flight = [t for t in ticks if t["at"] < deployed_at][-1:]
+    last = finished[-1] if finished else None
+    return {"tick_at": _iso(last["at"]) if last else None,
+            "failures": sorted(_failures(last)) if last else [],
+            "failing": sorted([list(pair) for pair in last["failing"]]) if last else [],
+            "in_flight_error": bool(in_flight and STEWARD_ERROR in _failures(in_flight[0]))}
+
+
+def swap_baseline(home: Path, tool: dict, deployed_at: float) -> dict | None:
+    """The baseline read at the swap, to keep with the deploy record. The log is
+    read from a bounded tail, so a baseline judged later may have scrolled out
+    of it; then a standing failure would look new and roll the release back."""
+    text = _read_tail(steward_log(home, tool))
+    if text is None:
+        return None
+    return _baseline(parse_ticks(text), deployed_at)
+
+
+def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float,
+                    stored: dict | None = None) -> tuple[str, str]:
+    """("ok" | "failed" | "pending", detail) from the first conclusive complete tick.
+
+    `stored` is the baseline recorded at the swap; without it (a record from an
+    older checkout) the baseline is read from the log as before."""
     text = _read_tail(steward_log(home, tool))
     if text is None:
         return "pending", "steward summary log unreadable"
@@ -467,19 +500,10 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     complete = [i < len(ticks) - 1
                 or bool(repos and repos_changed <= ticks[i]["at"] and repos <= ticks[i]["done"])
                 for i in range(len(ticks))]
-    # The baseline must have finished before the swap: the tick after it
-    # started at or before the swap. The last tick stamped before the swap may
-    # still have been running when the binary changed, so it never qualifies.
-    baseline = [ticks[i] for i in range(len(ticks) - 1)
-                if ticks[i + 1]["at"] <= deployed_at]
-    preexisting = _failures(baseline[-1]) if baseline else set()
-    excused = frozenset(baseline[-1]["failing"]) if baseline else frozenset()
-    # The tick in flight at the swap is not a baseline for invariants (its later
-    # repositories may have run the new binary), but if every repository in it
-    # errored, the ones that ran before the swap errored too: the steward was
-    # already down (a GitHub outage), and that is not the release's fault.
-    in_flight = [t for t in ticks if t["at"] < deployed_at][-1:]
-    if in_flight and STEWARD_ERROR in _failures(in_flight[0]):
+    baseline = stored if _valid_baseline(stored) else _baseline(ticks, deployed_at)
+    preexisting = set(baseline["failures"])
+    excused = frozenset(tuple(pair) for pair in baseline["failing"])
+    if baseline["in_flight_error"]:
         preexisting.add(STEWARD_ERROR)
     stamp = lambda t: _iso(t["at"])  # noqa: E731
     down = 0  # consecutive complete ticks after the swap where the steward could not run
@@ -516,10 +540,22 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     return "pending", f"no conclusive complete steward tick on {version} since {_iso(deployed_at)}"
 
 
+def _valid_baseline(value: object) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("failures"), list)
+            and isinstance(value.get("failing"), list)
+            and all(isinstance(p, list) and len(p) == 2 for p in value["failing"])
+            and isinstance(value.get("in_flight_error"), bool))
+
+
 def record_deploy(steward: dict, name: str, version: str, previous: str | None,
-                  by: str, swapped_at: float) -> None:
+                  by: str, swapped_at: float, home: Path | None = None,
+                  tool: dict | None = None) -> None:
     steward[name] = {"version": version, "from": previous, "by": by,
                      "deployed_at": _iso(swapped_at)}
+    if home is not None and tool is not None:
+        baseline = swap_baseline(home, tool, swapped_at)
+        if baseline is not None:
+            steward[name]["baseline"] = baseline
 
 
 def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, settings: dict,
@@ -551,7 +587,8 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
     if entry.get("failure_recorded"):
         verdict, detail = "failed", str(entry.get("detail") or "steward check failed")
     else:
-        verdict, detail = steward_verdict(home, tool, version, deployed_at)
+        verdict, detail = steward_verdict(home, tool, version, deployed_at,
+                                          entry.get("baseline"))
     if verdict == "ok":
         append({"event": "tool_steward_verified", "tool": name, "at": _iso(now),
                 "version": version, "detail": detail})
