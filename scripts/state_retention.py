@@ -308,10 +308,18 @@ def run(*, fix: bool, home: Path | None = None, now: float | None = None,
     # The per-boot files live under TARTCI_HOME and the generations under
     # HOME. When the two name different trees (a test pass, an operator's
     # scratch TARTCI_HOME) this is not the host's own pass: delete nothing.
+    # An empty value is set-but-unusable (build_plan would read it as ./state),
+    # so it is refused like any other mismatch; resolution errors are contained.
     tartci_home = os.environ.get("TARTCI_HOME")
-    if tartci_home and Path(tartci_home).resolve() != (home / ".tartci").resolve():
-        return {"enabled": False,
-                "reason": f"TARTCI_HOME={tartci_home} is not {home / '.tartci'}"}
+    if tartci_home is not None:
+        try:
+            matches = bool(tartci_home) and (
+                Path(tartci_home).resolve() == (home / ".tartci").resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
+        if not matches:
+            return {"enabled": False,
+                    "reason": f"TARTCI_HOME={tartci_home} is not {home / '.tartci'}"}
     try:
         plan = build_plan(home, now=time.time() if now is None else now,
                           max_age_days=DEFAULT_MAX_AGE_DAYS,

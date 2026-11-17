@@ -263,6 +263,19 @@ class ReclaimPassTests(unittest.TestCase):
         self.assertFalse(value["enabled"])
         self.assertTrue(all(p.exists() for p in self.paths))
 
+    def test_an_empty_tartci_home_deletes_nothing(self) -> None:
+        os.environ["TARTCI_HOME"] = ""
+        value = self.run_pass(fix=True)
+        self.assertFalse(value["enabled"])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
+    def test_a_failing_tartci_home_resolution_is_contained(self) -> None:
+        os.environ["TARTCI_HOME"] = str(self.h.home / "loop")
+        with mock.patch.object(Path, "resolve", side_effect=RuntimeError("Symlink loop")):
+            value = self.run_pass(fix=True)
+        self.assertIn("Symlink loop", value["error"])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
     def test_the_off_switch_and_errors_never_raise(self) -> None:
         with mock.patch.dict(os.environ, {"TARTCI_RECLAIM_RETENTION": "0"}):
             self.assertFalse(self.run_pass(fix=True)["enabled"])
