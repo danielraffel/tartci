@@ -33,6 +33,7 @@ class QueueTickControlTests(unittest.TestCase):
         extra_env: dict[str, str] | None = None,
         invalid_tmpdir: bool = False,
         reap_opt_in: bool = False,
+        launcher: str | None = None,
     ) -> tuple[subprocess.CompletedProcess[str], str, object | None]:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -155,6 +156,43 @@ exit 98
                 ledger_path.write_text(json.dumps(ledger_seed), encoding="utf-8")
             if repo_root:
                 env["SHIPYARD_QUEUE_REPO_ROOT"] = str(root)
+            if launcher is not None:
+                # A fake ShipyardLauncher.app: `--launcher-active` answers from
+                # LAUNCHER_REPORT (or hangs); any other call is recorded and
+                # hands its arguments to the fake release, as the real one does.
+                exe = root / ".local/libexec/ShipyardLauncher.app/Contents/MacOS/shipyard-launcher"
+                exe.parent.mkdir(parents=True)
+                exe.write_text(
+                    """#!/bin/sh
+if [ "$1" = "--launcher-active" ]; then
+  printf 'launcher-active\\n' >> "$CALLS"
+  [ -z "$LAUNCHER_HANG" ] || sleep "$LAUNCHER_HANG"
+  printf '%s\\n' "$LAUNCHER_REPORT"
+  exit "$LAUNCHER_RC"
+fi
+printf 'launcher %s\\n' "$*" >> "$CALLS"
+SHIPYARD_LAUNCHER_APP=fake exec "$FAKE_RELEASE" "$@"
+""",
+                    encoding="utf-8",
+                )
+                exe.chmod(0o755)
+                if launcher != "not-activated":
+                    record = root / ".local/share/shipyard/launcher/activation.json"
+                    record.parent.mkdir(parents=True)
+                    record.write_text("{}", encoding="utf-8")
+                env["FAKE_RELEASE"] = str(shipyard)
+                env["LAUNCHER_RC"] = "0"
+                env["LAUNCHER_HANG"] = ""
+                env["LAUNCHER_REPORT"] = json.dumps(
+                    {"active": launcher == "active", "reason": "grant_missing"}
+                )
+                if launcher != "active":
+                    env["LAUNCHER_RC"] = "1"
+                if launcher == "hang":
+                    env["LAUNCHER_HANG"] = "30"
+                    env["SHIPYARD_QUEUE_LAUNCHER_TIMEOUT_S"] = "1"
+            if extra_env:
+                env.update(extra_env)
             if reap_opt_in:
                 opt_in = root / ".config/tartci/reap-superseded-merge-groups.enabled"
                 opt_in.parent.mkdir(parents=True, exist_ok=True)
@@ -668,6 +706,72 @@ exit 98
         self.assertIn("merge-queue control schema malformed", result.stdout)
         self.assertNotIn("ship-state list", calls)
         self.assertNotIn("ghapp", calls)
+
+    # ShipyardLauncher.app routing (tartci#920): the release's per-install
+    # path must never be the TCC identity of a Shipyard call made here.
+    @staticmethod
+    def shipyard_calls(calls: str) -> list[str]:
+        return [line for line in calls.splitlines()
+                if not line.startswith(("ghapp ", "launcher"))]
+
+    def test_an_active_launcher_runs_every_shipyard_call(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, launcher="active", reap_opt_in=True,
+            states=self.stale_open_state(), gh_state="MERGED",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=app", result.stdout)
+        self.assertNotIn("FINDING", result.stdout)
+        routed = [line[len("launcher "):] for line in calls.splitlines()
+                  if line.startswith("launcher ")]
+        direct = self.shipyard_calls(calls)
+        self.assertTrue(direct, calls)
+        # Every Shipyard call the tick made reached the release through the
+        # launcher, the reaper's (run from the Removable Volumes repo root) included.
+        self.assertEqual(routed, direct)
+        self.assertIn("--version", routed)
+        self.assertIn("merge-queue status --json", routed)
+        self.assertIn("ship-state list --json", routed)
+        self.assertTrue(any(line.startswith("rescue ") for line in routed), routed)
+        self.assertTrue(any(line.startswith("ship-state discard 42") for line in routed), routed)
+
+    def test_an_inactive_launcher_runs_directly_with_a_finding(self) -> None:
+        result, calls, _ = self.run_tick(held=False, launcher="inactive")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct", result.stdout)
+        self.assertIn("launcher-fallback reason=exit_1 FINDING detail=exit_1:_grant_missing",
+                      result.stdout)
+        self.assertNotIn("launcher ", calls)
+        self.assertIn("merge-queue status --json", calls)
+
+    def test_a_hung_launcher_check_is_cut_off_and_the_tick_runs_directly(self) -> None:
+        started = time.monotonic()
+        result, calls, _ = self.run_tick(held=False, launcher="hang")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher-fallback reason=timeout FINDING", result.stdout)
+        self.assertNotIn("launcher ", calls)
+
+    def test_a_host_that_never_activated_runs_directly_and_quietly(self) -> None:
+        result, calls, _ = self.run_tick(held=False, launcher="not-activated")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct", result.stdout)
+        self.assertNotIn("FINDING", result.stdout)
+        self.assertNotIn("launcher", calls)
+
+    def test_routing_can_be_turned_off(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, launcher="active", extra_env={"SHIPYARD_QUEUE_LAUNCHER": "off"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=direct", result.stdout)
+        self.assertNotIn("launcher", calls)
+
+    def test_a_tick_already_under_the_launcher_never_routes_again(self) -> None:
+        result, calls, _ = self.run_tick(
+            held=False, launcher="active", extra_env={"SHIPYARD_LAUNCHER_APP": "/x.app"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("launcher=app", result.stdout)
+        self.assertNotIn("launcher", calls)
 
 if __name__ == "__main__":
     unittest.main()
