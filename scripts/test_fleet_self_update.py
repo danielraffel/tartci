@@ -1015,6 +1015,13 @@ class QueueLightTests(Base):
         aside = json.loads((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).read_text())
         self.assertIn("gate queue is heavy", aside["reason"])
 
+    def assertDrainedAnyway(self, rc: int) -> None:
+        """Passed a heavy queue. EXIT_DEFERRED is also 0, so a step-aside is
+        ruled out first: a revert then FAILs here rather than erroring later."""
+        self.assertFalse(self.receipt().get("stepped_aside"), self.receipt().get("error"))
+        self.assertIn("drains anyway", self.queue_step())
+        self.assertUpdated(rc)
+
     def test_a_heavy_queue_steps_aside_before_any_mutation(self) -> None:
         self.demand(2)
         self.assertSteppedAsideForQueue(self.apply())
@@ -1078,9 +1085,8 @@ class QueueLightTests(Base):
         # hours behind main. No ticket here, as after that release.
         self.demand(4)
         self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
-        self.assertUpdated(self.apply())
+        self.assertDrainedAnyway(self.apply())
         self.assertIn("behind main", self.queue_step())
-        self.assertIn("drains anyway", self.queue_step())
 
     def test_a_heavy_queue_steps_aside_while_behind_main_inside_the_bound(self) -> None:
         # Control, same instrument: ten minutes short of the bound.
@@ -1109,8 +1115,7 @@ class QueueLightTests(Base):
         self.demand(4)
         self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
         self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 60)
-        self.assertUpdated(self.apply())
-        self.assertIn("drains anyway", self.queue_step())
+        self.assertDrainedAnyway(self.apply())
 
     def test_a_refusal_before_the_turn_is_not_a_turn(self) -> None:
         attempts = self.cfg.state_dir / "attempts"
@@ -1124,6 +1129,18 @@ class QueueLightTests(Base):
         self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
         self.took_turn_at(NOW - 900)
         self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 900)
+
+    def test_a_same_generation_refresh_keeps_queue_courtesy(self) -> None:
+        # A fleet-source move reinstalls the running generation; it does not
+        # move the host along main, so time behind main must not drain every
+        # host into a heavy queue for it.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        with mock.patch.object(su, "checks_green", return_value=(False, "not green: red")), \
+                mock.patch.object(su, "refresh_reason",
+                                  return_value="fleet source moved to cccccccccccc"):
+            self.assertSteppedAsideForQueue(self.apply())
+        self.assertEqual(self.receipt()["target"], INSTALLED)
 
     def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
         self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
@@ -3180,10 +3197,13 @@ class HeavyQueueAfterHostFaultTests(Base):
     receipt = QueueLightTests.receipt
     queue_step = QueueLightTests.queue_step
     behind_main_for = QueueLightTests.behind_main_for
+    aside_since = QueueLightTests.aside_since
+    assertDrainedAnyway = QueueLightTests.assertDrainedAnyway
 
     def test_a_host_fault_does_not_restart_the_heavy_queue_bound(self) -> None:
         self.demand(1)
         self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.aside_since(NOW - 2 * 3600)
         self.sys.store_result = {"ms": 4200.0}
         self.assertEqual(su.EXIT_REFUSED, self.apply())
         self.assertIn("Tart store volume slow", self.receipt()["error"])
@@ -3192,8 +3212,7 @@ class HeavyQueueAfterHostFaultTests(Base):
         # Next attempt: the store is fast again but the queue is heavy.
         self.sys.store_result = {"ms": 4.0}
         self.demand(4)
-        self.assertUpdated(self.apply())
-        self.assertIn("drains anyway", self.queue_step())
+        self.assertDrainedAnyway(self.apply())
 
 
 class LauncherProbeStopTests(Base):

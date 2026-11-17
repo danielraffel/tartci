@@ -3867,8 +3867,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         if light:
             receipt.step("queue-light", why_light)
         elif max(waited, behind) >= cfg.queue_heavy_max_defer_seconds:
-            receipt.step("queue-light", f"{why_light}; deferred {waited / 3600:.1f} h for a heavy "
-                         f"queue and {behind / 3600:.1f} h behind main, the most allowed "
+            clock = (f"deferred {waited / 3600:.1f} h for a heavy queue" if waited >= behind
+                     else f"{behind / 3600:.1f} h behind main since its last turn")
+            receipt.step("queue-light", f"{why_light}; {clock}, the most allowed "
                          f"({cfg.queue_heavy_max_defer_seconds // 3600} h), so it drains anyway")
         else:
             refusal = (f"gate queue is heavy: {why_light}; draining now would idle this host's "
