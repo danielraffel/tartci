@@ -221,6 +221,14 @@ class LastPass(unittest.TestCase):
 class DiskPressure(unittest.TestCase):
     """The VM store volume's fill level is a readiness fact (pool status)."""
 
+    def setUp(self) -> None:
+        # These tests mock raw statfs numbers to hit the thresholds exactly; the
+        # host's real purgeable space (disk_available) must not credit them.
+        from unittest import mock
+        env = mock.patch.dict(os.environ, {"TARTCI_DISK_PURGEABLE": "0"})
+        env.start()
+        self.addCleanup(env.stop)
+
     def run_with(self, used_percent: float, home_percent: float = 50.0):
         import shutil
         from unittest import mock
