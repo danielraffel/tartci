@@ -1040,10 +1040,26 @@ class BehindMainAlertTests(Base):
         # last measured skew still says how far behind the host is.
         su._write_json(self.cfg.state_dir / "skew.json",
                        self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        out = io.StringIO()
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+            self.assertEqual(1, len(self.opened()), self.issues)
+            # That run wrote an unknown skew.json; the next one still knows.
+            out.truncate(0)
+            out.seek(0)
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+
+    def test_a_skew_from_before_an_install_is_not_used(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": "9" * 40})
         with mock.patch.object(su, "refresh_checkout",
                                side_effect=su.Refused("fetch failed")):
             self.assertEqual(su.EXIT_UNKNOWN, self.apply())
-        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertEqual([], self.opened())
 
     def test_an_unknown_skew_says_nothing(self) -> None:
         su.behind_alert(self.cfg, {"state": "unknown", "oldest_undeployed": None}, NOW)

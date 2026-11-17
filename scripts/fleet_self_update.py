@@ -2560,6 +2560,10 @@ BEHIND_STARVED_SECONDS = 4 * 3600
 BEHIND_ALERT_REPEAT_SECONDS = 6 * 3600
 BEHIND_ALERT_NAME = "behind-alert.json"
 BEHIND_ALERT_LAST_NAME = "behind-alert-last.json"
+# The last skew that measured how far behind the host is. skew.json is
+# overwritten with an unknown state when the checkout or the measurement
+# fails, and a run that stops there still needs the age.
+BEHIND_SKEW_NAME = "behind-skew.json"
 
 
 def behind_main_seconds(skew: dict, soak_seconds: int, now: float) -> float | None:
@@ -2582,6 +2586,7 @@ def behind_alert(cfg: Config, skew: dict, now: float) -> None:
         behind = behind_main_seconds(skew, cfg.soak_seconds, now)
         if behind is None:
             return
+        _write_json(cfg.state_dir / BEHIND_SKEW_NAME, skew)
         import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
         me = self_host_id(cfg)
         path = cfg.state_dir / BEHIND_ALERT_NAME
@@ -3586,8 +3591,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     last_skew = _read_json(cfg.state_dir / "skew.json") or {}
 
     def early_alert() -> None:
-        if apply:
-            behind_alert(cfg, last_skew, now)
+        if not apply:
+            return
+        skew = (last_skew if behind_main_seconds(last_skew, cfg.soak_seconds, now) is not None
+                else _read_json(cfg.state_dir / BEHIND_SKEW_NAME) or {})
+        try:
+            running = installed_commit(cfg)[0]
+        except Exception:  # noqa: BLE001 - unknown install: the skew still names one
+            running = None
+        if running and skew.get("installed") and skew["installed"] != running:
+            return  # measured before an install moved the host; stale
+        behind_alert(cfg, skew, now)
     blocked, interrupted = previous_run_state(cfg, sys_)
     if blocked:
         print(f"self-update: REFUSED: {blocked}")

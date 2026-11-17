@@ -3001,7 +3001,7 @@ fleet`), and check GitHub's job history against it with
   undeployed commit's age past the soak) logs `self-update: STARVED: ... behind
   main` whatever held it (a step-aside, a host fault, the rate limit, a pause),
   writes `self_update_behind` once per episode and opens one issue, at most
-  one per host per 6 h (`behind-alert.json`, `behind-alert-last.json`). The
+  one per host per 6 h (`behind-alert.json`, `behind-alert-last.json`; the last measured age is kept in `behind-skew.json` for attempts that stop before measuring). The
   issue closes once the host is back inside 4 h. Demand is a queued
   self-hosted *job* whose labels a registration of
   this host serves, for a workflow it names, at most 12 h old
