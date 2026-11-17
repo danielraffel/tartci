@@ -1337,9 +1337,29 @@ def _sha256(path: str) -> str | None:
         return None
 
 
+def attestation_python(timeout_s: float = 60.0) -> str | None:
+    """The interpreter install_host_attestation.sh would pin now, or None.
+
+    `--print-python` makes no change. None when the installer refuses or
+    cannot be run: the pass then judges the writer alone, as before."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        import bounded_subprocess  # noqa: PLC0415 - sibling module
+        proc = bounded_subprocess.run_bounded(
+            ["/bin/bash", os.path.join(root, "scripts", "install_host_attestation.sh"),
+             "--print-python"], timeout=timeout_s, operation="attestation-python")
+    except Exception:  # noqa: BLE001 - the heal pass must go on
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    if proc.returncode != 0 or not lines or not lines[-1].startswith("/"):
+        return None
+    return lines[-1]
+
+
 def host_attestation_pass(home: str | None = None, run=subprocess.run,
-                          loaded=None) -> str | None:
-    """Redeploy a loaded host-attestation writer that is not this tartci's.
+                          loaded=None, pinned_python=None) -> str | None:
+    """Redeploy a loaded host-attestation writer that is not this tartci's,
+    or that runs a different interpreter than the installer now pins.
 
     install_host_attestation.sh copies the writer out of the generation into
     ~/.local/share/pulp-landing, so a self-update never reached it: on
@@ -1349,6 +1369,12 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
     (every --advertise, the generation and the interval), so a host keeps
     attesting exactly what it attested. A host without the agent, or with it
     unloaded, is left alone: installing or re-enabling it is an operator's call.
+    The interpreter is the agent's macOS privacy identity: a plist rendered
+    before the installer pinned the python.org framework binary still runs
+    /opt/homebrew/bin/python3, an ad-hoc Cellar binary that becomes a new
+    identity on every `brew upgrade` (scripts/tcc_risk_lint.py). It is
+    re-rendered once; a plist that already runs the pinned interpreter is left
+    alone, so this never loops.
     Returns the line to log, or None when there is nothing to say. Never raises.
     """
     home = home or os.path.expanduser("~")
@@ -1363,12 +1389,24 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
     source = _sha256(os.path.join(root, "scripts", "tartci_host_attestation.py"))
     installed = _sha256(os.path.join(home, ".local", "share", "pulp-landing", "current",
                                      "tartci_host_attestation.py"))
-    if source is None or source == installed:
+    if source is None:
         return None
     try:
         with open(plist_path, "rb") as fh:
             plist = plistlib.load(fh)
         argv = [str(a) for a in plist.get("ProgramArguments") or []]
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        if source == installed:
+            return None
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation writer is stale "
+                f"but its plist is unreadable ({exc}); not redeployed")
+    repin = None
+    if source == installed:
+        wanted = (pinned_python or attestation_python)()
+        if not wanted or (argv and argv[0] == wanted):
+            return None
+        repin = (argv[0] if argv else "no program", wanted)
+    try:
         args: list[str] = []
         generation = (plist.get("EnvironmentVariables") or {}).get("PULP_ATTESTATION_GENERATION")
         if generation:
@@ -1387,6 +1425,14 @@ def host_attestation_pass(home: str | None = None, run=subprocess.run,
     except (OSError, subprocess.SubprocessError) as exc:
         return f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy FAILED ({exc})"
     was = (installed or "absent")[:12]
+    if repin is not None:
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation repin "
+                    f"{repin[0]} -> {repin[1]} FAILED (exit {proc.returncode}: "
+                    f"{detail[-1] if detail else 'no output'})")
+        return (f"{_iso(utcnow())} launchd-watchdog: host-attestation interpreter repinned "
+                f"{repin[0]} -> {repin[1]}")
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         return (f"{_iso(utcnow())} launchd-watchdog: WARN host-attestation redeploy {was} -> "
@@ -1727,6 +1773,32 @@ def tcc_prompt_pass(reading: dict[str, Any] | None, store_state: dict[str, Any] 
     except Exception as exc:  # noqa: BLE001 - the heal pass must go on
         return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-prompt check FAILED "
                 f"({type(exc).__name__}: {exc}); a waiting consent alert would not be paged")
+
+
+def tcc_stuck_recovery_pass(store_state: dict[str, Any], *, dry_run: bool,
+                            **kwargs) -> str | None:
+    """During a TCC wedge, restart this user's launchd jobs held in open() on
+    /Volumes and page when one stays stuck (scripts/tcc_stuck_recovery.py).
+    TARTCI_TCC_STUCK_RECOVERY=0 turns it off. Never raises."""
+    try:
+        import tcc_stuck_recovery  # noqa: PLC0415 - sibling module
+        lines = tcc_stuck_recovery.recovery_pass(store_state, dry_run=dry_run, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-stuck-recovery FAILED "
+                f"({type(exc).__name__}: {exc}); jobs stuck on the store were not restarted")
+    return "\n".join(lines) or None
+
+
+def tcc_risk_pass(now: float | None = None, **kwargs) -> str | None:
+    """At most every 15 min, report loaded LaunchAgents that can raise a
+    privacy prompt (scripts/tcc_risk_lint.py). Report only. Never raises."""
+    try:
+        import tcc_risk_lint  # noqa: PLC0415 - sibling module
+        lines = tcc_risk_lint.watchdog_pass(utcnow() if now is None else now, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - the heal pass must go on
+        return (f"{_iso(utcnow())} launchd-watchdog: WARN tcc-risk check FAILED "
+                f"({type(exc).__name__}: {exc}); prompt-prone agents would not be reported")
+    return "\n".join(lines) or None
 
 
 def interpreter_refusal_pass(now: float | None = None, issue=None, close=None) -> str | None:
@@ -2235,6 +2307,12 @@ def main(argv: list[str] | None = None) -> int:
         prompt_line = tcc_prompt_pass(consent_alert, store_health_result)
         if prompt_line:
             print(prompt_line)
+    # Then release the jobs the wedge left blocked in open(): they stay blocked
+    # after the alert goes away, and a run that never ends never starts again.
+    stuck_line = tcc_stuck_recovery_pass(store_health_result,
+                                         dry_run=args.status or args.dry_run)
+    if stuck_line and not args.json:
+        print(stuck_line)
     # Compute the VM-running guard ONCE per pass, but only after storage health
     # is proven. A Tart inventory call can itself block on a wedged external
     # volume; never let it outrun the bounded storage gate.
@@ -2335,6 +2413,9 @@ def main(argv: list[str] | None = None) -> int:
         grant_line = interpreter_grant_pass()
         if grant_line:
             print(grant_line)
+        tcc_risk_line = tcc_risk_pass()
+        if tcc_risk_line:
+            print(tcc_risk_line)
         scratch_line = scratch_vm_pass()
         if scratch_line:
             print(scratch_line)

@@ -15,6 +15,7 @@
 # Usage:
 #   scripts/install_host_attestation.sh [--generation <id>] [--interval <secs>]
 #   scripts/install_host_attestation.sh --verify      # receipt only, no changes
+#   scripts/install_host_attestation.sh --print-python  # the interpreter it would pin, no changes
 set -euo pipefail
 
 LABEL="com.danielraffel.shipyard.host-attestation"
@@ -28,6 +29,7 @@ DOMAIN="gui/$(id -u)"
 INTERVAL=300
 GENERATION="${PULP_ATTESTATION_GENERATION:-}"
 VERIFY_ONLY=0
+PRINT_PYTHON=0
 ADVERTISE=()
 
 while [ $# -gt 0 ]; do
@@ -36,6 +38,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="$2"; shift 2 ;;
     --advertise) ADVERTISE+=("$2"); shift 2 ;;
     --verify) VERIFY_ONLY=1; shift ;;
+    --print-python) PRINT_PYTHON=1; shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
 done
@@ -96,19 +99,83 @@ fi
 [ -f "$SRC" ] || { echo "missing $SRC" >&2; exit 1; }
 
 # launchd does not inherit an interactive PATH, so a bare `python3` in the
-# plist resolves to macOS's /usr/bin/python3 — which is 3.9 and has no
+# plist resolves to macOS's /usr/bin/python3, which is 3.9 and has no
 # `tomllib`. The first deployment did exactly that: the host profile parsed as
 # {} and the record declared zero lanes without reporting that it had failed to
 # look. Pick an interpreter that can actually read the profile, and refuse to
 # install rather than deploy a sensor that measures nothing.
-PYTHON=""
-for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(command -v python3 || true)" /usr/bin/python3; do
-  [ -n "$candidate" ] && [ -x "$candidate" ] || continue
-  if "$candidate" -c 'import tomllib' 2>/dev/null; then PYTHON="$candidate"; break; fi
-done
-if [ -z "$PYTHON" ]; then
+#
+# It must also be a stable macOS privacy identity. launchd attributes every
+# privacy (TCC) request of the job to its program, and /opt/homebrew/bin/python3
+# resolves into a Cellar directory that is ad-hoc signed and changes with every
+# `brew upgrade`: each upgrade is a new identity that can raise a new consent
+# alert, and while that alert waits every launchd open of the Tart store on
+# /Volumes blocks (m3, 2026-11-16). So the order is:
+#   1. TARTCI_ATTESTATION_PYTHON, when set (an absolute path; refused if unusable);
+#   2. the python.org framework binary, pinned at its real versioned path
+#      (Developer ID signed; stable across patch updates);
+#   3. /usr/bin/python3, once macOS ships one with tomllib;
+#   4. Homebrew or PATH, with a `WARN tcc-risk` line: the watchdog's launchd
+#      lint reports the agent until a stable interpreter is installed.
+FRAMEWORK="${TARTCI_PYTHON_FRAMEWORK_ROOT:-/Library/Frameworks/Python.framework}"
+has_tomllib() { [ -n "$1" ] && [ -x "$1" ] && "$1" -c 'import tomllib' >/dev/null 2>&1; }
+
+framework_python() {
+  local current version dir
+  # Versions/Current names the default minor version; prefer it, then the
+  # newest 3.x present. Pin the versioned binary itself, never a symlink.
+  current="$(readlink "$FRAMEWORK/Versions/Current" 2>/dev/null || true)"
+  local listed=""
+  for dir in "$FRAMEWORK"/Versions/3.*; do
+    [ -d "$dir" ] && listed="$listed ${dir##*/}"
+  done
+  # shellcheck disable=SC2086 # version names are 3.N, split on purpose
+  for version in "$current" $(printf '%s\n' $listed | sort -t. -k2,2nr); do
+    case "$version" in 3.[0-9]|3.[0-9][0-9]) ;; *) continue ;; esac
+    dir="$FRAMEWORK/Versions/$version/bin"
+    [ -f "$dir/python$version" ] && [ ! -L "$dir/python$version" ] || continue
+    if has_tomllib "$dir/python$version"; then
+      printf '%s\n' "$dir/python$version"
+      return 0
+    fi
+  done
+  return 1
+}
+
+choose_python() {
+  local candidate
+  if [ -n "${TARTCI_ATTESTATION_PYTHON:-}" ]; then
+    case "$TARTCI_ATTESTATION_PYTHON" in /*) ;; *)
+      echo "refusing to install: TARTCI_ATTESTATION_PYTHON must be an absolute path: $TARTCI_ATTESTATION_PYTHON" >&2
+      return 1 ;;
+    esac
+    if has_tomllib "$TARTCI_ATTESTATION_PYTHON"; then
+      printf '%s\n' "$TARTCI_ATTESTATION_PYTHON"
+      return 0
+    fi
+    echo "refusing to install: TARTCI_ATTESTATION_PYTHON=$TARTCI_ATTESTATION_PYTHON is missing or has no tomllib" >&2
+    return 1
+  fi
+  if framework_python; then return 0; fi
+  if has_tomllib /usr/bin/python3; then printf '%s\n' /usr/bin/python3; return 0; fi
+  for candidate in /opt/homebrew/bin/python3 /usr/local/bin/python3 "$(command -v python3 || true)"; do
+    if has_tomllib "$candidate"; then
+      echo "WARN tcc-risk: no python.org framework python under $FRAMEWORK; pinning $candidate," \
+           "whose privacy identity can change on upgrade (install python.org Python 3.11+ to fix)" >&2
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
   echo "refusing to install: no python3 on this host has tomllib (3.11+), so the host profile could not be read and every attestation would declare zero lanes without saying so" >&2
+  return 1
+}
+
+if ! PYTHON="$(choose_python)"; then
   exit 1
+fi
+if [ "$PRINT_PYTHON" -eq 1 ]; then
+  printf '%s\n' "$PYTHON"
+  exit 0
 fi
 echo "interpreter:       $PYTHON ($("$PYTHON" -c 'import sys;print(sys.version.split()[0])'))"
 SHA="$(shasum -a 256 "$SRC" | cut -d' ' -f1)"
