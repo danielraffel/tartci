@@ -8,8 +8,15 @@
 # granting NOPASSWD for this path with an EMPTY argument spec, so sudo itself
 # refuses any argument.
 #
-# WHAT IT DOES, EXACTLY: /usr/bin/killall tccd sandboxd. launchd relaunches both
-# on demand. No path, label, signal or argument is accepted; nothing else runs.
+# WHAT IT DOES, EXACTLY: /usr/bin/killall -KILL tccd sandboxd. launchd relaunches
+# both on demand. No path, label, signal or argument is accepted; nothing else
+# runs.
+#
+# WHY SIGKILL: both daemons catch SIGTERM and exit only once they are idle, and
+# a wedged tccd is never idle. On m3 the system tccd (pid 10970, started
+# 2026-11-09) survived every heal since, each of which exited 0 (2026-11-14,
+# 11-16, 11-17), and on 11-17 it sat at ~90% CPU with the store still hung.
+# SIGKILL cannot be caught or deferred.
 #
 # WHY A ROOT ACTION AT ALL: every open() of an external volume from a launchd
 # job needs a Removable Volumes authorization from sandboxd, which asks the
@@ -18,8 +25,10 @@
 # 2026-11-11). Restarting the two daemons clears it without a reboot.
 #
 # THREAT MODEL, STATED PLAINLY: restarting tccd drops in-flight privacy prompts
-# and makes apps re-ask; it changes no grant and reads no database. A principal
-# able to run this can do so at most once per 30 minutes (a stamp in a
+# and makes apps re-ask; it changes no grant and reads no database. TCC.db is
+# SQLite, which survives a killed writer (an uncommitted transaction rolls
+# back); a decision being written at that instant is lost and is asked again.
+# A principal able to run this can do so at most once per 30 minutes (a stamp in a
 # root-only directory under /var/db). The command vector is fixed, so
 # it cannot be bent into any other root action. tartci invokes it only when
 # its three readings agree the hang is tccd (scripts/tcc_wedge.py); the wrapper
@@ -72,7 +81,7 @@ fi
 before_tccd=$(pgrep -x tccd 2>/dev/null | tr '\n' ' ' || true)
 before_sandboxd=$(pgrep -x sandboxd 2>/dev/null | tr '\n' ' ' || true)
 rc=0
-output=$("$KILLALL" tccd sandboxd 2>&1) || rc=$?
+output=$("$KILLALL" -KILL tccd sandboxd 2>&1) || rc=$?
 {
   printf '%s heal uid=%s sudo_user=%s rc=%s tccd_before=[%s] sandboxd_before=[%s]\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(id -u)" "${SUDO_USER:-?}" "$rc" \
@@ -81,7 +90,7 @@ output=$("$KILLALL" tccd sandboxd 2>&1) || rc=$?
 } >>"$LOG" 2>/dev/null || true
 
 if (( rc != 0 )); then
-  die "killall tccd sandboxd exited $rc: $output" "$rc"
+  die "killall -KILL tccd sandboxd exited $rc: $output" "$rc"
 fi
 printf 'tartci-heal-tcc: restarted tccd and sandboxd (tccd was [%s], sandboxd was [%s]); launchd relaunches them on demand\n' \
   "${before_tccd% }" "${before_sandboxd% }"

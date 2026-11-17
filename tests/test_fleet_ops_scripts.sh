@@ -298,7 +298,8 @@ if [ "$(uname -s)" = Darwin ]; then
   has err "must run as root"
   expect_rc 0 "heal: first run" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
   has out "restarted tccd and sandboxd"
-  [ "$(cat "$STUB_STATE/killall.log")" = "tccd sandboxd" ] || fail "heal: killall must receive exactly 'tccd sandboxd', got: $(cat "$STUB_STATE/killall.log")"
+  # SIGKILL: tccd and sandboxd defer SIGTERM until idle, and a wedged tccd never is.
+  [ "$(cat "$STUB_STATE/killall.log")" = "-KILL tccd sandboxd" ] || fail "heal: killall must receive exactly '-KILL tccd sandboxd', got: $(cat "$STUB_STATE/killall.log")"
   [ -e "$tmp/heal.stamp" ] || fail "heal: no stamp written"
   grep -q "heal uid=" "$tmp/heal.log" || fail "heal: no audit line"
   expect_rc 75 "heal: second run within the interval is rate limited" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
@@ -308,7 +309,7 @@ if [ "$(uname -s)" = Darwin ]; then
   # An old stamp (older than 30 min) allows a run again; a failing killall is reported and still stamps.
   touch -t "$(date -v-31M +%Y%m%d%H%M.%S)" "$tmp/heal.stamp"
   expect_rc 3 "heal: killall failure is passed through" -- "${heal_env[@]+"${heal_env[@]}"}" env STUB_KILLALL_RC=3 bash "$HEAL"
-  has err "killall tccd sandboxd exited 3"
+  has err "killall -KILL tccd sandboxd exited 3"
   [ "$(wc -l <"$STUB_STATE/killall.log" | tr -d ' ')" = 2 ] || fail "heal: an old stamp must allow one run"
   expect_rc 75 "heal: a failed attempt still spends the budget" -- "${heal_env[@]+"${heal_env[@]}"}" bash "$HEAL"
 else

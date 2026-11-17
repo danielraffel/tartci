@@ -591,7 +591,7 @@ class WrapperSourceTests(unittest.TestCase):
     def test_wrapper_is_fixed_argument_less_and_rate_limited(self) -> None:
         text = (ROOT / "fleet" / "ops" / "tartci-heal-tcc").read_text()
         self.assertIn('[[ $# -eq 0 ]] || die "takes no arguments"', text)
-        self.assertIn('"$KILLALL" tccd sandboxd', text)
+        self.assertIn('"$KILLALL" -KILL tccd sandboxd', text)
         self.assertEqual(text.count('"$KILLALL"'), 1, "one fixed command vector")
         self.assertIn("MIN_INTERVAL=1800", text)
         self.assertIn("STAMP=$STAMP_DIR/last-heal", text)

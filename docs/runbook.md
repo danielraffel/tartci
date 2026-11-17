@@ -579,7 +579,8 @@ it. Nothing in tartci answers, dismisses or changes a privacy decision.
 
 The heal is one scoped root action and nothing broader:
 `sudo -n /usr/local/sbin/tartci-heal-tcc`, a root-owned wrapper that runs
-exactly `/usr/bin/killall tccd sandboxd` (launchd relaunches both on demand),
+exactly `/usr/bin/killall -KILL tccd sandboxd` (launchd relaunches both on demand;
+SIGKILL because both daemons defer SIGTERM until idle, and a wedged tccd never is),
 takes no arguments (its sudoers grant has an empty argument spec, so sudo
 refuses any), runs at most once per 30 minutes (stamp in the root-only
 `/var/db/tartci-heal-tcc`, plus tartci's own `last_heal` record) and at most
@@ -592,7 +593,7 @@ and records the result; a store that answers again is `action: tcc-healed`.
 re-reads the PIDs of tccd and sandboxd about 5 s later: if they are all the same
 processes the outcome is `heal ineffective` (event `tcc_heal_ineffective` and a
 `WARN tcc-heal ineffective` line), the page continues, and nothing stronger is
-tried. A stronger signal or a wider root helper is the owner's decision.
+tried. A wider root helper is the owner's decision.
 It is installed by hand, once per host:
 
 ```sh
