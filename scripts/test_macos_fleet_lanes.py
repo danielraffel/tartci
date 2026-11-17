@@ -269,6 +269,11 @@ class MacosFleetLaneTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, pattern):
                     fleet.load(path)
 
+    def test_m3_vellum_gate_runs_two_supervisors(self) -> None:
+        vellum = next(lane for lane in fleet.load(HOST_CONFIGS["studio"])["lane"]
+                      if lane["id"] == "vellum-gate")
+        self.assertEqual(vellum["supervisors"], 2)
+
     def test_vm_slot_lending_is_a_policed_boolean_on_the_m5_canary(self) -> None:
         self.assertIs(fleet.load(HOST_CONFIGS["m5"])["leases"]["vm_slot_lending"], True)
         vellum = next(lane for lane in fleet.load(HOST_CONFIGS["m5"])["lane"]
@@ -1100,9 +1105,9 @@ class MacosFleetLaneTests(unittest.TestCase):
                 if host_id == "m5studio":
                     expected_spectr_labels.append("spectr-release")
                 self.assertEqual(spectr_lane["labels"], expected_spectr_labels)
-                expected_spectr_workflows = ["Spectr M5 Product Acceptance"]
-                if host_id == "m5studio":
-                    expected_spectr_workflows.append("Spectr Release")
+                expected_spectr_workflows = [
+                    "Spectr M5 Product Acceptance", "Spectr Release",
+                ]
                 self.assertEqual(spectr_lane["workflows"], expected_spectr_workflows)
                 self.assertEqual(
                     spectr_lane["min_queued_age_seconds"],
