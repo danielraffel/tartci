@@ -2551,6 +2551,90 @@ def drain_timeout_alert(cfg: Config, me: str, busy: list[str] | None, waited: fl
         print(f"self-update: drain-timeout alert failed: {type(exc).__name__}: {exc}", flush=True)
 
 
+# A host this long behind main (its oldest undeployed commit's age past the
+# soak) is STARVED whatever held it: a step-aside, a host fault, the rate
+# limit, a pause or no turn. Those paths never reach defer(), so on
+# 2026-11-17 m3 sat ten hours behind with no STARVED line anywhere.
+BEHIND_STARVED_SECONDS = 4 * 3600
+# At most one behind-main issue per host in this long, across episodes.
+BEHIND_ALERT_REPEAT_SECONDS = 6 * 3600
+BEHIND_ALERT_NAME = "behind-alert.json"
+BEHIND_ALERT_LAST_NAME = "behind-alert-last.json"
+
+
+def behind_main_seconds(skew: dict, soak_seconds: int, now: float) -> float | None:
+    """How long a soaked main commit has waited for this host, or None when
+    the skew does not say (installed commit unknown, main unread)."""
+    if skew.get("state") == "current":
+        return 0.0
+    oldest = _ts(skew.get("oldest_undeployed")) if skew.get("oldest_undeployed") else 0.0
+    if not oldest:
+        return None
+    return max(0.0, now - oldest - soak_seconds)
+
+
+def behind_alert(cfg: Config, skew: dict, now: float) -> None:
+    """A loud STARVED line every attempt while this host is more than
+    BEHIND_STARVED_SECONDS behind main, and one event and issue per episode,
+    at most one issue per BEHIND_ALERT_REPEAT_SECONDS. The issue closes once
+    the host is back inside the bound. Best effort: never raises."""
+    try:
+        behind = behind_main_seconds(skew, cfg.soak_seconds, now)
+        if behind is None:
+            return
+        import host_off  # noqa: PLC0415 - sibling module; owns the issue helpers
+        me = self_host_id(cfg)
+        path = cfg.state_dir / BEHIND_ALERT_NAME
+        last_path = cfg.state_dir / BEHIND_ALERT_LAST_NAME
+        active = behind >= BEHIND_STARVED_SECONDS
+        state = host_off._read_json(path) or {}
+        since = state.get("since") or _iso(now)
+        last = _ts((host_off._read_json(last_path) or {}).get("opened_at"))
+        repeat_ok = bool(state.get("issue")) or now - last >= BEHIND_ALERT_REPEAT_SECONDS
+        if active:
+            print(f"self-update: STARVED: {behind / 3600:.1f} h behind main (oldest undeployed "
+                  f"{skew.get('oldest_undeployed')}, {skew.get('behind')} commits), past the "
+                  f"{BEHIND_STARVED_SECONDS // 3600} h bound", flush=True)
+
+        def render() -> tuple[str, str]:
+            body = "\n".join([
+                "## What happened",
+                f"`{me}` has run tartci {str(skew.get('installed') or '')[:12]} while main moved "
+                f"on: {skew.get('behind')} commits behind, the oldest undeployed from "
+                f"{skew.get('oldest_undeployed')}, {behind / 3600:.1f} h past its soak.", "",
+                "## Evidence",
+                f"- `~/.tartci/state/self-update/skew.json`: {render_skew(skew)[:300]}",
+                "- the newest receipts in `~/.tartci/state/self-update/attempts/` say why "
+                "each attempt did not update (stepped aside, refused, deferred, rate limited)", "",
+                "## Fix", "```sh",
+                "tartci fleet-macos self-update --plan   # every gate that holds the turn",
+                "tartci pool status                      # waiting / stepped-aside line",
+                "```", "",
+                "## Safe to auto-apply",
+                "No. Each gate that refuses protects serving capacity or the host's store; "
+                "fix the named gate.", "",
+                "## How to verify",
+                f"`tartci fleet-macos self-update --plan` reports the host current or under "
+                f"{BEHIND_STARVED_SECONDS // 3600} h behind; this issue then closes itself.",
+            ])
+            title = (f"[tartci] {me} self-update STARVED: {behind / 3600:.1f} h behind main")
+            marker = tartci_incident.marker(me, "self_update_behind", since, since)
+            return title, tartci_incident.with_marker(body, marker)
+
+        out = host_off.episode_alert(
+            path, active=active, resolved=not active, since=since if active else None,
+            raise_event=lambda: host_off.event(
+                cfg.state_dir, "self_update_behind",
+                f"{behind / 3600:.1f} h behind main since {skew.get('oldest_undeployed')}"[:300],
+                {"behind": skew.get("behind"), "installed": str(skew.get("installed"))[:12]}, now),
+            render=render,
+            issues_enabled=os.environ.get("TARTCI_SELF_UPDATE_ISSUE", "1") != "0" and repeat_ok)
+        if active and out.get("issue") and not state.get("issue"):
+            _write_json(last_path, {"opened_at": _iso(now), "issue": out["issue"]})
+    except Exception as exc:  # noqa: BLE001 - an alert never fails the update
+        print(f"self-update: behind-main alert failed: {type(exc).__name__}: {exc}", flush=True)
+
+
 # A gate-demand snapshot older than this is not used: the bound falls back.
 GATE_DEMAND_FRESH_SECONDS = 10 * 60
 
@@ -3568,6 +3652,8 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
               f"@{selected_source['commit'][:12]} (installed from "
               f"{_source_name(installed_fleet_source_commit(cfg))}; {selected_source['why']})")
     print(f"self-update: {render_skew(skew)}")
+    if apply:
+        behind_alert(cfg, skew, now)
     if skew.get("explicit"):
         print(f"self-update: selected {skew.get('selected_target') or 'none'} "
               f"(requested {skew.get('requested_target')}; {skew.get('selection_reason', 'same')})")

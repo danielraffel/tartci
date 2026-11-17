@@ -980,6 +980,71 @@ class HappyPathTests(Base):
         self.assertFalse((self.cfg.state_dir / "last.json").exists())
 
 
+class BehindMainAlertTests(Base):
+    """A host far behind main is STARVED whatever held it, and says so once."""
+
+    def behind_main_for(self, seconds: float) -> None:
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def opened(self) -> list[str]:
+        return [title for kind, title in self.issues if kind == "open"]
+
+    def skew(self, behind: float | None, state: str = "behind") -> dict:
+        oldest = None if behind is None else su._iso(NOW - self.cfg.soak_seconds - behind)
+        return {"state": state, "behind": 3, "installed": INSTALLED, "oldest_undeployed": oldest}
+
+    def test_a_deferred_host_far_behind_is_loud_once(self) -> None:
+        # m3, 2026-11-17: ten hours behind, held by refusals that never
+        # reach defer(), and nothing said STARVED.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+            self.assertDeferred(self.apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn("STARVED", self.opened()[0])
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(1, events.count("self_update_behind"))
+
+    def test_a_host_inside_the_bound_is_quiet(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS - 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_catching_up_closes_the_issue(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert(self.cfg, self.skew(None, state="current"), NOW + 60)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+        self.assertFalse((self.cfg.state_dir / su.BEHIND_ALERT_NAME).exists())
+
+    def test_at_most_one_issue_per_repeat_window(self) -> None:
+        bound = su.BEHIND_STARVED_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound), NOW)
+        su.behind_alert(self.cfg, self.skew(0.0), NOW + 600)  # caught up, closed
+        su.behind_alert(self.cfg, self.skew(bound), NOW + 1200)  # behind again, inside 6 h
+        self.assertEqual(1, len(self.opened()))
+        later = NOW + su.BEHIND_ALERT_REPEAT_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound - 3600 + (later - NOW)), later)
+        self.assertEqual(2, len(self.opened()))
+
+    def test_an_unknown_skew_says_nothing(self) -> None:
+        su.behind_alert(self.cfg, {"state": "unknown", "oldest_undeployed": None}, NOW)
+        self.assertEqual([], self.issues)
+
+    def test_a_plan_never_alerts(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.plan()
+        self.assertEqual([], self.opened())
+
+
 class QueueLightTests(Base):
     """A host drains for an update only while the gate backlog it serves is light."""
 
