@@ -210,6 +210,67 @@ class ApplyTests(unittest.TestCase):
             self.assertTrue(path.exists())
 
 
+class ReclaimPassTests(unittest.TestCase):
+    """state_retention.run is what the hourly reclaim agent calls."""
+
+    def setUp(self) -> None:
+        self.h = Home(self)
+        # Twelve generations a day apart (newest first) and an old per-boot file.
+        self.paths = [self.h.generation(gen_name(i), age_days=i + 3) for i in range(12)]
+        self.old_file = self.h.file("macos/m1-x-01-1-1.jit-error", 90)
+        os.environ.pop("TARTCI_RECLAIM_RETENTION", None)
+
+    def run_pass(self, fix: bool) -> dict:
+        return r.run(fix=fix, home=self.h.home, now=NOW, table=(["launchd"], ["/"]))
+
+    def test_fix_keeps_the_newest_ten_and_the_rollback_target(self) -> None:
+        snap = self.h.home / ".tartci/state/self-update/rollback/20261009T000000Z-x"
+        snap.mkdir(parents=True)
+        (snap / "snapshot.json").write_text(json.dumps({"previous": f"{11:040x}"}))
+        value = self.run_pass(fix=True)
+        self.assertEqual(value["failures"], [])
+        self.assertEqual(value["generations"]["delete"], [gen_name(10)])
+        self.assertFalse(self.paths[10].exists())
+        for i in list(range(10)) + [11]:
+            self.assertTrue(self.paths[i].exists(), gen_name(i))
+        # One old per-boot file is within the newest 50 its directory keeps.
+        self.assertTrue(self.old_file.exists())
+
+    def test_without_fix_nothing_is_deleted(self) -> None:
+        value = self.run_pass(fix=False)
+        self.assertEqual(value["mode"], "plan")
+        self.assertEqual(sorted(value["generations"]["delete"]), [gen_name(10), gen_name(11)])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
+    def test_a_self_update_that_starts_after_the_plan_stops_the_delete(self) -> None:
+        marker = self.h.home / ".tartci/state/self-update/active.json"
+        real_build = r.build_plan
+
+        def build_then_start_update(*args, **kwargs):
+            plan = real_build(*args, **kwargs)
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("{}")
+            return plan
+
+        with mock.patch.object(r, "build_plan", side_effect=build_then_start_update):
+            value = self.run_pass(fix=True)
+        self.assertEqual(value["generations"]["delete"], [])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
+    def test_a_tartci_home_elsewhere_deletes_nothing(self) -> None:
+        os.environ["TARTCI_HOME"] = str(self.h.home / "elsewhere")
+        value = self.run_pass(fix=True)
+        self.assertFalse(value["enabled"])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
+    def test_the_off_switch_and_errors_never_raise(self) -> None:
+        with mock.patch.dict(os.environ, {"TARTCI_RECLAIM_RETENTION": "0"}):
+            self.assertFalse(self.run_pass(fix=True)["enabled"])
+        with mock.patch.object(r, "build_plan", side_effect=OSError("boom")):
+            self.assertIn("boom", self.run_pass(fix=True)["error"])
+        self.assertTrue(all(p.exists() for p in self.paths))
+
+
 class ProcessTableTests(unittest.TestCase):
     """Idle safety rests on the process table, so any doubt about it is None."""
 

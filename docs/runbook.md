@@ -4079,8 +4079,11 @@ read, nothing is deleted. While a self-update marker
 for that pass, since an install may be staging one. Generations are installed
 read-only; `--apply` makes a doomed one writable before removing it.
 
-No agent runs this yet. Run the plan on a host, read it, then `--apply`.
-Scheduling it (for example from the reclaim agent) is a separate decision.
+The hourly reclaim agent runs it at these defaults on every pass: it plans on
+a dry run and deletes under `--fix`, and the result is the receipt's
+`state_retention` section. It deletes nothing when `TARTCI_HOME` names a
+tree other than `~/.tartci`, and `TARTCI_RECLAIM_RETENTION=0` turns it off
+for a pass. `tartci retention` still runs it by hand with other bounds.
 
 ## Fleet scheduling boundary
 
