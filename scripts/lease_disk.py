@@ -11,6 +11,8 @@ import sys
 import threading
 from typing import Any
 
+import disk_available
+
 
 DISK_PROBE_TIMEOUT_S = 15.0
 
@@ -61,8 +63,15 @@ def _disk_probe_impl(
             raise ValueError(
                 f"disk mount mismatch for {path_text!r}: expected {expected_mount}, got {mount}"
             )
-    free = shutil.disk_usage(requested).free
+    usage = shutil.disk_usage(requested)
+    # Free plus what macOS can purge (disk_available.py); raw free under the
+    # floor is taken as it is. A bounded swift read, inside this probe's deadline.
+    measured = disk_available.measure(requested, usage.free, usage.total,
+                                      timeout=DISK_PROBE_TIMEOUT_S / 2)
+    free = measured["available_bytes"]
     return {
+        "raw_free_bytes": measured["raw_free_bytes"],
+        "important_free_bytes": measured["important_free_bytes"],
         "device_id": str(device),
         "mount_path": str(mount),
         "reservation_path": str(requested),

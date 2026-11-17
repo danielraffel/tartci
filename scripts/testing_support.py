@@ -15,6 +15,7 @@ Python 3.9-safe.
 
 from __future__ import annotations
 
+import os
 import unittest
 
 try:
@@ -31,3 +32,9 @@ def skip_module_without_tomllib() -> None:
     """Skip the importing test module under Python < 3.11 (call before its imports)."""
     if not HAVE_TOMLLIB:
         raise unittest.SkipTest(REASON)
+
+
+# Tests mock raw disk numbers; the real macOS purgeable reading (a swift call
+# against the host's actual volume) would swamp them. A test of the purgeable
+# path sets TARTCI_DISK_PURGEABLE=1 and mocks disk_available.important_free_bytes.
+os.environ.setdefault("TARTCI_DISK_PURGEABLE", "0")

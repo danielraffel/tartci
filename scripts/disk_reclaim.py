@@ -77,6 +77,7 @@ import time
 from typing import Any, Iterable, Iterator
 
 import boot_usage
+import disk_available
 import checkout_outputs
 import pulp_reapers
 import gate_ccache_trim
@@ -582,10 +583,13 @@ def free_bytes(path: pathlib.Path) -> int | None:
     at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
-        return bounded_fs_call(lambda: shutil.disk_usage(path).free,
-                               description=f"disk usage {path}", pass_deadline=False)
+        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
+                                description=f"disk usage {path}", pass_deadline=False)
     except OSError:
         return None
+    # Free plus macOS-purgeable (disk_available.py), so reclaim does not read a
+    # volume with room to spare as tight and fall back to its 7-day age gate.
+    return disk_available.measure(path, usage.free, usage.total)["available_bytes"]
 
 
 def used_percent(path: pathlib.Path) -> float | None:
@@ -595,7 +599,10 @@ def used_percent(path: pathlib.Path) -> float | None:
                                 description=f"disk usage {path}", pass_deadline=False)
     except OSError:
         return None
-    return 100.0 * usage.used / usage.total if usage.total else None
+    if not usage.total:
+        return None
+    available = disk_available.measure(path, usage.free, usage.total)["available_bytes"]
+    return 100.0 * (usage.total - available) / usage.total
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:

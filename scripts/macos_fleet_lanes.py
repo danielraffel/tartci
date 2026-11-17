@@ -2398,33 +2398,9 @@ DISK_PROBLEM_PERCENT = 92
 HOME_DISK_PROBLEM_PERCENT = 97
 
 
-# Raw statfs free space below this is pressure whatever macOS says it could
-# purge: purgeable space is reclaimed on demand and with lag, and a build that
-# needs the room now gets ENOSPC first.
-DISK_RAW_FLOOR_BYTES = 20 * 1024 ** 3
-IMPORTANT_CAPACITY_SCRIPT = Path(__file__).with_name("disk_important_capacity.swift")
-IMPORTANT_CAPACITY_TIMEOUT_S = 20
-
-
-def important_free_bytes(path: Path) -> int | None:
-    """Bytes macOS says are available for important usage on `path`'s volume
-    (free plus purgeable), or None when it cannot be read.
-
-    statfs counts only the free blocks: on m5studio it read 49 GB free
-    (98% used) while the same volume reported 560 GB for important usage.
-    Any failure (no swift, a non-APFS volume, a timeout) is None, and the
-    caller falls back to the raw number.
-    """
-    from bounded_subprocess import ObservationError, run_bounded  # noqa: PLC0415
-    try:
-        proc = run_bounded(["/usr/bin/swift", str(IMPORTANT_CAPACITY_SCRIPT), str(path)],
-                           timeout=IMPORTANT_CAPACITY_TIMEOUT_S, operation="important_capacity")
-    except (OSError, ObservationError, ValueError):
-        return None
-    text = proc.stdout.strip()
-    if proc.returncode != 0 or not text.isdigit():
-        return None
-    return int(text)
+# Raw statfs free space below the floor is pressure whatever macOS says it
+# could purge; see disk_available.py.
+from disk_available import DISK_RAW_FLOOR_BYTES, effective_available, important_free_bytes  # noqa: E402,F401
 
 
 def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
@@ -2463,11 +2439,9 @@ def disk_pressure(config: Path, home: Path | None = None) -> list[dict]:
             continue
         important = important_free_bytes(path)
         # Purgeable space counts toward "available", but never past the volume.
-        available = usage.free if important is None else min(max(usage.free, important),
-                                                              usage.total)
+        available, below_floor = effective_available(usage.free, usage.total, important)
         percent = 100.0 * (usage.total - available) / usage.total if usage.total else 0.0
         limit = DISK_PROBLEM_PERCENT if role == "vm_store" else HOME_DISK_PROBLEM_PERCENT
-        below_floor = usage.free < DISK_RAW_FLOOR_BYTES
         state = ("problem" if percent >= limit or below_floor
                  else "warn" if percent >= DISK_WARN_PERCENT else "ok")
         rows.append({"role": role, "path": str(path), "state": state,
