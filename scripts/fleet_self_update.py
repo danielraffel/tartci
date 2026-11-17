@@ -2605,15 +2605,28 @@ def gate_demand_waiting(cfg: Config, me: str = "", now: float | None = None) -> 
     return bool(gate_demand(cfg, me, now)[0])
 
 
-def behind_seconds(skew: dict, soak_seconds: int, now: float) -> float:
+def behind_seconds(skew: dict, soak_seconds: int, now: float, last_turn: float = 0.0) -> float:
     """How long a soaked main commit has waited for this host: the age of the
-    oldest undeployed commit past the soak. Zero when current or unknown.
+    oldest undeployed commit past the soak, counted from no earlier than this
+    host's last turn. Zero when current or unknown.
 
-    Unlike the queue ticket's `since`, no refusal resets it; only an install
-    that moves the host forward does.
+    Unlike the queue ticket's `since`, a pre-drain refusal does not reset it.
+    A turn does, whatever its outcome, so a host whose update fails after the
+    drain waits out a heavy queue again instead of draining every attempt.
     """
     oldest = _ts(skew.get("oldest_undeployed")) if skew.get("oldest_undeployed") else 0.0
-    return max(0.0, now - oldest - soak_seconds) if oldest else 0.0
+    if not oldest:
+        return 0.0
+    return max(0.0, now - max(oldest + soak_seconds, last_turn))
+
+
+def last_turn_at(state_dir: Path) -> float:
+    """When this host last took an update turn: the newest apply receipt that
+    announced (and so drained or was about to). 0.0 when it never has."""
+    return max((_ts(value.get("started_at")) for _, value in _attempts(state_dir)
+                if value.get("mode") == "apply"
+                and any(step.get("step") == "announce" for step in value.get("steps") or ())),
+               default=0.0)
 
 
 def queue_light(cfg: Config, me: str, now: float) -> tuple[bool, str]:
@@ -3840,12 +3853,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
         # so a peer with a lighter queue can take the turn meanwhile.
         light, why_light = queue_light(cfg, me, sys_.now())
         # The bound runs on the longer of this host's place in the queue and
-        # how long it has been behind main. The place alone restarts whenever
+        # how long it has been behind main since its last turn. Being behind
+        # for any reason counts (a red main, a pause, a backoff): the fleet
+        # must not stay on old code, and turns stay one host at a time.
+        # The place alone restarts whenever
         # a pre-drain host fault releases the ticket: m3 on 2026-11-17 lost it
         # to seven store-volume refusals, and each heavy queue after one began
         # a fresh 3 h wait while m3 stayed ten hours behind.
         waited = max(0.0, sys_.now() - my_since)
-        behind = behind_seconds(skew, cfg.soak_seconds, sys_.now())
+        # A same-generation reinstall does not move the host along main.
+        behind = (0.0 if target == installed else
+                  behind_seconds(skew, cfg.soak_seconds, sys_.now(), last_turn_at(cfg.state_dir)))
         if light:
             receipt.step("queue-light", why_light)
         elif max(waited, behind) >= cfg.queue_heavy_max_defer_seconds:

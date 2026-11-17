@@ -1088,6 +1088,43 @@ class QueueLightTests(Base):
         self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 600)
         self.assertSteppedAsideForQueue(self.apply())
 
+    def took_turn_at(self, started: float, status: str = "refused") -> None:
+        """An earlier apply that announced its turn, then ended `status`."""
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-turn.json", {
+            "mode": "apply", "target": T_OLD, "status": status, "started_at": su._iso(started),
+            "steps": [{"step": "announce", "ok": True}]})
+
+    def test_a_turn_restarts_the_behind_main_clock(self) -> None:
+        # A post-drain refusal is neither rate limited nor counted toward the
+        # halt; without this a host far behind would drain at every attempt.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_a_turn_older_than_the_bound_does_not_hold_the_host(self) -> None:
+        # Control, same instrument: the last turn was past the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 60)
+        self.assertUpdated(self.apply())
+        self.assertIn("drains anyway", self.queue_step())
+
+    def test_a_refusal_before_the_turn_is_not_a_turn(self) -> None:
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-x.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 60),
+            "steps": [{"step": "store-volume", "ok": False}]})
+        su._write_json(attempts / "19990101T000001Z-y.json", {
+            "mode": "plan", "status": "planned", "started_at": su._iso(NOW - 30),
+            "steps": [{"step": "announce", "ok": True}]})
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
+        self.took_turn_at(NOW - 900)
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 900)
+
     def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
         self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
         self.assertEqual(su.behind_seconds({}, 1800, NOW), 0.0)
@@ -1095,6 +1132,8 @@ class QueueLightTests(Base):
                          0.0)
         self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW),
                          3600.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW,
+                                           last_turn=NOW - 600), 600.0)
 
     def test_the_bound_is_below_every_starvation_bound(self) -> None:
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_AFTER_SECONDS)
