@@ -87,9 +87,10 @@ if (( lock_rc == 75 )); then
 elif (( lock_rc != 0 )); then
   die "cannot take the lock: lockf exited $lock_rc" 70
 fi
-# Every command substitution below closes fd 9 first (`exec 9>&-` inside it),
-# so neither its subshell nor the command it runs keeps the lock: a child that hangs
-# (pgrep, killall) cannot keep the lock alive after this shell is gone.
+# Every command substitution below that runs pgrep, stat or killall closes
+# fd 9 first (`exec 9>&-` inside it), so neither its subshell nor that command
+# keeps the lock: a child that hangs cannot keep it alive after this shell
+# is gone.
 
 now=$(date +%s)
 stamp_age=""
