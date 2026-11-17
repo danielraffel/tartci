@@ -405,6 +405,13 @@ PRE_CLONE_DEMAND_GONE=0
 CURRENT_SELECTED_QUEUED=""
 LAST_HEARTBEAT_PHASE=""
 STORAGE_HEALTH_STATE="unknown"
+# A healthy store probe is written to the event log when the state changes and
+# then at most once per STORAGE_HEALTH_OK_EVENT_SECS. The probe runs on every
+# idle poll (about 3,700 times a day per lane), the heartbeat already carries
+# the current verdict, and nothing reads the repeated rows: they were 20-90% of
+# every idle lane's events.jsonl. Failures are still written on every probe.
+STORAGE_HEALTH_OK_EVENT_SECS=3600
+STORAGE_HEALTH_OK_EVENT_AT=0
 SUPERVISOR_PID="$$"
 SUPERVISOR_PID_STARTED_AT="$(ps -p "$$" -o lstart= 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
 HOST_NAME="$(hostname -s 2>/dev/null || hostname)"
@@ -1210,9 +1217,15 @@ tartci_storage_health_check(){
   rc="${rc:-0}"
   [ "${PRINT_STORAGE_HEALTH:-0}" = 1 ] && printf '%s\n' "$result"
   if [ "$rc" -eq 0 ]; then
+    local now
+    now="$(date +%s)"
+    if [ "$STORAGE_HEALTH_STATE" != ok ] \
+        || [ $((now - STORAGE_HEALTH_OK_EVENT_AT)) -ge "$STORAGE_HEALTH_OK_EVENT_SECS" ]; then
+      event storage_health "Tart store probe succeeded" \
+        "state=ok" "path=$path"
+      STORAGE_HEALTH_OK_EVENT_AT="$now"
+    fi
     STORAGE_HEALTH_STATE=ok
-    event storage_health "Tart store probe succeeded" \
-      "state=ok" "path=$path"
     return 0
   fi
   reason="$(printf '%s\n' "$result" | tail -1)"
