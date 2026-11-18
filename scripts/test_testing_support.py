@@ -58,5 +58,17 @@ class CiLaneTests(unittest.TestCase):
         )
 
 
+class RunnerGitMaintenanceTests(unittest.TestCase):
+    """Both test runners must turn off git's detached auto-maintenance."""
+
+    def test_prepush_and_ci_disable_auto_maintenance(self) -> None:
+        for rel in ("scripts/prepush.sh", ".github/workflows/ci.yml"):
+            text = (ROOT / rel).read_text()
+            for needle in ("GIT_CONFIG_COUNT", "maintenance.auto", "gc.auto"):
+                self.assertIn(needle, text, f"{rel} lacks {needle}")
+            self.assertRegex(text, r"GIT_CONFIG_VALUE_0[=:] ?\"?false", rel)
+            self.assertRegex(text, r"GIT_CONFIG_VALUE_1[=:] ?\"?0", rel)
+
+
 if __name__ == "__main__":
     unittest.main()
