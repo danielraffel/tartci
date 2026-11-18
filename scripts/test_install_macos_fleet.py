@@ -798,6 +798,17 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("stale hand-placed copy of leased-build", result.stderr)
         self.assertEqual(stale.read_text(), "#!/bin/sh\necho old\n")
 
+    def test_an_existing_leased_build_symlink_is_replaced_not_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        link = self.bin / "leased-build"
+        link.symlink_to(victim)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse(link.is_symlink())
+        self.assertIn("/scripts/leased-build", link.read_text())
+
     def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
         result = self.run_installer(GH_REPO="danielraffel/tartci")
         self.assertEqual(result.returncode, 0, result.stderr)
