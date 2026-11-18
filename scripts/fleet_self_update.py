@@ -259,7 +259,14 @@ class HostFault(Refused):
 
 
 class Deferred(Refused):
-    """Refused only because another host holds, or has waited longer for, a turn."""
+    """Refused only because another host holds, or has waited longer for, a turn.
+    `aside` is set when this host could not read a peer: it cannot take a turn,
+    so its place is kept privately (waiting-aside.json) instead of published,
+    and the starvation bound still runs on it."""
+
+    def __init__(self, message: str, *, aside: bool = False) -> None:
+        super().__init__(message)
+        self.aside = aside
 
 
 class SteppedAside(Refused):
@@ -1575,8 +1582,10 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
       read of X in the last PEER_UNREACHABLE_FRESH_SECONDS failed too. One
       peer that can still reach X means X is alive and may be updating.
     A host that flaps readable/unreadable never qualifies and keeps blocking;
-    STARVED_AFTER_SECONDS reports that. `record` persists the streaks and
-    emits the transition events; a plan reads them without writing.
+    STARVED_AFTER_SECONDS reports that. A host that cannot read a peer
+    (`unread`) keeps its place privately, and the same bound runs on it.
+    `record` persists the streaks and emits the transition events; a plan
+    reads them without writing.
     """
     import host_off  # noqa: PLC0415 - sibling module; owns the event log format
     now = sys_.now()
@@ -1854,7 +1863,19 @@ def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: s
             lines.append(f"- {peer} unreadable since {_iso(float(streak['since']))} "
                          f"({streak.get('reads')} reads; excluded: {bool(streak.get('excluded'))})")
     lines += ["", "**Likely cause and fix.**"]
-    if cause == "dark":
+    aside = bool(ticket.get("stepped_aside"))
+    if aside:
+        # defer(aside=True): this host could not read a peer over its own route.
+        lines += [
+            f"{me} cannot read a peer over its own route ({named[:200]}), so it cannot take a "
+            "turn. It stepped aside: peers that read every host take their turns meanwhile, "
+            "and its place is kept. A peer that the other hosts still read is never "
+            "excluded automatically, so this lasts until the route is back.",
+            f"- On {me}: `ssh <peer> true` for each peer named above, and the fleet-ssh "
+            "route checks (`<peer>-lan`, `<peer>-wifi`) to find the broken route.",
+            "- Safe to auto-apply: no; fix the route, then the next scheduled attempt goes.",
+        ]
+    elif cause == "dark":
         lines += [
             f"A peer this host cannot read holds the turn ({named[:200]}). It stops holding "
             f"it automatically once it has been dark for {PEER_UNREACHABLE_EXCLUDE_SECONDS // 3600} h, "
@@ -1888,9 +1909,12 @@ def starvation_body(cfg: Config, me: str, ticket: dict, waited: float, reason: s
         ]
     lines += [
         "",
-        f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` takes the turn, or "
-        "`~/.tartci/state/self-update/waiting.json` is gone. This issue records the fix "
-        "time on its marker and closes itself when the host gets its turn.",
+        (f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` passes its peers "
+         "step. This issue records the fix time on its marker and closes itself when the "
+         "host gets its turn." if aside else
+         f"**Verify.** On {me}, `tartci fleet-macos self-update --plan` takes the turn, or "
+         "`~/.tartci/state/self-update/waiting.json` is gone. This issue records the fix "
+         "time on its marker and closes itself when the host gets its turn."),
     ]
     marker = tartci_incident.marker(me, "self_update_starved", since, _iso(now))
     return tartci_incident.with_marker("\n".join(lines), marker)
@@ -2767,11 +2791,15 @@ def _gate_queue_path_in(state_dir: Path) -> Path:
     return Path(os.environ.get("TARTCI_GATE_QUEUE_JSON") or str(state_dir / "gate-queue.json"))
 
 
-def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
+def defer(cfg: Config, me: str, target: str, reason: str, now: float, *,
+          aside: bool = False) -> int:
     """Record the deferral; become loud past the starvation bound: one hour
     after the dark-peer exclusion when gate jobs this host serves are queued,
-    STARVED_FALLBACK_SECONDS otherwise or when the demand read failed."""
-    ticket = note_waiting(cfg, me, target, reason, now)
+    STARVED_FALLBACK_SECONDS otherwise or when the demand read failed. With
+    `aside` the place is kept privately, and the bound and reporting are the
+    same: a host that cannot read a peer must not go quiet."""
+    ticket = (step_aside if aside else note_waiting)(cfg, me, target, reason, now)
+    path = cfg.state_dir / (STEPPED_ASIDE_NAME if aside else "waiting.json")
     waited = max(0.0, now - float(ticket["since"]))
     refresh_gate_demand(cfg, me, now)
     demand, demand_errors = gate_demand(cfg, me, now)
@@ -2779,7 +2807,7 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
     # A failed demand read falls back to the long bound, and says so: a blind
     # read is not "no demand".
     ticket["demand_error"] = "; ".join(demand_errors)[:300] or None
-    _write_json(cfg.state_dir / "waiting.json", ticket)
+    _write_json(path, ticket)
     if demand_errors:
         print(f"self-update: gate demand unread ({ticket['demand_error']}); "
               f"starvation bound {STARVED_FALLBACK_SECONDS // 3600} h")
@@ -2798,7 +2826,7 @@ def defer(cfg: Config, me: str, target: str, reason: str, now: float) -> int:
                         "demand_error": ticket.get("demand_error")}, now)
         ticket["starved_evented"] = now
     starvation_issue(cfg, me, ticket, waited, reason, now)
-    _write_json(cfg.state_dir / "waiting.json", ticket)
+    _write_json(path, ticket)
     return EXIT_REFUSED
 
 
@@ -3947,9 +3975,9 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             # peer still refuses on its own reads, so this frees the turn
             # without letting two hosts go out at once.
             if apply and floor_refusal is None and survey.unread:
-                raise SteppedAside(f"{refusal}; stepped aside: this host cannot read "
-                                   f"{', '.join(survey.unread)}, so it cannot take a turn and "
-                                   "peers do not yield to it", quiet=True)
+                raise Deferred(f"{refusal}; stepped aside: this host cannot read "
+                               f"{', '.join(survey.unread)}, so it cannot take a turn and "
+                               "peers do not yield to it", aside=True)
             if apply and floor_refusal is None:
                 raise Deferred(refusal)
             if apply:
@@ -4089,8 +4117,11 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
     except Deferred as exc:
         receipt.step("refused", str(exc), ok=False)
         receipt.value["deferred"] = True
+        if exc.aside:
+            receipt.value["stepped_aside"] = True
         receipt.finish("refused", str(exc))
-        return defer(cfg, me if "me" in locals() else "", target, str(exc), now)
+        return defer(cfg, me if "me" in locals() else "", target, str(exc), now,
+                     aside=exc.aside)
     except SteppedAside as exc:
         step_aside(cfg, me, target, str(exc), now)
         receipt.step("refused", str(exc), ok=False)
@@ -4508,8 +4539,11 @@ class Run:
             self.receipt.step("refused", str(exc), ok=False)
             if isinstance(exc, Deferred):
                 self.receipt.value["deferred"] = True
+                if exc.aside:
+                    self.receipt.value["stepped_aside"] = True
                 self.receipt.finish("refused", str(exc))
-                return defer(self.cfg, self.me, self.target, str(exc), self.sys.now())
+                return defer(self.cfg, self.me, self.target, str(exc), self.sys.now(),
+                             aside=exc.aside)
             self.receipt.finish("refused", str(exc))
             return EXIT_REFUSED
         finally:
@@ -5306,7 +5340,9 @@ def _announce(cfg: Config, sys_: System, me: str, target: str,
         theirs = info["active_age"]
         if theirs is None:
             marker.unlink(missing_ok=True)
-            raise Deferred(f"peer changed after announcing: {info['evidence']}")
+            # Unreadable from here now: step aside, as at the survey.
+            raise Deferred(f"peer changed after announcing: {info['evidence']}",
+                           aside=not info["readable"] or info["clock"] is None)
         mine = max(0.0, sys_.now() - announced)
         if theirs > mine + ANNOUNCE_TIE_SECONDS or (
                 abs(theirs - mine) <= ANNOUNCE_TIE_SECONDS and peer < me):
@@ -5599,7 +5635,10 @@ def waiting_line(state_dir: Path, now: float | None = None) -> str | None:
         if isinstance(aside, dict) and isinstance(aside.get("since"), (int, float)):
             seen = (f" (as of {_iso(float(aside['ts']))})"
                     if isinstance(aside.get("ts"), (int, float)) else "")
-            return (f"self-update: stepped aside, holding no update turn (queued since "
+            # The run that crossed the starvation bound records it on the kept
+            # place too (defer with aside), so a starved host stays loud.
+            word = "STARVED, " if aside.get("starved_evented") else ""
+            return (f"self-update: {word}stepped aside, holding no update turn (queued since "
                     f"{_iso(float(aside['since']))}){seen}: {aside.get('reason')}")
     if not isinstance(ticket, dict) or not isinstance(ticket.get("since"), (int, float)):
         return None

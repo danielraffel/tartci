@@ -2967,7 +2967,9 @@ fleet`), and check GitHub's job history against it with
   `waiting.json` and keeps its place in `waiting-aside.json`, the same way a
   floor refusal does. A host that cannot read the whole fleet cannot take a
   turn, so it must not hold one. Each peer still refuses on its own reads, so
-  this never lets two hosts go out at once. On 2026-11-18 only m1's route to
+  this never lets two hosts go out at once. The starvation bound runs on the
+  kept place as on a published ticket: the event, the issue and exit 3, and
+  `pool status` says `STARVED, stepped aside`. On 2026-11-18 only m1's route to
   m5studio was dark; m1 held the oldest ticket for 3.5 h while m5 and m3,
   which read every peer, yielded to it at every attempt and no host updated.
 - **A host drains only while its gate queue is light.** Once the peers and
