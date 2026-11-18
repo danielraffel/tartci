@@ -172,7 +172,9 @@ def _internal_device_probe(
     errors: List[Dict[str, str]] = []
     for probe in probes:
         try:
-            return device(probe), errors
+            # A later probe that answers makes an earlier miss moot (Linux has no
+            # /System/Volumes/Data), so the misses are reported only when all fail.
+            return device(probe), []
         except OSError as exc:
             errors.append({"label": "internal device probe", "path": probe, "error": str(exc)})
     return None, errors

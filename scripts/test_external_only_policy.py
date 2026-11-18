@@ -112,6 +112,18 @@ class JudgeTests(unittest.TestCase):
         self.assertTrue(verdict["internal_device_errors"])
 
 
+    def test_a_missing_darwin_probe_is_not_an_error_when_the_fallback_answers(self) -> None:
+        def device(path: str) -> int:
+            if path == "/System/Volumes/Data":
+                raise FileNotFoundError(path)
+            return INTERNAL
+
+        with mock.patch.object(eop.sys, "platform", "linux"):
+            verdict = eop.judge([], EXT_ROOT, device=device)
+        self.assertTrue(verdict["internal_device_known"])
+        self.assertEqual(verdict["internal_device_errors"], [])
+
+
 class CollectTests(unittest.TestCase):
     def setUp(self) -> None:
         # Fall back to reading ccache.conf; the host's real ccache must not leak in.
