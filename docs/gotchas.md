@@ -1176,8 +1176,9 @@ not permission to force-remove a worktree.
   - an `in_progress` run updated since the previous discovery and at least
     60 s after its `created_at`.
 
-  Merge groups come first, then requeued runs before merely updated ones,
-  oldest first within each. These reads come from the same slots as
+  Requeued merge groups come first, then the newest merge groups, then other
+  requeued runs (requeued before merely updated, oldest first within each),
+  so a requeued PR run never displaces a merge group. These reads come from the same slots as
   `--merge-group-quota`. The newest quota, the oldest-run reservation and one
   rotating slot keep theirs, so the API-call budget is unchanged. `0`
   restores the old selection.

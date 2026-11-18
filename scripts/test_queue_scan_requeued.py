@@ -166,6 +166,17 @@ class RequeuedRankingTests(unittest.TestCase):
         self.assertIn(101, ids)
         self.assertIn(102, ids)
 
+    def test_requeued_pr_runs_never_displace_a_merge_group(self) -> None:
+        now = datetime.now(timezone.utc)
+        prs = [_run(i, now - timedelta(hours=2, minutes=i), "pull_request", "queued",
+                    now - timedelta(minutes=2)) for i in range(1, 5)]
+        merge = [_run(50, now - timedelta(minutes=30), "merge_group", "in_progress")]
+        fresh = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+                 for i in range(1, 9)]
+        ids = [int(r["id"]) for r in self.scanner()._candidate_runs([*prs, *merge, *fresh], {})[0]]
+        self.assertIn(50, ids)
+        self.assertLessEqual(len(ids), 5)
+
     def test_a_stale_update_is_not_requeued(self) -> None:
         now = datetime.now(timezone.utc)
         runs = [_run(1, now - timedelta(days=3), "merge_group", "queued", now - timedelta(hours=7)),

@@ -588,18 +588,26 @@ class QueueScanner:
         # oldest-run reservation will fire this sweep it costs a slot too.
         reservation = 1 if self._reservation_fires(newest, state) else 0
         slots = max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1)
-        # Requeued runs (an old run whose dependent job is now queued) come
-        # first, from the same slots as the merge-group quota, so every
-        # refresh reads them whatever their age; the newest quota, the
-        # oldest-run reservation and one rotating slot keep theirs.
-        requeued = self._requeued_runs(self._with_remembered(runs, state))[
-            : min(self._requeued_quota(), slots)]
-        requeued_ids = {int(run["id"]) for run in requeued}
-        merge_quota = min(self._merge_group_quota(), slots - len(requeued))
-        priority = requeued + [
+        # Requeued runs (an old run whose dependent job is now queued) are read
+        # whatever their age, from the same slots as the merge-group quota:
+        # requeued merge groups first, then the newest merge groups, then
+        # other requeued runs, so a requeued PR run never displaces a merge
+        # group. The newest quota, the oldest-run reservation and one rotating
+        # slot keep theirs.
+        requeued_quota = min(self._requeued_quota(), slots)
+        requeued = self._requeued_runs(self._with_remembered(runs, state))
+        requeued_mg = [run for run in requeued if run.get("event") == "merge_group"][:requeued_quota]
+        taken = {int(run["id"]) for run in requeued_mg}
+        merge = [
             run for run in newest
-            if run.get("event") == "merge_group" and int(run["id"]) not in requeued_ids
-        ][:merge_quota]
+            if run.get("event") == "merge_group" and int(run["id"]) not in taken
+        ][: min(self._merge_group_quota(), slots - len(requeued_mg))]
+        taken |= {int(run["id"]) for run in merge}
+        requeued_other = [
+            run for run in requeued
+            if run.get("event") != "merge_group" and int(run["id"]) not in taken
+        ][: max(0, min(requeued_quota - len(requeued_mg), slots - len(requeued_mg) - len(merge)))]
+        priority = requeued_mg + merge + requeued_other
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
