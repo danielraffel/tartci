@@ -398,8 +398,8 @@ SERVING_BLOCKED_LAST_PHASE=""
 SERVING_BLOCKED_CAUSE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
-# The run id of the job this lane served last (capture_current_job). run_one
-# resets it, so it never names an earlier VM's run.
+# The run id of the job this lane served last (capture_current_job). The
+# per-VM work entry resets it, so it never names an earlier VM's run.
 LAST_SERVED_RUN_ID=""
 # 1 when the last work entry declined to clone because the opt-in pre-clone
 # demand check found its class empty or a preferred class waiting.
