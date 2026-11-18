@@ -1545,6 +1545,7 @@ class Survey:
     off: list[str]                  # off and not updating: left to the capacity floor
     excluded: list[str]             # unreachable long enough to stop holding the turn
     notes: list[str]                # why each excluded peer is excluded
+    unread: list[str] = dataclasses.field(default_factory=list)  # blocking peers this host cannot read
 
 
 def peer_streaks(cfg: Config) -> dict[str, dict]:
@@ -1631,17 +1632,20 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
     busy: list[str] = []
     waiting: dict[str, float] = {}
     off: list[str] = []
+    unread: list[str] = []
     for peer, info in infos.items():
         if peer in excluded:
             continue
         if info["busy"]:
             busy.append(info["evidence"])
+            if not info["readable"]:
+                unread.append(peer)
         elif info.get("off"):
             off.append(peer)
             continue
         if info["since"] is not None:
             waiting[peer] = info["since"]
-    return Survey(busy, waiting, off, excluded, notes)
+    return Survey(busy, waiting, off, excluded, notes, sorted(unread))
 
 
 def queue_ahead(me: str, my_since: float, waiting: dict[str, float]) -> list[str]:
@@ -3932,6 +3936,17 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
             refusal = ("another fleet host is not serving normally: " + "; ".join(busy) if busy
                        else "yielding the update turn to a host that has waited longer: "
                        + ", ".join(ahead))
+            # A host that cannot read a peer cannot take a turn, so it must not
+            # hold one: it steps aside and keeps its place privately. On
+            # 2026-11-18 only m1's route to m5studio was dark; m1 deferred with
+            # the oldest ticket for 3.5 h while m5 and m3, which read every
+            # peer, yielded to it at every attempt and no host updated. Each
+            # peer still refuses on its own reads, so this frees the turn
+            # without letting two hosts go out at once.
+            if apply and floor_refusal is None and survey.unread:
+                raise SteppedAside(f"{refusal}; stepped aside: this host cannot read "
+                                   f"{', '.join(survey.unread)}, so it cannot take a turn and "
+                                   "peers do not yield to it", quiet=True)
             if apply and floor_refusal is None:
                 raise Deferred(refusal)
             if apply:

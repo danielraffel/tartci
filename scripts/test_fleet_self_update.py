@@ -1353,8 +1353,9 @@ class OneAtATimeTests(Base):
         self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 60}
         self.assertDeferred(self.apply())
         self.sys.peer_markers.clear()
-        del self.sys.peers["m5"]  # unreachable
-        self.assertDeferred(self.apply())
+        del self.sys.peers["m5"]  # unreachable: refused too, but steps aside (no ticket)
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertIn("SSH transport failed", su.waiting_ticket(self.cfg)["reason"])
         self.assertEqual(self.sys.mutations(), [])
 
     def test_stale_peer_marker_is_ignored(self) -> None:
@@ -1784,6 +1785,91 @@ class UpdateQueueTests(Base):
         su._demand_fetch = lambda: fetch
         self.addCleanup(setattr, su, "_demand_fetch", original)
         return paths
+
+    def last_receipt(self) -> dict:
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(receipts[-1].read_text())
+
+    def test_a_peer_this_host_cannot_read_frees_the_turn_and_keeps_the_place(self) -> None:
+        # 2026-11-18: only m1's route to m5studio was dark. m1 deferred with
+        # the oldest ticket for 3.5 h, and m5 and m3, which read every peer,
+        # yielded to that ticket at every attempt; no host updated.
+        since = NOW - 6 * 3600
+        self.ticket(since=since)
+        del self.sys.peers["m5"]  # this host cannot read m5
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [], "refused before any drain")
+        # Peers read waiting.json: with it gone they no longer yield to this host.
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        kept = su.waiting_ticket(self.cfg)
+        self.assertEqual(kept["since"], since, "the place in the queue is kept privately")
+        self.assertIn("cannot read m5", kept["reason"])
+        self.assertTrue(self.last_receipt().get("stepped_aside"))
+
+    def test_a_dark_route_beside_a_live_updater_still_frees_the_turn(self) -> None:
+        self.ticket(since=NOW - 6 * 3600)
+        del self.sys.peers["m5"]
+        self.sys.peer_markers["m3"] = {"host_id": "studio", "target": T_OLD, "ts": NOW - 60}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertIn("self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_readable_updating_peer_still_defers_and_publishes(self) -> None:
+        # Control, same instrument: every peer is readable and one is updating.
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+        self.sys.peer_markers["m3"] = {"host_id": "studio", "target": T_OLD, "ts": NOW - 60}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], since)
+        self.assertFalse((self.cfg.state_dir / "waiting-aside.json").exists())
+
+    def test_a_peer_that_reads_everyone_takes_the_turn_the_dark_route_freed(self) -> None:
+        # Both sides through the same instrument. First the head of the queue
+        # (oldest ticket) cannot read m5; whatever it publishes is what its
+        # peers will read.
+        self.ticket(since=NOW - 6 * 3600)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        path = self.cfg.state_dir / "waiting.json"
+        published = json.loads(path.read_text()) if path.exists() else None
+        # Then this fixture plays a peer that reads every host, joined the
+        # queue later, and sees the head's published ticket as studio's.
+        for name in ("waiting.json", su.STEPPED_ASIDE_NAME):
+            (self.cfg.state_dir / name).unlink(missing_ok=True)
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.ticket(since=NOW - 3600)
+        if published is not None:
+            published.update(host_id="studio", ts=self.sys.clock - 60)
+        self.sys.peer_waiting["m3"] = published
+        self.assertUpdated(self.apply())
+
+    def test_the_kept_place_goes_first_once_the_route_is_back(self) -> None:
+        since = NOW - 6 * 3600
+        self.ticket(since=since)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        # The route is back; studio joined the queue later and yields to the kept place.
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.sys.peer_waiting["m3"] = {"host_id": "studio", "since": since + 600,
+                                       "ts": self.sys.clock - 60}
+        self.assertUpdated(self.apply())
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+    def test_a_route_back_to_a_peer_mid_update_defers_and_never_drains(self) -> None:
+        # Stepping aside never lets two hosts go out: once m5 is readable its
+        # live marker refuses this host as before.
+        self.ticket(since=NOW - 2 * 3600)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": self.sys.clock - 60}
+        self.assertDeferred(self.apply())
+        self.assertFalse(any("pool drain" in m for m in self.sys.mutations()))
 
     def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
         # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
