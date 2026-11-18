@@ -91,10 +91,19 @@ def latest_release(cache_path, now=None, ttl=CACHE_TTL_SECS, fetch=None):
     return cached.get("latest") if cached else None
 
 
+def lane_log_globs(state_dir):
+    """Where macOS lanes keep runner logs: `state_dir` itself, and each fleet
+    lane's own directory beside it (`<state>/macos-fleet/<lane>/`)."""
+    fleet = os.path.join(os.path.dirname(os.path.normpath(state_dir)), "macos-fleet", "*")
+    return [os.path.join(state_dir, "*.actions-runner.log"),
+            os.path.join(fleet, "*.actions-runner.log")]
+
+
 def scan_logs(state_dir, pinned):
     """Lane runner logs whose listener reported the pinned version retired."""
     hits = []
-    for path in glob.glob(os.path.join(state_dir, "*.actions-runner.log")):
+    paths = [p for pattern in lane_log_globs(state_dir) for p in glob.glob(pattern)]
+    for path in sorted(paths):
         try:
             with open(path, errors="replace") as f:
                 version = find_deprecated(f.read())

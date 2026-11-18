@@ -3585,6 +3585,73 @@ arrive, and a host that did not get it is loud:
 3. On the new machine: install, then `tartci fleet-macos self-update --peers`
    to see every peer it will check and the target it resolves to.
 
+### Runner agent age in the goldens (`tartci doctor runner-age`)
+
+Every job VM is cloned from a golden that carries the GitHub Actions runner
+agent at `~/actions-runner`. GitHub retires old runner versions; a retired
+agent registers, prints `Runner version vX is deprecated and cannot receive
+messages` and exits, so every clone of a golden that carries it fails the same
+way. A Linux pool stopped for 13 days this way with nothing alerting.
+
+- **What it reports.** Per golden on this host (`pulp-build-runner`,
+  `pulp-linux-build`), the runner its VMs run and a verdict. `fail`: a runner
+  log shows GitHub refusing that version (`Runner version vX is deprecated and
+  cannot receive messages`). The watchdog pass remembers a refusal in
+  `~/.tartci/state/golden-runner/<golden>.refused.json`, so the alert stays
+  after the log ages out or the lane stops trying, and clears only when the
+  version changes. `warn`: the version
+  trails the latest `actions/runner` release by two minor versions or more.
+  `ok` otherwise. `unknown`: the version has no record, the latest release
+  could not be read, or the local Tart images could not be listed (then nothing
+  is judged, because the host may not hold the golden).
+- **One rule.** The lag verdict comes from `scripts/runner_version.py`, the rule
+  the macOS pin check already uses, so the two cannot disagree about how far
+  behind is too far. Refusals are read from every lane's recent runner logs,
+  including the fleet lanes' directories under `state/macos-fleet/`. There is no
+  date arithmetic: GitHub's actual retirement dates do not follow a fixed
+  number of days after a release, and the refusal line is the direct signal.
+- **Where the version comes from.** Nothing boots a golden to read it.
+  For `pulp-build-runner` it is the supervisor's pin
+  (`providers/tart-macos/runner.sh --print-runner-version`), because the macOS
+  lane installs that pin into every VM and the golden's own copy never runs.
+  For a Linux golden it is a record in
+  `~/.tartci/state/golden-runner/<golden>.json`. `providers/tart-linux/provision.sh`
+  writes one when the golden it provisions already carries a runner; it does
+  not install or update the runner.
+- **Where it shows.** `tartci doctor runner-age [--json]` (exit 1 on `fail`), a
+  section in bare `tartci doctor`, and the tool-freshness refresh the launchd
+  watchdog runs.
+- **What alerts.** Only `fail`, a live refusal. It joins the tool-freshness
+  problem, which reaches `tartci doctor fleet` as `tool_freshness_stale` and the
+  watchdog WARN. `warn` and `unknown` are doctor output and never a problem: a
+  lag warning would fire on every host whenever upstream ships two releases,
+  its text would change with each release, and it depends on a release lookup
+  that can be stale. The problem text names only the refused version.
+- **Setting** in `~/.config/tartci/tool-freshness.toml`:
+
+      [runner_age]
+      goldens = ["pulp-build-runner", "pulp-linux-build"]
+
+- **Runtime symptom.** The macOS supervisor backs off and records
+  `runner_version_deprecated` when a listener says it is retired. The Linux
+  supervisor also logs a named `runner_version_deprecated:` line for the same
+  output, whatever the runner's exit status.
+- **Remedy, macOS.** Bump `DEFAULT_RUNNER_VERSION` and its checksum in
+  `providers/tart-macos/runner.sh`.
+- **Remedy, Linux.** Boot the golden, replace `~/actions-runner` with the
+  current `actions-runner-linux-arm64` release (keep `.env` and `.path`), shut
+  it down, then record what it now carries:
+
+      python3 scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+      tartci fleet-macos tool-freshness --refresh
+
+  `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
+  version. The record is per host, so repeat it on every host that holds the
+  golden, including after a golden sync. Recording a version other than the
+  refused one clears the `fail`, unless a log written after the record still
+  shows a refusal; the refresh makes the watchdog's stored result catch up at
+  once.
+
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
 The 2026-09-22 incident was a raw `launchctl kickstart` by an agent on a lane

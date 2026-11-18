@@ -314,6 +314,22 @@ python3 "$HOME/.local/lib/tartci/pulp-render-generation.py" \
 test -s "$HOME/.config/tartci/pulp-render-generation.json"
 GUEST
 
+# Record the runner agent version the golden carries, so `tartci doctor
+# runner-age` can read it later without booting the golden. Best effort: a
+# golden with no record reports "unknown", never "ok".
+runner_probe='"$HOME/actions-runner/bin/Runner.Listener" --version'
+if [ "$GUEST_TRANSPORT" = "ssh" ]; then
+  runner_version="$(ssh -n ${SSH_OPTS[@]+"${SSH_OPTS[@]}"} -i "$SSH_KEY" "$VM_USER@$IP" "$runner_probe" 2>/dev/null | head -n1 || true)"
+else
+  runner_version="$(tart exec "$NAME" bash -c "$runner_probe" 2>/dev/null | head -n1 || true)"
+fi
+if [ -n "$runner_version" ] && python3 "$ROOT/scripts/runner_age.py" record \
+    --golden "$NAME" --version "$runner_version" --source provision >/dev/null; then
+  note "recorded Actions runner $runner_version for $NAME"
+else
+  note "could not record the Actions runner version for $NAME; tartci doctor runner-age will report it unknown"
+fi
+
 note "§stop $NAME — golden ready. Tag it: tart stop $NAME (then keep as :latest, or"
 note "  rename to a dated tag). run.sh clones it per job."
 tart stop "$NAME" >/dev/null 2>&1 || true
