@@ -2566,9 +2566,13 @@ alert, so its peers raise it.
   `~/.tartci/state/tool-freshness/state.json`. A peer more than one Shipyard
   release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 3 h
   (`TARTCI_SHIPYARD_DRIFT_HOURS`, 3, counted on the peer's clock from the
-  first release newer than what it runs) behind the latest release opens
-  `[tartci] <peer> Shipyard behind the latest release since <that time>`. So
-  does a peer whose freshness was last measured more than 6 h ago, since a
+  pass at which the peer first saw the first release newer than what it runs
+  published, `behind_published_since`; a peer on an older TartCI reports only
+  the tag time, `behind_since`) behind the latest release opens
+  `[tartci] <peer> Shipyard behind the latest release since <that time>`. A
+  Shipyard tag sits in draft until its macOS assets are uploaded, and that
+  window is not rollout time. So
+  does a peer whose freshness was last measured more than 3 h ago, since a
   host whose watchdog stopped cannot report itself. The body quotes the
   peer's own apply line (`waiting for steward host studio: ...`), so it names
   the gate that holds it. It closes when a fresh reading says `current`, and
@@ -3259,10 +3263,12 @@ arrive, and a host that did not get it is loud:
   (`~/.local/state/pulp/host_vitals.json`), warning above 1024 MB; the remedy is
   `sudo killall fseventsd`, which nothing here runs.
 - **When it refreshes.** Every watchdog pass, at most every 30 minutes, and
-  every 5 minutes while a release is in motion on the host (a tool `waiting`
-  for its apply age, the canary, a steward host or a steward verdict, or a
-  steward verdict pending in `steward.json`), so each host acts on its gate
-  within one 5-minute pass instead of up to 30 minutes per hop. A hold, a
+  on every 5-minute watchdog pass (an interval of 240 s, under the pass
+  interval, so no pass is skipped) while a release is in motion on the host:
+  a tool `waiting` for its apply age, the canary, a steward host or a steward
+  verdict, a release not ready yet, or a steward verdict pending in
+  `steward.json`. Each host then acts on its gate within one 5-minute pass
+  instead of up to 30 minutes per hop. A hold, a
   spent attempt or a rejected release keeps the 30-minute interval;
   `tartci fleet-macos tool-freshness --refresh` measures now.
 - **Cached lines carry an age limit.** Every status line read from a cached
@@ -3354,12 +3360,18 @@ arrive, and a host that did not get it is loud:
   a steward host also waits for every steward host to have deployed the
   release and recorded `tool_steward_verified` for it, whatever its deploy
   event says. With the defaults the order is m5s, then m3 (30 minutes after
-  m5s's deploy), then m1 and m5 (after m3's clean tick), so a release that
-  breaks the steward stops on m3. Every host is on a Shipyard release in
-  under 2 h: m5s at 30 minutes (or at publication when its release script
-  installed it), m3 about 35 minutes after
-  that, its verdict on the next complete steward tick (5 to 10 minutes), and
-  m1 and m5 on their next 5-minute pass. The drift alert below fires at 3 h.
+  m5s's deploy), then m1 (after m3's clean tick), so a release that breaks the
+  steward stops on m3. m5 follows m3 like m1 once it is no longer listed in
+  `former_canaries`; while it is listed it applies first with m5s, and a
+  former canary's deploy also clears the canary step for the hosts behind it
+  (a new canary still on the older TartCI waits for m5 and for m3, so m3 must
+  not wait for the new canary alone). Every host is on a Shipyard release
+  within about 1 h 45 min of publication: the canary sees it on its next pass
+  (up to 30 minutes, or at publication when the release script installed it
+  there), soaks 30 minutes, m3 applies on its next 5-minute pass, the next
+  complete steward tick judges it (10 to 15 minutes with the pass that reads
+  it), and m1 then applies on its next pass. The drift alert below fires at
+  3 h, counted from publication.
   To pause the whole rollout, hold the canary (`[tools.shipyard] auto_apply =
   false` in m5s's `tool-freshness.toml`, and in m5's while m5 is listed in
   `former_canaries`): every host waits behind it. A bad

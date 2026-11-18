@@ -300,38 +300,49 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
         # still guards every host behind it, and while the entry is listed a
         # rollout pause holds both canaries (docs/runbook.md).
         return newest, f"former canary {me}: applies first until every host reads canary {canary}"
-    # (host, needs a clean steward tick): the canary, then for a tool with a
-    # steward check every steward host other than this one.
-    # A canary that is also a published steward host must show a clean steward
-    # tick, whatever its own deploy event says: that flag is written by the
-    # canary's checkout, and a stale one there would weaken every reader's gate.
-    required = [(canary, bool(tool.get("steward_check"))
-                 and canary in roles["steward_hosts"])]
-    if tool.get("steward_check"):
-        required += [(host, True) for host in roles["steward_hosts"]
-                     if host not in (me, canary)]
+    # Each slot is (role, hosts that can clear it). The canary slot comes
+    # first, then for a tool with a steward check every steward host other
+    # than this one. A host needs a clean steward tick when it is a published
+    # steward host, whatever its own deploy event says: that flag is written by
+    # its checkout, and a stale one there would weaken every reader's gate.
+    # While former_canaries is listed, a former canary's deploy clears the
+    # canary slot too: a new canary still on the older TartCI generation waits
+    # for the former canary and for the steward host, so a steward host on the
+    # new generation that waited only for the new canary would wait for a host
+    # waiting on it.
+    stewards = roles["steward_hosts"] if tool.get("steward_check") else []
+    slots = [("canary", [canary] + [h for h in roles["former_canaries"] if h != me])]
+    slots += [("steward host", [host]) for host in stewards if host not in (me, canary)]
     reads = context.setdefault("reads", {})
     # A host's tool-freshness.toml value wins, then the tool's own default.
     soak = float(settings.get("canary_soak_hours",
                               tool.get("canary_soak_hours", CANARY_SOAK_HOURS)))
-    for host, _ in required:
-        if host not in reads:
-            reads[host] = read_host(host, me, settings, state, now, run)
-        if "error" in reads[host]:
-            role = "canary" if host == canary else "steward host"
-            return None, f"waiting for {role} {host}: unreadable ({reads[host]['error']})"
+    for role, hosts in slots:
+        for host in hosts:
+            if host not in reads:
+                reads[host] = read_host(host, me, settings, state, now, run)
+        if all("error" in reads[host] for host in hosts):
+            return None, (f"waiting for {role} {hosts[0]}: unreadable "
+                          f"({reads[hosts[0]]['error']})")
     why = ""
     for candidate in reversed(soaked):
         version = str(candidate.get("version"))
         notes, blocked = [], None
-        for host, steward in required:
-            ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name, version,
-                                    soak, require_steward=steward)
-            role = "canary" if host == canary else "steward host"
-            if not ok:
-                blocked = f"{role} {host}: {candidate.get('tag')} {why_one}"
+        for role, hosts in slots:
+            first = None
+            for host in hosts:
+                if "error" in reads[host]:
+                    continue
+                ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name,
+                                        version, soak, require_steward=host in stewards)
+                label = role if host == hosts[0] else "former canary"
+                if ok:
+                    notes.append(f"{label} {host}: {why_one}")
+                    break
+                first = first or f"{label} {host}: {candidate.get('tag')} {why_one}"
+            else:
+                blocked = first or f"{role} {hosts[0]}: unreadable"
                 break
-            notes.append(f"{role} {host}: {why_one}")
         if blocked is None:
             return candidate, "cleared by " + "; ".join(notes)
         if candidate is newest:

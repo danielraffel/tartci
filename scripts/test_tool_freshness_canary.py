@@ -237,13 +237,43 @@ class CanaryGateTests(_Fleet):
         self.assertEqual(former.fleet_updates(), ["v0.221.1"])
         self.assertIn("former canary m5: applies first", row["canary"])
         self.assertFalse(any(c[0] == "ssh" for c in former.calls))
-        # A reader on the new generation waits for the new canary, not the former.
+
+    def test_a_former_canary_deploy_clears_the_canary_slot_while_listed(self) -> None:
+        # m3 on the new generation, m5studio still on the old one: m5studio waits
+        # for m5 and for m3's steward verdict, so m3 must not wait for m5studio.
+        roles = {"canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": ["m5"]}
+        targets = {"m5studio": "m5s", "m5": "m5", "studio": "m3"}
+        steward = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 40 * MIN))})
+        row = self.refresh(steward, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(steward.fleet_updates(), ["v0.221.1"])
+        self.assertIn("former canary m5", row["tools"]["shipyard"]["canary"])
+        # Neither canary has soaked: the wait names the new canary.
         self.switch_host()
-        reader = self.behind({"m5s": canary_events(), "m5": canary_events(
+        young = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 10 * MIN))})
+        row = self.refresh(young, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(young.fleet_updates(), [])
+        self.assertIn("waiting for canary m5studio", row["tools"]["shipyard"]["apply"])
+        # An unreadable new canary does not stall the slot a former canary cleared.
+        self.switch_host()
+        dark = self.behind({"m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+        self.refresh(dark, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(dark.fleet_updates(), ["v0.221.1"])
+        # The steward stage still holds every host behind it.
+        self.switch_host()
+        later = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 3 * HOUR)), "m3": canary_events()})
+        row = self.refresh(later, "m1", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(later.fleet_updates(), [])
+        self.assertIn("waiting for steward host studio", row["tools"]["shipyard"]["apply"])
+        # With no former canary listed, m5's deploy no longer clears anything.
+        self.switch_host()
+        moved = self.behind({"m5s": canary_events(), "m5": canary_events(
             deployed("0.221.1", NOW - 3 * HOUR))})
-        row = self.refresh(reader, "studio", tool_rollout=roles,
-                           ssh_targets={"m5studio": "m5s", "m5": "m5", "studio": "m3"})
-        self.assertEqual(reader.fleet_updates(), [])
+        row = self.refresh(moved, "studio", ssh_targets=targets,
+                           tool_rollout={"canary": "m5studio", "steward_hosts": ["studio"]})
+        self.assertEqual(moved.fleet_updates(), [])
         self.assertIn("waiting for canary m5studio", row["tools"]["shipyard"]["apply"])
 
     def test_shipyard_soaks_half_an_hour_pulp_two_and_a_host_setting_wins(self) -> None:

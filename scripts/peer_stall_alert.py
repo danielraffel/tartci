@@ -320,7 +320,11 @@ def shipyard_drift_judge(info: Dict[str, Any], max_releases: int,
     if not isinstance(row, dict) or measured is None or not isinstance(clock, (int, float)):
         return {"active": False, "resolved": False, "since": None, "state": "unknown"}
     state = str(row.get("state") or "unknown")
-    behind_since = _epoch(row.get("behind_since"))
+    # Dated from when the peer first saw the release published, not from its
+    # tag: the draft window before the macOS assets upload is not rollout time.
+    # A peer on an older TartCI writes only the tag time.
+    since_text = row.get("behind_published_since") or row.get("behind_since")
+    behind_since = _epoch(since_text)
     hours = max(0.0, (float(clock) - behind_since) / 3600) if behind_since else 0.0
     try:
         releases = int(row.get("releases_behind") or 0)
@@ -334,7 +338,7 @@ def shipyard_drift_judge(info: Dict[str, Any], max_releases: int,
                "behind_hours": round(hours, 1), "apply": row.get("apply"),
                "measured_at": value.get("measured_at")}
     if drifted:
-        since = row.get("behind_since")
+        since = since_text
     elif unmeasured:
         since = value.get("measured_at")
     else:

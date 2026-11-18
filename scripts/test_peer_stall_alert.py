@@ -503,7 +503,7 @@ def freshness(state: str = "behind", releases: int = 3, behind_since: str = "202
 
 
 class ShipyardDrift(unittest.TestCase):
-    """A host more than one release or 6 h behind the latest Shipyard is reported."""
+    """A host more than one release or 3 h behind the latest Shipyard is reported."""
 
     setUp = PeerStall.setUp
     issue = PeerStall.issue
@@ -550,6 +550,22 @@ class ShipyardDrift(unittest.TestCase):
         since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)
         self.assertTrue(self.drift(freshness(releases=1, behind_since=since))["active"])
         self.assertEqual(len(self.titles()), 1)
+
+    def test_the_draft_window_does_not_count_toward_drift(self):
+        # The tag (behind_since) is 3.5 h old, but the release was published, and
+        # first seen by the peer, 1 h ago: the rollout is inside its bound.
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 3.5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = psa.iso(DRIFT_CLOCK - 3600)
+        self.assertFalse(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_drift_since_names_the_first_published_time(self):
+        published = psa.iso(DRIFT_CLOCK - 3.2 * 3600)
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = published
+        self.assertTrue(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [
+            f"[tartci] m1 Shipyard behind the latest release since {published}"])
 
     def test_the_limits_come_from_the_environment(self):
         since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)

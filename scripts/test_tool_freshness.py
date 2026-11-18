@@ -833,8 +833,10 @@ class ToolFreshnessTests(unittest.TestCase):
         before = len(host.calls)
         self.refresh(host, NOW + 120, if_older=1800)
         self.assertEqual(len(host.calls), before, "inside the rollout interval: cached")
-        self.refresh(host, NOW + 310, if_older=1800)
-        self.assertGreater(len(host.calls), before, "a waiting release refreshes at 5 min")
+        # The next watchdog pass, which can land a few seconds under 300 s after
+        # the cached measurement, must refresh rather than wait a second pass.
+        self.refresh(host, NOW + 295, if_older=1800)
+        self.assertGreater(len(host.calls), before, "a waiting release refreshes every pass")
 
     def test_a_pending_steward_verdict_refreshes_every_watchdog_pass(self) -> None:
         host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
@@ -852,6 +854,40 @@ class ToolFreshnessTests(unittest.TestCase):
             {"shipyard": {"version": "0.221.1", "gave_up": True}}))
         self.refresh(host, NOW + 640, if_older=1800)
         self.assertEqual(len(host.calls), before, "a rollback given up on is not motion")
+
+    def test_a_release_not_ready_yet_refreshes_every_watchdog_pass(self) -> None:
+        # The not-ready line reads "... not ready yet (...), waiting", which does
+        # not start with "waiting"; a failed download is still a rollout in motion.
+        cached = {"tools": {"shipyard": {
+            "state": "behind", "apply": "v0.221.1 not ready yet (download failed), waiting",
+            "not_ready": {"target": "v0.221.1", "since": "t", "hours": 0.1}}}}
+        self.assertTrue(tf.rollout_in_motion(cached, {}))
+
+    def test_drift_is_dated_from_the_pass_that_first_saw_the_release(self) -> None:
+        host = Host({"shipyard": "0.221.1", "pulp": "0.877.2"})
+        # fleet-update fails here (no apply_installs), and a failed apply
+        # re-measures the tool: the first sighting must survive that.
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "current")
+        self.assertEqual(row["published_seen"], {})
+        # v0.221.2 was tagged 2 h ago (a long draft) and is first seen ready now.
+        self.feeds["danielraffel/Shipyard"] = feed(
+            ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 20 * HOUR),
+            ("v0.221.2", NOW - 2 * HOUR))
+        later = NOW + 1900
+        row = self.refresh(host, later, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_since"], tf._iso(NOW - 2 * HOUR))
+        self.assertEqual(row["behind_published_since"], tf._iso(later))
+        # The first sighting is kept, not moved by later passes.
+        row = self.refresh(host, later + 1900, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], tf._iso(later))
+
+    def test_a_row_without_the_map_falls_back_to_the_tag_time(self) -> None:
+        # The first pass after TartCI updates has no record of when the release
+        # was first seen: the tag time is the safe (earliest) answer.
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        row = self.refresh(host)["tools"]["shipyard"]
+        self.assertEqual(row["behind_published_since"], tf._iso(NOW - 20 * HOUR))
 
     def test_held_or_spent_releases_keep_the_normal_interval(self) -> None:
         for apply in ("HELD: auto_apply = false in x until y",
