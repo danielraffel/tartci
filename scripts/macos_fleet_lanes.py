@@ -621,8 +621,8 @@ def load(path: Path) -> dict:
             fail("host.external_root must contain host.tart_home: an external-only host "
                  "keeps its Tart store on the external volume")
     only_mode = host.get("external_only_mode")
-    if only_mode is not None and only_mode not in ("report", "refuse"):
-        fail('host.external_only_mode must be "report" or "refuse"')
+    if only_mode is not None and only_mode != "report":
+        fail('host.external_only_mode must be "report" (refuse mode is not enabled yet)')
     if only_mode is not None and external_root is None:
         fail("host.external_only_mode needs host.external_root")
     agent_floor_pool = host.get("agent_floor_pool_cores")

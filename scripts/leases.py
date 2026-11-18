@@ -1696,13 +1696,27 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             "kind": args.kind,
         }, 75
 
-    # External-only hosts keep builds and caches off the internal disk. Refused
-    # before the store lock: nothing here depends on lease accounting.
-    refusal = external_only_policy.check_acquire(
-        args, cfg.get("external_root"), mode=cfg.get("external_only_mode", "report"))
-    if refusal is not None:
-        refusal["id"] = lease_id
-        return refusal, external_only_policy.EXIT_REFUSED
+    # External-only hosts keep builds and caches off the internal disk. Judged
+    # once per invocation (not on each --wait-secs retry), before the store lock:
+    # nothing here depends on lease accounting. Fail-open; see external_only_policy.
+    if not getattr(args, "external_policy_checked", False):
+        args.external_policy_checked = True
+        refusal = external_only_policy.check_acquire_safe(
+            args, cfg.get("external_root"), mode=cfg.get("external_only_mode", "report"))
+        would = getattr(args, "external_would_refuse", None)
+        if refusal is not None or would:
+            journal_lease_events(store_dir, [{
+                "event": "external_only_policy",
+                "outcome": "refused" if refusal is not None else "would_refuse",
+                "mode": cfg.get("external_only_mode", "report"),
+                "external_root": cfg.get("external_root"),
+                "kind": args.kind, "lease_id": lease_id, "owner": args.owner,
+                "paths": [v["path"] for v in (refusal["violations"] if refusal else would)],
+                "labels": [v["label"] for v in (refusal["violations"] if refusal else would)],
+            }])
+        if refusal is not None:
+            refusal["id"] = lease_id
+            return refusal, external_only_policy.EXIT_REFUSED
 
     disk: dict[str, Any] | None = None
     requested_disk_bytes = 0

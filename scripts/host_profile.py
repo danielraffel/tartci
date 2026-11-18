@@ -596,14 +596,9 @@ def external_root_setting(fleet_profile: str | None = None) -> str | None:
 
 
 def external_only_mode_setting(fleet_profile: str | None = None) -> str:
-    """`[host] external_only_mode`: "report" (default; warn and admit) or "refuse"."""
-    try:
-        value = _parse_host_str(
-            fleet_profile_path(fleet_profile).read_text(encoding="utf-8"), "external_only_mode"
-        )
-    except OSError:
-        return "report"
-    return value if value == "refuse" else "report"
+    """The external-only mode. Always "report" until refuse mode is reachable from
+    config: a profile value of "refuse" is rejected by the validator and ignored here."""
+    return "report"
 
 
 # --- VM lease waiter ranking ---------------------------------------------------

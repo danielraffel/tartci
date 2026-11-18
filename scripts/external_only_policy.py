@@ -7,8 +7,9 @@ on an external APFS volume; only m1 and m5 use their internal disk. On
 with caches, build trees and tool state all defaulting to $HOME.
 
 A host opts in with `[host] external_root = "/Volumes/<name>"` in its fleet
-profile. `[host] external_only_mode` is `report` (default: warn on stderr and
-admit, so existing caches can be migrated first) or `refuse`. `tartci leases acquire` for a host build (not a VM lease, whose store
+profile. `[host] external_only_mode` is `report` only for now: warn on stderr, admit,
+and journal a `would_refuse` row. Refuse mode (exit 78) exists in code but is not
+reachable from config until the follow-up checklist in the runbook is done. `tartci leases acquire` for a host build (not a VM lease, whose store
 is already judged by the disk axis) then resolves every build and cache
 directory it can see and refuses the build when any resolves, after symlinks,
 to the internal data volume. The refusal names the path and the fix. A host
@@ -129,13 +130,13 @@ def collect(env: Mapping[str, str], home: str, build_dirs: Sequence[str] = (),
         if not env.get(name) and os.path.isdir(default):
             found.append((name + " default dir", default))
     if not env.get("CCACHE_DIR"):
-        configured = ccache_reported_dir(env) or _ccache_conf_dir(env, home)
-        if configured:
-            found.append(("ccache.conf cache_dir", configured))
-        else:
-            default = os.path.join(home, "Library", "Caches", "ccache")
-            if os.path.isdir(default):
-                found.append(("ccache default dir", default))
+        # ccache's own answer, else the config file, else its default. Judged
+        # only when the directory already exists: a cache that is not there is
+        # not yet using the internal disk, and ccache may not be used at all.
+        candidate = (ccache_reported_dir(env) or _ccache_conf_dir(env, home)
+                     or os.path.join(home, "Library", "Caches", "ccache"))
+        if os.path.isdir(os.path.expanduser(candidate)):
+            found.append(("ccache dir", candidate))
     return [(label, os.path.expanduser(path)) for label, path in found]
 
 
@@ -244,6 +245,11 @@ def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "refus
         print("tartci (external_only_mode=report, would refuse): "
               + refusal_message(verdict["violations"], external_root)[len("tartci: "):],
               file=sys.stderr)
+        # For the journal: the evidence for deciding to enforce.
+        try:
+            args.external_would_refuse = verdict["violations"]
+        except AttributeError:
+            pass
         return None
     return {
         "ok": False,
@@ -252,6 +258,17 @@ def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "refus
         "external_root": external_root,
         "violations": verdict["violations"],
     }
+
+
+def check_acquire_safe(args: Any, external_root: Optional[str], *, mode: str = "report",
+                       **kwargs: Any) -> Optional[Dict[str, Any]]:
+    """check_acquire that can never fail an acquire: any error admits with one warning."""
+    try:
+        return check_acquire(args, external_root, mode=mode, **kwargs)
+    except Exception as exc:  # noqa: BLE001 - a probe failure must not become an outage
+        print(f"tartci: external-only policy not judged ({type(exc).__name__}: {exc}); admitting",
+              file=sys.stderr)
+        return None
 
 
 def _main(argv: Optional[List[str]] = None) -> int:

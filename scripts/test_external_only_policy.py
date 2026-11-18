@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts" / "leases.py"
 INTERNAL, EXTERNAL = 1, 2
 REAL_NEAREST = eop.nearest_existing
+REAL_CCACHE_DIR = eop.ccache_reported_dir
 
 
 def pretend_paths_exist(case: unittest.TestCase) -> None:
@@ -109,9 +111,11 @@ class CollectTests(unittest.TestCase):
         self.addCleanup(patcher.stop)
 
     def test_ccache_own_answer_wins_over_file_guessing(self) -> None:
-        with tempfile.TemporaryDirectory() as home, \
-                mock.patch.object(eop, "ccache_reported_dir", return_value="/Users/x/real"):
-            self.assertEqual(eop.collect({}, home), [("ccache.conf cache_dir", "/Users/x/real")])
+        with tempfile.TemporaryDirectory() as home:
+            real = Path(home) / "real"
+            real.mkdir()
+            with mock.patch.object(eop, "ccache_reported_dir", return_value=str(real)):
+                self.assertEqual(eop.collect({}, home), [("ccache dir", str(real))])
 
     def test_env_build_and_cache_dirs_are_all_collected(self) -> None:
         env = {"CCACHE_DIR": "/a", "CPM_SOURCE_CACHE": "/b", "FETCHCONTENT_BASE_DIR": "/c",
@@ -122,21 +126,40 @@ class CollectTests(unittest.TestCase):
 
     def test_ccache_conf_cache_dir_is_read_when_the_env_is_unset(self) -> None:
         with tempfile.TemporaryDirectory() as home:
+            cc = Path(home) / "cc"
+            cc.mkdir()
             conf = Path(home) / "Library" / "Preferences" / "ccache"
             conf.mkdir(parents=True)
-            (conf / "ccache.conf").write_text("max_size = 1G\ncache_dir = /Users/x/cc # note\n")
+            (conf / "ccache.conf").write_text(f"max_size = 1G\ncache_dir = {cc} # note\n")
             got = eop.collect({}, home)
-        self.assertEqual(got, [("ccache.conf cache_dir", "/Users/x/cc")])
+        self.assertEqual(got, [("ccache dir", str(cc))])
+
+    def test_a_configured_ccache_dir_that_does_not_exist_is_not_judged(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            conf = Path(home) / "Library" / "Preferences" / "ccache"
+            conf.mkdir(parents=True)
+            (conf / "ccache.conf").write_text("cache_dir = /Users/x/never-created\n")
+            self.assertEqual(eop.collect({}, home), [])
+
+    @unittest.skipUnless(shutil.which("ccache"), "needs a real ccache on PATH")
+    def test_a_real_ccache_with_a_missing_default_dir_is_not_judged(self) -> None:
+        # ccache -k cache_dir prints its default even when it does not exist.
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(eop, "ccache_reported_dir", REAL_CCACHE_DIR):
+            env = {"PATH": os.environ["PATH"], "HOME": home}
+            self.assertEqual(eop.collect(env, home), [])
 
     def test_ccache_configpath_wins_over_the_standard_files(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             conf = Path(home) / "custom.conf"
-            conf.write_text("cache_dir = /Users/x/custom\n")
+            custom = Path(home) / "custom"
+            custom.mkdir()
+            conf.write_text(f"cache_dir = {custom}\n")
             std = Path(home) / "Library" / "Preferences" / "ccache"
             std.mkdir(parents=True)
             (std / "ccache.conf").write_text("cache_dir = /Users/x/std\n")
             got = eop.collect({"CCACHE_CONFIGPATH": str(conf)}, home)
-        self.assertEqual(got, [("ccache.conf cache_dir", "/Users/x/custom")])
+        self.assertEqual(got, [("ccache dir", str(custom))])
 
     def test_unset_pip_and_uv_defaults_count_when_they_exist(self) -> None:
         with tempfile.TemporaryDirectory() as home:
@@ -160,7 +183,7 @@ class CollectTests(unittest.TestCase):
             self.assertEqual(eop.collect({}, home), [])
             default = Path(home) / "Library" / "Caches" / "ccache"
             default.mkdir(parents=True)
-            self.assertEqual(eop.collect({}, home), [("ccache default dir", str(default))])
+            self.assertEqual(eop.collect({}, home), [("ccache dir", str(default))])
 
 
 class AcquireCheckTests(unittest.TestCase):
@@ -228,13 +251,9 @@ class ProfileSettingTests(unittest.TestCase):
             self.assertEqual(host_profile.external_root_setting(path), EXT_ROOT)
             self.assertEqual(host_profile.build_profile(fleet_profile=path)["external_root"], EXT_ROOT)
 
-    def test_mode_defaults_to_report_and_reads_refuse(self) -> None:
+    def test_mode_is_report(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             self.assertEqual(host_profile.external_only_mode_setting(self.write(td, '[host]\nid = "x"\n')), "report")
-            self.assertEqual(host_profile.external_only_mode_setting(
-                self.write(td, '[host]\nexternal_only_mode = "refuse"\n')), "refuse")
-            self.assertEqual(host_profile.external_only_mode_setting(
-                self.write(td, '[host]\nexternal_only_mode = "bogus"\n')), "report")
 
     def test_absent_or_relative_means_internal_host(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -254,38 +273,87 @@ class CliTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.tmp.cleanup()
 
-    def acquire(self, root, *extra: str, mode="refuse"):
+    def acquire(self, root, *extra: str, cwd=None):
         profile = Path(self.tmp.name) / "fleet.toml"
-        body = '[host]\nid = "t"\n' + (
-            f'external_root = "{root}"\nexternal_only_mode = "{mode}"\n' if root else "")
+        body = '[host]\nid = "t"\n' + (f'external_root = "{root}"\n' if root else "")
         profile.write_text(body)
         env = dict(self.env, TARTCI_FLEET_PROFILE=str(profile), HOME=self.tmp.name)
         return subprocess.run(
             [sys.executable, str(SCRIPT), "acquire", "--cores", "1", "--id", "t1",
              "--store-dir", str(self.store), "--json", *extra],
-            text=True, capture_output=True, env=env, timeout=60)
+            text=True, capture_output=True, env=env, timeout=60, cwd=cwd)
 
-    def test_refused_before_a_lease_is_taken_and_never_retried(self) -> None:
+    def internal_dir(self) -> str:
         internal = os.path.realpath(self.tmp.name)
         if eop.internal_device(lambda p: os.stat(p).st_dev) != os.stat(internal).st_dev:
             self.skipTest("the temp dir is not on this host's boot volume")
-        proc = self.acquire("/Volumes/Example2", "--build-dir", internal,
-                            "--wait-secs", "30")
-        self.assertEqual(proc.returncode, eop.EXIT_REFUSED, proc.stdout + proc.stderr)
-        self.assertEqual(json.loads(proc.stdout)["reason"], eop.REASON)
-        self.assertIn(internal, proc.stderr)
-        self.assertIn("fix:", proc.stderr)
-        self.assertFalse(list(self.store.glob("*.json")) if self.store.exists() else [])
+        return internal
 
-    def test_report_mode_grants_and_warns(self) -> None:
-        internal = os.path.realpath(self.tmp.name)
-        proc = self.acquire("/Volumes/Example2", "--build-dir", internal, mode="report")
+    def events(self) -> list:
+        path = self.store / "events.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+    def test_report_mode_grants_warns_and_journals_would_refuse(self) -> None:
+        internal = self.internal_dir()
+        proc = self.acquire("/Volumes/Example2", "--build-dir", internal)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("would refuse", proc.stderr)
+        rows = [r for r in self.events() if r.get("event") == "external_only_policy"]
+        self.assertEqual(len(rows), 1, self.events())
+        self.assertEqual(rows[0]["outcome"], "would_refuse")
+        self.assertEqual(rows[0]["paths"], [internal])
+
+    def test_a_wait_loop_judges_once(self) -> None:
+        internal = self.internal_dir()
+        # Fill the host so the acquire is denied (75) and retried, then count warnings.
+        proc = self.acquire("/Volumes/Example2", "--build-dir", internal, "--cores", "9999",
+                            "--wait-secs", "5")
+        self.assertEqual(proc.stderr.count("would refuse"), 1, proc.stderr)
+
+    def test_a_deleted_working_directory_still_admits(self) -> None:
+        gone = Path(self.tmp.name) / "gone"
+        gone.mkdir()
+        script = (f"import os,sys,subprocess; os.chdir({str(gone)!r}); os.rmdir({str(gone)!r}); "
+                  f"sys.exit(subprocess.call({[sys.executable, str(SCRIPT), 'acquire', '--cores', '1', '--id', 't1', '--store-dir', str(self.store), '--json']!r}))")
+        profile = Path(self.tmp.name) / "fleet.toml"
+        profile.write_text('[host]\nid = "t"\nexternal_root = "/Volumes/Example2"\n')
+        env = dict(self.env, TARTCI_FLEET_PROFILE=str(profile), HOME=self.tmp.name)
+        proc = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, env=env, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_the_same_acquire_is_granted_on_an_internal_host(self) -> None:
         proc = self.acquire(None, "--build-dir", os.path.realpath(str(ROOT)))
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("would refuse", proc.stderr)
+
+
+class SafeAndRefuseTests(unittest.TestCase):
+    def setUp(self) -> None:
+        pretend_paths_exist(self)
+
+    def test_any_error_admits_with_one_warning(self) -> None:
+        import contextlib, io
+        err = io.StringIO()
+        with mock.patch.object(eop.os, "getcwd", side_effect=FileNotFoundError("gone")), \
+                contextlib.redirect_stderr(err):
+            self.assertIsNone(eop.check_acquire_safe(args(), EXT_ROOT, mode="refuse"))
+        self.assertEqual(err.getvalue().count("not judged"), 1)
+
+    def test_refuse_mode_still_refuses_in_code(self) -> None:
+        a = args()
+        a.build_dir = ["/Users/x/b"]
+        with mock.patch.object(eop, "ccache_reported_dir", return_value=None):
+            refusal = eop.check_acquire_safe(a, EXT_ROOT, mode="refuse", env={}, home="/nonexistent",
+                                             device=fake_device)
+        self.assertEqual(refusal["reason"], eop.REASON)
+
+    def test_refuse_is_not_reachable_from_the_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "f.toml"
+            path.write_text('[host]\nexternal_root = "/Volumes/Example"\nexternal_only_mode = "refuse"\n')
+            self.assertEqual(host_profile.external_only_mode_setting(str(path)), "report")
 
 
 @unittest.skipUnless(HAVE_TOMLLIB, "reads the shipped profiles with tomllib")
@@ -307,8 +375,18 @@ class ShippedProfileTests(unittest.TestCase):
                                       str(path)], cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)
                 if external:
-                    self.assertIn(host.get("external_only_mode"), ("report", "refuse"))
+                    self.assertEqual(host.get("external_only_mode"), "report")
         self.assertGreaterEqual(seen, 2)
+
+    def test_refuse_mode_is_rejected_by_the_validator(self) -> None:
+        source = (ROOT / "profiles" / "m5studio-macos-fleet.toml").read_text()
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "bad.toml"
+            path.write_text(source.replace('external_only_mode = "report"', 'external_only_mode = "refuse"'))
+            res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
+                                  str(path)], cwd=ROOT, capture_output=True, text=True)
+            self.assertNotEqual(res.returncode, 0)
+            self.assertIn("external_only_mode", res.stderr)
 
     def test_a_root_that_does_not_hold_the_tart_store_is_rejected(self) -> None:
         source = (ROOT / "profiles" / "m5-macos-fleet.toml").read_text()

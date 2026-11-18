@@ -5131,20 +5131,20 @@ use the internal disk. m5studio's internal Data volume reached 98% on
 21 GB and `~/.android` 16 GB, and tripped `fleet_ready`.
 
 **Policy.** A host's fleet profile sets `[host] external_root` (the host's own
-`/Volumes/<name>`; it must contain `tart_home`). `[host] external_only_mode` is `report` (shipped: warn on
-stderr and admit, so existing caches can be migrated first) or `refuse`; flip to
-`refuse` once `external_only_policy.py check` is clean on the host.
-`tartci leases acquire` for a host build resolves, after
-symlinks, every directory it can see and, in `refuse` mode, refuses the build (exit 78, reason
-`external_only_internal_path`, never retried by `--wait-secs`) when one is on the
-internal data volume. The message names the path and the fix. Judged:
+`/Volumes/<name>`; it must contain `tart_home`). `[host] external_only_mode` is `report` only: `tartci leases acquire` for a host
+build warns on stderr, admits, and journals an `external_only_policy` /
+`would_refuse` row in the lease store's `events.jsonl`. The policy runs once per acquire,
+never fails an acquire (any error admits with a warning), and reports any path
+that resolves, after symlinks, to the internal data volume, naming the path and
+the fix. The refusing code path (exit 78, reason `external_only_internal_path`,
+never retried by `--wait-secs`) exists but is disabled. Judged:
 `--build-dir` and `--cache-dir` (repeatable), `TARTCI_BUILD_DIR` (with no build
 dir declared, the working directory stands in), `CCACHE_DIR` or the `cache_dir`
 of the file `CCACHE_CONFIGPATH` names or of ccache.conf (or ccache's default
 dir once it exists), `CPM_SOURCE_CACHE`, `FETCHCONTENT_BASE_DIR`,
 `PIP_CACHE_DIR`, `UV_CACHE_DIR` (pip's and uv's default dirs are judged once
 they exist and the variable is unset). A
-path under an unmounted external volume is refused too, so a build cannot write
+path under an unmounted external volume is reported too, so a build cannot write
 a copy of the cache to the boot disk. VM leases are not judged here (the disk
 axis judges their store). Callers that know their build dir pass `--build-dir`.
 
@@ -5152,6 +5152,14 @@ Read-only audit on any host, and the defaults for unset caches:
 
     python3 scripts/external_only_policy.py check
     python3 scripts/external_only_policy.py exports   # export lines under <root>/caches/
+
+**Refuse-mode checklist (follow-up; refuse is not reachable from config).**
+Gate leases need no exemption but their callers must pass `--build-dir` (the
+working-directory stand-in would otherwise refuse them); a free-form `--kind`
+ending in `-vm` currently skips the check; judging should compare against
+`external_root` and fail closed when the internal device cannot be read; callers
+must treat exit 78 as terminal and surface stderr; and `cache_root` (below) must
+be moved. Decide the flip from the `would_refuse` journal rows.
 
 **Known gap.** m5studio's profile `cache_root` (`~/.cache/pulp-ci`, mounted into
 every lane VM) is still internal, as it is not judged by the lease check; m3's is
