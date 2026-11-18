@@ -1365,6 +1365,9 @@ def check_heal_wrapper(installed: Path | None = None, repo_copy: Path | None = N
                        f"heal wrapper: {installed} matches this checkout", facts)
     state = tcc_wedge.wrapper_state(str(installed))
     facts["wrapper_state"] = state
+    if state == "unreadable":  # replaced or unreadable between the two reads
+        return Finding("heal_wrapper", UNKNOWN, "heal_wrapper_unreadable",
+                       f"heal wrapper: {installed} became unreadable while checking it", facts)
     if state == "current":
         return Finding("heal_wrapper", OK, "heal_wrapper_current",
                        f"heal wrapper: {installed} is a known current version", facts)

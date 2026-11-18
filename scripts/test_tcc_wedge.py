@@ -752,6 +752,10 @@ class LaneAndDoctorTests(unittest.TestCase):
             self.assertIn(str(fd.ROOT / "fleet" / "ops" / "install-tartci-heal-tcc.sh") + " --apply",
                           finding.detail)
             self.assertIn("SIGTERM", finding.detail)
+            installed.write_text("x")
+            with mock.patch.object(tw, "wrapper_state", return_value="unreadable"):
+                raced = fd.check_heal_wrapper(installed=installed, repo_copy=repo)
+            self.assertEqual((raced.state, raced.code), (fd.UNKNOWN, "heal_wrapper_unreadable"))
             unreadable = fd.check_heal_wrapper(installed=installed, repo_copy=Path(td) / "gone")
             self.assertEqual((unreadable.state, unreadable.code),
                              (fd.UNKNOWN, "heal_wrapper_unreadable"))
