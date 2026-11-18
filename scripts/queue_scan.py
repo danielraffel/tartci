@@ -506,7 +506,8 @@ class QueueScanner:
         ][:1]
         merge_quota = min(
             self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
+            max(0, self.args.max_job_fetches - max(self.args.newest_quota, len(served))
+                - reservation - 1),
         )
         priority = served + [
             run for run in newest

@@ -743,7 +743,9 @@ The repository opts each job in by naming that job's class label in its
 back. When a short class's jobs are created as a longer class's job ends, also
 set `refresh_after_every_serve = true` (below). Roll out in this order:
 1. land and deploy the tier;
-2. confirm an online runner registers the label;
+2. confirm every host's installed lane declares the tier: `tartci fleet-macos
+   verify-supply` reports `match` against the published supply (the lane boots
+   a runner of the class only once a job requests it, so none is online before);
 3. set the repository variable.
 
 Roll back in the reverse order: unset the variable first, then delete the

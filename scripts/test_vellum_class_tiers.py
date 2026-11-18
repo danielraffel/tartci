@@ -115,6 +115,12 @@ class ProfileTests(unittest.TestCase):
             path.write_text(base.replace(aged, aged.replace("= 0", "= 600")))
             with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
                 fleet.load(path)
+            # An event-class-v2 lane (pulp-gate) has no tier-loop refresh either.
+            v2 = 'assignment_mode = "event-class-v2"\n'
+            self.assertEqual(base.count(v2), 1)
+            path.write_text(base.replace(v2, v2 + line))
+            with self.assertRaisesRegex(ValueError, "refresh_after_every_serve"):
+                fleet.load(path)
             # A single-label lane has no tier loop to refresh.
             spectr = 'id = "spectr-gate"\n'
             self.assertEqual(base.count(spectr), 1)

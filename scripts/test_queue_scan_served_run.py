@@ -137,8 +137,12 @@ class ServedRunFirstTests(unittest.TestCase):
         # The merge-group quota keeps its slot: the newest merge_group run.
         self.assertIn(1, ids)
         # And the served run's slot came out of the newest quota: the
-        # quota's merge-group run plus one newest run, then the backlog.
-        self.assertEqual(ids[:3], [SERVED, 1, 2])
+        # quota's merge-group run, one newest run, the reserved oldest run
+        # (107) and one rotating pick.
+        state: dict[str, Any] = {}
+        ids = [int(run["id"]) for run in scanner._candidate_runs(runs, state)[0]]
+        self.assertEqual(ids, [SERVED, 1, 2, 107, 106])
+        self.assertIn("107", state["oldest_reserved_at"])
 
 
 if __name__ == "__main__":
