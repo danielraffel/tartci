@@ -403,8 +403,15 @@ class CheckClassTests(LeaseCliTestCase):
 
     def test_vm_requests_never_take_a_check_lease(self) -> None:
         self.acquire("gate", 26, capacity=26, reserved=14, priority="gate")
-        vm = self.floor_acquire("vm-1", 4, check_class=True, kind="tart-macos-vm")
-        self.assertNotEqual(vm.returncode, 0)
+        vm = self.run_cli(
+            "acquire", "--id", "vm-1", "--cores", "4", "--capacity", "26",
+            "--reserved-gate-cores", "14", "--priority", "vm", "--pid", str(self.pid),
+            "--kind", "tart-macos-vm", "--disk-path", self.tmp.name, "--capacity-mem-mb", "0",
+            "--class", "check", "--min-cores", "1", check=False)
+        self.assertEqual(vm.returncode, 75, vm.stdout)
+        self.assertEqual(json.loads(vm.stdout)["reason"], "capacity_exceeded")
+        records = json.loads((self.store / "leases.json").read_text())
+        self.assertFalse([r for r in records if r.get("check")], records)
 
 
 class LeasePriorityTests(LeaseCliTestCase):
