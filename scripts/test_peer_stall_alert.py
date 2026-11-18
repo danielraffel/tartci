@@ -85,6 +85,7 @@ class PeerStall(unittest.TestCase):
         self.opened: list[tuple[str, str]] = []
         self.closed: list[str] = []
         self.patched: list[tuple[str, str]] = []
+        self.told: list[str] = []
 
     def issue(self, title: str, body: str) -> tuple[int, str]:
         self.opened.append((title, body))
@@ -99,6 +100,7 @@ class PeerStall(unittest.TestCase):
         # Never a real issue write: fixture issue numbers are real tartci numbers.
         kw.setdefault("comment", lambda number, body: self.patched.append((number, body))
                       or (0, "1"))
+        kw.setdefault("notify", lambda text: self.told.append(text) or (True, "HTTP 204"))
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
 
@@ -184,17 +186,18 @@ class PeerStall(unittest.TestCase):
         # #960 (privacy prompt) on the same host waited for a click for hours.
         self.stale_vitals()
         lister = lambda: [self.OTHER, self.STORE, self.PROMPT]  # noqa: E731
-        with mock.patch("owner_notify.notify_once") as told:
-            out = self.run_pass(RECEIPT_TS + 60, lister=lister)
+        out = self.run_pass(RECEIPT_TS + 60, lister=lister)
         body = self.opened[0][1]
         self.assertIn("click Allow on studio", body)
         self.assertIn("#960", body)
         self.assertIn("#959", body)
         self.assertNotIn("#1 ", body, "another host's prompt is not linked")
         self.assertEqual(out["peers"]["studio"]["host_vitals"]["related"], [960, 959])
-        # The stalled host is the one sender (tcc_prompt): a reader never adds a
-        # second owner message for the same wedge.
-        told.assert_not_called()
+        # The stalled host is the one sender of the prompt message
+        # (tcc_prompt): the reader sends only its own stall line.
+        self.assertEqual(len(self.told), 1)
+        self.assertNotIn("Click Allow", self.told[0])
+        self.assertIn("stopped reporting", self.told[0])
 
     def test_a_prompt_that_appears_later_is_commented_on_the_open_vitals_issue(self):
         self.stale_vitals()
@@ -285,6 +288,48 @@ class PeerStall(unittest.TestCase):
         self.assertIn("Possibly related open issues on studio", body)
         self.assertIn("#959", body)
         self.assertNotIn("click Allow", body)
+
+    def test_the_reader_that_opens_a_vitals_stall_tells_the_owner_once(self):
+        # A host that stalls before its own prompt check runs sends nothing;
+        # the reader that sees it go quiet does, once per stall episode.
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [])
+        self.assertEqual(len(self.told), 1)
+        self.assertIn("studio stopped reporting 6 min ago; likely a privacy prompt: "
+                      "check the screen", self.told[0])
+        self.assertIn("issues/501", self.told[0])
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [])
+        self.assertEqual(len(self.told), 1, "one line per stall episode")
+
+    def test_a_reader_that_adopts_the_issue_on_a_handover_does_not_resend(self):
+        self.stale_vitals()
+        with mock.patch.object(host_off, "_scratch_home", return_value=False), \
+                mock.patch.object(host_off, "_ghapp", return_value=(0, "777")):
+            out = self.run_pass(RECEIPT_TS + 60, lister=lambda: [], issue=psa._open_or_adopt)
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["issue"], "777")
+        self.assertEqual(self.told, [])
+
+    def test_a_failed_owner_post_is_retried_by_the_opener(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [],
+                      notify=lambda text: (False, "post failed: URLError"))
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [])
+        self.assertEqual(len(self.told), 1)
+
+    def test_no_owner_line_for_fresh_vitals(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 30})
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [])
+        self.assertEqual(self.told, [])
 
     def test_fresh_host_vitals_is_the_negative_control(self):
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},

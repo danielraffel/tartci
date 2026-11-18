@@ -2603,11 +2603,16 @@ alert, so its peers raise it.
   privacy-prompt or store-stall issue for the same host, and gets a comment
   when that set changes later (`<peer>.host-vitals-links.json`; a failed issue
   read changes nothing); with a privacy prompt open it names that as the
-  likely cause. Readers never message the owner: the stalled host's own
-  prompt pass is the one sender, so a wedge is announced once. A reader can
+  likely cause. The stalled host's own prompt pass is the one sender of the
+  "Click Allow" message. Separately, the reader that opens a host-vitals stall
+  issue posts one line per stall episode to the same channel: "<host> stopped
+  reporting <N> min ago; likely a privacy prompt: check the screen", with the
+  issue link. That covers a host that stalls before its own prompt check runs.
+  It is keyed on the issue number (`<peer>.host-vitals-owner.json`): a reader
+  that adopts the issue on a handover never sends, and the opener retries a
+  failed post. A reader can
   only see a prompt issue the host opened, in the same pass that sends the
-  message; the one gap is a host whose first post failed and that then stopped
-  running its watchdog before a retry.
+  message.
 
 ### System resolver dead while TCP is alive (`resolver_dead`)
 

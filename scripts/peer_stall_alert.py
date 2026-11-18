@@ -330,6 +330,43 @@ def related_issues(peer: str, lister: Optional[Lister] = None) -> Optional[List[
     return found
 
 
+def vitals_owner_text(peer: str, verdict: Dict[str, Any], issue: str) -> str:
+    minutes = int(round(float(verdict.get("age_seconds") or 0) / 60))
+    return (f"{peer} stopped reporting {minutes} min ago; likely a privacy prompt: check the "
+            f"screen. https://github.com/{host_off.ISSUE_REPO}/issues/{issue}")
+
+
+def vitals_owner_alert(directory: pathlib.Path, peer: str, verdict: Dict[str, Any],
+                       issue: Optional[str], opened_here: Dict[str, Any], active: bool,
+                       notify: Any, now: float) -> Dict[str, Any]:
+    """One owner-channel line per host-vitals stall episode, from the reader
+    that opened its issue.
+
+    A host that stalls before its own privacy-prompt check runs (or with the
+    check itself blocked) sends nothing, so the peer that sees it go quiet
+    tells the owner. Keyed on the episode's issue number: only the reader that
+    opened the issue starts the record, and a reader that adopts an existing
+    issue on a handover never sends. The opener retries a failed post on its
+    later passes. Separate from tcc_prompt's own message (its own record and
+    key), so neither suppresses the other."""
+    path = directory / f"{peer}.host-vitals-owner.json"
+    if not active or not issue:
+        return {}
+    key = f"issue-{issue}"
+    saved = host_off._read_json(path) or {}
+    opened = opened_here.get("number") == issue and not opened_here.get("adopted")
+    if not opened and saved.get("key") != key:
+        return {}  # adopted on a handover, or opened by another reader
+    if saved.get("key") == key and saved.get("sent_at"):
+        return {}
+    import owner_notify  # noqa: PLC0415 - sibling module
+    try:
+        return owner_notify.notify_once(path, key, vitals_owner_text(peer, verdict, issue),
+                                        sender=notify, now=now)
+    except Exception as exc:  # noqa: BLE001 - the peer pass goes on
+        return {"sent": False, "detail": type(exc).__name__}
+
+
 def _comment_issue(number: str, body: str) -> Tuple[int, str]:
     """Comment on an issue (never rewrite its body); never from a test run: a
     real-writer default a test forgot to stub once rewrote tartci #501."""
@@ -543,7 +580,7 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                peers: Optional[Dict[str, str]] = None, me: Optional[str] = None,
                run: Optional[Runner] = None, issue: Any = None,
                close: Any = None, lister: Optional[Lister] = None,
-               comment: Any = None) -> Dict[str, Any]:
+               comment: Any = None, notify: Any = None) -> Dict[str, Any]:
     """The watchdog's pass. Returns {"skipped": bool, "peers": {peer: verdict}}."""
     now = time.time() if now is None else now
     directory = directory or state_root()
@@ -682,10 +719,13 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                 if rc == 0:
                     host_off._write_json(links_path, {"issue": this_issue,
                                                       "numbers": numbers})
+        owner = vitals_owner_alert(directory, peer, vitals_verdict, this_issue, opened_here,
+                                   acting and enabled and vitals_verdict["active"], notify, now)
         result[peer]["host_vitals"] = {**vitals_verdict, "acting": acting,
                                         "issue": vitals_out.get("issue"),
                                         "closed": bool(vitals_out.get("closed")),
-                                        "related": [r.get("number") for r in related]}
+                                        "related": [r.get("number") for r in related],
+                                        "owner_told": bool(owner.get("sent"))}
         drift_verdict = shipyard_drift_judge(
             info, setting("TARTCI_SHIPYARD_DRIFT_RELEASES", SHIPYARD_DRIFT_RELEASES),
             setting("TARTCI_SHIPYARD_DRIFT_HOURS", SHIPYARD_DRIFT_HOURS))
