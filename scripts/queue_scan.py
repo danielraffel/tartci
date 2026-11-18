@@ -60,6 +60,12 @@ def _created_key(run: dict[str, Any]) -> str:
 # A run counts as requeued once it was last updated at least this long after it
 # was created: a run that is queued again after a job of it ran.
 REQUEUE_AFTER_SECONDS = 60
+# ...and only while that update is this recent. A dependent job is served in
+# minutes to hours; an older update is a phantom that must not hold a slot.
+REQUEUE_MAX_AGE_SECONDS = 6 * 3600
+# Requeued runs remembered between refreshes, for when the page that listed
+# them is not read again (each refresh reads page 1 plus one rotating page).
+REQUEUE_MEMORY_MAX = 16
 
 
 def _seconds_between(start: str, end: str) -> float:
@@ -485,6 +491,8 @@ class QueueScanner:
             updated = str(run.get("updated_at") or "")
             if not created or not updated:
                 continue
+            if now and _age_seconds(updated, now) > REQUEUE_MAX_AGE_SECONDS:
+                continue
             if status in ("queued", "pending"):
                 if _seconds_between(created, updated) < REQUEUE_AFTER_SECONDS:
                     continue
@@ -499,6 +507,43 @@ class QueueScanner:
             ranked.append((run.get("event") != "merge_group", kind, created, run))
         ranked.sort(key=lambda item: item[:3])
         return [item[3] for item in ranked]
+
+    def _with_remembered(
+        self, runs: list[dict[str, Any]], state: dict[str, Any]
+    ) -> list[dict[str, Any]]:
+        """The listed runs plus remembered requeued runs no page listed now.
+
+        Records this listing's requeued runs in `state["requeued_runs"]`
+        (bounded, newest update kept), so a requeued run on an older page is
+        still read while the rotation reads a different page. A remembered run
+        is dropped once a fetch of its jobs shows none queued (_forget_served).
+        """
+        if not self._requeued_quota():
+            return runs
+        listed = {int(run["id"]) for run in runs}
+        memory_raw = state.get("requeued_runs")
+        memory = {
+            str(key): value for key, value in (memory_raw or {}).items()
+            if isinstance(value, dict) and isinstance(value.get("id"), int)
+        } if isinstance(memory_raw, dict) else {}
+        for run in self._requeued_runs(runs):
+            memory[str(int(run["id"]))] = {
+                key: run[key] for key in ("id", "name", "event", "status", "created_at",
+                                          "updated_at", "head_sha") if key in run
+            }
+        # Expire by the same age bound, then keep the newest updates.
+        live = self._requeued_runs(list(memory.values()))
+        live.sort(key=lambda run: str(run.get("updated_at") or ""), reverse=True)
+        memory = {str(run["id"]): run for run in live[:REQUEUE_MEMORY_MAX]}
+        state["requeued_runs"] = memory
+        return runs + [run for run in memory.values() if int(run["id"]) not in listed]
+
+    def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any]) -> None:
+        memory = state.get("requeued_runs")
+        if not isinstance(memory, dict) or str(run_id) not in memory:
+            return
+        if not any(isinstance(job, dict) and job.get("status") == "queued" for job in jobs):
+            memory.pop(str(run_id), None)
 
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)
@@ -547,7 +592,8 @@ class QueueScanner:
         # first, from the same slots as the merge-group quota, so every
         # refresh reads them whatever their age; the newest quota, the
         # oldest-run reservation and one rotating slot keep theirs.
-        requeued = self._requeued_runs(runs)[: min(self._requeued_quota(), slots)]
+        requeued = self._requeued_runs(self._with_remembered(runs, state))[
+            : min(self._requeued_quota(), slots)]
         requeued_ids = {int(run["id"]) for run in requeued}
         merge_quota = min(self._merge_group_quota(), slots - len(requeued))
         priority = requeued + [
@@ -737,6 +783,7 @@ class QueueScanner:
                 ).get("jobs", [])
                 if not isinstance(jobs, list):
                     raise ValueError(f"jobs is not a list for run {run_id}")
+                self._forget_served(discovery, run_id, jobs)
                 discovered.append({**run, "_jobs": jobs})
 
             discovery["fetched_at"] = int(time.time())

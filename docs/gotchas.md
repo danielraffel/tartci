@@ -1181,3 +1181,9 @@ not permission to force-remove a worktree.
   `--merge-group-quota`. The newest quota, the oldest-run reservation and one
   rotating slot keep theirs, so the API-call budget is unchanged. `0`
   restores the old selection.
+
+  An update older than 6 h never counts, so a phantom run cannot hold a slot.
+  Each refresh reads page 1 and one rotating older page. So the shared
+  discovery remembers up to 16 requeued runs (`requeued_runs`) and reads them
+  even when their page is not read again. A remembered run is dropped once a
+  fetch of its jobs shows none queued.

@@ -166,6 +166,45 @@ class RequeuedRankingTests(unittest.TestCase):
         self.assertIn(101, ids)
         self.assertIn(102, ids)
 
+    def test_a_stale_update_is_not_requeued(self) -> None:
+        now = datetime.now(timezone.utc)
+        runs = [_run(1, now - timedelta(days=3), "merge_group", "queued", now - timedelta(hours=7)),
+                _run(2, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(hours=1))]
+        self.assertEqual([r["id"] for r in self.scanner()._requeued_runs(runs)], [2])
+
+    def test_a_requeued_run_off_the_read_pages_is_still_read(self) -> None:
+        """Remembered from the listing that saw it, until its jobs show none queued."""
+        now = datetime.now(timezone.utc)
+        incident = _run(INCIDENT, now - timedelta(minutes=124), "merge_group", "queued",
+                        now - timedelta(minutes=35))
+        prs = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+               for i in range(1, 9)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        first, _ = scanner._candidate_runs([incident, *prs], state)
+        self.assertEqual(int(first[0]["id"]), INCIDENT)
+        # Next refresh reads another page: the incident run is not listed.
+        second, _ = scanner._candidate_runs(list(prs), state)
+        self.assertEqual(int(second[0]["id"]), INCIDENT)
+        # A fetch shows its job still queued: kept. Then served: forgotten.
+        scanner._forget_served(state, INCIDENT, [{"status": "queued"}])
+        self.assertIn(str(INCIDENT), state["requeued_runs"])
+        scanner._forget_served(state, INCIDENT, [{"status": "completed"}, {"status": "in_progress"}])
+        third, _ = scanner._candidate_runs(list(prs), state)
+        self.assertNotIn(INCIDENT, [int(r["id"]) for r in third])
+
+    def test_memory_is_bounded(self) -> None:
+        import queue_scan
+        now = datetime.now(timezone.utc)
+        runs = [_run(i, now - timedelta(hours=3), "pull_request", "queued",
+                     now - timedelta(minutes=i)) for i in range(1, 40)]
+        state: dict[str, Any] = {}
+        self.scanner()._candidate_runs(runs, state)
+        self.assertEqual(len(state["requeued_runs"]), queue_scan.REQUEUE_MEMORY_MAX)
+        # The newest updates are the ones kept.
+        self.assertIn("1", state["requeued_runs"])
+        self.assertNotIn("39", state["requeued_runs"])
+
     def test_off_keeps_the_old_selection(self) -> None:
         now = datetime.now(timezone.utc)
         runs = [_run(i, now - timedelta(minutes=100 + i), "merge_group", "queued",
