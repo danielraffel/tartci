@@ -304,8 +304,7 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         "stale_hours": STALE_HOURS, "apply_after_minutes": APPLY_AFTER_MINUTES,
         "apply_retry_hours": APPLY_RETRY_HOURS, "hold_max_hours": HOLD_MAX_HOURS,
         "tools": {name: dict(tool, enabled=True) for name, tool in DEFAULT_TOOLS.items()},
-        "runner_age": {"goldens": list(runner_age.DEFAULT_GOLDENS),
-                       "warn_days": runner_age.WARN_DAYS, "minimum": None},
+        "runner_age": {"goldens": list(runner_age.DEFAULT_GOLDENS)},
     }
     path = path or home / ".config" / "tartci" / "tool-freshness.toml"
     if path.is_file() and tomllib is not None:
@@ -321,10 +320,6 @@ def load_settings(home: Path, path: Path | None = None) -> dict[str, Any]:
         if isinstance(age, dict):
             if isinstance(age.get("goldens"), list):
                 settings["runner_age"]["goldens"] = [str(g) for g in age["goldens"]]
-            if "warn_days" in age:
-                settings["runner_age"]["warn_days"] = float(age["warn_days"])
-            if isinstance(age.get("minimum"), str):
-                settings["runner_age"]["minimum"] = age["minimum"]
         # The canary and steward hosts are not settings: every host reads them
         # from the published fleet/advertised-labels.json (tool_rollout).
         for name, override in (data.get("tools") or {}).items():
@@ -1060,29 +1055,24 @@ def refresh(home: Path, now: float | None = None, *, if_older: int = 0,
     value = {"measured_at": _iso(now), "stale_hours": settings["stale_hours"], "tools": tools}
     age = settings.get("runner_age")
     if age and age.get("goldens"):
-        value["runner_age"] = measure_runner_age(age, home, now, feed)
+        value["runner_age"] = measure_runner_age(age, home, now)
     _write_json(state / "state.json", value)
     save()
     canary.log_gate(state, now, gate["notes"])
     return value
 
 
-def measure_runner_age(config: dict, home: Path, now: float,
-                       feed: Callable[[str], str]) -> list[dict]:
-    """The runner agent each golden on this host carries, against its deadline.
-
-    Reads the version recorded at provision time; never boots a golden. A
-    failure here becomes an `unknown` row, so it can never read as healthy.
+def measure_runner_age(config: dict, home: Path, now: float) -> list[dict]:
+    """The runner each golden's VMs run, against the latest release and against
+    any refusal in a recent runner log. Boots nothing. A failure to measure is an
+    `unknown` row, which doctor shows and the watchdog does not alert on.
     """
     try:
-        return runner_age.collect(
-            config["goldens"], now, home=home, minimum=config.get("minimum"),
-            warn_days=float(config.get("warn_days", runner_age.WARN_DAYS)),
-            releases=runner_age.fetch_releases(feed))
+        return runner_age.collect(config["goldens"], now, home=home,
+                                  latest=runner_age.latest_release(home))
     except Exception as exc:  # noqa: BLE001
         return [{"golden": "(all)", "verdict": "unknown", "installed": None, "latest": None,
-                 "latest_published": None, "deadline": None, "days_left": None,
-                 "reason": f"runner age check failed: {exc}"}]
+                 "source": None, "reason": f"runner age could not be measured: {exc}"}]
 
 
 def render_row(row: dict) -> str:

@@ -9,7 +9,7 @@
 #   tartci doctor --reap --json [--fix]  # report/fix safe owned CI residue
 #   tartci doctor build-disagreement [--profile P|--enable] [--json]
 #                              # cross-host compile/link disagreement (cache poisoning; default off)
-#   tartci doctor runner-age [--json]  # Actions runner agent baked into each golden vs GitHub's 30-day window
+#   tartci doctor runner-age [--json]  # Actions runner each golden's VMs run: behind upstream, or refused by GitHub
 #   tartci doctor fleet [--json]  # diagnose fleet config: executed generation,
 #                              # deploy/drain capability, dual-scope runner census
 #   tartci reclaim [--fix] [--json]      # reclaim idle regenerable build dirs
@@ -221,9 +221,9 @@ check_runner_version() {
   case "$out" in OK*) c_ok "${out#OK: }";; *) c_warn "${out#*: }";; esac
 }
 
-# check_golden_runner_age: the Actions runner agent baked into each golden,
-# against GitHub's 30-day update window. Reads the version recorded when the
-# golden was provisioned; never boots a VM. Unknown is not ok.
+# check_golden_runner_age: the Actions runner each golden's VMs run. WARN when
+# it trails the latest release by two minor versions, FAIL when a recent runner
+# log shows GitHub refusing it. Never boots a VM. Unknown is shown, not counted.
 check_golden_runner_age() {
   echo "golden runner agent age:"
   local out line

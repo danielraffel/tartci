@@ -3509,50 +3509,56 @@ arrive, and a host that did not get it is loud:
 ### Runner agent age in the goldens (`tartci doctor runner-age`)
 
 Every job VM is cloned from a golden that carries the GitHub Actions runner
-agent at `~/actions-runner`. GitHub retires a runner version 30 days after a
-newer release; a retired agent registers, prints `Runner version vX is
-deprecated and cannot receive messages` and exits, so every clone of a golden
-that carries it fails the same way. A Linux pool stopped for 13 days this way
-with nothing alerting.
+agent at `~/actions-runner`. GitHub retires old runner versions; a retired
+agent registers, prints `Runner version vX is deprecated and cannot receive
+messages` and exits, so every clone of a golden that carries it fails the same
+way. A Linux pool stopped for 13 days this way with nothing alerting.
 
 - **What it reports.** Per golden on this host (`pulp-build-runner`,
-  `pulp-linux-build`): the installed runner version, the latest `actions/runner`
-  release with its publish date, and a verdict. `fail`: the first release newer
-  than the installed one is more than 30 days old, or the installed version is
-  below the configured minimum. `warn`: that deadline is at most 10 days away.
-  `ok` otherwise, and always `ok` when installed equals latest. `unknown`: the
-  installed version has no record, or the release feed could not be read. It is
-  its own state and never counts as ok.
-- **Where the installed version comes from.** A record written when the golden
-  is provisioned (`~/.tartci/state/golden-runner/<golden>.json`;
-  `providers/tart-linux/provision.sh` writes it). Nothing boots a golden to read
-  it. A golden with no record is `unknown`; record an existing one by hand with
-  `scripts/runner_age.py record --golden NAME --version V`, using the version
-  printed by `~/actions-runner/bin/Runner.Listener --version` inside that golden.
-  The macOS lane installs its pinned runner into each VM
-  (`providers/tart-macos/runner.sh`), so what runs there is the pin and not the
-  golden's copy. For `pulp-build-runner` the installed version is therefore the
-  pin (`runner.sh --print-runner-version`), judged by the same 30-day rule. The
-  Linux lane runs the golden's agent as it is. Proxmox goldens are not covered: their version lives in the Proxmox
-  bake receipt, which is a different read path.
-- **Where it shows.** `tartci doctor runner-age [--json]`, a section in bare
-  `tartci doctor`, and the tool-freshness refresh (every watchdog pass), which
-  adds each non-ok golden to the tool-freshness problem. That reaches `tartci
-  doctor fleet` as `tool_freshness_stale` and the launchd watchdog WARN, so
-  nobody has to run doctor by hand.
-- **Settings** in `~/.config/tartci/tool-freshness.toml`:
+  `pulp-linux-build`), the runner its VMs run and a verdict. `fail`: a runner
+  log written in the last 24 hours shows GitHub refusing that version (`Runner
+  version vX is deprecated and cannot receive messages`). `warn`: the version
+  trails the latest `actions/runner` release by two minor versions or more.
+  `ok` otherwise. `unknown`: the version has no record, or the latest release
+  could not be read.
+- **One rule.** The verdict comes from `scripts/runner_version.py`, the rule
+  the macOS pin check already uses, so the two cannot disagree. There is no
+  date arithmetic: GitHub's actual retirement dates do not follow a fixed
+  number of days after a release, and the refusal line is the direct signal.
+- **Where the version comes from.** Nothing boots a golden to read it.
+  For `pulp-build-runner` it is the supervisor's pin
+  (`providers/tart-macos/runner.sh --print-runner-version`), because the macOS
+  lane installs that pin into every VM and the golden's own copy never runs.
+  For a Linux golden it is a record in
+  `~/.tartci/state/golden-runner/<golden>.json`. `providers/tart-linux/provision.sh`
+  writes one when the golden it provisions already carries a runner; it does
+  not install or update the runner.
+- **Where it shows.** `tartci doctor runner-age [--json]` (exit 1 on `fail`), a
+  section in bare `tartci doctor`, and the tool-freshness refresh the launchd
+  watchdog runs. `warn` and `fail` join the tool-freshness problem, which
+  reaches `tartci doctor fleet` as `tool_freshness_stale` and the watchdog
+  WARN. `unknown` is shown by doctor and is never a problem, so a host with no
+  record or no route to GitHub does not alert. The problem text names only the
+  two versions, so it changes when a version changes and not with the clock.
+- **Setting** in `~/.config/tartci/tool-freshness.toml`:
 
       [runner_age]
       goldens = ["pulp-build-runner", "pulp-linux-build"]
-      warn_days = 10
-      minimum = "2.330.0"      # optional; below this is a fail
 
-- **Runtime symptom.** The macOS supervisor already backs off and records
+- **Runtime symptom.** The macOS supervisor backs off and records
   `runner_version_deprecated` when a listener says it is retired. The Linux
-  supervisor now logs a named `runner_version_deprecated:` line for the same
+  supervisor logs a named `runner_version_deprecated:` line for the same
   output instead of a generic non-zero exit.
-- **Remedy.** Refresh the golden so it carries a current runner agent, then
-  re-provision (which records the new version). Doctor never refreshes a golden.
+- **Remedy, macOS.** Bump `DEFAULT_RUNNER_VERSION` and its checksum in
+  `providers/tart-macos/runner.sh`.
+- **Remedy, Linux.** Boot the golden, replace `~/actions-runner` with the
+  current `actions-runner-linux-arm64` release (keep `.env` and `.path`), shut
+  it down, then record what it now carries:
+
+      scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+
+  `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
+  version. Recording a newer version also clears a `fail` from older logs.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 

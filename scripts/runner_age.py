@@ -1,36 +1,36 @@
 #!/usr/bin/env python3
-"""GitHub Actions runner age for the runner agent baked into each golden image.
+"""Is the GitHub Actions runner each golden's VMs run still accepted by GitHub?
 
-Every job VM is cloned from a golden that carries the runner agent at
-~/actions-runner. GitHub retires a runner version 30 days after a newer one is
-released: the old agent then registers, prints "Runner version vX is
-deprecated and cannot receive messages" and exits. A golden that still carries
-such an agent makes every clone fail the same way, which stopped a runner pool
-for 13 days without any alert.
+GitHub retires old runner versions. A retired agent registers, prints "Runner
+version vX is deprecated and cannot receive messages" and exits, so every clone
+of a golden that carries it fails the same way. A runner pool stopped for 13
+days like that with nothing alerting.
 
-This module answers, per golden, three things: the installed runner version,
-the latest released version with its publish date, and a verdict.
+Per golden this reports one of:
 
-  ok       installed is current, or the first newer release is not yet near
-           its deadline
-  warn     the deadline (first newer release + 30 days) is at most `warn_days`
-           away (default 10)
-  fail     the deadline has passed, or the installed version is below the
-           configured minimum
-  unknown  the installed version or the release data could not be read. It is
-           its own state and is never reported as ok.
+  fail     a recent runner log shows GitHub refusing this version
+  warn     the version trails the latest release by
+           `runner_version.WARN_MINOR_LAG` minor versions or more
+  ok       the version is known and within that lag
+  unknown  the version or the latest release could not be read
 
-The installed version is never read by booting a golden. It is recorded when
-the golden is provisioned (`record`), and `check` reads that record. A golden
-with no record is unknown.
+The verdict comes from `runner_version.evaluate`, the rule the macOS pin check
+already uses, so the two can never disagree about the same version.
 
-The macOS lane is the exception: its supervisor installs a pinned runner into
-every VM, so what runs there is the pin, not what the golden carries. For the
-macOS golden the installed version is therefore the pin
-(`providers/tart-macos/runner.sh --print-runner-version`).
+`warn` and `fail` are problems for the watchdog. `unknown` is shown by doctor
+and is neither ok nor an alert: a host that has never recorded its golden, or
+cannot reach GitHub, must not page anyone.
+
+Where the version comes from. Nothing here boots a VM.
+  Linux golden   a record written by `record` (provision.sh writes one when the
+                 golden carries a runner; an operator writes one after updating
+                 the agent inside the golden).
+  macOS golden   the supervisor installs its pinned runner into every VM, so
+                 the version is the pin
+                 (`providers/tart-macos/runner.sh --print-runner-version`).
 
 CLI:
-  runner_age.py check [--json] [--golden NAME ...] [--min V] [--warn-days N]
+  runner_age.py check [--json] [--golden NAME ...]
   runner_age.py record --golden NAME --version V [--source TEXT]
 Exit 1 when any golden fails, otherwise 0.
 """
@@ -38,119 +38,87 @@ Exit 1 when any golden fails, otherwise 0.
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import glob
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
-DEADLINE_DAYS = 30.0
-WARN_DAYS = 10.0
-RUNNER_REPO = "actions/runner"
+import runner_version as rv
+
 DEFAULT_GOLDENS = ("pulp-build-runner", "pulp-linux-build")
 # Goldens whose VMs run the supervisor's pinned runner, not the baked one.
 PINNED_GOLDENS = ("pulp-build-runner",)
 MACOS_RUNNER = Path(__file__).resolve().parent.parent / "providers" / "tart-macos" / "runner.sh"
-DAY = 86400.0
-_VERSION_RE = re.compile(r"(\d+)\.(\d+)\.(\d+)")
-
-Version = tuple
-Release = tuple  # (version tuple, tag, published epoch)
-
-
-def parse_version(text: Optional[str]) -> Optional[Version]:
-    match = _VERSION_RE.search(text or "")
-    return tuple(int(part) for part in match.groups()) if match else None
+# A refusal older than this no longer counts: the lane has not run since, or
+# the golden was fixed without a record.
+REFUSAL_WINDOW_SECS = 86400.0
+# The refusal is printed when the listener starts, so the head of a log is
+# enough and a long build log is never read whole.
+LOG_HEAD_BYTES = 262144
 
 
-def _vstr(version: Optional[Version]) -> Optional[str]:
-    return ".".join(str(part) for part in version) if version else None
+def clean(version: Optional[str]) -> Optional[str]:
+    parsed = rv.parse_version(version)
+    return ".".join(str(part) for part in parsed) if parsed else None
 
 
-def _iso(ts: Optional[float]) -> Optional[str]:
-    if ts is None:
-        return None
-    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+_VERDICTS = {"problem": "fail", "warn": "warn", "ok": "ok", "unknown": "unknown"}
 
 
-def classify(installed: Optional[str], releases: Optional[list], now: float, *,
-             minimum: Optional[str] = None, warn_days: float = WARN_DAYS,
-             deadline_days: float = DEADLINE_DAYS) -> dict:
-    """Pure policy. `releases` is [(version tuple, tag, published epoch)].
+def classify(installed: Optional[str], latest: Optional[str],
+             refused: Optional[str] = None) -> dict:
+    """Pure policy. `refused` is a version a recent runner log says GitHub retired.
 
-    The deadline runs from the OLDEST release newer than the installed version,
-    which is when GitHub's 30-day clock for the installed version started. With
-    one new release that is the latest release. Fails closed: anything that
-    cannot be read is `unknown`.
+    A refusal counts when it names the installed version, or when the installed
+    version is unknown: a lane that is being refused is broken either way.
     """
-    have = parse_version(installed)
-    floor = parse_version(minimum) if minimum else None
-    if minimum and floor is None:
-        return _row("unknown", f"configured minimum {minimum!r} is not a version", installed, releases)
+    have, newest = clean(installed), clean(latest)
+    row = {"installed": have, "latest": newest}
+    if refused and (have is None or clean(refused) == have):
+        return dict(row, verdict="fail",
+                    reason=f"GitHub refuses runner v{clean(refused)} as deprecated")
     if have is None:
-        return _row("unknown", "installed runner version is not recorded", installed, releases)
-    if floor is not None and have < floor:
-        return _row("fail", f"installed v{_vstr(have)} is below the minimum v{_vstr(floor)}",
-                    installed, releases)
-    if not releases:
-        return _row("unknown", "latest runner release could not be read", installed)
-    latest = max(releases)
-    if have >= latest[0]:
-        return _row("ok", f"v{_vstr(have)} is the latest release", installed, releases)
-    first_newer = min(r for r in releases if r[0] > have and r[2] is not None) \
-        if any(r[0] > have and r[2] is not None for r in releases) else None
-    if first_newer is None:
-        return _row("unknown", "publish date of the newer release is unknown", installed, releases)
-    deadline = first_newer[2] + deadline_days * DAY
-    days_left = (deadline - now) / DAY
-    if now > deadline:
-        return _row("fail", f"v{_vstr(have)} is past GitHub's {deadline_days:g}-day window: "
-                    f"v{_vstr(first_newer[0])} was released {_iso(first_newer[2])}, "
-                    f"deadline {_iso(deadline)}", installed, releases, deadline, days_left)
-    if days_left <= warn_days:
-        return _row("warn", f"v{_vstr(have)} must update within {days_left:.1f} day(s): "
-                    f"v{_vstr(first_newer[0])} was released {_iso(first_newer[2])}, "
-                    f"deadline {_iso(deadline)}", installed, releases, deadline, days_left)
-    return _row("ok", f"v{_vstr(have)} is behind v{_vstr(latest[0])} with {days_left:.1f} "
-                f"day(s) before the deadline", installed, releases, deadline, days_left)
-
-
-def _row(verdict: str, reason: str, installed: Optional[str], releases: Optional[list] = None,
-         deadline: Optional[float] = None, days_left: Optional[float] = None) -> dict:
-    latest = max(releases) if releases else None
-    return {"verdict": verdict, "reason": reason,
-            "installed": _vstr(parse_version(installed)),
-            "latest": _vstr(latest[0]) if latest else None,
-            "latest_published": _iso(latest[2]) if latest else None,
-            "deadline": _iso(deadline),
-            "days_left": round(days_left, 1) if days_left is not None else None}
+        return dict(row, verdict="unknown", reason="runner version is not recorded")
+    status, _ = rv.evaluate(have, newest, [])
+    if status == "unknown":
+        reason = "latest runner release could not be read"
+    elif status == "warn":
+        reason = (f"runner v{have} is {rv.minor_lag(have, newest)} minor versions "
+                  f"behind v{newest}")
+    else:
+        reason = f"runner v{have} (latest v{newest})"
+    return dict(row, verdict=_VERDICTS[status], reason=reason)
 
 
 def base_name(golden: str) -> str:
     return golden.split(":", 1)[0]
 
 
+def tartci_home(home: Optional[Path] = None) -> Path:
+    return Path(os.environ.get("TARTCI_HOME") or str((home or Path.home()) / ".tartci"))
+
+
 def state_dir(home: Optional[Path] = None) -> Path:
-    root = os.environ.get("TARTCI_HOME") or str((home or Path.home()) / ".tartci")
-    return Path(root) / "state" / "golden-runner"
+    return tartci_home(home) / "state" / "golden-runner"
 
 
-def record(golden: str, version: str, *, home: Optional[Path] = None, now: Optional[float] = None,
-           source: str = "provision") -> Path:
+def record(golden: str, version: str, *, home: Optional[Path] = None,
+           now: Optional[float] = None, source: str = "provision") -> Path:
     """Write the runner version a golden carries. Refuses an unparseable version."""
-    parsed = parse_version(version)
+    parsed = clean(version.strip().lstrip("v")) if isinstance(version, str) else None
     if parsed is None:
         raise ValueError(f"not a runner version: {version!r}")
     directory = state_dir(home)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{base_name(golden)}.json"
-    body = {"golden": base_name(golden), "version": _vstr(parsed), "source": source,
-            "recorded_at": _iso(time.time() if now is None else now)}
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))
+    body = {"golden": base_name(golden), "version": parsed, "source": source,
+            "recorded_at": stamp}
     fd, tmp = tempfile.mkstemp(dir=str(directory), prefix=".record.")
     with os.fdopen(fd, "w") as handle:
         json.dump(body, handle, sort_keys=True)
@@ -188,22 +156,49 @@ def present_goldens() -> Optional[set]:
     return {base_name(line.strip()) for line in proc.stdout.splitlines() if line.strip()}
 
 
-def fetch_releases(feed: Optional[Callable[[str], str]] = None) -> Optional[list]:
-    """Plain vX.Y.Z releases of actions/runner from the public Atom feed, or None."""
-    import tool_freshness as tf
+def log_globs(golden: str, home: Optional[Path] = None) -> list:
+    """Where the lane that clones `golden` keeps each runner's output."""
+    if base_name(golden) in PINNED_GOLDENS:
+        root = os.environ.get("TARTCI_STATE_DIR") or str(tartci_home(home) / "state" / "macos")
+        return [os.path.join(root, "*.actions-runner.log")]
+    root = (os.environ.get("TARTCI_LINUX_LOGS") or os.environ.get("PULP_LINUX_LOGS")
+            or str((home or Path.home()) / "VMs" / "logs" / "tartci-linux"))
+    return [os.path.join(root, "*", "runner-output.log")]
+
+
+def recent_refusal(patterns: list, now: float,
+                   window: float = REFUSAL_WINDOW_SECS) -> Optional[str]:
+    """The version a runner log written in the last `window` seconds says is retired."""
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                if now - os.path.getmtime(path) > window:
+                    continue
+                with open(path, errors="replace") as handle:
+                    version = rv.find_deprecated(handle.read(LOG_HEAD_BYTES))
+            except OSError:
+                continue
+            if version:
+                return version
+    return None
+
+
+def latest_release(home: Optional[Path] = None) -> Optional[str]:
+    """Latest actions/runner version through the cached lookup the pin check uses."""
+    cache = (home or Path.home()) / ".cache" / "tartci" / "runner-latest.json"
     try:
-        return tf.parse_releases((feed or tf.fetch_feed)(RUNNER_REPO)) or None
-    except Exception:  # noqa: BLE001 - an unreadable feed is "unknown", never "ok"
+        return rv.latest_release(str(cache))
+    except Exception:  # noqa: BLE001 - an unreadable release is "unknown"
         return None
 
 
-def collect(goldens, now: float, *, home: Optional[Path] = None, minimum: Optional[str] = None,
-            warn_days: float = WARN_DAYS, releases: Optional[list] = None,
+def collect(goldens, now: float, *, home: Optional[Path] = None,
+            latest: Optional[str] = None,
             present: Optional[Callable[[], Optional[set]]] = None,
             read: Optional[Callable[[str], Optional[str]]] = None,
-            pin: Optional[Callable[[], Optional[str]]] = None) -> list:
-    """One row per golden that exists on this host. Reads records and the macOS
-    pin only; boots nothing."""
+            pin: Optional[Callable[[], Optional[str]]] = None,
+            refusal: Optional[Callable[[str], Optional[str]]] = None) -> list:
+    """One row per golden that exists on this host."""
     here = (present or present_goldens)()
     rows = []
     for golden in goldens:
@@ -214,9 +209,8 @@ def collect(goldens, now: float, *, home: Optional[Path] = None, minimum: Option
             installed = (pin or macos_pin)()
         else:
             installed = (read or (lambda g: read_record(g, home)))(golden)
-        row = classify(installed, releases, now, minimum=minimum, warn_days=warn_days)
-        if pinned and row["installed"] is None:
-            row["reason"] = "pinned macOS runner version could not be read"
+        refused = (refusal or (lambda g: recent_refusal(log_globs(g, home), now)))(golden)
+        row = classify(installed, latest, refused)
         row["golden"] = base_name(golden)
         row["source"] = "pin" if pinned else "record"
         rows.append(row)
@@ -224,15 +218,12 @@ def collect(goldens, now: float, *, home: Optional[Path] = None, minimum: Option
 
 
 def render(row: dict) -> str:
-    return (f"{row['golden']}: {row['verdict'].upper()}: installed "
-            f"{row['installed'] or 'unknown'}, latest {row['latest'] or 'unknown'}"
-            f"{' (' + row['latest_published'] + ')' if row['latest_published'] else ''}; "
-            f"{row['reason']}")
+    return f"{row['golden']}: {row['verdict'].upper()}: {row['reason']}"
 
 
 def problems(rows: list) -> list:
-    """Every non-ok row is worth a human's attention."""
-    return [render(row) for row in rows if row["verdict"] != "ok"]
+    """Only a version known to be too old, or refused by GitHub, is a problem."""
+    return [render(row) for row in rows if row.get("verdict") in ("warn", "fail")]
 
 
 def main(argv: Optional[list] = None) -> int:
@@ -241,8 +232,6 @@ def main(argv: Optional[list] = None) -> int:
     check = sub.add_parser("check")
     check.add_argument("--json", action="store_true")
     check.add_argument("--golden", action="append", default=[])
-    check.add_argument("--min", dest="minimum", default=None)
-    check.add_argument("--warn-days", type=float, default=WARN_DAYS)
     rec = sub.add_parser("record")
     rec.add_argument("--golden", required=True)
     rec.add_argument("--version", required=True)
@@ -255,8 +244,7 @@ def main(argv: Optional[list] = None) -> int:
             print(f"refused: {exc}", file=sys.stderr)
             return 2
         return 0
-    rows = collect(args.golden or list(DEFAULT_GOLDENS), time.time(), minimum=args.minimum,
-                   warn_days=args.warn_days, releases=fetch_releases())
+    rows = collect(args.golden or list(DEFAULT_GOLDENS), time.time(), latest=latest_release())
     if args.json:
         print(json.dumps({"goldens": rows}, indent=2, sort_keys=True))
     elif rows:
