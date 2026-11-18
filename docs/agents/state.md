@@ -10,6 +10,7 @@ beside them. `~` is the serving user's home directory.
 | `~/.local/bin/tartci` | installed shim; runs the installed support generation |
 | `~/.local/share/tartci-generations/` | immutable support generations, one per installed commit |
 | `~/.local/bin/agent-hygiene` | wrapper for `scripts/agent-hygiene` |
+| `~/.local/bin/leased-build` | wrapper for `scripts/leased-build`, the agents' core-lease wrapper (`--class check` for git/Python checks) |
 
 A git checkout of this repository is not what a host's supervisors run.
 
