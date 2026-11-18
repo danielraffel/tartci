@@ -398,6 +398,9 @@ SERVING_BLOCKED_LAST_PHASE=""
 SERVING_BLOCKED_CAUSE=""
 # 1 once the current work entry has had a job assigned to it.
 CURRENT_SERVED=0
+# The run id of the job this lane served last (capture_current_job). The
+# per-VM work entry resets it, so it never names an earlier VM's run.
+LAST_SERVED_RUN_ID=""
 # 1 when the last work entry declined to clone because the opt-in pre-clone
 # demand check found its class empty or a preferred class waiting.
 PRE_CLONE_DEMAND_GONE=0
@@ -1375,6 +1378,21 @@ tier_workflow_args(){
   done <<< "$WORKFLOW_TIERS"
 }
 
+# tier_force_once <forced-sets> <tier labels>: prints `1|<forced-sets>` when the
+# tier's workflow set is not yet in <forced-sets> (each set follows a newline,
+# so command substitution cannot strip one), else `0|<forced-sets>`. queue_scan.py shares one discovery snapshot per repository
+# and workflow set across labels, and a forced scan publishes it, so a later
+# tier of the same set reads that fresh snapshot instead of spending another
+# uncached discovery on the fleet's API budget. Workflow names hold no newline.
+tier_force_once(){
+  local forced="$1" set
+  set="$(tier_workflow_args "$2" | sort | tr '\n' '|')"
+  case "$forced"$'\n' in
+    *$'\n'"$set"$'\n'*) printf '0|%s' "$forced" ;;
+    *) printf '1|%s' "$forced"$'\n'"$set" ;;
+  esac
+}
+
 tier_queued_work(){
   local tier_labels="$1" force_refresh="${2:-0}" workflow tier_args=() scan_cmd=()
   while IFS= read -r workflow; do
@@ -1392,6 +1410,12 @@ tier_queued_work(){
     --max-age-seconds 0 \
     --min-age-seconds "$MIN_QUEUED_AGE")
   [ "$force_refresh" = 1 ] && scan_cmd+=(--force-refresh)
+  # After a served job, read that job's run first: its dependent job (queued as
+  # the served one ended) is otherwise visible only when the run's turn in the
+  # bounded rotation comes up.
+  if [ "$force_refresh" = 1 ] && printf '%s' "${SCAN_PRIORITY_RUN:-}" | grep -qxE '[1-9][0-9]*'; then
+    scan_cmd+=(--priority-run "$SCAN_PRIORITY_RUN")
+  fi
   if [ "$ASSIGNMENT_MODE" != event-class-v2 ] \
      && declare -F tartci_slot_priority_enabled >/dev/null && tartci_slot_priority_enabled; then
     scan_cmd+=(--detail-file "$(tartci_slot_priority_detail_file "$tier_labels")")
@@ -1450,9 +1474,17 @@ select_work(){
     printf '%s|%s|0\n' "$q" "$LABELS"
     return 0
   fi
+  # A forced refresh bypasses the cache once per workflow set, not once per
+  # tier (tier_force_once).
+  local force=0 forced_sets="" verdict
   while IFS= read -r tier_labels; do
     [ -n "$tier_labels" ] || continue
-    if ! q="$(tier_queued_work "$tier_labels" "${SCAN_FORCE_REFRESH:-0}")"; then
+    if [ "${SCAN_FORCE_REFRESH:-0}" = 1 ]; then
+      verdict="$(tier_force_once "$forced_sets" "$tier_labels")"
+      force="${verdict%%|*}"
+      forced_sets="${verdict#*|}"
+    fi
+    if ! q="$(tier_queued_work "$tier_labels" "$force")"; then
       printf 'ERR|%s|%s\n' "$LABELS" "$tier"
       return 0
     fi
@@ -1476,12 +1508,24 @@ select_work(){
 # tears down). The shared discovery snapshot is up to TARTCI_QUEUE_DISCOVERY_TTL_SECS
 # (160 s) old, so the freed lane's first scan does not see that job, finds
 # PR-class work instead and boots it: on 2026-11-15..17, 16 of 42 Vellum
-# merge-group sterile jobs waited behind a ~35 min PR proof that way. Only a
-# served job of a class whose label ends in -merge-group triggers it, and it
-# costs one uncached scan per such job.
+# merge-group sterile jobs waited behind a ~35 min PR proof that way. A served
+# job of a class whose label ends in -merge-group triggers it. A lane with
+# TARTCI_REFRESH_AFTER_EVERY_SERVE=1 (profile `refresh_after_every_serve`)
+# triggers it after every served job: Vellum serves sterile-consumer as its own
+# first class, and every proof, of any event, queues one as it ends. It costs
+# one uncached scan per such job.
 refresh_after_serve(){
-  if [ "${1:-0}" = 1 ]; then
+  if [ "${1:-0}" = 1 ] && [ -n "${2:-}" ]; then
     case ",${2:-}," in *-merge-group,*) printf '%s\n' 1; return 0 ;; esac
+    # Not after the lane's first class: that class is what the refresh looks
+    # for, and nothing is created when one of its jobs ends.
+    # Tier loop only, as the profile validator requires; a hand-set env on a
+    # single-label or event-class-v2 lane stays off.
+    if [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] && [ -n "${TIER_LABELS_CONFIG:-}" ] \
+       && [ "${ASSIGNMENT_MODE:-legacy}" != event-class-v2 ] \
+       && [ "${2##*,}" != "$(printf '%s\n' "$TIER_LABELS_CONFIG" | sed -n '1p')" ]; then
+      printf '%s\n' 1; return 0
+    fi
   fi
   printf '%s\n' 0
 }
@@ -1548,12 +1592,15 @@ claim_delay_gate(){
 }
 
 higher_priority_demand(){
-  local selected_tier="$1" tier_labels q tier=0
+  local selected_tier="$1" tier_labels q tier=0 forced_sets="" verdict
   [ "$selected_tier" -gt 0 ] || return 1
   while IFS= read -r tier_labels; do
     [ -n "$tier_labels" ] || continue
     [ "$tier" -lt "$selected_tier" ] || break
-    q="$(tier_queued_work "$tier_labels" 1)" || return 0
+    # Live, but one uncached discovery per workflow set (tier_force_once).
+    verdict="$(tier_force_once "$forced_sets" "$tier_labels")"
+    forced_sets="${verdict#*|}"
+    q="$(tier_queued_work "$tier_labels" "${verdict%%|*}")" || return 0
     printf '%s' "$q" | grep -qxE '[0-9]+' || return 0
     [ "$q" -eq 0 ] || return 0
     tier=$((tier + 1))
@@ -2275,6 +2322,8 @@ capture_current_job(){
   case "$kind" in
     active)
       CURRENT_RUN_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["run_id"])')"
+      # Outlives cleanup's reset: the loop's post-serve refresh reads it.
+      LAST_SERVED_RUN_ID="$CURRENT_RUN_ID"
       CURRENT_JOB_ID="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["job_id"])')"
       CURRENT_WORKFLOW_NAME="$(printf '%s' "$result" | python3 -c 'import json,sys; print(json.load(sys.stdin)["workflow_name"])')"
       CURRENT_JOB_SCAN_FAILURES=0
@@ -3048,6 +3097,7 @@ run_one(){
   # Before the first early return, not beside the other CURRENT_* resets: the
   # pre-clone admission bail below returns above those.
   CURRENT_SERVED=0
+  LAST_SERVED_RUN_ID=""
   JOB_CLAIM_CONTENDED=0
   PRE_CLONE_DEMAND_GONE=0
   VM_DHCP_BACKOFF=0
@@ -3572,8 +3622,12 @@ run_one(){
 }
 
 i=0
-# One-shot: set after this lane serves a merge-group job (refresh_after_serve).
+# One-shot: set after this lane serves a merge-group job, or any job on a lane
+# with refresh_after_every_serve (refresh_after_serve).
 SCAN_REFRESH_NEXT=0
+# The served job's run id and class label, for that refresh (--priority-run).
+SCAN_REFRESH_RUN=""
+SCAN_REFRESH_CLASS=""
 [ "$PRINT_QUEUE" = 1 ] && { print_queued_work; exit 0; }
 [ "$PRINT_SELECTION" = 1 ] && { select_work | tr '|' '\t'; exit 0; }
 [ "$PRINT_ASSIGNMENT_PARITY" = 1 ] && {
@@ -3776,8 +3830,8 @@ if [ "$LOOP" = 1 ]; then
     tartci_heartbeat_keepalive_start
     if [ "$SCAN_REFRESH_NEXT" = 1 ]; then
       SCAN_REFRESH_NEXT=0
-      selection="$(next_selection 1)"
-      event scan_refresh_after_merge_group "selection=$selection"
+      selection="$(SCAN_PRIORITY_RUN="$SCAN_REFRESH_RUN" next_selection 1)"
+      event scan_refresh_after_serve "served_class=$SCAN_REFRESH_CLASS run_id=${SCAN_REFRESH_RUN:-unknown} selection=$selection"
     else
       selection="$(next_selection 0)"
     fi
@@ -3998,9 +4052,12 @@ if [ "$LOOP" = 1 ]; then
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
-      # A served merge-group job may have just queued its dependent job: the
-      # next selection skips the scan caches once so this freed slot sees it.
+      # A served merge-group job (or any served job, with
+      # TARTCI_REFRESH_AFTER_EVERY_SERVE=1) may have just queued its dependent
+      # job: the next selection skips the scan caches once so this freed slot sees it.
       SCAN_REFRESH_NEXT="$(refresh_after_serve "$CURRENT_SERVED" "$selected_labels")"
+      SCAN_REFRESH_RUN="$LAST_SERVED_RUN_ID"
+      SCAN_REFRESH_CLASS="${selected_labels##*,}"
       if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
         tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone
       fi

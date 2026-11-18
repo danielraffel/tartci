@@ -448,6 +448,11 @@ class QueueScanner:
         # keep the historical selection.
         return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
 
+    def _priority_run_id(self) -> int:
+        # The run whose job this lane just served (runner.sh passes it on the
+        # forced post-serve scan); 0 when absent.
+        return max(0, int(getattr(self.args, "priority_run", 0) or 0))
+
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)
         max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
@@ -490,17 +495,28 @@ class QueueScanner:
         # (Pulp builds up to five groups) cannot starve the PR backlog. When the
         # oldest-run reservation will fire this sweep it costs a slot too.
         reservation = 1 if self._reservation_fires(newest, state) else 0
+        # The run whose job the lane just served goes first: a dependent job
+        # it queued as that job ended exists nowhere else, and the run (as old
+        # as its proof) would otherwise wait for its turn in the rotation. It
+        # takes one of the newest-run slots, so the merge-group quota, the
+        # oldest-run reservation and the rotating slot keep theirs.
+        priority_run_id = self._priority_run_id()
+        served = [
+            run for run in newest if priority_run_id and int(run["id"]) == priority_run_id
+        ][:1]
         merge_quota = min(
             self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
+            max(0, self.args.max_job_fetches - max(self.args.newest_quota, len(served))
+                - reservation - 1),
         )
-        priority = [
-            run for run in newest if run.get("event") == "merge_group"
+        priority = served + [
+            run for run in newest
+            if run.get("event") == "merge_group" and run not in served
         ][:merge_quota]
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
-        ][: self.args.newest_quota]
+        ][: max(0, self.args.newest_quota - len(served))]
         latency_ids = {int(run["id"]) for run in latency}
         backlog = [
             run for run in runs if int(run["id"]) not in latency_ids
@@ -866,6 +882,13 @@ def parse_args() -> argparse.Namespace:
         "from --max-job-fetches (0, the default, keeps the newest-then-rotation order)",
     )
     parser.add_argument(
+        "--priority-run",
+        type=int,
+        default=0,
+        help="a run id whose jobs this refresh reads first, from the same "
+        "--max-job-fetches cap (the run whose job the lane just served)",
+    )
+    parser.add_argument(
         "--oldest-reserve-max-age",
         type=int,
         default=int(os.environ.get("TARTCI_QUEUE_OLDEST_RESERVE_MAX_AGE_SECS", "172800")),
@@ -889,6 +912,13 @@ def parse_args() -> argparse.Namespace:
     # operator traffic instead of consuming the installation's full allowance.
     parser.add_argument("--fleet-api-budget-per-hour", type=int, default=int(os.environ.get("TARTCI_QUEUE_FLEET_API_BUDGET_PER_HOUR", "4000")))
     parser.add_argument("--stagger-max-seconds", type=int, default=int(os.environ.get("TARTCI_QUEUE_STAGGER_MAX_SECS", "4")))
+    parser.add_argument(
+        "--forced-discoveries-per-hour",
+        type=int,
+        default=int(os.environ.get("TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR", "0")),
+        help="fleet-wide uncached discoveries an hour outside the TTL cadence "
+        "(post-serve refreshes), counted in the fleet API budget check",
+    )
     parser.add_argument("--negative-ttl", type=int, default=int(os.environ.get("TARTCI_QUEUE_NEGATIVE_TTL_SECS", "30")))
     parser.add_argument("--max-age-seconds", type=int, default=0)
     parser.add_argument(
@@ -931,6 +961,8 @@ def parse_args() -> argparse.Namespace:
         or args.observation_lock_timeout <= 0
     ):
         parser.error("--observation-lock-timeout must be positive")
+    if args.forced_discoveries_per_hour < 0:
+        parser.error("--forced-discoveries-per-hour must be non-negative")
     if args.min_age_seconds < 0:
         parser.error("--min-age-seconds must be non-negative")
     if args.observation_backoff_file is None:
@@ -960,6 +992,9 @@ def parse_args() -> argparse.Namespace:
         * maximum_calls
         * args.expected_fleet_hosts
         * args.expected_discovery_namespaces
+        # Uncached discoveries outside the TTL cadence (a lane's post-serve
+        # refresh), fleet-wide, each a full discovery.
+        + args.forced_discoveries_per_hour * maximum_calls
     )
     if fleet_calls_per_hour > args.fleet_api_budget_per_hour:
         parser.error(

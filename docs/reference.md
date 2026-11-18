@@ -725,16 +725,74 @@ overrides the ssh client (tests). It never changes the host VM cap. Preview with
 `serve macos --print-claim-delay`. Set it on the gate lanes of slower hosts
 only, e.g. 0 / 15 / 30 / 60 from fastest to slowest.
 
-After a lane serves a job whose class label ends in `-merge-group`, its next
-selection bypasses the scan caches once (`scan_refresh_after_merge_group`
-event): a tier lane passes `--force-refresh` to `queue_scan.py`, and an
-event-class-v2 lane skips its selection cache. A merge-group run can queue a
-dependent job when the served job ends (Vellum's `sterile-consumer` waits on
-its GPU proof), seconds before the VM tears down, while the shared discovery
-snapshot can be up to `TARTCI_QUEUE_DISCOVERY_TTL_SECS` (160 s) old. Without
-the refresh the freed lane saw only PR-class work and booted it, so the
-dependent job waited for another lane. It costs one uncached scan per served
-merge-group job and changes no priority.
+Job classes on a fleet lane. Any repository's lane can split its jobs into
+classes with ordered `[[lane.tier]]` entries, with no repository-specific code.
+Each tier is one class label and one workflow. The lane's base `labels` carry
+no class label, so a runner registers with exactly one class and can take only
+a job of that class. The lane serves the first tier with queued work, falling
+through to the next tier on the same scan.
+
+The usual order:
+1. a short follow-on check (for example Vellum's `vellum-sterile-consumer`,
+   about 1.4 min);
+2. merge-group work (`<prefix>-merge-group`);
+3. the long proof class.
+
+The repository opts each job in by naming that job's class label in its
+`runs-on`, ideally through a repository variable so that unsetting it rolls
+back. When a short class's jobs are created as a longer class's job ends, also
+set `refresh_after_every_serve = true` (below). Roll out in this order:
+1. land and deploy the tier;
+2. confirm every host's installed lane declares the tier: `tartci fleet-macos
+   verify-supply` reports `match` against the published supply (the lane boots
+   a runner of the class only once a job requests it, so none is online before);
+3. set the repository variable.
+
+Roll back in the reverse order: unset the variable first, wait until no
+queued job requests the label, then delete the tier. A job that requests a
+label no lane registers queues forever.
+
+After a lane serves a job whose class label ends in `-merge-group`, or any job
+on a lane with `refresh_after_every_serve = true` (env
+`TARTCI_REFRESH_AFTER_EVERY_SERVE=1`), its next selection bypasses the scan
+caches once. A tier lane passes `--force-refresh` and `--priority-run <served
+run id>` to `queue_scan.py`. An event-class-v2 lane skips its selection cache.
+The lane logs a `scan_refresh_after_serve` event (`served_class=`, `run_id=`,
+`selection=`).
+
+A served job's run can queue a dependent job as that job ends. Vellum's
+`sterile-consumer` waits on its GPU proof and is created seconds before the VM
+tears down. The shared discovery snapshot can be up to
+`TARTCI_QUEUE_DISCOVERY_TTL_SECS` (160 s) old, and a run as old as its proof
+sits in the bounded rotation of runs whose jobs a refresh reads. Without the
+refresh, the freed lane saw only proof-class work and booted it, so the
+dependent job waited for another lane.
+
+`--priority-run` reads that run's jobs first, so the dependent job is counted
+on that refresh. The run takes one of the `--newest-quota` slots inside the
+same `--max-job-fetches` cap. The merge-group quota, the oldest-run
+reservation and the rotating slot keep theirs.
+
+Cost: a forced selection spends one uncached discovery per workflow set, not
+one per tier. Lower tiers of the same workflows read the snapshot the forced
+scan just published. That is about 5 to 14 API calls per served job.
+
+There is no refresh after a job of the lane's first class: that class is what
+the refresh looks for, and nothing is queued when one of its jobs ends. The
+lane with `refresh_after_every_serve` must also set `forced_discoveries_per_hour`: its repository's post-serve
+discoveries an hour, fleet-wide (Vellum: 8). The lane renders it as
+`TARTCI_QUEUE_FORCED_DISCOVERIES_PER_HOUR`, and `queue_scan.py` adds those
+discoveries to its fleet API budget check. That check has about 136 calls, or 9
+discoveries, of headroom, which every repository that sets the key shares.
+
+The refresh reorders nothing: the tier order, the merge-group quota and the
+oldest-run reservation are the same as on an unforced scan.
+
+`refresh_after_every_serve` is valid only on a legacy `[[lane.tier]]` lane
+with `min_queued_age_seconds = 0`, and the validator refuses it elsewhere:
+under a minimum age a just-queued job cannot count, so the refresh would be
+pure cost. Set it where one class's jobs are created when another class's
+job ends.
 
 To order a lane across hosts by speed, give the same lane id a `claim_rank` on
 every host instead (0 = fastest, integers 0-9; not combined with
