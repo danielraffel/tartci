@@ -409,6 +409,22 @@ class HealTests(unittest.TestCase):
         self.assertIn(digest, tw.WRAPPER_CURRENT_SHA256)
         self.assertEqual(tw.wrapper_state(str(ROOT / "fleet" / "ops" / "tartci-heal-tcc")), "current")
 
+    def test_each_stale_hash_is_the_sigterm_wrapper_in_git_history(self) -> None:
+        # A typo in the list would otherwise quietly stop matching. The two
+        # commits are on main; skip only where the history is not available.
+        pins = {"e40651e": "ded836e75858502c75d83ed06ab66582499f410ccad951493fcbe27dcce54da5",
+                "f2712f3": "5f56cd2c96d8da689c241fc49fb49ae7b4f27f98087177b3b9b9f449dd932e7a"}
+        self.assertEqual(set(pins.values()), set(tw.WRAPPER_STALE_SHA256))
+        for commit, digest in pins.items():
+            with self.subTest(commit):
+                shown = subprocess.run(["git", "show", f"{commit}:fleet/ops/tartci-heal-tcc"],
+                                       cwd=ROOT, capture_output=True)
+                if shown.returncode != 0:
+                    self.skipTest(f"{commit} not in this clone's history")
+                self.assertEqual(hashlib.sha256(shown.stdout).hexdigest(), digest)
+                self.assertEqual(tw.classify_wrapper(shown.stdout), "stale")
+                self.assertIn(b'"$KILLALL" tccd sandboxd', shown.stdout)
+
     def test_hash_lists_are_well_formed_and_disjoint(self) -> None:
         for digest in tw.WRAPPER_CURRENT_SHA256 | tw.WRAPPER_STALE_SHA256:
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
@@ -753,9 +769,6 @@ class LaneAndDoctorTests(unittest.TestCase):
                           finding.detail)
             self.assertIn("SIGTERM", finding.detail)
             installed.write_text("x")
-            with mock.patch.object(tw, "wrapper_state", return_value="unreadable"):
-                raced = fd.check_heal_wrapper(installed=installed, repo_copy=repo)
-            self.assertEqual((raced.state, raced.code), (fd.UNKNOWN, "heal_wrapper_unreadable"))
             unreadable = fd.check_heal_wrapper(installed=installed, repo_copy=Path(td) / "gone")
             self.assertEqual((unreadable.state, unreadable.code),
                              (fd.UNKNOWN, "heal_wrapper_unreadable"))

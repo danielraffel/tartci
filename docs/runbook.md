@@ -610,8 +610,8 @@ whose installed wrapper's sha256 is a known old SIGTERM version also records
 A wrapper whose hash is in neither list (a local edit) records
 `unknown_wrapper`, a notice with the same install command, never a problem. A
 repo change reaches a host only when the installer below is re-run there, and
-the new file's sha256 goes in `WRAPPER_CURRENT_SHA256` (scripts/tcc_wedge.py)
-in the same change; a test fails until it does.
+the new file's sha256 replaces the old one in `WRAPPER_CURRENT_SHA256`
+(scripts/tcc_wedge.py) in the same change; a test fails until it does.
 Merging a wrapper change changes nothing on a host until
 `sudo fleet/ops/install-tartci-heal-tcc.sh --apply` runs there; `tartci doctor
 fleet` reports `heal_wrapper_stale` (known old version) or the notice

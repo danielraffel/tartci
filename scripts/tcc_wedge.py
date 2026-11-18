@@ -116,7 +116,8 @@ INSTALLER = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 # Installed-wrapper identity is a hash, not a reading of its source: a script
 # that decides what a root wrapper does by parsing shell can be fooled by any
 # quoting trick. Add the new hash here in the same change that edits
-# fleet/ops/tartci-heal-tcc (a test fails until you do).
+# fleet/ops/tartci-heal-tcc (a test fails until you do). Replace the old
+# hash rather than adding to it, so a host still on the old copy is reported.
 WRAPPER_CURRENT_SHA256 = frozenset({
     "657941360b74b612eb251cb4e88145fde85c5e62864a8435c79e011bb7bfc3e8",
 })
@@ -888,26 +889,31 @@ def unchanged_pids(before: dict[str, list[int]], after: dict[str, list[int]]) ->
     return all(before.get(name, []) == after.get(name, []) for name in HEALED_PROCESSES)
 
 
-def wrapper_state(wrapper: str, current: Optional[frozenset] = None,
-                  stale: Optional[frozenset] = None) -> str:
-    """Classify the installed root wrapper by the sha256 of its bytes (read only; 0755).
-
-    `current`: a known-good version. `stale`: a version that sends SIGTERM.
-    `unknown`: anything else, such as a local edit; never treated as broken.
-    `unreadable`: nothing is claimed about a file this cannot see.
-    """
+def classify_wrapper(data: bytes, current: Optional[frozenset] = None,
+                     stale: Optional[frozenset] = None) -> str:
+    """`current` (a known-good version), `stale` (a known SIGTERM version) or
+    `unknown` (anything else, such as a local edit; never treated as broken),
+    by the sha256 of the bytes alone."""
     current = WRAPPER_CURRENT_SHA256 if current is None else current
     stale = WRAPPER_STALE_SHA256 if stale is None else stale
-    try:
-        with open(wrapper, "rb") as handle:
-            digest = hashlib.sha256(handle.read()).hexdigest()
-    except OSError:
-        return "unreadable"
+    digest = hashlib.sha256(data).hexdigest()
     if digest in current:
         return "current"
     if digest in stale:
         return "stale"
     return "unknown"
+
+
+def wrapper_state(wrapper: str, current: Optional[frozenset] = None,
+                  stale: Optional[frozenset] = None) -> str:
+    """classify_wrapper for the installed file (read only; it is 0755), or
+    `unreadable`: nothing is claimed about a file this cannot see."""
+    try:
+        with open(wrapper, "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return "unreadable"
+    return classify_wrapper(data, current, stale)
 
 
 def heal(*, now: Optional[float] = None, last_heal: Optional[dict] = None,
