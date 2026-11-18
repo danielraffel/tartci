@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "70e959b702567e41351def39e7c749b6185f0210db16953dbe30c508a068108a"
+    "profiles_sha256": "a6fc7e0bb02778df60c1ef7aef19ccb9b42dc047ef6da7620bd30932fc187069"
   },
   "registrations": [
     {
@@ -116,6 +116,24 @@
       "lane": "vellum-gate",
       "repo": "Generous-Corp/vellum",
       "assignment_mode": "legacy",
+      "class_label": "vellum-sterile-consumer",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "vellum-host-m1",
+        "vellum-sterile-consumer"
+      ],
+      "workflows": [
+        "Locked macOS GPU proof"
+      ]
+    },
+    {
+      "profile": "m1-macos-fleet",
+      "host_id": "m1",
+      "lane": "vellum-gate",
+      "repo": "Generous-Corp/vellum",
+      "assignment_mode": "legacy",
       "class_label": "vellum-build-macos-merge-group",
       "labels": [
         "self-hosted",
@@ -269,6 +287,24 @@
       "lane": "vellum-gate",
       "repo": "Generous-Corp/vellum",
       "assignment_mode": "legacy",
+      "class_label": "vellum-sterile-consumer",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "vellum-host-m3",
+        "vellum-sterile-consumer"
+      ],
+      "workflows": [
+        "Locked macOS GPU proof"
+      ]
+    },
+    {
+      "profile": "m3-macos-fleet",
+      "host_id": "studio",
+      "lane": "vellum-gate",
+      "repo": "Generous-Corp/vellum",
+      "assignment_mode": "legacy",
       "class_label": "vellum-build-macos-merge-group",
       "labels": [
         "self-hosted",
@@ -451,6 +487,24 @@
       "workflows": [
         "build",
         "protected macOS build"
+      ]
+    },
+    {
+      "profile": "m5-macos-fleet",
+      "host_id": "m5",
+      "lane": "vellum-gate",
+      "repo": "Generous-Corp/vellum",
+      "assignment_mode": "legacy",
+      "class_label": "vellum-sterile-consumer",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "vellum-host-m5",
+        "vellum-sterile-consumer"
+      ],
+      "workflows": [
+        "Locked macOS GPU proof"
       ]
     },
     {
@@ -605,6 +659,24 @@
       "workflows": [
         "build",
         "protected macOS build"
+      ]
+    },
+    {
+      "profile": "m5studio-macos-fleet",
+      "host_id": "m5studio",
+      "lane": "vellum-gate",
+      "repo": "Generous-Corp/vellum",
+      "assignment_mode": "legacy",
+      "class_label": "vellum-sterile-consumer",
+      "labels": [
+        "self-hosted",
+        "macOS",
+        "ARM64",
+        "vellum-host-m5studio",
+        "vellum-sterile-consumer"
+      ],
+      "workflows": [
+        "Locked macOS GPU proof"
       ]
     },
     {

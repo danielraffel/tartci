@@ -318,6 +318,12 @@ min_queued_age_seconds = 0
 # jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
 # default 0. Rollback: delete this line and re-render.
 queue_merge_group_quota = 2
+# Every proof this lane serves queues its sterile-consumer job as it ends,
+# seconds before the VM tears down, and the shared discovery snapshot is up
+# to 160 s old. So after any served job (not only a merge-group one) the
+# next selection rescans uncached once, and the freed slot sees the journey
+# instead of booting another proof. Rollback: delete this line and re-render.
+refresh_after_every_serve = true
 # sterile-consumer runs about 1.5 min after the GPU proof, on the same runner
 # class, and waited a median 5.3 min (mean 16.7) for a VM slot behind 30-minute
 # GPU jobs. Named here, slot priority lets it take the next free slot ahead of
@@ -340,11 +346,22 @@ replaces_launchd_labels = []
 # frozen guest otherwise holds the slot until the 2 h job timeout.
 guest_heartbeat_stale_seconds = 600
 
-# Two classes, merge-group first: a merge-group "Locked macOS GPU proof" job
-# requests vellum-build-macos-merge-group, every other event requests
-# vellum-build-macos. A runner registers with exactly one class label, so it
-# can only take a job of that class. With no merge-group job queued the lane
-# serves the PR class on the same scan.
+# Three classes, served in this order. sterile-consumer, the 1.4 min journey
+# that installs a GPU proof's release archive on a VM without the proof's build
+# state, requests vellum-sterile-consumer once Vellum sets
+# VELLUM_LOCAL_MACOS_STERILE_RUNS_ON_JSON. A merge-group "Locked macOS GPU
+# proof" job requests vellum-build-macos-merge-group, every other event
+# requests vellum-build-macos. A runner registers with exactly one class label,
+# so it can only take a job of that class: a VM booted for a journey can no
+# longer be handed another pull request's 30-minute proof (median 11.1 min,
+# p90 63.5 queued for 1.4 min of work, 2026-11-04..18). With no demand in a
+# class the lane serves the next one on the same scan.
+# Rollback: delete the vellum-sterile-consumer tier and re-render.
+[[lane.tier]]
+label = "vellum-sterile-consumer"
+workflow = "Locked macOS GPU proof"
+runner_group_id = 8
+
 [[lane.tier]]
 label = "vellum-build-macos-merge-group"
 workflow = "Locked macOS GPU proof"

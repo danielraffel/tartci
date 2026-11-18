@@ -1476,12 +1476,16 @@ select_work(){
 # tears down). The shared discovery snapshot is up to TARTCI_QUEUE_DISCOVERY_TTL_SECS
 # (160 s) old, so the freed lane's first scan does not see that job, finds
 # PR-class work instead and boots it: on 2026-11-15..17, 16 of 42 Vellum
-# merge-group sterile jobs waited behind a ~35 min PR proof that way. Only a
-# served job of a class whose label ends in -merge-group triggers it, and it
-# costs one uncached scan per such job.
+# merge-group sterile jobs waited behind a ~35 min PR proof that way. A served
+# job of a class whose label ends in -merge-group triggers it. A lane with
+# TARTCI_REFRESH_AFTER_EVERY_SERVE=1 (profile `refresh_after_every_serve`)
+# triggers it after every served job: Vellum serves sterile-consumer as its own
+# first class, and every proof, of any event, queues one as it ends. It costs
+# one uncached scan per such job.
 refresh_after_serve(){
-  if [ "${1:-0}" = 1 ]; then
+  if [ "${1:-0}" = 1 ] && [ -n "${2:-}" ]; then
     case ",${2:-}," in *-merge-group,*) printf '%s\n' 1; return 0 ;; esac
+    [ "${TARTCI_REFRESH_AFTER_EVERY_SERVE:-0}" = 1 ] && { printf '%s\n' 1; return 0; }
   fi
   printf '%s\n' 0
 }
@@ -3572,7 +3576,8 @@ run_one(){
 }
 
 i=0
-# One-shot: set after this lane serves a merge-group job (refresh_after_serve).
+# One-shot: set after this lane serves a merge-group job, or any job on a lane
+# with refresh_after_every_serve (refresh_after_serve).
 SCAN_REFRESH_NEXT=0
 [ "$PRINT_QUEUE" = 1 ] && { print_queued_work; exit 0; }
 [ "$PRINT_SELECTION" = 1 ] && { select_work | tr '|' '\t'; exit 0; }
@@ -3998,8 +4003,9 @@ if [ "$LOOP" = 1 ]; then
         [ -n "$SERVING_BLOCKED_SINCE" ] \
           || SERVING_BLOCKED_SINCE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
       fi
-      # A served merge-group job may have just queued its dependent job: the
-      # next selection skips the scan caches once so this freed slot sees it.
+      # A served merge-group job (or any served job, with
+      # TARTCI_REFRESH_AFTER_EVERY_SERVE=1) may have just queued its dependent
+      # job: the next selection skips the scan caches once so this freed slot sees it.
       SCAN_REFRESH_NEXT="$(refresh_after_serve "$CURRENT_SERVED" "$selected_labels")"
       if [ "${VM_DHCP_PROBE:-0}" = 1 ] && [ "${VM_DHCP_PROBE_REPORTED:-0}" != 1 ]; then
         tartci_vm_dhcp_cancel "${TARTCI_QUEUE_LANE_ID:-$RUNNER_NAME-$SLOT}" loop_pre_clone

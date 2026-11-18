@@ -133,7 +133,7 @@ LANE_KEYS = {
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
-    "v2_gate_classes", "queue_merge_group_quota",
+    "v2_gate_classes", "queue_merge_group_quota", "refresh_after_every_serve",
     # Slot priority's short-job-first rule (scripts/slot_priority.py).
     "short_jobs", "short_job_first",
 }
@@ -925,6 +925,12 @@ def load(path: Path) -> dict:
         quota = lane.get("queue_merge_group_quota")
         if quota is not None and (type(quota) is not int or quota < 0):
             fail(f"lane {lane_id}: queue_merge_group_quota must be a nonnegative integer")
+        refresh = lane.get("refresh_after_every_serve")
+        if refresh is not None and (type(refresh) is not bool or not lane.get("tier")
+                                    or lane.get("assignment_mode") == "event-class-v2"):
+            # The runner implements it in the tier loop's selection only.
+            fail(f"lane {lane_id}: refresh_after_every_serve must be a boolean on a "
+                 "[[lane.tier]] lane that is not event-class-v2")
         validate_short_jobs(lane_id, lane, data)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
@@ -3257,6 +3263,10 @@ def lane_plist(
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.
         env["TARTCI_QUEUE_MERGE_GROUP_QUOTA"] = str(lane["queue_merge_group_quota"])
+    if lane.get("refresh_after_every_serve"):
+        # runner.sh refresh_after_serve: after any served job, not only a
+        # merge-group one, the next selection rescans uncached once.
+        env["TARTCI_REFRESH_AFTER_EVERY_SERVE"] = "1"
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if "vm_cores_from" in lane:
