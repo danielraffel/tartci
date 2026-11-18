@@ -50,9 +50,10 @@ class PolicyTests(unittest.TestCase):
         row = ra.classify(None, None, refused={"2.330.0", "2.336.0"})
         self.assertIn("v2.336.0", row["reason"])
 
-    def test_refusal_of_another_version_is_ignored(self):
-        # The golden was updated and recorded since that log was written.
-        self.assertEqual(ra.classify("2.338.2", "2.338.2", refused={"2.336.0"})["verdict"], "ok")
+    def test_any_live_refusal_fails_and_names_the_installed_version_first(self):
+        row = ra.classify("2.338.2", "2.338.2", refused={"2.336.0"})
+        self.assertEqual(row["verdict"], "fail")
+        self.assertIn("v2.336.0", row["reason"])
 
     def test_unrecorded_version_is_unknown(self):
         self.assertEqual(ra.classify(None, "2.338.2")["verdict"], "unknown")
@@ -163,7 +164,7 @@ class CollectTests(unittest.TestCase):
         self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log", REFUSAL)
         ra.collect(("pulp-linux-build",), NOW, latest="2.338.2",
                    present=lambda: {"pulp-linux-build"})
-        self.assertEqual(ra.read_refused("pulp-linux-build"), set())
+        self.assertEqual(ra.read_refused("pulp-linux-build"), {})
 
     def test_old_log_alone_is_not_opened(self):
         self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log",
@@ -178,7 +179,7 @@ class CollectTests(unittest.TestCase):
         self.assertEqual(ra.collect(("pulp-linux-build",), NOW, **kw)[0]["verdict"], "fail")
         ra.record("pulp-linux-build", "2.338.2", now=NOW, source="operator")
         self.assertEqual(ra.collect(("pulp-linux-build",), NOW, **kw)[0]["verdict"], "ok")
-        self.assertEqual(ra.read_refused("pulp-linux-build"), set())
+        self.assertEqual(ra.read_refused("pulp-linux-build"), {})
 
     def test_macos_golden_is_judged_by_the_pin_not_a_record(self):
         ra.record("pulp-build-runner", "2.336.0", now=NOW)
@@ -200,13 +201,54 @@ class CollectTests(unittest.TestCase):
         self.assertEqual([r["verdict"] for r in rows], ["unknown", "unknown"])
         self.assertEqual(ra.problems(rows), [])
 
-    def test_macos_refusals_come_from_the_pin_check_scan(self):
-        self.write_log(self.home / "macos-state" / "vm-1.actions-runner.log", REFUSAL,
-                       age=30 * 86400.0)
-        hits = rv.scan_logs(str(self.home / "macos-state"), "2.336.0")
-        self.assertEqual(ra.scan_refusals("pulp-build-runner", "2.336.0", NOW),
-                         {h["version"] for h in hits})
-        self.assertEqual(ra.scan_refusals("pulp-build-runner", "2.338.2", NOW), set())
+    def test_macos_refusal_is_found_in_a_fleet_lane_state_dir(self):
+        # Fleet lanes keep their runner logs under state/macos-fleet/<lane>/.
+        with mock.patch.dict(os.environ):
+            os.environ.pop("TARTCI_STATE_DIR")
+            self.write_log(self.home / ".tartci" / "state" / "macos-fleet" / "pulp-gate"
+                           / "vm-1.actions-runner.log", REFUSAL)
+            rows = ra.collect(("pulp-build-runner",), NOW, latest="2.338.2",
+                              present=lambda: {"pulp-build-runner"}, pin=lambda: "2.336.0")
+        self.assertEqual(rows[0]["verdict"], "fail")
+
+    def test_macos_refusal_of_an_older_pin_does_not_apply(self):
+        self.write_log(self.home / "macos-state" / "vm-1.actions-runner.log", REFUSAL)
+        rows = ra.collect(("pulp-build-runner",), NOW, latest="2.338.2",
+                          present=lambda: {"pulp-build-runner"}, pin=lambda: "2.338.2")
+        self.assertEqual(rows[0]["verdict"], "ok")
+
+    def test_refusal_logged_after_the_record_fails_whatever_it_names(self):
+        # The record says 2.338.2 but the lane is still being refused as
+        # 2.336.0: the record is wrong about what the golden carries.
+        record = ra.record("pulp-linux-build", "2.338.2", source="operator")
+        after = os.path.getmtime(record) + 600
+        log = self.home / "linux-logs" / "linux-ephr-1-2" / "runner-output.log"
+        self.write_log(log, REFUSAL)
+        os.utime(log, (after, after))
+        rows = ra.collect(("pulp-linux-build",), after + 60, latest="2.338.2",
+                          present=lambda: {"pulp-linux-build"})
+        self.assertEqual(rows[0]["verdict"], "fail")
+
+    def test_remembered_refusal_is_reported_when_images_cannot_be_listed(self):
+        self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log", REFUSAL)
+        ra.collect(("pulp-linux-build",), NOW, latest="2.338.2", persist=True,
+                   present=lambda: {"pulp-linux-build"})
+        rows = ra.collect(("pulp-linux-build",), NOW, latest="2.338.2", present=lambda: None)
+        self.assertEqual(rows[0]["verdict"], "fail")
+
+    def test_refusal_past_the_log_head_is_not_read(self):
+        self.write_log(self.home / "linux-logs" / "linux-ephr-1-1" / "runner-output.log",
+                       "x" * (ra.LOG_HEAD_BYTES + 10) + REFUSAL)
+        self.assertEqual(ra.scan_refusals("pulp-linux-build", NOW), {})
+
+    def test_present_goldens_parses_names_and_tags(self):
+        done = mock.Mock(returncode=0, stdout="pulp-linux-build:latest\nm5-gate-01\n\n")
+        with mock.patch.object(ra.subprocess, "run", return_value=done):
+            self.assertEqual(ra.present_goldens(), {"pulp-linux-build", "m5-gate-01"})
+        with mock.patch.object(ra.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="")):
+            self.assertIsNone(ra.present_goldens())
+        with mock.patch.object(ra.subprocess, "run", side_effect=OSError("no tart")):
+            self.assertIsNone(ra.present_goldens())
 
     def test_render_tolerates_a_truncated_row(self):
         self.assertEqual(ra.render({"golden": "x"}), "x: UNKNOWN: ")
@@ -237,7 +279,7 @@ class SurfaceTests(unittest.TestCase):
         with mock.patch.object(ra, "latest_release", lambda home=None: "2.338.2"), \
                 mock.patch.object(ra, "present_goldens", lambda: {"pulp-linux-build"}), \
                 mock.patch.object(ra, "scan_refusals",
-                                  lambda g, v, now, home=None: {refused} if refused else set()), \
+                                  lambda g, now, home=None: {refused: now} if refused else {}), \
                 mock.patch("builtins.print", lambda *a, **k: out.append(" ".join(map(str, a)))):
             code = ra.main(["check", *args])
         return code, "\n".join(out)
@@ -266,7 +308,7 @@ class SurfaceTests(unittest.TestCase):
         with mock.patch.object(ra, "present_goldens", lambda: {"pulp-linux-build"}), \
                 mock.patch.object(ra, "latest_release", lambda home=None: latest), \
                 mock.patch.object(ra, "scan_refusals",
-                                  lambda g, v, now, home=None: {refused} if refused else set()):
+                                  lambda g, now, home=None: {refused: now} if refused else {}):
             tf.refresh(self.home, NOW, settings=settings, feed=lambda repo: "")
         import state_age
         with mock.patch.object(state_age, "clock", lambda: NOW + 60):
@@ -302,6 +344,7 @@ class SurfaceTests(unittest.TestCase):
         reasons = json.loads((HERE / "fleet_reasons.json").read_text())
         text = json.dumps(reasons)
         self.assertIn("python3 scripts/runner_age.py record --golden", text)
+        self.assertIn("--source operator", text)
         self.assertIn("tool-freshness --refresh", text)
         self.assertIn("DEFAULT_RUNNER_VERSION", text)
 

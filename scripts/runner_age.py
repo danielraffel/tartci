@@ -17,8 +17,9 @@ Per golden this reports one of:
   unknown  the version or the latest release could not be read
 
 The lag verdict comes from `runner_version.evaluate`, the rule the macOS pin
-check already uses, and the macOS golden's refusals come from the same
-`runner_version.scan_logs` read, so the two checks agree on the same input.
+check already uses, so the two cannot disagree about how far behind is too
+far. Refusals are read from every lane's runner logs, including the fleet
+lanes' own state directories.
 
 `warn` and `fail` are problems for the watchdog. `unknown` is shown by doctor
 and is neither ok nor an alert: a host that has never recorded its golden, or
@@ -77,16 +78,15 @@ def _newest(versions) -> Optional[str]:
 
 
 def classify(installed: Optional[str], latest: Optional[str], refused=()) -> dict:
-    """Pure policy. `refused` holds the versions runner logs say GitHub retired.
-
-    A refusal counts when it names the installed version, or when the installed
-    version is unknown: a lane that is being refused is broken either way.
+    """Pure policy. `refused` holds the versions GitHub is refusing for this
+    golden's lane right now (see `refusals`, which drops the ones that no
+    longer apply). Any of them is a fail.
     """
     have, newest = clean(installed), clean(latest)
     row = {"installed": have, "latest": newest}
     named = {clean(v) for v in refused or ()} - {None}
-    hit = have if have in named else (_newest(named) if have is None else None)
-    if hit:
+    if named:
+        hit = have if have in named else _newest(named)
         return dict(row, verdict="fail", reason=f"GitHub refuses runner v{hit} as deprecated")
     if have is None:
         return dict(row, verdict="unknown", reason="runner version is not recorded")
@@ -138,6 +138,14 @@ def read_record(golden: str, home: Optional[Path] = None) -> Optional[str]:
     return value.get("version") if isinstance(value, dict) else None
 
 
+def recorded_at(golden: str, home: Optional[Path] = None) -> Optional[float]:
+    """When the record was written (file time), or None without a record."""
+    try:
+        return os.path.getmtime(state_dir(home) / f"{base_name(golden)}.json")
+    except OSError:
+        return None
+
+
 def macos_pin(script: Optional[Path] = None) -> Optional[str]:
     """The runner version the macOS supervisor installs into each VM, or None."""
     try:
@@ -166,37 +174,37 @@ def present_goldens() -> Optional[set]:
     return {base_name(line.strip()) for line in proc.stdout.splitlines() if line.strip()}
 
 
-def macos_state_dir(home: Optional[Path] = None) -> str:
-    return os.environ.get("TARTCI_STATE_DIR") or str(tartci_home(home) / "state" / "macos")
-
-
-def linux_log_root(home: Optional[Path] = None) -> str:
-    return (os.environ.get("TARTCI_LINUX_LOGS") or os.environ.get("PULP_LINUX_LOGS")
-            or str((home or Path.home()) / "VMs" / "logs" / "tartci-linux"))
-
-
-def scan_refusals(golden: str, installed: Optional[str], now: float,
-                  home: Optional[Path] = None) -> set:
-    """Versions that runner logs for this golden's lane say GitHub retired.
-
-    macOS: the same read the pin check does (`runner_version.scan_logs`).
-    Linux: the head of each runner-output.log written in the scan window.
-    """
+def log_globs(golden: str, home: Optional[Path] = None) -> list:
+    """Where the lanes that clone `golden` keep each runner's output."""
     if base_name(golden) in PINNED_GOLDENS:
-        if not installed:
-            return set()
-        return {hit["version"] for hit in rv.scan_logs(macos_state_dir(home), installed)}
-    found = set()
-    for path in glob.glob(os.path.join(linux_log_root(home), "*", "runner-output.log")):
-        try:
-            if now - os.path.getmtime(path) > LOG_SCAN_WINDOW_SECS:
+        state = tartci_home(home) / "state"
+        roots = [str(state / "macos"), str(state / "macos-fleet" / "*")]
+        if os.environ.get("TARTCI_STATE_DIR"):
+            roots.append(os.environ["TARTCI_STATE_DIR"])
+        return [os.path.join(root, "*.actions-runner.log") for root in roots]
+    root = (os.environ.get("TARTCI_LINUX_LOGS") or os.environ.get("PULP_LINUX_LOGS")
+            or str((home or Path.home()) / "VMs" / "logs" / "tartci-linux"))
+    return [os.path.join(root, "*", "runner-output.log")]
+
+
+def scan_refusals(golden: str, now: float, home: Optional[Path] = None) -> dict:
+    """{version: newest log time} for refusals in this golden's recent runner logs.
+
+    Only logs written in the scan window are opened, and only their head.
+    """
+    found: dict = {}
+    for pattern in log_globs(golden, home):
+        for path in glob.glob(pattern):
+            try:
+                mtime = os.path.getmtime(path)
+                if now - mtime > LOG_SCAN_WINDOW_SECS:
+                    continue
+                with open(path, errors="replace") as handle:
+                    version = rv.find_deprecated(handle.read(LOG_HEAD_BYTES))
+            except OSError:
                 continue
-            with open(path, errors="replace") as handle:
-                version = rv.find_deprecated(handle.read(LOG_HEAD_BYTES))
-        except OSError:
-            continue
-        if version:
-            found.add(version)
+            if version:
+                found[version] = max(mtime, found.get(version, 0.0))
     return found
 
 
@@ -204,45 +212,58 @@ def _refused_path(golden: str, home: Optional[Path] = None) -> Path:
     return state_dir(home) / f"{base_name(golden)}.refused.json"
 
 
-def read_refused(golden: str, home: Optional[Path] = None) -> set:
+def read_refused(golden: str, home: Optional[Path] = None) -> dict:
+    """Remembered refusals as {version: time last seen}."""
     try:
         value = json.loads(_refused_path(golden, home).read_text())
     except (OSError, ValueError):
-        return set()
-    versions = value.get("versions") if isinstance(value, dict) else None
-    return {v for v in (clean(x) for x in versions or [] if isinstance(x, str)) if v}
+        return {}
+    seen = value.get("seen") if isinstance(value, dict) else None
+    out = {}
+    for version, when in (seen.items() if isinstance(seen, dict) else ()):
+        if clean(version) and isinstance(when, (int, float)):
+            out[clean(version)] = float(when)
+    return out
 
 
-def remember_refused(golden: str, versions: set, home: Optional[Path] = None) -> None:
-    """Keep refusals across passes. An empty set forgets them."""
+def remember_refused(golden: str, seen: dict, home: Optional[Path] = None) -> None:
+    """Keep refusals across passes. An empty mapping forgets them."""
     path = _refused_path(golden, home)
     try:
-        if not versions:
-            path.unlink()
+        if not seen:
+            if path.exists():
+                path.unlink()
             return
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".refused.")
         with os.fdopen(fd, "w") as handle:
-            json.dump({"golden": base_name(golden), "versions": sorted(versions)}, handle)
+            json.dump({"golden": base_name(golden), "seen": seen}, handle, sort_keys=True)
         os.replace(tmp, path)
     except OSError:
         pass
 
 
 def refusals(golden: str, installed: Optional[str], now: float, *,
-             home: Optional[Path] = None, persist: bool = False) -> set:
-    """Remembered and freshly seen refusals that still apply to `installed`.
+             home: Optional[Path] = None, persist: bool = False,
+             since: Optional[float] = None) -> set:
+    """Versions GitHub is refusing for this golden's lane, remembered or fresh.
 
-    A refusal of some other version stops applying once the installed version
-    is known, which is how recording a new version or bumping the pin clears
-    it. While the installed version is unknown every refusal still applies.
+    A refusal stops applying when it names a version other than the installed
+    one AND was last seen before `since` (when the Linux record was written).
+    That is how recording a new version clears it, while a refusal logged after
+    the record still fails: the record is then wrong about what the lane runs.
+    The macOS pin has no such time, so there only the pinned version applies.
+    With no installed version every refusal applies.
     """
     have = clean(installed)
-    seen = read_refused(golden, home) | scan_refusals(golden, have, now, home)
-    live = {v for v in seen if have is None or v == have}
+    seen = read_refused(golden, home)
+    for version, when in scan_refusals(golden, now, home).items():
+        seen[version] = max(when, seen.get(version, 0.0))
+    live = {v: t for v, t in seen.items()
+            if have is None or v == have or (since is not None and t > since)}
     if persist and live != read_refused(golden, home):
         remember_refused(golden, live, home)
-    return live
+    return set(live)
 
 
 def latest_release(home: Optional[Path] = None) -> Optional[str]:
@@ -273,18 +294,22 @@ def collect(goldens, now: float, *, home: Optional[Path] = None,
         pinned = name in PINNED_GOLDENS
         source = "pin" if pinned else "record"
         if here is None:
-            rows.append({"golden": name, "source": source, "installed": None,
-                         "latest": clean(latest), "verdict": "unknown",
-                         "reason": "local Tart images could not be listed"})
+            # Still report a refusal already on file; judge nothing else.
+            row = classify(None, latest, set(read_refused(golden, home)))
+            if row["verdict"] != "fail":
+                row["reason"] = "local Tart images could not be listed"
+            row.update(golden=name, source=source)
+            rows.append(row)
             continue
         if name not in here:
             continue
         if pinned:
-            installed = (pin or macos_pin)()
+            installed, since = (pin or macos_pin)(), None
         else:
             installed = (read or (lambda g: read_record(g, home)))(golden)
-        refused = (refusal or (lambda g, v: refusals(g, v, now, home=home, persist=persist)))(
-            golden, installed)
+            since = recorded_at(golden, home)
+        refused = (refusal or (lambda g, v: refusals(g, v, now, home=home, persist=persist,
+                                                     since=since)))(golden, installed)
         row = classify(installed, latest, refused)
         row.update(golden=name, source=source)
         rows.append(row)

@@ -3526,8 +3526,9 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
   could not be read, or the local Tart images could not be listed (then nothing
   is judged, because the host may not hold the golden).
 - **One rule.** The lag verdict comes from `scripts/runner_version.py`, the rule
-  the macOS pin check already uses, and the macOS golden's refusals come from
-  the same log read as that check, so the two agree on the same input. There is no
+  the macOS pin check already uses, so the two cannot disagree about how far
+  behind is too far. Refusals are read from every lane's recent runner logs,
+  including the fleet lanes' directories under `state/macos-fleet/`. There is no
   date arithmetic: GitHub's actual retirement dates do not follow a fixed
   number of days after a release, and the refusal line is the direct signal.
 - **Where the version comes from.** Nothing boots a golden to read it.
@@ -3552,8 +3553,8 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
 
 - **Runtime symptom.** The macOS supervisor backs off and records
   `runner_version_deprecated` when a listener says it is retired. The Linux
-  supervisor logs a named `runner_version_deprecated:` line for the same
-  output instead of a generic non-zero exit.
+  supervisor also logs a named `runner_version_deprecated:` line for the same
+  output, whatever the runner's exit status.
 - **Remedy, macOS.** Bump `DEFAULT_RUNNER_VERSION` and its checksum in
   `providers/tart-macos/runner.sh`.
 - **Remedy, Linux.** Boot the golden, replace `~/actions-runner` with the
@@ -3564,8 +3565,11 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
       tartci fleet-macos tool-freshness --refresh
 
   `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
-  version. Recording a version other than the refused one clears the `fail`;
-  the refresh makes the watchdog's stored result catch up at once.
+  version. The record is per host, so repeat it on every host that holds the
+  golden, including after a golden sync. Recording a version other than the
+  refused one clears the `fail`, unless a log written after the record still
+  shows a refusal; the refresh makes the watchdog's stored result catch up at
+  once.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
