@@ -219,6 +219,29 @@ class NoReserveTests(unittest.TestCase):
         self.assertEqual(fd.check_gate_reserve(value, installed_present=True).code,
                          "gate_reserve_fits")
 
+    @requires_tomllib
+    def test_summary_keeps_unreachable_problem_when_gate_reserve_is_not_applicable(self) -> None:
+        host = {"reserved_gate_cores": 0, "vm_pool_cores": 4,
+                "reserved_gate_mem_mb": 0, "non_gate_capacity_cores": 6,
+                "non_gate_capacity_mem_mb": 100000}
+        profile_text = (
+            '[[lane]]\nid = "pulp-gate"\nsupervisors = 1\n'
+            '[[lane]]\nid = "vellum-gate"\npriority = "vm"\n'
+            'supervisors = 2\nvm_cores = 4\n')
+        import macos_fleet_lanes
+        with tempfile.TemporaryDirectory() as td, \
+                mock.patch.object(macos_fleet_lanes, "live_host_profile", return_value=host):
+            config = Path(td) / "profile.toml"
+            config.write_text(profile_text)
+            value = macos_fleet_lanes.gate_reserve_summary(config)
+        self.assertEqual(value["problem"],
+                         "lane=vellum-gate axis=cores supervisors=2 vm_cores=4 demand=8 budget=6")
+        self.assertEqual(value["lines"], [
+            "gate reserve: n/a (this host reserves no gate cores)",
+            "lane budget: UNREACHABLE lane=vellum-gate axis=cores supervisors=2 "
+            "vm_cores=4 demand=8 budget=6"])
+        self.assertEqual(fd.check_gate_reserve(value, installed_present=True).state, fd.PROBLEM)
+
 
 class RatchetTests(unittest.TestCase):
     @requires_tomllib
@@ -373,6 +396,15 @@ class UnreachableConcurrencyTests(unittest.TestCase):
         del data["leases"]["vm_slot_lending"]
         # Without lending, the same two 6-core slots exceed m5's 6-core budget.
         self.assertEqual(len(grf.unreachable_concurrency(data, self.host("m5"))), 1)
+
+    @requires_tomllib
+    def test_live_slot_lending_override_can_disable_profile_lending(self) -> None:
+        data = profile("m5")
+        host = {**self.host("m5"), "vm_slot_lending": True}
+        with mock.patch.dict("os.environ", {"TARTCI_VM_SLOT_LENDING": "0"}):
+            rows = grf.unreachable_concurrency(data, host)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["budget"], 6)
 
     @requires_tomllib
     def test_validate_check_reserve_exits_nonzero(self) -> None:

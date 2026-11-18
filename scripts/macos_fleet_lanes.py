@@ -4056,9 +4056,12 @@ def gate_reserve_summary(config: Path) -> dict:
     except Exception as exc:  # noqa: BLE001 - a status line must not break status
         return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
                 "problem": None}
-    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
-        return {"lines": not_applicable, "problem": None}
     extra = [f"lane budget: UNREACHABLE {line.split(' ', 1)[1]}" for line in unreachable]
+    if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
+        if not unreachable:
+            return {"lines": not_applicable, "problem": None}
+        return {"lines": [*not_applicable, *extra],
+                "problem": "; ".join(line.split(" ", 1)[1] for line in unreachable)}
     if not lines:
         return {"lines": ["gate reserve: every gate lane fits", *extra, *not_applicable],
                 "problem": "; ".join(line.split(" ", 1)[1] for line in unreachable) or None}
