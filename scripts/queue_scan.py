@@ -600,6 +600,12 @@ class QueueScanner:
             and "self-hosted" in [str(label).lower() for label in job.get("labels") or []]
             for job in jobs
         ):
+            stamp = str(updated_at or (memory.get(str(run_id)) or {}).get("updated_at") or "")
+            now = int(getattr(self, "now", 0) or 0)
+            # A fetch in the second a job ends can precede its dependent job,
+            # which shares that updated_at. Read such a run once more instead.
+            if stamp and now and _age_seconds(stamp, now) < REQUEUE_AFTER_SECONDS:
+                return
             gone = memory.pop(str(run_id), None) or {}
             cleared = state.setdefault("requeued_cleared", {})
             if isinstance(cleared, dict) and (updated_at or gone.get("updated_at")):
@@ -685,7 +691,18 @@ class QueueScanner:
         requeued_waiting = [run for run in requeued_mg if waiting(run)]
         # Waiting groups are chosen before running ones, not just among the
         # newest: a fresh group behind two newer running ones is demand.
-        fresh = [run for run in all_merge if waiting(run)][: self._merge_group_quota()]
+        # Not a group a job fetch already showed has no queued fleet job (a
+        # phantom, or one whose queued job is hosted) until it changes.
+        cleared_map = state.get("requeued_cleared") if isinstance(
+            state.get("requeued_cleared"), dict) else {}
+
+        def known_idle(run: dict[str, Any]) -> bool:
+            entry = cleared_map.get(str(int(run["id"])))
+            return isinstance(entry, dict) and entry.get("updated_at") == str(
+                run.get("updated_at") or "")
+
+        fresh = [run for run in all_merge if waiting(run) and not known_idle(run)][
+            : self._merge_group_quota()]
         groups: list[dict[str, Any]] = []
         for index in range(max(len(requeued_waiting), len(fresh))):
             groups += requeued_waiting[index:index + 1] + fresh[index:index + 1]
@@ -741,8 +758,18 @@ class QueueScanner:
         oldest = self._oldest_reservable(backlog)
         oldest_id = int(oldest["id"]) if oldest is not None else -1
 
+        # The rotating lists keep their shape while the priority picks turn:
+        # with the requeued quota on they are built from the listing minus
+        # only the newest picks, and this refresh's priority picks are skipped
+        # inside the loop. Built from `backlog`, a pick that alternates would
+        # shift the list under the saved offset and skip one run for good.
+        newest_ids = latency_ids - priority_ids
+        rotation_source = (
+            [run for run in runs if int(run["id"]) not in newest_ids]
+            if self._requeued_quota() else backlog
+        )
         groups: dict[str, list[dict[str, Any]]] = {}
-        for run in backlog:
+        for run in rotation_source:
             key = str(run.get("_page_key") or "legacy")
             groups.setdefault(key, []).append(run)
         for group in groups.values():
@@ -812,6 +839,8 @@ class QueueScanner:
                 break
             consumed += 1
             candidate = group[(offset + step) % len(group)]
+            if int(candidate["id"]) in priority_ids:
+                continue
             if not reserved_oldest or int(candidate["id"]) != oldest_id:
                 selected.append(candidate)
         offsets[key] = {

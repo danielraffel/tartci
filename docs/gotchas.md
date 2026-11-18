@@ -1200,4 +1200,10 @@ not permission to force-remove a worktree.
   even when their page is not read again. A remembered run stays requeued
   until a fetch of its jobs shows no queued job on a self-hosted runner,
   within the 6 h bound. After that fetch the run gets no priority read until
-  its `updated_at` changes (`requeued_cleared`), though it still rotates.
+  its `updated_at` changes (`requeued_cleared`), though it still rotates. A
+  fresh merge group with such a record is not "waiting" either, so a phantom
+  cannot take the waiting groups' turns. A fetch whose run was updated under
+  60 s earlier records nothing, because the dependent job may not exist yet
+  in that second. While the priority picks turn, the rotating lists are built
+  from the listing minus only the newest picks, and priority picks are
+  skipped in place, so the rotation still reaches every run.
