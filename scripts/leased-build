@@ -55,9 +55,12 @@ floor_arg=""; [ "$class" = background ] && floor_arg="--allow-floor"
 min_cores=2
 if [ "$class" = check ]; then cores=1; min_cores=1; fi
 id="leased-build-$(hostname -s)-$$-$(date +%s)"
+# acquire's stderr is left connected: it carries the external-only policy's
+# report-mode warnings, which an agent running a build must see. Only stdout (the
+# JSON) is captured.
 out="$("$tartci" leases acquire --id "$id" --cores "$cores" --min-cores "$min_cores" \
   --priority build --class "$class" $floor_arg --kind agent-build --owner "${USER:-agent}" \
-  --label "$(basename "$PWD")" --pid "$$" --wait-secs "$wait_secs" --json 2>/dev/null)" || true
+  --label "$(basename "$PWD")" --pid "$$" --wait-secs "$wait_secs" --json)" || true
 granted="$(printf '%s' "$out" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: sys.exit(1)
