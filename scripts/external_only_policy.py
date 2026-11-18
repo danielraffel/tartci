@@ -49,6 +49,7 @@ import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 REASON = "external_only_internal_path"
+REASON_UNREADABLE = "external_only_device_unreadable"
 EXIT_REFUSED = 78  # EX_CONFIG: not a capacity denial, so --wait-secs never retries it.
 
 # Environment variable -> directory under <external_root>/caches/.
@@ -127,8 +128,14 @@ def collect(env: Mapping[str, str], home: str, build_dirs: Sequence[str] = (),
         if env.get(name):
             found.append((name, env[name]))
     xdg = env.get("XDG_CACHE_HOME") or os.path.join(home, ".cache")
+    if env.get("XDG_CACHE_HOME"):
+        uv_default = os.path.join(xdg, "uv")
+    elif sys.platform == "darwin":
+        uv_default = os.path.join(home, "Library", "Caches", "uv")
+    else:
+        uv_default = os.path.join(home, ".cache", "uv")
     for name, default in (("PIP_CACHE_DIR", os.path.join(home, "Library", "Caches", "pip")),
-                          ("UV_CACHE_DIR", os.path.join(xdg, "uv"))):
+                          ("UV_CACHE_DIR", uv_default)):
         if not env.get(name) and os.path.isdir(default):
             found.append((name + " default dir", default))
     if not env.get("CCACHE_DIR"):
@@ -158,13 +165,22 @@ def nearest_existing(path: str) -> str:
     return current or "/"
 
 
-def internal_device(device: Callable[[str], int]) -> Optional[int]:
-    for probe in INTERNAL_DEVICE_PROBES:
+def _internal_device_probe(
+    device: Callable[[str], int],
+) -> Tuple[Optional[int], List[Dict[str, str]]]:
+    probes = INTERNAL_DEVICE_PROBES[:1] if sys.platform == "darwin" else INTERNAL_DEVICE_PROBES
+    errors: List[Dict[str, str]] = []
+    for probe in probes:
         try:
-            return device(probe)
-        except OSError:
-            continue
-    return None
+            return device(probe), errors
+        except OSError as exc:
+            errors.append({"label": "internal device probe", "path": probe, "error": str(exc)})
+    return None, errors
+
+
+def internal_device(device: Callable[[str], int]) -> Optional[int]:
+    """Return the internal device, or None when it cannot be proven."""
+    return _internal_device_probe(device)[0]
 
 
 def _st_dev(path: str) -> int:
@@ -175,7 +191,10 @@ def judge(paths: Sequence[Tuple[str, str]], external_root: str, *,
           device: Optional[Callable[[str], int]] = None) -> Dict[str, Any]:
     """Judge each path; `violations` lists those on the internal data volume."""
     device = device or _st_dev
-    internal = internal_device(device)
+    internal, internal_device_errors = _internal_device_probe(device)
+    if internal is None and not internal_device_errors:
+        internal_device_errors = [{"label": "internal device probe", "path": "<unknown>",
+                                   "error": "device id unavailable"}]
     violations: List[Dict[str, str]] = []
     judged: List[Dict[str, str]] = []
     unread: List[Dict[str, str]] = []
@@ -194,6 +213,7 @@ def judge(paths: Sequence[Tuple[str, str]], external_root: str, *,
     return {
         "external_root": external_root,
         "internal_device_known": internal is not None,
+        "internal_device_errors": internal_device_errors,
         "judged": judged,
         "violations": violations,
         "unread": unread,
@@ -227,6 +247,27 @@ def refusal_message(violations: Sequence[Mapping[str, str]], external_root: str)
     )
 
 
+def unread_message(unread: Sequence[Mapping[str, str]], external_root: str, *,
+                   mode: str, internal_unknown: bool) -> str:
+    details = "\n".join(
+        f"  {row.get('label', 'probe')}: {row.get('path', '<unknown>')} "
+        f"({row.get('error', 'unreadable')})"
+        for row in unread
+    )
+    if mode == "refuse":
+        action = "refusing"
+        suffix = " in refuse mode"
+    else:
+        action = "admitting"
+        suffix = " in report mode"
+    if internal_unknown:
+        subject = "could not prove the internal data volume"
+    else:
+        subject = "could not inspect every build or cache path"
+    return (f"tartci: external-only policy {subject} (external_root {external_root}); "
+            f"{action}{suffix} with these unreadable probes:\n{details}")
+
+
 def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "report",
                   env: Optional[Mapping[str, str]] = None, home: Optional[str] = None,
                   device: Optional[Callable[[str], int]] = None) -> Optional[Dict[str, Any]]:
@@ -244,6 +285,26 @@ def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "repor
                     getattr(args, "build_dir", None) or (),
                     getattr(args, "cache_dir", None) or (), cwd=os.getcwd())
     verdict = judge(paths, external_root, device=device)
+    internal_errors = verdict["internal_device_errors"]
+    unread = internal_errors + verdict["unread"]
+    internal_unknown = not verdict["internal_device_known"]
+    if unread or internal_unknown:
+        if mode == "refuse" and internal_unknown:
+            return {
+                "ok": False,
+                "reason": REASON_UNREADABLE,
+                "message": unread_message(unread, external_root, mode="refuse",
+                                           internal_unknown=True),
+                "external_root": external_root,
+                "violations": verdict["violations"],
+                "unread": unread,
+            }
+        print(unread_message(unread, external_root, mode="report",
+                             internal_unknown=internal_unknown), file=sys.stderr)
+        try:
+            args.external_policy_unread = unread
+        except AttributeError:
+            pass
     if not verdict["violations"]:
         return None
     if mode != "refuse":
@@ -294,12 +355,21 @@ def _main(argv: Optional[List[str]] = None) -> int:
         print("not an external-only host: no [host] external_root in the fleet profile")
         return 0
     if args.command == "exports":
-        for name, path in default_dirs(root).items():
-            if not os.environ.get(name):
+        exports = {name: path for name, path in default_dirs(root).items()
+                   if not os.environ.get(name)}
+        if args.json:
+            print(json.dumps(exports, indent=2, sort_keys=True))
+        else:
+            for name, path in exports.items():
                 print(f"export {name}={path}")
         return 0
     verdict = judge(collect(os.environ, os.path.expanduser("~"), args.build_dir, args.cache_dir,
                               cwd=os.getcwd()), root)
+    if (not verdict["internal_device_known"] or verdict["internal_device_errors"]
+            or verdict["unread"]):
+        print(unread_message(verdict["internal_device_errors"] + verdict["unread"], root,
+                             mode="report", internal_unknown=not verdict["internal_device_known"]),
+              file=sys.stderr)
     if args.json:
         print(json.dumps(verdict, indent=2, sort_keys=True))
     elif verdict["violations"]:

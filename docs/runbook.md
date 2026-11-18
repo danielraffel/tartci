@@ -5130,7 +5130,7 @@ use the internal disk. m5studio's internal Data volume reached 98% on
 2026-11-17 with `~/Library/Containers` at 159 GB, `~/.codex` 22 GB, `~/.pulp`
 21 GB and `~/.android` 16 GB, and tripped `fleet_ready`.
 
-**Policy.** A host's fleet profile sets `[host] external_root` (the host's own
+**Policy.** When enabled, a host's fleet profile sets `[host] external_root` (the host's own
 `/Volumes/<name>`; it must contain `tart_home`). `[host] external_only_mode` is `report` only: `tartci leases acquire` for a host
 build warns on stderr, admits, and journals an `external_only_policy` /
 `would_refuse` row in the lease store's `events.jsonl`. The policy runs once per acquire,
@@ -5185,7 +5185,7 @@ Each step copies, verifies, renames the old directory aside and symlinks; the
     move ~/.pulp/sdk                $X/caches/pulp/sdk
     move ~/.pulp/sdk-source-dev     $X/caches/pulp/sdk-source-dev
     move ~/.cache/vellum-gates      $X/caches/vellum-gates
-    move ~/.cache/uv                $X/caches/uv
+    move ~/Library/Caches/uv        $X/caches/uv
     move ~/Library/Caches/Pulp      $X/caches/Pulp
     move ~/Library/Caches/org.swift.swiftpm $X/caches/swiftpm
     move ~/Library/Caches/go-build  $X/caches/go-build

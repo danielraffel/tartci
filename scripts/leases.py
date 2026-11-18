@@ -1705,15 +1705,20 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             args, cfg.get("external_root"), mode=cfg.get("external_only_mode", "report"))
         try:
             would = getattr(args, "external_would_refuse", None)
-            if refusal is not None or would:
+            unread = getattr(args, "external_policy_unread", None)
+            if refusal is not None or would or unread:
+                observed = (refusal["violations"] if refusal else would) or []
+                observed_unread = (refusal or {}).get("unread", []) if refusal else (unread or [])
                 journal_lease_events(store_dir, [{
                     "event": "external_only_policy",
-                    "outcome": "refused" if refusal is not None else "would_refuse",
+                    "outcome": ("refused" if refusal is not None else
+                                "would_refuse" if would else "unread"),
                     "mode": cfg.get("external_only_mode", "report"),
                     "external_root": cfg.get("external_root"),
                     "kind": args.kind, "lease_id": lease_id, "owner": args.owner,
-                    "paths": [v["path"] for v in (refusal["violations"] if refusal else would)],
-                    "labels": [v["label"] for v in (refusal["violations"] if refusal else would)],
+                    "paths": [v["path"] for v in observed] + [v["path"] for v in observed_unread],
+                    "labels": [v["label"] for v in observed] + [v["label"] for v in observed_unread],
+                    "unread": observed_unread,
                 }])
         except Exception:  # noqa: BLE001 - an audit row must never fail an acquire
             pass
@@ -2761,7 +2766,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:  # noqa: BLE001
         result = {"ok": False, "error": str(exc)}
         rc = 2
-    if result.get("reason") == external_only_policy.REASON:
+    if result.get("reason") in (external_only_policy.REASON,
+                                 external_only_policy.REASON_UNREADABLE):
         print(result["message"], file=sys.stderr)
     emit(result, bool(getattr(args, "json", False)))
     return rc

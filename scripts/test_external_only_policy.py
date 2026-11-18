@@ -102,6 +102,15 @@ class JudgeTests(unittest.TestCase):
         self.assertEqual(verdict["violations"], [])
         self.assertEqual(len(verdict["unread"]), 1)
 
+    def test_an_unreadable_internal_device_is_explicitly_unknown(self) -> None:
+        def device(path: str) -> int:
+            raise PermissionError(f"cannot read {path}")
+
+        verdict = eop.judge([], EXT_ROOT, device=device)
+        self.assertFalse(verdict["internal_device_known"])
+        self.assertEqual(verdict["violations"], [])
+        self.assertTrue(verdict["internal_device_errors"])
+
 
 class CollectTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -176,8 +185,9 @@ class CollectTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             self.assertEqual(eop.collect({}, home), [])
             (Path(home) / "Library" / "Caches" / "pip").mkdir(parents=True)
-            (Path(home) / ".cache" / "uv").mkdir(parents=True)
-            got = dict(eop.collect({}, home))
+            with mock.patch.object(eop.sys, "platform", "darwin"):
+                (Path(home) / "Library" / "Caches" / "uv").mkdir(parents=True)
+                got = dict(eop.collect({}, home))
             self.assertEqual(set(got), {"PIP_CACHE_DIR default dir", "UV_CACHE_DIR default dir"})
             self.assertEqual(eop.collect({"PIP_CACHE_DIR": "/p", "UV_CACHE_DIR": "/u"}, home),
                              [("PIP_CACHE_DIR", "/p"), ("UV_CACHE_DIR", "/u")])
@@ -361,6 +371,24 @@ class SafeAndRefuseTests(unittest.TestCase):
                                              device=fake_device)
         self.assertEqual(refusal["reason"], eop.REASON)
 
+    def test_unknown_internal_device_warns_in_report_and_refuses_in_refuse_mode(self) -> None:
+        import contextlib, io
+
+        def unreadable(_path: str) -> int:
+            raise PermissionError("EPERM")
+
+        report_args = args()
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertIsNone(eop.check_acquire(report_args, EXT_ROOT, mode="report", env={},
+                                                home="/nonexistent", device=unreadable))
+        self.assertIn("could not prove the internal data volume", err.getvalue())
+        self.assertTrue(report_args.external_policy_unread)
+
+        refusal = eop.check_acquire(args(), EXT_ROOT, mode="refuse", env={},
+                                    home="/nonexistent", device=unreadable)
+        self.assertEqual(refusal["reason"], eop.REASON_UNREADABLE)
+
     def test_check_acquire_defaults_to_report(self) -> None:
         import contextlib, io
         a = args()
@@ -397,6 +425,44 @@ class SafeAndRefuseTests(unittest.TestCase):
                         external_would_refuse=[{"path": "/p", "label": "l"}],
                         external_policy_checked=False))
 
+    def test_unread_policy_evidence_is_journaled(self) -> None:
+        import leases
+
+        unread = [{"path": "/p", "label": "internal device probe", "error": "EPERM"}]
+        args_for_acquire = argparse.Namespace(
+            store_dir="/nonexistent", priority="build", pid=None, cores_requested=1,
+            id="t1", kind="build", owner="o", build_dir=[], cache_dir=[],
+            external_policy_checked=False)
+
+        def mark_unread(args, *_args, **_kwargs):
+            args.external_policy_unread = unread
+            return None
+
+        with mock.patch.object(leases.external_only_policy, "check_acquire_safe",
+                               side_effect=mark_unread), \
+                mock.patch.object(leases, "journal_lease_events") as journal, \
+                mock.patch.object(leases, "capacity_config", return_value={
+                    "external_root": EXT_ROOT, "external_only_mode": "report"}), \
+                mock.patch.object(leases, "locked_store", side_effect=StopIteration):
+            with self.assertRaises(StopIteration):
+                leases.acquire(args_for_acquire)
+
+        row = journal.call_args.args[1][0]
+        self.assertEqual(row["outcome"], "unread")
+        self.assertEqual(row["paths"], ["/p"])
+        self.assertEqual(row["unread"], unread)
+
+    def test_exports_json_is_machine_readable(self) -> None:
+        env = {"PATH": os.environ.get("PATH", "")}
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "scripts" / "external_only_policy.py"), "exports",
+             "--external-root", EXT_ROOT, "--json"],
+            text=True, capture_output=True, env=env, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual(payload["UV_CACHE_DIR"], EXT_ROOT + "/caches/uv")
+        self.assertNotIn("export ", proc.stdout)
+
     def test_refuse_is_not_reachable_from_the_profile(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "f.toml"
@@ -406,31 +472,23 @@ class SafeAndRefuseTests(unittest.TestCase):
 
 @unittest.skipUnless(HAVE_TOMLLIB, "reads the shipped profiles with tomllib")
 class ShippedProfileTests(unittest.TestCase):
-    def test_hosts_with_an_external_tart_store_are_external_only_and_validate(self) -> None:
-        import tomllib
-        seen = 0
+    def test_shipped_profiles_validate(self) -> None:
         for path in sorted((ROOT / "profiles").glob("*-macos-fleet.toml")):
-            host = tomllib.loads(path.read_text())["host"]
-            external = host["tart_home"].startswith("/Volumes/")
             with self.subTest(profile=path.name):
-                root = host.get("external_root")
-                if external:
-                    seen += 1
-                    self.assertTrue(root and (host["tart_home"] + "/").startswith(root + "/"), root)
-                else:
-                    self.assertIsNone(root)
                 res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
                                       str(path)], cwd=ROOT, capture_output=True, text=True)
                 self.assertEqual(res.returncode, 0, res.stderr)
-                if external:
-                    self.assertEqual(host.get("external_only_mode"), "report")
-        self.assertGreaterEqual(seen, 2)
 
     def test_refuse_mode_is_rejected_by_the_validator(self) -> None:
         source = (ROOT / "profiles" / "m5studio-macos-fleet.toml").read_text()
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "bad.toml"
-            path.write_text(source.replace('external_only_mode = "report"', 'external_only_mode = "refuse"'))
+            import re
+            path.write_text(re.sub(r'^tart_home = "[^"]+"$',
+                                   'tart_home = "/Volumes/Example/VMs"', source,
+                                   count=1, flags=re.MULTILINE).replace(
+                    '[host]\n', '[host]\nexternal_root = "/Volumes/Example"\n'
+                    'external_only_mode = "refuse"\n', 1))
             res = subprocess.run([sys.executable, "scripts/macos_fleet_lanes.py", "validate",
                                   str(path)], cwd=ROOT, capture_output=True, text=True)
             self.assertNotEqual(res.returncode, 0)
