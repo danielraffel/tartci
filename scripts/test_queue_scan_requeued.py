@@ -125,6 +125,32 @@ class IncidentShapeTests(unittest.TestCase):
             sys.argv = old
 
 
+class ProfileKeyTests(unittest.TestCase):
+    def test_a_lane_can_set_or_turn_off_the_quota(self) -> None:
+        import plistlib
+        import tempfile as tf
+        import macos_fleet_lanes as fleet
+        root = Path(__file__).resolve().parents[1]
+        base = (root / "profiles" / "m5-macos-fleet.toml").read_text()
+        anchor = "queue_merge_group_quota = 2\n"
+        self.assertEqual(base.count(anchor), 1)
+        with tf.TemporaryDirectory() as td:
+            path = Path(td) / "p.toml"
+            path.write_text(base.replace(anchor, anchor + "queue_requeued_quota = 0\n"))
+            env = next(plistlib.loads(body)["EnvironmentVariables"]
+                       for name, body in fleet.rendered_plists(fleet.load(path)).items()
+                       if name.endswith(".vellum-gate.plist"))
+            self.assertEqual(env["TARTCI_QUEUE_REQUEUED_QUOTA"], "0")
+            path.write_text(base.replace(anchor, anchor + "queue_requeued_quota = -1\n"))
+            with self.assertRaisesRegex(ValueError, "queue_requeued_quota"):
+                fleet.load(path)
+        # Absent, nothing is rendered and the CLI default applies.
+        env = next(plistlib.loads(body)["EnvironmentVariables"]
+                   for name, body in fleet.rendered_plists(fleet.load(root / "profiles" / "m5-macos-fleet.toml")).items()
+                   if name.endswith(".vellum-gate.plist"))
+        self.assertNotIn("TARTCI_QUEUE_REQUEUED_QUOTA", env)
+
+
 class RequeuedRankingTests(unittest.TestCase):
     def scanner(self, **args: Any) -> Any:
         import queue_scan
@@ -242,6 +268,63 @@ class RequeuedRankingTests(unittest.TestCase):
         changed = {**run, "updated_at": _stamp(now - timedelta(minutes=1))}
         later, _ = scanner._candidate_runs([changed, *prs], state)
         self.assertEqual(int(later[0]["id"]), 8)
+
+    def test_a_cleared_run_outside_memory_loses_its_slot(self) -> None:
+        """More requeued runs than memory holds: the oldest is still cleared."""
+        now = datetime.now(timezone.utc)
+        # The oldest-created run also has the oldest update, so it is not
+        # among the 16 newest updates memory keeps.
+        runs = [_run(i, now - timedelta(hours=3, minutes=i), "pull_request", "queued",
+                     now - timedelta(minutes=i)) for i in range(1, 31)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        first, _ = scanner._candidate_runs(runs, state)
+        oldest = int(first[0]["id"])
+        self.assertEqual(oldest, 30)
+        self.assertNotIn(str(oldest), state["requeued_runs"])
+        scanner._forget_served(state, oldest, [{"status": "queued", "labels": ["ubuntu-24.04"]}],
+                               next(r["updated_at"] for r in runs if r["id"] == oldest))
+        second, _ = scanner._candidate_runs(runs, state)
+        self.assertNotEqual(int(second[0]["id"]), oldest)
+
+    def test_the_reservation_does_not_charge_a_requeued_run(self) -> None:
+        """Two requeued merge groups, refreshed inside negative_ttl, both read."""
+        now = datetime.now(timezone.utc)
+        old_a = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        old_b = _run(2, now - timedelta(hours=2), "merge_group", "queued", now - timedelta(minutes=8))
+        prs = [_run(100 + i, now - timedelta(minutes=i), "pull_request", "queued")
+               for i in range(1, 13)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        # The first refresh spends the reservation on the oldest PR run; the
+        # next ones, inside negative_ttl, give both requeued groups a slot.
+        scanner._candidate_runs([old_a, old_b, *prs], state)
+        self.assertNotIn("1", state.get("oldest_reserved_at", {}))
+        for _ in range(2):
+            scanner.now += 10
+            ids = [int(r["id"]) for r in scanner._candidate_runs([old_a, old_b, *prs], state)[0]]
+            self.assertIn(1, ids)
+            self.assertIn(2, ids)
+
+    def test_requeued_and_fresh_merge_groups_share_the_slots(self) -> None:
+        now = datetime.now(timezone.utc)
+        old = [_run(i, now - timedelta(hours=3, minutes=i), "merge_group", "queued",
+                    now - timedelta(minutes=9)) for i in (1, 2)]
+        fresh = _run(3, now - timedelta(minutes=2), "merge_group", "queued")
+        prs = [_run(100 + i, now - timedelta(minutes=10 + i), "pull_request", "queued")
+               for i in range(1, 13)]
+        ids = [int(r["id"]) for r in self.scanner()._candidate_runs([*old, fresh, *prs], {})[0]]
+        self.assertIn(3, ids)
+        self.assertTrue({1, 2} & set(ids))
+
+    def test_memory_trim_keeps_merge_groups(self) -> None:
+        now = datetime.now(timezone.utc)
+        merge = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=50))
+        prs = [_run(100 + i, now - timedelta(hours=2), "pull_request", "queued",
+                    now - timedelta(minutes=i)) for i in range(1, 25)]
+        state: dict[str, Any] = {}
+        self.scanner()._candidate_runs([merge, *prs], state)
+        self.assertIn("1", state["requeued_runs"])
 
     def test_memory_is_bounded(self) -> None:
         import queue_scan

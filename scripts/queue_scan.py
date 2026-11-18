@@ -559,7 +559,9 @@ class QueueScanner:
             }
         # Expire by the same age bound, then keep the newest updates.
         live = self._requeued_runs(list(memory.values()))
-        live.sort(key=lambda run: str(run.get("updated_at") or ""), reverse=True)
+        # Merge groups first, then the newest updates.
+        live.sort(key=lambda run: (run.get("event") == "merge_group",
+                                   str(run.get("updated_at") or "")), reverse=True)
         memory = {str(run["id"]): run for run in live[:REQUEUE_MEMORY_MAX]}
         state["requeued_runs"] = memory
         # A listed run keeps its remembered standing (an in_progress run whose
@@ -570,9 +572,11 @@ class QueueScanner:
 
     def _forget_served(self, state: dict[str, Any], run_id: int, jobs: list[Any],
                        updated_at: str = "") -> None:
+        # Recorded whether or not the run is remembered: memory keeps the
+        # newest updates, while priority goes to the oldest runs.
         memory = state.get("requeued_runs")
-        if not isinstance(memory, dict) or str(run_id) not in memory:
-            return
+        if not isinstance(memory, dict):
+            memory = {}
         # Kept only while a queued job can need a fleet VM: a queued job on a
         # GitHub-hosted runner would otherwise hold a priority slot for 6 h.
         # Not this scanner's labels: the discovery (and this memory) is shared
@@ -587,7 +591,7 @@ class QueueScanner:
         ):
             gone = memory.pop(str(run_id), None) or {}
             cleared = state.setdefault("requeued_cleared", {})
-            if isinstance(cleared, dict):
+            if isinstance(cleared, dict) and (updated_at or gone.get("updated_at")):
                 cleared[str(run_id)] = {
                     "updated_at": str(updated_at or gone.get("updated_at") or ""),
                     "at": int(getattr(self, "now", 0) or 0),
@@ -634,28 +638,36 @@ class QueueScanner:
         # Every refresh keeps at least one rotating slot, so a busy merge queue
         # (Pulp builds up to five groups) cannot starve the PR backlog. When the
         # oldest-run reservation will fire this sweep it costs a slot too.
-        reservation = 1 if self._reservation_fires(newest, state) else 0
-        slots = max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1)
         # Requeued runs (an old run whose dependent job is now queued) are read
-        # whatever their age, from the same slots as the merge-group quota:
-        # requeued merge groups first, then the newest merge groups, then
-        # other requeued runs, so a requeued PR run never displaces a merge
-        # group. The newest quota, the oldest-run reservation and one rotating
-        # slot keep theirs.
-        requeued_quota = min(self._requeued_quota(), slots)
+        # whatever their age, from the same slots as the merge-group quota. The
+        # reservation is judged without them: a requeued run read here needs no
+        # reserved slot, and charging one would cost a priority slot.
         requeued = self._requeued_runs(self._with_remembered(runs, state))
-        requeued_mg = [run for run in requeued if run.get("event") == "merge_group"][:requeued_quota]
-        taken = {int(run["id"]) for run in requeued_mg}
+        requeued = requeued[: self._requeued_quota()]
+        requeued_ids = {int(run["id"]) for run in requeued}
+        reservation = 1 if self._reservation_fires(
+            [run for run in newest if int(run["id"]) not in requeued_ids], state) else 0
+        slots = max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1)
+        # Merge groups first, alternating requeued and newest, so neither an
+        # old requeued group nor a fresh one hides the other; then other
+        # requeued runs. A requeued PR run never displaces a merge group. The
+        # newest quota, the oldest-run reservation and one rotating slot keep
+        # theirs.
+        requeued_mg = [run for run in requeued if run.get("event") == "merge_group"]
         merge = [
             run for run in newest
-            if run.get("event") == "merge_group" and int(run["id"]) not in taken
-        ][: min(self._merge_group_quota(), slots - len(requeued_mg))]
-        taken |= {int(run["id"]) for run in merge}
+            if run.get("event") == "merge_group" and int(run["id"]) not in requeued_ids
+        ][: self._merge_group_quota()]
+        groups: list[dict[str, Any]] = []
+        for index in range(max(len(requeued_mg), len(merge))):
+            groups += requeued_mg[index:index + 1] + merge[index:index + 1]
+        groups = groups[:slots]
+        taken = {int(run["id"]) for run in groups}
         requeued_other = [
             run for run in requeued
             if run.get("event") != "merge_group" and int(run["id"]) not in taken
-        ][: max(0, min(requeued_quota - len(requeued_mg), slots - len(requeued_mg) - len(merge)))]
-        priority = requeued_mg + merge + requeued_other
+        ][: max(0, slots - len(groups))]
+        priority = groups + requeued_other
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
@@ -674,7 +686,10 @@ class QueueScanner:
         # A run older than --oldest-reserve-max-age (a closed PR's run GitHub
         # never retired, a phantom) cannot be live demand worth a guaranteed
         # slot on every refresh; it stays in the rotation but is not reserved.
-        oldest = self._oldest_reservable(backlog)
+        # Judged as _reservation_fires judged it: without requeued runs, which
+        # their own priority reads cover when slots allow.
+        oldest = self._oldest_reservable(
+            [run for run in backlog if int(run["id"]) not in requeued_ids])
         oldest_id = int(oldest["id"]) if oldest is not None else -1
 
         groups: dict[str, list[dict[str, Any]]] = {}

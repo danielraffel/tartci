@@ -1173,15 +1173,19 @@ not permission to force-remove a worktree.
   one of their jobs ran:
   - a `queued` or `pending` run whose `updated_at` is at least 60 s after
     `created_at`;
-  - an `in_progress` run updated since the previous discovery and at least
-    60 s after its `created_at`.
+  - an `in_progress` run updated within the discovery window (160 s,
+    `TARTCI_QUEUE_DISCOVERY_TTL_SECS`) and at least 60 s after its
+    `created_at`.
 
-  Requeued merge groups come first, then the newest merge groups, then other
-  requeued runs (requeued before merely updated, oldest first within each),
-  so a requeued PR run never displaces a merge group. These reads come from the same slots as
+  Merge groups come first, alternating requeued (oldest first) and newest,
+  so neither hides the other. Other requeued runs come after them (requeued
+  before merely updated, oldest first), so a requeued PR run never displaces
+  a merge group. The oldest-run reservation is judged without the requeued
+  runs. These reads come from the same slots as
   `--merge-group-quota`. The newest quota, the oldest-run reservation and one
   rotating slot keep theirs, so the API-call budget is unchanged. `0`
-  restores the old selection.
+  restores the old selection. A lane can set it with the profile key
+  `queue_requeued_quota`.
 
   An update older than 6 h never counts, so a phantom run cannot hold a slot.
   Each refresh reads page 1 and one rotating older page. So the shared

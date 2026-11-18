@@ -133,7 +133,7 @@ LANE_KEYS = {
     "fallback_peer_max_age_seconds",
     "warm_vm", "warm_vm_max_park_seconds", "guest_heartbeat_stale_seconds",
     "admission_precheck_overlap", "admission_precheck_overlap_backoff_seconds",
-    "v2_gate_classes", "queue_merge_group_quota",
+    "v2_gate_classes", "queue_merge_group_quota", "queue_requeued_quota",
     # Slot priority's short-job-first rule (scripts/slot_priority.py).
     "short_jobs", "short_job_first",
 }
@@ -925,6 +925,9 @@ def load(path: Path) -> dict:
         quota = lane.get("queue_merge_group_quota")
         if quota is not None and (type(quota) is not int or quota < 0):
             fail(f"lane {lane_id}: queue_merge_group_quota must be a nonnegative integer")
+        requeued = lane.get("queue_requeued_quota")
+        if requeued is not None and (type(requeued) is not int or requeued < 0):
+            fail(f"lane {lane_id}: queue_requeued_quota must be a nonnegative integer")
         validate_short_jobs(lane_id, lane, data)
         vm_cores = lane.get("vm_cores")
         if vm_cores is not None and (type(vm_cores) is not int or vm_cores < 1):
@@ -3257,6 +3260,10 @@ def lane_plist(
         # queue_scan.py reads the newest N merge_group runs' jobs on every
         # refresh; absent, the lane keeps the plain newest-then-rotation order.
         env["TARTCI_QUEUE_MERGE_GROUP_QUOTA"] = str(lane["queue_merge_group_quota"])
+    if "queue_requeued_quota" in lane:
+        # queue_scan.py reads runs that queued a job after one of theirs ran
+        # first; absent, its default (2) applies, and 0 turns it off.
+        env["TARTCI_QUEUE_REQUEUED_QUOTA"] = str(lane["queue_requeued_quota"])
     if "vm_cores" in lane:
         env["TARTCI_MACOS_VM_CORES"] = str(lane["vm_cores"])
     if "vm_cores_from" in lane:
