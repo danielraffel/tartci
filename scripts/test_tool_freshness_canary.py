@@ -260,6 +260,20 @@ class CanaryGateTests(_Fleet):
         dark = self.behind({"m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
         self.refresh(dark, "studio", tool_rollout=roles, ssh_targets=targets)
         self.assertEqual(dark.fleet_updates(), ["v0.221.1"])
+        # A failure recorded on the current canary blocks, even though the
+        # former canary deployed the release healthily.
+        for failure in ({"event": "tool_apply_failed", "tool": "shipyard",
+                         "at": iso(NOW - 20 * MIN), "target": "0.221.1"},
+                        {"event": "tool_rolled_back", "tool": "shipyard",
+                         "at": iso(NOW - 5 * MIN), "from": "0.221.1", "to": "0.221.0"}):
+            self.switch_host()
+            failed = self.behind({
+                "m5s": canary_events(deployed("0.221.1", NOW - 30 * MIN), failure),
+                "m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+            row = self.refresh(failed, "studio", tool_rollout=roles, ssh_targets=targets)
+            self.assertEqual(failed.fleet_updates(), [], failure["event"])
+            self.assertIn(f"canary m5studio: v0.221.1 recorded {failure['event']}",
+                          row["tools"]["shipyard"]["apply"])
         # The steward stage still holds every host behind it.
         self.switch_host()
         later = self.behind({"m5s": canary_events(), "m5": canary_events(

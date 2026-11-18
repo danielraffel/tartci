@@ -230,6 +230,34 @@ def read_host(host_id: str, me: str | None, settings: dict, state: Path, now: fl
     return {"events": _parse_events(rest), "clock": float(first.strip())}
 
 
+def recorded_failure(events: list[dict], tool: str, version: str,
+                     since: float = 0.0) -> str | None:
+    """Why `version` of `tool` failed on this host at or after `since`, or None."""
+    for event in events:
+        at = _epoch(event.get("at"))
+        if event.get("tool") != tool or at is None or at < since:
+            continue
+        kind = event.get("event")
+        if kind == "tool_apply_failed" and event.get("target") == version:
+            return f"recorded tool_apply_failed for {version} at {event['at']}"
+        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
+                event.get("from"), event.get("version")):
+            return f"recorded {kind} for {version} at {event['at']}"
+        if (kind == "tool_deployed" and event.get("from") == version
+                and event.get("downgrade")):
+            return f"moved back from {version} to {event.get('to')} at {event['at']}"
+    return None
+
+
+def newest_deploy_at(events: list[dict], tool: str, version: str) -> float:
+    """When this host last moved up to `version` (0 when it never deployed it)."""
+    times = [_epoch(e.get("at")) or 0.0 for e in events
+             if e.get("event") == "tool_deployed" and e.get("tool") == tool
+             and e.get("component", "cli") == "cli" and e.get("to") == version
+             and not e.get("downgrade")]
+    return max(times, default=0.0)
+
+
 def clearance(events: list[dict], clock: float, tool: str, version: str,
               soak_hours: float, require_steward: bool = False) -> tuple[bool, str]:
     """(whether a host's events clear `version` of `tool`, why).
@@ -246,19 +274,9 @@ def clearance(events: list[dict], clock: float, tool: str, version: str,
     # by the deploy that first moved up to it, so that one starts the clock.
     deploy = ([e for e in deploys if not e.get("downgrade")] or deploys)[-1]
     since = _epoch(deploy["at"]) or 0.0
-    for event in events:
-        at = _epoch(event.get("at"))
-        if event.get("tool") != tool or at is None or at < since:
-            continue
-        kind = event.get("event")
-        if kind == "tool_apply_failed" and event.get("target") == version:
-            return False, f"recorded tool_apply_failed for {version} at {event['at']}"
-        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
-                event.get("from"), event.get("version")):
-            return False, f"recorded {kind} for {version} at {event['at']}"
-        if (kind == "tool_deployed" and event.get("from") == version
-                and event.get("downgrade")):
-            return False, f"moved back from {version} to {event.get('to')} at {event['at']}"
+    failure = recorded_failure(events, tool, version, since)
+    if failure:
+        return False, failure
     if deploy.get("steward_host") or require_steward:
         for event in events:
             if (event.get("event") == "tool_steward_verified" and event.get("tool") == tool
@@ -330,6 +348,16 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
         notes, blocked = [], None
         for role, hosts in slots:
             first = None
+            # A former canary stands in only for a current canary that is
+            # unreadable or has not proved the release yet. A failure recorded
+            # on the current canary blocks, whatever the former one shows.
+            current = reads[hosts[0]]
+            failed = None if len(hosts) == 1 or "error" in current else recorded_failure(
+                current["events"], name, version,
+                newest_deploy_at(current["events"], name, version))
+            if failed:
+                blocked = f"{role} {hosts[0]}: {candidate.get('tag')} {failed}"
+                break
             for host in hosts:
                 if "error" in reads[host]:
                     continue
