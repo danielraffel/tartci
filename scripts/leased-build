@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Run one build command under a tartci core lease instead of a load-average gate.
+#
+#   leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive|check] -- <command...>
+#
+# The lease queues: it waits up to --wait-secs (default 3600) for cores rather
+# than refusing, so callers need no retry loop. The command runs with
+# CMAKE_BUILD_PARALLEL_LEVEL and CTEST_PARALLEL_LEVEL set to the granted share,
+# so pass no -j/--parallel of your own. When the build share is full a
+# background build takes the host's agent floor, which runs at utility QoS so it
+# yields to gate VMs. The lease is heartbeated, bound to this process and
+# released on exit, including on error or interrupt. Commands that take their
+# own lease (pulp build, governed-build.sh) and nested calls run as is.
+#
+# --class check is for git/Python checks: it takes 1 core from the host's small
+# check pool and never queues behind compiles. It ignores --cores.
+#
+# Use --class interactive (or LEASED_BUILD_CLASS=interactive) for critical-path
+# work only. tartci does not order waiting builds; a waiting acquire retries
+# every 2 s.
+set -euo pipefail
+
+cores=8
+wait_secs=3600
+class="${LEASED_BUILD_CLASS:-background}"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cores) cores="$2"; shift 2 ;;
+    --wait-secs) wait_secs="$2"; shift 2 ;;
+    --class) class="$2"; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+[ "$#" -gt 0 ] || { echo "leased-build: usage: leased-build.sh [--cores N] [--wait-secs S] [--class background|interactive|check] -- <command...>" >&2; exit 2; }
+
+case "$class" in background|interactive|check) ;; *) echo "leased-build: --class must be background, interactive or check" >&2; exit 2 ;; esac
+
+# Never nest leases: a command that takes its own tartci lease, or a call made
+# inside another leased-build, runs as is. A lease inside a lease double-counts
+# cores and can wait forever on cores its own parent holds.
+cmd0="$(basename "$1")"
+if [ -n "${LEASED_BUILD_ID:-}" ] || [ "$cmd0" = governed-build.sh ] \
+   || { [ "$cmd0" = pulp ] && case "${2:-}" in build|dev|loop|test|ship) true ;; *) false ;; esac; }; then
+  exec "$@"
+fi
+
+tartci="$(command -v tartci || true)"
+[ -n "$tartci" ] || { echo "leased-build: tartci not found on PATH" >&2; exit 69; }
+
+# Background builds may take the host's agent floor when their share is full.
+# Interactive builds get the larger interactive share at default QoS and can
+# borrow idle gate reserve; use it for critical-path work only.
+floor_arg=""; [ "$class" = background ] && floor_arg="--allow-floor"
+min_cores=2
+if [ "$class" = check ]; then cores=1; min_cores=1; fi
+id="leased-build-$(hostname -s)-$$-$(date +%s)"
+out="$("$tartci" leases acquire --id "$id" --cores "$cores" --min-cores "$min_cores" \
+  --priority build --class "$class" $floor_arg --kind agent-build --owner "${USER:-agent}" \
+  --label "$(basename "$PWD")" --pid "$$" --wait-secs "$wait_secs" --json 2>/dev/null)" || true
+granted="$(printf '%s' "$out" | python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(1)
+l=d.get("lease") or {}
+print(l.get("lease_size_cores") or "", "floor" if d.get("floor") else "share") if d.get("ok") else sys.exit(1)' 2>/dev/null || true)"
+mode="${granted#* }"; granted="${granted%% *}"
+if ! [[ "$granted" =~ ^[0-9]+$ ]] || [ "$granted" -lt 1 ]; then
+  echo "leased-build: no lease within ${wait_secs}s (cores=$cores)" >&2
+  "$tartci" leases release --id "$id" --json >/dev/null 2>&1 || true
+  exit 75
+fi
+# Heartbeat so a long build is not reported as a stale lease. Its output is
+# detached so a caller capturing ours does not wait for the loop to exit.
+( while kill -0 "$$" 2>/dev/null; do sleep 60; "$tartci" leases heartbeat --id "$id" --json >/dev/null 2>&1 || true; done ) >/dev/null 2>&1 &
+hb=$!
+trap 'kill "$hb" 2>/dev/null || true; "$tartci" leases release --id "$id" --json >/dev/null 2>&1 || true' EXIT
+echo "leased-build: lease $id granted $granted cores ($mode)" >&2
+export LEASED_BUILD_ID="$id"
+export CMAKE_BUILD_PARALLEL_LEVEL="$granted" CTEST_PARALLEL_LEVEL="$granted"
+if [ "$mode" = floor ]; then
+  # A floor grant is lent on condition of utility QoS so it yields to gate VMs.
+  taskpolicy -c utility nice -n 10 "$@"
+  exit $?
+fi
+nice -n 10 "$@"
