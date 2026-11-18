@@ -116,6 +116,8 @@ class CollectTests(unittest.TestCase):
             real.mkdir()
             with mock.patch.object(eop, "ccache_reported_dir", return_value=str(real)):
                 self.assertEqual(eop.collect({}, home), [("ccache dir", str(real))])
+            with mock.patch.object(eop, "ccache_reported_dir", return_value=str(real / "absent")):
+                self.assertEqual(eop.collect({}, home), [])
 
     def test_env_build_and_cache_dirs_are_all_collected(self) -> None:
         env = {"CCACHE_DIR": "/a", "CPM_SOURCE_CACHE": "/b", "FETCHCONTENT_BASE_DIR": "/c",
@@ -134,12 +136,12 @@ class CollectTests(unittest.TestCase):
             got = eop.collect({}, home)
         self.assertEqual(got, [("ccache dir", str(cc))])
 
-    def test_a_configured_ccache_dir_that_does_not_exist_is_not_judged(self) -> None:
+    def test_a_configured_ccache_dir_is_judged_before_it_exists(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             conf = Path(home) / "Library" / "Preferences" / "ccache"
             conf.mkdir(parents=True)
             (conf / "ccache.conf").write_text("cache_dir = /Users/x/never-created\n")
-            self.assertEqual(eop.collect({}, home), [])
+            self.assertEqual(eop.collect({}, home), [("ccache dir", "/Users/x/never-created")])
 
     @unittest.skipUnless(shutil.which("ccache"), "needs a real ccache on PATH")
     def test_a_real_ccache_with_a_missing_default_dir_is_not_judged(self) -> None:

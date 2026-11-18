@@ -130,13 +130,17 @@ def collect(env: Mapping[str, str], home: str, build_dirs: Sequence[str] = (),
         if not env.get(name) and os.path.isdir(default):
             found.append((name + " default dir", default))
     if not env.get("CCACHE_DIR"):
-        # ccache's own answer, else the config file, else its default. Judged
-        # only when the directory already exists: a cache that is not there is
-        # not yet using the internal disk, and ccache may not be used at all.
-        candidate = (ccache_reported_dir(env) or _ccache_conf_dir(env, home)
-                     or os.path.join(home, "Library", "Caches", "ccache"))
-        if os.path.isdir(os.path.expanduser(candidate)):
-            found.append(("ccache dir", candidate))
+        # An explicit cache_dir is judged as written. ccache's own answer (which is
+        # its default when nothing is configured) is judged only once the directory
+        # exists: ccache may not be used at all.
+        configured = _ccache_conf_dir(env, home)
+        reported = ccache_reported_dir(env)
+        default = os.path.join(home, "Library", "Caches", "ccache")
+        if configured:
+            # Named in a config file: judged even before it is created.
+            found.append(("ccache dir", configured))
+        elif os.path.isdir(os.path.expanduser(reported or default)):
+            found.append(("ccache dir", reported or default))
     return [(label, os.path.expanduser(path)) for label, path in found]
 
 
