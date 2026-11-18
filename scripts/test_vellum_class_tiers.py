@@ -30,6 +30,7 @@ import macos_fleet_lanes as fleet  # noqa: E402
 
 PROFILES = {h: ROOT / "profiles" / f"{h}-macos-fleet.toml" for h in ("m1", "m3", "m5", "m5studio")}
 RUNNER = ROOT / "providers/tart-macos/runner.sh"
+REFRESH_HOSTS = ("m3", "m5", "m5studio")
 STERILE = "vellum-sterile-consumer"
 MERGE_GROUP = "vellum-build-macos-merge-group"
 PR_HEAD = "vellum-build-macos"
@@ -59,8 +60,13 @@ class ProfileTests(unittest.TestCase):
                 # No class label in the base: a runner carries exactly one.
                 for label in (STERILE, MERGE_GROUP, PR_HEAD):
                     self.assertNotIn(label, lane["labels"])
-                # Every proof queues a journey as it ends: rescan after any serve.
-                self.assertIs(lane["refresh_after_every_serve"], True)
+                # Every proof queues a journey as it ends: rescan after any serve,
+                # except on m1, whose 600 s minimum queue age hides a fresh journey.
+                if host in REFRESH_HOSTS:
+                    self.assertIs(lane["refresh_after_every_serve"], True)
+                else:
+                    self.assertEqual(lane["min_queued_age_seconds"], 600)
+                    self.assertNotIn("refresh_after_every_serve", lane)
                 self.assertEqual(lane["labels"][-1], f"vellum-host-{host}")
                 self.assertEqual(lane["job_claim_labels"], ["self-hosted", "macOS", "ARM64"])
                 self.assertNotIn("workflows", lane)
@@ -84,7 +90,8 @@ class ProfileTests(unittest.TestCase):
             for name, body in fleet.rendered_plists(fleet.load(profile)).items():
                 env = plistlib.loads(body)["EnvironmentVariables"]
                 with self.subTest(host=host, plist=name):
-                    if env.get("TARTCI_RUNNER_REPO") == "Generous-Corp/vellum":
+                    if (env.get("TARTCI_RUNNER_REPO") == "Generous-Corp/vellum"
+                            and host in REFRESH_HOSTS):
                         self.assertEqual(env.get("TARTCI_REFRESH_AFTER_EVERY_SERVE"), "1")
                     else:
                         self.assertNotIn("TARTCI_REFRESH_AFTER_EVERY_SERVE", env)
@@ -125,6 +132,7 @@ class SelectionTests(unittest.TestCase):
             f"{MERGE_GROUP}) echo {merge_group} ;; {PR_HEAD}) echo {pr_head} ;; esac; }}\n"
             "queued_work(){ echo 0; }\n"
             + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
             + runner_function("select_work") + "\nselect_work\n"
         )
         proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
@@ -176,6 +184,7 @@ class RefreshAfterServeTests(unittest.TestCase):
             "queued_work(){ echo 0; }\n"
             "tartci_assignment_v2_select(){ echo \"v2|force=${1:-0}|0\"; }\n"
             + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
             + runner_function("select_work") + "\n"
             + runner_function("refresh_after_serve") + "\n"
             + runner_function("next_selection") + "\n"
@@ -226,7 +235,8 @@ class RefreshAfterServeTests(unittest.TestCase):
         self.assertIn(
             'if [ "$SCAN_REFRESH_NEXT" = 1 ]; then\n'
             '      SCAN_REFRESH_NEXT=0\n'
-            '      selection="$(next_selection 1)"', text)
+            '      selection="$(SCAN_PRIORITY_RUN="$SCAN_REFRESH_RUN" next_selection 1)"\n'
+            '      event scan_refresh_after_serve "served_class=$SCAN_REFRESH_CLASS ', text)
         self.assertIn('selection="$(next_selection 0)"', text)
         # The loop-top selection goes through next_selection, never around it.
         loop = text[text.index("tartci_heartbeat_keepalive_start\n    if [ \"$SCAN_REFRESH_NEXT\""):run_one]
@@ -255,6 +265,7 @@ class RefreshAfterEveryServeTests(unittest.TestCase):
             "queued_work(){ echo 0; }\n"
             "tartci_assignment_v2_select(){ echo \"v2|force=${1:-0}|0\"; }\n"
             + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
             + runner_function("select_work") + "\n"
             + runner_function("refresh_after_serve") + "\n"
             + runner_function("next_selection") + "\n"
@@ -311,6 +322,7 @@ class ForcedRefreshBudgetTests(unittest.TestCase):
             "tier_queued_work(){ echo \"$1 force=$2\" >&2; echo 0; }\n"
             "queued_work(){ echo 0; }\n"
             + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
             + runner_function("select_work") + "\n"
             + f"SCAN_FORCE_REFRESH={force} select_work >/dev/null\n"
         )
@@ -334,6 +346,69 @@ class ForcedRefreshBudgetTests(unittest.TestCase):
                  ("c", "Release CLI"), ("d", "Release CLI"), ("d", "Sign and Release")]
         self.assertEqual(self.calls(tiers, "1"),
                          ["a force=1", "b force=1", "c force=0", "d force=0"])
+
+class ServedRunPlumbingTests(unittest.TestCase):
+    """The forced post-serve scan names the served run (--priority-run)."""
+
+    def scan_args(self, force: str, priority: str) -> list[str]:
+        script = (
+            "set -u\n"
+            "TARTCI_ROOT=/x; REPO=o/r; LABELS=self-hosted,macOS,ARM64; STATE_DIR=/s\n"
+            "RUNNER_NAME=r; SLOT=1; MIN_QUEUED_AGE=0; ASSIGNMENT_MODE=legacy\n"
+            f"WORKFLOW_TIERS='{STERILE}|{WORKFLOW}'\n"
+            "run_scan_capture(){ printf '%s\\n' \"$@\"; }\n"
+            + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
+            + runner_function("tier_queued_work") + "\n"
+            + f"SCAN_PRIORITY_RUN='{priority}' tier_queued_work {STERILE} {force}\n"
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stdout.splitlines()
+
+    def test_a_forced_scan_reads_the_served_run_first(self) -> None:
+        args = self.scan_args("1", "43900000001")
+        self.assertIn("--force-refresh", args)
+        self.assertEqual(args[args.index("--priority-run") + 1], "43900000001")
+
+    def test_only_a_forced_scan_with_a_numeric_run_names_one(self) -> None:
+        for force, priority in (("0", "43900000001"), ("1", ""), ("1", "0"), ("1", "12x")):
+            with self.subTest(force=force, priority=priority):
+                self.assertNotIn("--priority-run", self.scan_args(force, priority))
+
+    def test_the_run_id_survives_cleanup_and_resets_per_vm(self) -> None:
+        text = RUNNER.read_text()
+        capture = runner_function("capture_current_job")
+        self.assertIn('LAST_SERVED_RUN_ID="$CURRENT_RUN_ID"', capture)
+        run_one = runner_function("run_one")
+        self.assertIn('CURRENT_SERVED=0\n  LAST_SERVED_RUN_ID=""', run_one)
+        flag = text.index('SCAN_REFRESH_NEXT="$(refresh_after_serve "$CURRENT_SERVED" "$selected_labels")"')
+        self.assertEqual(text.index('SCAN_REFRESH_RUN="$LAST_SERVED_RUN_ID"', flag) > flag, True)
+
+
+class HigherPriorityDemandBudgetTests(unittest.TestCase):
+    """The claim-time recheck of higher tiers also forces once per workflow set."""
+
+    def calls(self, selected_tier: int) -> list[str]:
+        script = (
+            "set -u\n"
+            f"WORKFLOW_TIERS=$'{STERILE}|{WORKFLOW}\\n{MERGE_GROUP}|{WORKFLOW}\\n{PR_HEAD}|{WORKFLOW}'\n"
+            f"TIER_LABELS_CONFIG=$'{STERILE}\\n{MERGE_GROUP}\\n{PR_HEAD}'\n"
+            "tier_queued_work(){ echo \"$1 force=$2\" >&2; echo 0; }\n"
+            + runner_function("tier_workflow_args") + "\n"
+            + runner_function("tier_force_once") + "\n"
+            + runner_function("higher_priority_demand") + "\n"
+            + f"higher_priority_demand {selected_tier} || true\n"
+        )
+        proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return proc.stderr.splitlines()
+
+    def test_two_higher_tiers_of_one_workflow_cost_one_forced_discovery(self) -> None:
+        self.assertEqual(self.calls(2), [f"{STERILE} force=1", f"{MERGE_GROUP} force=0"])
+
+    def test_one_higher_tier_is_still_read_live(self) -> None:
+        self.assertEqual(self.calls(1), [f"{STERILE} force=1"])
 
 if __name__ == "__main__":
     unittest.main()

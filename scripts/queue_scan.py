@@ -448,6 +448,11 @@ class QueueScanner:
         # keep the historical selection.
         return max(0, int(getattr(self.args, "merge_group_quota", 0) or 0))
 
+    def _priority_run_id(self) -> int:
+        # The run whose job this lane just served (runner.sh passes it on the
+        # forced post-serve scan); 0 when absent.
+        return max(0, int(getattr(self.args, "priority_run", 0) or 0))
+
     def _oldest_reservable(self, backlog: list[dict[str, Any]]) -> dict[str, Any] | None:
         now = int(getattr(self, "now", 0) or 0)
         max_age = int(getattr(self.args, "oldest_reserve_max_age", 0) or 0)
@@ -490,12 +495,22 @@ class QueueScanner:
         # (Pulp builds up to five groups) cannot starve the PR backlog. When the
         # oldest-run reservation will fire this sweep it costs a slot too.
         reservation = 1 if self._reservation_fires(newest, state) else 0
+        # The run whose job the lane just served goes first: a dependent job
+        # it queued as that job ended exists nowhere else, and the run (as old
+        # as its proof) would otherwise wait for its turn in the rotation. It
+        # takes a slot from the same cap, ahead of the merge-group quota.
+        priority_run_id = self._priority_run_id()
+        served = [
+            run for run in newest if priority_run_id and int(run["id"]) == priority_run_id
+        ][:1]
         merge_quota = min(
             self._merge_group_quota(),
-            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1),
+            max(0, self.args.max_job_fetches - self.args.newest_quota - reservation - 1
+                - len(served)),
         )
-        priority = [
-            run for run in newest if run.get("event") == "merge_group"
+        priority = served + [
+            run for run in newest
+            if run.get("event") == "merge_group" and run not in served
         ][:merge_quota]
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
@@ -864,6 +879,13 @@ def parse_args() -> argparse.Namespace:
         default=int(os.environ.get("TARTCI_QUEUE_MERGE_GROUP_QUOTA", "0")),
         help="newest merge_group runs whose jobs are read on every refresh, taken "
         "from --max-job-fetches (0, the default, keeps the newest-then-rotation order)",
+    )
+    parser.add_argument(
+        "--priority-run",
+        type=int,
+        default=0,
+        help="a run id whose jobs this refresh reads first, from the same "
+        "--max-job-fetches cap (the run whose job the lane just served)",
     )
     parser.add_argument(
         "--oldest-reserve-max-age",
