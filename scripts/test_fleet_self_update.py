@@ -91,6 +91,7 @@ class FakeSystem(su.System):
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
         self.peer_status_errors: dict[str, str] = {}
+        self.peer_marker_errors: dict[str, str] = {}   # the marker read after pool status fails
         # A peer's launchd watchdog store-health.json, keyed by SSH target.
         # Absent: a healthy reading taken just now. None: no file. An int: ssh exit code.
         self.peer_store: dict[str, object] = {}
@@ -376,6 +377,8 @@ class FakeSystem(su.System):
                     return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
+            if peer in self.peer_marker_errors:
+                return su.Result(255, "", self.peer_marker_errors[peer])
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
@@ -1805,6 +1808,18 @@ class UpdateQueueTests(Base):
         self.assertEqual(kept["since"], since, "the place in the queue is kept privately")
         self.assertIn("cannot read m5", kept["reason"])
         self.assertTrue(self.last_receipt().get("stepped_aside"))
+
+    def test_a_failed_marker_read_also_frees_the_turn(self) -> None:
+        # Pool status answered but the marker read after it timed out: this
+        # host still cannot tell whether m5 is updating, so it cannot go.
+        since = NOW - 6 * 3600
+        self.ticket(since=since)
+        self.sys.peer_marker_errors["m5"] = "Connection timed out during banner exchange"
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], since)
+        self.assertIn("marker unreadable", su.waiting_ticket(self.cfg)["reason"])
 
     def test_a_dark_route_beside_a_live_updater_still_frees_the_turn(self) -> None:
         self.ticket(since=NOW - 6 * 3600)

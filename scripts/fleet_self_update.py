@@ -1638,7 +1638,10 @@ def survey_peers(cfg: Config, sys_: System, me: str, *, record: bool = False) ->
             continue
         if info["busy"]:
             busy.append(info["evidence"])
-            if not info["readable"]:
+            # Either SSH read failed on this host's route: pool status, or the
+            # marker read after it (no clock). A marker that every host reads
+            # but that does not parse is the peer's state, not this route's.
+            if not info["readable"] or info["clock"] is None:
                 unread.append(peer)
         elif info.get("off"):
             off.append(peer)
