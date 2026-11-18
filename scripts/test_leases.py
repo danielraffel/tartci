@@ -370,6 +370,21 @@ class CheckClassTests(LeaseCliTestCase):
         gate = self.acquire("gate", 14, capacity=26, reserved=14, priority="gate")
         self.assertTrue(json.loads(gate.stdout)["ok"])
 
+    def test_a_check_lease_still_counts_against_later_memory_admissions(self) -> None:
+        mem = ["--capacity-mem-mb", "40000", "--reserved-gate-mem-mb", "20000"]
+        granted = self.run_cli(
+            "acquire", "--id", "check-1", "--cores", "1", "--capacity", "26",
+            "--reserved-gate-cores", "14", "--pid", str(self.pid), "--kind", "agent-build",
+            "--class", "check", "--mem-mb", "2048", *mem)
+        self.assertTrue(json.loads(granted.stdout)["check"])
+        # 2048 + 18432 > the 20000 MB non-gate budget: the build is refused.
+        build = self.run_cli(
+            "acquire", "--id", "build-1", "--cores", "1", "--capacity", "26",
+            "--reserved-gate-cores", "14", "--pid", str(self.pid), "--kind", "agent-build",
+            "--mem-mb", "18432", *mem, check=False)
+        self.assertEqual(build.returncode, 75, build.stdout)
+        self.assertEqual(json.loads(build.stdout)["reason"], "memory_exceeded")
+
     def test_vm_requests_never_take_a_check_lease(self) -> None:
         self.acquire("gate", 26, capacity=26, reserved=14, priority="gate")
         vm = self.floor_acquire("vm-1", 4, check_class=True, kind="tart-macos-vm")

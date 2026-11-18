@@ -63,10 +63,11 @@ def is_floor(record: dict[str, Any]) -> bool:
 # 2026-11-17 they waited 1 to 2.5 h before starting. A `--class check` lease is
 # always 1 core from its own small pool, admitted whenever that pool has room
 # whatever compiles hold or wait for. Like a floor lease it is charged to no
-# other admission and runs at the floor QoS, so gates and VMs never see it; it
-# is not charged to the build floor pool either, so compiles cannot fill it.
-# Memory is not oversubscribed. A full pool falls back to a background lease.
-CHECK_POOL_CORES_DEFAULT = 2
+# other admission on cores and runs at the floor QoS, so gates and VMs never
+# wait on its core; it is not charged to the build floor pool either, so
+# compiles cannot fill it. Its memory IS charged, at grant and to every later
+# admission. A full pool falls back to a background lease.
+CHECK_POOL_CORES = 2
 
 
 def is_check(record: dict[str, Any]) -> bool:
@@ -80,7 +81,7 @@ def check_grant(
     if priority >= cfg["gate_priority"] or is_vm_kind(args.kind):
         return None
     used = sum(record_int(r, "lease_size_cores") for r in active if is_check(r))
-    if used + 1 > int(cfg.get("check_pool_cores", CHECK_POOL_CORES_DEFAULT)):
+    if used + 1 > CHECK_POOL_CORES:
         return None
     mem = int(args.mem_mb) if getattr(args, "mem_mb", None) is not None else cfg["per_job_mem_mb"]
     if cfg["total_mem_mb"] > 0:
@@ -773,7 +774,6 @@ def capacity_config(args: argparse.Namespace) -> dict[str, int]:
         "agent_floor_cores": floor_cores,
         "agent_floor_pool_cores": floor_pool,
         "agent_floor_qos": floor_qos,
-        "check_pool_cores": max(0, int(profile.get("check_pool_cores", CHECK_POOL_CORES_DEFAULT))),
         "reserved_gate_cores": reserved,
         "gate_priority": gate_priority,
         "total_mem_mb": total_mem,
@@ -1169,7 +1169,8 @@ def usage(all_records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, A
     # Floor leases are reported separately and excluded from every figure other
     # admissions read, which is what keeps them from taking gate or VM capacity.
     records = [record for record in all_records if not is_floor(record)]
-    floor_records = [record for record in all_records if is_floor(record) and not is_check(record)]
+    floor_records_all = [record for record in all_records if is_floor(record)]
+    floor_records = [record for record in floor_records_all if not is_check(record)]
     used = sum(record_int(record, "lease_size_cores") for record in records)
     non_gate_limit = max(1, cfg["total"] - cfg["reserved_gate_cores"])
     non_gate_used = sum(
@@ -1203,13 +1204,16 @@ def usage(all_records: list[dict[str, Any]], cfg: dict[str, int]) -> dict[str, A
     total_mem = int(cfg.get("total_mem_mb", 0))
     if total_mem > 0:
         per_job_mem = int(cfg.get("per_job_mem_mb", host_profile.PER_COMPILE_JOB_MEM_MB))
-        used_mem = sum(record_mem_mb(record, per_job_mem) for record in records)
-        legacy = any(not record_has_explicit_mem(record) for record in records)
+        # A check lease is free on cores but not on memory: later admissions
+        # must see it, or a build and a gate could together overrun RAM.
+        mem_records = records + [record for record in floor_records_all if is_check(record)]
+        used_mem = sum(record_mem_mb(record, per_job_mem) for record in mem_records)
+        legacy = any(not record_has_explicit_mem(record) for record in mem_records)
         reserved_mem = int(cfg.get("reserved_gate_mem_mb", 0))
         non_gate_mem_limit = max(per_job_mem, total_mem - reserved_mem)
         non_gate_used_mem = sum(
             record_mem_mb(record, per_job_mem)
-            for record in records
+            for record in mem_records
             if record_int(record, "priority") < cfg["gate_priority"]
         )
         result.update(
