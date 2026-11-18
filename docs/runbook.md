@@ -2968,8 +2968,13 @@ fleet`), and check GitHub's job history against it with
   floor refusal does. A host that cannot read the whole fleet cannot take a
   turn, so it must not hold one. Each peer still refuses on its own reads, so
   this never lets two hosts go out at once. The starvation bound runs on the
-  kept place as on a published ticket: the event, the issue and exit 3, and
-  `pool status` says `STARVED, stepped aside`. On 2026-11-18 only m1's route to
+  kept place as on a published ticket, also when the capacity floor refuses
+  the same host: the event, the issue and exit 3, and `pool status` says
+  `STARVED, stepped aside`. A peer already excluded as dark does not count as
+  unread. When a peer is dark to every host, every host steps aside and no
+  ticket is published, so the first host to run after the exclusion goes,
+  whatever its place. That costs one turn per episode: the others defer on
+  its update marker, publish their kept places, and take turns in order. On 2026-11-18 only m1's route to
   m5studio was dark; m1 held the oldest ticket for 3.5 h while m5 and m3,
   which read every peer, yielded to it at every attempt and no host updated.
 - **A host drains only while its gate queue is light.** Once the peers and

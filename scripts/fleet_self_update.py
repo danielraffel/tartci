@@ -3980,6 +3980,14 @@ def plan_or_apply(cfg: Config, sys_: System, *, apply: bool, target_ref: str,
                                "peers do not yield to it", aside=True)
             if apply and floor_refusal is None:
                 raise Deferred(refusal)
+            if apply and survey.unread:
+                # The floor reads peers over the same routes, so a dark route
+                # often refuses both ways. The starvation bound still runs on
+                # the kept place: a quiet step-aside here never alerted.
+                # The peer reason leads, so the starvation issue names the peer.
+                raise Deferred(f"{refusal}; stepped aside: this host cannot read "
+                               f"{', '.join(survey.unread)}, so it cannot take a turn and "
+                               f"peers do not yield to it (also: {floor_refusal})", aside=True)
             if apply:
                 raise SteppedAside(f"{floor_refusal}; stepped aside so peers do not "
                                    f"yield to it (also: {refusal})", quiet=bool(busy))
