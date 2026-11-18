@@ -1186,8 +1186,13 @@ not permission to force-remove a worktree.
   job was picked up), so it goes with the running groups after them. Running
   groups get priority only on a lane with `--merge-group-quota` above 0, and
   so do other requeued runs. A requeued PR run never displaces a merge group.
-  A running group or other requeued run unread for 16 min takes one slot
-  ahead of the waiting groups, so no class is starved. Every read counts as a
+  A running group or other requeued run unread for 16 min gets one turn,
+  but never the waiting groups' last slot. It takes a second priority slot,
+  or the oldest-run reservation's slot for that refresh (the reservation
+  fires again on the next one), so waiting merge-group demand is read on
+  every refresh. The cost: a running merge group that still has a queued
+  fleet job, which main read on every refresh through the merge-group quota,
+  is read only on its turns while an older group waits. Every read counts as a
   turn, including a read through the newest quota. At the production cadence
   the oldest-run reservation fires on most refreshes, leaving one or two
   priority slots, taken from the same slots as `--merge-group-quota`. On a

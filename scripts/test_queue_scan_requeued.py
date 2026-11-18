@@ -103,6 +103,48 @@ class IncidentShapeTests(unittest.TestCase):
     def test_the_requeued_merge_group_job_is_counted_on_every_refresh(self) -> None:
         self.assertEqual(self._scan(MERGE_CLASS, 12, requeued_quota=2), [1] * 12)
 
+    def test_no_zero_at_production_cadence(self) -> None:
+        """The real scan path, the clock 160 s per refresh for 1.6 h: the
+        running groups' turns must never take the waiting group's slot."""
+        from unittest import mock
+        clock = {"t": datetime.now(timezone.utc).timestamp()}
+        with mock.patch.object(helpers.queue_scan.time, "time", lambda: clock["t"]):
+            counts = []
+            queued, in_progress, jobs = self._queue()
+            # An older never-started PR run holds the oldest-run reservation,
+            # as Vellum's queue did, so priority has one slot.
+            older = _run(50, datetime.fromtimestamp(clock["t"], timezone.utc) - timedelta(hours=5),
+                         "pull_request", "queued")
+            queued = [*queued, older]
+            jobs[50] = [{"id": 500, "status": "queued",
+                         "labels": ["self-hosted", "macOS", "ARM64", "vellum-build-macos"]}]
+            with tempfile.TemporaryDirectory() as directory:
+                def api(path: str) -> dict[str, Any]:
+                    if path == "rate_limit":
+                        return helpers.AUTHENTICATED_RATE_LIMIT
+                    if path.endswith("/actions/workflows?per_page=100"):
+                        return {"workflows": [{"id": 99, "name": WORKFLOW}]}
+                    if "status=queued" in path:
+                        return {"workflow_runs": queued}
+                    if "status=in_progress" in path:
+                        return {"workflow_runs": in_progress}
+                    if "status=pending" in path:
+                        return {"workflow_runs": []}
+                    for run_id, run_jobs in jobs.items():
+                        if f"/actions/runs/{run_id}/jobs?" in path:
+                            return {"jobs": run_jobs}
+                    raise AssertionError(path)
+                options = {"force_refresh": True, "workflow": WORKFLOW, "labels": MERGE_CLASS,
+                           "negative_ttl": 30, "merge_group_quota": 2,
+                           "oldest_reserve_max_age": 172800, "requeued_quota": 2}
+                for _ in range(36):
+                    scanner = helpers.PaginatedQueueScanTests()._scanner(
+                        "tart-macos-tier", Path(directory) / "state.json", api, **options)
+                    scanner.now = int(clock["t"])
+                    counts.append(scanner.scan())
+                    clock["t"] += 160
+        self.assertNotIn(0, counts, counts)
+
     def test_control_without_it_the_journey_is_missed(self) -> None:
         counts = self._scan(MERGE_CLASS, 12, requeued_quota=0)
         self.assertIn(0, counts, counts)
@@ -630,6 +672,110 @@ class RequeuedRankingTests(unittest.TestCase):
         deleted["on"] = True
         self.assertNotIn(str(INCIDENT), scan()["requeued_runs"])
         scan()
+
+    ROTATION_FIXTURE = [
+        (1, "merge_group", "queued", "11:35", "11:45", "queued:1"),
+        (2, "merge_group", "queued", "09:38", "09:48", "queued:1"),
+        (3, "merge_group", "queued", "10:49", "10:49", "queued:1"),
+        (100, "pull_request", "in_progress", "09:57", "09:57", "in_progress:1"),
+        (101, "pull_request", "in_progress", "10:46", "10:46", "in_progress:1"),
+        (102, "pull_request", "in_progress", "10:14", "10:14", "queued:1"),
+        (103, "pull_request", "queued", "07:53", "07:53", "in_progress:1"),
+        (104, "pull_request", "in_progress", "11:36", "11:36", "queued:1"),
+        (105, "pull_request", "queued", "09:59", "09:59", "queued:1"),
+        (106, "pull_request", "queued", "09:49", "09:49", "queued:1"),
+        (107, "pull_request", "queued", "09:47", "09:47", "queued:1"),
+        (108, "pull_request", "in_progress", "11:41", "11:41", "queued:1"),
+    ]
+
+    def test_rotation_lists_come_from_the_listing_not_the_backlog(self) -> None:
+        """Found by search: built from the backlog, a turning pick shifts a page
+        list under its saved offset and one PR run is never read in 60 refreshes."""
+        day = "2026-11-18T"
+        runs = [{"id": i, "name": WORKFLOW, "event": e, "status": s,
+                 "created_at": f"{day}{c}:00Z", "updated_at": f"{day}{u}:00Z", "_page_key": k}
+                for i, e, s, c, u, k in self.ROTATION_FIXTURE]
+        scanner = self.scanner(oldest_reserve_max_age=172800)
+        scanner.now = int(datetime(2026, 11, 18, 12, tzinfo=timezone.utc).timestamp())
+        state: dict[str, Any] = {}
+        seen: set[int] = set()
+        for _ in range(60):
+            seen |= {int(r["id"]) for r in scanner._candidate_runs([dict(r) for r in runs], state)[0]}
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+        self.assertEqual({i for i, *_ in self.ROTATION_FIXTURE if i >= 100} - seen, set())
+
+    def test_a_listed_remembered_run_keeps_its_standing(self) -> None:
+        now = datetime.now(timezone.utc)
+        run = _run(7, now - timedelta(hours=2), "merge_group", "in_progress", now - timedelta(seconds=30))
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        scanner._with_remembered([run], state)
+        # A listing without it, then one with it: its update (now 350 s old)
+        # is outside the 190 s since the previous listing.
+        scanner.now += 160
+        scanner._with_remembered([], state)
+        scanner.now += 160
+        self.assertEqual([r["id"] for r in scanner._requeued_runs(scanner._with_remembered([run], state))], [7])
+
+    def test_a_404_on_a_listed_run_still_raises(self) -> None:
+        tests = IncidentShapeTests()
+        queued, in_progress, jobs = tests._queue()
+
+        def api(path: str) -> dict[str, Any]:
+            if path == "rate_limit":
+                return helpers.AUTHENTICATED_RATE_LIMIT
+            if path.endswith("/actions/workflows?per_page=100"):
+                return {"workflows": [{"id": 99, "name": WORKFLOW}]}
+            if "status=queued" in path:
+                return {"workflow_runs": queued}
+            if "status=in_progress" in path:
+                return {"workflow_runs": in_progress}
+            if "status=pending" in path:
+                return {"workflow_runs": []}
+            if f"/actions/runs/{INCIDENT}/jobs?" in path:
+                raise helpers.queue_scan.GitHubApiError(path, 1, "HTTP 404: Not Found")
+            for run_id, run_jobs in jobs.items():
+                if f"/actions/runs/{run_id}/jobs?" in path:
+                    return {"jobs": run_jobs}
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as directory:
+            scanner = helpers.PaginatedQueueScanTests()._scanner(
+                "tart-macos-tier", Path(directory) / "state.json", api, force_refresh=True,
+                workflow=WORKFLOW, labels=MERGE_CLASS, negative_ttl=30, merge_group_quota=2,
+                oldest_reserve_max_age=172800, requeued_quota=2)
+            with self.assertRaises(Exception):
+                scanner.scan()
+
+    def test_overdue_runs_never_break_the_cap_or_the_rotation(self) -> None:
+        now = datetime.now(timezone.utc)
+        waiting = _run(1, now - timedelta(hours=3), "merge_group", "queued", now - timedelta(minutes=9))
+        running = [_run(10 + i, now - timedelta(minutes=50 + i), "merge_group", "in_progress")
+                   for i in range(3)]
+        prs = [_run(200 + i, now - timedelta(hours=2, minutes=i), "pull_request", "queued",
+                    now - timedelta(minutes=3)) for i in range(3)]
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        for _ in range(20):
+            candidates, picked = scanner._candidate_runs([waiting, *running, *prs, *self.backlog(now)], state)
+            self.assertLessEqual(len(candidates), 5)
+            self.assertTrue(picked)
+            self.assertIn(1, [int(r["id"]) for r in candidates])
+            state = json.loads(json.dumps(state))
+            scanner.now += 160
+
+    def test_the_window_margin_covers_a_listing_gap(self) -> None:
+        now = datetime.now(timezone.utc)
+        scanner = self.scanner()
+        state: dict[str, Any] = {}
+        scanner._with_remembered([], state)
+        scanner.now += 160
+        later = datetime.fromtimestamp(scanner.now, timezone.utc)
+        # Updated 175 s ago: after the previous listing's window, within its margin.
+        run = _run(9, later - timedelta(hours=1), "merge_group", "in_progress", later - timedelta(seconds=175))
+        scanner._with_remembered([run], state)
+        self.assertEqual([r["id"] for r in scanner._requeued_runs([run])], [9])
 
     def test_off_writes_no_requeued_state(self) -> None:
         scanner = self.scanner(requeued_quota=0)

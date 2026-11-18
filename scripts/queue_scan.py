@@ -720,17 +720,19 @@ class QueueScanner:
         read_at = {str(k): v for k, v in read_raw.items() if isinstance(v, int)} \
             if isinstance(read_raw, dict) else {}
 
-        def fit(slots: int) -> list[dict[str, Any]]:
+        def fit(slots: int, spare: int) -> list[dict[str, Any]]:
             if not self._requeued_quota():
-                # Off: exactly the newest merge groups, as before.
+                # Off: exactly the newest merge groups, as before (`spare` unused).
                 return merge[:slots]
             def lru(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 return sorted(items, key=lambda run: read_at.get(str(int(run["id"])), 0))
 
             # Waiting groups first, least recently read first. A running group
-            # or other requeued run that has not been read for
-            # REQUEUE_TURN_AFTER_SECONDS goes ahead of them once, so neither
-            # class is starved when waiting groups hold every slot.
+            # or other requeued run unread for REQUEUE_TURN_AFTER_SECONDS gets
+            # one turn, but never the waiting groups' last slot: it takes a
+            # second priority slot, or the oldest-run reservation's slot
+            # (`spare`) for this refresh, which is left unstamped and fires
+            # again on the next one.
             now = int(getattr(self, "now", 0) or 0)
             tail = lru(running) + lru(others)
             # First seen counts as read: the wait starts now.
@@ -739,11 +741,17 @@ class QueueScanner:
             overdue = [run for run in tail
                        if now - read_at.get(str(int(run["id"])), 0) >= REQUEUE_TURN_AFTER_SECONDS][:1]
             rest = [run for run in lru(groups) + tail if run not in overdue]
-            return (overdue + rest)[:slots]
+            if not overdue:
+                return rest[:slots]
+            if not groups or slots >= 2:
+                return (rest[:1] + overdue + rest[1:])[:slots] if groups else (overdue + rest)[:slots]
+            # One slot and a waiting group: the overdue run borrows the
+            # reservation's slot, or waits for a refresh that has one.
+            return rest[:slots] + (overdue if spare else [])
 
         base = max(0, self.args.max_job_fetches - self.args.newest_quota - 1)
         reservation = 1 if self._reservation_fires(newest, state) else 0
-        priority = fit(max(0, base - reservation))
+        priority = fit(max(0, base - reservation), reservation)
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids
