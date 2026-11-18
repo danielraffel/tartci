@@ -1846,6 +1846,35 @@ class UpdateQueueTests(Base):
         self.assertUpdated(self.apply())
         self.assertEqual(self.issues[-1], ("close", "77"))
 
+    def test_an_unread_peer_with_a_floor_refusal_still_starves_loudly(self) -> None:
+        # The capacity floor reads peers over the same routes, so a dark route
+        # to the only other server of a label refuses both ways. That path
+        # stepped aside quietly and never reached the starvation bound.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        del self.sys.peers["m5"]
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(events.count("self_update_starved"), 1)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("STARVED", su.summary(self.home)["problem"])
+        # The issue names the peer to check, not the floor message.
+        body = su.waiting_ticket(self.cfg)["issue_body"]
+        self.assertIn("own route (peer m5 (m5) SSH transport failed", body)
+
+    def test_a_floor_refusal_with_readable_peers_stays_a_quiet_step_aside(self) -> None:
+        # Control: the floor path without an unread peer is unchanged.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(self.issues, [])
+
     def test_a_plan_with_a_peer_it_cannot_read_reports_and_writes_no_ticket(self) -> None:
         del self.sys.peers["m5"]
         self.assertEqual(self.plan(), su.EXIT_REFUSED)

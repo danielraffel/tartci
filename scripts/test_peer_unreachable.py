@@ -118,52 +118,60 @@ class ReplayTests(Fleet):
     """m1's view of 2026-10-05: m5 drained at 10:42Z and went dark at 11:12Z;
     m5studio had waited since 08:32Z."""
 
-    def replay_until_m5studio_goes(self) -> list[str]:
+    def replay_until_the_bound(self) -> None:
+        """10:42 to 13:44: m5 drains, then goes dark to every host at 11:12.
+        m5studio cannot read m5 either, so it steps aside and withdraws its
+        published ticket (its place, 08:32, is kept privately on m5studio)."""
         m5_dark_at = at("11:12")
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
         self.sys.peer_waiting["m5s"] = {"host_id": "m5studio", "since": at("08:32"), "ts": 0}
-        outcomes = []
-        for hhmm in ("10:42", "11:12", "11:43", "12:14", "12:44", "13:14", "13:44", "14:14"):
+        for hhmm in ("10:42", "11:12", "11:43", "12:14", "12:44", "13:14", "13:44"):
             if hhmm == "11:12":
                 self.dark("m5")
+                self.sys.peer_waiting.pop("m5s")
             if self.sys.clock >= m5_dark_at or hhmm == "11:12":
                 self.corroborate("m5", m5_dark_at)
             self.attempt(hhmm)
-            outcomes.append(f"{hhmm} {self.reason()}")
-        return outcomes
+            self.assertRegex(self.reason(),
+                             r"m5 is draining|m5 \(m5\) (?:pool status unreadable|SSH (?:transport|authentication) failed)")
+        self.assertEqual(self.sys.mutations(), [])
+        # m1 cannot read m5 either: its place is kept, and not published.
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], NOW)
 
     def test_the_fleet_moves_once_m5_has_been_dark_for_the_bound(self) -> None:
-        outcomes = self.replay_until_m5studio_goes()
-        for line in outcomes[:7]:
-            self.assertRegex(line,
-                             r"m5 is draining|m5 \(m5\) (?:pool status unreadable|SSH (?:transport|authentication) failed)",
-                             line)
-        self.assertIn("yielding the update turn to a host that has waited longer: m5studio",
-                      outcomes[7])
-        self.assertEqual(self.sys.mutations(), [], "m1 never went out ahead of m5studio")
+        self.replay_until_the_bound()
+        # 14:14: m5 is excluded. No host publishes a ticket while it cannot
+        # read m5, so the first host to run after the exclusion goes: here m1,
+        # one turn ahead of m5studio's kept 08:32 place. That costs one turn
+        # per episode; m5studio then defers on m1's marker and republishes.
+        self.corroborate("m5", at("11:12"))
+        self.assertUpdated(self.attempt("14:14"))
+        receipt = Path(self.last()["receipt"]).read_text()
+        self.assertIn("unreachable, so no longer holding the turn", receipt)
         [excluded] = self.events("peer_unreachable_excluded")
         self.assertEqual(excluded["fields"]["peer"], "m5")
         self.assertEqual(excluded["fields"]["corroborated_by"], ["m5studio", "studio"])
-        # m5studio takes its turn: m1 waits on its marker, never overlapping.
-        self.sys.peer_waiting.pop("m5s")
-        self.sys.peer_markers["m5s"] = {"host_id": "m5studio", "target": "c" * 40,
-                                        "ts": at("14:20")}
-        self.corroborate("m5", at("11:12"))
-        self.attempt("14:44")
-        self.assertIn("m5studio is self-updating", self.reason())
-        self.assertEqual(self.sys.mutations(), [])
-        # m5studio is done; m1 goes while m5 is still dark.
-        self.sys.peer_markers.pop("m5s")
-        self.corroborate("m5", at("11:12"))
-        self.assertUpdated(self.attempt("15:14"))
-        receipt = Path(self.last()["receipt"]).read_text()
-        self.assertIn("unreachable, so no longer holding the turn", receipt)
         self.assertEqual(len(self.events("peer_unreachable_excluded")), 1, "once per episode")
+
+    def test_after_the_exclusion_a_live_updater_defers_with_a_published_ticket(self) -> None:
+        # An excluded peer is not an unread one: once m5 is excluded, m1 reads
+        # every peer that still counts, so waiting on m5studio's update keeps
+        # its ticket published and peers yield to it in order.
+        self.replay_until_the_bound()
+        self.sys.peer_markers["m5s"] = {"host_id": "m5studio", "target": "c" * 40,
+                                        "ts": at("14:10")}
+        self.corroborate("m5", at("11:12"))
+        self.attempt("14:14")
+        self.assertIn("m5studio is self-updating", self.reason())
+        self.assertEqual(self.sys.mutations(), [], "never overlapping m5studio")
+        self.assertTrue((self.cfg.state_dir / "waiting.json").exists())
+        self.assertFalse((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).exists())
+        self.assertEqual(json.loads((self.cfg.state_dir / "waiting.json").read_text())["since"], NOW)
 
     def test_under_the_old_rule_the_same_day_never_moves(self) -> None:
         with mock.patch.object(su, "PEER_UNREACHABLE_EXCLUDE_SECONDS", float("inf")):
-            self.replay_until_m5studio_goes()
-            self.sys.peer_waiting.pop("m5s")
+            self.replay_until_the_bound()
             for hhmm in ("14:44", "16:14", "18:14", "20:14"):
                 self.corroborate("m5", at("11:12"))
                 self.attempt(hhmm)
