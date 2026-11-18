@@ -658,14 +658,19 @@ class QueueScanner:
         # theirs. With more merge groups than slots, the starting point turns
         # each refresh, so each is read every few refreshes rather than one
         # every time.
-        requeued = self._requeued_runs(self._with_remembered(runs, state))[
-            : self._requeued_quota()]
+        # Every requeued merge group takes part (memory bounds them at 16); the
+        # quota caps only the other requeued runs.
+        ranked = self._requeued_runs(self._with_remembered(runs, state)) \
+            if self._requeued_quota() else []
+        requeued_mg = [run for run in ranked if run.get("event") == "merge_group"]
+        requeued = requeued_mg + [run for run in ranked if run.get("event") != "merge_group"][
+            : max(0, self._requeued_quota() - len(requeued_mg))]
         requeued_ids = {int(run["id"]) for run in requeued}
-        requeued_mg = [run for run in requeued if run.get("event") == "merge_group"]
-        merge = [
+        all_merge = [
             run for run in newest
             if run.get("event") == "merge_group" and int(run["id"]) not in requeued_ids
-        ][: self._merge_group_quota()]
+        ]
+        merge = all_merge[: self._merge_group_quota()]
         # A merge group listed `queued` or `pending` is likely waiting for a
         # runner (its first job, or a requeued one); an `in_progress` one is
         # likely running. Likely demand comes first and shares the turns.
@@ -673,14 +678,27 @@ class QueueScanner:
             status = str(run.get("status") or str(run.get("_page_key", "")).split(":")[0])
             return status in ("queued", "pending")
 
-        fresh = [run for run in merge if waiting(run)]
+        # Only waiting groups share the turns. A group whose job just started
+        # also moved its updated_at, so an in_progress requeued group is
+        # likely running: it goes with the running ones, and only on a lane
+        # that reads merge groups by quota.
+        requeued_waiting = [run for run in requeued_mg if waiting(run)]
+        # Waiting groups are chosen before running ones, not just among the
+        # newest: a fresh group behind two newer running ones is demand.
+        fresh = [run for run in all_merge if waiting(run)][: self._merge_group_quota()]
         groups: list[dict[str, Any]] = []
-        for index in range(max(len(requeued_mg), len(fresh))):
-            groups += requeued_mg[index:index + 1] + fresh[index:index + 1]
-        running = [run for run in merge if not waiting(run)]
+        for index in range(max(len(requeued_waiting), len(fresh))):
+            groups += requeued_waiting[index:index + 1] + fresh[index:index + 1]
+        running = ([run for run in requeued_mg if not waiting(run)]
+                   if self._merge_group_quota() else []) + [
+            run for run in all_merge if not waiting(run)][: self._merge_group_quota()]
         others = [run for run in requeued if run.get("event") != "merge_group"] \
             if self._merge_group_quota() else []
-        turn = int(state.get("requeued_turn", 0) or 0)
+        # Least recently read first, so each waiting group is read in turn even
+        # while the set changes between refreshes.
+        read_raw = state.get("requeued_read_at")
+        read_at = {str(k): v for k, v in read_raw.items() if isinstance(v, int)} \
+            if isinstance(read_raw, dict) else {}
 
         def fit(slots: int) -> list[dict[str, Any]]:
             if not self._requeued_quota():
@@ -688,20 +706,20 @@ class QueueScanner:
                 return merge[:slots]
             ordered = groups
             if len(groups) > slots:
-                start = turn % len(groups)
-                ordered = groups[start:] + groups[:start]
+                ordered = sorted(groups, key=lambda run: read_at.get(str(int(run["id"])), 0))
             chosen = ordered[:slots] + running[: max(0, slots - len(groups))]
             return chosen + others[: max(0, slots - len(chosen))]
 
         base = max(0, self.args.max_job_fetches - self.args.newest_quota - 1)
-        # The reservation is judged on the backlog these picks leave behind.
-        tentative = {int(run["id"]) for run in fit(max(0, base - 1))} \
-            if self._requeued_quota() else set()
-        reservation = 1 if self._reservation_fires(
-            [run for run in newest if int(run["id"]) not in tentative], state) else 0
+        reservation = 1 if self._reservation_fires(newest, state) else 0
         priority = fit(max(0, base - reservation))
-        if self._requeued_quota() and len(groups) > max(0, base - reservation):
-            state["requeued_turn"] = turn + 1
+        if self._requeued_quota():
+            now = int(getattr(self, "now", 0) or 0)
+            group_ids = {str(int(run["id"])) for run in groups}
+            for run in priority:
+                if str(int(run["id"])) in group_ids:
+                    read_at[str(int(run["id"]))] = now
+            state["requeued_read_at"] = {k: v for k, v in read_at.items() if k in group_ids}
         priority_ids = {int(run["id"]) for run in priority}
         latency = priority + [
             run for run in newest if int(run["id"]) not in priority_ids

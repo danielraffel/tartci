@@ -1177,18 +1177,20 @@ not permission to force-remove a worktree.
     160 s discovery window, plus 30 s) and at least 60 s after its
     `created_at`.
 
-  Merge groups come first. Requeued ones (oldest first) alternate with
-  newest ones listed `queued` or `pending`, which are likely waiting for a
-  runner; running groups come after them. At the production cadence the
-  oldest-run reservation fires on most refreshes, which leaves one or two
-  priority slots. When more waiting groups than that compete, the starting
-  point turns every refresh (`requeued_turn`), so each is read every few
-  refreshes. Other requeued runs follow, only on a lane with
-  `--merge-group-quota` above 0. So a requeued PR run never displaces a merge
-  group, and a Pulp-style PR backlog keeps its rotation. The oldest-run
-  reservation is judged on the backlog these picks leave. These reads come
-  from the same slots as `--merge-group-quota`. The newest quota and one
-  rotating slot keep theirs, so the job-fetch cap and API budget are
+  Merge groups come first. Requeued ones listed `queued` or `pending`
+  alternate with fresh ones listed the same way: these are likely waiting for
+  a runner, chosen from every merge group, not just the newest. When more of
+  them compete than there are slots, the least recently read goes first
+  (`requeued_read_at`). An `in_progress` merge group whose update moved has
+  probably just started a job (run 44317241223's `updated_at` moved when its
+  job was picked up), so it goes with the running groups after them. Running
+  groups get priority only on a lane with `--merge-group-quota` above 0, and
+  so do other requeued runs. A requeued PR run never displaces a merge group,
+  and a Pulp-style PR backlog keeps its rotation. At the production cadence
+  the oldest-run reservation fires on most refreshes, leaving one or two
+  priority slots. These reads come from the same slots as
+  `--merge-group-quota`. The newest quota, the reservation and one rotating
+  slot keep theirs, so the job-fetch cap and the API budget are
   unchanged. `0` restores the old selection. A lane can set it with the profile key
   `queue_requeued_quota`.
 
