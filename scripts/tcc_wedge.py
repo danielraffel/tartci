@@ -917,7 +917,7 @@ def kill_vectors(text: str) -> list[str]:
     """
     calls: list[str] = []
     stack = ["code"]  # "code", "paren" (code inside $( )), "dq", "sq"
-    pending: list[str] = []  # here-document tags awaiting their bodies
+    pending: list[tuple[str, bool]] = []  # here-document tags awaiting their bodies
     n, i = len(text), 0
     while i < n:
         c, top = text[i], stack[-1]
@@ -937,7 +937,8 @@ def kill_vectors(text: str) -> list[str]:
             while pending and i <= n:
                 end = text.find("\n", i)
                 end = n if end < 0 else end
-                if text[i:end].strip() == pending[0]:
+                tag, dash = pending[0]
+                if (text[i:end].lstrip("\t") if dash else text[i:end]) == tag:
                     pending.pop(0)
                 i = end + 1
             continue
@@ -950,8 +951,7 @@ def kill_vectors(text: str) -> list[str]:
         elif text.startswith(_KILL_WORD, i):
             lead = re.split(r"[\n]|\$\(|&&|\|\||[;&|({!]", text[:i])[-1].strip()
             raw = re.match(r'(?:[^)\n;&|<>]|\d*>&?[-\w/]*)*', text[i:]).group(0)
-            if lead.split()[-1:] in ([], ["exec"], ["then"], ["do"], ["else"], ["elif"]) \
-                    or lead in _COMMAND_LEADERS:
+            if lead in _COMMAND_LEADERS:
                 calls.append(_REDIRECTIONS.sub("", raw).strip())
             i += len(_KILL_WORD)
             continue
@@ -967,7 +967,8 @@ def kill_vectors(text: str) -> list[str]:
         elif text.startswith("<<", i) and not text.startswith("<<<", i):
             m = _HEREDOC.match(text, i)
             if m:
-                pending.append(m.group(1) or m.group(2) or m.group(3))
+                pending.append((m.group(1) or m.group(2) or m.group(3),
+                                text.startswith("<<-", i)))
                 i = m.end()
                 continue
         i += 1

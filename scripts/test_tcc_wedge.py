@@ -394,6 +394,8 @@ class HealTests(unittest.TestCase):
             "heredoc body": f"cat <<'EOF'\n{v1}\n{v2}\nEOF\n" + old,
             "unquoted heredoc": f"cat <<EOF\n{v1}\n{v2}\nEOF\n" + old,
             "as an argument": f"echo {v1}\necho {v2}\n" + old,
+            "exec as an echo argument": f"echo exec {v1}\necho exec {v2}\n" + old,
+            "padded heredoc terminator": f"cat <<EOF\nnote\n EOF \n{v1}\n{v2}\nEOF\n" + old,
             "inside a quoted $( )": f"x='$({v1})'\ny='$({v2})'\n" + old,
         }
         for name, body in not_executed.items():
@@ -402,6 +404,9 @@ class HealTests(unittest.TestCase):
                 self.assertFalse(tw.wrapper_sends_sigkill(str(self.wrapper)), name)
         # An executed call after a heredoc is still found.
         self.wrapper.write_text(f"#!/bin/bash\ncat <<EOF\nnote\nEOF\n{v1}\n{v2}\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+        # `<<-` strips leading tabs from the terminator, and only then.
+        self.wrapper.write_text(f"#!/bin/bash\ncat <<-EOF\nnote\n\tEOF\n{v1}\n{v2}\n")
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
 
     def test_the_repo_wrapper_is_the_sigkill_version(self) -> None:
