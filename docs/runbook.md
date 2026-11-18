@@ -2930,7 +2930,11 @@ fleet`), and check GitHub's job history against it with
   overcommitted pair is printed as `gate_reserve_overcommitted lane=...
   axis=... demand=... reserve=...` on every update, and `tartci pool status`
   and `tartci doctor fleet` (`gate_reserve_overcommitted`) show the same from
-  the installed profile. The update is refused only when the target profile's
+  the installed profile.
+  The same check also refuses a non-gate lane (for example Vellum) whose
+  `supervisors x` VM cores exceed the non-gate lease budget (`lane_concurrency_unreachable`,
+  `scripts/gate_reserve_fit.py`): its slots could never run together, whatever the load.
+  A host with `vm_slot_lending` is held to its lease capacity instead. The update is refused only when the target profile's
   overcommit on some (lane, axis) is strictly greater than the installed
   profile's, both against the same live reserve (`gate_reserve_worse`). This is
   a ratchet because a host whose installed profile overcommits (m1: 2 x 3

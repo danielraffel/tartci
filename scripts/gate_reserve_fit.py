@@ -119,6 +119,50 @@ def fit(profile: Dict[str, Any], host: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def non_gate_lanes(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [lane for lane in profile.get("lane", []) or []
+            if isinstance(lane, dict) and lane.get("priority") not in (None, "gate")]
+
+
+def unreachable_concurrency(profile: Dict[str, Any], host: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Non-gate lanes whose slots can never run together, per axis.
+
+    A non-gate lease is held to the non-gate budget (lease capacity minus the
+    gate reserve). m3, 2026-11-18: two Vellum slots of 8 cores against a 12-core
+    budget; the second slot could never boot beside the first, whatever else the
+    host was doing. Unlike the gate ratchet this is not a matter of load: the
+    sizing is arithmetically unreachable, so it is refused outright.
+
+    With `[leases] vm_slot_lending = true`, the non-gate guest that takes the
+    last macOS slot is held to the lease capacity instead (leases.py, "VM slot
+    lending"), and that is the budget used here.
+    """
+    lending = bool((profile.get("leases") or {}).get("vm_slot_lending"))
+    per_job = int(host.get("per_compile_job_mem_mb") or PER_JOB_MEM_MB)
+    cores_key, mem_key = (("lease_capacity_cores", "lease_capacity_mem_mb") if lending
+                          else ("non_gate_capacity_cores", "non_gate_capacity_mem_mb"))
+    # A host reading without the key leaves that axis unmeasured (budget 0).
+    budget = {"cores": int(host.get(cores_key) or 0), "memory": int(host.get(mem_key) or 0)}
+    rows = []
+    for lane in non_gate_lanes(profile):
+        supervisors = int(lane.get("supervisors", 1))
+        cores = lane_vm_cores(lane, host)
+        demand = {"cores": supervisors * cores,
+                  "memory": supervisors * vm_mem_mb(cores, per_job)}
+        for axis in AXES:
+            if budget[axis] > 0 and demand[axis] > budget[axis]:
+                rows.append({"lane": str(lane.get("id")), "axis": axis,
+                             "supervisors": supervisors, "vm_cores": cores,
+                             "demand": demand[axis], "budget": budget[axis]})
+    return rows
+
+
+def unreachable_lines(rows: List[Dict[str, Any]]) -> List[str]:
+    return [f"lane_concurrency_unreachable lane={r['lane']} axis={r['axis']} "
+            f"supervisors={r['supervisors']} vm_cores={r['vm_cores']} "
+            f"demand={r['demand']} budget={r['budget']}" for r in rows]
+
+
 def not_applicable_lines(profile: Dict[str, Any], host: Dict[str, Any]) -> List[str]:
     """Axes with gate lanes declared but no gate reserve to measure them against.
 
