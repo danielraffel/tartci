@@ -293,6 +293,12 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
     if me == canary:
         return newest, f"canary {canary}: applies first"
     if me in roles["former_canaries"]:
+        # Deliberately not gated on the new canary: a host still on the older
+        # generation (the new canary included) waits for this one, so waiting
+        # here could deadlock until TartCI itself rolls out. This is exactly
+        # how the former canary behaved before the move, the steward stage
+        # still guards every host behind it, and while the entry is listed a
+        # rollout pause holds both canaries (docs/runbook.md).
         return newest, f"former canary {me}: applies first until every host reads canary {canary}"
     # (host, needs a clean steward tick): the canary, then for a tool with a
     # steward check every steward host other than this one.

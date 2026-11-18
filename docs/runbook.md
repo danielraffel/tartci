@@ -3334,7 +3334,8 @@ arrive, and a host that did not get it is loud:
   TartCI generation that names the new one: a former canary still applies
   first, so a host on the older generation, which waits for it, is never left
   waiting on a host that in turn waits for it. Readers wait only for
-  `canary`. Remove the entry once `tartci fleet-macos self-update --plan`
+  `canary`. A former canary does not wait for the new one, so while it is
+  listed, pausing the rollout means holding both. Remove the entry once `tartci fleet-macos self-update --plan`
   reports every host current.
   The canary applies a release at 30 minutes, as above. Every other host
   applies it only once the canary's `events.jsonl` shows a `tool_deployed` for
@@ -3360,7 +3361,8 @@ arrive, and a host that did not get it is loud:
   that, its verdict on the next complete steward tick (5 to 10 minutes), and
   m1 and m5 on their next 5-minute pass. The drift alert below fires at 3 h.
   To pause the whole rollout, hold the canary (`[tools.shipyard] auto_apply =
-  false` in m5s's `tool-freshness.toml`): every host waits behind it. A bad
+  false` in m5s's `tool-freshness.toml`, and in m5's while m5 is listed in
+  `former_canaries`): every host waits behind it. A bad
   release that reached m3 is rolled back there automatically; to roll back a
   host by hand, run its `shipyard runner fleet-update --to <previous release>`. pulp does not wait for the steward hosts.
   Of the soaked releases a host applies the newest one every host it waits
