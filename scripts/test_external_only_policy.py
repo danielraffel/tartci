@@ -116,7 +116,8 @@ class CollectTests(unittest.TestCase):
             real.mkdir()
             with mock.patch.object(eop, "ccache_reported_dir", return_value=str(real)):
                 self.assertEqual(eop.collect({}, home), [("ccache dir", str(real))])
-            with mock.patch.object(eop, "ccache_reported_dir", return_value=str(real / "absent")):
+            with mock.patch.object(eop, "ccache_reported_dir",
+                                   return_value=str(Path(home) / "Library" / "Caches" / "ccache")):
                 self.assertEqual(eop.collect({}, home), [])
 
     def test_env_build_and_cache_dirs_are_all_collected(self) -> None:
