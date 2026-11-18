@@ -882,6 +882,15 @@ class ToolFreshnessTests(unittest.TestCase):
         row = self.refresh(host, later + 1900, if_older=1800)["tools"]["shipyard"]
         self.assertEqual(row["behind_published_since"], tf._iso(later))
 
+    def test_the_first_sighting_survives_its_release_leaving_the_feed(self) -> None:
+        host = Host({"shipyard": "0.221.0", "pulp": "0.877.2"})
+        first = self.refresh(host)["tools"]["shipyard"]["behind_published_since"]
+        # The bounded feed rotates: v0.221.1 drops out, a newer release arrives.
+        self.feeds["danielraffel/Shipyard"] = feed(("v0.221.2", NOW + 1000))
+        row = self.refresh(host, NOW + 1900, if_older=1800)["tools"]["shipyard"]
+        self.assertEqual(row["state"], "behind")
+        self.assertEqual(row["behind_published_since"], first)
+
     def test_a_row_without_the_map_falls_back_to_the_tag_time(self) -> None:
         # The first pass after TartCI updates has no record of when the release
         # was first seen: the tag time is the safe (earliest) answer.

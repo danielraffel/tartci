@@ -673,7 +673,15 @@ def measure(name: str, tool: dict, home: Path, now: float, previous: dict | None
         row["published_seen"] = {
             _vstr(version): published_seen.get(_vstr(version)) or _iso(now if carried else at)
             for version, _, at in newer}
-        row["behind_published_since"] = row["published_seen"][_vstr(newer[0][0])]
+        first = row["published_seen"][_vstr(newer[0][0])]
+        # Like behind_since: once the oldest newer release leaves the bounded
+        # feed, keep the earliest time recorded for this installed version.
+        if previous and (previous.get("effective") or previous.get("installed")) \
+                == row["effective"]:
+            earlier = _epoch(previous.get("behind_published_since"))
+            if earlier is not None and earlier < (_epoch(first) or earlier):
+                first = _iso(earlier)
+        row["behind_published_since"] = first
     row.update(state="behind", releases_behind=len(newer), behind_since=_iso(behind_since),
                behind_since_lower_bound=lower_bound, behind_hours=round(hours, 1),
                stale=hours > stale_hours,
