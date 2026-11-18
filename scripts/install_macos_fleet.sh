@@ -258,6 +258,7 @@ LOADED_RECEIPT="$HOME/.config/tartci/macos-fleet-loaded.json"
 SUPPORT_GENERATIONS="$HOME/.local/share/tartci-generations"
 ENTRYPOINT="$HOME/.local/bin/tartci"
 AGENT_HYGIENE_ENTRYPOINT="$HOME/.local/bin/agent-hygiene"
+LEASED_BUILD_ENTRYPOINT="$HOME/.local/bin/leased-build"
 DOMAIN="gui/$(id -u)"
 CONFIG="$("$PYTHON_BIN" - "$CONFIG" <<'PY'
 from pathlib import Path
@@ -381,6 +382,7 @@ echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
 echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
+echo "  leased_build_entrypoint=$LEASED_BUILD_ENTRYPOINT"
 echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 if [ -n "$plan_launcher_layout" ]; then
@@ -932,6 +934,26 @@ content = "#!/bin/zsh\nexec " + str(source) + ' "$@"\n'
 target.write_text(content)
 target.chmod(0o755)
 PY
+
+# leased-build, the agents' core-lease wrapper, comes from the same cohort, so
+# every host runs the same copy. A hand-placed copy elsewhere on PATH (it lived
+# untracked in ~/bin on m5studio until 2026-11-18) may shadow it: say so, and
+# leave it for its owner to remove.
+"$PYTHON_BIN" - "$LEASED_BUILD_ENTRYPOINT" "$support_root/scripts/leased-build" <<'PY'
+import os, sys
+from pathlib import Path
+target, source = map(Path, sys.argv[1:])
+if target.parent.is_symlink() or not target.parent.is_dir() or target.parent.stat().st_uid != os.getuid():
+    raise SystemExit("leased-build entrypoint parent must be owned and non-symlinked")
+target.write_text("#!/bin/bash\nexec " + str(source) + ' "$@"\n')
+target.chmod(0o755)
+PY
+stale_leased_build="$HOME/bin/leased-build"
+if [ -f "$stale_leased_build" ] && ! cmp -s "$stale_leased_build" "$support_root/scripts/leased-build"; then
+  echo "fleet install: NOTICE: $stale_leased_build is a stale hand-placed copy of leased-build;" \
+    "the tracked one is $LEASED_BUILD_ENTRYPOINT. Remove it (or put ~/.local/bin first on PATH)" \
+    "so agents run the installed copy." >&2
+fi
 
 if [ -z "$launcher_target" ]; then
   "$PYTHON_BIN" - "$render_dir" "$launch_entrypoint" "$ENTRYPOINT" <<'PY'

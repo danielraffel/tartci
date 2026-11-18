@@ -776,6 +776,28 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("terminate these process groups", output)
         self.assertNotIn("done; victims log", output)
 
+    def test_installed_leased_build_runs_the_cohort_copy(self) -> None:
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = self.bin / "leased-build"
+        self.assertTrue(wrapper.is_file())
+        target = wrapper.read_text().split("exec ", 1)[1].split(" ", 1)[0]
+        self.assertTrue(target.endswith("/scripts/leased-build"), target)
+        self.assertEqual(Path(target).read_bytes(), (ROOT / "scripts/leased-build").read_bytes())
+        usage = subprocess.run([str(wrapper)], text=True, capture_output=True, env=self.env)
+        self.assertEqual(usage.returncode, 2)
+        self.assertIn("leased-build: usage", usage.stderr)
+        self.assertNotIn("stale hand-placed copy", result.stderr)
+
+    def test_a_stale_hand_placed_leased_build_is_reported_not_touched(self) -> None:
+        stale = self.home / "bin/leased-build"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("#!/bin/sh\necho old\n")
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stale hand-placed copy of leased-build", result.stderr)
+        self.assertEqual(stale.read_text(), "#!/bin/sh\necho old\n")
+
     def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
         result = self.run_installer(GH_REPO="danielraffel/tartci")
         self.assertEqual(result.returncode, 0, result.stderr)
