@@ -1004,6 +1004,8 @@ def kill_vectors(text: str) -> list[str]:
                 i += 2
         elif c in "<>&":
             i += 1
+        elif cmd and c in "!{" and text[i + 1:i + 2] in (" ", "\t"):
+            i += 1  # `!` and `{ ` leave the next word at a command position
         else:
             word = _WORD.match(text, i) if cmd else None
             if word and word.group(0) in _LEADER_KEYWORDS:

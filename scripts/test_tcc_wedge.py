@@ -412,6 +412,9 @@ class HealTests(unittest.TestCase):
         # A here-string is not a here-document: the calls after it still run.
         self.wrapper.write_text(f'#!/bin/bash\ntr a b <<<"$x"\n{v1}\n{v2}\n')
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
+        # `!` and a `{ }` group still run their command.
+        self.wrapper.write_text(f"#!/bin/bash\n! {v1}\n{{ {v2}; }}\n")
+        self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
         # `<<-` strips leading tabs from the terminator, and only then.
         self.wrapper.write_text(f"#!/bin/bash\ncat <<-EOF\nnote\n\tEOF\n{v1}\n{v2}\n")
         self.assertTrue(tw.wrapper_sends_sigkill(str(self.wrapper)))
