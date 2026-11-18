@@ -136,6 +136,14 @@ class CollectTests(unittest.TestCase):
             got = eop.collect({}, home)
         self.assertEqual(got, [("ccache dir", str(cc))])
 
+    def test_ccache_reported_dir_beats_the_user_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            conf = Path(home) / "Library" / "Preferences" / "ccache"
+            conf.mkdir(parents=True)
+            (conf / "ccache.conf").write_text("cache_dir = /Volumes/Example/cc\n")
+            with mock.patch.object(eop, "ccache_reported_dir", return_value="/Users/x/dir-specific"):
+                self.assertEqual(eop.collect({}, home), [("ccache dir", "/Users/x/dir-specific")])
+
     def test_a_configured_ccache_dir_is_judged_before_it_exists(self) -> None:
         with tempfile.TemporaryDirectory() as home:
             conf = Path(home) / "Library" / "Preferences" / "ccache"

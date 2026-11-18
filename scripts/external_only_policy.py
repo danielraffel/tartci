@@ -138,11 +138,12 @@ def collect(env: Mapping[str, str], home: str, build_dirs: Sequence[str] = (),
         configured = _ccache_conf_dir(env, home)
         reported = ccache_reported_dir(env)
         default = os.path.join(home, "Library", "Caches", "ccache")
-        if configured:
-            # Named in a config file: judged even before it is created.
-            found.append(("ccache dir", configured))
-        elif os.path.isdir(os.path.expanduser(reported or default)):
-            found.append(("ccache dir", reported or default))
+        # ccache's own answer wins (it knows directory-specific configs); the
+        # parsed file is the fallback when the probe fails.
+        path = reported or configured or default
+        explicit = bool(configured) or (reported is not None and reported != default)
+        if explicit or os.path.isdir(os.path.expanduser(path)):
+            found.append(("ccache dir", path))
     return [(label, os.path.expanduser(path)) for label, path in found]
 
 
