@@ -48,7 +48,7 @@ class Fleet:
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
               last: dict | None = None, vitals: dict | None = None,
-              freshness: dict | None = None) -> None:
+              freshness: dict | None = None, owner: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
@@ -56,7 +56,9 @@ class Fleet:
                                    f"{psa.VITALS_SEPARATOR}\n"
                                    f"{json.dumps(vitals) if vitals is not None else ''}\n"
                                    f"{psa.FRESHNESS_SEPARATOR}\n"
-                                   f"{json.dumps(freshness) if freshness is not None else ''}\n",
+                                   f"{json.dumps(freshness) if freshness is not None else ''}\n"
+                                   f"{psa.OWNER_SEPARATOR}\n"
+                                   f"{json.dumps(owner) if owner is not None else ''}\n",
                                 "")
 
     def healthy(self, target: str) -> None:
@@ -176,10 +178,10 @@ class PeerStall(unittest.TestCase):
     OTHER = {"number": 1, "title": "[tartci] m5 has a macOS privacy prompt waiting: click Allow",
              "body": ""}
 
-    def stale_vitals(self):
+    def stale_vitals(self, owner=None):
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},
-                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360})
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360}, owner=owner)
 
     def test_a_vitals_stall_links_the_prompt_and_never_messages_the_owner(self):
         # 2026-11-18: #965 (host-vitals) said only "tartci launchd heal" while
@@ -193,11 +195,28 @@ class PeerStall(unittest.TestCase):
         self.assertIn("#959", body)
         self.assertNotIn("#1 ", body, "another host's prompt is not linked")
         self.assertEqual(out["peers"]["studio"]["host_vitals"]["related"], [960, 959])
-        # The stalled host is the one sender of the prompt message
-        # (tcc_prompt): the reader sends only its own stall line.
+        # An open prompt issue alone is not proof the host told the owner (it
+        # opens the issue before it posts), so the reader's line still goes.
         self.assertEqual(len(self.told), 1)
         self.assertNotIn("Click Allow", self.told[0])
-        self.assertIn("stopped reporting", self.told[0])
+
+    def test_no_stall_line_when_the_host_receipt_shows_it_told_the_owner(self):
+        self.stale_vitals(owner={"key": "2026-10-09T06:50:00Z", "sent_at": "2026-10-09T06:51:00Z"})
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
+        self.assertEqual(self.told, [], "one message per wedge")
+        # The prompt issue closes (or the receipt is unreadable) while the
+        # host stays quiet: still no line for this episode.
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [])
+        self.assertEqual(self.told, [])
+
+    def test_a_host_receipt_for_another_episode_does_not_suppress(self):
+        self.stale_vitals(owner={"key": "2026-10-01T00:00:00Z", "sent_at": "2026-10-01T00:01:00Z"})
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
+        self.assertEqual(len(self.told), 1)
 
     def test_a_prompt_that_appears_later_is_commented_on_the_open_vitals_issue(self):
         self.stale_vitals()
@@ -317,6 +336,28 @@ class PeerStall(unittest.TestCase):
         self.stale_vitals()
         self.run_pass(RECEIPT_TS + 60, lister=lambda: [],
                       notify=lambda text: (False, "post failed: URLError"))
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [])
+        self.assertEqual(len(self.told), 1)
+
+    def test_an_unwritable_receipt_on_the_opening_pass_is_retried(self):
+        self.stale_vitals()
+        real = host_off._write_json
+        calls = {"n": 0}
+
+        def flaky(path, value):
+            # The pre-send receipt write fails once, on the opening pass.
+            if str(path).endswith("host-vitals-owner.json") and value.get("detail") == "sending" \
+                    and calls["n"] == 0:
+                calls["n"] += 1
+                raise OSError("disk full")
+            return real(path, value)
+        with mock.patch.object(host_off, "_write_json", side_effect=flaky):
+            self.run_pass(RECEIPT_TS + 60, lister=lambda: [])
+        self.assertEqual(self.told, [])
         later = RECEIPT_TS + psa.READ_SECS + 60
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
                                  "stalled": [], "paused": []},

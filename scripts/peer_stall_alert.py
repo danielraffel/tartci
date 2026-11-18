@@ -61,6 +61,7 @@ RESOLVER_SEPARATOR = "--- resolver ---"
 LAST_SEPARATOR = "--- peer-stall ---"
 VITALS_SEPARATOR = "--- host-vitals ---"
 FRESHNESS_SEPARATOR = "--- tool-freshness ---"
+OWNER_SEPARATOR = "--- owner-notify ---"
 # Open issues on the same host that explain a host-vitals stall.
 PROMPT_TITLE = "[tartci] {peer} has a macOS privacy prompt waiting: click Allow"
 STORE_STALL_PREFIX = "[tartci] {peer}: writes on "
@@ -81,6 +82,8 @@ PEER_READ = ('date +%s; echo "' + SEPARATOR + '"; '
              'cat "${TARTCI_HOST_VITALS_STATE:-$HOME/.local/state/pulp/host_vitals.json}" '
              '2>/dev/null || true; echo; echo "' + FRESHNESS_SEPARATOR + '"; '
              'cat "${TARTCI_HOME:-$HOME/.tartci}/state/tool-freshness/state.json" '
+             '2>/dev/null || true; echo; echo "' + OWNER_SEPARATOR + '"; '
+             'cat "${TARTCI_HOME:-$HOME/.tartci}/state/tcc-prompt-notify.json" '
              '2>/dev/null || true')
 
 Runner = Callable[[List[str]], Tuple[int, str, str]]
@@ -137,6 +140,7 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
     body, _, last_text = body.partition(LAST_SEPARATOR)
     last_text, _, vitals_text = last_text.partition(VITALS_SEPARATOR)
     vitals_text, _, freshness_text = vitals_text.partition(FRESHNESS_SEPARATOR)
+    freshness_text, _, owner_text = freshness_text.partition(OWNER_SEPARATOR)
     guard_text, _, resolver_text = body.partition(RESOLVER_SEPARATOR)
     try:
         last = json.loads(last_text) if last_text.strip() else None
@@ -164,10 +168,16 @@ def read_peer(target: str, run: Optional[Runner] = None) -> Dict[str, Any]:
         freshness = json.loads(freshness_text) if freshness_text.strip() else None
     except ValueError:
         freshness = None
+    try:
+        owner = json.loads(owner_text) if owner_text.strip() else None
+    except ValueError:
+        owner = None
     return {"readable": True, "clock": clock, "last": last if isinstance(last, dict) else None,
             "resolver": resolver if isinstance(resolver, dict) else None,
             "vitals": vitals if isinstance(vitals, dict) else None,
             "freshness": freshness if isinstance(freshness, dict) else None,
+            # The host's own "Click Allow" receipt (tcc_prompt): key = episode since.
+            "owner_notified": owner if isinstance(owner, dict) else None,
             "guard": launchd_interval_guard.classify(
                 receipt, float(clock),
                 receipt_path=f"{target}:launchd-interval-guard/status.json"),
@@ -330,6 +340,16 @@ def related_issues(peer: str, lister: Optional[Lister] = None) -> Optional[List[
     return found
 
 
+def host_told_owner(info: Dict[str, Any], prompt: Dict[str, Any]) -> bool:
+    """Whether the host's own receipt shows a successful "Click Allow" post
+    for this prompt episode: its key is the episode's `since`, which the
+    prompt issue's incident marker carries as symptom_at."""
+    told = info.get("owner_notified") or {}
+    key = told.get("key")
+    return bool(told.get("sent_at")) and key is not None and (
+        '"symptom_at":' + json.dumps(str(key))) in str(prompt.get("body") or "")
+
+
 def vitals_owner_text(peer: str, verdict: Dict[str, Any], issue: str) -> str:
     minutes = int(round(float(verdict.get("age_seconds") or 0) / 60))
     return (f"{peer} stopped reporting {minutes} min ago; likely a privacy prompt: check the "
@@ -338,7 +358,9 @@ def vitals_owner_text(peer: str, verdict: Dict[str, Any], issue: str) -> str:
 
 def vitals_owner_alert(directory: pathlib.Path, peer: str, verdict: Dict[str, Any],
                        issue: Optional[str], opened_here: Dict[str, Any], active: bool,
-                       notify: Any, now: float) -> Dict[str, Any]:
+                       notify: Any, now: float,
+                       related: Optional[List[Dict[str, Any]]] = None,
+                       info: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One owner-channel line per host-vitals stall episode, from the reader
     that opened its issue.
 
@@ -348,7 +370,10 @@ def vitals_owner_alert(directory: pathlib.Path, peer: str, verdict: Dict[str, An
     opened the issue starts the record, and a reader that adopts an existing
     issue on a handover never sends. The opener retries a failed post on its
     later passes. Separate from tcc_prompt's own message (its own record and
-    key), so neither suppresses the other."""
+    key). When the host's receipt shows it already told the owner "Click
+    Allow" for the open privacy-prompt issue, this line is not sent: one
+    message per wedge. An open prompt issue alone is not proof, since the host
+    opens the issue before it posts."""
     path = directory / f"{peer}.host-vitals-owner.json"
     if not active or not issue:
         return {}
@@ -359,8 +384,26 @@ def vitals_owner_alert(directory: pathlib.Path, peer: str, verdict: Dict[str, An
         return {}  # adopted on a handover, or opened by another reader
     if saved.get("key") == key and saved.get("sent_at"):
         return {}
-    import owner_notify  # noqa: PLC0415 - sibling module
+    if opened and saved.get("key") != key:
+        # Mark the episode as this reader's before sending, so a failed post,
+        # an unwritable receipt or a killed pass is retried next pass.
+        try:
+            host_off._write_json(path, {"key": key, "detail": "opened here"})
+        except OSError:
+            pass
+    prompt = next((r for r in related or [] if r.get("title") == PROMPT_TITLE.format(peer=peer)),
+                  None)
+    if prompt is not None and host_told_owner(info or {}, prompt):
+        # Recorded as handled: a later pass that can no longer see the prompt
+        # issue or the host's receipt must not send for this episode.
+        try:
+            host_off._write_json(path, {"key": key, "sent_at": "suppressed",
+                                        "detail": "the host already told the owner"})
+        except OSError:
+            pass
+        return {"sent": False, "skipped": "the host already told the owner about this prompt"}
     try:
+        import owner_notify  # noqa: PLC0415 - sibling module
         return owner_notify.notify_once(path, key, vitals_owner_text(peer, verdict, issue),
                                         sender=notify, now=now)
     except Exception as exc:  # noqa: BLE001 - the peer pass goes on
@@ -695,6 +738,10 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
         current = host_off._read_json(vitals_path) or {}
         this_issue = (current.get("issue")
                       if current.get("since") == vitals_verdict["since"] else None)
+        # Right after the open, before anything else in the pass can fail.
+        owner = vitals_owner_alert(directory, peer, vitals_verdict, this_issue, opened_here,
+                                   acting and enabled and vitals_verdict["active"], notify, now,
+                                   related, info)
         if (vitals_verdict["active"] and acting and enabled and read is not None
                 and this_issue and not vitals_out.get("closed")):
             # The vitals issue may predate the prompt or store issue it should
@@ -719,8 +766,6 @@ def alert_pass(now: Optional[float] = None, directory: Optional[pathlib.Path] = 
                 if rc == 0:
                     host_off._write_json(links_path, {"issue": this_issue,
                                                       "numbers": numbers})
-        owner = vitals_owner_alert(directory, peer, vitals_verdict, this_issue, opened_here,
-                                   acting and enabled and vitals_verdict["active"], notify, now)
         result[peer]["host_vitals"] = {**vitals_verdict, "acting": acting,
                                         "issue": vitals_out.get("issue"),
                                         "closed": bool(vitals_out.get("closed")),

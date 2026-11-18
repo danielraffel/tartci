@@ -2610,7 +2610,10 @@ alert, so its peers raise it.
   issue link. That covers a host that stalls before its own prompt check runs.
   It is keyed on the issue number (`<peer>.host-vitals-owner.json`): a reader
   that adopts the issue on a handover never sends, and the opener retries a
-  failed post. A reader can
+  failed post. It is not sent when the host's own receipt
+  (`tcc-prompt-notify.json`, read over the same SSH command) shows it already
+  posted "Click Allow" for the open privacy-prompt issue; an open prompt issue
+  alone is not proof, since the host opens it before it posts. A reader can
   only see a prompt issue the host opened, in the same pass that sends the
   message.
 
