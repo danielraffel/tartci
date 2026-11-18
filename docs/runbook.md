@@ -3010,7 +3010,14 @@ fleet`), and check GitHub's job history against it with
   reports after 4 h when gate jobs this host serves are queued (one hour past
   the 3 h exclusion, so one dark peer cannot raise issues on every other host
   before the queue heals), and after 6 h otherwise or when the demand read
-  fails. Demand is a queued self-hosted *job* whose labels a registration of
+  fails. Those bounds only cover a host deferred to a peer. Separately, every
+  scheduled apply that finds the host more than 4 h behind main (its oldest
+  undeployed commit's age past the soak) logs `self-update: STARVED: ... behind
+  main` whatever held it (a step-aside, a host fault, the rate limit, a pause),
+  writes `self_update_behind` once per episode and opens one issue, at most
+  one per host per 6 h (`behind-alert.json`, `behind-alert-last.json`; the last measured age is kept in `behind-skew.json` for attempts that stop before measuring). The
+  issue closes once the host is back inside 4 h. Demand is a queued
+  self-hosted *job* whose labels a registration of
   this host serves, for a workflow it names, at most 12 h old
   (`scripts/gate_job_demand.py`); runs carry no labels, so a run-level read
   would count hosted-only runs and the 2026-08-19 zombie merge group. The
