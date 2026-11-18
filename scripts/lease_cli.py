@@ -144,8 +144,9 @@ def parse_args(
             "build class: interactive (someone is waiting; normal QoS, may borrow "
             "idle gate cores when lending is on, never floored), background "
             "(validations/opportunistic; capped at the background share) or check "
-            "(git/Python checks: always 1 core from a small pool of their own, so "
-            "never queued behind compiles; a full pool falls back to background). "
+            "(git/Python checks: 1 core from a small pool of their own, so never "
+            "queued behind compiles, unless --min-cores is above 1; a full pool "
+            "falls back to background). "
             "Omitted: the class-less rule every caller had before classes"
         ),
     )

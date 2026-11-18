@@ -3632,7 +3632,8 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   `agent_floor_qos` (the result says `"floor": true`); it never counts against
   the build floor pool, so compiles cannot fill it. Its memory is charged, at
   grant and to every later admission. A full pool falls back to an ordinary
-  background lease.
+  background lease, and so does a request with `--min-cores` above 1, since a
+  1-core grant would break that promise.
 - **Dynamic gate lending (opt-in per host, default off)** — with
   `dynamic_lending = true`, an interactive lease may grow non-gate use past the
   guaranteed budget N = T - S, up to `max(N, T - G - P)` where G is the cores

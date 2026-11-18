@@ -1866,7 +1866,11 @@ def acquire(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
             raise ValueError("--class applies to non-gate build leases only")
         check_mem = None
         if build_class == "check":
-            check_mem = None if memory_only else check_grant(args, cfg, active, priority)
+            # 1 core is the check grant, so a caller that will not accept 1
+            # core (--min-cores above 1) queues as a background build.
+            one_core_ok = int(getattr(args, "min_cores", 0) or 0) <= 1
+            check_mem = (check_grant(args, cfg, active, priority)
+                         if one_core_ok and not memory_only else None)
             # A full check pool queues like any background build.
             build_class = None if check_mem is not None else "background"
         reserve, reserve_source = prompt_reserve(store_dir, cfg)

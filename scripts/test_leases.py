@@ -318,7 +318,7 @@ class CheckClassTests(LeaseCliTestCase):
             return self.build_floor_acquire(lease_id, cores, **kwargs)
         extra = ["--capacity-mem-mb", "0", "--agent-floor-cores", "6",
                  "--agent-floor-pool-cores", "6", "--allow-floor", "--class", "check",
-                 "--min-cores", "2"]
+                 "--min-cores", "1"]
         return self.run_cli(
             "acquire", "--id", lease_id, "--cores", str(cores), "--capacity", "26",
             "--reserved-gate-cores", "14", "--priority", "build", "--pid", str(self.pid),
@@ -384,6 +384,15 @@ class CheckClassTests(LeaseCliTestCase):
             "--mem-mb", "18432", *mem, check=False)
         self.assertEqual(build.returncode, 75, build.stdout)
         self.assertEqual(json.loads(build.stdout)["reason"], "memory_exceeded")
+
+    def test_a_check_that_needs_two_cores_queues_as_a_build(self) -> None:
+        # --min-cores is a promise: a 1-core check grant would break it.
+        self.fill_builds_and_floor()
+        denied = self.run_cli(
+            "acquire", "--id", "check-2", "--cores", "8", "--capacity", "26",
+            "--reserved-gate-cores", "14", "--pid", str(self.pid), "--kind", "agent-build",
+            "--capacity-mem-mb", "0", "--class", "check", "--min-cores", "2", check=False)
+        self.assertEqual(denied.returncode, 75, denied.stdout)
 
     def test_a_check_lease_cannot_be_resized(self) -> None:
         self.assertEqual(self.floor_acquire("check-1", 8, check_class=True).returncode, 0)
