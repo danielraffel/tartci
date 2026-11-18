@@ -61,11 +61,13 @@ class PolicyTests(unittest.TestCase):
     def test_unreadable_latest_is_unknown(self):
         self.assertEqual(ra.classify("2.336.0", None)["verdict"], "unknown")
 
-    def test_reason_carries_no_clock(self):
-        # The text is the issue dedupe key, so it may change only when the
-        # version or the latest release changes.
-        self.assertEqual(ra.classify("2.336.0", "2.338.2")["reason"],
-                         "runner v2.336.0 is 2 minor versions behind v2.338.2")
+    def test_problem_text_survives_a_new_upstream_release(self):
+        # The text is an alert's identity: same host state, same text.
+        before = ra.problems([dict(ra.classify("2.336.0", "2.338.2"), golden="g")])
+        after = ra.problems([dict(ra.classify("2.336.0", "2.339.0"), golden="g")])
+        self.assertEqual(before, after)
+        self.assertEqual(before, ["g: WARN: runner v2.336.0 is 2 or more minor versions "
+                                  "behind the latest release"])
 
     def test_agrees_with_the_pin_rule(self):
         names = {"problem": "fail", "warn": "warn", "ok": "ok", "unknown": "unknown"}
@@ -100,7 +102,8 @@ class ProblemTests(unittest.TestCase):
         rows = [dict(ra.classify("2.336.0", "2.338.2"), golden="a"),
                 dict(ra.classify(None, None, refused={"2.336.0"}), golden="b")]
         self.assertEqual(ra.problems(rows),
-                         ["a: WARN: runner v2.336.0 is 2 minor versions behind v2.338.2",
+                         ["a: WARN: runner v2.336.0 is 2 or more minor versions behind "
+                          "the latest release",
                           "b: FAIL: GitHub refuses runner v2.336.0 as deprecated"])
 
 
@@ -250,6 +253,11 @@ class CollectTests(unittest.TestCase):
         with mock.patch.object(ra.subprocess, "run", side_effect=OSError("no tart")):
             self.assertIsNone(ra.present_goldens())
 
+    def test_record_with_a_non_string_version_is_unknown(self):
+        path = ra.record("pulp-linux-build", "2.338.2", now=NOW)
+        path.write_text(json.dumps({"version": 2338}))
+        self.assertIsNone(ra.read_record("pulp-linux-build"))
+
     def test_render_tolerates_a_truncated_row(self):
         self.assertEqual(ra.render({"golden": "x"}), "x: UNKNOWN: ")
 
@@ -331,8 +339,8 @@ class SurfaceTests(unittest.TestCase):
 
     def test_tool_freshness_behind_is_a_problem_with_stable_text(self):
         first = self.summary_after_refresh("2.338.2", recorded="2.336.0")["problem"]
-        self.assertIn("runner age pulp-linux-build: WARN: runner v2.336.0 is 2 minor "
-                      "versions behind v2.338.2", first)
+        self.assertIn("runner age pulp-linux-build: WARN: runner v2.336.0 is 2 or more "
+                      "minor versions behind the latest release", first)
 
     def test_measure_failure_is_unknown_not_a_problem(self):
         with mock.patch.object(ra, "collect", side_effect=OSError("boom")):

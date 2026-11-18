@@ -135,7 +135,8 @@ def read_record(golden: str, home: Optional[Path] = None) -> Optional[str]:
         value = json.loads((state_dir(home) / f"{base_name(golden)}.json").read_text())
     except (OSError, ValueError):
         return None
-    return value.get("version") if isinstance(value, dict) else None
+    version = value.get("version") if isinstance(value, dict) else None
+    return version if isinstance(version, str) else None
 
 
 def recorded_at(golden: str, home: Optional[Path] = None) -> Optional[float]:
@@ -322,8 +323,19 @@ def render(row: dict) -> str:
 
 
 def problems(rows: list) -> list:
-    """Only a version known to be too old, or refused by GitHub, is a problem."""
-    return [render(row) for row in rows if row.get("verdict") in ("warn", "fail")]
+    """Only a version known to be too old, or refused by GitHub, is a problem.
+
+    The text is an alert's identity, so it names the installed version only: a
+    new upstream release must not turn one standing problem into a new one.
+    """
+    out = []
+    for row in rows:
+        if row.get("verdict") == "fail":
+            out.append(render(row))
+        elif row.get("verdict") == "warn":
+            out.append(f"{row.get('golden', '?')}: WARN: runner v{row.get('installed')} is "
+                       f"{rv.WARN_MINOR_LAG} or more minor versions behind the latest release")
+    return out
 
 
 def main(argv: Optional[list] = None) -> int:

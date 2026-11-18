@@ -3545,7 +3545,7 @@ way. A Linux pool stopped for 13 days this way with nothing alerting.
   reaches `tartci doctor fleet` as `tool_freshness_stale` and the watchdog
   WARN. `unknown` is shown by doctor and is never a problem, so a host with no
   record or no route to GitHub does not alert. The problem text names only the
-  two versions, so it changes when a version changes and not with the clock.
+  installed version, so neither the clock nor a new upstream release changes it.
 - **Setting** in `~/.config/tartci/tool-freshness.toml`:
 
       [runner_age]
