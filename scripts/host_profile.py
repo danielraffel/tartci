@@ -11,6 +11,7 @@ import platform
 import plistlib
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -591,6 +592,9 @@ def external_root_setting(fleet_profile: str | None = None) -> str | None:
             fleet_profile_path(fleet_profile).read_text(encoding="utf-8"), "external_root"
         )
     except OSError:
+        return None
+    except Exception as exc:  # noqa: BLE001 - e.g. a non-UTF-8 profile; admit, never fail a lease
+        print(f"tartci: external_root not read ({type(exc).__name__}); policy off", file=sys.stderr)
         return None
     return value if value and value.startswith("/") else None
 

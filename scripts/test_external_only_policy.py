@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""External-only hosts refuse a build whose build or cache dir is on the internal disk.
+"""External-only hosts report a build whose build or cache dir is on the internal disk.
 
 m5studio, 2026-11-17: the internal Data volume sat at 98% while builds, ccache,
 dependency sources and tool caches defaulted to $HOME. Each test below fails on
@@ -229,7 +229,8 @@ class AcquireCheckTests(unittest.TestCase):
     def test_an_internal_working_directory_is_refused_without_a_declared_build_dir(self) -> None:
         with tempfile.TemporaryDirectory() as home, \
                 mock.patch.object(eop.os, "getcwd", return_value="/Users/x/Code/p"):
-            refusal = eop.check_acquire(args(), EXT_ROOT, env={}, home=home, device=fake_device)
+            refusal = eop.check_acquire(args(), EXT_ROOT, mode="refuse", env={}, home=home,
+                                        device=fake_device)
         self.assertEqual(refusal["violations"][0]["label"], "working directory")
 
     def test_external_dirs_are_admitted(self) -> None:
@@ -350,6 +351,42 @@ class SafeAndRefuseTests(unittest.TestCase):
             refusal = eop.check_acquire_safe(a, EXT_ROOT, mode="refuse", env={}, home="/nonexistent",
                                              device=fake_device)
         self.assertEqual(refusal["reason"], eop.REASON)
+
+    def test_check_acquire_defaults_to_report(self) -> None:
+        import contextlib, io
+        a = args()
+        a.build_dir = ["/Users/x/b"]
+        with mock.patch.object(eop, "ccache_reported_dir", return_value=None), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertIsNone(eop.check_acquire(a, EXT_ROOT, env={}, home="/nonexistent",
+                                                device=fake_device))
+
+    def test_an_unreadable_profile_means_policy_off_not_an_error(self) -> None:
+        import contextlib, io
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "f.toml"
+            path.write_bytes(b'[host]\nid = "\xff\xfe"\nexternal_root = "/Volumes/Example"\n')
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertIsNone(host_profile.external_root_setting(str(path)))
+            self.assertIn("policy off", err.getvalue())
+
+    def test_a_failing_journal_never_fails_the_acquire(self) -> None:
+        import leases
+        a = argparse.Namespace(kind="build", build_dir=[], cache_dir=[], owner="o", id="t1")
+        with mock.patch.object(leases, "journal_lease_events", side_effect=TypeError("boom")), \
+                mock.patch.object(leases.external_only_policy, "check_acquire_safe", return_value=None):
+            a.external_would_refuse = [{"path": "/p", "label": "l"}]
+            # Reaches the policy block only; the journal failure must not propagate out of it.
+            cfg = {"external_root": EXT_ROOT, "external_only_mode": "report"}
+            with mock.patch.object(leases, "capacity_config", return_value=cfg), \
+                    mock.patch.object(leases, "locked_store", side_effect=StopIteration):
+                with self.assertRaises(StopIteration):  # got past the journal block
+                    leases.acquire(argparse.Namespace(
+                        store_dir="/nonexistent", priority="build", pid=None, cores_requested=1,
+                        id="t1", kind="build", owner="o", build_dir=[], cache_dir=[],
+                        external_would_refuse=[{"path": "/p", "label": "l"}],
+                        external_policy_checked=False))
 
     def test_refuse_is_not_reachable_from_the_profile(self) -> None:
         with tempfile.TemporaryDirectory() as td:

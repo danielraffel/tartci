@@ -7,13 +7,14 @@ on an external APFS volume; only m1 and m5 use their internal disk. On
 with caches, build trees and tool state all defaulting to $HOME.
 
 A host opts in with `[host] external_root = "/Volumes/<name>"` in its fleet
-profile. `[host] external_only_mode` is `report` only for now: warn on stderr, admit,
-and journal a `would_refuse` row. Refuse mode (exit 78) exists in code but is not
-reachable from config until the follow-up checklist in the runbook is done. `tartci leases acquire` for a host build (not a VM lease, whose store
-is already judged by the disk axis) then resolves every build and cache
-directory it can see and refuses the build when any resolves, after symlinks,
-to the internal data volume. The refusal names the path and the fix. A host
-without `external_root` is unchanged.
+profile. `[host] external_only_mode` is `report` only for now. `tartci leases
+acquire` for a host build (not a VM lease, whose store is already judged by the
+disk axis) resolves every build and cache directory it can see; when one
+resolves, after symlinks, to the internal data volume it warns on stderr, admits
+the build, and journals a `would_refuse` row. The warning names the path and the
+fix. Refuse mode (exit 78) exists in code and is tested but is not reachable
+from config until the follow-up checklist in the runbook is done. A host without
+`external_root` is unchanged.
 
 Directories judged, in order of authority:
 
@@ -28,8 +29,9 @@ Directories judged, in order of authority:
 
 A path that does not exist yet is judged by its nearest existing ancestor,
 which is where the first byte would land. A path under external_root while the
-volume is not mounted resolves to the internal volume, so it is refused: the
-build would otherwise write a copy of the cache to the boot disk.
+volume is not mounted resolves to the internal volume, so it is reported (and
+would be refused in refuse mode): the build would otherwise write a copy of the
+cache to the boot disk.
 
 `python3 scripts/external_only_policy.py check` runs the same judgement
 read-only, `exports` prints `export` lines that point every unset cache at the
@@ -224,10 +226,10 @@ def refusal_message(violations: Sequence[Mapping[str, str]], external_root: str)
     )
 
 
-def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "refuse",
+def check_acquire(args: Any, external_root: Optional[str], *, mode: str = "report",
                   env: Optional[Mapping[str, str]] = None, home: Optional[str] = None,
                   device: Optional[Callable[[str], int]] = None) -> Optional[Dict[str, Any]]:
-    """A refusal result for `leases acquire`, or None to admit.
+    """A refusal result for `leases acquire` (refuse mode only), or None to admit.
 
     Host-build leases only: a VM lease's store is judged by the disk axis, and
     the lane environment is rendered, not an agent's shell.
