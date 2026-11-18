@@ -383,7 +383,7 @@ class FakeSystem(su.System):
                 active = (self.home / ".tartci" / "state" / "self-update" / "active.json").exists()
                 self.kicks.append((peer, a[-1], active))
                 rc = self.kick_rc.get(peer, 0)
-                return su.Result(rc, "kicked\n" if rc == 0 else "",
+                return su.Result(rc, "kickstart sent\n" if rc == 0 else "",
                                  "" if rc == 0 else "Connection timed out")
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
@@ -1412,7 +1412,7 @@ class HandoffKickTests(Base):
         self.assertEqual(receipt["status"], "succeeded")
         detail = next(s["detail"] for s in receipt["steps"] if s["step"] == "handoff-kick")
         self.assertIn("m5: kick failed (exit 255)", detail)
-        self.assertIn("studio: kicked", detail)
+        self.assertIn("studio: kickstart sent", detail)
 
     def test_no_kick_on_a_deferred_refused_or_planned_run(self) -> None:
         self.sys.peers["m5"] = {"state": "draining", "participating": False}
@@ -2999,6 +2999,47 @@ class PausedByStallTests(Base):
         finding = fleet_doctor.check_self_update(summary)
         self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
         self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+
+    def test_a_scheduled_run_refuses_during_the_stall(self):
+        # A demand start (a peer's handoff kick) still spawns self-update in a
+        # stall; the guard's pause held only because nobody kicked it.
+        self.guard()
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertIn("PAUSED by the launchd timer stall",
+                      json.loads(receipts[-1].read_text())["error"])
+
+    def test_a_kicked_run_refuses_even_when_the_guard_lists_it_running(self):
+        # The guard omits a running self-update from `paused`; the open
+        # episode is what holds it.
+        self.guard(paused=())
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_stall_that_opens_after_the_first_check_refuses_before_the_drain(self):
+        # The stagger, checkout, preflight and build take minutes; the guard
+        # can open an episode meanwhile. Opened here at validate.
+        def hook(argv) -> None:
+            if "validate" in argv:
+                self.guard()
+        self.sys.hook = hook
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "active.json").exists())
+
+    def test_a_scheduled_run_outside_a_stall_still_updates(self):
+        # Control: the same scheduled run with no live episode goes ahead.
+        self.guard(active=False)
+        self.sys.on_sleep = None
+        self.assertUpdated(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                            target_ref="origin/main", scheduled=True))
 
     def test_the_guard_dir_override_is_honoured(self):
         other = self.home / "guard-elsewhere"
