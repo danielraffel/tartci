@@ -3998,6 +3998,16 @@ def check_reserve(target: dict, installed_path: Path, host_json: Path | None,
         print(line)
     for line in gate_reserve_fit.finding_lines(rows):
         print(line)
+    unreachable = gate_reserve_fit.unreachable_lines(
+        gate_reserve_fit.unreachable_concurrency(target, host))
+    for line in unreachable:
+        print(line)
+        print(line, file=sys.stderr)
+    if unreachable:
+        print("refusing: a lane's slots can never run together inside the non-gate lease "
+              "budget; lower its vm_cores or supervisors (or enable vm_slot_lending)",
+              file=sys.stderr)
+        return 1
     for line in refusals:
         print(line, file=sys.stderr)
     if refusals:
@@ -4016,18 +4026,21 @@ def gate_reserve_summary(config: Path) -> dict:
             profile = tomllib.load(fh)
         host = live_host_profile(config)
         lines = gate_reserve_fit.finding_lines(gate_reserve_fit.fit(profile, host))
+        unreachable = gate_reserve_fit.unreachable_lines(
+            gate_reserve_fit.unreachable_concurrency(profile, host))
         not_applicable = gate_reserve_fit.not_applicable_lines(profile, host)
     except Exception as exc:  # noqa: BLE001 - a status line must not break status
         return {"lines": [f"gate reserve: UNKNOWN ({type(exc).__name__}: {exc})"],
                 "problem": None}
     if not_applicable and not_applicable[0].startswith("gate reserve: n/a"):
         return {"lines": not_applicable, "problem": None}
+    extra = [f"lane budget: UNREACHABLE {line.split(' ', 1)[1]}" for line in unreachable]
     if not lines:
-        return {"lines": ["gate reserve: every gate lane fits", *not_applicable],
-                "problem": None}
+        return {"lines": ["gate reserve: every gate lane fits", *extra, *not_applicable],
+                "problem": "; ".join(line.split(" ", 1)[1] for line in unreachable) or None}
     return {"lines": [f"gate reserve: OVERCOMMITTED {line.split(' ', 1)[1]}" for line in lines]
-            + not_applicable,
-            "problem": "; ".join(line.split(" ", 1)[1] for line in lines)}
+            + extra + not_applicable,
+            "problem": "; ".join(line.split(" ", 1)[1] for line in lines + unreachable)}
 
 
 def self_update_summary() -> dict:

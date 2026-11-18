@@ -309,15 +309,18 @@ ccache_write_isolation = true
 # Vellum is advisory to Pulp's required gate: vm=60, while Pulp
 # event-class leases derive 100 (PR head) / 110 (merge group).
 priority = "vm"
-# 8, not the role's 14: a non-gate lane is clamped to the 12-core non-gate
-# budget, so a 12-core Vellum lease fit only while no agent build held a single
-# non-gate core. On 2026-11-13 one 4-core governed build held the lane at
-# "cores=12 budget=12 used=4" with a Vellum job queued, until the two Pulp gate
-# VMs took both guest slots. 8 + a 4-core build fits the budget. Rollback:
-# delete this line and re-render.
-vm_cores = 8
-# Two supervisors: the lease budget (26 cores) holds a second 8-core Vellum guest
-# beside a Spectr guest while Pulp gate lanes idle; 6 merge-queue GPU proofs queued
+# 4, not 8 (and not the role's 14): a non-gate lane is held to the 12-core
+# non-gate budget (26 lease cores minus the 14-core gate reserve), and the
+# two supervisors below must fit it together. 2 x 8 = 16 > 12, so slot 2 could
+# never boot beside slot 1 (`tartci pool status`: "2 lanes of 8-core VMs but the
+# 12-core budget fits 1 at once"). 2 x 4 = 8 leaves 4 for an agent build, the
+# case the 8 was sized for on 2026-11-13. Memory: 4 cores derive 8192 MB, so
+# 2 x 8192 fits the 37810 MB non-gate budget. Vellum's GPU proof is not
+# core-bound: it took 15.9 min on this host's 8 cores and 18.6 min on m1's 3.
+# Rollback: set this back to 8 and re-render.
+vm_cores = 4
+# Two supervisors: the 12-core non-gate budget holds two 4-core Vellum guests
+# and a 4-core agent build; 6 merge-queue GPU proofs queued
 # 2-4h behind one slot on 2026-11-15. Rollback: set back to 1 and re-render.
 supervisors = 2
 min_queued_age_seconds = 0
