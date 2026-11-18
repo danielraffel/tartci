@@ -187,6 +187,26 @@ PYTHON_BIN="$(cd "$(dirname "$PYTHON_BIN")" && pwd -P)/$(basename "$PYTHON_BIN")
   echo "fleet install requires Python 3.11+ with tomllib; set TARTCI_PYTHON" >&2
   exit 127
 }
+# A Homebrew Cellar interpreter is ad-hoc signed and becomes a new macOS
+# privacy identity on every `brew upgrade`; while its consent alert waits,
+# every launchd open of the store on /Volumes blocks (m3, 2026-11-16). The
+# interpreter is not switched here: on a sealed-launcher host the launcher's
+# lanes.json is built with the interpreter self-update chose, and the two must
+# agree. The profile's host.python is the one switch both sides honour, and
+# the preflight below proves it from launchd before any lane runs it.
+if [ -z "${TARTCI_ROLLBACK_PYTHON:-}" ] && [ -z "${PROFILE_PYTHON:-}" ]; then
+  case "$PYTHON_BIN" in
+    */Cellar/*)
+      if framework_python="$(tartci_framework_python)"; then
+        echo "WARN tcc-risk: the pinned interpreter $PYTHON_BIN is a Homebrew Cellar binary whose privacy" \
+             "identity changes on every brew upgrade; add  python = \"$framework_python\"  to [host]" \
+             "in this host's fleet profile and reinstall" >&2
+      else
+        echo "WARN tcc-risk: the pinned interpreter $PYTHON_BIN is a Homebrew Cellar binary whose privacy" \
+             "identity changes on every brew upgrade; install python.org Python 3.11+ and set host.python" >&2
+      fi ;;
+  esac
+fi
 # Switching the lane interpreter: macOS grants (Full Disk Access, Removable
 # Volumes, Local Network) belong to the binary, so prove the NEW one can use the
 # VM store from launchd before any lane runs it. If it cannot, keep the
@@ -238,6 +258,7 @@ LOADED_RECEIPT="$HOME/.config/tartci/macos-fleet-loaded.json"
 SUPPORT_GENERATIONS="$HOME/.local/share/tartci-generations"
 ENTRYPOINT="$HOME/.local/bin/tartci"
 AGENT_HYGIENE_ENTRYPOINT="$HOME/.local/bin/agent-hygiene"
+LEASED_BUILD_ENTRYPOINT="$HOME/.local/bin/leased-build"
 DOMAIN="gui/$(id -u)"
 CONFIG="$("$PYTHON_BIN" - "$CONFIG" <<'PY'
 from pathlib import Path
@@ -361,6 +382,7 @@ echo "  support_manifest=$SUPPORT_MANIFEST"
 echo "  support_source=$SUPPORT_SOURCE"
 echo "  entrypoint=$ENTRYPOINT"
 echo "  agent_hygiene_entrypoint=$AGENT_HYGIENE_ENTRYPOINT"
+echo "  leased_build_entrypoint=$LEASED_BUILD_ENTRYPOINT"
 echo "  repository=$TARTCI_REPOSITORY"
 [ -z "$LAUNCH_HELPER_SOURCE" ] || echo "  launch_helper_source=$LAUNCH_HELPER_SOURCE"
 if [ -n "$plan_launcher_layout" ]; then
@@ -1237,6 +1259,42 @@ tartci_pool_lock_release
 lock_owned=0
 trap - EXIT
 rm -rf "$stage_dir" "$plan_dir"
+# leased-build, the agents' core-lease wrapper, comes from the same cohort, so
+# every host runs the same copy. It is placed after the install has committed
+# (the trap above is cleared), so a rolled-back install never leaves it pointing
+# at a generation the tartci entrypoint left; a failure here warns and the next
+# install retries. The wrapper is replaced atomically, never written through an
+# existing symlink. A differing hand-placed ~/bin/leased-build (it lived
+# untracked on m5studio) may shadow it: say so, and leave it for its owner.
+if ! "$PYTHON_BIN" - "$LEASED_BUILD_ENTRYPOINT" "$support_root/scripts/leased-build" <<'PY'
+import os, sys, tempfile
+from pathlib import Path
+target, source = map(Path, sys.argv[1:])
+parent = target.parent
+if parent.is_symlink() or not parent.is_dir() or parent.stat().st_uid != os.getuid():
+    raise SystemExit("leased-build entrypoint parent must be owned and non-symlinked")
+fd, tmp = tempfile.mkstemp(dir=parent, prefix=".leased-build.")
+try:
+    with os.fdopen(fd, "w") as handle:
+        handle.write("#!/bin/bash\nexec " + str(source) + ' "$@"\n')
+    os.chmod(tmp, 0o755)
+    os.replace(tmp, target)
+except BaseException:
+    try:
+        os.unlink(tmp)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+then
+  echo "fleet install: WARNING: could not install $LEASED_BUILD_ENTRYPOINT; the next install retries" >&2
+fi
+stale_leased_build="$HOME/bin/leased-build"
+if [ -f "$stale_leased_build" ] && ! cmp -s "$stale_leased_build" "$support_root/scripts/leased-build"; then
+  echo "fleet install: NOTICE: $stale_leased_build is a stale hand-placed copy of leased-build;" \
+    "the tracked one is $LEASED_BUILD_ENTRYPOINT. Remove it (or put ~/.local/bin first on PATH)" \
+    "so agents run the installed copy." >&2
+fi
 # Shared object stores this host lists get no automatic git maintenance: one
 # store's background repacks ran 53 at once on m3 (2026-10-16). No list, no-op.
 "$PYTHON_BIN" "$ROOT/scripts/git_maintenance_guard.py" enforce \

@@ -33,6 +33,11 @@
 set -euo pipefail
 cd "$(cd "$(dirname "$0")/.." && pwd)"
 
+# Tests commit in temp repos; a commit forks a detached `git maintenance run
+# --auto` that races the test's temp-dir cleanup. Mirrors env: in ci.yml.
+export GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=maintenance.auto GIT_CONFIG_VALUE_0=false \
+  GIT_CONFIG_KEY_1=gc.auto GIT_CONFIG_VALUE_1=0
+
 PY39="${TARTCI_PREPUSH_PY39:-/usr/bin/python3}"
 BASE="${TARTCI_PREPUSH_BASE:-origin/main}"
 total_start=$SECONDS

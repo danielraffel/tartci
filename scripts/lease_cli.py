@@ -128,6 +128,15 @@ def parse_args(
     )
     acquire_parser.add_argument("--priority", default="build")
     acquire_parser.add_argument(
+        "--build-dir", action="append", default=[],
+        help="a build directory this build writes; on an external-only host a path on "
+             "the internal data volume is reported (external_only_policy.py)",
+    )
+    acquire_parser.add_argument(
+        "--cache-dir", action="append", default=[],
+        help="a cache directory this build writes; judged like --build-dir",
+    )
+    acquire_parser.add_argument(
         "--allow-floor",
         action="store_true",
         help=(
@@ -139,11 +148,14 @@ def parse_args(
     acquire_parser.add_argument(
         "--class",
         dest="build_class",
-        choices=("interactive", "background"),
+        choices=("interactive", "background", "check"),
         help=(
             "build class: interactive (someone is waiting; normal QoS, may borrow "
-            "idle gate cores when lending is on, never floored) or background "
-            "(validations/opportunistic; capped at the background share). "
+            "idle gate cores when lending is on, never floored), background "
+            "(validations/opportunistic; capped at the background share) or check "
+            "(git/Python checks: 1 core from a small pool of their own, so never "
+            "queued behind compiles, unless --min-cores is above 1; a full pool "
+            "falls back to background). "
             "Omitted: the class-less rule every caller had before classes"
         ),
     )

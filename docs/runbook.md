@@ -425,7 +425,9 @@ finish. The watchdog never reboots or kills a process for this condition.
 `--store-health-timeout-seconds` and
 `--store-health-failure-threshold` tune the bounds for fixture testing.
 The macOS runner performs the same probe before a new job claim/clone and on
-each idle poll. An unknown or timed-out result emits `yielded_storage_health`,
+each idle poll. A healthy result emits `storage_health` only when the state
+turns healthy and then at most hourly; the heartbeat's `storage_health` field
+is the current verdict. An unknown or timed-out result emits `yielded_storage_health`,
 sets `storage_health=unknown` in the heartbeat, and makes `gate_supply` report
 the lane as blocked/unknown; active guests continue to finish.
 
@@ -470,15 +472,24 @@ times in a row (default 2), `scripts/tcc_wedge.py` classifies the hang from
 independent readings: the same bounded probe on an internal control path (the
 state directory) must answer; a bounded `log show` over the whole failing
 streak (10 min to 3 h) must contain a sandboxd/tccd Removable Volumes
-authorization failure (lines written after the last heal are ignored, so the
-burst a release writes cannot justify the next heal); and, when
+authorization failure (lines written after a heal inside that window are
+ignored, so the burst a release writes cannot justify the next heal; a heal
+before the minutes the scan reads cuts nothing); and, when
 `TARTCI_TCC_CONTEXT_PROBE` names a command that probes the store from a context
 with TCC access (for example over `ssh localhost`, whose sshd holds Full Disk
 Access), that command must exit 0. Set it per host as `[launchd_watchdog]
 tcc_context_probe` in the fleet profile (launchd/README.md), which the
 support-agents step renders into the watchdog plist; never edit the plist by
 hand. Only every configured reading agreeing
-yields `tcc_attribution_wedge` (`path: error_signature`).
+yields `tcc_attribution_wedge` (`path: error_signature`). The one exception is a
+saturated tccd (m3, 2026-11-17: tccd at 90% CPU, a storm of refusals): the
+context probe waits on the same tccd and times out too, while `df -P` of the
+volume root (statfs, which needs no privacy decision) answers. With the
+refusal lines present that is `path: error_signature_saturated`, still
+`tcc_attribution_wedge`; a volume that does not answer `df` either, or a
+context probe that failed fast instead of timing out, keeps the "the volume,
+not tccd, is stalled" veto. `df` answering proves the volume is mounted, not
+that its I/O is healthy, so this path leans on the refusal lines.
 
 A wedge can also log nothing at all (m3, 2026-11-13: no refusal line for
 hours). For that shape the classifier takes positive readings instead of error
@@ -561,6 +572,22 @@ all is `unavailable`, never "no alert". Then:
   Allow`, opened when the alert is up and either a store open waits on it or
   the alert followed a Shipyard install, and closed when the alert is gone
   (`TARTCI_TCC_PROMPT_ISSUE=0` keeps the WARN line and opens no issue);
+- only the owner can click Allow, so the same pass, after the fallback heal
+  (and not on the pass a heal ran and dropped the alert), also tells him once
+  per alert episode on the fleet Discord channel ("Click
+  Allow on <host>", with the issue link, or the issue title if the issue is
+  not open yet), through the webhook file fleet-health and fleet-liveness use
+  (`~/.config/pulp/secrets/fleet/discord-machine-room.webhook`). The host is
+  the only sender. The send is recorded in
+  `~/.tartci/state/tcc-prompt-notify.json` only once it succeeds, so a failed
+  post is retried on the next pass; a post that reached Discord but timed out
+  is sent again (at least once, not exactly once). The WARN line says
+  `owner told`, or `owner NOT told: <why>` until a send succeeds. Nothing on
+  this path touches /Volumes (the store volume a prompt wedge hangs): the
+  webhook file, the receipt, the watchdog's program, generation and log all
+  live under the home directory. `TARTCI_OWNER_NOTIFY=0`
+  turns it off. On 2026-11-18 the issue alone (tartci #960) waited about 4 h
+  for a click;
 - the consent-alert pass owns the fallback heal: once a store open has waited
   on the alert for `PROMPT_HEAL_AFTER_S` (15 min) it runs the same scoped heal
   once per alert episode, sharing the store-health heal record as one budget
@@ -603,6 +630,46 @@ With the wrapper absent the watchdog still classifies, records
 the install step; `TARTCI_TCC_HEAL=0` in the watchdog's environment keeps it
 classify-only. Operator reads: `python3 scripts/tcc_wedge.py --state`,
 `python3 scripts/tcc_wedge.py --scan-log --last-minutes 60`.
+
+**Jobs a wedge leaves blocked are paged; prompt-prone agents are reported.**
+Restarting tccd and sandboxd does not release a job already held in `open()`
+on the store: on m3 (2026-11-16) com.pulp.fleet.prewall and three fleet-pass
+`must-review.py` children stayed blocked for hours after the alert went away,
+and a periodic job whose run never ends never starts again.
+
+- *Stuck jobs* (`scripts/tcc_stuck_jobs.py`, every watchdog pass right after
+  store health, report only). While store health names a wedge
+  (`tcc_attribution_wedge`, `tcc_prompt_pending`, or a store probe that timed
+  out past the failure threshold), it finds this user's loaded launchd jobs
+  running longer than max(3 x StartInterval, 30 min) whose process tree has an
+  argument or cwd under /Volumes (one `ps` read, one `lsof -b -w -d cwd`;
+  /Volumes itself is never stat'ed). Each is logged as
+  `WARN tcc-wedge stuck <label>: ...`; the episode raises one page (issue
+  class `tcc_wedge_stuck_jobs`, closed when the store recovers) naming the
+  labels, the pids and the one line that clears them
+  (`launchctl kickstart -k gui/<uid>/<label>; kill -KILL <pids>`). It never
+  restarts or signals anything, since a fleet-pass run can be legitimately busy;
+  runner lanes, `actions.runner.*`, the watchdog itself and KeepAlive
+  services without a StartInterval are never reported.
+  `python3 scripts/tcc_stuck_jobs.py` prints the current reading.
+- *Lint* (`scripts/tcc_risk_lint.py`, at most every 15 min, report only). A
+  loaded LaunchAgent whose program, or the interpreter it resolves to, is under
+  a Homebrew Cellar or is ad-hoc or unsigned, or whose script argument or
+  WorkingDirectory is under /Volumes, and that does not run through
+  TartCILauncher.app or ShipyardLauncher.app, is logged as
+  `WARN tcc-risk <label>: <reason>`; each newly flagged label is a `tcc_risk`
+  event, and the host carries one `tcc_risk` issue while anything is flagged.
+  It never unloads anything. `python3 scripts/tcc_risk_lint.py` prints the same
+  findings now. The lint judges the program launchd starts: a `/bin/bash` agent
+  passes even if the script then execs a Cellar python (most tartci agents run
+  the `python.pin` interpreter that way).
+- *Host attestation* runs the python.org framework binary at its versioned path
+  (`/Library/Frameworks/Python.framework/Versions/3.x/bin/python3.x`, Developer
+  ID signed) instead of `/opt/homebrew/bin/python3`.
+  `scripts/install_host_attestation.sh --print-python` shows the choice
+  (`TARTCI_ATTESTATION_PYTHON` overrides it); with no framework python it falls
+  back to Homebrew with a `WARN tcc-risk` line. The watchdog re-renders a loaded
+  attestation plist that runs any other interpreter, once.
 
 **Wire Shipyard's GitHub auth to the App token (do NOT skip).** After installing
 Shipyard on a host, its GitHub auth must point at the GitHub-App **installation**
@@ -946,7 +1013,11 @@ September 2026 torn manifests made every gate build link the wrong objects for
 - when, and only when, the job's verdict is green (clean listener exit, no
   lifecycle quarantine, and the host's own GitHub observation: a `terminal`
   receipt with conclusion `success`, bound to this run and job, for a trusted
-  ref: a push to `main` or a merge-group run). The guest-written runner log is
+  ref: a push to `main` or a merge-group run). A job that completed while later
+  jobs of its run were still going is observed as `terminal_pending_run` and
+  carries the `listener_exited_workflow_active` lifecycle quarantine; that
+  pairing is accepted when the receipt says the job completed with `success`
+  and is bound to both the run and the job. The guest-written runner log is
   attacker-controlled output; it can turn a verdict red but never green, and
   no receipt means red. A pull-request job's results are never promoted. The host
   pulls the guest's entries over ssh as a tar stream while the VM is still up
@@ -2572,6 +2643,24 @@ alert, so its peers raise it.
   and `events.jsonl` (`peer_launchd_stalled`, once per episode).
   `TARTCI_PEER_STALL_ISSUE=0` keeps the event and the WARN line and opens no
   issue.
+- **Shipyard drift.** The same read prints the peer's
+  `~/.tartci/state/tool-freshness/state.json`. A peer more than one Shipyard
+  release (`TARTCI_SHIPYARD_DRIFT_RELEASES`, 1) or more than 3 h
+  (`TARTCI_SHIPYARD_DRIFT_HOURS`, 3, counted on the peer's clock from the
+  pass at which the peer first saw the first release newer than what it runs
+  published, `behind_published_since`; a peer on an older TartCI reports only
+  the tag time, `behind_since`) behind the latest release opens
+  `[tartci] <peer> Shipyard behind the latest release since <that time>`. A
+  Shipyard tag sits in draft until its macOS assets are uploaded, and that
+  window is not rollout time. So
+  does a peer whose freshness was last measured more than 3 h ago, since a
+  host whose watchdog stopped cannot report itself. The body quotes the
+  peer's own apply line (`waiting for steward host studio: ...`), so it names
+  the gate that holds it. It closes when a fresh reading says `current`, and
+  a peer with no measurement decides nothing. The primary-reader rule above
+  applies, and the episode is `<peer>.shipyard-drift.json`. This exists because
+  m1 and m5s sat on 0.439.2 for 12 h behind 0.440.0 on 2026-11-17 while
+  every per-host view called them only "behind".
 - **Host-vitals timer stall.** The same peer tick reads
   `~/.local/state/pulp/host_vitals.json` using the peer's clock. A sample older
   than `TARTCI_HOST_VITALS_ALERT_SECS` (default 300 seconds) opens one issue
@@ -2579,7 +2668,15 @@ alert, so its peers raise it.
   is `ssh <peer> 'tartci launchd heal'`. A fresh sample closes the episode.
   This check is deliberately peer-driven because a watchdog cannot report its
   own StartInterval stall. Its receipt is recorded beside the existing peer
-  alert state as `<peer>.host-vitals.json`.
+  alert state as `<peer>.host-vitals.json`. The issue links any open
+  privacy-prompt or store-stall issue for the same host, and gets a comment
+  when that set changes later (`<peer>.host-vitals-links.json`; a failed issue
+  read changes nothing); with a privacy prompt open it names that as the
+  likely cause. Readers never message the owner: the stalled host's own
+  prompt pass is the one sender, so a wedge is announced once. A reader can
+  only see a prompt issue the host opened, in the same pass that sends the
+  message; the one gap is a host whose first post failed and that then stopped
+  running its watchdog before a retry.
 
 ### System resolver dead while TCP is alive (`resolver_dead`)
 
@@ -2723,6 +2820,15 @@ unknown defers the heal with `heal-deferred: mid-job (<evidence>)`; there is no
 override, because nobody is there to accept killing the job. A stale-boot heal
 skips the probe (its verdict already proves no run or job identity) but still
 reads the event log.
+
+A lane's `events.jsonl` is bounded: once it reaches 16 MiB the supervisor
+renames it to `events.jsonl.1` (replacing the previous one) at the top of its
+loop with no VM, never mid-job, so the open `job_assigned` above is always in
+the current file. `tartci pool status --usage`, `pre_mint_outcomes`, the
+serving-truth alarm and the DHCP breaker's boot times read `events.jsonl.1`
+first. Tail readers (lease-fit transitions over 24 h, the watchdog) read only
+the current file, so for the first hours after a rename their window is
+shorter. A `grep` by hand should include `events.jsonl.1`.
 
 ### Runners the janitor must never delete (`keep_not_minted_here`)
 
@@ -2940,6 +3046,19 @@ fleet`), and check GitHub's job history against it with
   order, earliest first, ties to the lower host id: every host computes the
   same order from the same tickets, whenever its survey runs. An off peer and
   a ticket not refreshed within the TTL hold no place.
+- **A finished turn starts the next one.** After a self-update succeeds and
+  its update marker is gone, the host runs a plain `launchctl kickstart` of
+  `com.danielraffel.tartci.self-update` on each peer over SSH, only when that
+  peer has a queue ticket file (`waiting.json` or `waiting-aside.json`). The
+  next host attempts within its stagger (up to 10 min) instead of at its next
+  30 min tick. Plain `kickstart` does nothing to a job already running; `-k`
+  is never used. A kick is best effort, recorded as the receipt's
+  `handoff-kick` step, and never sent after a failed, rolled-back, refused or
+  deferred run, so a failed canary does not speed up the rest of the fleet.
+  A kick is a demand start, which launchd still honours during a timer
+  stall, so a scheduled self-update now refuses by itself while the interval
+  guard holds it for a stall (`self-update PAUSED by the launchd timer
+  stall`). A run started by hand without `--scheduled` is not held.
 - **A host the capacity floor refuses steps aside.** The floor is read
   before a host defers. When it refuses (the host is the last server of a
   required label and no peer can mint it on demand), the host cannot take a
@@ -2948,6 +3067,22 @@ fleet`), and check GitHub's job history against it with
   the first attempt the floor admits publishes the kept `since` again. On
   2026-11-04 m5studio, the only host whose fleet was ready while m1, m3 and
   m5 reported `disk_pressure`, kept its ticket and every peer yielded to it.
+- **A host that cannot read a peer steps aside.** When any blocking peer is
+  unreadable to this host (SSH transport or authentication failure, or no
+  parseable pool status), the host is refused as before but withdraws
+  `waiting.json` and keeps its place in `waiting-aside.json`, the same way a
+  floor refusal does. A host that cannot read the whole fleet cannot take a
+  turn, so it must not hold one. Each peer still refuses on its own reads, so
+  this never lets two hosts go out at once. The starvation bound runs on the
+  kept place as on a published ticket, also when the capacity floor refuses
+  the same host: the event, the issue and exit 3, and `pool status` says
+  `STARVED, stepped aside`. A peer already excluded as dark does not count as
+  unread. When a peer is dark to every host, every host steps aside and no
+  ticket is published, so the first host to run after the exclusion goes,
+  whatever its place. That costs one turn per episode: the others defer on
+  its update marker, publish their kept places, and take turns in order. On 2026-11-18 only m1's route to
+  m5studio was dark; m1 held the oldest ticket for 3.5 h while m5 and m3,
+  which read every peer, yielded to it at every attempt and no host updated.
 - **A host drains only while its gate queue is light.** Once the peers and
   the capacity floor would let a host take its turn, it reads the queued
   self-hosted gate jobs it serves fleet-wide (the same `gate-queue.json` read
@@ -2958,8 +3093,13 @@ fleet`), and check GitHub's job history against it with
   and the receipt's `queue-light` step names the count. A host that serves no
   published gate registration is always light. After
   `queue_heavy_max_defer_seconds` (default 3 h, below both starvation bounds)
-  in the update queue the host drains anyway, so a fleet that is never idle
-  cannot hold a host on old code. Both are top-level keys in
+  in the update queue, or that long behind main (the oldest undeployed commit's
+  age past the soak, counted from no earlier than the host's last turn), the
+  host drains anyway, so a fleet that is never idle cannot hold a host on old
+  code. The behind-main clock matters because a pre-drain host fault such as a
+  slow store volume releases the queue place. It counts any reason for being
+  behind (a red main, a pause, a backoff), so after a long hold hosts take
+  their turns, one at a time, without waiting for a light queue. Both are top-level keys in
   `~/.config/tartci/self-update.toml`. From 2026-11-10 m3 drained ten times for
   self-updates and once sat idle 25 minutes while gate jobs waited.
   `pool status` reports the host as `stepped aside, holding no update turn`.
@@ -2992,7 +3132,14 @@ fleet`), and check GitHub's job history against it with
   reports after 4 h when gate jobs this host serves are queued (one hour past
   the 3 h exclusion, so one dark peer cannot raise issues on every other host
   before the queue heals), and after 6 h otherwise or when the demand read
-  fails. Demand is a queued self-hosted *job* whose labels a registration of
+  fails. Those bounds only cover a host deferred to a peer. Separately, every
+  scheduled apply that finds the host more than 4 h behind main (its oldest
+  undeployed commit's age past the soak) logs `self-update: STARVED: ... behind
+  main` whatever held it (a step-aside, a host fault, the rate limit, a pause),
+  writes `self_update_behind` once per episode and opens one issue, at most
+  one per host per 6 h (`behind-alert.json`, `behind-alert-last.json`; the last measured age is kept in `behind-skew.json` for attempts that stop before measuring). The
+  issue closes once the host is back inside 4 h. Demand is a queued
+  self-hosted *job* whose labels a registration of
   this host serves, for a workflow it names, at most 12 h old
   (`scripts/gate_job_demand.py`); runs carry no labels, so a run-level read
   would count hosted-only runs and the 2026-08-19 zombie merge group. The
@@ -3165,7 +3312,8 @@ fleet`), and check GitHub's job history against it with
   with an exit code; only a slow volume reaches the deadline, and the error
   says so.
 - **Periodic agent** (`launchd/com.danielraffel.tartci.self-update.plist.template`,
-  every 30 min, `--apply --scheduled` with a per-host stagger, ExitTimeOut 120)
+  every 30 min, `--apply --scheduled` with a per-host stagger of at most 2 min,
+  ExitTimeOut 120)
   is not installed by default: `scripts/install_self_update_agent.sh` prints
   the plan and the resolved peers, and `--install` loads it.
 
@@ -3222,7 +3370,14 @@ arrive, and a host that did not get it is loud:
   prints fseventsd from the host-vitals sensor's published reading
   (`~/.local/state/pulp/host_vitals.json`), warning above 1024 MB; the remedy is
   `sudo killall fseventsd`, which nothing here runs.
-- **When it refreshes.** Every watchdog pass, at most every 30 minutes;
+- **When it refreshes.** Every watchdog pass, at most every 30 minutes, and
+  on every 5-minute watchdog pass (an interval of 240 s, under the pass
+  interval, so no pass is skipped) while a release is in motion on the host:
+  a tool `waiting` for its apply age, the canary, a steward host or a steward
+  verdict, a release not ready yet, or a steward verdict pending in
+  `steward.json`. Each host then acts on its gate within one 5-minute pass
+  instead of up to 30 minutes per hop. A hold, a
+  spent attempt or a rejected release keeps the 30-minute interval;
   `tartci fleet-macos tool-freshness --refresh` measures now.
 - **Cached lines carry an age limit.** Every status line read from a cached
   measurement is flagged once it is older than three of its refresher's
@@ -3279,14 +3434,23 @@ arrive, and a host that did not get it is loud:
 
 - **One host goes first (canary gate).** Both automatic applies follow the
   rollout roles in `fleet/tool-rollout.json`, published into
-  `fleet/advertised-labels.json` as `tool_rollout` (`canary`, default `m5`, the
-  least loaded build host; `steward_hosts`, the hosts that run the merge
+  `fleet/advertised-labels.json` as `tool_rollout` (`canary`, `m5studio`: always on,
+  and the Mac whose release script can install a Shipyard release at
+  publication (its fleet stage covers only its own host class); the m5 laptop
+  was the canary until 2026-11-18, and every host waited while it slept; `steward_hosts`, the hosts that run the merge
   steward, `studio`). Every host reads the same committed copy, so no two can
   name different canaries; the generator refuses a role that is not a
   published host and an empty `steward_hosts` (which would drop the steward
   stage fleet-wide), and `tool-freshness.toml` cannot set either. A missing or
   unreadable role list fails closed: no host applies. To move the canary,
   edit `fleet/tool-rollout.json`, regenerate the published file and merge.
+  List the old canary in `former_canaries` there until every host runs a
+  TartCI generation that names the new one: a former canary still applies
+  first, so a host on the older generation, which waits for it, is never left
+  waiting on a host that in turn waits for it. Readers wait only for
+  `canary`. A former canary does not wait for the new one, so while it is
+  listed, pausing the rollout means holding both. Remove the entry once `tartci fleet-macos self-update --plan`
+  reports every host current.
   The canary applies a release at 30 minutes, as above. Every other host
   applies it only once the canary's `events.jsonl` shows a `tool_deployed` for
   the tool's CLI with `to` equal to the release and `verify` current or behind,
@@ -3295,16 +3459,32 @@ arrive, and a host that did not get it is loud:
   away from it), and a health signal: when the canary runs the merge steward
   (its deploy event carries `steward_host: true`), a `tool_steward_verified`
   for the release recorded after that deploy; otherwise `canary_soak_hours`
-  (2) on the canary's clock since the deploy. A deploy first recorded with
+  on the canary's clock since the deploy: 0.5 for Shipyard, whose steward
+  stage below is the real health check, and 2 for pulp. A deploy first recorded with
   another `verify` (the re-read right after the swap failed) is re-recorded
   (`rerecorded: true`) on the canary's next pass that measures it, so one
   failed read does not strand the fleet.
   For Shipyard there is a second stage: a host that is neither the canary nor
   a steward host also waits for every steward host to have deployed the
   release and recorded `tool_steward_verified` for it, whatever its deploy
-  event says. With the defaults the order is m5, then m3 (after m5's 2 h),
-  then m1 and m5s (after m3's clean tick), so a release that breaks the
-  steward stops on m3. pulp does not wait for the steward hosts.
+  event says. With the defaults the order is m5s, then m3 (30 minutes after
+  m5s's deploy), then m1 (after m3's clean tick), so a release that breaks the
+  steward stops on m3. m5 follows m3 like m1 once it is no longer listed in
+  `former_canaries`; while it is listed it applies first with m5s, and a
+  former canary's deploy also clears the canary step for the hosts behind it
+  (a new canary still on the older TartCI waits for m5 and for m3, so m3 must
+  not wait for the new canary alone). Every host is on a Shipyard release
+  within about 1 h 45 min of publication: the canary sees it on its next pass
+  (up to 30 minutes, or at publication when the release script installed it
+  there), soaks 30 minutes, m3 applies on its next 5-minute pass, the next
+  complete steward tick judges it (10 to 15 minutes with the pass that reads
+  it), and m1 then applies on its next pass. The drift alert below fires at
+  3 h, counted from publication.
+  To pause the whole rollout, hold the canary (`[tools.shipyard] auto_apply =
+  false` in m5s's `tool-freshness.toml`, and in m5's while m5 is listed in
+  `former_canaries`): every host waits behind it. A bad
+  release that reached m3 is rolled back there automatically; to roll back a
+  host by hand, run its `shipyard runner fleet-update --to <previous release>`. pulp does not wait for the steward hosts.
   Of the soaked releases a host applies the newest one every host it waits
   for cleared. Those hosts are read over fleet ssh (`ssh -n -o BatchMode=yes
   <target> tail events.jsonl`, once per pass each); the target is the host's
@@ -3312,7 +3492,7 @@ arrive, and a host that did not get it is loud:
   fails closed: an unreadable host or an unsafe target waits, and a host that
   cannot name itself (no fleet profile `host.id` and no `host_class`) waits
   without reading anyone, since it cannot tell whether it is the canary or a
-  steward host. None of them applies. The wait reads `waiting for canary m5: ...` (or `steward host
+  steward host. None of them applies. The wait reads `waiting for canary m5studio: ...` (or `steward host
   studio`) on the tool's line, is appended to the stale problem once the tool
   goes STALE, and every waiting pass writes exactly one line to
   `~/.tartci/state/tool-freshness/canary-gate.log`. There is no urgent-release
@@ -3321,7 +3501,7 @@ arrive, and a host that did not get it is loud:
   host that is held, retired or down stalls the automatic applies behind it,
   and says so on every host.
 
-      # tool-freshness.toml
+      # tool-freshness.toml (overrides every tool's own soak on this host)
       # canary_soak_hours = 2
 
 - **The steward judges each Shipyard swap where it runs.** On a published
@@ -3348,8 +3528,21 @@ arrive, and a host that did not get it is loud:
   repositories may have run the new binary under the old `ver=`. The steward
   ticks every 5 minutes, so the check lands within one or two watchdog
   intervals of the swap.
-  - The first judging tick with every `invariants=` token ok and no `ERROR`
-    line writes `tool_steward_verified`.
+  - The first judging tick with no `ERROR` line whose every `invariants=`
+    token is ok, or a `FAIL` the baseline tick already had in the same
+    repository, writes `tool_steward_verified`. A repository added to the
+    fleet with a standing failure therefore no longer holds every release on
+    the steward host and the hosts behind it: on 2026-11-16 skia-builder and
+    v8-builder joined with `required_never_ran` and m3 sat on 0.439.3, with
+    m1 and m5s on 0.439.2, for nine hours. The comparison is per repository,
+    so a standing failure in one repository does not excuse the same
+    invariant newly failing in another. The baseline (the last tick finished
+    before the swap, and whether the tick in flight could not run the steward)
+    is stored with the deploy in `steward.json` at the swap. summary.log is
+    read from a 512 KiB tail, and a verdict judged after the pre-swap ticks
+    scrolled out would otherwise blame a standing failure on the release and
+    roll it back. A record without one (written by an older checkout) still
+    reads the baseline from the log.
   - The first one with a failing invariant the baseline did not have, or the
     second in a row in which the steward could not run at all (every
     repository wrote `ERROR` or a skip; one such tick is often a timeout or a
@@ -3376,11 +3569,13 @@ arrive, and a host that did not get it is loud:
     tick where only some repositories wrote `ERROR` are inconclusive: they
     neither verify nor fail, and the next complete tick decides.
   - A failure on a version installed by hand is recorded as
-    `tool_steward_failed` and not rolled back. No judging tick after an hour
-    is a problem (`is the steward tick running?`), never a rollback. An
-    invariant already failing before the swap neither rolls back nor
-    verifies; it keeps the hosts behind the steward host waiting until a
-    clean tick.
+    `tool_steward_failed` and not rolled back. No conclusive tick after an
+    hour is a problem, never a rollback: `is the steward tick running?` when
+    no complete tick ran the release, `N complete steward ticks ... none
+    conclusive` when ticks ran it but an `ERROR` token, a repository `ERROR`
+    line, or an invariant newly failing in another repository kept each one
+    from deciding. An invariant already failing before the swap never rolls
+    back.
   - While a deploy waits for its verdict, a newer release waits too, so the
     verdict and its rollback target are never overwritten. A steward host
     that rolled back onto a release it had verified earlier still clears that
@@ -3454,6 +3649,73 @@ arrive, and a host that did not get it is loud:
    only to override a target.
 3. On the new machine: install, then `tartci fleet-macos self-update --peers`
    to see every peer it will check and the target it resolves to.
+
+### Runner agent age in the goldens (`tartci doctor runner-age`)
+
+Every job VM is cloned from a golden that carries the GitHub Actions runner
+agent at `~/actions-runner`. GitHub retires old runner versions; a retired
+agent registers, prints `Runner version vX is deprecated and cannot receive
+messages` and exits, so every clone of a golden that carries it fails the same
+way. A Linux pool stopped for 13 days this way with nothing alerting.
+
+- **What it reports.** Per golden on this host (`pulp-build-runner`,
+  `pulp-linux-build`), the runner its VMs run and a verdict. `fail`: a runner
+  log shows GitHub refusing that version (`Runner version vX is deprecated and
+  cannot receive messages`). The watchdog pass remembers a refusal in
+  `~/.tartci/state/golden-runner/<golden>.refused.json`, so the alert stays
+  after the log ages out or the lane stops trying, and clears only when the
+  version changes. `warn`: the version
+  trails the latest `actions/runner` release by two minor versions or more.
+  `ok` otherwise. `unknown`: the version has no record, the latest release
+  could not be read, or the local Tart images could not be listed (then nothing
+  is judged, because the host may not hold the golden).
+- **One rule.** The lag verdict comes from `scripts/runner_version.py`, the rule
+  the macOS pin check already uses, so the two cannot disagree about how far
+  behind is too far. Refusals are read from every lane's recent runner logs,
+  including the fleet lanes' directories under `state/macos-fleet/`. There is no
+  date arithmetic: GitHub's actual retirement dates do not follow a fixed
+  number of days after a release, and the refusal line is the direct signal.
+- **Where the version comes from.** Nothing boots a golden to read it.
+  For `pulp-build-runner` it is the supervisor's pin
+  (`providers/tart-macos/runner.sh --print-runner-version`), because the macOS
+  lane installs that pin into every VM and the golden's own copy never runs.
+  For a Linux golden it is a record in
+  `~/.tartci/state/golden-runner/<golden>.json`. `providers/tart-linux/provision.sh`
+  writes one when the golden it provisions already carries a runner; it does
+  not install or update the runner.
+- **Where it shows.** `tartci doctor runner-age [--json]` (exit 1 on `fail`), a
+  section in bare `tartci doctor`, and the tool-freshness refresh the launchd
+  watchdog runs.
+- **What alerts.** Only `fail`, a live refusal. It joins the tool-freshness
+  problem, which reaches `tartci doctor fleet` as `tool_freshness_stale` and the
+  watchdog WARN. `warn` and `unknown` are doctor output and never a problem: a
+  lag warning would fire on every host whenever upstream ships two releases,
+  its text would change with each release, and it depends on a release lookup
+  that can be stale. The problem text names only the refused version.
+- **Setting** in `~/.config/tartci/tool-freshness.toml`:
+
+      [runner_age]
+      goldens = ["pulp-build-runner", "pulp-linux-build"]
+
+- **Runtime symptom.** The macOS supervisor backs off and records
+  `runner_version_deprecated` when a listener says it is retired. The Linux
+  supervisor also logs a named `runner_version_deprecated:` line for the same
+  output, whatever the runner's exit status.
+- **Remedy, macOS.** Bump `DEFAULT_RUNNER_VERSION` and its checksum in
+  `providers/tart-macos/runner.sh`.
+- **Remedy, Linux.** Boot the golden, replace `~/actions-runner` with the
+  current `actions-runner-linux-arm64` release (keep `.env` and `.path`), shut
+  it down, then record what it now carries:
+
+      python3 scripts/runner_age.py record --golden pulp-linux-build --version <version> --source operator
+      tartci fleet-macos tool-freshness --refresh
+
+  `~/actions-runner/bin/Runner.Listener --version` inside the golden prints the
+  version. The record is per host, so repeat it on every host that holds the
+  golden, including after a golden sync. Recording a version other than the
+  refused one clears the `fail`, unless a log written after the record still
+  shows a refusal; the refresh makes the watchdog's stored result catch up at
+  once.
 
 ### Keep agents off raw `launchctl` (`tartci launchd guard`)
 
@@ -3590,6 +3852,17 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   role QoS and the agent floor. A lease without `--class` follows the exact
   pre-class rule. `host-profile` exports `TARTCI_GOVERNOR_SCHEMA=1` so a caller
   can tell the store accepts `--class`.
+- **Check class** — `leases acquire --class check` is for git and Python checks
+  (fast gates, provenance verify, observatory reconcile), which used to queue
+  behind compiles for 1 to 2.5 h on a busy m5studio. Whatever `--cores` asks,
+  it is granted 1 core from a pool of its own (2 cores per host) whenever that
+  pool has room, however many compiles hold or wait for cores. Like a floor
+  lease its core is charged to no other admission and it runs at
+  `agent_floor_qos` (the result says `"floor": true`); it never counts against
+  the build floor pool, so compiles cannot fill it. Its memory is charged, at
+  grant and to every later admission. A full pool falls back to an ordinary
+  background lease, and so does a request with `--min-cores` above 1, since a
+  1-core grant would break that promise.
 - **Dynamic gate lending (opt-in per host, default off)** — with
   `dynamic_lending = true`, an interactive lease may grow non-gate use past the
   guaranteed budget N = T - S, up to `max(N, T - G - P)` where G is the cores
@@ -3677,6 +3950,30 @@ memory-bound/OOM — before this existed). Three pieces tie together:
   300) in a row. Intents live in `slot-intents.json` beside `leases.json`
   (`scripts/slot_priority.py status`). Full rules and limits:
   `docs/assignment-v2-rollout.md`, "Slot priority".
+- **Short job first (per lane; needs slot priority)**: `[[lane]] short_jobs =
+  [{ workflow = "...", job = "..." }]` names a lane's short jobs (today only
+  Vellum's `sterile-consumer`, about 1.5 min); the lane's queue scan counts
+  them per event class in its slot-demand detail file, with no extra GitHub
+  call. With `short_job_first = "on"` a lane whose scan saw one queued ranks
+  ahead of the other lanes of its own effective class for the next free slot;
+  the class order (release, merge group, other, pull request) is unchanged.
+  Starvation bound: a waiting lane is passed over at most `[leases]
+  short_job_first_max_passes` times (default 1), and not at all once it was
+  first passed `short_job_first_max_pass_secs` ago (default 600); after that
+  its class ranks by age alone until that lane stops waiting.
+  `TARTCI_SLOT_PRIORITY_MAX_DEFER_SECS` (300) still caps any one defer streak.
+  The switch defaults to `"shadow"` for a lane that names short jobs: order is
+  unchanged and the short lane logs `short_job_first_shadow`
+  ("would-boot-short-first") when the rule would have given it a slot; `on`
+  logs `short_job_first_granted`. Both name the short job's id and run id.
+  GitHub, not tartci, picks which matching job the booted runner takes, so a
+  boost can serve a long job that shares the short job's label: the lane's
+  next boot after either event logs `short_job_first_outcome` with the job the
+  VM ran and `served_short=yes|no|no_job|unknown`. Keep the vellum-gate lanes
+  in shadow until sterile-consumer runs on a runner label of its own that
+  only boosted runners carry; until then `on` can hand a long GPU job the slot.
+  Rollback: set `short_job_first = "off"` (or delete the line to return to
+  shadow), re-render, restart the lanes at an idle boundary.
 - **Fair share between repositories (opt-in, default off)**: `[leases]
   fair_share_after_secs = N` (300-14400). A VM lane with work it could not
   place for N seconds is admitted at gate priority while another repository
@@ -4087,8 +4384,11 @@ read, nothing is deleted. While a self-update marker
 for that pass, since an install may be staging one. Generations are installed
 read-only; `--apply` makes a doomed one writable before removing it.
 
-No agent runs this yet. Run the plan on a host, read it, then `--apply`.
-Scheduling it (for example from the reclaim agent) is a separate decision.
+The hourly reclaim agent runs it at these defaults on every pass: it plans on
+a dry run and deletes under `--fix`, and the result is the receipt's
+`state_retention` section. It deletes nothing when `TARTCI_HOME` names a
+tree other than `~/.tartci`, and `TARTCI_RECLAIM_RETENTION=0` turns it off
+for a pass. `tartci retention` still runs it by hand with other bounds.
 
 ## Fleet scheduling boundary
 
@@ -5061,3 +5361,109 @@ high floor share or a p90 that climbs while capacity sits full means the caps
 are too tight for the demand; a p90 near zero with idle capacity means agents
 get cores at once. The journal keeps one previous generation (about 8 MB), so
 `--since` beyond a few days may be truncated on a busy host.
+
+## Keeping builds and caches on the external volume
+
+m3 and m5studio keep build trees, ccache, dependency sources and tool caches on
+an external APFS volume (each host's own `/Volumes/<name>`); only m1 and m5
+use the internal disk. m5studio's internal Data volume reached 98% on
+2026-11-17 with `~/Library/Containers` at 159 GB, `~/.codex` 22 GB, `~/.pulp`
+21 GB and `~/.android` 16 GB, and tripped `fleet_ready`.
+
+**Policy.** When enabled, a host's fleet profile sets `[host] external_root` (the host's own
+`/Volumes/<name>`; it must contain `tart_home`). `[host] external_only_mode` is `report` only: `tartci leases acquire` for a host
+build warns on stderr, admits, and journals an `external_only_policy` /
+`would_refuse` row in the lease store's `events.jsonl`. The policy runs once per acquire,
+never fails an acquire (any error admits with a warning), and reports any path
+that resolves, after symlinks, to the internal data volume, naming the path and
+the fix. The refusing code path (exit 78, reason `external_only_internal_path`,
+never retried by `--wait-secs`) exists but is disabled; when enabled it also
+refuses (reason `external_only_device_unreadable`) if any judged path cannot be read,
+because an unreadable path cannot be proven external. No shipped host profile
+sets `external_root` yet: opting a host in is a separate data change. Judged:
+`--build-dir` and `--cache-dir` (repeatable), `TARTCI_BUILD_DIR` (with no build
+dir declared, the working directory stands in), `CCACHE_DIR` or the `cache_dir`
+of the file `CCACHE_CONFIGPATH` names or of ccache.conf (or ccache's default
+dir once it exists), `CPM_SOURCE_CACHE`, `FETCHCONTENT_BASE_DIR`,
+`PIP_CACHE_DIR`, `UV_CACHE_DIR` (pip's and uv's default dirs are judged once
+they exist and the variable is unset). A
+path under an unmounted external volume is reported too, so a build cannot write
+a copy of the cache to the boot disk. VM leases are not judged here (the disk
+axis judges their store). Callers that know their build dir pass `--build-dir`.
+
+Read-only audit on any host, and the defaults for unset caches:
+
+    python3 scripts/external_only_policy.py check
+    python3 scripts/external_only_policy.py exports   # export lines under <root>/caches/
+
+**Refuse-mode checklist (follow-up; refuse is not reachable from config).**
+Gate leases need no exemption but their callers must pass `--build-dir` (the
+working-directory stand-in would otherwise refuse them); a free-form `--kind`
+ending in `-vm` currently skips the check; judging should compare against
+`external_root` and fail closed when the internal device cannot be read; callers
+must treat exit 78 as terminal and surface stderr; and `cache_root` (below) must
+be moved. Decide the flip from the `would_refuse` journal rows.
+
+**Known gap.** m5studio's profile `cache_root` (`~/.cache/pulp-ci`, mounted into
+every lane VM) is still internal, as it is not judged by the lease check; m3's is
+already on its external volume. Moving it cold-starts the gate ccache and needs
+a lane restart at an idle boundary, so it is an owner decision, not part of this
+change.
+
+**One-time migration (owner runs it; nothing here deletes data).** Stop the
+writers first (no build, no `pulp dev`, no lane mid-job on the paths moved).
+Set `X` to the host's external volume.
+Each step copies, verifies, renames the old directory aside and symlinks; the
+`*.pre-external` directories are what you delete later to actually free space.
+
+    X=/Volumes/Example   # the host's external volume
+    # An unmounted X would be created on the internal disk and the caches copied onto it.
+    mount | grep -q " on $X (" || { echo "$X is not a mounted volume"; exit 1; }
+    move() {  # move SRC DEST
+      src="$1"; dest="$2"
+      [ -d "$src" ] && [ ! -L "$src" ] || { echo "skip $src"; return 0; }
+      mkdir -p "$dest" && rsync -a "$src"/ "$dest"/ &&
+        diff -rq "$src" "$dest" >/dev/null &&
+        mv "$src" "$src.pre-external" && ln -s "$dest" "$src" && echo "moved $src"
+    }
+    move ~/.pulp/sdk-dev            $X/caches/pulp/sdk-dev
+    move ~/.pulp/sdk                $X/caches/pulp/sdk
+    move ~/.pulp/sdk-source-dev     $X/caches/pulp/sdk-source-dev
+    move ~/.cache/vellum-gates      $X/caches/vellum-gates
+    move ~/Library/Caches/uv        $X/caches/uv
+    move ~/Library/Caches/Pulp      $X/caches/Pulp
+    move ~/Library/Caches/org.swift.swiftpm $X/caches/swiftpm
+    move ~/Library/Caches/go-build  $X/caches/go-build
+    move ~/.android                 $X/caches/android
+
+Caches that take an environment variable are better pointed than symlinked.
+Add to the interactive shell profile and the agent launcher environment (the
+`exports` command above prints the cache ones):
+
+    export CCACHE_DIR=$X/caches/ccache        # m5studio and m3 already set this in ccache.conf
+    export CPM_SOURCE_CACHE=$X/caches/cpm
+    export FETCHCONTENT_BASE_DIR=$X/caches/fetchcontent
+    export PIP_CACHE_DIR=$X/caches/pip
+    export UV_CACHE_DIR=$X/caches/uv
+    export HOMEBREW_CACHE=$X/caches/Homebrew
+    export GOCACHE=$X/caches/go-build
+
+Then verify, and only after a day of green builds delete the `*.pre-external`
+directories one by one:
+
+    python3 scripts/external_only_policy.py check
+    df -h /System/Volumes/Data
+    du -sh ~/.pulp/*.pre-external ~/.cache/*.pre-external ~/Library/Caches/*.pre-external
+
+Do not symlink the profile's `cache_root` (m5studio: `~/.cache/pulp-ci`): lane
+start refuses a symlinked cache root. Change `cache_root` in the profile to a
+physical external directory and restart the lanes at an idle boundary. On m3 the
+real root is already external and `~/.cache/pulp-ci` is a stale 4.6 GB copy its
+owner can remove.
+
+Leave `~/.codex` and `~/Library/Containers` alone: `~/.codex` is written by live
+agent sessions (move it only with every session stopped), and the containers hold
+app data. The largest on m5studio is `com.utmapp.UTM` (157 GB of VM disks);
+moving those is done from UTM, by their owner. Stale leftover: with ccache's
+`cache_dir` on the external volume, `~/Library/Caches/ccache`
+(5 GB on m5studio) is unused and can be removed by its owner.

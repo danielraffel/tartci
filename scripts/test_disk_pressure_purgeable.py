@@ -8,6 +8,7 @@ the raw number flagged disk_pressure and held fleet_ready false.
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import types
@@ -19,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import testing_support  # noqa: E402
 
 testing_support.skip_module_without_tomllib()  # macos_fleet_lanes imports tomllib
+import disk_available  # noqa: E402
 import macos_fleet_lanes as fleet  # noqa: E402
 
 GIB = 1024 ** 3
@@ -26,14 +28,42 @@ TOTAL = 1858 * GIB
 
 
 class DiskPressurePurgeableTests(unittest.TestCase):
-    def rows(self, raw_free_gib, important_gib):
+    def setUp(self) -> None:
+        cache = tempfile.TemporaryDirectory()
+        self.addCleanup(cache.cleanup)
+        env = mock.patch.dict(os.environ, {
+            "TARTCI_DISK_PURGEABLE": "1",
+            "TARTCI_DISK_CACHE_FILE": str(Path(cache.name) / "cache.json")})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def rows(self, raw_free_gib, important_gib, helper=None):
         usage = types.SimpleNamespace(total=TOTAL, free=int(raw_free_gib * GIB),
                                       used=TOTAL - int(raw_free_gib * GIB))
         important = None if important_gib is None else int(important_gib * GIB)
         with tempfile.TemporaryDirectory() as home, \
                 mock.patch.object(fleet.shutil, "disk_usage", return_value=usage), \
-                mock.patch.object(fleet, "important_free_bytes", return_value=important):
-            return fleet.disk_pressure(Path(home) / "none.toml", Path(home))
+                mock.patch.object(disk_available, "important_free_bytes",
+                                  return_value=important) as patched:
+            rows = fleet.disk_pressure(Path(home) / "none.toml", Path(home))
+        self.last_helper = patched
+        return rows
+
+    def test_disk_pressure_honours_the_off_switch(self) -> None:
+        with mock.patch.dict(os.environ, {"TARTCI_DISK_PURGEABLE": "0"}):
+            row = self.home(self.rows(49, 560))
+        self.last_helper.assert_not_called()
+        self.assertIsNone(row["important_free_gib"])
+        self.assertEqual(row["state"], "problem", "raw numbers only: 97%+ used")
+
+    def test_disk_pressure_uses_the_cache(self) -> None:
+        # One volume read twice within the TTL (the vm_store and home roots can
+        # share a device, and the readiness check runs often): one helper run.
+        first = self.home(self.rows(49, 560))
+        second = self.home(self.rows(49, 560))
+        self.assertEqual(first["important_free_gib"], 560.0)
+        self.assertEqual(second["important_free_gib"], 560.0)
+        self.last_helper.assert_not_called()  # the second call was a cache hit
 
     def home(self, rows):
         return next(r for r in rows if r["role"] == "home")

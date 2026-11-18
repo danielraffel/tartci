@@ -372,6 +372,38 @@ class InstallMacosFleetTests(unittest.TestCase):
         result = self.run_installer("--apply", TARTCI_PYTHON=str(interpreter))
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def _fake_framework(self) -> Path:
+        bindir = self.root / "Python.framework" / "Versions" / "3.13" / "bin"
+        bindir.mkdir(parents=True)
+        binary = bindir / "python3.13"
+        shutil.copy2(sys.executable, binary)
+        binary.chmod(0o755)
+        (self.root / "Python.framework" / "Versions" / "Current").symlink_to("3.13")
+        return binary
+
+    def test_a_cellar_pin_warns_with_the_host_python_line_to_add(self) -> None:
+        # m3, 2026-11-16: python.pin named an ad-hoc Cellar binary.
+        framework = self._fake_framework()
+        cellar = self.root / "homebrew" / "Cellar" / "python@3.12" / "3.12.13" / "bin"
+        cellar.mkdir(parents=True)
+        interpreter = cellar / "python3.12"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(interpreter),
+                                    TARTCI_PYTHON_FRAMEWORK_ROOT=str(self.root / "Python.framework"))
+        self.assertIn("WARN tcc-risk", result.stderr)
+        self.assertIn(f'python = "{framework}"', result.stderr)
+
+    def test_a_non_cellar_pin_does_not_warn(self) -> None:
+        # Control, same instrument: only the interpreter's path changed.
+        self._fake_framework()
+        interpreter = self.root / "pinned-python3"
+        shutil.copy2(sys.executable, interpreter)
+        interpreter.chmod(0o755)
+        result = self.run_installer("--preflight", TARTCI_PYTHON=str(interpreter),
+                                    TARTCI_PYTHON_FRAMEWORK_ROOT=str(self.root / "Python.framework"))
+        self.assertNotIn("WARN tcc-risk", result.stderr)
+
     def test_python_symlink_cycle_is_bounded(self) -> None:
         first = self.root / "python-cycle-0"
         first.symlink_to(sys.executable)
@@ -743,6 +775,39 @@ class InstallMacosFleetTests(unittest.TestCase):
         self.assertIn("--yes is ignored", output)
         self.assertIn("terminate these process groups", output)
         self.assertNotIn("done; victims log", output)
+
+    def test_installed_leased_build_runs_the_cohort_copy(self) -> None:
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        wrapper = self.bin / "leased-build"
+        self.assertTrue(wrapper.is_file())
+        target = wrapper.read_text().split("exec ", 1)[1].split(" ", 1)[0]
+        self.assertTrue(target.endswith("/scripts/leased-build"), target)
+        self.assertEqual(Path(target).read_bytes(), (ROOT / "scripts/leased-build").read_bytes())
+        usage = subprocess.run([str(wrapper)], text=True, capture_output=True, env=self.env)
+        self.assertEqual(usage.returncode, 2)
+        self.assertIn("leased-build: usage", usage.stderr)
+        self.assertNotIn("stale hand-placed copy", result.stderr)
+
+    def test_a_stale_hand_placed_leased_build_is_reported_not_touched(self) -> None:
+        stale = self.home / "bin/leased-build"
+        stale.parent.mkdir(parents=True, exist_ok=True)
+        stale.write_text("#!/bin/sh\necho old\n")
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stale hand-placed copy of leased-build", result.stderr)
+        self.assertEqual(stale.read_text(), "#!/bin/sh\necho old\n")
+
+    def test_an_existing_leased_build_symlink_is_replaced_not_followed(self) -> None:
+        victim = self.root / "victim"
+        victim.write_text("keep")
+        link = self.bin / "leased-build"
+        link.symlink_to(victim)
+        result = self.run_installer("--apply")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(victim.read_text(), "keep")
+        self.assertFalse(link.is_symlink())
+        self.assertIn("/scripts/leased-build", link.read_text())
 
     def test_dry_run_bound_legacy_repository_resolves_and_reports_slug(self) -> None:
         result = self.run_installer(GH_REPO="danielraffel/tartci")

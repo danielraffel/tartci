@@ -103,6 +103,9 @@ def runner_log_result(path: Path | None) -> str | None:
 
 
 TRUSTED_BRANCHES = ("main",)
+# The lifecycle quarantine runner.sh records for a job that completed while its
+# run was still in progress (current_job_scan's `terminal_pending_run`).
+PENDING_RUN_QUARANTINE = "listener_exited_workflow_active"
 
 
 def trusted_ref(receipt: dict) -> str | None:
@@ -128,14 +131,26 @@ def verdict(runner_rc: int, capture_status: str, receipt: str, quarantine: str,
     conclusion=success, bound to this run and job, for a trusted ref. The
     guest-written runner log is attacker-controlled output, so it can only
     downgrade a verdict, never establish one.
+
+    A job that completes while later jobs of its run are still going (a GPU
+    proof followed by its consumer job, a gate followed by a report) is
+    observed as ``terminal_pending_run``. The lifecycle records that as the
+    ``listener_exited_workflow_active`` quarantine, which keeps VM reclamation
+    conservative. For the cache it is the same proof as ``terminal``: GitHub
+    reported this job completed. Only that exact pairing is accepted, and only
+    with the receipt saying so and bound to both the run and the job.
     """
     if runner_rc != 0:
         return "red", f"runner_rc={runner_rc}"
-    if quarantine not in ("", "none"):
+    # runner.sh always records this quarantine for terminal_pending_run, so a
+    # pending-run capture without it is not the observation described above.
+    pending_run = (capture_status == "terminal_pending_run"
+                   and quarantine == PENDING_RUN_QUARANTINE)
+    if quarantine not in ("", "none") and not pending_run:
         return "red", f"quarantine={quarantine}"
     if local_result is not None and local_result not in GREEN_RESULTS:
         return "red", f"result={local_result}"
-    if capture_status != "terminal":
+    if capture_status != "terminal" and not pending_run:
         return "red", f"no_host_receipt={capture_status or 'none'}"
     try:
         data = json.loads(receipt or "{}")
@@ -144,6 +159,11 @@ def verdict(runner_rc: int, capture_status: str, receipt: str, quarantine: str,
         return "red", "receipt_unreadable"
     if conclusion != "success":
         return "red", f"conclusion={conclusion}"
+    if pending_run:
+        if data.get("kind") != "terminal_pending_run" or data.get("job_status") != "completed":
+            return "red", "receipt_not_job_terminal"
+        if not run_id or not job_id:
+            return "red", "receipt_unbound"
     if (run_id and str(data.get("run_id")) != str(run_id)) or \
             (job_id and str(data.get("job_id")) != str(job_id)):
         return "red", "receipt_unbound"

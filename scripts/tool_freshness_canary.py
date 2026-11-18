@@ -25,8 +25,9 @@ shows it landed and stayed healthy:
     from it;
   - then a health signal. When the canary runs the merge steward (its deploy
     event carries `steward_host: true`), a `tool_steward_verified` for the
-    release recorded after that deploy. Otherwise `canary_soak_hours` (2) on
-    the canary's clock since the deploy.
+    release recorded after that deploy. Otherwise `canary_soak_hours` on
+    the canary's clock since the deploy: the tool's own value (Shipyard 0.5,
+    since its steward stage follows), else 2.
 
 For a tool with a steward check (Shipyard), a host that is neither the canary
 nor a steward host also waits for every published steward host to have
@@ -133,7 +134,7 @@ def rollout(settings: dict) -> dict:
         value = published.get("tool_rollout")
     if not isinstance(value, dict) or not isinstance(value.get("canary"), str) \
             or not value["canary"]:
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"no tool_rollout canary in {PUBLISHED}"}
     rows = published.get("hosts")
     known = {row["host_id"] for row in rows
@@ -144,10 +145,23 @@ def rollout(settings: dict) -> dict:
     # a required steward and let a release pass after only the canary soak.
     if value["canary"] not in known or not isinstance(hosts, list) or not hosts \
             or any(not isinstance(h, str) or h not in known for h in hosts):
-        return {"canary": None, "steward_hosts": [],
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
                 "error": f"invalid tool_rollout in {PUBLISHED}: canary and a non-empty "
                          "steward_hosts list must name published hosts"}
-    return {"canary": value["canary"], "steward_hosts": hosts, "error": None}
+    # A former canary still applies first while the fleet's TartCI generations
+    # catch up with a canary move: an older generation on a steward host waits
+    # for it, and if it waited in turn for that steward host, neither would
+    # move until TartCI itself had rolled out. Readers wait only for `canary`.
+    former = value.get("former_canaries", [])
+    if not isinstance(former, list) or any(
+            not isinstance(h, str) or h not in known or h == value["canary"] for h in former):
+        # Fail closed like the other roles: dropping a former canary mid-move
+        # would leave a steward host waiting on a canary that waits on it.
+        return {"canary": None, "steward_hosts": [], "former_canaries": [],
+                "error": f"invalid tool_rollout in {PUBLISHED}: former_canaries must list "
+                         "published hosts other than the canary"}
+    return {"canary": value["canary"], "steward_hosts": hosts, "former_canaries": former,
+            "error": None}
 
 
 def self_host_id(home: Path, settings: dict) -> str | None:
@@ -221,6 +235,35 @@ def read_host(host_id: str, me: str | None, settings: dict, state: Path, now: fl
     return {"events": _parse_events(rest), "clock": float(first.strip())}
 
 
+def recorded_failure(events: list[dict], tool: str, version: str,
+                     since: float = 0.0) -> str | None:
+    """Why `version` of `tool` failed on this host at or after `since`, or None."""
+    for event in events:
+        at = _epoch(event.get("at"))
+        if event.get("tool") != tool or at is None or at < since:
+            continue
+        kind = event.get("event")
+        if kind == "tool_apply_failed" and event.get("target") == version:
+            return f"recorded tool_apply_failed for {version} at {event['at']}"
+        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
+                event.get("from"), event.get("version")):
+            return f"recorded {kind} for {version} at {event['at']}"
+        if (kind == "tool_deployed" and event.get("from") == version
+                and event.get("downgrade")):
+            return f"moved back from {version} to {event.get('to')} at {event['at']}"
+    return None
+
+
+def newest_deploy_at(events: list[dict], tool: str, version: str) -> float:
+    """When this host last verifiably moved up to `version` (0 when it never
+    did). An unverified redeploy does not wipe out an earlier failure."""
+    times = [_epoch(e.get("at")) or 0.0 for e in events
+             if e.get("event") == "tool_deployed" and e.get("tool") == tool
+             and e.get("component", "cli") == "cli" and e.get("to") == version
+             and e.get("verify") in ("current", "behind") and not e.get("downgrade")]
+    return max(times, default=0.0)
+
+
 def clearance(events: list[dict], clock: float, tool: str, version: str,
               soak_hours: float, require_steward: bool = False) -> tuple[bool, str]:
     """(whether a host's events clear `version` of `tool`, why).
@@ -237,19 +280,9 @@ def clearance(events: list[dict], clock: float, tool: str, version: str,
     # by the deploy that first moved up to it, so that one starts the clock.
     deploy = ([e for e in deploys if not e.get("downgrade")] or deploys)[-1]
     since = _epoch(deploy["at"]) or 0.0
-    for event in events:
-        at = _epoch(event.get("at"))
-        if event.get("tool") != tool or at is None or at < since:
-            continue
-        kind = event.get("event")
-        if kind == "tool_apply_failed" and event.get("target") == version:
-            return False, f"recorded tool_apply_failed for {version} at {event['at']}"
-        if kind in ("tool_rolled_back", "tool_steward_failed") and version in (
-                event.get("from"), event.get("version")):
-            return False, f"recorded {kind} for {version} at {event['at']}"
-        if (kind == "tool_deployed" and event.get("from") == version
-                and event.get("downgrade")):
-            return False, f"moved back from {version} to {event.get('to')} at {event['at']}"
+    failure = recorded_failure(events, tool, version, since)
+    if failure:
+        return False, failure
     if deploy.get("steward_host") or require_steward:
         for event in events:
             if (event.get("event") == "tool_steward_verified" and event.get("tool") == tool
@@ -283,36 +316,67 @@ def gate_candidate(name: str, tool: dict, soaked: list[dict], home: Path, now: f
                       "or set host_class in tool-freshness.toml)")
     if me == canary:
         return newest, f"canary {canary}: applies first"
-    # (host, needs a clean steward tick): the canary, then for a tool with a
-    # steward check every steward host other than this one.
-    # A canary that is also a published steward host must show a clean steward
-    # tick, whatever its own deploy event says: that flag is written by the
-    # canary's checkout, and a stale one there would weaken every reader's gate.
-    required = [(canary, bool(tool.get("steward_check"))
-                 and canary in roles["steward_hosts"])]
-    if tool.get("steward_check"):
-        required += [(host, True) for host in roles["steward_hosts"]
-                     if host not in (me, canary)]
+    if me in roles["former_canaries"]:
+        # Deliberately not gated on the new canary: a host still on the older
+        # generation (the new canary included) waits for this one, so waiting
+        # here could deadlock until TartCI itself rolls out. This is exactly
+        # how the former canary behaved before the move, the steward stage
+        # still guards every host behind it, and while the entry is listed a
+        # rollout pause holds both canaries (docs/runbook.md).
+        return newest, f"former canary {me}: applies first until every host reads canary {canary}"
+    # Each slot is (role, hosts that can clear it). The canary slot comes
+    # first, then for a tool with a steward check every steward host other
+    # than this one. A host needs a clean steward tick when it is a published
+    # steward host, whatever its own deploy event says: that flag is written by
+    # its checkout, and a stale one there would weaken every reader's gate.
+    # While former_canaries is listed, a former canary's deploy clears the
+    # canary slot too: a new canary still on the older TartCI generation waits
+    # for the former canary and for the steward host, so a steward host on the
+    # new generation that waited only for the new canary would wait for a host
+    # waiting on it.
+    stewards = roles["steward_hosts"] if tool.get("steward_check") else []
+    slots = [("canary", [canary] + [h for h in roles["former_canaries"] if h != me])]
+    slots += [("steward host", [host]) for host in stewards if host not in (me, canary)]
     reads = context.setdefault("reads", {})
-    soak = float(settings.get("canary_soak_hours", CANARY_SOAK_HOURS))
-    for host, _ in required:
-        if host not in reads:
-            reads[host] = read_host(host, me, settings, state, now, run)
-        if "error" in reads[host]:
-            role = "canary" if host == canary else "steward host"
-            return None, f"waiting for {role} {host}: unreadable ({reads[host]['error']})"
+    # A host's tool-freshness.toml value wins, then the tool's own default.
+    soak = float(settings.get("canary_soak_hours",
+                              tool.get("canary_soak_hours", CANARY_SOAK_HOURS)))
+    for role, hosts in slots:
+        for host in hosts:
+            if host not in reads:
+                reads[host] = read_host(host, me, settings, state, now, run)
+        if all("error" in reads[host] for host in hosts):
+            return None, (f"waiting for {role} {hosts[0]}: unreadable "
+                          f"({reads[hosts[0]]['error']})")
     why = ""
     for candidate in reversed(soaked):
         version = str(candidate.get("version"))
         notes, blocked = [], None
-        for host, steward in required:
-            ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name, version,
-                                    soak, require_steward=steward)
-            role = "canary" if host == canary else "steward host"
-            if not ok:
-                blocked = f"{role} {host}: {candidate.get('tag')} {why_one}"
+        for role, hosts in slots:
+            first = None
+            # A former canary stands in only for a current canary that is
+            # unreadable or has not proved the release yet. A failure recorded
+            # on the current canary blocks, whatever the former one shows.
+            current = reads[hosts[0]]
+            failed = None if len(hosts) == 1 or "error" in current else recorded_failure(
+                current["events"], name, version,
+                newest_deploy_at(current["events"], name, version))
+            if failed:
+                blocked = f"{role} {hosts[0]}: {candidate.get('tag')} {failed}"
                 break
-            notes.append(f"{role} {host}: {why_one}")
+            for host in hosts:
+                if "error" in reads[host]:
+                    continue
+                ok, why_one = clearance(reads[host]["events"], reads[host]["clock"], name,
+                                        version, soak, require_steward=host in stewards)
+                label = role if host == hosts[0] else "former canary"
+                if ok:
+                    notes.append(f"{label} {host}: {why_one}")
+                    break
+                first = first or f"{label} {host}: {candidate.get('tag')} {why_one}"
+            else:
+                blocked = first or f"{role} {hosts[0]}: unreadable"
+                break
         if blocked is None:
             return candidate, "cleared by " + "; ".join(notes)
         if candidate is newest:
@@ -395,13 +459,16 @@ def parse_ticks(text: str) -> list[dict]:
         if subject != "fleet" and "/" not in subject:
             continue
         tick = ticks.setdefault(stamp, {"at": _epoch(stamp), "versions": set(),
-                                        "invariants": [], "done": set(),
+                                        "invariants": [], "failing": set(), "done": set(),
                                         "passes": 0, "errors": 0})
         tokens = dict(TOKEN_RE.findall(" " + rest))
         if tokens.get("ver"):
             tick["versions"].add(tokens["ver"])
         if "invariants" in tokens:
             tick["invariants"].append(tokens["invariants"])
+            if tokens["invariants"].startswith("FAIL:"):
+                tick["failing"].update((subject, part) for part in
+                                       tokens["invariants"][5:].split(",") if part)
         if "/" in subject and FINAL_RE.match(rest):
             tick["done"].add(subject)
             if rest.startswith("rc="):
@@ -422,10 +489,18 @@ def _failures(tick: dict) -> set[str]:
     return failed
 
 
-def _clean(tick: dict) -> bool:
-    """Every token ok (off ignored), at least one ok, and no repository errored."""
+def _clean(tick: dict, excused: frozenset = frozenset()) -> bool:
+    """No repository errored, at least one token, every token ok (off ignored)
+    or a FAIL whose every (repository, invariant) pair is in `excused`: the
+    failures the baseline tick already had. Comparing per repository keeps a
+    standing failure in one repository from excusing the same invariant newly
+    failing in another."""
     tokens = [t for t in tick["invariants"] if t != "off"]
-    return bool(tokens) and all(t == "ok" for t in tokens) and not tick["errors"]
+    if not tokens or tick["errors"]:
+        return False
+    if not all(t == "ok" or t.startswith("FAIL:") for t in tokens):
+        return False  # an ERROR token: the tick could not read its own pass
+    return tick["failing"] <= excused
 
 
 def is_steward_host(home: Path, settings: dict) -> bool:
@@ -441,9 +516,42 @@ def runs_steward(home: Path, tool: dict, now: float) -> bool:
     return any(now - t["at"] <= STEWARD_ACTIVE_HOURS * 3600 for t in parse_ticks(text))
 
 
-def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
-                    ) -> tuple[str, str]:
-    """("ok" | "failed" | "pending", detail) from the first conclusive complete tick."""
+def _baseline(ticks: list[dict], deployed_at: float) -> dict:
+    """What was already failing when the binary changed: the last tick known to
+    have finished before the swap, and whether the tick in flight at the swap
+    could not run the steward at all."""
+    # The baseline must have finished before the swap: the tick after it
+    # started at or before the swap. The last tick stamped before the swap may
+    # still have been running when the binary changed, so it never qualifies.
+    finished = [ticks[i] for i in range(len(ticks) - 1) if ticks[i + 1]["at"] <= deployed_at]
+    # The tick in flight at the swap is not a baseline for invariants (its later
+    # repositories may have run the new binary), but if every repository in it
+    # errored, the ones that ran before the swap errored too: the steward was
+    # already down (a GitHub outage), and that is not the release's fault.
+    in_flight = [t for t in ticks if t["at"] < deployed_at][-1:]
+    last = finished[-1] if finished else None
+    return {"tick_at": _iso(last["at"]) if last else None,
+            "failures": sorted(_failures(last)) if last else [],
+            "failing": sorted([list(pair) for pair in last["failing"]]) if last else [],
+            "in_flight_error": bool(in_flight and STEWARD_ERROR in _failures(in_flight[0]))}
+
+
+def swap_baseline(home: Path, tool: dict, deployed_at: float) -> dict | None:
+    """The baseline read at the swap, to keep with the deploy record. The log is
+    read from a bounded tail, so a baseline judged later may have scrolled out
+    of it; then a standing failure would look new and roll the release back."""
+    text = _read_tail(steward_log(home, tool))
+    if text is None:
+        return None
+    return _baseline(parse_ticks(text), deployed_at)
+
+
+def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float,
+                    stored: dict | None = None) -> tuple[str, str]:
+    """("ok" | "failed" | "pending", detail) from the first conclusive complete tick.
+
+    `stored` is the baseline recorded at the swap; without it (a record from an
+    older checkout) the baseline is read from the log as before."""
     text = _read_tail(steward_log(home, tool))
     if text is None:
         return "pending", "steward summary log unreadable"
@@ -456,21 +564,14 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
     complete = [i < len(ticks) - 1
                 or bool(repos and repos_changed <= ticks[i]["at"] and repos <= ticks[i]["done"])
                 for i in range(len(ticks))]
-    # The baseline must have finished before the swap: the tick after it
-    # started at or before the swap. The last tick stamped before the swap may
-    # still have been running when the binary changed, so it never qualifies.
-    baseline = [ticks[i] for i in range(len(ticks) - 1)
-                if ticks[i + 1]["at"] <= deployed_at]
-    preexisting = _failures(baseline[-1]) if baseline else set()
-    # The tick in flight at the swap is not a baseline for invariants (its later
-    # repositories may have run the new binary), but if every repository in it
-    # errored, the ones that ran before the swap errored too: the steward was
-    # already down (a GitHub outage), and that is not the release's fault.
-    in_flight = [t for t in ticks if t["at"] < deployed_at][-1:]
-    if in_flight and STEWARD_ERROR in _failures(in_flight[0]):
+    baseline = stored if _valid_baseline(stored) else _baseline(ticks, deployed_at)
+    preexisting = set(baseline["failures"])
+    excused = frozenset(tuple(pair) for pair in baseline["failing"])
+    if baseline["in_flight_error"]:
         preexisting.add(STEWARD_ERROR)
     stamp = lambda t: _iso(t["at"])  # noqa: E731
     down = 0  # consecutive complete ticks after the swap where the steward could not run
+    judged = 0  # complete ticks that ran it but were inconclusive
     for i, tick in enumerate(ticks):
         if tick["at"] < deployed_at or not complete[i]:
             continue
@@ -491,13 +592,34 @@ def steward_verdict(home: Path, tool: dict, version: str, deployed_at: float
                                  f"invariants FAIL {','.join(sorted(failed))}"))
         if _clean(tick):
             return "ok", f"steward tick {stamp(tick)} on {version}: invariants=ok"
+        if _clean(tick, excused):
+            standing = ",".join(sorted(f"{repo}:{inv}" for repo, inv in tick["failing"]))
+            return "ok", (f"steward tick {stamp(tick)} on {version}: no new failure "
+                          f"(already failing before the swap: {standing})")
+        judged += ran_it
+    if judged:
+        return "pending", (f"{judged} complete steward ticks on {version} since "
+                           f"{_iso(deployed_at)}, none conclusive (see their invariants= "
+                           "tokens and ERROR lines)")
     return "pending", f"no conclusive complete steward tick on {version} since {_iso(deployed_at)}"
 
 
+def _valid_baseline(value: object) -> bool:
+    return (isinstance(value, dict) and isinstance(value.get("failures"), list)
+            and isinstance(value.get("failing"), list)
+            and all(isinstance(p, list) and len(p) == 2 for p in value["failing"])
+            and isinstance(value.get("in_flight_error"), bool))
+
+
 def record_deploy(steward: dict, name: str, version: str, previous: str | None,
-                  by: str, swapped_at: float) -> None:
+                  by: str, swapped_at: float, home: Path | None = None,
+                  tool: dict | None = None) -> None:
     steward[name] = {"version": version, "from": previous, "by": by,
                      "deployed_at": _iso(swapped_at)}
+    if home is not None and tool is not None:
+        baseline = swap_baseline(home, tool, swapped_at)
+        if baseline is not None:
+            steward[name]["baseline"] = baseline
 
 
 def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, settings: dict,
@@ -529,7 +651,8 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
     if entry.get("failure_recorded"):
         verdict, detail = "failed", str(entry.get("detail") or "steward check failed")
     else:
-        verdict, detail = steward_verdict(home, tool, version, deployed_at)
+        verdict, detail = steward_verdict(home, tool, version, deployed_at,
+                                          entry.get("baseline"))
     if verdict == "ok":
         append({"event": "tool_steward_verified", "tool": name, "at": _iso(now),
                 "version": version, "detail": detail})
@@ -540,8 +663,9 @@ def steward_pass(name: str, tool: dict, row: dict, home: Path, now: float, setti
         hours = (now - deployed_at) / 3600
         row["steward"] = detail
         if hours > STEWARD_WAIT_HOURS:
-            row["steward_problem"] = (f"{name} {version}: {detail} after {hours:.1f} h "
-                                      "(is the steward tick running?)")
+            row["steward_problem"] = (f"{name} {version}: {detail} after {hours:.1f} h"
+                                      + ("" if "none conclusive" in detail else
+                                         " (is the steward tick running?)"))
         return False
     if entry.get("by") != "auto_apply" or not entry.get("from"):
         append({"event": "tool_steward_failed", "tool": name, "at": _iso(now),

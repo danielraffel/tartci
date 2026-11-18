@@ -77,10 +77,12 @@ import time
 from typing import Any, Iterable, Iterator
 
 import boot_usage
+import disk_available
 import checkout_outputs
 import pulp_reapers
 import gate_ccache_trim
 import scratch_dirs
+import state_retention
 import tmp_checkouts
 
 try:
@@ -561,6 +563,20 @@ def dir_size_bytes(path: pathlib.Path) -> int:
     return total
 
 
+def measured_usage(path: pathlib.Path) -> tuple[Any, dict[str, Any]]:
+    """statfs plus disk_available's reading, all inside one bounded call.
+
+    disk_available.measure stats the path and reads its cache file, so on a
+    wedged volume it blocks like statfs does; it gets the same deadline, and a
+    timeout reads as unreadable (OSError) rather than hanging the pass.
+    """
+    def probe() -> tuple[Any, dict[str, Any]]:
+        usage = shutil.disk_usage(path)
+        return usage, disk_available.measure(path, usage.free, usage.total,
+                                             timeout=ROOT_PROBE_TIMEOUT_S / 2)
+    return bounded_fs_call(probe, description=f"disk usage {path}", pass_deadline=False)
+
+
 def free_bytes(path: pathlib.Path) -> int | None:
     """Free bytes on `path`'s volume, or None when it cannot be read.
 
@@ -582,20 +598,23 @@ def free_bytes(path: pathlib.Path) -> int | None:
     at 92%. One statfs is cheap; the walk is what the deadline bounds.
     """
     try:
-        return bounded_fs_call(lambda: shutil.disk_usage(path).free,
-                               description=f"disk usage {path}", pass_deadline=False)
+        usage, measured = measured_usage(path)
     except OSError:
         return None
+    # Free plus macOS-purgeable (disk_available.py), so reclaim does not read a
+    # volume with room to spare as tight and fall back to its 7-day age gate.
+    return measured["available_bytes"]
 
 
 def used_percent(path: pathlib.Path) -> float | None:
     """Percent of `path`'s volume in use, or None when it cannot be read."""
     try:
-        usage = bounded_fs_call(lambda: shutil.disk_usage(path),
-                                description=f"disk usage {path}", pass_deadline=False)
+        usage, measured = measured_usage(path)
     except OSError:
         return None
-    return 100.0 * usage.used / usage.total if usage.total else None
+    if not usage.total:
+        return None
+    return 100.0 * (usage.total - measured["available_bytes"]) / usage.total
 
 
 def path_spellings(path: pathlib.Path) -> set[str]:
@@ -1594,6 +1613,14 @@ def _run(args: argparse.Namespace, receipt: dict[str, Any]) -> int:
                                            profile=pulp_reapers.default_profile_path(),
                                            state_dir=state_dir(args))
     receipt["gate_ccache_trim"] = gate_ccache
+    # Per-boot lane files older than 30 days and support generations outside
+    # the newest 10 (state_retention.py). Nothing else ran it, so m1, m3, m5
+    # and m5studio held 111-202 generations (440-818 MB) each. It keeps every
+    # generation a wrapper, plist, receipt, launcher pointer, rollback
+    # snapshot or running process names, and skips generations entirely
+    # while a self-update is in progress.
+    progress.emit("state retention: per-boot files and old generations", force=True)
+    receipt["state_retention"] = state_retention.run(fix=args.fix)
     # Which CI and agent paths hold the boot volume, sampled once a day after
     # the reapers above (boot_usage.py). Read-only.
     progress.emit("boot usage: sampling CI and agent paths on the boot volume", force=True)

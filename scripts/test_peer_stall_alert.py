@@ -47,13 +47,17 @@ class Fleet:
         self.calls: list[str] = []
 
     def guard(self, target: str, receipt: dict | None, clock: float = RECEIPT_TS + 60,
-              last: dict | None = None, vitals: dict | None = None) -> None:
+              last: dict | None = None, vitals: dict | None = None,
+              freshness: dict | None = None) -> None:
         body = json.dumps(receipt) if receipt is not None else ""
         tail = json.dumps(last) if last is not None else ""
         self.answers[target] = (0, f"{int(clock)}\n{psa.SEPARATOR}\n{body}\n"
                                    f"{psa.LAST_SEPARATOR}\n{tail}\n"
                                    f"{psa.VITALS_SEPARATOR}\n"
-                                   f"{json.dumps(vitals) if vitals is not None else ''}\n", "")
+                                   f"{json.dumps(vitals) if vitals is not None else ''}\n"
+                                   f"{psa.FRESHNESS_SEPARATOR}\n"
+                                   f"{json.dumps(freshness) if freshness is not None else ''}\n",
+                                "")
 
     def healthy(self, target: str) -> None:
         self.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
@@ -80,6 +84,7 @@ class PeerStall(unittest.TestCase):
         self.fleet.guard("m3", M3_RECEIPT)
         self.opened: list[tuple[str, str]] = []
         self.closed: list[str] = []
+        self.patched: list[tuple[str, str]] = []
 
     def issue(self, title: str, body: str) -> tuple[int, str]:
         self.opened.append((title, body))
@@ -91,6 +96,9 @@ class PeerStall(unittest.TestCase):
 
     def run_pass(self, at: float, host: str = "m1", **kw) -> dict:
         kw.setdefault("issue", self.issue)
+        # Never a real issue write: fixture issue numbers are real tartci numbers.
+        kw.setdefault("comment", lambda number, body: self.patched.append((number, body))
+                      or (0, "1"))
         return psa.alert_pass(now=at, directory=self.tmp / host, peers=PEERS, me=host,
                               run=self.fleet.run, close=self.close, **kw)
 
@@ -157,6 +165,126 @@ class PeerStall(unittest.TestCase):
         self.assertEqual(out["peers"]["studio"]["host_vitals"]["state"], "stale")
         self.assertEqual([title for title, _ in self.opened], [VITALS_TITLE])
         self.assertIn("tartci launchd heal", self.opened[0][1])
+
+    PROMPT = {"number": 960, "title": "[tartci] studio has a macOS privacy prompt waiting: click Allow",
+              "body": 'body\n\n<!-- tartci-incident {"host":"studio","class":"tcc_prompt_pending",'
+                      '"symptom_at":"2026-10-09T06:50:00Z","detected_at":"x","fixed_at":null} -->'}
+    STORE = {"number": 959, "title": "[tartci] studio: writes on /Volumes/Example/VMs stalling "
+                                     "since 2026-10-09T06:40:00Z", "body": ""}
+    OTHER = {"number": 1, "title": "[tartci] m5 has a macOS privacy prompt waiting: click Allow",
+             "body": ""}
+
+    def stale_vitals(self):
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=RECEIPT_TS, vitals={"sampled_at": RECEIPT_TS - 360})
+
+    def test_a_vitals_stall_links_the_prompt_and_never_messages_the_owner(self):
+        # 2026-11-18: #965 (host-vitals) said only "tartci launchd heal" while
+        # #960 (privacy prompt) on the same host waited for a click for hours.
+        self.stale_vitals()
+        lister = lambda: [self.OTHER, self.STORE, self.PROMPT]  # noqa: E731
+        with mock.patch("owner_notify.notify_once") as told:
+            out = self.run_pass(RECEIPT_TS + 60, lister=lister)
+        body = self.opened[0][1]
+        self.assertIn("click Allow on studio", body)
+        self.assertIn("#960", body)
+        self.assertIn("#959", body)
+        self.assertNotIn("#1 ", body, "another host's prompt is not linked")
+        self.assertEqual(out["peers"]["studio"]["host_vitals"]["related"], [960, 959])
+        # The stalled host is the one sender (tcc_prompt): a reader never adds a
+        # second owner message for the same wedge.
+        told.assert_not_called()
+
+    def test_a_prompt_that_appears_later_is_commented_on_the_open_vitals_issue(self):
+        self.stale_vitals()
+        patched: list = []
+        patch = lambda number, body: patched.append((number, body)) or (0, "1")  # noqa: E731
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [], comment=patch)
+        self.assertNotIn("click Allow", self.opened[0][1])
+        self.assertEqual(patched, [])
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [self.PROMPT], comment=patch)
+        self.assertEqual(patched[-1][0], "501")
+        self.assertIn("click Allow on studio", patched[-1][1])
+        n = len(patched)
+        self.run_pass(later + psa.READ_SECS, lister=lambda: [self.PROMPT],
+                      comment=patch)
+        self.assertEqual(len(patched), n, "patched once per change of links")
+
+    def test_a_prompt_that_closes_is_removed_from_the_open_vitals_issue(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: [])
+        self.assertNotIn("click Allow", self.patched[-1][1])
+        count = len(self.patched)
+        # A failed issue read keeps the links: no rewrite.
+        self.run_pass(later + psa.READ_SECS, lister=lambda: None)
+        self.assertEqual(len(self.patched), count)
+
+    def test_an_unreadable_issue_list_keeps_the_existing_links(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
+        count = len(self.patched)
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": RECEIPT_TS - 360})
+        self.run_pass(later, lister=lambda: None)
+        self.assertEqual(len(self.patched), count)
+
+    def test_a_malformed_issue_list_is_an_unreadable_read(self):
+        good = json.dumps({"number": 960, "title": "t", "body": ""})
+        # The real reader refuses under unittest; lift that for this read only.
+        with mock.patch.dict(sys.modules), \
+                mock.patch.object(host_off, "_scratch_home", return_value=False), \
+                mock.patch.object(host_off, "_ghapp", return_value=(0, good + "\n{trunc")):
+            sys.modules.pop("unittest", None)
+            self.assertIsNone(psa._open_issues())
+        with mock.patch.dict(sys.modules), \
+                mock.patch.object(host_off, "_scratch_home", return_value=False), \
+                mock.patch.object(host_off, "_ghapp", return_value=(0, good + "\n")):
+            sys.modules.pop("unittest", None)
+            self.assertEqual([r["number"] for r in psa._open_issues()], [960])
+
+    def test_the_real_comment_never_runs_from_a_test(self):
+        with mock.patch.object(host_off, "_ghapp") as real:
+            rc, text = psa._comment_issue("501", "body")
+        self.assertEqual(rc, 1)
+        real.assert_not_called()
+
+    def test_a_failed_open_in_a_new_episode_never_patches_the_old_issue(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [])
+        self.assertEqual([t for t, _ in self.opened], [VITALS_TITLE])
+        later = RECEIPT_TS + psa.READ_SECS + 60
+        self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
+                                 "stalled": [], "paused": []},
+                         clock=later, vitals={"sampled_at": later - 900})
+        self.run_pass(later, lister=lambda: [self.PROMPT],
+                      issue=lambda title, body: (1, "HTTP 502"))
+        self.assertEqual(self.patched, [], "issue 501 belongs to the previous episode")
+
+    def test_a_freshly_opened_issue_gets_no_duplicate_link_comment(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.PROMPT])
+        self.assertIn("#960", self.opened[0][1])
+        self.assertEqual(self.patched, [])
+
+    def test_a_store_stall_alone_is_linked_without_a_prompt_hint(self):
+        self.stale_vitals()
+        self.run_pass(RECEIPT_TS + 60, lister=lambda: [self.STORE])
+        body = self.opened[0][1]
+        self.assertIn("Possibly related open issues on studio", body)
+        self.assertIn("#959", body)
+        self.assertNotIn("click Allow", body)
 
     def test_fresh_host_vitals_is_the_negative_control(self):
         self.fleet.guard("m3", {**M3_RECEIPT, "episode": {"active": False},
@@ -483,3 +611,117 @@ class PeerSshDestinationTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# m1 and m5s on 2026-11-17: Shipyard 0.439.2 while 0.439.3, 0.439.4 and
+# 0.440.0 were out, waiting on a steward verdict that never came.
+DRIFT_CLOCK = psa._epoch("2026-11-17T06:53:24Z")
+
+
+def freshness(state: str = "behind", releases: int = 3, behind_since: str = "2026-11-16T18:59:17Z",
+              measured_at: str = "2026-11-17T06:53:24Z", latest: str = "0.440.0") -> dict:
+    return {"measured_at": measured_at, "tools": {"shipyard": {
+        "state": state, "installed": "0.439.2", "effective": "0.439.2", "latest": latest,
+        "releases_behind": releases, "behind_since": behind_since,
+        "apply": "waiting for steward host studio: v0.440.0 has not deployed 0.440.0"}}}
+
+
+class ShipyardDrift(unittest.TestCase):
+    """A host more than one release or 3 h behind the latest Shipyard is reported."""
+
+    setUp = PeerStall.setUp
+    issue = PeerStall.issue
+    close = PeerStall.close
+    run_pass = PeerStall.run_pass
+
+    def answer(self, value: dict | None, clock: float = DRIFT_CLOCK) -> None:
+        self.fleet.guard("m1", {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                "paused": []}, clock=clock, freshness=value)
+
+    def drift(self, value: dict | None, clock: float = DRIFT_CLOCK, host: str = "m5") -> dict:
+        self.answer(value, clock)
+        return self.run_pass(clock + 60, host=host)["peers"]["m1"]["shipyard_drift"]
+
+    def titles(self) -> list[str]:
+        return [title for title, _ in self.opened if "Shipyard" in title]
+
+    def test_the_incident_pages_once_naming_the_wait(self):
+        verdict = self.drift(freshness())
+        self.assertTrue(verdict["active"])
+        self.assertEqual(self.titles(), [
+            "[tartci] m1 Shipyard behind the latest release since 2026-11-16T18:59:17Z"])
+        body = [b for t, b in self.opened if "Shipyard" in t][0]
+        self.assertIn("0.439.2, 3 release(s) and 11.9 h behind 0.440.0", body)
+        self.assertIn("waiting for steward host studio", body)
+        self.assertIn("Run: ssh m1 'tartci fleet-macos tool-freshness --refresh;", body)
+
+    # The threshold: more than one release, or more than three hours (a
+    # healthy rollout reaches every host in under two).
+
+    def test_one_release_behind_for_under_three_hours_is_quiet(self):
+        since = psa.iso(DRIFT_CLOCK - 2.9 * 3600)
+        verdict = self.drift(freshness(releases=1, behind_since=since))
+        self.assertFalse(verdict["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_two_releases_behind_pages_at_once(self):
+        since = psa.iso(DRIFT_CLOCK - 0.5 * 3600)
+        self.assertTrue(self.drift(freshness(releases=2, behind_since=since))["active"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_one_release_behind_for_over_three_hours_pages(self):
+        # v0.444.0 sat 4 h 15 min short of m5s with the old 6 h limit quiet.
+        since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)
+        self.assertTrue(self.drift(freshness(releases=1, behind_since=since))["active"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_the_draft_window_does_not_count_toward_drift(self):
+        # The tag (behind_since) is 3.5 h old, but the release was published, and
+        # first seen by the peer, 1 h ago: the rollout is inside its bound.
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 3.5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = psa.iso(DRIFT_CLOCK - 3600)
+        self.assertFalse(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_drift_since_names_the_first_published_time(self):
+        published = psa.iso(DRIFT_CLOCK - 3.2 * 3600)
+        value = freshness(releases=1, behind_since=psa.iso(DRIFT_CLOCK - 5 * 3600))
+        value["tools"]["shipyard"]["behind_published_since"] = published
+        self.assertTrue(self.drift(value)["active"])
+        self.assertEqual(self.titles(), [
+            f"[tartci] m1 Shipyard behind the latest release since {published}"])
+
+    def test_the_limits_come_from_the_environment(self):
+        since = psa.iso(DRIFT_CLOCK - 3.1 * 3600)
+        with mock.patch.dict(os.environ, {"TARTCI_SHIPYARD_DRIFT_HOURS": "8"}):
+            self.assertFalse(self.drift(freshness(releases=1, behind_since=since))["active"])
+
+    def test_a_host_that_stopped_measuring_pages(self):
+        # Its watchdog stopped: the last reading says current, 4 h ago.
+        old = psa.iso(DRIFT_CLOCK - 4 * 3600)
+        verdict = self.drift(freshness(state="current", releases=0, measured_at=old))
+        self.assertTrue(verdict["active"])
+        self.assertEqual(verdict["state"], "unmeasured")
+        self.assertIn("has not measured its Shipyard freshness", self.opened[-1][1])
+
+    def test_no_measurement_decides_nothing(self):
+        self.assertFalse(self.drift(None)["active"])
+        self.assertEqual(self.titles(), [])
+
+    def test_a_current_reading_closes_the_issue(self):
+        self.drift(freshness())
+        later = DRIFT_CLOCK + psa.READ_SECS + 60
+        verdict = self.drift(freshness(state="current", releases=0, measured_at=psa.iso(later)),
+                             clock=later)
+        self.assertTrue(verdict["closed"])
+        self.assertEqual(len(self.titles()), 1)
+
+    def test_only_the_primary_reader_pages(self):
+        self.answer(freshness())
+        for target in ("m5", "m3"):
+            self.fleet.guard(target, {**M3_RECEIPT, "episode": {"active": False}, "stalled": [],
+                                      "paused": []}, clock=DRIFT_CLOCK,
+                             last={"ts": DRIFT_CLOCK, "peers": {"m1": {}}})
+        out = self.run_pass(DRIFT_CLOCK + 60, host="studio")
+        self.assertFalse(out["peers"]["m1"]["shipyard_drift"]["acting"])
+        self.assertEqual(self.titles(), [])

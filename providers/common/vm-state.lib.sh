@@ -52,7 +52,10 @@ tartci_check_disk_floor(){
   fi
   [ "$floor_gb" -gt 0 ] || return 0
   probe="$path"
-  avail_kb="$(df -Pk "$probe" 2>/dev/null | awk 'NR==2 {print $4}')"
+  # Free plus what macOS can purge, with a hard floor on raw free space
+  # (scripts/disk_available.py); df is the fallback if that cannot run.
+  avail_kb="$(python3 "${BASH_SOURCE[0]%/*}/../../scripts/disk_available.py" kb "$probe" 2>/dev/null || true)"
+  case "$avail_kb" in ''|*[!0-9]*) avail_kb="$(df -Pk "$probe" 2>/dev/null | awk 'NR==2 {print $4}')" ;; esac
   case "$avail_kb" in ''|*[!0-9]*) tartci_vm_state_note "cannot read free disk for $probe"; return 75 ;; esac
   floor_kb=$((floor_gb * 1024 * 1024))
   if [ "$avail_kb" -lt "$floor_kb" ]; then

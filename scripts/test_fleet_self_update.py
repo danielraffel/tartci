@@ -91,6 +91,10 @@ class FakeSystem(su.System):
                       "m5": {"state": "on", "participating": True},
                       "m3": {"state": "on", "participating": True}}
         self.peer_status_errors: dict[str, str] = {}
+        # handoff kicks: (ssh target, remote command, state of this host's active.json then)
+        self.kicks: list[tuple[str, str, bool]] = []
+        self.kick_rc: dict[str, int] = {}
+        self.peer_marker_errors: dict[str, str] = {}   # the marker read after pool status fails
         # A peer's launchd watchdog store-health.json, keyed by SSH target.
         # Absent: a healthy reading taken just now. None: no file. An int: ssh exit code.
         self.peer_store: dict[str, object] = {}
@@ -376,6 +380,14 @@ class FakeSystem(su.System):
                     return su.Result(255, "", self.peer_status_errors[peer])
                 value = self.peers.get(peer)
                 return ok(json.dumps(value)) if value else su.Result(255, "", "ssh: unreachable")
+            if "launchctl kickstart" in a[-1]:
+                active = (self.home / ".tartci" / "state" / "self-update" / "active.json").exists()
+                self.kicks.append((peer, a[-1], active))
+                rc = self.kick_rc.get(peer, 0)
+                return su.Result(rc, "kickstart sent\n" if rc == 0 else "",
+                                 "" if rc == 0 else "Connection timed out")
+            if peer in self.peer_marker_errors:
+                return su.Result(255, "", self.peer_marker_errors[peer])
             marker = self.peer_markers.get(peer)
             clock = int(self.peer_clock.get(peer, self.clock))
             ticket = self.peer_waiting.get(peer)
@@ -980,6 +992,148 @@ class HappyPathTests(Base):
         self.assertFalse((self.cfg.state_dir / "last.json").exists())
 
 
+class BehindMainAlertTests(Base):
+    """A host far behind main is STARVED whatever held it, and says so once."""
+
+    def behind_main_for(self, seconds: float) -> None:
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def opened(self) -> list[str]:
+        return [title for kind, title in self.issues if kind == "open"]
+
+    def skew(self, behind: float | None, state: str = "behind") -> dict:
+        oldest = None if behind is None else su._iso(NOW - self.cfg.soak_seconds - behind)
+        return {"state": state, "behind": 3, "installed": INSTALLED, "oldest_undeployed": oldest}
+
+    def scheduled_apply(self) -> int:
+        return su.plan_or_apply(self.cfg, self.sys, apply=True, scheduled=True,
+                                target_ref="origin/main")
+
+    def test_a_deferred_host_far_behind_is_loud_once(self) -> None:
+        # m3, 2026-11-17: ten hours behind, held by refusals that never
+        # reach defer(), and nothing said STARVED.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.scheduled_apply())
+            self.assertDeferred(self.scheduled_apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn("STARVED", self.opened()[0])
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(1, events.count("self_update_behind"))
+
+    def test_an_update_that_catches_up_closes_its_issue(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.assertUpdated(self.scheduled_apply())
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+
+    def test_a_host_inside_the_bound_is_quiet(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS - 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.scheduled_apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_catching_up_closes_the_issue(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert(self.cfg, self.skew(None, state="current"), NOW + 60)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+        self.assertFalse((self.cfg.state_dir / su.BEHIND_ALERT_NAME).exists())
+
+    def test_at_most_one_issue_per_repeat_window(self) -> None:
+        bound = su.BEHIND_STARVED_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound), NOW)
+        su.behind_alert(self.cfg, self.skew(0.0), NOW + 600)  # caught up, closed
+        su.behind_alert(self.cfg, self.skew(bound), NOW + 1200)  # behind again, inside 6 h
+        self.assertEqual(1, len(self.opened()))
+        later = NOW + su.BEHIND_ALERT_REPEAT_SECONDS + 60
+        su.behind_alert(self.cfg, self.skew(bound - 3600 + (later - NOW)), later)
+        self.assertEqual(2, len(self.opened()))
+
+    def test_a_refusal_before_measuring_uses_the_last_skew(self) -> None:
+        # A checkout that will not refresh returns before measure_skew; the
+        # last measured skew still says how far behind the host is.
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        out = io.StringIO()
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
+            self.assertEqual(1, len(self.opened()), self.issues)
+            # That run wrote an unknown skew.json; the next one still knows.
+            out.truncate(0)
+            out.seek(0)
+            self.assertEqual(su.EXIT_UNKNOWN, self.scheduled_apply())
+        self.assertIn("STARVED", out.getvalue())
+        self.assertEqual(1, len(self.opened()), self.issues)
+        self.assertIn(
+            f"~/.tartci/state/self-update/{su.BEHIND_SKEW_NAME}", self.bodies[0])
+        self.assertNotIn(
+            "~/.tartci/state/self-update/skew.json`:", self.bodies[0])
+
+    def test_an_unreadable_installed_commit_does_not_alert_from_saved_skew(self) -> None:
+        su._write_json(self.cfg.state_dir / su.BEHIND_SKEW_NAME,
+                       self.skew(su.BEHIND_STARVED_SECONDS + 600))
+        with mock.patch.object(su, "installed_commit",
+                               side_effect=su.Refused("installed commit unreadable")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
+
+    def test_a_saved_skew_without_installed_commit_does_not_alert(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": None})
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.issues)
+
+    def test_a_skew_from_before_an_install_is_not_used(self) -> None:
+        su._write_json(self.cfg.state_dir / "skew.json",
+                       {**self.skew(su.BEHIND_STARVED_SECONDS + 600), "installed": "9" * 40})
+        with mock.patch.object(su, "refresh_checkout",
+                               side_effect=su.Refused("fetch failed")):
+            self.assertEqual(su.EXIT_UNKNOWN, self.apply())
+        self.assertEqual([], self.opened())
+
+    def test_an_unknown_skew_says_nothing(self) -> None:
+        su.behind_alert(self.cfg, {"state": "unknown", "oldest_undeployed": None}, NOW)
+        self.assertEqual([], self.issues)
+
+    def test_a_plan_never_alerts(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.plan()
+        self.assertEqual([], self.opened())
+
+    def test_a_manual_apply_never_opens_a_behind_main_alert(self) -> None:
+        self.behind_main_for(su.BEHIND_STARVED_SECONDS + 600)
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertDeferred(self.apply())
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+        self.assertFalse((self.cfg.state_dir / "events.jsonl").exists())
+
+    def test_exactly_four_hours_is_inside_the_bound(self) -> None:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS), NOW)
+        self.assertNotIn("STARVED", out.getvalue())
+        self.assertEqual([], self.opened())
+
+    def test_a_manual_recovery_closes_an_existing_episode(self) -> None:
+        su.behind_alert(self.cfg, self.skew(su.BEHIND_STARVED_SECONDS + 60), NOW)
+        su.behind_alert_for_apply(self.cfg, self.skew(0.0), NOW + 60, scheduled=False)
+        self.assertEqual([("open", self.opened()[0]), ("close", "77")], self.issues)
+
+
 class QueueLightTests(Base):
     """A host drains for an update only while the gate backlog it serves is light."""
 
@@ -1014,6 +1168,13 @@ class QueueLightTests(Base):
         self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
         aside = json.loads((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).read_text())
         self.assertIn("gate queue is heavy", aside["reason"])
+
+    def assertDrainedAnyway(self, rc: int) -> None:
+        """Passed a heavy queue. EXIT_DEFERRED is also 0, so a step-aside is
+        ruled out first: a revert then FAILs here rather than erroring later."""
+        self.assertFalse(self.receipt().get("stepped_aside"), self.receipt().get("error"))
+        self.assertIn("drains anyway", self.queue_step())
+        self.assertUpdated(rc)
 
     def test_a_heavy_queue_steps_aside_before_any_mutation(self) -> None:
         self.demand(2)
@@ -1067,6 +1228,98 @@ class QueueLightTests(Base):
         self.aside_since(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 600)
         self.assertSteppedAsideForQueue(self.apply())
 
+    def behind_main_for(self, seconds: float) -> None:
+        """The oldest undeployed commit finished its soak `seconds` ago."""
+        self.sys.log_lines = (f"{T_NEW} {int(NOW - 60)}\n"
+                              f"{T_OLD} {int(NOW - self.cfg.soak_seconds - seconds)}\n")
+
+    def test_a_heavy_queue_drains_once_behind_main_past_the_bound(self) -> None:
+        # m3, 2026-11-17: a slow-store host fault released its queue place,
+        # so the next heavy queue started a fresh 3 h wait while m3 sat ten
+        # hours behind main. No ticket here, as after that release.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.assertDrainedAnyway(self.apply())
+        self.assertIn("behind main", self.queue_step())
+
+    def test_a_heavy_queue_steps_aside_while_behind_main_inside_the_bound(self) -> None:
+        # Control, same instrument: ten minutes short of the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def took_turn_at(self, started: float, status: str = "refused",
+                     finished: float | None = None) -> None:
+        """An earlier apply that drained for its turn, then ended `status`."""
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-turn.json", {
+            "mode": "apply", "target": T_OLD, "status": status, "started_at": su._iso(started),
+            "finished_at": su._iso(started + 60 if finished is None else finished),
+            "steps": [{"step": "announce", "ok": True}, {"step": "drain", "ok": True}]})
+
+    def test_a_turn_restarts_the_behind_main_clock(self) -> None:
+        # A post-drain refusal is neither rate limited nor counted toward the
+        # halt; without this a host far behind would drain at every attempt.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_a_turn_older_than_the_bound_does_not_hold_the_host(self) -> None:
+        # Control, same instrument: the last turn was past the bound.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 60)
+        self.assertDrainedAnyway(self.apply())
+
+    def test_a_refusal_before_the_turn_is_not_a_turn(self) -> None:
+        attempts = self.cfg.state_dir / "attempts"
+        attempts.mkdir(parents=True, exist_ok=True)
+        su._write_json(attempts / "19990101T000000Z-x.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 60),
+            "steps": [{"step": "store-volume", "ok": False}]})
+        su._write_json(attempts / "19990101T000001Z-y.json", {
+            "mode": "plan", "status": "planned", "started_at": su._iso(NOW - 30),
+            "steps": [{"step": "drain", "ok": True}]})
+        # Announced, then the snapshot refused before any drain: still serving.
+        su._write_json(attempts / "19990101T000002Z-z.json", {
+            "mode": "apply", "status": "refused", "started_at": su._iso(NOW - 20),
+            "steps": [{"step": "announce", "ok": True},
+                      {"step": "snapshot-verify", "ok": False}]})
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), 0.0)
+        self.took_turn_at(NOW - 900, finished=NOW - 840)
+        self.assertEqual(su.last_turn_at(self.cfg.state_dir), NOW - 840)
+
+    def test_a_same_generation_refresh_keeps_queue_courtesy(self) -> None:
+        # A fleet-source move reinstalls the running generation; it does not
+        # move the host along main, so time behind main must not drain every
+        # host into a heavy queue for it.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 3600)
+        with mock.patch.object(su, "checks_green", return_value=(False, "not green: red")), \
+                mock.patch.object(su, "refresh_reason",
+                                  return_value="fleet source moved to cccccccccccc"):
+            self.assertSteppedAsideForQueue(self.apply())
+        self.assertEqual(self.receipt()["target"], INSTALLED)
+
+    def test_a_long_turn_counts_from_when_it_ended(self) -> None:
+        # Began past the bound, ended ten minutes ago: still a recent turn.
+        self.demand(4)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 7200)
+        self.took_turn_at(NOW - su.QUEUE_HEAVY_MAX_DEFER_SECONDS - 3600, finished=NOW - 600)
+        self.assertSteppedAsideForQueue(self.apply())
+
+    def test_behind_seconds_is_zero_when_current_or_unknown(self) -> None:
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": None}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({}, 1800, NOW), 0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 600)}, 1800, NOW),
+                         0.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW),
+                         3600.0)
+        self.assertEqual(su.behind_seconds({"oldest_undeployed": su._iso(NOW - 5400)}, 1800, NOW,
+                                           last_turn=NOW - 600), 600.0)
+
     def test_the_bound_is_below_every_starvation_bound(self) -> None:
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_AFTER_SECONDS)
         self.assertLess(su.QUEUE_HEAVY_MAX_DEFER_SECONDS, su.STARVED_FALLBACK_SECONDS)
@@ -1112,8 +1365,9 @@ class OneAtATimeTests(Base):
         self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": NOW - 60}
         self.assertDeferred(self.apply())
         self.sys.peer_markers.clear()
-        del self.sys.peers["m5"]  # unreachable
-        self.assertDeferred(self.apply())
+        del self.sys.peers["m5"]  # unreachable: refused too, but steps aside (no ticket)
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertIn("SSH transport failed", su.waiting_ticket(self.cfg)["reason"])
         self.assertEqual(self.sys.mutations(), [])
 
     def test_stale_peer_marker_is_ignored(self) -> None:
@@ -1130,7 +1384,60 @@ class OneAtATimeTests(Base):
 
     def test_stagger_is_stable_and_bounded(self) -> None:
         self.assertEqual(su.stagger_seconds("m5"), su.stagger_seconds("m5"))
-        self.assertTrue(0 <= su.stagger_seconds("studio") < 600)
+        # m3 ("studio") hashed to 596 s of a 600 s window and slept ~10 min in
+        # every scheduled attempt (2026-11-17/18 receipts: "checkout 9.9 min").
+        for host in ("m1", "m5", "studio", "m5studio"):
+            self.assertTrue(0 <= su.stagger_seconds(host) <= 120, host)
+
+
+class HandoffKickTests(Base):
+    """After a succeeded turn, queued peers start their next attempt now
+    instead of at their next 30 min tick."""
+
+    def test_a_succeeded_turn_kicks_every_peer_after_its_marker_is_gone(self) -> None:
+        self.assertUpdated(self.apply())
+        self.assertEqual(sorted(peer for peer, _, _ in self.sys.kicks), ["m3", "m5"])
+        self.assertFalse(any(active for _, _, active in self.sys.kicks),
+                         "a peer kicked while this host's marker is live would just defer")
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(receipt["status"], "succeeded")
+        self.assertIn("handoff-kick", [step["step"] for step in receipt["steps"]])
+
+    def test_the_kick_is_plain_kickstart_gated_on_a_queued_place(self) -> None:
+        self.assertUpdated(self.apply())
+        command = self.sys.kicks[0][1]
+        self.assertIn('launchctl kickstart "gui/$(id -u)/com.danielraffel.tartci.self-update"',
+                      command)
+        self.assertNotIn("kickstart -k", command, "-k would SIGTERM a peer mid-update")
+        self.assertIn('test -s "$d/waiting.json"', command)
+        self.assertIn('test -s "$d/waiting-aside.json"', command)
+
+    def test_a_failed_kick_does_not_change_the_result(self) -> None:
+        self.sys.kick_rc["m5"] = 255
+        self.assertUpdated(self.apply())
+        receipt = json.loads(Path(self.last()["receipt"]).read_text())
+        self.assertEqual(receipt["status"], "succeeded")
+        detail = next(s["detail"] for s in receipt["steps"] if s["step"] == "handoff-kick")
+        self.assertIn("m5: kick failed (exit 255)", detail)
+        self.assertIn("studio: kickstart sent", detail)
+
+    def test_no_kick_on_a_deferred_refused_or_planned_run(self) -> None:
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.sys.floor = {"allowed": True, "reason": "", "findings": []}
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        self.assertEqual(self.sys.kicks, [])
+
+    def test_no_kick_after_a_rolled_back_turn(self) -> None:
+        # A failed canary never speeds up the rest of the fleet.
+        self.sys.broken_target = True
+        rc = self.apply()
+        self.assertNotEqual(rc, su.EXIT_OK)
+        self.assertIn(self.last()["status"], ("rolled_back", "failed"))
+        self.assertEqual(self.sys.kicks, [])
 
 
 class FloorTests(Base):
@@ -1543,6 +1850,178 @@ class UpdateQueueTests(Base):
         su._demand_fetch = lambda: fetch
         self.addCleanup(setattr, su, "_demand_fetch", original)
         return paths
+
+    def last_receipt(self) -> dict:
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        return json.loads(receipts[-1].read_text())
+
+    def test_a_peer_this_host_cannot_read_frees_the_turn_and_keeps_the_place(self) -> None:
+        # 2026-11-18: only m1's route to m5studio was dark. m1 deferred with
+        # the oldest ticket for 3.5 h, and m5 and m3, which read every peer,
+        # yielded to that ticket at every attempt; no host updated.
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+        del self.sys.peers["m5"]  # this host cannot read m5
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [], "refused before any drain")
+        # Peers read waiting.json: with it gone they no longer yield to this host.
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        kept = su.waiting_ticket(self.cfg)
+        self.assertEqual(kept["since"], since, "the place in the queue is kept privately")
+        self.assertIn("cannot read m5", kept["reason"])
+        self.assertTrue(self.last_receipt().get("stepped_aside"))
+
+    def test_a_failed_marker_read_also_frees_the_turn(self) -> None:
+        # Pool status answered but the marker read after it timed out: this
+        # host still cannot tell whether m5 is updating, so it cannot go.
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+        self.sys.peer_marker_errors["m5"] = "Connection timed out during banner exchange"
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], since)
+        self.assertIn("marker unreadable", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_host_that_cannot_read_a_peer_still_starves_loudly_once(self) -> None:
+        # Stepping aside must not silence the bound: m1's route to m5studio
+        # could stay dark while m3 and m5 still read it, so unanimity never
+        # excludes m5studio and m1 would wait forever, quietly.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        del self.sys.peers["m5"]
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(events.count("self_update_starved"), 1)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        kept = su.waiting_ticket(self.cfg)
+        self.assertEqual(kept["issue"], "77")
+        # The issue names this host's route, not a peer that will be excluded.
+        self.assertIn("cannot read a peer over its own route", kept["issue_body"])
+        self.assertNotIn("waiting.json` is gone", kept["issue_body"])
+        self.assertTrue(any("STARVED" in line for line in su.status_lines(self.cfg.state_dir)))
+        self.assertIn("STARVED", su.summary(self.home)["problem"])
+        # The route is back: the kept place takes the turn and closes the issue.
+        self.sys.peers["m5"] = {"state": "on", "participating": True}
+        self.assertUpdated(self.apply())
+        self.assertEqual(self.issues[-1], ("close", "77"))
+
+    def test_an_unread_peer_with_a_floor_refusal_still_starves_loudly(self) -> None:
+        # The capacity floor reads peers over the same routes, so a dark route
+        # to the only other server of a label refuses both ways. That path
+        # stepped aside quietly and never reached the starvation bound.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        del self.sys.peers["m5"]
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        events = (self.cfg.state_dir / "events.jsonl").read_text()
+        self.assertEqual(events.count("self_update_starved"), 1)
+        self.assertEqual([kind for kind, _ in self.issues], ["open"])
+        self.assertIn("STARVED", su.summary(self.home)["problem"])
+        # The issue names the peer to check, not the floor message.
+        body = su.waiting_ticket(self.cfg)["issue_body"]
+        self.assertIn("own route (peer m5 (m5) SSH transport failed", body)
+
+    def test_a_floor_refusal_with_readable_peers_stays_a_quiet_step_aside(self) -> None:
+        # Control: the floor path without an unread peer is unchanged.
+        self.ticket(since=NOW - su.STARVED_AFTER_SECONDS - 60)
+        self.gate_queue()
+        self.sys.floor = {"allowed": False, "reason": "capacity_unknown", "findings": []}
+        self.sys.peers["m5"] = {"state": "draining", "participating": False}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(self.issues, [])
+
+    def test_a_plan_with_a_peer_it_cannot_read_reports_and_writes_no_ticket(self) -> None:
+        del self.sys.peers["m5"]
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertFalse((self.cfg.state_dir / su.STEPPED_ASIDE_NAME).exists())
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_peer_dark_at_the_announce_re_read_also_frees_the_turn(self) -> None:
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+
+        def hook(seconds: float) -> None:
+            if seconds == su.ANNOUNCE_SETTLE_SECONDS:
+                self.sys.peers.pop("m5", None)
+        self.sys.on_sleep = hook
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertFalse(any("pool drain" in m for m in self.sys.mutations()))
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], since)
+        self.assertIn("peer changed after announcing", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_dark_route_beside_a_live_updater_still_frees_the_turn(self) -> None:
+        self.ticket(since=NOW - 2 * 3600)
+        del self.sys.peers["m5"]
+        self.sys.peer_markers["m3"] = {"host_id": "studio", "target": T_OLD, "ts": NOW - 60}
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "waiting.json").exists())
+        self.assertIn("self-updating", su.waiting_ticket(self.cfg)["reason"])
+
+    def test_a_readable_updating_peer_still_defers_and_publishes(self) -> None:
+        # Control, same instrument: every peer is readable and one is updating.
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+        self.sys.peer_markers["m3"] = {"host_id": "studio", "target": T_OLD, "ts": NOW - 60}
+        self.assertDeferred(self.apply())
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertEqual(su.waiting_ticket(self.cfg)["since"], since)
+        self.assertFalse((self.cfg.state_dir / "waiting-aside.json").exists())
+
+    def test_a_peer_that_reads_everyone_takes_the_turn_the_dark_route_freed(self) -> None:
+        # Both sides through the same instrument. First the head of the queue
+        # (oldest ticket) cannot read m5; whatever it publishes is what its
+        # peers will read.
+        self.ticket(since=NOW - 2 * 3600)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        path = self.cfg.state_dir / "waiting.json"
+        published = json.loads(path.read_text()) if path.exists() else None
+        # Then this fixture plays a peer that reads every host, joined the
+        # queue later, and sees the head's published ticket as studio's.
+        for name in ("waiting.json", su.STEPPED_ASIDE_NAME):
+            (self.cfg.state_dir / name).unlink(missing_ok=True)
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.ticket(since=NOW - 3600)
+        if published is not None:
+            published.update(host_id="studio", ts=self.sys.clock - 60)
+        self.sys.peer_waiting["m3"] = published
+        self.assertUpdated(self.apply())
+
+    def test_the_kept_place_goes_first_once_the_route_is_back(self) -> None:
+        since = NOW - 2 * 3600
+        self.ticket(since=since)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        # The route is back; studio joined the queue later and yields to the kept place.
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.sys.peer_waiting["m3"] = {"host_id": "studio", "since": since + 600,
+                                       "ts": self.sys.clock - 60}
+        self.assertUpdated(self.apply())
+        self.assertIsNone(su.waiting_ticket(self.cfg))
+
+    def test_a_route_back_to_a_peer_mid_update_defers_and_never_drains(self) -> None:
+        # Stepping aside never lets two hosts go out: once m5 is readable its
+        # live marker refuses this host as before.
+        self.ticket(since=NOW - 2 * 3600)
+        saved = self.sys.peers.pop("m5")
+        self.assertEqual(self.apply(), su.EXIT_DEFERRED)
+        self.sys.peers["m5"] = saved
+        self.sys.clock += 1800
+        self.sys.peer_markers["m5"] = {"host_id": "m5", "target": T_OLD, "ts": self.sys.clock - 60}
+        self.assertDeferred(self.apply())
+        self.assertFalse(any("pool drain" in m for m in self.sys.mutations()))
 
     def test_a_peer_that_has_waited_longer_goes_first(self) -> None:
         # m3 on 2026-09-30: refused at every attempt while a peer took each turn.
@@ -2464,6 +2943,12 @@ class SealedTests(Base):
         self.assertTrue(os.access(self.cfg.checkout, os.W_OK))
 
     def test_build_launcher_uses_rendered_pin_from_environment(self) -> None:
+        # The handoff applies only to a profile without host.python (which
+        # always wins); m3's real profile declares one, so drop it here.
+        for profile in (self.home / ".config/tartci/macos-fleet-profile.toml",
+                        self.home / ".local/share/tartci/update-checkout/profiles/m3-macos-fleet.toml"):
+            profile.write_text("".join(line for line in profile.read_text().splitlines(True)
+                                       if not line.startswith("python = ")))
         pinned = self.home / "pinned-python"
         pinned.symlink_to(sys.executable)
         with mock.patch.dict(os.environ, {"TARTCI_RENDER_PYTHON": str(pinned)}):
@@ -2554,6 +3039,29 @@ class SealedTests(Base):
                              for a, _ in self.sys.calls))
         receipts = list((self.cfg.state_dir / "attempts").glob("*.json"))
         self.assertTrue(all(json.loads(p.read_text())["status"] != "running" for p in receipts))
+
+    def test_a_live_launcher_that_does_not_verify_refuses_before_the_queue_wait_and_build(self) -> None:
+        # m3, 2026-11-15..17: 11 attempts waited out a heavy queue, built and signed a
+        # launcher, then refused at the snapshot on the same standing digest mismatch.
+        self.sys.snapshot_verify_rc = 1
+        self.assertEqual(self.plan(), su.EXIT_REFUSED)
+        self.assertEqual(self.apply(), su.EXIT_REFUSED)
+        self.assertFalse(any(a[:2] == ["bash", "scripts/build_macos_launcher.sh"]
+                             for a, _ in self.sys.calls))
+        self.assertEqual(self.sys.mutations(), [])
+        latest = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        steps = json.loads(latest.read_text())["steps"]
+        names = [step["step"] for step in steps]
+        self.assertIn("live launcher does not verify", steps[-1]["detail"] if "detail" in steps[-1]
+                      else json.dumps(steps[-1]))
+        self.assertNotIn("queue-light", names)
+        self.assertNotIn("announce", names)
+
+    def test_a_verified_live_launcher_is_reported_in_the_plan(self) -> None:
+        self.assertEqual(self.plan(), su.EXIT_OK)
+        latest = max((self.cfg.state_dir / "attempts").glob("*.json"), key=lambda p: p.stat().st_mtime)
+        steps = json.loads(latest.read_text())["steps"]
+        self.assertTrue(any(s["step"] == "live-launcher-verify" and s["ok"] for s in steps))
 
     def test_snapshot_that_does_not_verify_refuses_before_drain(self) -> None:
         self.sys.snapshot_verify_rc = 1
@@ -2670,6 +3178,47 @@ class PausedByStallTests(Base):
         finding = fleet_doctor.check_self_update(summary)
         self.assertEqual((finding.state, finding.code), (fleet_doctor.PROBLEM, "self_update_paused"))
         self.assertIn("self_update_paused", fleet_doctor.load_reasons())
+
+    def test_a_scheduled_run_refuses_during_the_stall(self):
+        # A demand start (a peer's handoff kick) still spawns self-update in a
+        # stall; the guard's pause held only because nobody kicked it.
+        self.guard()
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        receipts = sorted((self.cfg.state_dir / "attempts").glob("*.json"))
+        self.assertIn("PAUSED by the launchd timer stall",
+                      json.loads(receipts[-1].read_text())["error"])
+
+    def test_a_kicked_run_refuses_even_when_the_guard_lists_it_running(self):
+        # The guard omits a running self-update from `paused`; the open
+        # episode is what holds it.
+        self.guard(paused=())
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+
+    def test_a_stall_that_opens_after_the_first_check_refuses_before_the_drain(self):
+        # The stagger, checkout, preflight and build take minutes; the guard
+        # can open an episode meanwhile. Opened here at validate.
+        def hook(argv) -> None:
+            if "validate" in argv:
+                self.guard()
+        self.sys.hook = hook
+        rc = su.plan_or_apply(self.cfg, self.sys, apply=True, target_ref="origin/main",
+                              scheduled=True)
+        self.assertEqual(rc, su.EXIT_REFUSED)
+        self.assertEqual(self.sys.mutations(), [])
+        self.assertFalse((self.cfg.state_dir / "active.json").exists())
+
+    def test_a_scheduled_run_outside_a_stall_still_updates(self):
+        # Control: the same scheduled run with no live episode goes ahead.
+        self.guard(active=False)
+        self.sys.on_sleep = None
+        self.assertUpdated(su.plan_or_apply(self.cfg, self.sys, apply=True,
+                                            target_ref="origin/main", scheduled=True))
 
     def test_the_guard_dir_override_is_honoured(self):
         other = self.home / "guard-elsewhere"
@@ -3073,6 +3622,32 @@ class StoreHealthRecordTests(unittest.TestCase):
         self.state.parent.mkdir(parents=True, exist_ok=True)
         self.state.write_text("{not json")
         self.assertEqual("unknown", su.System().store_health(str(self.store))[0])
+
+
+class HeavyQueueAfterHostFaultTests(Base):
+    """m3, 2026-11-17: a slow-store host fault releases the queue place, and
+    the heavy-queue bound must not restart from zero after it."""
+    sealed = True
+    demand = QueueLightTests.demand
+    receipt = QueueLightTests.receipt
+    queue_step = QueueLightTests.queue_step
+    behind_main_for = QueueLightTests.behind_main_for
+    aside_since = QueueLightTests.aside_since
+    assertDrainedAnyway = QueueLightTests.assertDrainedAnyway
+
+    def test_a_host_fault_does_not_restart_the_heavy_queue_bound(self) -> None:
+        self.demand(1)
+        self.behind_main_for(su.QUEUE_HEAVY_MAX_DEFER_SECONDS + 60)
+        self.aside_since(NOW - 2 * 3600)
+        self.sys.store_result = {"ms": 4200.0}
+        self.assertEqual(su.EXIT_REFUSED, self.apply())
+        self.assertIn("Tart store volume slow", self.receipt()["error"])
+        self.assertIsNone(su.waiting_ticket(self.cfg), "the place was released")
+        self.assertEqual([], self.sys.mutations())
+        # Next attempt: the store is fast again but the queue is heavy.
+        self.sys.store_result = {"ms": 4.0}
+        self.demand(4)
+        self.assertDrainedAnyway(self.apply())
 
 
 class LauncherProbeStopTests(Base):

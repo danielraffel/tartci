@@ -13,8 +13,26 @@ schedule_backstop = "live"
 id = "studio"
 # The SSH alias other fleet hosts reach this one by (self-update peers).
 ssh = "m3"
+# The one interpreter every tartci LaunchAgent here runs (runbook: Pinned
+# interpreter): the python.org framework build, Developer ID signed (team
+# BMM5U3QVKW), so its macOS privacy identity survives patch updates. The
+# Homebrew Cellar 3.12.13_2 it replaces is ad-hoc signed and becomes a new
+# identity on every upgrade; on 2026-11-16 a consent alert held every launchd
+# open of /Volumes/Workshop for hours. This binary already reads and writes
+# /Volumes/Workshop from launchd (com.pulp.fleet.prewall runs it every 5 min),
+# and the installer's launchd preflight proves it against tart_home before any
+# lane switches. Rollback: delete this line and reinstall.
+python = "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3.13"
 home = "/Users/danielraffel"
 tart_home = "/Volumes/Workshop/VMs"
+# External-only host: a host build whose build dir or cache dir resolves to the
+# internal data volume is reported (refuse mode is not enabled yet) at
+# `tartci leases acquire` (scripts/external_only_policy.py). The fleet's internal
+# volumes filled up on 2026-11-17. Rollback: delete these two lines and re-render.
+external_root = "/Volumes/Workshop"
+# Report-only: warn, admit and journal a would_refuse row. Refuse mode is not
+# reachable from config yet (runbook: Keeping builds and caches on the external volume).
+external_only_mode = "report"
 # The CI cache (gate ccache, artifact cache, pip wheelhouse) lives on Workshop
 # with the Tart store, not on the boot volume, which held 10 GiB of it. The
 # old ~/.cache/pulp-ci is a symlink here, for tools that default to it.
@@ -308,6 +326,13 @@ min_queued_age_seconds = 0
 # jobs on every refresh (queue_scan.py --merge-group-quota). Pulp keeps the
 # default 0. Rollback: delete this line and re-render.
 queue_merge_group_quota = 2
+# sterile-consumer runs about 1.5 min after the GPU proof, on the same runner
+# class, and waited a median 5.3 min (mean 16.7) for a VM slot behind 30-minute
+# GPU jobs. Named here, slot priority lets it take the next free slot ahead of
+# longer jobs of its class, at most once per waiting lane (short_job_first,
+# scripts/slot_priority.py). Unset, the switch is "shadow": logs only.
+# Rollback: delete these lines and re-render.
+short_jobs = [{ workflow = "Locked macOS GPU proof", job = "sterile-consumer" }]
 labels = ["self-hosted", "macOS", "ARM64", "vellum-host-m3"]
 # Count peers' in-flight boots, so one queued job no longer boots a VM on
 # every host (31 of 65 Vellum boots got no job, 2026-11-01..04).

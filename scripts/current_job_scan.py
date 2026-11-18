@@ -40,6 +40,8 @@ class CurrentJobScanner:
         self.deadline = time.monotonic() + args.scan_timeout
         self.api_calls = 0
         self.api_lock = threading.Lock()
+        self.started = time.monotonic()
+        self.slowest: tuple[float, str] = (0.0, "")
         self.page_fingerprints: dict[str, tuple[tuple[int, ...], ...]] = {}
         self.observation_lock_path = Path(args.observation_lock_file)
         self.observation_lock_fd: int | None = None
@@ -76,10 +78,10 @@ class CurrentJobScanner:
                 ),
                 operation="current_job_github_api",
             )
-            print(
-                f"current-job-api path={path} elapsed_s={time.monotonic() - started:.3f}",
-                file=sys.stderr,
-            )
+            elapsed = time.monotonic() - started
+            with self.api_lock:
+                if elapsed > self.slowest[0]:
+                    self.slowest = (elapsed, path)
         except ObservationError as error:
             raise ScanError(f"GitHub API unavailable for {path}: {error}") from error
         if getattr(result, "timed_out", False):
@@ -95,6 +97,15 @@ class CurrentJobScanner:
         if not isinstance(payload, dict):
             raise ScanError(f"GitHub API returned non-object for {path}")
         return payload
+
+    def summary(self, result: str) -> str:
+        """One stderr line per scan. runner.sh appends this stderr to the lane's
+        events.jsonl, where a line per API call added about 230 KB a day to
+        each Pulp gate lane (76k lines in 49 days on m5studio)."""
+        slowest_s, slowest_path = self.slowest
+        return (f"current-job-api mode={self.args.mode} result={result} "
+                f"calls={self.api_calls} elapsed_s={time.monotonic() - self.started:.3f} "
+                f"slowest_s={slowest_s:.3f} slowest={slowest_path or '-'}")
 
     def record_timeout(self, error: BaseException) -> None:
         """Record timeout backoff without reacquiring the host observation flock."""
@@ -306,34 +317,37 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    args = parse_args()
+    scanner = CurrentJobScanner(args)
+    result = "error"
     try:
-        args = parse_args()
-        scanner = CurrentJobScanner(args)
+        rc, result = _scan(scanner)
+        return rc
+    finally:
+        print(scanner.summary(result), file=sys.stderr)
+
+
+def _scan(scanner: CurrentJobScanner) -> tuple[int, str]:
+    """Print the receipt; return the exit code and the receipt's kind."""
+    try:
         # API observation is lock-free. The host flock is reserved for short
         # claim/state operations; holding it across pagination starves lanes.
-        receipt = scanner.discover() if args.mode == "discover" else scanner.revalidate()
-        print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+        receipt = scanner.discover() if scanner.args.mode == "discover" else scanner.revalidate()
+        rc = 0
     except ObservationBackoff as error:
         scanner.record_timeout(error)
-        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
-                         sort_keys=True, separators=(",", ":")))
-        return 2
-    except ObservationTimeout as error:
+        receipt, rc = {"kind": "observation_error", "detail": f"lock_contention: {error}"}, 2
+    except ObservationTimeout as error:  # before TimeoutError: it is one
         scanner.record_timeout(error)
-        print(json.dumps({"kind": "observation_error", "detail": f"api_timeout: {error}"},
-                         sort_keys=True, separators=(",", ":")))
-        return 2
+        receipt, rc = {"kind": "observation_error", "detail": f"api_timeout: {error}"}, 2
     except TimeoutError as error:
         scanner.record_timeout(error)
-        print(json.dumps({"kind": "observation_error", "detail": f"lock_contention: {error}"},
-                         sort_keys=True, separators=(",", ":")))
-        return 2
+        receipt, rc = {"kind": "observation_error", "detail": f"lock_contention: {error}"}, 2
     except ScanError as error:
         scanner.record_timeout(error)
-        print(json.dumps({"kind": "observation_error", "detail": str(error)},
-                         sort_keys=True, separators=(",", ":")))
-        return 2
-    return 0
+        receipt, rc = {"kind": "observation_error", "detail": str(error)}, 2
+    print(json.dumps(receipt, sort_keys=True, separators=(",", ":")))
+    return rc, str(receipt.get("kind"))
 
 
 if __name__ == "__main__":

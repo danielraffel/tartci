@@ -15,6 +15,8 @@ Python 3.9-safe.
 
 from __future__ import annotations
 
+import os
+import tempfile
 import unittest
 
 try:
@@ -31,3 +33,11 @@ def skip_module_without_tomllib() -> None:
     """Skip the importing test module under Python < 3.11 (call before its imports)."""
     if not HAVE_TOMLLIB:
         raise unittest.SkipTest(REASON)
+
+
+# disk_available caches its macOS reading in a state file: keep tests off the
+# real ~/.tartci state. (TARTCI_DISK_PURGEABLE=0 turns the reading off for a
+# test that wants raw numbers only.)
+os.environ.setdefault("TARTCI_DISK_CACHE_FILE",
+                      os.path.join(tempfile.mkdtemp(prefix="tartci-test-disk-"),
+                                   "disk-important-cache.json"))

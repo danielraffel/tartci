@@ -161,12 +161,14 @@ class CanaryGateTests(_Fleet):
     # ── canary verified and healthy releases the others ──
 
     def test_a_canary_deploy_healthy_for_the_soak_releases_the_others(self) -> None:
-        young = self.behind(canary_events(deployed("0.221.1", NOW - 1 * HOUR)))
+        # Shipyard soaks 30 minutes on the canary: the steward host's tick, which
+        # every later host also waits for, is its real health check.
+        young = self.behind(canary_events(deployed("0.221.1", NOW - 20 * MIN)))
         row = self.refresh(young, "studio")["tools"]["shipyard"]
         self.assertEqual(young.fleet_updates(), [])
-        self.assertIn("deployed 0.221.1 1.0 h ago; healthy once 2 h pass", row["apply"])
+        self.assertIn("deployed 0.221.1 0.3 h ago; healthy once 0.5 h pass", row["apply"])
 
-        soaked = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
+        soaked = self.behind(canary_events(deployed("0.221.1", NOW - 40 * MIN)))
         row = self.refresh(soaked, "studio")["tools"]["shipyard"]
         self.assertEqual(soaked.fleet_updates(), ["v0.221.1"])
         self.assertIn("cleared by canary m5", row["canary"])
@@ -221,9 +223,118 @@ class CanaryGateTests(_Fleet):
         self.feeds["danielraffel/Shipyard"] = feed(
             ("v0.221.0", NOW - 30 * HOUR), ("v0.221.1", NOW - 6 * HOUR), ("v0.221.2", NOW - HOUR))
         host = self.behind(canary_events(deployed("0.221.1", NOW - 5 * HOUR),
-                                         deployed("0.221.2", NOW - 0.5 * HOUR, **{"from": "0.221.1"})))
+                                         deployed("0.221.2", NOW - 0.2 * HOUR, **{"from": "0.221.1"})))
         self.refresh(host, "studio")
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+
+    def test_a_former_canary_still_applies_first_while_readers_wait_for_the_new_one(self) -> None:
+        # Moving the canary from m5 to m5studio: a steward host still on the
+        # older TartCI generation waits for m5, so m5 must not wait for that
+        # steward host in turn, or neither moves until TartCI has rolled out.
+        roles = {"canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": ["m5"]}
+        former = self.behind(canary_events())
+        row = self.refresh(former, "m5", tool_rollout=roles)["tools"]["shipyard"]
+        self.assertEqual(former.fleet_updates(), ["v0.221.1"])
+        self.assertIn("former canary m5: applies first", row["canary"])
+        self.assertFalse(any(c[0] == "ssh" for c in former.calls))
+
+    def test_a_malformed_former_canary_list_fails_closed(self) -> None:
+        for former in ("m5", ["m9"], ["m5studio"], [None]):
+            roles = canary.rollout({"tool_rollout": {
+                "canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": former}})
+            self.assertIsNone(roles["canary"], former)
+            self.assertIn("former_canaries", roles["error"])
+        roles = canary.rollout({"tool_rollout": {"canary": "m5studio",
+                                                 "steward_hosts": ["studio"]}})
+        self.assertEqual(roles["former_canaries"], [])
+
+    def test_a_former_canary_deploy_clears_the_canary_slot_while_listed(self) -> None:
+        # m3 on the new generation, m5studio still on the old one: m5studio waits
+        # for m5 and for m3's steward verdict, so m3 must not wait for m5studio.
+        roles = {"canary": "m5studio", "steward_hosts": ["studio"], "former_canaries": ["m5"]}
+        targets = {"m5studio": "m5s", "m5": "m5", "studio": "m3"}
+        steward = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 40 * MIN))})
+        row = self.refresh(steward, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(steward.fleet_updates(), ["v0.221.1"])
+        self.assertIn("former canary m5", row["tools"]["shipyard"]["canary"])
+        # Neither canary has soaked: the wait names the new canary.
+        self.switch_host()
+        young = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 10 * MIN))})
+        row = self.refresh(young, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(young.fleet_updates(), [])
+        self.assertIn("waiting for canary m5studio", row["tools"]["shipyard"]["apply"])
+        # An unreadable new canary does not stall the slot a former canary cleared.
+        self.switch_host()
+        dark = self.behind({"m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+        self.refresh(dark, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(dark.fleet_updates(), ["v0.221.1"])
+        # A failure recorded on the current canary blocks, even though the
+        # former canary deployed the release healthily.
+        for failure in ({"event": "tool_apply_failed", "tool": "shipyard",
+                         "at": iso(NOW - 20 * MIN), "target": "0.221.1"},
+                        {"event": "tool_rolled_back", "tool": "shipyard",
+                         "at": iso(NOW - 5 * MIN), "from": "0.221.1", "to": "0.221.0"}):
+            self.switch_host()
+            failed = self.behind({
+                "m5s": canary_events(deployed("0.221.1", NOW - 30 * MIN), failure),
+                "m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+            row = self.refresh(failed, "studio", tool_rollout=roles, ssh_targets=targets)
+            self.assertEqual(failed.fleet_updates(), [], failure["event"])
+            self.assertIn(f"canary m5studio: v0.221.1 recorded {failure['event']}",
+                          row["tools"]["shipyard"]["apply"])
+        # An unverified redeploy on the current canary does not clear its failure.
+        self.switch_host()
+        unverified = self.behind({
+            "m5s": canary_events(deployed("0.221.1", NOW - 50 * MIN),
+                                 {"event": "tool_apply_failed", "tool": "shipyard",
+                                  "at": iso(NOW - 45 * MIN), "target": "0.221.1"},
+                                 deployed("0.221.1", NOW - 10 * MIN, verify="unknown")),
+            "m5": canary_events(deployed("0.221.1", NOW - 40 * MIN))})
+        self.refresh(unverified, "studio", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(unverified.fleet_updates(), [])
+        # The steward stage still holds every host behind it.
+        self.switch_host()
+        later = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 3 * HOUR)), "m3": canary_events()})
+        row = self.refresh(later, "m1", tool_rollout=roles, ssh_targets=targets)
+        self.assertEqual(later.fleet_updates(), [])
+        self.assertIn("waiting for steward host studio", row["tools"]["shipyard"]["apply"])
+        # With no former canary listed, m5's deploy no longer clears anything.
+        self.switch_host()
+        moved = self.behind({"m5s": canary_events(), "m5": canary_events(
+            deployed("0.221.1", NOW - 3 * HOUR))})
+        row = self.refresh(moved, "studio", ssh_targets=targets,
+                           tool_rollout={"canary": "m5studio", "steward_hosts": ["studio"]})
+        self.assertEqual(moved.fleet_updates(), [])
+        self.assertIn("waiting for canary m5studio", row["tools"]["shipyard"]["apply"])
+
+    def test_shipyard_soaks_half_an_hour_pulp_two_and_a_host_setting_wins(self) -> None:
+        # v0.444.0 took 4 h 15 min to reach every host, 2 h of it the canary
+        # soak, with nothing on the canary able to fail the release meanwhile.
+        self.assertEqual(tf.DEFAULT_TOOLS["shipyard"]["canary_soak_hours"], 0.5)
+        self.assertNotIn("canary_soak_hours", tf.DEFAULT_TOOLS["pulp"])
+        events = canary_events(deployed("0.221.1", NOW - 45 * MIN))
+        host = self.behind(events)
+        self.refresh(host, "studio")
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        # tool-freshness.toml's canary_soak_hours still overrides the tool's own value.
+        self.switch_host()
+        held = self.behind(events)
+        row = self.refresh(held, "studio", canary_soak_hours=2.0)
+        self.assertEqual(held.fleet_updates(), [])
+        self.assertIn("healthy once 2 h pass", row["tools"]["shipyard"]["apply"])
+        # pulp keeps the 2 h soak (it has no steward stage after the canary).
+        pulp = {"event": "tool_deployed", "tool": "pulp", "component": "cli",
+                "at": iso(NOW - 45 * MIN), "from": "0.877.2", "to": "0.877.3",
+                "by": "auto_apply", "downgrade": False, "verify": "current"}
+        self.feeds["Generous-Corp/pulp"] = feed(("v0.877.2", NOW - 30 * HOUR),
+                                                ("v0.877.3", NOW - 2 * HOUR))
+        self.switch_host()
+        pulp_host = self.behind(canary_events(pulp))
+        row = self.refresh(pulp_host, "studio")
+        self.assertIn("healthy once 2 h pass", row["tools"]["pulp"]["apply"])
 
     # ── canary rollback blocks them ──
 
@@ -391,8 +502,11 @@ class CanaryGateTests(_Fleet):
         published = json.loads(canary.PUBLISHED.read_text())["tool_rollout"]
         self.assertEqual(canary.rollout({}), {"canary": published["canary"],
                                               "steward_hosts": published["steward_hosts"],
+                                              "former_canaries": ["m5"],
                                               "error": None})
-        self.assertEqual(published, {"canary": "m5", "steward_hosts": ["studio"]})
+        # m5studio is always on; the m5 laptop canary stalled every host while it slept.
+        self.assertEqual(published, {"canary": "m5studio", "steward_hosts": ["studio"],
+                                     "former_canaries": ["m5"]})
         with mock.patch.object(canary, "PUBLISHED", Path(self.tmp.name) / "missing.json"):
             self.assertIsNotNone(canary.rollout({})["error"])
             host = self.behind(canary_events(deployed("0.221.1", NOW - 3 * HOUR)))
@@ -664,16 +778,80 @@ class StewardCheckTests(_Fleet):
         row = self.refresh(host, "m5", now=NOW + 2 * HOUR)["tools"]["shipyard"]
         self.assertIn("is the steward tick running?", row["steward_problem"])
 
-    def test_a_failure_already_failing_before_the_swap_is_not_rolled_back(self) -> None:
+    def test_a_failure_already_failing_before_the_swap_verifies_and_is_not_rolled_back(self) -> None:
+        # A repository added to the fleet with a standing failure (skia-builder
+        # and v8-builder, 2026-11-16: required_never_ran) must not hold every
+        # later release on the steward host, and the hosts behind it, forever.
         self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
         host = self.deploy_on_steward_host(before="FAIL:clones")
         self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones")
+        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"])
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+        self.assertIn("no new failure (already failing before the swap: "
+                      "danielraffel/tartci:clones,fleet:clones)", row["steward"])
+        reply = canary_events(*self.events(), clock=NOW + 10 * MIN)
+        self.switch_host()
+        other = self.behind(reply)
+        self.refresh(other, "studio", now=NOW + 10 * MIN)
+        self.assertEqual(other.fleet_updates(), ["v0.221.1"])
+
+    def test_the_baseline_kept_at_the_swap_survives_the_log_scrolling(self) -> None:
+        # summary.log is read from a 512 KiB tail (about a day of ticks on m3).
+        # A verdict judged after the pre-swap ticks scrolled out must not
+        # blame a standing failure on the release and roll it back.
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        entry = json.loads((self.state / "steward.json").read_text())["shipyard"]
+        self.assertEqual(entry["baseline"]["failing"],
+                         [["danielraffel/tartci", "clones"], ["fleet", "clones"]])
+        log = self.home / canary.STEWARD_LOG
+        log.write_text("")  # rotated: nothing from before the swap is left
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones")
+        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        self.assertEqual(host.fleet_updates(), ["v0.221.1"], "not rolled back")
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+        self.assertIn("already failing before the swap", row["steward"])
+
+    def test_a_record_without_a_stored_baseline_reads_the_log_as_before(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        path = self.state / "steward.json"
+        value = json.loads(path.read_text())
+        value["shipyard"].pop("baseline")
+        path.write_text(json.dumps(value))
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones")
         self.refresh(host, "m5", now=NOW + 10 * MIN)
+        self.assertEqual(self.kinds()[-1], "tool_steward_verified")
+
+    def test_a_new_invariant_beside_a_standing_failure_still_rolls_back(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        self.tick(NOW + 5 * MIN, "0.221.1", "FAIL:clones,arming")
+        self.refresh(host, "m5", now=NOW + 10 * MIN)
+        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
+        self.assertNotIn("tool_steward_verified", self.kinds())
+
+    def test_a_standing_failure_does_not_excuse_it_failing_in_another_repository(self) -> None:
+        self.tick(NOW - 20 * MIN, "0.221.0", "FAIL:clones")
+        host = self.deploy_on_steward_host(before="FAIL:clones")
+        at = NOW + 5 * MIN
+        self.log(f"{stamp(at)} fleet invariants=ok",
+                 f"{stamp(at)} danielraffel/tartci rc=0 took=9s ver=0.221.1 invariants=ok",
+                 f"{stamp(at)} Generous-Corp/pulp rc=0 took=20s ver=0.221.1 invariants=ok",
+                 f"{stamp(at)} danielraffel/Shipyard rc=0 took=30s ver=0.221.1 "
+                 "invariants=FAIL:clones")
+        row = self.refresh(host, "m5", now=NOW + 10 * MIN)["tools"]["shipyard"]
+        # Neither verified (clones is new in Shipyard) nor rolled back (the
+        # invariant was already failing before the swap).
         self.assertEqual(host.fleet_updates(), ["v0.221.1"])
         self.assertNotIn("tool_steward_verified", self.kinds())
-        self.tick(NOW + 15 * MIN, "0.221.1", "FAIL:clones,arming")
-        self.refresh(host, "m5", now=NOW + 20 * MIN)
-        self.assertEqual(host.fleet_updates(), ["v0.221.1", "v0.221.0"])
+        self.assertIn("1 complete steward ticks on 0.221.1", row["steward"])
+        self.assertIn("none conclusive", row["steward"])
+        row = self.refresh(host, "m5", now=NOW + 2 * HOUR)["tools"]["shipyard"]
+        # The tick is running; the problem must not say otherwise.
+        self.assertIn("none conclusive", row["steward_problem"])
+        self.assertNotIn("is the steward tick running?", row["steward_problem"])
 
     # ── error lines and error tokens ──
 
@@ -969,8 +1147,21 @@ class PublishedRolloutTests(unittest.TestCase):
             path.write_text(json.dumps({"canary": "m5", "steward_hosts": ["studio"]}))
             self.assertEqual(fleet.tool_rollout(path, hosts),
                              {"canary": "m5", "steward_hosts": ["studio"]})
+            for bad in ({"canary": "m5", "steward_hosts": ["studio"], "former_canaries": ["m5"]},
+                        {"canary": "m5", "steward_hosts": ["studio"], "former_canaries": ["m9"]},
+                        {"canary": "m5", "steward_hosts": ["studio"], "former_canaries": "m1"}):
+                path.write_text(json.dumps(bad))
+                with self.assertRaises(ValueError):
+                    fleet.tool_rollout(path, hosts)
+            path.write_text(json.dumps({"canary": "m5", "steward_hosts": ["studio"],
+                                        "former_canaries": ["m1"]}))
+            self.assertEqual(fleet.tool_rollout(path, hosts),
+                             {"canary": "m5", "steward_hosts": ["studio"],
+                              "former_canaries": ["m1"]})
         published = fleet.published_snapshot()
-        self.assertEqual(published["tool_rollout"], {"canary": "m5", "steward_hosts": ["studio"]})
+        self.assertEqual(published["tool_rollout"], {"canary": "m5studio",
+                                                     "steward_hosts": ["studio"],
+                                                     "former_canaries": ["m5"]})
 
 
 if __name__ == "__main__":

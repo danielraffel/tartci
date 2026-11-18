@@ -294,6 +294,54 @@ def report(plan: Plan, *, applied: bool, failures: list[str]) -> dict:
     }
 
 
+def run(*, fix: bool, home: Path | None = None, now: float | None = None,
+        table: tuple[list[str], list[str]] | None | bool = True) -> dict:
+    """One pass at the default bounds, for the hourly reclaim agent.
+
+    Plans only unless FIX. Never raises: a retention pass that fails must not
+    stop the reclaim pass that runs it. TARTCI_RECLAIM_RETENTION=0 turns it
+    off for one pass.
+    """
+    if os.environ.get("TARTCI_RECLAIM_RETENTION") == "0":
+        return {"enabled": False, "reason": "TARTCI_RECLAIM_RETENTION=0"}
+    home = home or Path.home()
+    # The per-boot files live under TARTCI_HOME and the generations under
+    # HOME. When the two name different trees (a test pass, an operator's
+    # scratch TARTCI_HOME) this is not the host's own pass: delete nothing.
+    # An empty value is set-but-unusable (build_plan would read it as ./state),
+    # so it is refused like any other mismatch; resolution errors are contained.
+    tartci_home = os.environ.get("TARTCI_HOME")
+    if tartci_home is not None:
+        try:
+            matches = bool(tartci_home) and (
+                Path(tartci_home).resolve() == (home / ".tartci").resolve())
+        except (OSError, RuntimeError, ValueError) as exc:
+            return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
+        if not matches:
+            return {"enabled": False,
+                    "reason": f"TARTCI_HOME={tartci_home} is not {home / '.tartci'}"}
+    try:
+        plan = build_plan(home, now=time.time() if now is None else now,
+                          max_age_days=DEFAULT_MAX_AGE_DAYS,
+                          keep_per_dir=DEFAULT_KEEP_PER_DIR,
+                          keep_generations=DEFAULT_KEEP_GENERATIONS,
+                          table=process_table() if table is True else table,
+                          running_from=Path(__file__).resolve())
+        # A self-update that started after the plan may be staging or
+        # switching generations now: re-read its marker just before deleting.
+        if fix and plan.generations and (home / ".tartci/state/self-update/active.json").exists():
+            plan.generations, plan.generations_bytes = [], 0
+            plan.notes.append("a self-update started during the pass; generations left alone")
+        failures = apply(plan) if fix else []
+        value = report(plan, applied=fix, failures=failures)
+    except Exception as exc:  # noqa: BLE001 - reported in the receipt instead
+        return {"enabled": True, "error": f"{type(exc).__name__}: {exc}"}
+    value["enabled"] = True
+    # Names only: the hourly receipt keeps counts, not every kept generation.
+    value["generations"]["kept"] = len(value["generations"]["kept"])
+    return value
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="tartci retention", description=__doc__.split("\n")[0])
     parser.add_argument("--apply", action="store_true", help="delete; default is a plan")

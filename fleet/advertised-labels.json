@@ -9,7 +9,7 @@
       "profiles/m5-macos-fleet.toml",
       "profiles/m5studio-macos-fleet.toml"
     ],
-    "profiles_sha256": "88bfce195e33ad52d1c92445ae0b96efcf70cc4f8dd188bfdcac834c295ffe79"
+    "profiles_sha256": "b3df7517a61255a1cec95e976acfc83b04a4b9397f0c0c2c69e9b2719b7f5f4d"
   },
   "registrations": [
     {
@@ -668,9 +668,12 @@
     }
   ],
   "tool_rollout": {
-    "canary": "m5",
+    "canary": "m5studio",
     "steward_hosts": [
       "studio"
+    ],
+    "former_canaries": [
+      "m5"
     ]
   }
 }
